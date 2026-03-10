@@ -3,7 +3,6 @@
 /// Translated from rpython/jit/metainterp/optimizeopt/rewrite.py.
 /// Rewrites operations into equivalent, cheaper operations.
 /// This includes constant folding for pure ops and algebraic identities.
-
 use majit_ir::{Op, OpCode, OpRef, Value};
 
 use crate::{OptContext, OptimizationPass, PassResult};
@@ -27,12 +26,7 @@ impl OptRewrite {
 
     /// Try to constant-fold a binary integer operation.
     /// Returns `Some(result)` if both args are constant.
-    fn try_fold_binary_int(
-        &self,
-        opcode: OpCode,
-        lhs: i64,
-        rhs: i64,
-    ) -> Option<i64> {
+    fn try_fold_binary_int(&self, opcode: OpCode, lhs: i64, rhs: i64) -> Option<i64> {
         match opcode {
             OpCode::IntAdd => Some(lhs.wrapping_add(rhs)),
             OpCode::IntSub => Some(lhs.wrapping_sub(rhs)),
@@ -615,9 +609,16 @@ impl OptimizationPass for OptRewrite {
             OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, ctx),
 
             // ── Comparisons ──
-            OpCode::IntLt | OpCode::IntLe | OpCode::IntEq | OpCode::IntNe
-            | OpCode::IntGt | OpCode::IntGe | OpCode::UintLt | OpCode::UintLe
-            | OpCode::UintGt | OpCode::UintGe => self.optimize_comparison(op, ctx),
+            OpCode::IntLt
+            | OpCode::IntLe
+            | OpCode::IntEq
+            | OpCode::IntNe
+            | OpCode::IntGt
+            | OpCode::IntGe
+            | OpCode::UintLt
+            | OpCode::UintLe
+            | OpCode::UintGt
+            | OpCode::UintGe => self.optimize_comparison(op, ctx),
 
             // ── Guards ──
             OpCode::GuardTrue => self.optimize_guard_true(op, ctx),
@@ -625,9 +626,7 @@ impl OptimizationPass for OptRewrite {
             OpCode::GuardValue => self.optimize_guard_value(op, ctx),
 
             // ── Identity ops ──
-            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => {
-                self.optimize_same_as(op, ctx)
-            }
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => self.optimize_same_as(op, ctx),
 
             // Everything else: pass on to next optimization pass
             _ => PassResult::PassOn,
@@ -698,8 +697,8 @@ mod tests {
         // op1: constant 0
         // op2: IntAdd(op0, op1) -> should become x
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),  // op0: x
-            Op::new(OpCode::SameAsI, &[]),  // op1: constant 0
+            Op::new(OpCode::SameAsI, &[]), // op0: x
+            Op::new(OpCode::SameAsI, &[]), // op1: constant 0
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
         ];
         ops[0].pos = OpRef(0);
@@ -724,8 +723,8 @@ mod tests {
     #[test]
     fn test_int_add_zero_left() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),  // op0: constant 0
-            Op::new(OpCode::SameAsI, &[]),  // op1: x
+            Op::new(OpCode::SameAsI, &[]), // op0: constant 0
+            Op::new(OpCode::SameAsI, &[]), // op1: x
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
         ];
         with_positions(&mut ops);
@@ -743,8 +742,8 @@ mod tests {
     #[test]
     fn test_int_add_constant_fold() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),  // op0: constant 10
-            Op::new(OpCode::SameAsI, &[]),  // op1: constant 20
+            Op::new(OpCode::SameAsI, &[]), // op0: constant 10
+            Op::new(OpCode::SameAsI, &[]), // op1: constant 20
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
         ];
         with_positions(&mut ops);
@@ -763,7 +762,7 @@ mod tests {
     #[test]
     fn test_int_add_x_plus_x() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),  // op0: x
+            Op::new(OpCode::SameAsI, &[]), // op0: x
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
         ];
         with_positions(&mut ops);
@@ -789,8 +788,8 @@ mod tests {
     #[test]
     fn test_int_sub_zero() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),  // op0: x
-            Op::new(OpCode::SameAsI, &[]),  // op1: constant 0
+            Op::new(OpCode::SameAsI, &[]), // op0: x
+            Op::new(OpCode::SameAsI, &[]), // op1: constant 0
             Op::new(OpCode::IntSub, &[OpRef(0), OpRef(1)]),
         ];
         with_positions(&mut ops);
@@ -808,7 +807,7 @@ mod tests {
     #[test]
     fn test_int_sub_self() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),  // op0: x
+            Op::new(OpCode::SameAsI, &[]), // op0: x
             Op::new(OpCode::IntSub, &[OpRef(0), OpRef(0)]),
         ];
         with_positions(&mut ops);
@@ -846,8 +845,8 @@ mod tests {
     #[test]
     fn test_int_mul_by_zero() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),  // op0: x
-            Op::new(OpCode::SameAsI, &[]),  // op1: constant 0
+            Op::new(OpCode::SameAsI, &[]), // op0: x
+            Op::new(OpCode::SameAsI, &[]), // op1: constant 0
             Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]),
         ];
         with_positions(&mut ops);
@@ -904,8 +903,8 @@ mod tests {
     #[test]
     fn test_int_mul_power_of_two() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),  // op0: x
-            Op::new(OpCode::SameAsI, &[]),  // op1: constant 8 (2^3)
+            Op::new(OpCode::SameAsI, &[]), // op0: x
+            Op::new(OpCode::SameAsI, &[]), // op1: constant 8 (2^3)
             Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]),
         ];
         with_positions(&mut ops);
@@ -1476,8 +1475,8 @@ mod tests {
 
         // Create a trace: x = SameAsI(), y = SameAsI(constant 0), z = IntAdd(x, y)
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),           // op0: x
-            Op::new(OpCode::SameAsI, &[]),           // op1: 0
+            Op::new(OpCode::SameAsI, &[]),                  // op0: x
+            Op::new(OpCode::SameAsI, &[]),                  // op1: 0
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]), // op2: x + 0
         ];
         with_positions(&mut ops);
@@ -1498,10 +1497,16 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => { ctx.emit(emitted); }
-                PassResult::Replace(replacement) => { ctx.emit(replacement); }
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                PassResult::Replace(replacement) => {
+                    ctx.emit(replacement);
+                }
                 PassResult::Remove => {}
-                PassResult::PassOn => { ctx.emit(resolved); }
+                PassResult::PassOn => {
+                    ctx.emit(resolved);
+                }
             }
         }
 
@@ -1518,9 +1523,9 @@ mod tests {
         // Test chaining: x - x -> 0, then guard_true(0) should NOT be removed
         // (it always fails)
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                    // op0: x
-            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(0)]),   // op1: x - x -> 0
-            Op::new(OpCode::GuardTrue, &[OpRef(1)]),          // op2: guard_true(0)
+            Op::new(OpCode::SameAsI, &[]),                  // op0: x
+            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(0)]), // op1: x - x -> 0
+            Op::new(OpCode::GuardTrue, &[OpRef(1)]),        // op2: guard_true(0)
         ];
         with_positions(&mut ops);
 
@@ -1533,10 +1538,16 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => { ctx.emit(emitted); }
-                PassResult::Replace(replacement) => { ctx.emit(replacement); }
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                PassResult::Replace(replacement) => {
+                    ctx.emit(replacement);
+                }
                 PassResult::Remove => {}
-                PassResult::PassOn => { ctx.emit(resolved); }
+                PassResult::PassOn => {
+                    ctx.emit(resolved);
+                }
             }
         }
 
@@ -1544,7 +1555,9 @@ mod tests {
         // should be passed on since guard_true of known 0 always fails
         // => we keep it for the backend.
         // Let's check that guard_true(0) is in the output
-        let guards: Vec<_> = ctx.new_operations.iter()
+        let guards: Vec<_> = ctx
+            .new_operations
+            .iter()
             .filter(|op| op.opcode == OpCode::GuardTrue)
             .collect();
         assert_eq!(guards.len(), 1, "guard_true(0) should remain in trace");
@@ -1633,9 +1646,7 @@ mod tests {
 
     #[test]
     fn test_unknown_opcode_passthrough() {
-        let mut ops = vec![
-            Op::new(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)])];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(1);
 

@@ -6,7 +6,6 @@
 ///
 /// Layout: [header0|payload0|header1|payload1|...|free...top]
 ///          ^nursery_start                       ^free  ^top
-
 use std::alloc::{self, Layout};
 use std::ptr;
 

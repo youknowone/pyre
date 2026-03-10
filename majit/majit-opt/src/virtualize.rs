@@ -6,7 +6,6 @@
 /// Instead of emitting the allocation, fields are tracked in the optimizer.
 /// If a virtual escapes (e.g., passed to a call or stored in a non-virtual),
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
-
 use std::sync::Arc;
 
 use majit_ir::{Descr, DescrRef, FieldDescr, Op, OpCode, OpRef, Value};
@@ -63,7 +62,11 @@ impl OptVirtualize {
     /// Returns the OpRef of the emitted allocation.
     fn force_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_replacement(opref);
-        let info = match self.ptr_info.get(resolved.0 as usize).and_then(|v| v.as_ref()) {
+        let info = match self
+            .ptr_info
+            .get(resolved.0 as usize)
+            .and_then(|v| v.as_ref())
+        {
             Some(info) if info.is_virtual() => info.clone(),
             _ => return resolved, // not virtual, nothing to do
         };
@@ -400,7 +403,9 @@ impl OptVirtualize {
                 PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_) | PtrInfo::VirtualArray(_) => {
                     return PassResult::Remove;
                 }
-                PtrInfo::KnownClass { is_nonnull: true, .. } => {
+                PtrInfo::KnownClass {
+                    is_nonnull: true, ..
+                } => {
                     return PassResult::Remove;
                 }
                 _ => {}
@@ -782,7 +787,7 @@ mod tests {
         // OpRef(52) = value to store (arbitrary opref)
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArray, &[OpRef(50)], ad.clone()),       // pos=0
+            Op::with_descr(OpCode::NewArray, &[OpRef(50)], ad.clone()), // pos=0
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[OpRef(0), OpRef(51), OpRef(52)],
@@ -792,10 +797,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![
-            (OpRef(50), Value::Int(3)),
-            (OpRef(51), Value::Int(0)),
-        ];
+        let constants = vec![(OpRef(50), Value::Int(3)), (OpRef(51), Value::Int(0))];
 
         let result = run_pass_with_constants(&ops, &constants);
         assert!(
@@ -885,11 +887,11 @@ mod tests {
         let fd_int = field_descr(20);
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewWithVtable, &[], sd1.clone()),                       // pos=0
-            Op::with_descr(OpCode::NewWithVtable, &[], sd2.clone()),                       // pos=1
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], fd_ref.clone()),     // pos=2
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(100)], fd_int.clone()),   // pos=3
-            Op::new(OpCode::CallN, &[OpRef(0)]),                                           // pos=4
+            Op::with_descr(OpCode::NewWithVtable, &[], sd1.clone()), // pos=0
+            Op::with_descr(OpCode::NewWithVtable, &[], sd2.clone()), // pos=1
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], fd_ref.clone()), // pos=2
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(100)], fd_int.clone()), // pos=3
+            Op::new(OpCode::CallN, &[OpRef(0)]),                     // pos=4
         ];
         assign_positions(&mut ops);
 
@@ -990,10 +992,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![
-            (OpRef(50), Value::Int(2)),
-            (OpRef(51), Value::Int(0)),
-        ];
+        let constants = vec![(OpRef(50), Value::Int(2)), (OpRef(51), Value::Int(0))];
 
         let result = run_pass_with_constants(&ops, &constants);
 

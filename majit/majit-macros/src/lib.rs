@@ -4,7 +4,6 @@
 /// - #[jit_driver]: Annotate an interpreter's main dispatch loop
 /// - #[elidable]: Mark a function as pure (constant-foldable)
 /// - #[dont_look_inside]: Prevent tracing into a function
-
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse::Parse, parse::ParseStream, parse_macro_input, Ident, ItemFn, Token};
@@ -59,8 +58,8 @@ impl Parse for JitDriverArgs {
 
         let greens = greens
             .ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "missing `greens`"))?;
-        let reds = reds
-            .ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "missing `reds`"))?;
+        let reds =
+            reds.ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "missing `reds`"))?;
 
         Ok(JitDriverArgs { greens, reds })
     }

@@ -6,7 +6,6 @@
 /// - Warm state management (interpreter → tracing → compiled)
 ///
 /// Reference: rpython/jit/metainterp/pyjitpl.py, warmstate.py, counter.py
-
 pub mod counter;
 pub mod heapcache;
 pub mod recorder;

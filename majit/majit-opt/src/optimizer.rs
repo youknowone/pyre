@@ -1,10 +1,9 @@
+use crate::{OptContext, OptimizationPass, PassResult};
 /// Main optimization driver.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
 /// Chains multiple optimization passes and drives operations through them.
-
 use majit_ir::Op;
-use crate::{OptContext, OptimizationPass, PassResult};
 
 /// The optimizer: chains passes and runs them over a trace.
 pub struct Optimizer {
@@ -106,15 +105,15 @@ mod tests {
             PassResult::PassOn
         }
 
-        fn name(&self) -> &'static str { "add_zero_elim" }
+        fn name(&self) -> &'static str {
+            "add_zero_elim"
+        }
     }
 
     #[test]
     fn test_optimizer_passthrough() {
         let mut opt = Optimizer::new();
-        let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-        ];
+        let ops = vec![Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)])];
         let result = opt.optimize(&ops);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);

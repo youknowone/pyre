@@ -3,7 +3,6 @@
 /// When a guard fails at runtime, execution exits the JIT-compiled loop
 /// and the current register/variable state is packaged into a `FrameData`
 /// (stored inside a `DeadFrame`) so the frontend can read values back.
-
 use majit_ir::{FailDescr, GcRef, Type, Value};
 use std::sync::Arc;
 

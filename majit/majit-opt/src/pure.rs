@@ -4,7 +4,6 @@
 ///
 /// When the same pure operation is seen again with the same arguments,
 /// the cached result is returned instead of recomputing.
-
 use std::collections::HashMap;
 
 use majit_ir::{Op, OpCode, OpRef};
@@ -305,9 +304,7 @@ mod tests {
     #[test]
     fn test_call_pure_demoted_to_call() {
         // call_pure_i(args...) -> should become call_i(args...)
-        let mut ops = vec![
-            Op::new(OpCode::CallPureI, &[OpRef(0), OpRef(1)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::CallPureI, &[OpRef(0), OpRef(1)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -321,9 +318,7 @@ mod tests {
 
     #[test]
     fn test_call_pure_r_demoted() {
-        let mut ops = vec![
-            Op::new(OpCode::CallPureR, &[OpRef(0)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::CallPureR, &[OpRef(0)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -337,9 +332,7 @@ mod tests {
     #[test]
     fn test_non_pure_op_passes_through() {
         // setfield_gc is not pure, should pass through unchanged
-        let mut ops = vec![
-            Op::new(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -512,9 +505,9 @@ mod tests {
     fn test_mixed_pure_and_non_pure() {
         // Mix of pure and non-pure operations, only duplicated pure ops get CSE'd.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),     // pure, kept
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]), // pure, kept
             Op::new(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)]), // not pure, kept
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),     // pure duplicate, eliminated
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]), // pure duplicate, eliminated
         ];
         assign_positions(&mut ops);
 

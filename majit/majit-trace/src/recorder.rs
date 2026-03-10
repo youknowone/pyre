@@ -5,7 +5,6 @@
 /// recorder, which builds a linear sequence of IR operations (a trace).
 ///
 /// Reference: rpython/jit/metainterp/pyjitpl.py MetaInterp.record()
-
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 
 use crate::trace::Trace;
@@ -90,12 +89,7 @@ impl TraceRecorder {
     /// Record a guard operation.
     /// Guards carry a FailDescr that describes what happens when the guard fails.
     /// Returns the OpRef for this guard.
-    pub fn record_guard(
-        &mut self,
-        opcode: OpCode,
-        args: &[OpRef],
-        descr: DescrRef,
-    ) -> OpRef {
+    pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], descr: DescrRef) -> OpRef {
         assert!(!self.finalized, "recorder already finalized");
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef(self.op_count);

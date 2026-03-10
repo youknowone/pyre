@@ -10,7 +10,6 @@
 /// - Cache invalidation on calls and side-effecting operations
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
-
 use std::collections::HashMap;
 
 use majit_ir::{Op, OpCode, OpRef};
@@ -491,7 +490,11 @@ mod tests {
         let d = descr(0);
         let idx = OpRef(50);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetarrayitemGc, &[OpRef(100), idx, OpRef(101)], d.clone()),
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(100), idx, OpRef(101)],
+                d.clone(),
+            ),
             Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];

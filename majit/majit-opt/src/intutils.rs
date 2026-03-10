@@ -158,8 +158,16 @@ impl IntBound {
 
     /// Internal constructor. Callers should prefer the static constructors below.
     fn new_raw(lower: i64, upper: i64, tvalue: u64, tmask: u64, do_shrinking: bool) -> Self {
-        debug_assert!(is_valid_tnum(tvalue, tmask), "invalid tnum: tvalue={tvalue:#x}, tmask={tmask:#x}");
-        let mut b = IntBound { lower, upper, tvalue, tmask };
+        debug_assert!(
+            is_valid_tnum(tvalue, tmask),
+            "invalid tnum: tvalue={tvalue:#x}, tmask={tmask:#x}"
+        );
+        let mut b = IntBound {
+            lower,
+            upper,
+            tvalue,
+            tmask,
+        };
         if do_shrinking {
             b.shrink();
         }
@@ -212,8 +220,13 @@ impl IntBound {
 
     /// Whether the value is exactly known.
     pub fn is_constant(&self) -> bool {
-        debug_assert!((self.lower == self.upper) == (self.tmask == 0),
-            "constant invariant violated: lower={}, upper={}, tmask={:#x}", self.lower, self.upper, self.tmask);
+        debug_assert!(
+            (self.lower == self.upper) == (self.tmask == 0),
+            "constant invariant violated: lower={}, upper={}, tmask={:#x}",
+            self.lower,
+            self.upper,
+            self.tmask
+        );
         self.tmask == 0
     }
 
@@ -230,8 +243,10 @@ impl IntBound {
 
     /// Whether this abstract integer is unbounded.
     pub fn is_unbounded(&self) -> bool {
-        self.lower == i64::MIN && self.upper == i64::MAX
-            && self.tvalue == 0 && self.tmask == u64::MAX
+        self.lower == i64::MIN
+            && self.upper == i64::MAX
+            && self.tvalue == 0
+            && self.tmask == u64::MAX
     }
 
     /// Whether the value is known to represent a boolean (0 or 1).
@@ -500,7 +515,12 @@ impl IntBound {
         self.intersect_const_inner(lower, upper, true)
     }
 
-    fn intersect_const_inner(&mut self, lower: i64, upper: i64, do_shrinking: bool) -> Result<bool, InvalidLoop> {
+    fn intersect_const_inner(
+        &mut self,
+        lower: i64,
+        upper: i64,
+        do_shrinking: bool,
+    ) -> Result<bool, InvalidLoop> {
         let mut changed = false;
         if lower > self.lower {
             if lower > self.upper {
@@ -743,7 +763,9 @@ impl IntBound {
                 checked_shl_i64(self.lower, other.upper),
                 checked_shl_i64(self.lower, other.lower),
             ];
-            if let (Some(a), Some(b), Some(c), Some(d)) = (results[0], results[1], results[2], results[3]) {
+            if let (Some(a), Some(b), Some(c), Some(d)) =
+                (results[0], results[1], results[2], results[3])
+            {
                 let lower = a.min(b).min(c).min(d);
                 let upper = a.max(b).max(c).max(d);
                 return IntBound::new(lower, upper, tvalue, tmask);
@@ -924,7 +946,9 @@ impl IntBound {
             tmask |= s_tmask;
             let inconsistent = self.tvalue & ((1u64 << shift) - 1);
             if inconsistent != 0 {
-                return Err(InvalidLoop("lshift_bound_backwards inconsistent known bits"));
+                return Err(InvalidLoop(
+                    "lshift_bound_backwards inconsistent known bits",
+                ));
             }
         }
         Ok(IntBound::from_knownbits(tvalue, tmask))
@@ -980,7 +1004,8 @@ impl IntBound {
     #[inline(always)]
     fn _tnum_sub(&self, other: &IntBound) -> (u64, u64) {
         let diff_values = self.tvalue.wrapping_sub(other.tvalue);
-        let val_borrows = diff_values.wrapping_add(self.tmask) ^ diff_values.wrapping_sub(other.tmask);
+        let val_borrows =
+            diff_values.wrapping_add(self.tmask) ^ diff_values.wrapping_sub(other.tmask);
         let tmask = self.tmask | other.tmask | val_borrows;
         let tvalue = unmask_zero(diff_values, tmask);
         (tvalue, tmask)
@@ -1072,8 +1097,10 @@ impl IntBound {
         // One more pass (should be idempotent after two passes)
         let changed_again = self._shrink_bounds_by_knownbits();
         let changed_again2 = self._shrink_knownbits_by_bounds();
-        debug_assert!(!changed_again && !changed_again2,
-            "shrinking was not idempotent after two passes");
+        debug_assert!(
+            !changed_again && !changed_again2,
+            "shrinking was not idempotent after two passes"
+        );
     }
 
     fn _shrink_bounds_by_knownbits(&mut self) -> bool {
@@ -1098,9 +1125,7 @@ impl IntBound {
     }
 
     fn _tnum_implied_by_bounds(&self) -> (u64, u64) {
-        let hbm_bounds = leading_zeros_mask(
-            (self.lower as u64) ^ (self.upper as u64)
-        );
+        let hbm_bounds = leading_zeros_mask((self.lower as u64) ^ (self.upper as u64));
         let bounds_common = (self.lower as u64) & hbm_bounds;
         let tmask = !hbm_bounds;
         (unmask_zero(bounds_common, tmask), tmask)
@@ -1219,7 +1244,11 @@ impl IntBound {
             if self.tmask & (1u64 << bit) != 0 {
                 results.push('?');
             } else {
-                results.push(if (self.tvalue >> bit) & 1 != 0 { '1' } else { '0' });
+                results.push(if (self.tvalue >> bit) & 1 != 0 {
+                    '1'
+                } else {
+                    '0'
+                });
             }
         }
         results.reverse();
@@ -2478,7 +2507,7 @@ mod tests {
         let a = IntBound::bounded(1, 2);
         let shift = IntBound::bounded(1, 3);
         let result = a.lshift_bound(&shift);
-        assert_eq!(result.lower, 2);  // 1 << 1
+        assert_eq!(result.lower, 2); // 1 << 1
         assert_eq!(result.upper, 16); // 2 << 3
     }
 
@@ -2487,7 +2516,7 @@ mod tests {
         let a = IntBound::bounded(16, 32);
         let shift = IntBound::bounded(1, 3);
         let result = a.rshift_bound(&shift);
-        assert_eq!(result.lower, 2);  // 16 >> 3
+        assert_eq!(result.lower, 2); // 16 >> 3
         assert_eq!(result.upper, 16); // 32 >> 1
     }
 

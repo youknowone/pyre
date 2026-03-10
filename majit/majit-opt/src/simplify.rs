@@ -12,7 +12,6 @@
 ///    RECORD_KNOWN_RESULT, VIRTUAL_REF_FINISH, QUASIIMMUT_FIELD,
 ///    ASSERT_NOT_NONE) that were consumed by earlier passes.
 /// 4. Rewrites VIRTUAL_REF to SAME_AS_R (the virtualisation is resolved).
-
 use majit_ir::{Op, OpCode};
 
 use crate::{OptContext, OptimizationPass, PassResult};
@@ -44,10 +43,9 @@ impl OptimizationPass for OptSimplify {
     fn propagate_forward(&mut self, op: &Op, _ctx: &mut OptContext) -> PassResult {
         match op.opcode {
             // CALL_PURE_* -> CALL_*
-            OpCode::CallPureI
-            | OpCode::CallPureR
-            | OpCode::CallPureF
-            | OpCode::CallPureN => PassResult::Emit(Self::rewrite_call(op)),
+            OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
+                PassResult::Emit(Self::rewrite_call(op))
+            }
 
             // CALL_LOOPINVARIANT_* -> CALL_*
             OpCode::CallLoopinvariantI
@@ -165,17 +163,11 @@ mod tests {
 
     #[test]
     fn test_preserves_args_on_call_rewrite() {
-        let ops = vec![Op::new(
-            OpCode::CallPureI,
-            &[OpRef(0), OpRef(1), OpRef(2)],
-        )];
+        let ops = vec![Op::new(OpCode::CallPureI, &[OpRef(0), OpRef(1), OpRef(2)])];
         let result = run_pass(&ops);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
-        assert_eq!(
-            result[0].args.as_slice(),
-            &[OpRef(0), OpRef(1), OpRef(2)]
-        );
+        assert_eq!(result[0].args.as_slice(), &[OpRef(0), OpRef(1), OpRef(2)]);
     }
 
     #[test]

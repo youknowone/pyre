@@ -3,7 +3,6 @@
 /// Translated from rpython/jit/backend/model.py (AbstractCPU).
 /// The Backend trait is the contract between the JIT frontend (tracing + optimization)
 /// and the code generation backend (Cranelift, etc.).
-
 use majit_ir::{FailDescr, InputArg, Op, Type, Value};
 
 /// Result of compiling a loop or bridge.
@@ -73,11 +72,7 @@ pub trait Backend: Send {
     ) -> Result<AsmInfo, BackendError>;
 
     /// Execute compiled code starting at the given token.
-    fn execute_token(
-        &self,
-        token: &LoopToken,
-        args: &[Value],
-    ) -> DeadFrame;
+    fn execute_token(&self, token: &LoopToken, args: &[Value]) -> DeadFrame;
 
     /// Read the FailDescr from the last guard failure.
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr;
@@ -95,11 +90,7 @@ pub trait Backend: Send {
     fn invalidate_loop(&self, token: &LoopToken);
 
     /// Redirect calls from one loop token to another (for CALL_ASSEMBLER).
-    fn redirect_call_assembler(
-        &self,
-        _old: &LoopToken,
-        _new: &LoopToken,
-    ) {
+    fn redirect_call_assembler(&self, _old: &LoopToken, _new: &LoopToken) {
         // Default: no-op
     }
 
