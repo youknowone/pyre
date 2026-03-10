@@ -13,6 +13,7 @@ pub mod collector;
 pub mod header;
 pub mod nursery;
 pub mod oldgen;
+pub mod rewrite;
 pub mod trace;
 
 /// GC flags stored in object headers.
