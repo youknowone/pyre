@@ -1,0 +1,9 @@
+[package]
+name = "majit-trace"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+majit-ir = { path = "../majit-ir" }
+majit-codegen = { path = "../majit-codegen" }
+majit-gc = { path = "../majit-gc" }

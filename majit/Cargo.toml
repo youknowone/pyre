@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "majit-ir",
+    "majit-opt",
+    "majit-trace",
+    "majit-codegen",
+    "majit-codegen-cranelift",
+    "majit-gc",
+    "majit-macros",
+    "majit-runtime",
+    "examples/calc",
+]
