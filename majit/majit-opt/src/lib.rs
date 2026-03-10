@@ -9,6 +9,9 @@
 pub mod optimizer;
 pub mod info;
 pub mod intutils;
+pub mod pure;
+pub mod rewrite;
+pub mod simplify;
 
 use majit_ir::{Op, OpRef, Value};
 

@@ -1,0 +1,195 @@
+/// Late-stage simplification pass.
+///
+/// Translated from rpython/jit/metainterp/optimizeopt/simplify.py.
+///
+/// This is the simplest optimization pass. It runs after the other passes
+/// and cleans up operations that are no longer needed:
+///
+/// 1. Converts CALL_PURE_* to the corresponding CALL_* (purity has already
+///    been exploited by OptPure).
+/// 2. Converts CALL_LOOPINVARIANT_* to the corresponding CALL_*.
+/// 3. Removes hint operations (RECORD_EXACT_CLASS, RECORD_EXACT_VALUE_*,
+///    RECORD_KNOWN_RESULT, VIRTUAL_REF_FINISH, QUASIIMMUT_FIELD,
+///    ASSERT_NOT_NONE) that were consumed by earlier passes.
+/// 4. Rewrites VIRTUAL_REF to SAME_AS_R (the virtualisation is resolved).
+
+use majit_ir::{Op, OpCode};
+
+use crate::{OptContext, OptimizationPass, PassResult};
+
+pub struct OptSimplify;
+
+impl OptSimplify {
+    pub fn new() -> Self {
+        OptSimplify
+    }
+
+    /// Convert a CALL_PURE_* or CALL_LOOPINVARIANT_* to the corresponding CALL_*.
+    fn rewrite_call(op: &Op) -> Op {
+        let new_opcode = OpCode::call_for_type(op.result_type());
+        let mut new_op = Op::new(new_opcode, &op.args);
+        new_op.descr = op.descr.clone();
+        new_op.pos = op.pos;
+        new_op
+    }
+}
+
+impl Default for OptSimplify {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OptimizationPass for OptSimplify {
+    fn propagate_forward(&mut self, op: &Op, _ctx: &mut OptContext) -> PassResult {
+        match op.opcode {
+            // CALL_PURE_* -> CALL_*
+            OpCode::CallPureI
+            | OpCode::CallPureR
+            | OpCode::CallPureF
+            | OpCode::CallPureN => PassResult::Emit(Self::rewrite_call(op)),
+
+            // CALL_LOOPINVARIANT_* -> CALL_*
+            OpCode::CallLoopinvariantI
+            | OpCode::CallLoopinvariantR
+            | OpCode::CallLoopinvariantF
+            | OpCode::CallLoopinvariantN => PassResult::Emit(Self::rewrite_call(op)),
+
+            // VIRTUAL_REF -> SAME_AS_R (just forward the first arg)
+            OpCode::VirtualRefR => {
+                let mut new_op = Op::new(OpCode::SameAsR, &[op.arg(0)]);
+                new_op.pos = op.pos;
+                PassResult::Emit(new_op)
+            }
+
+            // Hint operations that are simply removed
+            OpCode::VirtualRefFinish
+            | OpCode::QuasiimmutField
+            | OpCode::AssertNotNone
+            | OpCode::RecordExactClass
+            | OpCode::RecordExactValueR
+            | OpCode::RecordExactValueI
+            | OpCode::RecordKnownResult => PassResult::Remove,
+
+            _ => PassResult::PassOn,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "simplify"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_ir::OpRef;
+
+    fn run_pass(ops: &[Op]) -> Vec<Op> {
+        let mut opt = crate::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(OptSimplify::new()));
+        opt.optimize(ops)
+    }
+
+    #[test]
+    fn test_call_pure_to_call() {
+        for (pure_op, expected_op) in [
+            (OpCode::CallPureI, OpCode::CallI),
+            (OpCode::CallPureR, OpCode::CallR),
+            (OpCode::CallPureF, OpCode::CallF),
+            (OpCode::CallPureN, OpCode::CallN),
+        ] {
+            let ops = vec![Op::new(pure_op, &[OpRef(0), OpRef(1)])];
+            let result = run_pass(&ops);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].opcode, expected_op);
+            assert_eq!(result[0].args.as_slice(), &[OpRef(0), OpRef(1)]);
+        }
+    }
+
+    #[test]
+    fn test_call_loopinvariant_to_call() {
+        for (loopinv_op, expected_op) in [
+            (OpCode::CallLoopinvariantI, OpCode::CallI),
+            (OpCode::CallLoopinvariantR, OpCode::CallR),
+            (OpCode::CallLoopinvariantF, OpCode::CallF),
+            (OpCode::CallLoopinvariantN, OpCode::CallN),
+        ] {
+            let ops = vec![Op::new(loopinv_op, &[OpRef(0)])];
+            let result = run_pass(&ops);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].opcode, expected_op);
+        }
+    }
+
+    #[test]
+    fn test_virtual_ref_to_same_as() {
+        let ops = vec![Op::new(OpCode::VirtualRefR, &[OpRef(0), OpRef(1)])];
+        let result = run_pass(&ops);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::SameAsR);
+        assert_eq!(result[0].args.as_slice(), &[OpRef(0)]);
+    }
+
+    #[test]
+    fn test_removed_ops() {
+        let removed_opcodes = [
+            OpCode::VirtualRefFinish,
+            OpCode::QuasiimmutField,
+            OpCode::AssertNotNone,
+            OpCode::RecordExactClass,
+            OpCode::RecordExactValueR,
+            OpCode::RecordExactValueI,
+            OpCode::RecordKnownResult,
+        ];
+        for opcode in removed_opcodes {
+            let arity = opcode.arity().unwrap_or(0) as usize;
+            let args: Vec<OpRef> = (0..arity).map(|i| OpRef(i as u32)).collect();
+            let ops = vec![Op::new(opcode, &args)];
+            let result = run_pass(&ops);
+            assert!(result.is_empty(), "{:?} should be removed", opcode);
+        }
+    }
+
+    #[test]
+    fn test_passthrough() {
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+        ];
+        let result = run_pass(&ops);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::IntAdd);
+        assert_eq!(result[1].opcode, OpCode::GuardTrue);
+    }
+
+    #[test]
+    fn test_preserves_args_on_call_rewrite() {
+        let ops = vec![Op::new(
+            OpCode::CallPureI,
+            &[OpRef(0), OpRef(1), OpRef(2)],
+        )];
+        let result = run_pass(&ops);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::CallI);
+        assert_eq!(
+            result[0].args.as_slice(),
+            &[OpRef(0), OpRef(1), OpRef(2)]
+        );
+    }
+
+    #[test]
+    fn test_mixed_ops() {
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::CallPureI, &[OpRef(0)]),
+            Op::new(OpCode::RecordExactClass, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(1)]),
+        ];
+        let result = run_pass(&ops);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::IntAdd);
+        assert_eq!(result[1].opcode, OpCode::CallI);
+        assert_eq!(result[2].opcode, OpCode::IntSub);
+    }
+}

@@ -8,10 +8,7 @@
 /// Reference: rpython/jit/metainterp/pyjitpl.py, warmstate.py, counter.py
 
 pub mod counter;
-
-// Future modules (Stream E):
-// pub mod recorder;
-// pub mod frame;
-// pub mod heapcache;
-// pub mod warmstate;
-// pub mod compile;
+pub mod heapcache;
+pub mod recorder;
+pub mod trace;
+pub mod warmstate;
