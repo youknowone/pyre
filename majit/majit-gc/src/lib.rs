@@ -10,6 +10,12 @@
 
 use majit_ir::{GcRef, Op};
 
+pub mod collector;
+pub mod header;
+pub mod nursery;
+pub mod oldgen;
+pub mod trace;
+
 /// GC flags stored in object headers.
 ///
 /// From incminimark.py GCFLAG_* constants.
