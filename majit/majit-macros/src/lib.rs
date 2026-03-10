@@ -76,23 +76,69 @@ impl Parse for JitDriverArgs {
 /// struct MyJitDriver;
 /// ```
 ///
-/// This validates the attribute syntax and stores the green/red variable names
-/// as a string constant on the struct.
+/// Generates an `impl` block with associated constants describing the green
+/// and red variable names, their counts, and the total number of JIT
+/// variables.
 #[proc_macro_attribute]
 pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as JitDriverArgs);
-    let item_tokens: proc_macro2::TokenStream = item.into();
+
+    let input: syn::DeriveInput = match syn::parse(item) {
+        Ok(v) => v,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let struct_name = &input.ident;
 
     let green_strs: Vec<String> = args.greens.iter().map(|id| id.to_string()).collect();
     let red_strs: Vec<String> = args.reds.iter().map(|id| id.to_string()).collect();
     let greens_joined = green_strs.join(", ");
     let reds_joined = red_strs.join(", ");
 
+    let num_greens = green_strs.len();
+    let num_reds = red_strs.len();
+    let num_vars = num_greens + num_reds;
+
     let doc = format!("JIT driver: greens=[{greens_joined}], reds=[{reds_joined}]");
 
+    let attrs = &input.attrs;
+    let vis = &input.vis;
+    let generics = &input.generics;
+    let data = &input.data;
+
+    // Re-emit the struct with doc annotation, then add the impl block.
+    let struct_token = match data {
+        syn::Data::Struct(s) => {
+            let fields = &s.fields;
+            let semi = &s.semi_token;
+            quote! {
+                #(#attrs)*
+                #[doc = #doc]
+                #vis struct #struct_name #generics #fields #semi
+            }
+        }
+        _ => {
+            return syn::Error::new_spanned(&input, "jit_driver can only be applied to structs")
+                .to_compile_error()
+                .into();
+        }
+    };
+
     let expanded = quote! {
-        #[doc = #doc]
-        #item_tokens
+        #struct_token
+
+        impl #generics #struct_name #generics {
+            /// Green variable names.
+            pub const GREENS: &'static [&'static str] = &[#(#green_strs),*];
+            /// Red variable names.
+            pub const REDS: &'static [&'static str] = &[#(#red_strs),*];
+            /// Total number of JIT variables.
+            pub const NUM_VARS: usize = #num_vars;
+            /// Number of green variables.
+            pub const NUM_GREENS: usize = #num_greens;
+            /// Number of red variables.
+            pub const NUM_REDS: usize = #num_reds;
+        }
     };
 
     expanded.into()
@@ -101,7 +147,8 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Mark a function as elidable (pure / constant-foldable).
 ///
 /// The JIT can eliminate calls to this function when all arguments are constants.
-/// Adds `#[inline(never)]` to make the function easy to identify in traces.
+/// Adds `#[inline(never)]` to prevent inlining, and a hidden `#[majit_elidable]`
+/// marker attribute that the tracer can detect at compile time.
 #[proc_macro_attribute]
 pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -113,7 +160,14 @@ pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#attrs)*
         #[inline(never)]
-        #vis #sig #block
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_ELIDABLE: bool = true;
+            #block
+        }
     };
 
     expanded.into()
@@ -122,7 +176,8 @@ pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Mark a function as opaque to the tracer.
 ///
 /// The JIT will not trace into this function; it will be called as a black box.
-/// Adds `#[inline(never)]` to make the function easy to identify in traces.
+/// Adds `#[inline(never)]` to prevent inlining, and a hidden `#[majit_opaque]`
+/// marker constant that the tracer can detect at compile time.
 #[proc_macro_attribute]
 pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -134,7 +189,14 @@ pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#attrs)*
         #[inline(never)]
-        #vis #sig #block
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_OPAQUE: bool = true;
+            #block
+        }
     };
 
     expanded.into()

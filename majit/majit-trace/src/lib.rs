@@ -7,6 +7,7 @@
 ///
 /// Reference: rpython/jit/metainterp/pyjitpl.py, warmstate.py, counter.py
 pub mod counter;
+pub mod encoding;
 pub mod heapcache;
 pub mod recorder;
 pub mod trace;
