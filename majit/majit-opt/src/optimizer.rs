@@ -78,6 +78,27 @@ impl Optimizer {
     }
 }
 
+impl Optimizer {
+    /// Create an optimizer with the standard pass pipeline.
+    /// Order: IntBounds -> Rewrite -> Virtualize -> String -> Pure -> Simplify -> Heap
+    pub fn default_pipeline() -> Self {
+        let mut opt = Self::new();
+        opt.add_pass(Box::new(crate::intbounds::OptIntBounds::new()));
+        opt.add_pass(Box::new(crate::rewrite::OptRewrite::new()));
+        opt.add_pass(Box::new(crate::virtualize::OptVirtualize::new()));
+        opt.add_pass(Box::new(crate::vstring::OptString::new()));
+        opt.add_pass(Box::new(crate::pure::OptPure::new()));
+        opt.add_pass(Box::new(crate::simplify::OptSimplify::new()));
+        opt.add_pass(Box::new(crate::heap::OptHeap::new()));
+        opt
+    }
+
+    /// Number of passes in this optimizer.
+    pub fn num_passes(&self) -> usize {
+        self.passes.len()
+    }
+}
+
 impl Default for Optimizer {
     fn default() -> Self {
         Self::new()
@@ -117,5 +138,35 @@ mod tests {
         let result = opt.optimize(&ops);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
+    }
+
+    #[test]
+    fn test_default_pipeline_has_7_passes() {
+        let opt = Optimizer::default_pipeline();
+        assert_eq!(opt.num_passes(), 7);
+    }
+
+    #[test]
+    fn test_default_pipeline_processes_trace() {
+        let mut opt = Optimizer::default_pipeline();
+        // A simple trace: two INT_ADD with identical args. The Pure pass (CSE)
+        // should eliminate the duplicate.
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        for (i, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef(i as u32);
+        }
+        let result = opt.optimize(&ops);
+        // The duplicate INT_ADD should be eliminated by CSE (OptPure).
+        let add_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::IntAdd)
+            .count();
+        assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
+        // Jump should still be present.
+        assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
     }
 }
