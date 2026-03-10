@@ -73,6 +73,58 @@ impl CalcInterp {
         }
     }
 
+    // -- Public accessors for JIT integration --
+
+    /// Current program counter.
+    pub fn pc(&self) -> usize {
+        self.pc
+    }
+
+    /// Set the program counter.
+    pub fn set_pc(&mut self, pc: usize) {
+        self.pc = pc;
+    }
+
+    /// Get a variable value by index.
+    pub fn get_var(&self, idx: u8) -> i64 {
+        self.vars[idx as usize]
+    }
+
+    /// Set a variable value by index.
+    pub fn set_var(&mut self, idx: u8, val: i64) {
+        self.vars[idx as usize] = val;
+    }
+
+    /// Push a value onto the operand stack.
+    pub fn push_stack(&mut self, val: i64) {
+        self.stack.push(val);
+    }
+
+    /// Pop a value from the operand stack.
+    pub fn pop_stack(&mut self) -> i64 {
+        self.stack.pop().expect("stack underflow")
+    }
+
+    /// Reference to the operand stack.
+    pub fn stack(&self) -> &[i64] {
+        &self.stack
+    }
+
+    /// Top-of-stack or 0 if empty.
+    pub fn top_or_zero(&self) -> i64 {
+        self.stack.last().copied().unwrap_or(0)
+    }
+
+    /// Execute a binary operation (pop two, push result).
+    pub fn do_binop(&mut self, op: impl FnOnce(i64, i64) -> i64) {
+        self.binop(op);
+    }
+
+    /// Execute a comparison operation (pop two, push 0 or 1).
+    pub fn do_cmpop(&mut self, op: impl FnOnce(i64, i64) -> bool) {
+        self.cmpop(op);
+    }
+
     #[inline(always)]
     fn binop(&mut self, op: impl FnOnce(i64, i64) -> i64) {
         let b = self.stack.pop().expect("stack underflow");
