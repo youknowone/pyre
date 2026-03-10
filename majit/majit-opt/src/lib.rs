@@ -6,12 +6,16 @@
 /// Operations flow through the chain: IntBounds → Rewrite → Virtualize → String →
 /// Pure → EarlyForce → Heap (configurable).
 
+pub mod heap;
+pub mod intbounds;
 pub mod optimizer;
 pub mod info;
 pub mod intutils;
 pub mod pure;
 pub mod rewrite;
 pub mod simplify;
+pub mod virtualize;
+pub mod vstring;
 
 use majit_ir::{Op, OpRef, Value};
 
@@ -59,6 +63,9 @@ impl OptContext {
 
     /// Record that `old` should be replaced by `new` wherever it appears.
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
+        if old == new {
+            return; // avoid self-referencing forwarding loop
+        }
         let idx = old.0 as usize;
         if idx >= self.forwarding.len() {
             self.forwarding.resize(idx + 1, OpRef::NONE);
