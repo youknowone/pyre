@@ -13,7 +13,6 @@
 ///
 /// When a virtual string escapes (used in an unhandled context), it is
 /// "forced": NEWSTR + STRSETITEM ops are emitted to materialize it.
-
 use std::collections::HashMap;
 
 use majit_ir::{Op, OpCode, OpRef, Value};
@@ -199,9 +198,7 @@ impl OptString {
                     self.try_get_char(*right, index - left_len, ctx)
                 }
             }
-            VStringInfo::Slice {
-                source, start, ..
-            } => {
+            VStringInfo::Slice { source, start, .. } => {
                 let start_val = ctx.get_constant_int(*start)?;
                 self.try_get_char(*source, index + start_val, ctx)
             }
@@ -471,7 +468,7 @@ mod tests {
         //   i3 = strgetitem(p0, i101) -> should resolve to i200, removed
 
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef(100)]),          // op 0: p0 = newstr(3)
+            Op::new(OpCode::Newstr, &[OpRef(100)]), // op 0: p0 = newstr(3)
             Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(101), OpRef(200)]), // op 1
             Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(102), OpRef(201)]), // op 2
             Op::new(OpCode::Strgetitem, &[OpRef(0), OpRef(101)]), // op 3: get char at 0
@@ -502,8 +499,8 @@ mod tests {
         // p0 = newstr(5)
         // i1 = strlen(p0) -> should be constant 5
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef(100)]),  // op 0
-            Op::new(OpCode::Strlen, &[OpRef(0)]),    // op 1
+            Op::new(OpCode::Newstr, &[OpRef(100)]), // op 0
+            Op::new(OpCode::Strlen, &[OpRef(0)]),   // op 1
         ];
         assign_positions(&mut ops);
 
@@ -529,18 +526,14 @@ mod tests {
         // strsetitem(p0, 1, c1)
         // escape_r(p0)   -> forces the string
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef(100)]),                          // op 0
-            Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(101), OpRef(200)]),// op 1
-            Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(102), OpRef(201)]),// op 2
-            Op::new(OpCode::EscapeR, &[OpRef(0)]),                           // op 3: forces
+            Op::new(OpCode::Newstr, &[OpRef(100)]), // op 0
+            Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(101), OpRef(200)]), // op 1
+            Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(102), OpRef(201)]), // op 2
+            Op::new(OpCode::EscapeR, &[OpRef(0)]),  // op 3: forces
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![
-            (OpRef(100), 2),
-            (OpRef(101), 0),
-            (OpRef(102), 1),
-        ];
+        let constants = vec![(OpRef(100), 2), (OpRef(101), 0), (OpRef(102), 1)];
 
         let result = run_with_constants(&ops, &constants);
 
@@ -764,23 +757,19 @@ mod tests {
         // copystrcontent(src, dst, 0, 0, 2)
         // strgetitem(dst, 0) -> c0
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef(100)]),                           // op 0: src
+            Op::new(OpCode::Newstr, &[OpRef(100)]), // op 0: src
             Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(101), OpRef(200)]), // op 1
             Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(102), OpRef(201)]), // op 2
-            Op::new(OpCode::Newstr, &[OpRef(100)]),                           // op 3: dst
+            Op::new(OpCode::Newstr, &[OpRef(100)]), // op 3: dst
             Op::new(
                 OpCode::Copystrcontent,
                 &[OpRef(0), OpRef(3), OpRef(101), OpRef(101), OpRef(100)],
             ), // op 4: copy src->dst
-            Op::new(OpCode::Strgetitem, &[OpRef(3), OpRef(101)]),             // op 5: get dst[0]
+            Op::new(OpCode::Strgetitem, &[OpRef(3), OpRef(101)]), // op 5: get dst[0]
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![
-            (OpRef(100), 2),
-            (OpRef(101), 0),
-            (OpRef(102), 1),
-        ];
+        let constants = vec![(OpRef(100), 2), (OpRef(101), 0), (OpRef(102), 1)];
 
         let result = run_with_constants(&ops, &constants);
 
@@ -826,10 +815,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![
-            (OpRef(100), 3),
-            (OpRef(101), 0),
-        ];
+        let constants = vec![(OpRef(100), 3), (OpRef(101), 0)];
 
         let result = run_with_constants(&ops, &constants);
 
@@ -854,20 +840,37 @@ mod tests {
         let a = OpRef(10);
         let b = OpRef(11);
         let c = OpRef(12);
-        pass.vstrings.insert(a, VStringInfo::Plain { chars: vec![None; 2] });
+        pass.vstrings.insert(
+            a,
+            VStringInfo::Plain {
+                chars: vec![None; 2],
+            },
+        );
         pass.known_lengths.insert(a, OpRef(100));
-        pass.vstrings.insert(b, VStringInfo::Plain { chars: vec![None; 3] });
+        pass.vstrings.insert(
+            b,
+            VStringInfo::Plain {
+                chars: vec![None; 3],
+            },
+        );
         pass.known_lengths.insert(b, OpRef(101));
-        pass.vstrings.insert(c, VStringInfo::Plain { chars: vec![None; 4] });
+        pass.vstrings.insert(
+            c,
+            VStringInfo::Plain {
+                chars: vec![None; 4],
+            },
+        );
         pass.known_lengths.insert(c, OpRef(102));
 
         // ab = concat(a, b)
         let ab = OpRef(20);
-        pass.vstrings.insert(ab, VStringInfo::Concat { left: a, right: b });
+        pass.vstrings
+            .insert(ab, VStringInfo::Concat { left: a, right: b });
 
         // abc = concat(ab, c)
         let abc = OpRef(21);
-        pass.vstrings.insert(abc, VStringInfo::Concat { left: ab, right: c });
+        pass.vstrings
+            .insert(abc, VStringInfo::Concat { left: ab, right: c });
 
         assert_eq!(pass.get_known_length(abc, &ctx), Some(9));
     }
@@ -900,13 +903,8 @@ mod tests {
         pass.known_lengths.insert(right, OpRef(101));
 
         let concat = OpRef(12);
-        pass.vstrings.insert(
-            concat,
-            VStringInfo::Concat {
-                left,
-                right,
-            },
-        );
+        pass.vstrings
+            .insert(concat, VStringInfo::Concat { left, right });
 
         // Index 0 -> left[0] = 200
         assert_eq!(pass.try_get_char(concat, 0, &ctx), Some(OpRef(200)));

@@ -6,7 +6,6 @@
 /// - Write barrier with remembered set for old-to-young pointers
 ///
 /// Modeled after incminimark's minor/major collection.
-
 use majit_ir::GcRef;
 
 use crate::flags;
@@ -202,7 +201,9 @@ impl MiniMarkGC {
             let gcref = unsafe { *root_ptr };
             if !gcref.is_null() && self.is_in_nursery(gcref.0) {
                 let new_ref = self.copy_nursery_object(gcref.0);
-                unsafe { *root_ptr = new_ref; }
+                unsafe {
+                    *root_ptr = new_ref;
+                }
             }
         }
 
@@ -263,8 +264,10 @@ impl MiniMarkGC {
         // Allocate in old gen and copy.
         let header_ptr = obj_addr - GcHeader::SIZE;
         // Safety: header_ptr points to a valid nursery object of total_size bytes.
-        let new_header_ptr =
-            unsafe { self.oldgen.alloc_and_copy(header_ptr as *const u8, total_size) };
+        let new_header_ptr = unsafe {
+            self.oldgen
+                .alloc_and_copy(header_ptr as *const u8, total_size)
+        };
         let new_obj_addr = new_header_ptr as usize + GcHeader::SIZE;
 
         // Set TRACK_YOUNG_PTRS on the new old-gen object.
@@ -306,7 +309,9 @@ impl MiniMarkGC {
             let field_ref = unsafe { *slot };
             if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
                 let new_ref = self.copy_nursery_object(field_ref.0);
-                unsafe { *slot = new_ref; }
+                unsafe {
+                    *slot = new_ref;
+                }
             }
         }
 
@@ -319,7 +324,9 @@ impl MiniMarkGC {
                 let field_ref = unsafe { *slot };
                 if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
                     let new_ref = self.copy_nursery_object(field_ref.0);
-                    unsafe { *slot = new_ref; }
+                    unsafe {
+                        *slot = new_ref;
+                    }
                 }
             }
         }
@@ -379,8 +386,7 @@ impl MiniMarkGC {
                 let length = unsafe { *((obj_addr + length_offset) as *const usize) };
                 let items_start = obj_addr + base_size;
                 for i in 0..length {
-                    let field_ref =
-                        unsafe { *((items_start + i * item_size) as *const GcRef) };
+                    let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
                     if !field_ref.is_null() {
                         let hdr = unsafe { header_of(field_ref.0) };
                         if !hdr.has_flag(flags::VISITED) {
@@ -520,7 +526,9 @@ mod tests {
 
         // Root it.
         let mut root = obj;
-        unsafe { gc.roots.add(&mut root); }
+        unsafe {
+            gc.roots.add(&mut root);
+        }
 
         // Trigger collection.
         gc.collect_nursery();
@@ -606,7 +614,9 @@ mod tests {
 
         // Root only the parent.
         let mut root = parent;
-        unsafe { gc.roots.add(&mut root); }
+        unsafe {
+            gc.roots.add(&mut root);
+        }
 
         // Trigger collection.
         gc.collect_nursery();
@@ -661,7 +671,9 @@ mod tests {
         let _obj2 = gc.alloc_with_type(tid, 16); // unreachable
 
         let mut root = obj1;
-        unsafe { gc.roots.add(&mut root); }
+        unsafe {
+            gc.roots.add(&mut root);
+        }
 
         // Full collection: promotes to old gen and sweeps.
         gc.collect_full();
@@ -708,12 +720,16 @@ mod tests {
         let tid = gc.register_type(TypeInfo::simple(16));
 
         let mut root = GcRef::NULL;
-        unsafe { gc.roots.add(&mut root); }
+        unsafe {
+            gc.roots.add(&mut root);
+        }
 
         for i in 0..50 {
             let obj = gc.alloc_with_type(tid, 16);
             // Write a marker value.
-            unsafe { *(obj.0 as *mut u64) = i as u64; }
+            unsafe {
+                *(obj.0 as *mut u64) = i as u64;
+            }
             root = obj;
 
             if i % 10 == 0 {
@@ -772,7 +788,9 @@ mod tests {
 
         // Root only the old object.
         let mut root = old_obj;
-        unsafe { gc.roots.add(&mut root); }
+        unsafe {
+            gc.roots.add(&mut root);
+        }
 
         // Collect.
         gc.collect_nursery();
@@ -807,16 +825,24 @@ mod tests {
         ));
 
         let c = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
-        unsafe { *(c.0 as *mut GcRef) = GcRef::NULL; }
+        unsafe {
+            *(c.0 as *mut GcRef) = GcRef::NULL;
+        }
 
         let b = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
-        unsafe { *(b.0 as *mut GcRef) = c; }
+        unsafe {
+            *(b.0 as *mut GcRef) = c;
+        }
 
         let a = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
-        unsafe { *(a.0 as *mut GcRef) = b; }
+        unsafe {
+            *(a.0 as *mut GcRef) = b;
+        }
 
         let mut root = a;
-        unsafe { gc.roots.add(&mut root); }
+        unsafe {
+            gc.roots.add(&mut root);
+        }
 
         gc.collect_nursery();
 
@@ -845,16 +871,24 @@ mod tests {
         let tid2 = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size * 2, vec![0, ptr_size]));
 
         let b = gc.alloc_with_type(tid1, ptr_size);
-        unsafe { *(b.0 as *mut GcRef) = GcRef::NULL; }
+        unsafe {
+            *(b.0 as *mut GcRef) = GcRef::NULL;
+        }
 
         let a = gc.alloc_with_type(tid1, ptr_size);
-        unsafe { *(a.0 as *mut GcRef) = b; }
+        unsafe {
+            *(a.0 as *mut GcRef) = b;
+        }
 
         let c = gc.alloc_with_type(tid1, ptr_size);
-        unsafe { *(c.0 as *mut GcRef) = GcRef::NULL; }
+        unsafe {
+            *(c.0 as *mut GcRef) = GcRef::NULL;
+        }
 
         let d = gc.alloc_with_type(tid1, ptr_size);
-        unsafe { *(d.0 as *mut GcRef) = GcRef::NULL; }
+        unsafe {
+            *(d.0 as *mut GcRef) = GcRef::NULL;
+        }
         let _ = d; // unreachable
 
         // Root object points to both A and C.
@@ -865,7 +899,9 @@ mod tests {
         }
 
         let mut root = root_obj;
-        unsafe { gc.roots.add(&mut root); }
+        unsafe {
+            gc.roots.add(&mut root);
+        }
 
         // Promote to old gen.
         gc.collect_nursery();
@@ -906,7 +942,9 @@ mod tests {
         }
 
         let mut root = parent;
-        unsafe { gc.roots.add(&mut root); }
+        unsafe {
+            gc.roots.add(&mut root);
+        }
 
         gc.collect_nursery();
 

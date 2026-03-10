@@ -136,15 +136,24 @@ pub struct InputArg {
 
 impl InputArg {
     pub fn new_int(index: u32) -> Self {
-        InputArg { tp: Type::Int, index }
+        InputArg {
+            tp: Type::Int,
+            index,
+        }
     }
 
     pub fn new_ref(index: u32) -> Self {
-        InputArg { tp: Type::Ref, index }
+        InputArg {
+            tp: Type::Ref,
+            index,
+        }
     }
 
     pub fn new_float(index: u32) -> Self {
-        InputArg { tp: Type::Float, index }
+        InputArg {
+            tp: Type::Float,
+            index,
+        }
     }
 
     pub fn from_type(tp: Type, index: u32) -> Self {

@@ -52,24 +52,24 @@ pub enum ByteCode {
 pub fn sum_program(n: i64) -> Vec<ByteCode> {
     use ByteCode::*;
     vec![
-        /*  0 */ LoadConst(0),    // sum = 0
+        /*  0 */ LoadConst(0), // sum = 0
         /*  1 */ StoreVar(0),
-        /*  2 */ LoadConst(0),    // i = 0
+        /*  2 */ LoadConst(0), // i = 0
         /*  3 */ StoreVar(1),
-        /*  4 */ LoadVar(1),      // loop: push i
-        /*  5 */ LoadConst(n),    //        push n
-        /*  6 */ Lt,              //        i < n?
+        /*  4 */ LoadVar(1), // loop: push i
+        /*  5 */ LoadConst(n), //        push n
+        /*  6 */ Lt, //        i < n?
         /*  7 */ JumpIfFalse(17), //        if false -> end
-        /*  8 */ LoadVar(0),      // sum = sum + i
+        /*  8 */ LoadVar(0), // sum = sum + i
         /*  9 */ LoadVar(1),
         /* 10 */ Add,
         /* 11 */ StoreVar(0),
-        /* 12 */ LoadVar(1),      // i = i + 1
+        /* 12 */ LoadVar(1), // i = i + 1
         /* 13 */ LoadConst(1),
         /* 14 */ Add,
         /* 15 */ StoreVar(1),
-        /* 16 */ Jump(4),         // goto loop
-        /* 17 */ LoadVar(0),      // push sum as result
+        /* 16 */ Jump(4), // goto loop
+        /* 17 */ LoadVar(0), // push sum as result
         /* 18 */ Halt,
     ]
 }
@@ -85,24 +85,24 @@ pub fn sum_program(n: i64) -> Vec<ByteCode> {
 pub fn factorial_program(n: i64) -> Vec<ByteCode> {
     use ByteCode::*;
     vec![
-        /*  0 */ LoadConst(1),    // result = 1
+        /*  0 */ LoadConst(1), // result = 1
         /*  1 */ StoreVar(0),
-        /*  2 */ LoadConst(1),    // i = 1
+        /*  2 */ LoadConst(1), // i = 1
         /*  3 */ StoreVar(1),
-        /*  4 */ LoadVar(1),      // loop: push i
-        /*  5 */ LoadConst(n),    //        push n
-        /*  6 */ Le,              //        i <= n?
+        /*  4 */ LoadVar(1), // loop: push i
+        /*  5 */ LoadConst(n), //        push n
+        /*  6 */ Le, //        i <= n?
         /*  7 */ JumpIfFalse(17), //        if false -> end
-        /*  8 */ LoadVar(0),      // result = result * i
+        /*  8 */ LoadVar(0), // result = result * i
         /*  9 */ LoadVar(1),
         /* 10 */ Mul,
         /* 11 */ StoreVar(0),
-        /* 12 */ LoadVar(1),      // i = i + 1
+        /* 12 */ LoadVar(1), // i = i + 1
         /* 13 */ LoadConst(1),
         /* 14 */ Add,
         /* 15 */ StoreVar(1),
-        /* 16 */ Jump(4),         // goto loop
-        /* 17 */ LoadVar(0),      // push result
+        /* 16 */ Jump(4), // goto loop
+        /* 17 */ LoadVar(0), // push result
         /* 18 */ Halt,
     ]
 }

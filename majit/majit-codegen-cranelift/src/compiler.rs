@@ -2,7 +2,6 @@
 ///
 /// Translates majit IR traces into native code via Cranelift, then
 /// executes them as ordinary function pointers.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -160,7 +159,13 @@ impl CraneliftBackend {
         let mut fail_descrs: Vec<Arc<CraneliftFailDescr>> = Vec::new();
         let mut guard_infos: Vec<GuardInfo> = Vec::new();
         let mut max_output_slots: usize = 0;
-        collect_guards(ops, inputargs, &mut fail_descrs, &mut guard_infos, &mut max_output_slots);
+        collect_guards(
+            ops,
+            inputargs,
+            &mut fail_descrs,
+            &mut guard_infos,
+            &mut max_output_slots,
+        );
 
         let num_inputs = inputargs.len();
 
@@ -192,7 +197,9 @@ impl CraneliftBackend {
         for i in 0..num_inputs {
             let offset = (i as i32) * 8;
             let addr = builder.ins().iadd_imm(inputs_ptr, offset as i64);
-            let val = builder.ins().load(cl_types::I64, MemFlags::trusted(), addr, 0);
+            let val = builder
+                .ins()
+                .load(cl_types::I64, MemFlags::trusted(), addr, 0);
             builder.def_var(var(i as u32), val);
         }
 
@@ -306,16 +313,46 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), r);
                 }
 
-                OpCode::IntLt  => emit_icmp(&mut builder, &constants, IntCC::SignedLessThan, op, vi),
-                OpCode::IntLe  => emit_icmp(&mut builder, &constants, IntCC::SignedLessThanOrEqual, op, vi),
-                OpCode::IntEq  => emit_icmp(&mut builder, &constants, IntCC::Equal, op, vi),
-                OpCode::IntNe  => emit_icmp(&mut builder, &constants, IntCC::NotEqual, op, vi),
-                OpCode::IntGt  => emit_icmp(&mut builder, &constants, IntCC::SignedGreaterThan, op, vi),
-                OpCode::IntGe  => emit_icmp(&mut builder, &constants, IntCC::SignedGreaterThanOrEqual, op, vi),
-                OpCode::UintLt => emit_icmp(&mut builder, &constants, IntCC::UnsignedLessThan, op, vi),
-                OpCode::UintLe => emit_icmp(&mut builder, &constants, IntCC::UnsignedLessThanOrEqual, op, vi),
-                OpCode::UintGt => emit_icmp(&mut builder, &constants, IntCC::UnsignedGreaterThan, op, vi),
-                OpCode::UintGe => emit_icmp(&mut builder, &constants, IntCC::UnsignedGreaterThanOrEqual, op, vi),
+                OpCode::IntLt => emit_icmp(&mut builder, &constants, IntCC::SignedLessThan, op, vi),
+                OpCode::IntLe => emit_icmp(
+                    &mut builder,
+                    &constants,
+                    IntCC::SignedLessThanOrEqual,
+                    op,
+                    vi,
+                ),
+                OpCode::IntEq => emit_icmp(&mut builder, &constants, IntCC::Equal, op, vi),
+                OpCode::IntNe => emit_icmp(&mut builder, &constants, IntCC::NotEqual, op, vi),
+                OpCode::IntGt => {
+                    emit_icmp(&mut builder, &constants, IntCC::SignedGreaterThan, op, vi)
+                }
+                OpCode::IntGe => emit_icmp(
+                    &mut builder,
+                    &constants,
+                    IntCC::SignedGreaterThanOrEqual,
+                    op,
+                    vi,
+                ),
+                OpCode::UintLt => {
+                    emit_icmp(&mut builder, &constants, IntCC::UnsignedLessThan, op, vi)
+                }
+                OpCode::UintLe => emit_icmp(
+                    &mut builder,
+                    &constants,
+                    IntCC::UnsignedLessThanOrEqual,
+                    op,
+                    vi,
+                ),
+                OpCode::UintGt => {
+                    emit_icmp(&mut builder, &constants, IntCC::UnsignedGreaterThan, op, vi)
+                }
+                OpCode::UintGe => emit_icmp(
+                    &mut builder,
+                    &constants,
+                    IntCC::UnsignedGreaterThanOrEqual,
+                    op,
+                    vi,
+                ),
 
                 OpCode::SameAsI => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0));
@@ -334,9 +371,13 @@ impl CraneliftBackend {
                     let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
 
                     if op.opcode == OpCode::GuardTrue {
-                        builder.ins().brif(is_zero, exit_block, &[], cont_block, &[]);
+                        builder
+                            .ins()
+                            .brif(is_zero, exit_block, &[], cont_block, &[]);
                     } else {
-                        builder.ins().brif(is_zero, cont_block, &[], exit_block, &[]);
+                        builder
+                            .ins()
+                            .brif(is_zero, cont_block, &[], exit_block, &[]);
                     }
 
                     builder.switch_to_block(exit_block);
@@ -496,7 +537,10 @@ fn collect_guards(
             fail_arg_types,
         });
         fail_descrs.push(descr);
-        guard_infos.push(GuardInfo { fail_index, fail_arg_refs });
+        guard_infos.push(GuardInfo {
+            fail_index,
+            fail_arg_refs,
+        });
     }
 }
 
@@ -528,7 +572,9 @@ impl majit_codegen::Backend for CraneliftBackend {
         _ops: &[Op],
         _original_token: &LoopToken,
     ) -> Result<AsmInfo, BackendError> {
-        Err(BackendError::Unsupported("compile_bridge not yet implemented".into()))
+        Err(BackendError::Unsupported(
+            "compile_bridge not yet implemented".into(),
+        ))
     }
 
     fn execute_token(&self, token: &LoopToken, args: &[Value]) -> DeadFrame {
@@ -576,19 +622,36 @@ impl majit_codegen::Backend for CraneliftBackend {
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
-        frame.data.downcast_ref::<FrameData>().expect("FrameData expected").fail_descr.as_ref()
+        frame
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("FrameData expected")
+            .fail_descr
+            .as_ref()
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
-        frame.data.downcast_ref::<FrameData>().expect("FrameData expected").get_int(index)
+        frame
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("FrameData expected")
+            .get_int(index)
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
-        frame.data.downcast_ref::<FrameData>().expect("FrameData expected").get_float(index)
+        frame
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("FrameData expected")
+            .get_float(index)
     }
 
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> GcRef {
-        frame.data.downcast_ref::<FrameData>().expect("FrameData expected").get_ref(index)
+        frame
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("FrameData expected")
+            .get_ref(index)
     }
 
     fn invalidate_loop(&self, _token: &LoopToken) {
@@ -702,7 +765,11 @@ mod tests {
             mk_op(OpCode::IntAnd, &[OpRef(0), OpRef(1)], 2),
             mk_op(OpCode::IntOr, &[OpRef(0), OpRef(1)], 3),
             mk_op(OpCode::IntXor, &[OpRef(0), OpRef(1)], 4),
-            mk_op(OpCode::Finish, &[OpRef(2), OpRef(3), OpRef(4)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef(2), OpRef(3), OpRef(4)],
+                OpRef::NONE.0,
+            ),
         ];
 
         let mut token = LoopToken::new(4);
@@ -724,7 +791,11 @@ mod tests {
             mk_op(OpCode::IntLshift, &[OpRef(0), OpRef(1)], 2),
             mk_op(OpCode::IntRshift, &[OpRef(0), OpRef(1)], 3),
             mk_op(OpCode::UintRshift, &[OpRef(0), OpRef(1)], 4),
-            mk_op(OpCode::Finish, &[OpRef(2), OpRef(3), OpRef(4)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef(2), OpRef(3), OpRef(4)],
+                OpRef::NONE.0,
+            ),
         ];
 
         let mut token = LoopToken::new(5);
@@ -750,7 +821,11 @@ mod tests {
             mk_op(OpCode::IntNe, &[OpRef(0), OpRef(1)], 5),
             mk_op(OpCode::IntGt, &[OpRef(0), OpRef(1)], 6),
             mk_op(OpCode::IntGe, &[OpRef(0), OpRef(1)], 7),
-            mk_op(OpCode::Finish, &[OpRef(2), OpRef(3), OpRef(4), OpRef(5), OpRef(6), OpRef(7)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef(2), OpRef(3), OpRef(4), OpRef(5), OpRef(6), OpRef(7)],
+                OpRef::NONE.0,
+            ),
         ];
 
         let mut token = LoopToken::new(6);
@@ -847,7 +922,11 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
             mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
             mk_op(OpCode::IntMul, &[OpRef(0), OpRef(1)], 3),
-            mk_op(OpCode::Finish, &[OpRef(0), OpRef(1), OpRef(2), OpRef(3)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef(0), OpRef(1), OpRef(2), OpRef(3)],
+                OpRef::NONE.0,
+            ),
         ];
 
         let mut token = LoopToken::new(10);

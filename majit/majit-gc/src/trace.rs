@@ -9,7 +9,6 @@
 /// declares the offsets of its GC pointer fields relative to the object
 /// payload start. The collector reads/writes GcRef values at these offsets
 /// directly.
-
 use majit_ir::GcRef;
 
 /// Registry mapping type IDs to their type descriptors and object sizes.
@@ -208,7 +207,9 @@ mod tests {
         let obj_addr = data.as_mut_ptr() as usize;
 
         // Write length = 3.
-        unsafe { *(obj_addr as *mut usize) = 3; }
+        unsafe {
+            *(obj_addr as *mut usize) = 3;
+        }
 
         let mut visited = Vec::new();
         unsafe {

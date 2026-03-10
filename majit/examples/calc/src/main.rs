@@ -6,7 +6,6 @@
 /// - Comparison operators (<, <=, ==, !=, >, >=)
 /// - While loops via conditional/unconditional jumps
 /// - A simple bytecode format
-
 pub mod bytecode;
 pub mod interp;
 

@@ -5,7 +5,6 @@
 ///
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
-
 use std::sync::Arc;
 
 use crate::value::Type;
@@ -30,15 +29,29 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
 
     // ── Downcasting helpers ──
 
-    fn as_fail_descr(&self) -> Option<&dyn FailDescr> { None }
-    fn as_size_descr(&self) -> Option<&dyn SizeDescr> { None }
-    fn as_field_descr(&self) -> Option<&dyn FieldDescr> { None }
-    fn as_array_descr(&self) -> Option<&dyn ArrayDescr> { None }
-    fn as_call_descr(&self) -> Option<&dyn CallDescr> { None }
-    fn as_interior_field_descr(&self) -> Option<&dyn InteriorFieldDescr> { None }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        None
+    }
+    fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+        None
+    }
+    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+        None
+    }
+    fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
+        None
+    }
+    fn as_call_descr(&self) -> Option<&dyn CallDescr> {
+        None
+    }
+    fn as_interior_field_descr(&self) -> Option<&dyn InteriorFieldDescr> {
+        None
+    }
 
     /// Whether the field/array described is always pure (immutable).
-    fn is_always_pure(&self) -> bool { false }
+    fn is_always_pure(&self) -> bool {
+        false
+    }
 }
 
 /// Descriptor for guard failures — carries resume information.
@@ -66,13 +79,19 @@ pub trait SizeDescr: Descr {
     fn is_immutable(&self) -> bool;
 
     /// Whether this is an object (has vtable).
-    fn is_object(&self) -> bool { false }
+    fn is_object(&self) -> bool {
+        false
+    }
 
     /// Vtable address, if is_object().
-    fn vtable(&self) -> usize { 0 }
+    fn vtable(&self) -> usize {
+        0
+    }
 
     /// Field descriptors for fields containing GC pointers.
-    fn gc_field_descrs(&self) -> &[Arc<dyn FieldDescr>] { &[] }
+    fn gc_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
+        &[]
+    }
 }
 
 /// Descriptor for a field within a struct.
@@ -99,7 +118,9 @@ pub trait FieldDescr: Descr {
     }
 
     /// Whether reads from this field are signed.
-    fn is_field_signed(&self) -> bool { true }
+    fn is_field_signed(&self) -> bool {
+        true
+    }
 }
 
 /// Descriptor for an array type.
@@ -129,7 +150,9 @@ pub trait ArrayDescr: Descr {
     }
 
     /// Descriptor for the length field.
-    fn len_descr(&self) -> Option<&dyn FieldDescr> { None }
+    fn len_descr(&self) -> Option<&dyn FieldDescr> {
+        None
+    }
 }
 
 /// Descriptor for a field within an array element (interior pointer).
@@ -154,7 +177,9 @@ pub trait CallDescr: Descr {
     fn result_size(&self) -> usize;
 
     /// Whether the result is a signed integer.
-    fn is_result_signed(&self) -> bool { true }
+    fn is_result_signed(&self) -> bool {
+        true
+    }
 
     /// Side effect information.
     fn effect_info(&self) -> &EffectInfo;

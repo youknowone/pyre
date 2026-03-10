@@ -541,10 +541,7 @@ impl OpCode {
     pub fn is_call_pure(self) -> bool {
         matches!(
             self,
-            OpCode::CallPureI
-                | OpCode::CallPureR
-                | OpCode::CallPureF
-                | OpCode::CallPureN
+            OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN
         )
     }
 
@@ -818,112 +815,217 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
         };
     }
     // Guards
-    set!(GuardTrue, 1); set!(GuardFalse, 1);
-    set!(VecGuardTrue, 1); set!(VecGuardFalse, 1);
-    set!(GuardValue, 2); set!(GuardClass, 2);
-    set!(GuardNonnull, 1); set!(GuardIsnull, 1);
+    set!(GuardTrue, 1);
+    set!(GuardFalse, 1);
+    set!(VecGuardTrue, 1);
+    set!(VecGuardFalse, 1);
+    set!(GuardValue, 2);
+    set!(GuardClass, 2);
+    set!(GuardNonnull, 1);
+    set!(GuardIsnull, 1);
     set!(GuardNonnullClass, 2);
-    set!(GuardGcType, 2); set!(GuardIsObject, 1); set!(GuardSubclass, 2);
-    set!(GuardNoException, 0); set!(GuardException, 1);
-    set!(GuardNoOverflow, 0); set!(GuardOverflow, 0);
-    set!(GuardNotForced, 0); set!(GuardNotForced2, 0);
-    set!(GuardNotInvalidated, 0); set!(GuardFutureCondition, 0);
+    set!(GuardGcType, 2);
+    set!(GuardIsObject, 1);
+    set!(GuardSubclass, 2);
+    set!(GuardNoException, 0);
+    set!(GuardException, 1);
+    set!(GuardNoOverflow, 0);
+    set!(GuardOverflow, 0);
+    set!(GuardNotForced, 0);
+    set!(GuardNotForced2, 0);
+    set!(GuardNotInvalidated, 0);
+    set!(GuardFutureCondition, 0);
     set!(GuardAlwaysFails, 0);
     // Arithmetic (binary)
-    set!(IntAdd, 2); set!(IntSub, 2); set!(IntMul, 2); set!(UintMulHigh, 2);
-    set!(IntAnd, 2); set!(IntOr, 2); set!(IntXor, 2);
-    set!(IntRshift, 2); set!(IntLshift, 2); set!(UintRshift, 2);
+    set!(IntAdd, 2);
+    set!(IntSub, 2);
+    set!(IntMul, 2);
+    set!(UintMulHigh, 2);
+    set!(IntAnd, 2);
+    set!(IntOr, 2);
+    set!(IntXor, 2);
+    set!(IntRshift, 2);
+    set!(IntLshift, 2);
+    set!(UintRshift, 2);
     set!(IntSignext, 2);
-    set!(FloatAdd, 2); set!(FloatSub, 2); set!(FloatMul, 2); set!(FloatTrueDiv, 2);
-    set!(FloatNeg, 1); set!(FloatAbs, 1);
+    set!(FloatAdd, 2);
+    set!(FloatSub, 2);
+    set!(FloatMul, 2);
+    set!(FloatTrueDiv, 2);
+    set!(FloatNeg, 1);
+    set!(FloatAbs, 1);
     // Casts (unary)
-    set!(CastFloatToInt, 1); set!(CastIntToFloat, 1);
-    set!(CastFloatToSinglefloat, 1); set!(CastSinglefloatToFloat, 1);
-    set!(ConvertFloatBytesToLonglong, 1); set!(ConvertLonglongBytesToFloat, 1);
+    set!(CastFloatToInt, 1);
+    set!(CastIntToFloat, 1);
+    set!(CastFloatToSinglefloat, 1);
+    set!(CastSinglefloatToFloat, 1);
+    set!(ConvertFloatBytesToLonglong, 1);
+    set!(ConvertLonglongBytesToFloat, 1);
     // Vector arithmetic (binary/unary)
-    set!(VecIntAdd, 2); set!(VecIntSub, 2); set!(VecIntMul, 2);
-    set!(VecIntAnd, 2); set!(VecIntOr, 2); set!(VecIntXor, 2);
-    set!(VecFloatAdd, 2); set!(VecFloatSub, 2); set!(VecFloatMul, 2); set!(VecFloatTrueDiv, 2);
-    set!(VecFloatNeg, 1); set!(VecFloatAbs, 1);
-    set!(VecFloatEq, 2); set!(VecFloatNe, 2); set!(VecFloatXor, 2);
-    set!(VecIntIsTrue, 1); set!(VecIntNe, 2); set!(VecIntEq, 2);
+    set!(VecIntAdd, 2);
+    set!(VecIntSub, 2);
+    set!(VecIntMul, 2);
+    set!(VecIntAnd, 2);
+    set!(VecIntOr, 2);
+    set!(VecIntXor, 2);
+    set!(VecFloatAdd, 2);
+    set!(VecFloatSub, 2);
+    set!(VecFloatMul, 2);
+    set!(VecFloatTrueDiv, 2);
+    set!(VecFloatNeg, 1);
+    set!(VecFloatAbs, 1);
+    set!(VecFloatEq, 2);
+    set!(VecFloatNe, 2);
+    set!(VecFloatXor, 2);
+    set!(VecIntIsTrue, 1);
+    set!(VecIntNe, 2);
+    set!(VecIntEq, 2);
     set!(VecIntSignext, 2);
-    set!(VecCastFloatToSinglefloat, 1); set!(VecCastSinglefloatToFloat, 1);
-    set!(VecCastFloatToInt, 1); set!(VecCastIntToFloat, 1);
-    set!(VecI, 0); set!(VecF, 0);
-    set!(VecUnpackI, 3); set!(VecUnpackF, 3);
-    set!(VecPackI, 4); set!(VecPackF, 4);
-    set!(VecExpandI, 1); set!(VecExpandF, 1);
+    set!(VecCastFloatToSinglefloat, 1);
+    set!(VecCastSinglefloatToFloat, 1);
+    set!(VecCastFloatToInt, 1);
+    set!(VecCastIntToFloat, 1);
+    set!(VecI, 0);
+    set!(VecF, 0);
+    set!(VecUnpackI, 3);
+    set!(VecUnpackF, 3);
+    set!(VecPackI, 4);
+    set!(VecPackF, 4);
+    set!(VecExpandI, 1);
+    set!(VecExpandF, 1);
     // Comparisons
-    set!(IntLt, 2); set!(IntLe, 2); set!(IntEq, 2); set!(IntNe, 2);
-    set!(IntGt, 2); set!(IntGe, 2);
-    set!(UintLt, 2); set!(UintLe, 2); set!(UintGt, 2); set!(UintGe, 2);
-    set!(FloatLt, 2); set!(FloatLe, 2); set!(FloatEq, 2); set!(FloatNe, 2);
-    set!(FloatGt, 2); set!(FloatGe, 2);
+    set!(IntLt, 2);
+    set!(IntLe, 2);
+    set!(IntEq, 2);
+    set!(IntNe, 2);
+    set!(IntGt, 2);
+    set!(IntGe, 2);
+    set!(UintLt, 2);
+    set!(UintLe, 2);
+    set!(UintGt, 2);
+    set!(UintGe, 2);
+    set!(FloatLt, 2);
+    set!(FloatLe, 2);
+    set!(FloatEq, 2);
+    set!(FloatNe, 2);
+    set!(FloatGt, 2);
+    set!(FloatGe, 2);
     // Unary int
-    set!(IntIsZero, 1); set!(IntIsTrue, 1); set!(IntNeg, 1); set!(IntInvert, 1);
+    set!(IntIsZero, 1);
+    set!(IntIsTrue, 1);
+    set!(IntNeg, 1);
+    set!(IntInvert, 1);
     set!(IntForceGeZero, 1);
     // Identity/cast
-    set!(SameAsI, 1); set!(SameAsR, 1); set!(SameAsF, 1);
-    set!(CastPtrToInt, 1); set!(CastIntToPtr, 1);
+    set!(SameAsI, 1);
+    set!(SameAsR, 1);
+    set!(SameAsF, 1);
+    set!(CastPtrToInt, 1);
+    set!(CastIntToPtr, 1);
     // Pointer comparisons
-    set!(PtrEq, 2); set!(PtrNe, 2); set!(InstancePtrEq, 2); set!(InstancePtrNe, 2);
+    set!(PtrEq, 2);
+    set!(PtrNe, 2);
+    set!(InstancePtrEq, 2);
+    set!(InstancePtrNe, 2);
     set!(NurseryPtrIncrement, 2);
     // Array/string length
-    set!(ArraylenGc, 1); set!(Strlen, 1); set!(Strgetitem, 2);
-    set!(GetarrayitemGcPureI, 2); set!(GetarrayitemGcPureR, 2); set!(GetarrayitemGcPureF, 2);
-    set!(Unicodelen, 1); set!(Unicodegetitem, 2);
-    set!(LoadFromGcTable, 1); set!(LoadEffectiveAddress, 4);
+    set!(ArraylenGc, 1);
+    set!(Strlen, 1);
+    set!(Strgetitem, 2);
+    set!(GetarrayitemGcPureI, 2);
+    set!(GetarrayitemGcPureR, 2);
+    set!(GetarrayitemGcPureF, 2);
+    set!(Unicodelen, 1);
+    set!(Unicodegetitem, 2);
+    set!(LoadFromGcTable, 1);
+    set!(LoadEffectiveAddress, 4);
     // GC load
-    set!(GcLoadI, 3); set!(GcLoadR, 3); set!(GcLoadF, 3);
-    set!(GcLoadIndexedI, 5); set!(GcLoadIndexedR, 5); set!(GcLoadIndexedF, 5);
+    set!(GcLoadI, 3);
+    set!(GcLoadR, 3);
+    set!(GcLoadF, 3);
+    set!(GcLoadIndexedI, 5);
+    set!(GcLoadIndexedR, 5);
+    set!(GcLoadIndexedF, 5);
     // Array/field get
-    set!(GetarrayitemGcI, 2); set!(GetarrayitemGcR, 2); set!(GetarrayitemGcF, 2);
-    set!(GetarrayitemRawI, 2); set!(GetarrayitemRawF, 2);
-    set!(RawLoadI, 2); set!(RawLoadF, 2);
-    set!(VecLoadI, 4); set!(VecLoadF, 4);
-    set!(GetinteriorfieldGcI, 2); set!(GetinteriorfieldGcR, 2); set!(GetinteriorfieldGcF, 2);
-    set!(GetfieldGcI, 1); set!(GetfieldGcR, 1); set!(GetfieldGcF, 1);
-    set!(GetfieldRawI, 1); set!(GetfieldRawR, 1); set!(GetfieldRawF, 1);
-    set!(GetfieldGcPureI, 1); set!(GetfieldGcPureR, 1); set!(GetfieldGcPureF, 1);
+    set!(GetarrayitemGcI, 2);
+    set!(GetarrayitemGcR, 2);
+    set!(GetarrayitemGcF, 2);
+    set!(GetarrayitemRawI, 2);
+    set!(GetarrayitemRawF, 2);
+    set!(RawLoadI, 2);
+    set!(RawLoadF, 2);
+    set!(VecLoadI, 4);
+    set!(VecLoadF, 4);
+    set!(GetinteriorfieldGcI, 2);
+    set!(GetinteriorfieldGcR, 2);
+    set!(GetinteriorfieldGcF, 2);
+    set!(GetfieldGcI, 1);
+    set!(GetfieldGcR, 1);
+    set!(GetfieldGcF, 1);
+    set!(GetfieldRawI, 1);
+    set!(GetfieldRawR, 1);
+    set!(GetfieldRawF, 1);
+    set!(GetfieldGcPureI, 1);
+    set!(GetfieldGcPureR, 1);
+    set!(GetfieldGcPureF, 1);
     // Allocation
-    set!(New, 0); set!(NewWithVtable, 0);
-    set!(NewArray, 1); set!(NewArrayClear, 1);
-    set!(Newstr, 1); set!(Newunicode, 1);
+    set!(New, 0);
+    set!(NewWithVtable, 0);
+    set!(NewArray, 1);
+    set!(NewArrayClear, 1);
+    set!(Newstr, 1);
+    set!(Newunicode, 1);
     // Misc no-side-effect
     set!(ForceToken, 0);
-    set!(VirtualRefI, 2); set!(VirtualRefR, 2);
-    set!(Strhash, 1); set!(Unicodehash, 1);
+    set!(VirtualRefI, 2);
+    set!(VirtualRefR, 2);
+    set!(Strhash, 1);
+    set!(Unicodehash, 1);
     // GC store
-    set!(GcStore, 4); set!(GcStoreIndexed, 6);
+    set!(GcStore, 4);
+    set!(GcStoreIndexed, 6);
     set!(IncrementDebugCounter, 1);
     // Array/field set
-    set!(SetarrayitemGc, 3); set!(SetarrayitemRaw, 3);
-    set!(RawStore, 3); set!(VecStore, 5);
-    set!(SetinteriorfieldGc, 3); set!(SetinteriorfieldRaw, 3);
-    set!(SetfieldGc, 2); set!(ZeroArray, 5); set!(SetfieldRaw, 2);
-    set!(Strsetitem, 3); set!(Unicodesetitem, 3);
+    set!(SetarrayitemGc, 3);
+    set!(SetarrayitemRaw, 3);
+    set!(RawStore, 3);
+    set!(VecStore, 5);
+    set!(SetinteriorfieldGc, 3);
+    set!(SetinteriorfieldRaw, 3);
+    set!(SetfieldGc, 2);
+    set!(ZeroArray, 5);
+    set!(SetfieldRaw, 2);
+    set!(Strsetitem, 3);
+    set!(Unicodesetitem, 3);
     // GC write barriers
-    set!(CondCallGcWb, 1); set!(CondCallGcWbArray, 2);
+    set!(CondCallGcWb, 1);
+    set!(CondCallGcWbArray, 2);
     // Debug (variadic) - already None
     // Portal frames
-    set!(EnterPortalFrame, 2); set!(LeavePortalFrame, 1);
+    set!(EnterPortalFrame, 2);
+    set!(LeavePortalFrame, 1);
     // Misc
     set!(ForceSpill, 1);
     set!(VirtualRefFinish, 2);
-    set!(Copystrcontent, 5); set!(Copyunicodecontent, 5);
-    set!(QuasiimmutField, 1); set!(AssertNotNone, 1);
+    set!(Copystrcontent, 5);
+    set!(Copyunicodecontent, 5);
+    set!(QuasiimmutField, 1);
+    set!(AssertNotNone, 1);
     set!(RecordExactClass, 2);
-    set!(RecordExactValueR, 2); set!(RecordExactValueI, 2);
+    set!(RecordExactValueR, 2);
+    set!(RecordExactValueI, 2);
     set!(Keepalive, 1);
-    set!(SaveException, 0); set!(SaveExcClass, 0);
+    set!(SaveException, 0);
+    set!(SaveExcClass, 0);
     set!(RestoreException, 2);
     // Calls: all variadic (None) - default
     set!(CheckMemoryError, 1);
     set!(CallMallocNursery, 1);
     set!(CallMallocNurseryVarsizeFrame, 1);
     // Overflow
-    set!(IntAddOvf, 2); set!(IntSubOvf, 2); set!(IntMulOvf, 2);
+    set!(IntAddOvf, 2);
+    set!(IntSubOvf, 2);
+    set!(IntMulOvf, 2);
     t
 };
 
@@ -937,45 +1039,106 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         };
     }
     set!(
-        Jump, Finish, Label,
+        Jump,
+        Finish,
+        Label,
         // Guards
-        GuardTrue, GuardFalse, VecGuardTrue, VecGuardFalse,
-        GuardValue, GuardClass, GuardNonnull, GuardIsnull,
-        GuardNonnullClass, GuardGcType, GuardIsObject, GuardSubclass,
-        GuardNoException, GuardException,
-        GuardNoOverflow, GuardOverflow,
-        GuardNotForced, GuardNotForced2, GuardNotInvalidated,
-        GuardFutureCondition, GuardAlwaysFails,
+        GuardTrue,
+        GuardFalse,
+        VecGuardTrue,
+        VecGuardFalse,
+        GuardValue,
+        GuardClass,
+        GuardNonnull,
+        GuardIsnull,
+        GuardNonnullClass,
+        GuardGcType,
+        GuardIsObject,
+        GuardSubclass,
+        GuardNoException,
+        GuardException,
+        GuardNoOverflow,
+        GuardOverflow,
+        GuardNotForced,
+        GuardNotForced2,
+        GuardNotInvalidated,
+        GuardFutureCondition,
+        GuardAlwaysFails,
         // Array/field access
         ArraylenGc,
-        GetarrayitemGcPureI, GetarrayitemGcPureR, GetarrayitemGcPureF,
-        GetarrayitemGcI, GetarrayitemGcR, GetarrayitemGcF,
-        GetarrayitemRawI, GetarrayitemRawF,
-        RawLoadI, RawLoadF,
-        VecLoadI, VecLoadF,
-        GetinteriorfieldGcI, GetinteriorfieldGcR, GetinteriorfieldGcF,
-        GetfieldGcI, GetfieldGcR, GetfieldGcF,
-        GetfieldRawI, GetfieldRawR, GetfieldRawF,
-        GetfieldGcPureI, GetfieldGcPureR, GetfieldGcPureF,
+        GetarrayitemGcPureI,
+        GetarrayitemGcPureR,
+        GetarrayitemGcPureF,
+        GetarrayitemGcI,
+        GetarrayitemGcR,
+        GetarrayitemGcF,
+        GetarrayitemRawI,
+        GetarrayitemRawF,
+        RawLoadI,
+        RawLoadF,
+        VecLoadI,
+        VecLoadF,
+        GetinteriorfieldGcI,
+        GetinteriorfieldGcR,
+        GetinteriorfieldGcF,
+        GetfieldGcI,
+        GetfieldGcR,
+        GetfieldGcF,
+        GetfieldRawI,
+        GetfieldRawR,
+        GetfieldRawF,
+        GetfieldGcPureI,
+        GetfieldGcPureR,
+        GetfieldGcPureF,
         // Allocation
-        New, NewWithVtable, NewArray, NewArrayClear,
+        New,
+        NewWithVtable,
+        NewArray,
+        NewArrayClear,
         // Stores
-        GcStore, GcStoreIndexed,
-        SetarrayitemGc, SetarrayitemRaw, RawStore, VecStore,
-        SetinteriorfieldGc, SetinteriorfieldRaw,
-        SetfieldGc, ZeroArray, SetfieldRaw,
+        GcStore,
+        GcStoreIndexed,
+        SetarrayitemGc,
+        SetarrayitemRaw,
+        RawStore,
+        VecStore,
+        SetinteriorfieldGc,
+        SetinteriorfieldRaw,
+        SetfieldGc,
+        ZeroArray,
+        SetfieldRaw,
         // GC barriers
-        CondCallGcWb, CondCallGcWbArray,
+        CondCallGcWb,
+        CondCallGcWbArray,
         // Misc
         QuasiimmutField,
         // Calls
-        CallI, CallR, CallF, CallN,
-        CondCallN, CondCallValueI, CondCallValueR,
-        CallAssemblerI, CallAssemblerR, CallAssemblerF, CallAssemblerN,
-        CallMayForceI, CallMayForceR, CallMayForceF, CallMayForceN,
-        CallLoopinvariantI, CallLoopinvariantR, CallLoopinvariantF, CallLoopinvariantN,
-        CallReleaseGilI, CallReleaseGilF, CallReleaseGilN,
-        CallPureI, CallPureR, CallPureF, CallPureN,
+        CallI,
+        CallR,
+        CallF,
+        CallN,
+        CondCallN,
+        CondCallValueI,
+        CondCallValueR,
+        CallAssemblerI,
+        CallAssemblerR,
+        CallAssemblerF,
+        CallAssemblerN,
+        CallMayForceI,
+        CallMayForceR,
+        CallMayForceF,
+        CallMayForceN,
+        CallLoopinvariantI,
+        CallLoopinvariantR,
+        CallLoopinvariantF,
+        CallLoopinvariantN,
+        CallReleaseGilI,
+        CallReleaseGilF,
+        CallReleaseGilN,
+        CallPureI,
+        CallPureR,
+        CallPureF,
+        CallPureN,
         CallMallocNurseryVarsize,
         RecordKnownResult
     );
@@ -992,12 +1155,33 @@ static OPBOOL: [bool; OPCODE_COUNT] = {
         };
     }
     set!(
-        IntLt, IntLe, IntEq, IntNe, IntGt, IntGe,
-        UintLt, UintLe, UintGt, UintGe,
-        FloatLt, FloatLe, FloatEq, FloatNe, FloatGt, FloatGe,
-        IntIsZero, IntIsTrue,
-        PtrEq, PtrNe, InstancePtrEq, InstancePtrNe,
-        VecFloatEq, VecFloatNe, VecIntIsTrue, VecIntNe, VecIntEq
+        IntLt,
+        IntLe,
+        IntEq,
+        IntNe,
+        IntGt,
+        IntGe,
+        UintLt,
+        UintLe,
+        UintGt,
+        UintGe,
+        FloatLt,
+        FloatLe,
+        FloatEq,
+        FloatNe,
+        FloatGt,
+        FloatGe,
+        IntIsZero,
+        IntIsTrue,
+        PtrEq,
+        PtrNe,
+        InstancePtrEq,
+        InstancePtrNe,
+        VecFloatEq,
+        VecFloatNe,
+        VecIntIsTrue,
+        VecIntNe,
+        VecIntEq
     );
     t
 };
@@ -1024,65 +1208,164 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
     }
 
     int!(
-        IntAdd, IntSub, IntMul, UintMulHigh,
-        IntAnd, IntOr, IntXor, IntRshift, IntLshift, UintRshift, IntSignext,
-        CastFloatToInt, CastFloatToSinglefloat,
+        IntAdd,
+        IntSub,
+        IntMul,
+        UintMulHigh,
+        IntAnd,
+        IntOr,
+        IntXor,
+        IntRshift,
+        IntLshift,
+        UintRshift,
+        IntSignext,
+        CastFloatToInt,
+        CastFloatToSinglefloat,
         ConvertFloatBytesToLonglong,
         // Vector int
-        VecIntAdd, VecIntSub, VecIntMul, VecIntAnd, VecIntOr, VecIntXor,
-        VecFloatEq, VecFloatNe, VecIntIsTrue, VecIntNe, VecIntEq,
-        VecIntSignext, VecCastFloatToSinglefloat, VecCastFloatToInt,
+        VecIntAdd,
+        VecIntSub,
+        VecIntMul,
+        VecIntAnd,
+        VecIntOr,
+        VecIntXor,
+        VecFloatEq,
+        VecFloatNe,
+        VecIntIsTrue,
+        VecIntNe,
+        VecIntEq,
+        VecIntSignext,
+        VecCastFloatToSinglefloat,
+        VecCastFloatToInt,
         // Comparisons (all return int)
-        IntLt, IntLe, IntEq, IntNe, IntGt, IntGe,
-        UintLt, UintLe, UintGt, UintGe,
-        FloatLt, FloatLe, FloatEq, FloatNe, FloatGt, FloatGe,
-        IntIsZero, IntIsTrue, IntNeg, IntInvert, IntForceGeZero,
-        SameAsI, CastPtrToInt,
-        PtrEq, PtrNe, InstancePtrEq, InstancePtrNe,
-        ArraylenGc, Strlen, Strgetitem,
-        GetarrayitemGcPureI, Unicodelen, Unicodegetitem,
+        IntLt,
+        IntLe,
+        IntEq,
+        IntNe,
+        IntGt,
+        IntGe,
+        UintLt,
+        UintLe,
+        UintGt,
+        UintGe,
+        FloatLt,
+        FloatLe,
+        FloatEq,
+        FloatNe,
+        FloatGt,
+        FloatGe,
+        IntIsZero,
+        IntIsTrue,
+        IntNeg,
+        IntInvert,
+        IntForceGeZero,
+        SameAsI,
+        CastPtrToInt,
+        PtrEq,
+        PtrNe,
+        InstancePtrEq,
+        InstancePtrNe,
+        ArraylenGc,
+        Strlen,
+        Strgetitem,
+        GetarrayitemGcPureI,
+        Unicodelen,
+        Unicodegetitem,
         LoadEffectiveAddress,
-        GcLoadI, GcLoadIndexedI,
-        GetarrayitemGcI, GetarrayitemRawI, RawLoadI,
-        GetinteriorfieldGcI, GetfieldGcI, GetfieldRawI, GetfieldGcPureI,
-        Strhash, Unicodehash,
+        GcLoadI,
+        GcLoadIndexedI,
+        GetarrayitemGcI,
+        GetarrayitemRawI,
+        RawLoadI,
+        GetinteriorfieldGcI,
+        GetfieldGcI,
+        GetfieldRawI,
+        GetfieldGcPureI,
+        Strhash,
+        Unicodehash,
         CondCallValueI,
-        CallI, CallPureI, CallMayForceI, CallAssemblerI,
-        CallLoopinvariantI, CallReleaseGilI,
+        CallI,
+        CallPureI,
+        CallMayForceI,
+        CallAssemblerI,
+        CallLoopinvariantI,
+        CallReleaseGilI,
         SaveExcClass,
         RecordExactValueI,
-        IntAddOvf, IntSubOvf, IntMulOvf
+        IntAddOvf,
+        IntSubOvf,
+        IntMulOvf
     );
 
     float!(
-        FloatAdd, FloatSub, FloatMul, FloatTrueDiv, FloatNeg, FloatAbs,
-        CastIntToFloat, CastSinglefloatToFloat, ConvertLonglongBytesToFloat,
-        VecFloatAdd, VecFloatSub, VecFloatMul, VecFloatTrueDiv,
-        VecFloatNeg, VecFloatAbs, VecFloatXor,
-        VecCastSinglefloatToFloat, VecCastIntToFloat,
+        FloatAdd,
+        FloatSub,
+        FloatMul,
+        FloatTrueDiv,
+        FloatNeg,
+        FloatAbs,
+        CastIntToFloat,
+        CastSinglefloatToFloat,
+        ConvertLonglongBytesToFloat,
+        VecFloatAdd,
+        VecFloatSub,
+        VecFloatMul,
+        VecFloatTrueDiv,
+        VecFloatNeg,
+        VecFloatAbs,
+        VecFloatXor,
+        VecCastSinglefloatToFloat,
+        VecCastIntToFloat,
         SameAsF,
-        GetarrayitemGcPureF, GcLoadF, GcLoadIndexedF,
-        GetarrayitemGcF, GetarrayitemRawF, RawLoadF,
-        GetinteriorfieldGcF, GetfieldGcF, GetfieldRawF, GetfieldGcPureF,
-        CallF, CallPureF, CallMayForceF, CallAssemblerF,
-        CallLoopinvariantF, CallReleaseGilF
+        GetarrayitemGcPureF,
+        GcLoadF,
+        GcLoadIndexedF,
+        GetarrayitemGcF,
+        GetarrayitemRawF,
+        RawLoadF,
+        GetinteriorfieldGcF,
+        GetfieldGcF,
+        GetfieldRawF,
+        GetfieldGcPureF,
+        CallF,
+        CallPureF,
+        CallMayForceF,
+        CallAssemblerF,
+        CallLoopinvariantF,
+        CallReleaseGilF
     );
 
     ref_!(
-        CastIntToPtr, SameAsR, NurseryPtrIncrement,
+        CastIntToPtr,
+        SameAsR,
+        NurseryPtrIncrement,
         GetarrayitemGcPureR,
         LoadFromGcTable,
-        GcLoadR, GcLoadIndexedR,
+        GcLoadR,
+        GcLoadIndexedR,
         GetarrayitemGcR,
-        GetinteriorfieldGcR, GetfieldGcR, GetfieldRawR, GetfieldGcPureR,
-        New, NewWithVtable, NewArray, NewArrayClear, Newstr, Newunicode,
+        GetinteriorfieldGcR,
+        GetfieldGcR,
+        GetfieldRawR,
+        GetfieldGcPureR,
+        New,
+        NewWithVtable,
+        NewArray,
+        NewArrayClear,
+        Newstr,
+        Newunicode,
         ForceToken,
         VirtualRefR,
         GuardException,
         CondCallValueR,
-        CallR, CallPureR, CallMayForceR, CallAssemblerR,
+        CallR,
+        CallPureR,
+        CallMayForceR,
+        CallAssemblerR,
         CallLoopinvariantR,
-        CallMallocNursery, CallMallocNurseryVarsize, CallMallocNurseryVarsizeFrame,
+        CallMallocNursery,
+        CallMallocNurseryVarsize,
+        CallMallocNurseryVarsizeFrame,
         SaveException
     );
 
@@ -1109,71 +1392,234 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         };
     }
     name!(
-        Jump, Finish, Label,
-        GuardTrue, GuardFalse, VecGuardTrue, VecGuardFalse,
-        GuardValue, GuardClass, GuardNonnull, GuardIsnull,
-        GuardNonnullClass, GuardGcType, GuardIsObject, GuardSubclass,
-        GuardNoException, GuardException, GuardNoOverflow, GuardOverflow,
-        GuardNotForced, GuardNotForced2, GuardNotInvalidated,
-        GuardFutureCondition, GuardAlwaysFails,
-        IntAdd, IntSub, IntMul, UintMulHigh,
-        IntAnd, IntOr, IntXor, IntRshift, IntLshift, UintRshift, IntSignext,
-        FloatAdd, FloatSub, FloatMul, FloatTrueDiv, FloatNeg, FloatAbs,
-        CastFloatToInt, CastIntToFloat,
-        CastFloatToSinglefloat, CastSinglefloatToFloat,
-        ConvertFloatBytesToLonglong, ConvertLonglongBytesToFloat,
-        VecIntAdd, VecIntSub, VecIntMul, VecIntAnd, VecIntOr, VecIntXor,
-        VecFloatAdd, VecFloatSub, VecFloatMul, VecFloatTrueDiv,
-        VecFloatNeg, VecFloatAbs,
-        VecFloatEq, VecFloatNe, VecFloatXor,
-        VecIntIsTrue, VecIntNe, VecIntEq,
+        Jump,
+        Finish,
+        Label,
+        GuardTrue,
+        GuardFalse,
+        VecGuardTrue,
+        VecGuardFalse,
+        GuardValue,
+        GuardClass,
+        GuardNonnull,
+        GuardIsnull,
+        GuardNonnullClass,
+        GuardGcType,
+        GuardIsObject,
+        GuardSubclass,
+        GuardNoException,
+        GuardException,
+        GuardNoOverflow,
+        GuardOverflow,
+        GuardNotForced,
+        GuardNotForced2,
+        GuardNotInvalidated,
+        GuardFutureCondition,
+        GuardAlwaysFails,
+        IntAdd,
+        IntSub,
+        IntMul,
+        UintMulHigh,
+        IntAnd,
+        IntOr,
+        IntXor,
+        IntRshift,
+        IntLshift,
+        UintRshift,
+        IntSignext,
+        FloatAdd,
+        FloatSub,
+        FloatMul,
+        FloatTrueDiv,
+        FloatNeg,
+        FloatAbs,
+        CastFloatToInt,
+        CastIntToFloat,
+        CastFloatToSinglefloat,
+        CastSinglefloatToFloat,
+        ConvertFloatBytesToLonglong,
+        ConvertLonglongBytesToFloat,
+        VecIntAdd,
+        VecIntSub,
+        VecIntMul,
+        VecIntAnd,
+        VecIntOr,
+        VecIntXor,
+        VecFloatAdd,
+        VecFloatSub,
+        VecFloatMul,
+        VecFloatTrueDiv,
+        VecFloatNeg,
+        VecFloatAbs,
+        VecFloatEq,
+        VecFloatNe,
+        VecFloatXor,
+        VecIntIsTrue,
+        VecIntNe,
+        VecIntEq,
         VecIntSignext,
-        VecCastFloatToSinglefloat, VecCastSinglefloatToFloat,
-        VecCastFloatToInt, VecCastIntToFloat,
-        VecI, VecF, VecUnpackI, VecUnpackF, VecPackI, VecPackF, VecExpandI, VecExpandF,
-        IntLt, IntLe, IntEq, IntNe, IntGt, IntGe,
-        UintLt, UintLe, UintGt, UintGe,
-        FloatLt, FloatLe, FloatEq, FloatNe, FloatGt, FloatGe,
-        IntIsZero, IntIsTrue, IntNeg, IntInvert, IntForceGeZero,
-        SameAsI, SameAsR, SameAsF, CastPtrToInt, CastIntToPtr,
-        PtrEq, PtrNe, InstancePtrEq, InstancePtrNe, NurseryPtrIncrement,
-        ArraylenGc, Strlen, Strgetitem,
-        GetarrayitemGcPureI, GetarrayitemGcPureR, GetarrayitemGcPureF,
-        Unicodelen, Unicodegetitem,
-        LoadFromGcTable, LoadEffectiveAddress,
-        GcLoadI, GcLoadR, GcLoadF,
-        GcLoadIndexedI, GcLoadIndexedR, GcLoadIndexedF,
-        GetarrayitemGcI, GetarrayitemGcR, GetarrayitemGcF,
-        GetarrayitemRawI, GetarrayitemRawF,
-        RawLoadI, RawLoadF, VecLoadI, VecLoadF,
-        GetinteriorfieldGcI, GetinteriorfieldGcR, GetinteriorfieldGcF,
-        GetfieldGcI, GetfieldGcR, GetfieldGcF,
-        GetfieldRawI, GetfieldRawR, GetfieldRawF,
-        GetfieldGcPureI, GetfieldGcPureR, GetfieldGcPureF,
-        New, NewWithVtable, NewArray, NewArrayClear, Newstr, Newunicode,
-        ForceToken, VirtualRefI, VirtualRefR, Strhash, Unicodehash,
-        GcStore, GcStoreIndexed, IncrementDebugCounter,
-        SetarrayitemGc, SetarrayitemRaw, RawStore, VecStore,
-        SetinteriorfieldGc, SetinteriorfieldRaw,
-        SetfieldGc, ZeroArray, SetfieldRaw, Strsetitem, Unicodesetitem,
-        CondCallGcWb, CondCallGcWbArray,
-        DebugMergePoint, EnterPortalFrame, LeavePortalFrame, JitDebug,
-        EscapeI, EscapeR, EscapeF, EscapeN, ForceSpill,
-        VirtualRefFinish, Copystrcontent, Copyunicodecontent,
-        QuasiimmutField, AssertNotNone, RecordExactClass,
-        RecordExactValueR, RecordExactValueI, Keepalive,
-        SaveException, SaveExcClass, RestoreException,
-        CallI, CallR, CallF, CallN,
-        CondCallN, CondCallValueI, CondCallValueR,
-        CallAssemblerI, CallAssemblerR, CallAssemblerF, CallAssemblerN,
-        CallMayForceI, CallMayForceR, CallMayForceF, CallMayForceN,
-        CallLoopinvariantI, CallLoopinvariantR, CallLoopinvariantF, CallLoopinvariantN,
-        CallReleaseGilI, CallReleaseGilF, CallReleaseGilN,
-        CallPureI, CallPureR, CallPureF, CallPureN,
+        VecCastFloatToSinglefloat,
+        VecCastSinglefloatToFloat,
+        VecCastFloatToInt,
+        VecCastIntToFloat,
+        VecI,
+        VecF,
+        VecUnpackI,
+        VecUnpackF,
+        VecPackI,
+        VecPackF,
+        VecExpandI,
+        VecExpandF,
+        IntLt,
+        IntLe,
+        IntEq,
+        IntNe,
+        IntGt,
+        IntGe,
+        UintLt,
+        UintLe,
+        UintGt,
+        UintGe,
+        FloatLt,
+        FloatLe,
+        FloatEq,
+        FloatNe,
+        FloatGt,
+        FloatGe,
+        IntIsZero,
+        IntIsTrue,
+        IntNeg,
+        IntInvert,
+        IntForceGeZero,
+        SameAsI,
+        SameAsR,
+        SameAsF,
+        CastPtrToInt,
+        CastIntToPtr,
+        PtrEq,
+        PtrNe,
+        InstancePtrEq,
+        InstancePtrNe,
+        NurseryPtrIncrement,
+        ArraylenGc,
+        Strlen,
+        Strgetitem,
+        GetarrayitemGcPureI,
+        GetarrayitemGcPureR,
+        GetarrayitemGcPureF,
+        Unicodelen,
+        Unicodegetitem,
+        LoadFromGcTable,
+        LoadEffectiveAddress,
+        GcLoadI,
+        GcLoadR,
+        GcLoadF,
+        GcLoadIndexedI,
+        GcLoadIndexedR,
+        GcLoadIndexedF,
+        GetarrayitemGcI,
+        GetarrayitemGcR,
+        GetarrayitemGcF,
+        GetarrayitemRawI,
+        GetarrayitemRawF,
+        RawLoadI,
+        RawLoadF,
+        VecLoadI,
+        VecLoadF,
+        GetinteriorfieldGcI,
+        GetinteriorfieldGcR,
+        GetinteriorfieldGcF,
+        GetfieldGcI,
+        GetfieldGcR,
+        GetfieldGcF,
+        GetfieldRawI,
+        GetfieldRawR,
+        GetfieldRawF,
+        GetfieldGcPureI,
+        GetfieldGcPureR,
+        GetfieldGcPureF,
+        New,
+        NewWithVtable,
+        NewArray,
+        NewArrayClear,
+        Newstr,
+        Newunicode,
+        ForceToken,
+        VirtualRefI,
+        VirtualRefR,
+        Strhash,
+        Unicodehash,
+        GcStore,
+        GcStoreIndexed,
+        IncrementDebugCounter,
+        SetarrayitemGc,
+        SetarrayitemRaw,
+        RawStore,
+        VecStore,
+        SetinteriorfieldGc,
+        SetinteriorfieldRaw,
+        SetfieldGc,
+        ZeroArray,
+        SetfieldRaw,
+        Strsetitem,
+        Unicodesetitem,
+        CondCallGcWb,
+        CondCallGcWbArray,
+        DebugMergePoint,
+        EnterPortalFrame,
+        LeavePortalFrame,
+        JitDebug,
+        EscapeI,
+        EscapeR,
+        EscapeF,
+        EscapeN,
+        ForceSpill,
+        VirtualRefFinish,
+        Copystrcontent,
+        Copyunicodecontent,
+        QuasiimmutField,
+        AssertNotNone,
+        RecordExactClass,
+        RecordExactValueR,
+        RecordExactValueI,
+        Keepalive,
+        SaveException,
+        SaveExcClass,
+        RestoreException,
+        CallI,
+        CallR,
+        CallF,
+        CallN,
+        CondCallN,
+        CondCallValueI,
+        CondCallValueR,
+        CallAssemblerI,
+        CallAssemblerR,
+        CallAssemblerF,
+        CallAssemblerN,
+        CallMayForceI,
+        CallMayForceR,
+        CallMayForceF,
+        CallMayForceN,
+        CallLoopinvariantI,
+        CallLoopinvariantR,
+        CallLoopinvariantF,
+        CallLoopinvariantN,
+        CallReleaseGilI,
+        CallReleaseGilF,
+        CallReleaseGilN,
+        CallPureI,
+        CallPureR,
+        CallPureF,
+        CallPureN,
         CheckMemoryError,
-        CallMallocNursery, CallMallocNurseryVarsize, CallMallocNurseryVarsizeFrame,
+        CallMallocNursery,
+        CallMallocNurseryVarsize,
+        CallMallocNurseryVarsizeFrame,
         RecordKnownResult,
-        IntAddOvf, IntSubOvf, IntMulOvf
+        IntAddOvf,
+        IntSubOvf,
+        IntMulOvf
     );
     t
 };

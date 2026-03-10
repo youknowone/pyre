@@ -6,7 +6,6 @@
 ///
 /// This is a simplified version of rpython/jit/metainterp/heapcache.py.
 /// Phase 0 omits versioning, array caches, and escape tracking.
-
 use std::collections::{HashMap, HashSet};
 
 use majit_ir::{GcRef, OpCode, OpRef};
@@ -92,9 +91,8 @@ impl HeapCache {
     /// Invalidate caches for escaped objects only.
     /// Unescaped objects cannot be affected by external calls.
     pub fn invalidate_caches_for_escaped(&mut self) {
-        self.field_cache.retain(|&(obj, _), _| {
-            self.is_unescaped.contains(&obj)
-        });
+        self.field_cache
+            .retain(|&(obj, _), _| self.is_unescaped.contains(&obj));
     }
 
     /// Record a new object allocation. The object is marked as unescaped

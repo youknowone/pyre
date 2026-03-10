@@ -1,5 +1,4 @@
 /// The bytecode interpreter for the calc language.
-
 use crate::bytecode::ByteCode;
 
 pub struct CalcInterp {

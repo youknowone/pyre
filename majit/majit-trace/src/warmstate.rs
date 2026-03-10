@@ -5,7 +5,6 @@
 /// complete, we compile it and cache the result.
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseJitCell
-
 use std::collections::HashMap;
 
 use majit_codegen::LoopToken;
@@ -129,7 +128,10 @@ impl WarmState {
 
         // Threshold reached: start tracing
         self.counter.reset(green_key_hash);
-        let cell = self.cells.entry(green_key_hash).or_insert_with(JitCell::new);
+        let cell = self
+            .cells
+            .entry(green_key_hash)
+            .or_insert_with(JitCell::new);
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
 
         HotResult::StartTracing(TraceRecorder::new())
@@ -157,7 +159,10 @@ impl WarmState {
 
     /// Install a compiled loop token for a green key.
     pub fn install_compiled(&mut self, green_key_hash: u64, token: LoopToken) {
-        let cell = self.cells.entry(green_key_hash).or_insert_with(JitCell::new);
+        let cell = self
+            .cells
+            .entry(green_key_hash)
+            .or_insert_with(JitCell::new);
         cell.flags &= !jc_flags::TRACING;
         cell.loop_token = Some(token);
     }

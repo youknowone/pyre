@@ -7,7 +7,6 @@
 /// 4. Stack maps for compiled code
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
-
 use majit_ir::{GcRef, Op};
 
 pub mod collector;
@@ -109,7 +108,9 @@ pub struct GcMap {
 
 impl GcMap {
     pub fn new() -> Self {
-        GcMap { ref_bitmap: Vec::new() }
+        GcMap {
+            ref_bitmap: Vec::new(),
+        }
     }
 
     pub fn set_ref(&mut self, slot: usize) {

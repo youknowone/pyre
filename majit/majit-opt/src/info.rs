@@ -1,11 +1,10 @@
+use crate::intutils::IntBound;
 /// Abstract information attached to operations during optimization.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-
 use majit_ir::{DescrRef, GcRef, OpRef, Value};
-use crate::intutils::IntBound;
 
 /// Information about an operation's result, attached during optimization.
 #[derive(Clone, Debug)]

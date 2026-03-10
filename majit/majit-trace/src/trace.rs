@@ -5,7 +5,6 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
-
 use majit_ir::{InputArg, Op, OpCode, OpRef};
 
 /// A completed trace ready for optimization and compilation.
@@ -40,7 +39,9 @@ impl Trace {
 
     /// Whether this trace ends with FINISH.
     pub fn is_finished(&self) -> bool {
-        self.ops.last().is_some_and(|op| op.opcode == OpCode::Finish)
+        self.ops
+            .last()
+            .is_some_and(|op| op.opcode == OpCode::Finish)
     }
 
     /// Get a reference to the operation at the given OpRef index.

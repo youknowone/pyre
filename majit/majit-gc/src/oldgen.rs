@@ -4,7 +4,6 @@
 /// this is a simple allocation scheme using the system allocator. Each
 /// allocation is tracked in a list so we can iterate all old-gen objects
 /// during major (mark-sweep) collection.
-
 use std::alloc::{self, Layout};
 use std::ptr;
 
