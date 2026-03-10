@@ -8,9 +8,11 @@
 /// - A simple bytecode format
 pub mod bytecode;
 pub mod interp;
+pub mod jit_interp;
 
 use bytecode::*;
 use interp::CalcInterp;
+use jit_interp::JitCalcInterp;
 use std::time::Instant;
 
 fn main() {
@@ -34,18 +36,44 @@ fn main() {
         assert_eq!(result, 2_432_902_008_176_640_000);
     }
 
-    // Benchmark: sum(0..10_000_000)
-    println!("\n--- Benchmark: sum(0..10_000_000) ---");
+    // Benchmark: sum(0..10_000_000) — interpreter only
+    println!("\n--- Benchmark: sum(0..10_000_000) [interpreter] ---");
+    let interp_result;
     {
         let prog = sum_program(10_000_000);
         let mut interp = CalcInterp::new();
 
         let start = Instant::now();
-        let result = interp.run(&prog);
+        interp_result = interp.run(&prog);
+        let elapsed = start.elapsed();
+
+        println!("result = {interp_result}");
+        println!("time   = {elapsed:?}");
+        assert_eq!(interp_result, 49_999_995_000_000);
+    }
+
+    // Benchmark: sum(0..10_000_000) — JIT
+    println!("\n--- Benchmark: sum(0..10_000_000) [JIT] ---");
+    {
+        let prog = sum_program(10_000_000);
+        let mut jit = JitCalcInterp::new();
+
+        let start = Instant::now();
+        let result = jit.run(&prog);
         let elapsed = start.elapsed();
 
         println!("result = {result}");
         println!("time   = {elapsed:?}");
-        assert_eq!(result, 49_999_995_000_000);
+        assert_eq!(result, interp_result);
+    }
+
+    // JIT Demo: factorial(20)
+    println!("\n--- JIT: factorial(20) ---");
+    {
+        let prog = factorial_program(20);
+        let mut jit = JitCalcInterp::new();
+        let result = jit.run(&prog);
+        println!("factorial(20) = {result}");
+        assert_eq!(result, 2_432_902_008_176_640_000);
     }
 }
