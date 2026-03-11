@@ -295,6 +295,22 @@ impl OptimizationPass for OptHeap {
                 }
             }
 
+            // ── Quasi-immutable field: treat as read + guard_not_invalidated ──
+            // The QUASIIMMUT_FIELD op marks a field that rarely changes.
+            // The optimizer replaces the field read with the cached value and
+            // emits GUARD_NOT_INVALIDATED to ensure validity.
+            OpCode::QuasiimmutField => {
+                if !self.seen_guard_not_invalidated {
+                    self.seen_guard_not_invalidated = true;
+                    // Emit a GUARD_NOT_INVALIDATED for the quasi-immutable promise.
+                    let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
+                    self.force_all_lazy(ctx);
+                    ctx.emit(guard_op);
+                }
+                // The QUASIIMMUT_FIELD itself is a no-op marker.
+                PassResult::Remove
+            }
+
             // ── SETFIELD_RAW / SETARRAYITEM_RAW: no effect on GC caches ──
             OpCode::SetfieldRaw | OpCode::SetarrayitemRaw => PassResult::Emit(op.clone()),
 
