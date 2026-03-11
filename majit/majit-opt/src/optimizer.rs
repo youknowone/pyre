@@ -80,6 +80,11 @@ impl Optimizer {
         for arg in &mut resolved_op.args {
             *arg = ctx.get_replacement(*arg);
         }
+        if let Some(ref mut fa) = resolved_op.fail_args {
+            for arg in fa.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+        }
 
         let mut current_op = resolved_op;
 

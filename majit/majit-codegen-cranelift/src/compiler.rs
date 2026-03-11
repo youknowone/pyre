@@ -1429,6 +1429,10 @@ fn collect_guards(
             let refs: Vec<OpRef> = op.args.iter().copied().collect();
             let types: Vec<Type> = refs.iter().map(|_| Type::Int).collect();
             (refs, types)
+        } else if let Some(ref fa) = op.fail_args {
+            let refs: Vec<OpRef> = fa.iter().copied().collect();
+            let types: Vec<Type> = refs.iter().map(|_| Type::Int).collect();
+            (refs, types)
         } else {
             let refs: Vec<OpRef> = (0..num_inputs as u32).map(OpRef).collect();
             let types: Vec<Type> = inputargs.iter().map(|ia| ia.tp).collect();

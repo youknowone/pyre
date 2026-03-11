@@ -100,6 +100,26 @@ impl TraceRecorder {
         opref
     }
 
+    /// Record a guard with explicit fail_args — values stored in the dead
+    /// frame on guard failure. Mirrors rpython setfailargs().
+    pub fn record_guard_with_fail_args(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: DescrRef,
+        fail_args: &[OpRef],
+    ) -> OpRef {
+        assert!(!self.finalized, "recorder already finalized");
+        assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
+        let opref = OpRef(self.op_count);
+        let mut op = Op::with_descr(opcode, args, descr);
+        op.pos = opref;
+        op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
+        self.ops.push(op);
+        self.op_count += 1;
+        opref
+    }
+
     /// Close the loop: add a JUMP operation back to the start.
     /// `jump_args` are the values of the input arguments at the end of the loop.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {

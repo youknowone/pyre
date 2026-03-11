@@ -7,3 +7,4 @@ edition = "2021"
 majit-ir = { path = "../majit-ir" }
 majit-codegen = { path = "../majit-codegen" }
 majit-gc = { path = "../majit-gc" }
+smallvec = "1"
