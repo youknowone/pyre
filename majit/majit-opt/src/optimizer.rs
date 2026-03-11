@@ -24,7 +24,29 @@ impl Optimizer {
     ///
     /// Returns the optimized operation list.
     pub fn optimize(&mut self, ops: &[Op]) -> Vec<Op> {
+        self.optimize_with_constants(ops, &mut std::collections::HashMap::new())
+    }
+
+    /// Run all optimization passes, with known constants pre-populated.
+    ///
+    /// `constants` maps OpRef indices to their integer values. This allows the
+    /// optimizer to constant-fold and eliminate guards on known-constant values
+    /// (e.g., constants from the trace's constant pool).
+    ///
+    /// After optimization, newly-discovered constants (from constant folding)
+    /// are written back into the map so the backend can resolve them.
+    pub fn optimize_with_constants(
+        &mut self,
+        ops: &[Op],
+        constants: &mut std::collections::HashMap<u32, i64>,
+    ) -> Vec<Op> {
+        use majit_ir::{OpRef, Value};
         let mut ctx = OptContext::new(ops.len());
+
+        // Pre-populate known constants so passes can see them.
+        for (&idx, &val) in constants.iter() {
+            ctx.make_constant(OpRef(idx), Value::Int(val));
+        }
 
         // Setup all passes
         for pass in &mut self.passes {
@@ -39,6 +61,13 @@ impl Optimizer {
         // Flush all passes
         for pass in &mut self.passes {
             pass.flush();
+        }
+
+        // Export newly-discovered constants back to the caller's map.
+        for (idx, val) in ctx.constants.iter().enumerate() {
+            if let Some(Value::Int(v)) = val {
+                constants.entry(idx as u32).or_insert(*v);
+            }
         }
 
         ctx.new_operations

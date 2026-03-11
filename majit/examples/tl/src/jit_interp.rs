@@ -360,9 +360,10 @@ impl JitTlInterp {
         let trace = recorder.get_trace();
 
         let mut optimizer = Optimizer::default_pipeline();
-        let optimized_ops = optimizer.optimize(&trace.ops);
+        let mut constants = state.constants;
+        let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
 
-        self.backend.set_constants(state.constants);
+        self.backend.set_constants(constants);
 
         let token_num = self.warm_state.alloc_token_number();
         let mut token = LoopToken::new(token_num);
