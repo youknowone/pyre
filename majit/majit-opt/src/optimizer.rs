@@ -114,7 +114,7 @@ impl Optimizer {
 
 impl Optimizer {
     /// Create an optimizer with the standard pass pipeline.
-    /// Order: IntBounds -> Rewrite -> Virtualize -> String -> Pure -> Simplify -> Heap
+    /// Order: IntBounds -> Rewrite -> Virtualize -> String -> Pure -> Guard -> Simplify -> Heap
     pub fn default_pipeline() -> Self {
         let mut opt = Self::new();
         opt.add_pass(Box::new(crate::intbounds::OptIntBounds::new()));
@@ -122,6 +122,7 @@ impl Optimizer {
         opt.add_pass(Box::new(crate::virtualize::OptVirtualize::new()));
         opt.add_pass(Box::new(crate::vstring::OptString::new()));
         opt.add_pass(Box::new(crate::pure::OptPure::new()));
+        opt.add_pass(Box::new(crate::guard::OptGuard::new()));
         opt.add_pass(Box::new(crate::simplify::OptSimplify::new()));
         opt.add_pass(Box::new(crate::heap::OptHeap::new()));
         opt
@@ -175,9 +176,9 @@ mod tests {
     }
 
     #[test]
-    fn test_default_pipeline_has_7_passes() {
+    fn test_default_pipeline_has_8_passes() {
         let opt = Optimizer::default_pipeline();
-        assert_eq!(opt.num_passes(), 7);
+        assert_eq!(opt.num_passes(), 8);
     }
 
     #[test]

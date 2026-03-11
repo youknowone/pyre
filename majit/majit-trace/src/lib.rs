@@ -9,6 +9,7 @@
 pub mod counter;
 pub mod encoding;
 pub mod heapcache;
+pub mod jitlog;
 pub mod recorder;
 pub mod trace;
 pub mod warmstate;

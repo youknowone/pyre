@@ -31,6 +31,13 @@ impl OptRewrite {
             OpCode::IntAdd => Some(lhs.wrapping_add(rhs)),
             OpCode::IntSub => Some(lhs.wrapping_sub(rhs)),
             OpCode::IntMul => Some(lhs.wrapping_mul(rhs)),
+            OpCode::IntFloorDiv => {
+                if rhs != 0 {
+                    Some(lhs.wrapping_div(rhs))
+                } else {
+                    None
+                }
+            }
             OpCode::IntAnd => Some(lhs & rhs),
             OpCode::IntOr => Some(lhs | rhs),
             OpCode::IntXor => Some(lhs ^ rhs),
@@ -193,6 +200,29 @@ impl OptRewrite {
                 let shift_ref = self.emit_constant_int(ctx, shift);
                 return PassResult::Emit(Op::new(OpCode::IntLshift, &[arg1, shift_ref]));
             }
+        }
+
+        PassResult::PassOn
+    }
+
+    /// Try algebraic simplification for INT_FLOORDIV.
+    /// `x // 1 -> x`, constant fold when both operands are known.
+    fn optimize_int_floor_div(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        // Constant fold
+        if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
+            if let Some(result) = self.try_fold_binary_int(OpCode::IntFloorDiv, a, b) {
+                ctx.make_constant(op.pos, Value::Int(result));
+                return PassResult::Remove;
+            }
+        }
+
+        // x // 1 -> x (identity)
+        if let Some(1) = ctx.get_constant_int(arg1) {
+            ctx.replace_op(op.pos, arg0);
+            return PassResult::Remove;
         }
 
         PassResult::PassOn
@@ -594,6 +624,7 @@ impl OptimizationPass for OptRewrite {
             OpCode::IntAdd => self.optimize_int_add(op, ctx),
             OpCode::IntSub => self.optimize_int_sub(op, ctx),
             OpCode::IntMul => self.optimize_int_mul(op, ctx),
+            OpCode::IntFloorDiv => self.optimize_int_floor_div(op, ctx),
             OpCode::IntAnd => self.optimize_int_and(op, ctx),
             OpCode::IntOr => self.optimize_int_or(op, ctx),
             OpCode::IntXor => self.optimize_int_xor(op, ctx),
@@ -924,6 +955,47 @@ mod tests {
             }
             other => panic!("expected Emit(IntLshift), got {:?}", other),
         }
+    }
+
+    // ── INT_FLOORDIV tests ──
+
+    #[test]
+    fn test_int_floor_div_by_one() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]), // op0: x
+            Op::new(OpCode::SameAsI, &[]), // op1: constant 1
+            Op::new(OpCode::IntFloorDiv, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(1), Value::Int(1));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+    }
+
+    #[test]
+    fn test_int_floor_div_constant_fold() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntFloorDiv, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Int(42));
+        ctx.make_constant(OpRef(1), Value::Int(6));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(7));
     }
 
     // ── INT_AND tests ──

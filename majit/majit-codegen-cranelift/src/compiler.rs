@@ -19,7 +19,7 @@ use cranelift_codegen::ir::Value as CValue;
 use majit_codegen::{AsmInfo, BackendError, DeadFrame, LoopToken};
 use majit_ir::{CallDescr, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
-use crate::guard::{CraneliftFailDescr, FrameData};
+use crate::guard::{BridgeData, CraneliftFailDescr, FrameData};
 
 // ---------------------------------------------------------------------------
 // Helpers (free functions to avoid borrow conflicts)
@@ -245,6 +245,60 @@ impl CraneliftBackend {
         self.constants = constants;
     }
 
+    /// Decode raw i64 output slots into typed `Value`s.
+    fn decode_frame_values(outputs: &[i64], types: &[Type]) -> Vec<Value> {
+        let mut values = Vec::with_capacity(types.len());
+        for (i, tp) in types.iter().enumerate() {
+            let raw = outputs[i];
+            values.push(match tp {
+                Type::Int => Value::Int(raw),
+                Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                Type::Ref => Value::Ref(GcRef(raw as usize)),
+                Type::Void => Value::Void,
+            });
+        }
+        values
+    }
+
+    /// Execute a compiled bridge, returning the DeadFrame from the bridge's
+    /// exit point (either a Finish or a further guard failure).
+    ///
+    /// If the bridge itself hits a guard that has another bridge attached,
+    /// this chains through until a final exit is reached.
+    fn execute_bridge(
+        bridge: &BridgeData,
+        parent_outputs: &[i64],
+        parent_types: &[Type],
+    ) -> DeadFrame {
+        // The bridge's inputs are the parent guard's fail args.
+        let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
+        let bridge_inputs = &parent_outputs[..num_bridge_inputs];
+
+        let mut outputs = vec![0i64; bridge.max_output_slots.max(1)];
+
+        let func: unsafe extern "C" fn(*const i64, *mut i64) -> i64 =
+            unsafe { std::mem::transmute(bridge.code_ptr) };
+        let fail_index = unsafe { func(bridge_inputs.as_ptr(), outputs.as_mut_ptr()) } as u32;
+
+        let fail_descr = &bridge.fail_descrs[fail_index as usize];
+        fail_descr.increment_fail_count();
+
+        // Check for chained bridges.
+        let bridge_guard = fail_descr.bridge.lock().unwrap();
+        if let Some(ref next_bridge) = *bridge_guard {
+            return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
+        }
+        drop(bridge_guard);
+
+        let values = Self::decode_frame_values(&outputs, &fail_descr.fail_arg_types);
+        DeadFrame {
+            data: Box::new(FrameData {
+                values,
+                fail_descr: fail_descr.clone(),
+            }),
+        }
+    }
+
     fn do_compile(
         &mut self,
         inputargs: &[InputArg],
@@ -367,6 +421,11 @@ impl CraneliftBackend {
                 OpCode::IntMul => {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
                     let r = builder.ins().imul(a, b);
+                    builder.def_var(var(vi), r);
+                }
+                OpCode::IntFloorDiv => {
+                    let (a, b) = resolve_binop(&mut builder, &constants, op);
+                    let r = builder.ins().sdiv(a, b);
                     builder.def_var(var(vi), r);
                 }
 
@@ -1444,10 +1503,7 @@ fn collect_guards(
             *max_output_slots = n;
         }
 
-        let descr = Arc::new(CraneliftFailDescr {
-            fail_index,
-            fail_arg_types,
-        });
+        let descr = Arc::new(CraneliftFailDescr::new(fail_index, fail_arg_types));
         fail_descrs.push(descr);
         guard_infos.push(GuardInfo {
             fail_index,
@@ -1479,28 +1535,43 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn compile_bridge(
         &mut self,
-        _fail_descr: &dyn FailDescr,
+        fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
         ops: &[Op],
-        _original_token: &LoopToken,
+        original_token: &LoopToken,
     ) -> Result<AsmInfo, BackendError> {
-        // Compile the bridge as a standalone function, same as compile_loop.
-        // A real implementation would patch the guard's side-exit to jump
-        // directly to the bridge code; for now we compile independently.
-        let mut bridge_token = LoopToken::new(_original_token.number + 1000);
-        self.compile_loop(inputargs, ops, &mut bridge_token)?;
+        // Compile the bridge trace as a standalone function using the same
+        // code generation path as compile_loop.
+        let compiled = self.do_compile(inputargs, ops)?;
+        let info = AsmInfo {
+            code_addr: compiled.code_ptr as usize,
+            code_size: compiled.code_size,
+        };
 
-        let code_addr = bridge_token
+        // Attach the bridge to the original guard's fail descriptor so that
+        // execute_token can dispatch to it on subsequent guard failures.
+        let original_compiled = original_token
             .compiled
             .as_ref()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())
-            .map(|c| c.code_ptr as usize)
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                BackendError::CompilationFailed(
+                    "original token has no compiled loop".to_string(),
+                )
+            })?;
 
-        Ok(AsmInfo {
-            code_addr,
-            code_size: 0,
-        })
+        let fi = fail_descr.fail_index() as usize;
+        if fi < original_compiled.fail_descrs.len() {
+            let target_descr = &original_compiled.fail_descrs[fi];
+            target_descr.attach_bridge(BridgeData {
+                code_ptr: compiled.code_ptr,
+                fail_descrs: compiled.fail_descrs,
+                num_inputs: compiled.num_inputs,
+                max_output_slots: compiled.max_output_slots,
+            });
+        }
+
+        Ok(info)
     }
 
     fn execute_token(&self, token: &LoopToken, args: &[Value]) -> DeadFrame {
@@ -1528,16 +1599,19 @@ impl majit_codegen::Backend for CraneliftBackend {
         let fail_index = unsafe { func(inputs.as_ptr(), outputs.as_mut_ptr()) } as u32;
 
         let fail_descr = &compiled.fail_descrs[fail_index as usize];
-        let mut values = Vec::with_capacity(fail_descr.fail_arg_types.len());
-        for (i, tp) in fail_descr.fail_arg_types.iter().enumerate() {
-            let raw = outputs[i];
-            values.push(match tp {
-                Type::Int => Value::Int(raw),
-                Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                Type::Ref => Value::Ref(GcRef(raw as usize)),
-                Type::Void => Value::Void,
-            });
+
+        // Increment guard failure count.
+        fail_descr.increment_fail_count();
+
+        // If a bridge is attached to this guard, execute it.
+        // The bridge receives the guard's fail args as its inputs.
+        let bridge_guard = fail_descr.bridge.lock().unwrap();
+        if let Some(ref bridge) = *bridge_guard {
+            return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
         }
+        drop(bridge_guard);
+
+        let values = Self::decode_frame_values(&outputs, &fail_descr.fail_arg_types);
 
         DeadFrame {
             data: Box::new(FrameData {
@@ -1730,6 +1804,24 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
+    }
+
+    #[test]
+    fn test_int_floor_div() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::IntFloorDiv, &[OpRef(0), OpRef(1)], 2),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+
+        let mut token = LoopToken::new(3);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(42), Value::Int(6)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 7);
     }
 
     #[test]
@@ -2185,10 +2277,7 @@ mod tests {
         constants.insert(100, 10i64);
         backend.set_constants(constants);
 
-        let fail_descr = CraneliftFailDescr {
-            fail_index: 0,
-            fail_arg_types: vec![Type::Int],
-        };
+        let fail_descr = CraneliftFailDescr::new(0, vec![Type::Int]);
 
         let info = backend
             .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token)
