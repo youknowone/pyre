@@ -29,6 +29,10 @@ pub struct Op {
     pub descr: Option<DescrRef>,
     /// Index of this op in the trace (set by the trace builder).
     pub pos: OpRef,
+    /// For guard ops: values to store in the dead frame on guard failure.
+    /// Mirrors rpython/jit/metainterp/resoperation.py getfailargs/setfailargs.
+    /// If None, the backend falls back to storing input args.
+    pub fail_args: Option<SmallVec<[OpRef; 3]>>,
 }
 
 impl Op {
@@ -38,6 +42,7 @@ impl Op {
             args: SmallVec::from_slice(args),
             descr: None,
             pos: OpRef::NONE,
+            fail_args: None,
         }
     }
 
@@ -47,6 +52,7 @@ impl Op {
             args: SmallVec::from_slice(args),
             descr: Some(descr),
             pos: OpRef::NONE,
+            fail_args: None,
         }
     }
 
