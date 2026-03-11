@@ -359,7 +359,7 @@ impl JitTlInterp {
         recorder.close_loop(&jump_args);
         let trace = recorder.get_trace();
 
-        let mut optimizer = Optimizer::new();
+        let mut optimizer = Optimizer::default_pipeline();
         let optimized_ops = optimizer.optimize(&trace.ops);
 
         self.backend.set_constants(state.constants);
