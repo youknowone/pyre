@@ -15,4 +15,6 @@ members = [
     "examples/tiny2",
     "examples/tiny3",
     "examples/tinyframe",
+    "examples/braininterp",
+    "examples/tlc",
 ]
