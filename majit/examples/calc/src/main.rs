@@ -16,31 +16,18 @@ use jit_interp::JitCalcInterp;
 use std::time::Instant;
 
 fn main() {
-    println!("=== majit calc interpreter ===\n");
+    let n: i64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000_000);
 
-    // Demo 1: sum(0..1_000_000)
-    {
-        let prog = sum_program(1_000_000);
-        let mut interp = CalcInterp::new();
-        let result = interp.run(&prog);
-        println!("sum(0..1_000_000) = {result}");
-        assert_eq!(result, 499_999_500_000);
-    }
+    println!("=== majit calc interpreter (n={n}) ===\n");
 
-    // Demo 2: factorial(20)
-    {
-        let prog = factorial_program(20);
-        let mut interp = CalcInterp::new();
-        let result = interp.run(&prog);
-        println!("factorial(20) = {result}");
-        assert_eq!(result, 2_432_902_008_176_640_000);
-    }
-
-    // Benchmark: sum(0..10_000_000) — interpreter only
-    println!("\n--- Benchmark: sum(0..10_000_000) [interpreter] ---");
+    // Benchmark: sum(0..n) — interpreter only
+    println!("--- sum(0..{n}) [interpreter] ---");
     let interp_result;
     {
-        let prog = sum_program(10_000_000);
+        let prog = sum_program(n);
         let mut interp = CalcInterp::new();
 
         let start = Instant::now();
@@ -49,13 +36,12 @@ fn main() {
 
         println!("result = {interp_result}");
         println!("time   = {elapsed:?}");
-        assert_eq!(interp_result, 49_999_995_000_000);
     }
 
-    // Benchmark: sum(0..10_000_000) — JIT
-    println!("\n--- Benchmark: sum(0..10_000_000) [JIT] ---");
+    // Benchmark: sum(0..n) — JIT
+    println!("\n--- sum(0..{n}) [JIT] ---");
     {
-        let prog = sum_program(10_000_000);
+        let prog = sum_program(n);
         let mut jit = JitCalcInterp::new();
 
         let start = Instant::now();
