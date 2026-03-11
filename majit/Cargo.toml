@@ -11,4 +11,5 @@ members = [
     "majit-runtime",
     "examples/tlr",
     "examples/tl",
+    "examples/tla",
 ]
