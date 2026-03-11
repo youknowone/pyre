@@ -89,15 +89,26 @@ impl PureOpCache {
 /// computed before. If yes, replaces the current op with the cached result
 /// (CSE). If no, records the operation for future lookups.
 ///
-/// Also handles CALL_PURE -> CALL demotion when arguments aren't all constant.
+/// Also handles:
+/// - CALL_PURE -> CALL demotion when arguments aren't all constant.
+/// - CALL_LOOPINVARIANT_* caching: the result of a loop-invariant call is
+///   cached for the entire loop iteration (unlike pure ops, no LRU eviction).
+///   Translated from rpython/jit/metainterp/optimizeopt/pure.py
+///   optimize_CALL_LOOPINVARIANT_I/R/F/N.
 pub struct OptPure {
     cache: PureOpCache,
+    /// Per-loop-iteration cache for CALL_LOOPINVARIANT_* results.
+    /// Key: (func_ptr_opref, arg0, arg1, ...) → result OpRef.
+    /// This cache persists across the whole loop body without eviction,
+    /// as loop-invariant calls produce the same result for one iteration.
+    loopinvariant_cache: HashMap<PureOpKey, OpRef>,
 }
 
 impl OptPure {
     pub fn new() -> Self {
         OptPure {
             cache: PureOpCache::new(16),
+            loopinvariant_cache: HashMap::new(),
         }
     }
 
@@ -141,6 +152,33 @@ impl OptPure {
         new_op.opcode = call_opcode;
         PassResult::Emit(new_op)
     }
+
+    /// Handle CALL_LOOPINVARIANT_*: cache the result for the loop iteration.
+    ///
+    /// If the same call (same function + arguments) was already seen, replace
+    /// with the cached result. Otherwise, emit and cache the result.
+    /// The call is demoted to a plain CALL_* for the backend.
+    fn handle_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let key = PureOpKey::from_op(op);
+
+        // Check if we've already computed this loop-invariant call.
+        if let Some(cached_ref) = self.loopinvariant_cache.get(&key).copied() {
+            let cached_ref = ctx.get_replacement(cached_ref);
+            ctx.replace_op(op.pos, cached_ref);
+            return PassResult::Remove;
+        }
+
+        // Also check the commutative case (unlikely for calls, but consistent).
+        // Not applicable for calls — skip.
+
+        // Cache the result and demote to plain CALL_*.
+        self.loopinvariant_cache.insert(key, op.pos);
+
+        let call_opcode = OpCode::call_for_type(op.result_type());
+        let mut new_op = op.clone();
+        new_op.opcode = call_opcode;
+        PassResult::Emit(new_op)
+    }
 }
 
 impl Default for OptPure {
@@ -173,6 +211,11 @@ impl OptimizationPass for OptPure {
         // CALL_PURE_* -> demote to plain CALL_*
         if op.opcode.is_call_pure() {
             return self.handle_call_pure(op);
+        }
+
+        // CALL_LOOPINVARIANT_* -> cache result, demote to CALL_*
+        if op.opcode.is_call_loopinvariant() {
+            return self.handle_call_loopinvariant(op, ctx);
         }
 
         PassResult::PassOn
@@ -518,5 +561,107 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::SetfieldGc);
+    }
+
+    #[test]
+    fn test_call_loopinvariant_cse() {
+        // Two identical CALL_LOOPINVARIANT_I calls → second eliminated.
+        let mut ops = vec![
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize(&ops);
+
+        // Only the first call should remain, demoted to CallI.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::CallI);
+    }
+
+    #[test]
+    fn test_call_loopinvariant_different_args() {
+        // CALL_LOOPINVARIANT_I with different args → both kept.
+        let mut ops = vec![
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(102)]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize(&ops);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::CallI);
+        assert_eq!(result[1].opcode, OpCode::CallI);
+    }
+
+    #[test]
+    fn test_call_loopinvariant_all_types() {
+        for (loopinv_op, expected_op) in [
+            (OpCode::CallLoopinvariantI, OpCode::CallI),
+            (OpCode::CallLoopinvariantR, OpCode::CallR),
+            (OpCode::CallLoopinvariantF, OpCode::CallF),
+            (OpCode::CallLoopinvariantN, OpCode::CallN),
+        ] {
+            let mut ops = vec![Op::new(loopinv_op, &[OpRef(0)])];
+            assign_positions(&mut ops);
+
+            let mut opt = Optimizer::new();
+            opt.add_pass(Box::new(OptPure::new()));
+            let result = opt.optimize(&ops);
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].opcode, expected_op);
+        }
+    }
+
+    #[test]
+    fn test_call_loopinvariant_no_eviction() {
+        // Unlike pure CSE (LRU limit 16), loop-invariant cache has no eviction.
+        // Create 20 unique calls, then re-check the first one.
+        let mut ops = Vec::new();
+        for i in 0..20u32 {
+            ops.push(Op::new(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(i + 100), OpRef(200)],
+            ));
+        }
+        // Re-insert call #0: same args as ops[0]
+        ops.push(Op::new(
+            OpCode::CallLoopinvariantI,
+            &[OpRef(100), OpRef(200)],
+        ));
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize(&ops);
+
+        // 20 unique calls + the duplicate (#0) should be eliminated → 20 total
+        assert_eq!(result.len(), 20);
+    }
+
+    #[test]
+    fn test_call_loopinvariant_mixed_with_pure() {
+        // Loop-invariant and pure CSE should coexist.
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),       // pure
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(200), OpRef(201)]), // loopinvariant
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),       // pure dup → removed
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(200), OpRef(201)]), // loopinvariant dup → removed
+        ];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize(&ops);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::IntAdd);
+        assert_eq!(result[1].opcode, OpCode::CallI);
     }
 }

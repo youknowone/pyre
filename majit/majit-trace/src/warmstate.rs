@@ -5,7 +5,9 @@
 /// complete, we compile it and cache the result.
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseJitCell
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use majit_codegen::LoopToken;
@@ -89,6 +91,14 @@ pub struct WarmState {
     next_token_number: u64,
     /// Optional profiling logger, enabled via MAJIT_STATS=1 or MAJIT_LOG=1.
     jitlog: Option<JitLog>,
+    /// Quasi-immutable field invalidation registry.
+    ///
+    /// Maps a quasi-immutable field key (hash of object_id + field_index)
+    /// to the set of green_key_hashes whose compiled loops depend on that field.
+    /// When a quasi-immutable field is mutated, all dependent loops are invalidated.
+    ///
+    /// Mirrors rpython/jit/metainterp/quasiimmut.py QuasiImmut.
+    quasiimmut_deps: HashMap<u64, HashSet<u64>>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -114,6 +124,7 @@ impl WarmState {
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
             next_token_number: 0,
             jitlog: JitLog::from_env(),
+            quasiimmut_deps: HashMap::new(),
         }
     }
 
@@ -126,6 +137,7 @@ impl WarmState {
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
             next_token_number: 0,
             jitlog,
+            quasiimmut_deps: HashMap::new(),
         }
     }
 
@@ -239,7 +251,13 @@ impl WarmState {
         compile_time: Duration,
     ) {
         if let Some(log) = &mut self.jitlog {
-            log.log_compile(green_key, ops_before_opt, ops_after_opt, opt_time, compile_time);
+            log.log_compile(
+                green_key,
+                ops_before_opt,
+                ops_after_opt,
+                opt_time,
+                compile_time,
+            );
         }
     }
 
@@ -283,6 +301,62 @@ impl WarmState {
         if let Some(log) = &mut self.jitlog {
             log.log_bridge_compile(guard_index);
         }
+    }
+
+    // ── Quasi-immutable field invalidation ──
+
+    /// Register that the compiled loop at `green_key_hash` depends on the
+    /// quasi-immutable field identified by `qmut_key`.
+    ///
+    /// When `invalidate_quasiimmut(qmut_key)` is called later, the compiled
+    /// loop's LoopToken will be invalidated, causing GUARD_NOT_INVALIDATED
+    /// to fail and forcing a retrace.
+    ///
+    /// `qmut_key` should be a hash of (object_id, field_index) or similar.
+    pub fn register_quasiimmut_dependency(&mut self, qmut_key: u64, green_key_hash: u64) {
+        self.quasiimmut_deps
+            .entry(qmut_key)
+            .or_default()
+            .insert(green_key_hash);
+    }
+
+    /// Invalidate all compiled loops that depend on the quasi-immutable field
+    /// identified by `qmut_key`.
+    ///
+    /// Called by the interpreter when a quasi-immutable field is mutated.
+    /// Each dependent loop's LoopToken has its invalidated flag set, causing
+    /// GUARD_NOT_INVALIDATED to fail on the next execution.
+    ///
+    /// Returns the number of loops invalidated.
+    pub fn invalidate_quasiimmut(&mut self, qmut_key: u64) -> usize {
+        let deps = match self.quasiimmut_deps.remove(&qmut_key) {
+            Some(deps) => deps,
+            None => return 0,
+        };
+
+        let mut invalidated = 0;
+        for green_key_hash in &deps {
+            if let Some(cell) = self.cells.get(green_key_hash) {
+                if let Some(token) = &cell.loop_token {
+                    token.invalidate();
+                    invalidated += 1;
+                }
+            }
+        }
+        invalidated
+    }
+
+    /// Invalidate all compiled loops that contain a GUARD_NOT_INVALIDATED.
+    ///
+    /// This is a brute-force invalidation used when the specific qmut_key
+    /// is not known (e.g., bulk invalidation after a class hierarchy change).
+    pub fn invalidate_all(&mut self) {
+        for cell in self.cells.values() {
+            if let Some(token) = &cell.loop_token {
+                token.invalidate();
+            }
+        }
+        self.quasiimmut_deps.clear();
     }
 }
 
@@ -494,5 +568,84 @@ mod tests {
         assert!(!ws.should_compile_bridge(4));
         assert!(ws.should_compile_bridge(5));
         assert!(ws.should_compile_bridge(100));
+    }
+
+    // ── Quasi-immutable invalidation tests ──
+
+    #[test]
+    fn test_quasiimmut_register_and_invalidate() {
+        let mut ws = WarmState::new(1);
+        let token = LoopToken::new(ws.alloc_token_number());
+        let green_key = 42;
+        let qmut_key = 0xABCD;
+
+        assert!(!token.is_invalidated());
+        ws.install_compiled(green_key, token);
+        ws.register_quasiimmut_dependency(qmut_key, green_key);
+
+        let count = ws.invalidate_quasiimmut(qmut_key);
+        assert_eq!(count, 1);
+
+        let cell = ws.get_cell(green_key).unwrap();
+        assert!(cell.loop_token.as_ref().unwrap().is_invalidated());
+    }
+
+    #[test]
+    fn test_quasiimmut_no_deps() {
+        let mut ws = WarmState::new(1);
+        // No dependencies registered → invalidation returns 0.
+        let count = ws.invalidate_quasiimmut(0xDEAD);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_quasiimmut_multiple_deps() {
+        let mut ws = WarmState::new(1);
+        let qmut_key = 0xABCD;
+
+        // Install two loops depending on the same quasi-immutable field.
+        for green_key in [10, 20] {
+            let token = LoopToken::new(ws.alloc_token_number());
+            ws.install_compiled(green_key, token);
+            ws.register_quasiimmut_dependency(qmut_key, green_key);
+        }
+
+        let count = ws.invalidate_quasiimmut(qmut_key);
+        assert_eq!(count, 2);
+
+        for green_key in [10, 20] {
+            let cell = ws.get_cell(green_key).unwrap();
+            assert!(cell.loop_token.as_ref().unwrap().is_invalidated());
+        }
+    }
+
+    #[test]
+    fn test_quasiimmut_invalidate_all() {
+        let mut ws = WarmState::new(1);
+        for green_key in [1, 2, 3] {
+            let token = LoopToken::new(ws.alloc_token_number());
+            ws.install_compiled(green_key, token);
+        }
+
+        ws.invalidate_all();
+
+        for green_key in [1, 2, 3] {
+            let cell = ws.get_cell(green_key).unwrap();
+            assert!(cell.loop_token.as_ref().unwrap().is_invalidated());
+        }
+    }
+
+    #[test]
+    fn test_quasiimmut_deps_cleared_after_invalidation() {
+        let mut ws = WarmState::new(1);
+        let qmut_key = 0xABCD;
+        let token = LoopToken::new(ws.alloc_token_number());
+        ws.install_compiled(42, token);
+        ws.register_quasiimmut_dependency(qmut_key, 42);
+
+        ws.invalidate_quasiimmut(qmut_key);
+        // Second invalidation should find no deps.
+        let count = ws.invalidate_quasiimmut(qmut_key);
+        assert_eq!(count, 0);
     }
 }

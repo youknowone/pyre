@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 /// Cranelift-based JIT code generation backend.
 ///
 /// Translates majit IR traces into native code via Cranelift, then
@@ -261,6 +261,14 @@ thread_local! {
     /// exc_type holds the current exception class (as a GcRef encoded in i64).
     static JIT_EXC_VALUE: Cell<i64> = const { Cell::new(0) };
     static JIT_EXC_TYPE: Cell<i64> = const { Cell::new(0) };
+    /// Thread-local reference storage for JIT-compiled code.
+    ///
+    /// Mirrors RPython's `rpy_threadlocalref` — an array of integer-sized slots
+    /// indexed by offset. The interpreter stores per-thread state here (e.g.,
+    /// the current action flag, signal handler data, etc.).
+    ///
+    /// Slots are accessed via THREADLOCALREF_GET opcode.
+    static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
 }
 
 // ── Exception state shims called from JIT-compiled code ──
@@ -322,6 +330,48 @@ fn take_pending_jit_exception_ref() -> GcRef {
     } else {
         GcRef(value as usize)
     }
+}
+
+// ── Thread-local reference access shims ──
+
+/// Read a thread-local slot at the given offset.
+///
+/// Called from JIT-compiled code for THREADLOCALREF_GET operations.
+/// The offset is in bytes (divided by 8 to get the slot index).
+extern "C" fn jit_threadlocalref_get(offset: i64) -> i64 {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let slots = slots.borrow();
+        let idx = (offset / 8) as usize;
+        slots.get(idx).copied().unwrap_or(0)
+    })
+}
+
+/// Write a value to a thread-local slot at the given offset.
+///
+/// Called by the interpreter to set up thread-local state before entering
+/// JIT-compiled code.
+pub fn jit_threadlocalref_set(offset: i64, value: i64) {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        let idx = (offset / 8) as usize;
+        if idx >= slots.len() {
+            slots.resize(idx + 1, 0);
+        }
+        slots[idx] = value;
+    });
+}
+
+/// Get the base pointer for thread-local slots.
+/// Returns 0 since we use callback-based access.
+pub fn jit_threadlocalref_base() -> *const i64 {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let slots = slots.borrow();
+        if slots.is_empty() {
+            std::ptr::null()
+        } else {
+            slots.as_ptr()
+        }
+    })
 }
 
 // ── GIL release/reacquire shims ──
@@ -739,12 +789,14 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     let fail_descr = pending.fail_descr.clone();
     let raw_values = pending.into_raw_values(frame.gc_runtime_id);
     let saved_data = take_force_frame_saved_data(&frame);
+    let exception = take_pending_jit_exception_ref();
     DeadFrame {
-        data: Box::new(FrameData::new_with_savedata(
+        data: Box::new(FrameData::new_with_savedata_and_exception(
             raw_values,
             fail_descr,
             frame.gc_runtime_id,
             saved_data,
+            (!exception.is_null()).then_some(exception),
         )),
     }
 }
@@ -811,6 +863,16 @@ pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> GcRef {
             .unwrap_or_else(|| preview.frame.get_savedata_ref());
     }
     panic!("unsupported dead frame type for saved-data");
+}
+
+pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> GcRef {
+    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
+        return frame_data.get_exception_ref();
+    }
+    if frame.data.downcast_ref::<PreviewFrameData>().is_some() {
+        return GcRef::NULL;
+    }
+    panic!("unsupported dead frame type for exception value");
 }
 
 extern "C" fn call_assembler_shim(target_token: u64, args_ptr: u64) -> u64 {
@@ -1835,22 +1897,26 @@ impl CraneliftBackend {
         // Check for chained bridges.
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref next_bridge) = *bridge_guard {
-            release_force_token(handle);
-            return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
+            if !jit_exc_is_pending() {
+                release_force_token(handle);
+                return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
+            }
         }
         drop(bridge_guard);
 
         let saved_data = take_force_frame_saved_data(&force_frame);
+        let exception = take_pending_jit_exception_ref();
         if fail_descr.force_token_slots.is_empty() {
             release_force_token(handle);
         }
 
         DeadFrame {
-            data: Box::new(FrameData::new_with_savedata(
+            data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
                 fail_descr.clone(),
                 bridge.gc_runtime_id,
                 saved_data,
+                (!exception.is_null()).then_some(exception),
             )),
         }
     }
@@ -2553,22 +2619,21 @@ impl CraneliftBackend {
                     let expected_tid = resolve_opref(&mut builder, &constants, op.args[1]);
 
                     // Load header word from obj_ptr - GcHeader::SIZE
-                    let hdr_addr = builder
-                        .ins()
-                        .iadd_imm(obj_ptr, -(GcHeader::SIZE as i64));
-                    let hdr_word = builder
-                        .ins()
-                        .load(cl_types::I64, MemFlags::trusted(), hdr_addr, 0);
+                    let hdr_addr = builder.ins().iadd_imm(obj_ptr, -(GcHeader::SIZE as i64));
+                    let hdr_word =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), hdr_addr, 0);
                     // Extract type_id (lower 32 bits)
                     let tid_mask = builder.ins().iconst(cl_types::I64, TYPE_ID_MASK as i64);
                     let actual_tid = builder.ins().band(hdr_word, tid_mask);
 
-                    let neq = builder.ins().icmp(IntCC::NotEqual, actual_tid, expected_tid);
+                    let neq = builder
+                        .ins()
+                        .icmp(IntCC::NotEqual, actual_tid, expected_tid);
                     let exit_block = builder.create_block();
                     let cont_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(neq, exit_block, &[], cont_block, &[]);
+                    builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
@@ -2611,9 +2676,7 @@ impl CraneliftBackend {
                     let neq = builder.ins().icmp(IntCC::NotEqual, a, b);
                     let exit_block = builder.create_block();
                     let cont_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(neq, exit_block, &[], cont_block, &[]);
+                    builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
@@ -2680,7 +2743,9 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(trap_block);
                     builder.seal_block(trap_block);
-                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                    builder
+                        .ins()
+                        .trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -2883,11 +2948,17 @@ impl CraneliftBackend {
                     }
                 }
 
-                OpCode::CallReleaseGilI | OpCode::CallReleaseGilR | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {
+                OpCode::CallReleaseGilI
+                | OpCode::CallReleaseGilR
+                | OpCode::CallReleaseGilF
+                | OpCode::CallReleaseGilN => {
                     // Release-GIL calls: spill roots, release GIL, call,
                     // reacquire GIL, reload roots.
                     // In Rust, "GIL" is modeled as a pre/post hook pair.
-                    let descr = op.descr.as_ref().expect("call_release_gil op must have a descriptor");
+                    let descr = op
+                        .descr
+                        .as_ref()
+                        .expect("call_release_gil op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
                         .expect("call_release_gil descriptor must be a CallDescr");
@@ -2986,7 +3057,9 @@ impl CraneliftBackend {
 
                     if let Some(result) = result {
                         let result_val = if result_type == Type::Float {
-                            builder.ins().bitcast(cl_types::I64, MemFlags::new(), result)
+                            builder
+                                .ins()
+                                .bitcast(cl_types::I64, MemFlags::new(), result)
                         } else {
                             result
                         };
@@ -4087,8 +4160,12 @@ impl CraneliftBackend {
                 // in two consecutive Cranelift variables.
                 // We implement vector ops via scalar emulation for portability.
                 // A future SIMD pass can lower these to native vector instructions.
-                OpCode::VecIntAdd | OpCode::VecIntSub | OpCode::VecIntMul
-                | OpCode::VecIntAnd | OpCode::VecIntOr | OpCode::VecIntXor => {
+                OpCode::VecIntAdd
+                | OpCode::VecIntSub
+                | OpCode::VecIntMul
+                | OpCode::VecIntAnd
+                | OpCode::VecIntOr
+                | OpCode::VecIntXor => {
                     // Binary vector integer ops: emulated as scalar ops on the
                     // packed representation (pairs of i64).
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
@@ -4106,8 +4183,10 @@ impl CraneliftBackend {
                 }
 
                 // ── Vector float arithmetic ──
-                OpCode::VecFloatAdd | OpCode::VecFloatSub
-                | OpCode::VecFloatMul | OpCode::VecFloatTrueDiv => {
+                OpCode::VecFloatAdd
+                | OpCode::VecFloatSub
+                | OpCode::VecFloatMul
+                | OpCode::VecFloatTrueDiv => {
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
                     let b = resolve_opref(&mut builder, &constants, op.args[1]);
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
@@ -4119,7 +4198,9 @@ impl CraneliftBackend {
                         OpCode::VecFloatTrueDiv => builder.ins().fdiv(fa, fb),
                         _ => unreachable!(),
                     };
-                    let result = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fresult);
+                    let result = builder
+                        .ins()
+                        .bitcast(cl_types::I64, MemFlags::new(), fresult);
                     builder.def_var(var(vi), result);
                 }
 
@@ -4127,7 +4208,9 @@ impl CraneliftBackend {
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let fresult = builder.ins().fneg(fa);
-                    let result = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fresult);
+                    let result = builder
+                        .ins()
+                        .bitcast(cl_types::I64, MemFlags::new(), fresult);
                     builder.def_var(var(vi), result);
                 }
 
@@ -4135,7 +4218,9 @@ impl CraneliftBackend {
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let fresult = builder.ins().fabs(fa);
-                    let result = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fresult);
+                    let result = builder
+                        .ins()
+                        .bitcast(cl_types::I64, MemFlags::new(), fresult);
                     builder.def_var(var(vi), result);
                 }
 
@@ -4209,7 +4294,9 @@ impl CraneliftBackend {
                 OpCode::VecCastIntToFloat => {
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
                     let fresult = builder.ins().fcvt_from_sint(cl_types::F64, a);
-                    let result = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fresult);
+                    let result = builder
+                        .ins()
+                        .bitcast(cl_types::I64, MemFlags::new(), fresult);
                     builder.def_var(var(vi), result);
                 }
 
@@ -4217,7 +4304,9 @@ impl CraneliftBackend {
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let f32val = builder.ins().fdemote(cl_types::F32, fa);
-                    let result = builder.ins().bitcast(cl_types::I32, MemFlags::new(), f32val);
+                    let result = builder
+                        .ins()
+                        .bitcast(cl_types::I32, MemFlags::new(), f32val);
                     let result_ext = builder.ins().uextend(cl_types::I64, result);
                     builder.def_var(var(vi), result_ext);
                 }
@@ -4225,9 +4314,13 @@ impl CraneliftBackend {
                 OpCode::VecCastSinglefloatToFloat => {
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
                     let a_trunc = builder.ins().ireduce(cl_types::I32, a);
-                    let f32val = builder.ins().bitcast(cl_types::F32, MemFlags::new(), a_trunc);
+                    let f32val = builder
+                        .ins()
+                        .bitcast(cl_types::F32, MemFlags::new(), a_trunc);
                     let f64val = builder.ins().fpromote(cl_types::F64, f32val);
-                    let result = builder.ins().bitcast(cl_types::I64, MemFlags::new(), f64val);
+                    let result = builder
+                        .ins()
+                        .bitcast(cl_types::I64, MemFlags::new(), f64val);
                     builder.def_var(var(vi), result);
                 }
 
@@ -4282,11 +4375,7 @@ impl CraneliftBackend {
                     } else {
                         builder.ins().iconst(cl_types::I64, 0)
                     };
-                    let value = resolve_opref(
-                        &mut builder,
-                        &constants,
-                        op.args[op.args.len() - 1],
-                    );
+                    let value = resolve_opref(&mut builder, &constants, op.args[op.args.len() - 1]);
                     let addr = builder.ins().iadd(base, offset_val);
                     builder.ins().store(MemFlags::trusted(), value, addr, 0);
                 }
@@ -4297,18 +4386,19 @@ impl CraneliftBackend {
                 // we call out to a runtime helper.
                 OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
                     // Call jit_malloc_nursery(size) → returns ptr
-                    let size = if op.opcode == OpCode::NewArray || op.opcode == OpCode::NewArrayClear {
-                        // Array allocation: first arg is the length
-                        let len = resolve_opref(&mut builder, &constants, op.arg(0));
-                        // size = base_size + len * item_size
-                        // For simplicity, assume 8-byte items + 16-byte header
-                        let item_size = builder.ins().iconst(cl_types::I64, 8);
-                        let items_total = builder.ins().imul(len, item_size);
-                        builder.ins().iadd_imm(items_total, 16)
-                    } else {
-                        // Fixed-size object: use descriptor's size_of if available, else 16
-                        builder.ins().iconst(cl_types::I64, 16)
-                    };
+                    let size =
+                        if op.opcode == OpCode::NewArray || op.opcode == OpCode::NewArrayClear {
+                            // Array allocation: first arg is the length
+                            let len = resolve_opref(&mut builder, &constants, op.arg(0));
+                            // size = base_size + len * item_size
+                            // For simplicity, assume 8-byte items + 16-byte header
+                            let item_size = builder.ins().iconst(cl_types::I64, 8);
+                            let items_total = builder.ins().imul(len, item_size);
+                            builder.ins().iadd_imm(items_total, 16)
+                        } else {
+                            // Fixed-size object: use descriptor's size_of if available, else 16
+                            builder.ins().iconst(cl_types::I64, 16)
+                        };
 
                     let result = emit_host_call(
                         &mut builder,
@@ -4350,7 +4440,9 @@ impl CraneliftBackend {
                     // i64-encoded f64 → f64 → f32 → zero-extend to i64
                     let f64_val = builder.ins().bitcast(cl_types::F64, MemFlags::new(), val);
                     let f32_val = builder.ins().fdemote(cl_types::F32, f64_val);
-                    let i32_val = builder.ins().bitcast(cl_types::I32, MemFlags::new(), f32_val);
+                    let i32_val = builder
+                        .ins()
+                        .bitcast(cl_types::I32, MemFlags::new(), f32_val);
                     let result = builder.ins().uextend(cl_types::I64, i32_val);
                     builder.def_var(var(vi), result);
                 }
@@ -4359,9 +4451,13 @@ impl CraneliftBackend {
                     let val = resolve_opref(&mut builder, &constants, op.arg(0));
                     // i64 (lower 32 bits = f32) → f32 → f64 → i64
                     let i32_val = builder.ins().ireduce(cl_types::I32, val);
-                    let f32_val = builder.ins().bitcast(cl_types::F32, MemFlags::new(), i32_val);
+                    let f32_val = builder
+                        .ins()
+                        .bitcast(cl_types::F32, MemFlags::new(), i32_val);
                     let f64_val = builder.ins().fpromote(cl_types::F64, f32_val);
-                    let result = builder.ins().bitcast(cl_types::I64, MemFlags::new(), f64_val);
+                    let result = builder
+                        .ins()
+                        .bitcast(cl_types::I64, MemFlags::new(), f64_val);
                     builder.def_var(var(vi), result);
                 }
 
@@ -4383,14 +4479,26 @@ impl CraneliftBackend {
                     let scale = builder.ins().iconst(cl_types::I64, 8);
                     let offset = builder.ins().imul(index, scale);
                     let addr = builder.ins().iadd(base, offset);
-                    let result = builder.ins().load(cl_types::I64, MemFlags::trusted(), addr, 0);
+                    let result = builder
+                        .ins()
+                        .load(cl_types::I64, MemFlags::trusted(), addr, 0);
                     builder.def_var(var(vi), result);
                 }
 
                 // ── Thread-local reference get ──
                 OpCode::ThreadlocalrefGet => {
-                    // Load from a thread-local slot. For now, return 0 (placeholder).
-                    let result = builder.ins().iconst(cl_types::I64, 0);
+                    // Load from a thread-local slot via runtime callback.
+                    // arg(0) = offset (in bytes) into the TLS area.
+                    let offset = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let result = emit_host_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        jit_threadlocalref_get as *const () as usize,
+                        &[offset],
+                        Some(cl_types::I64),
+                    )
+                    .expect("jit_threadlocalref_get must return a value");
                     builder.def_var(var(vi), result);
                 }
 
@@ -4413,6 +4521,43 @@ impl CraneliftBackend {
                     let scaled_index = builder.ins().imul(index, scale);
                     let addr = builder.ins().iadd(base, scaled_index);
                     let result = builder.ins().iadd(addr, offset);
+                    builder.def_var(var(vi), result);
+                }
+
+                // ── String allocation ──
+                // Newstr: allocate a byte string of length args[0].
+                // Newunicode: allocate a unicode string of length args[0].
+                // Layout: 16-byte header + length * char_size bytes.
+                OpCode::Newstr => {
+                    let len = resolve_opref(&mut builder, &constants, op.arg(0));
+                    // Byte string: 1 byte per char + 16-byte header
+                    let size = builder.ins().iadd_imm(len, 16);
+                    let result = emit_host_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        jit_malloc_nursery_shim as *const () as usize,
+                        &[size],
+                        Some(cl_types::I64),
+                    )
+                    .expect("jit_malloc_nursery_shim must return a value");
+                    builder.def_var(var(vi), result);
+                }
+                OpCode::Newunicode => {
+                    let len = resolve_opref(&mut builder, &constants, op.arg(0));
+                    // Unicode string: 4 bytes per char + 16-byte header
+                    let char_size = builder.ins().iconst(cl_types::I64, 4);
+                    let chars_total = builder.ins().imul(len, char_size);
+                    let size = builder.ins().iadd_imm(chars_total, 16);
+                    let result = emit_host_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        jit_malloc_nursery_shim as *const () as usize,
+                        &[size],
+                        Some(cl_types::I64),
+                    )
+                    .expect("jit_malloc_nursery_shim must return a value");
                     builder.def_var(var(vi), result);
                 }
 
@@ -4629,22 +4774,26 @@ impl majit_codegen::Backend for CraneliftBackend {
         // The bridge receives the guard's fail args as its inputs.
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref bridge) = *bridge_guard {
-            release_force_token(handle);
-            return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            if !jit_exc_is_pending() {
+                release_force_token(handle);
+                return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            }
         }
         drop(bridge_guard);
 
         let saved_data = take_force_frame_saved_data(&force_frame);
+        let exception = take_pending_jit_exception_ref();
         if fail_descr.force_token_slots.is_empty() {
             release_force_token(handle);
         }
 
         DeadFrame {
-            data: Box::new(FrameData::new_with_savedata(
+            data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
                 fail_descr.clone(),
                 compiled.gc_runtime_id,
                 saved_data,
+                (!exception.is_null()).then_some(exception),
             )),
         }
     }
@@ -4699,6 +4848,10 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn get_savedata_ref(&self, frame: &DeadFrame) -> GcRef {
         get_savedata_ref_from_deadframe(frame)
+    }
+
+    fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
+        grab_exc_value_from_deadframe(frame)
     }
 
     fn invalidate_loop(&self, token: &LoopToken) {
@@ -4817,6 +4970,35 @@ mod tests {
     fn may_force_ref_values() -> &'static Mutex<Vec<usize>> {
         static VALUES: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
         VALUES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    thread_local! {
+        static TEST_EXCEPTION_VALUE: Cell<i64> = const { Cell::new(0) };
+        static TEST_EXCEPTION_TYPE: Cell<i64> = const { Cell::new(0) };
+        static TEST_EXCEPTION_CALL_LOG: std::cell::RefCell<Vec<bool>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn set_test_exception_state(value: i64, exc_type: i64) {
+        TEST_EXCEPTION_VALUE.with(|cell| cell.set(value));
+        TEST_EXCEPTION_TYPE.with(|cell| cell.set(exc_type));
+    }
+
+    fn clear_test_exception_call_log() {
+        TEST_EXCEPTION_CALL_LOG.with(|log| log.borrow_mut().clear());
+    }
+
+    fn test_exception_call_log_snapshot() -> Vec<bool> {
+        TEST_EXCEPTION_CALL_LOG.with(|log| log.borrow().clone())
+    }
+
+    extern "C" fn maybe_raise_test_exception(flag: i64) {
+        TEST_EXCEPTION_CALL_LOG.with(|log| log.borrow_mut().push(jit_exc_is_pending()));
+        if flag != 0 {
+            let value = TEST_EXCEPTION_VALUE.with(Cell::get);
+            let exc_type = TEST_EXCEPTION_TYPE.with(Cell::get);
+            jit_exc_raise(value, exc_type);
+        }
     }
 
     extern "C" fn maybe_force_and_return_void(force_token: i64, flag: i64) {
@@ -5453,6 +5635,229 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 99);
+    }
+
+    #[test]
+    fn test_guard_exception_exact_match_returns_value_and_clears_deadframe_exception() {
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(0xABCDusize as i64, 0x1111);
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardException, &[OpRef(101)], 1);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, maybe_raise_test_exception as *const () as i64);
+        constants.insert(101, 0x1111);
+        constants.insert(102, 1);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(25);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(1)]);
+        assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0xABCDusize));
+        assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert!(!jit_exc_is_pending());
+
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert!(!jit_exc_is_pending());
+    }
+
+    #[test]
+    fn test_guard_exception_exact_mismatch_preserves_deadframe_exception() {
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(0xBEEFusize as i64, 0x2222);
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardException, &[OpRef(101)], 1);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, maybe_raise_test_exception as *const () as i64);
+        constants.insert(101, 0x1111);
+        constants.insert(102, 1);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(26);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(1)]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef(0xBEEFusize));
+        assert!(!jit_exc_is_pending());
+    }
+
+    #[test]
+    fn test_guard_no_exception_failure_preserves_deadframe_exception() {
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(0xCAFEusize as i64, 0x1111);
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(103)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, maybe_raise_test_exception as *const () as i64);
+        constants.insert(102, 1);
+        constants.insert(103, 0);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(27);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(1)]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef(0xCAFEusize));
+        assert!(!jit_exc_is_pending());
+
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert!(!jit_exc_is_pending());
+    }
+
+    #[test]
+    fn test_save_restore_exception_roundtrip_matches_rpython_order() {
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(0xD00Dusize as i64, 0x3333);
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardException, &[OpRef(101)], 3);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallN,
+                &[OpRef(100), OpRef(0)],
+                OpRef::NONE.0,
+                descr.clone(),
+            ),
+            mk_op(OpCode::SaveExcClass, &[], 1),
+            mk_op(OpCode::SaveException, &[], 2),
+            mk_op_with_descr(
+                OpCode::CallN,
+                &[OpRef(100), OpRef(103)],
+                OpRef::NONE.0,
+                descr,
+            ),
+            mk_op(
+                OpCode::RestoreException,
+                &[OpRef(1), OpRef(2)],
+                OpRef::NONE.0,
+            ),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, maybe_raise_test_exception as *const () as i64);
+        constants.insert(101, 0x3333);
+        constants.insert(102, 1);
+        constants.insert(103, 0);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(28);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(1)]);
+        assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0xD00Dusize));
+        assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert_eq!(test_exception_call_log_snapshot(), vec![false, false]);
+        assert!(!jit_exc_is_pending());
+    }
+
+    #[test]
+    fn test_deadframe_exception_ref_survives_collection_after_execute_token() {
+        jit_exc_clear();
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 48,
+            large_object_threshold: 1024,
+        });
+        gc.register_type(TypeInfo::simple(16));
+
+        let exception_ref = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(exception_ref.0));
+        unsafe {
+            *(exception_ref.0 as *mut u64) = 0xCAFEBABE;
+        }
+
+        set_test_exception_state(exception_ref.0 as i64, 0x4444);
+        clear_test_exception_call_log();
+
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let runtime_id = backend
+            .gc_runtime_id
+            .expect("GC runtime must be configured");
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(103)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, maybe_raise_test_exception as *const () as i64);
+        constants.insert(102, 1);
+        constants.insert(103, 0);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(29);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(1)]);
+        with_gc_runtime(runtime_id, |gc| gc.collect_nursery());
+
+        let moved = backend.grab_exc_value(&frame);
+        assert!(!moved.is_null());
+        assert_ne!(moved, exception_ref);
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xCAFEBABE);
     }
 
     // ── Debug / no-op tests ──
@@ -7463,7 +7868,11 @@ mod tests {
             OpRef(1),
         ]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Label,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+                OpRef::NONE.0,
+            ),
             mk_op(OpCode::ForceToken, &[], 3),
             mk_op_with_descr(
                 OpCode::CallMayForceR,
