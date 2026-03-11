@@ -332,6 +332,20 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
+    fn postprocess_int_floordiv(&mut self, op: &Op, ctx: &OptContext) {
+        let b0 = self.get_bound(op.arg(0), ctx);
+        let b1 = self.get_bound(op.arg(1), ctx);
+        let b = b0.floordiv_bound(&b1);
+        self.intersect_bound(op.pos, &b);
+    }
+
+    fn postprocess_int_mod(&mut self, op: &Op, ctx: &OptContext) {
+        let b0 = self.get_bound(op.arg(0), ctx);
+        let b1 = self.get_bound(op.arg(1), ctx);
+        let b = b0.mod_bound(&b1);
+        self.intersect_bound(op.pos, &b);
+    }
+
     fn postprocess_int_neg(&mut self, op: &Op, ctx: &OptContext) {
         let b = self.get_bound(op.arg(0), ctx);
         let result = b.neg_bound();
@@ -999,6 +1013,14 @@ impl OptimizationPass for OptIntBounds {
             }
             OpCode::UintRshift => {
                 self.postprocess_uint_rshift(op, ctx);
+                PassResult::PassOn
+            }
+            OpCode::IntFloorDiv => {
+                self.postprocess_int_floordiv(op, ctx);
+                PassResult::PassOn
+            }
+            OpCode::IntMod => {
+                self.postprocess_int_mod(op, ctx);
                 PassResult::PassOn
             }
             OpCode::IntNeg => {

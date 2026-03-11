@@ -3,6 +3,7 @@
 /// Translates majit IR traces into native code via Cranelift, then
 /// executes them as ordinary function pointers.
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -303,6 +304,7 @@ impl CraneliftBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[Op],
+        invalidation_flag_ptr: Option<usize>,
     ) -> Result<CompiledLoop, BackendError> {
         let ptr_type = self.module.target_config().pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
@@ -798,9 +800,51 @@ impl CraneliftBackend {
                     let _ = info;
                 }
 
-                OpCode::GuardNotInvalidated
-                | OpCode::GuardFutureCondition
-                | OpCode::GuardAlwaysFails => {
+                OpCode::GuardNotInvalidated => {
+                    let info = &guard_infos[guard_idx];
+                    guard_idx += 1;
+
+                    if let Some(flag_addr) = invalidation_flag_ptr {
+                        // Load the invalidation flag (AtomicBool, 1 byte) from
+                        // the known address baked into the generated code.
+                        let addr_val =
+                            builder.ins().iconst(cl_types::I64, flag_addr as i64);
+                        let flag_val = builder.ins().load(
+                            cl_types::I8,
+                            MemFlags::trusted(),
+                            addr_val,
+                            0,
+                        );
+                        let zero = builder.ins().iconst(cl_types::I8, 0);
+                        let is_invalidated =
+                            builder.ins().icmp(IntCC::NotEqual, flag_val, zero);
+
+                        let exit_block = builder.create_block();
+                        let cont_block = builder.create_block();
+
+                        builder.ins().brif(
+                            is_invalidated,
+                            exit_block,
+                            &[],
+                            cont_block,
+                            &[],
+                        );
+
+                        builder.switch_to_block(exit_block);
+                        builder.seal_block(exit_block);
+                        emit_guard_exit(
+                            &mut builder,
+                            &constants,
+                            outputs_ptr,
+                            info,
+                        );
+
+                        builder.switch_to_block(cont_block);
+                        builder.seal_block(cont_block);
+                    }
+                }
+
+                OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
                     let _ = info;
@@ -1550,7 +1594,10 @@ impl majit_codegen::Backend for CraneliftBackend {
         token: &mut LoopToken,
     ) -> Result<AsmInfo, BackendError> {
         token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
-        let compiled = self.do_compile(inputargs, ops)?;
+        // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
+        // can load from it at runtime.
+        let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
+        let compiled = self.do_compile(inputargs, ops, Some(flag_ptr))?;
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
             code_size: compiled.code_size,
@@ -1568,7 +1615,10 @@ impl majit_codegen::Backend for CraneliftBackend {
     ) -> Result<AsmInfo, BackendError> {
         // Compile the bridge trace as a standalone function using the same
         // code generation path as compile_loop.
-        let compiled = self.do_compile(inputargs, ops)?;
+        // Bridges share the parent loop's invalidation flag.
+        let flag_ptr =
+            Arc::as_ptr(&original_token.invalidated) as *const AtomicBool as usize;
+        let compiled = self.do_compile(inputargs, ops, Some(flag_ptr))?;
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
             code_size: compiled.code_size,
@@ -1680,8 +1730,8 @@ impl majit_codegen::Backend for CraneliftBackend {
             .get_ref(index)
     }
 
-    fn invalidate_loop(&self, _token: &LoopToken) {
-        // TODO: patch compiled code for invalidation
+    fn invalidate_loop(&self, token: &LoopToken) {
+        token.invalidate();
     }
 }
 
@@ -3426,5 +3476,154 @@ mod tests {
         // Guard passes on x=5, y=7 -> original path returns 5 + 7 = 12
         let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(7)]);
         assert_eq!(backend.get_int_value(&frame, 0), 12);
+    }
+
+    #[test]
+    fn test_guard_not_invalidated_passes() {
+        // GUARD_NOT_INVALIDATED should pass (not side-exit) when the loop
+        // has not been invalidated.
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            // GUARD_NOT_INVALIDATED takes no data args
+            mk_op(OpCode::GuardNotInvalidated, &[], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+
+        let mut token = LoopToken::new(100);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Not invalidated -> guard passes -> Finish returns 10 + 32 = 42
+        let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(32)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 42);
+    }
+
+    #[test]
+    fn test_guard_not_invalidated_fails_after_invalidation() {
+        // After calling invalidate(), GUARD_NOT_INVALIDATED should fail and
+        // the compiled code should side-exit through the guard's fail path.
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+
+        // Build a guard with explicit fail_args so we can inspect them.
+        let mut guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
+        guard_op.pos = OpRef(OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0), OpRef(1)]));
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            guard_op,
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+
+        let mut token = LoopToken::new(101);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Before invalidation: guard passes, Finish is reached.
+        let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(32)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 42);
+
+        // Invalidate the loop.
+        token.invalidate();
+        assert!(token.is_invalidated());
+
+        // After invalidation: guard fails, side-exits with the guard's fail args.
+        let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(32)]);
+        // The guard's fail_args are [OpRef(0), OpRef(1)] = the input values.
+        let descr = backend.get_latest_descr(&frame);
+        // fail_index 0 is the GuardNotInvalidated guard (first guard in the trace).
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 10);
+        assert_eq!(backend.get_int_value(&frame, 1), 32);
+    }
+
+    #[test]
+    fn test_guard_not_invalidated_in_loop() {
+        // Verify GUARD_NOT_INVALIDATED works inside a loop that runs
+        // multiple iterations before being invalidated.
+        let mut backend = CraneliftBackend::new();
+
+        // Loop: i = i + 1; guard_not_invalidated; guard i < limit; jump
+        let inputargs = vec![InputArg::new_int(0)];
+
+        let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
+        guard_inv.pos = OpRef(OpRef::NONE.0);
+        guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1)]));
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1), // i = i + 1
+            guard_inv,                                          // guard_not_invalidated
+            mk_op(OpCode::IntLt, &[OpRef(1), OpRef(101)], 2),  // i < 1000000
+            mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0),
+            mk_op(OpCode::Jump, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, 1i64);
+        constants.insert(101, 1_000_000i64);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(102);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Without invalidation: runs to completion (i reaches 1000000,
+        // GuardTrue fails).
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr(&frame);
+        // fail_index 1 = GuardTrue (second guard)
+        assert_eq!(descr.fail_index(), 1);
+        assert_eq!(backend.get_int_value(&frame, 0), 999_999);
+
+        // Now invalidate and run again: should fail at GuardNotInvalidated
+        // on the first iteration.
+        token.invalidate();
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr(&frame);
+        // fail_index 0 = GuardNotInvalidated (first guard)
+        assert_eq!(descr.fail_index(), 0);
+        // i = 0 + 1 = 1 (only one iteration before guard fails)
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+    }
+
+    #[test]
+    fn test_invalidate_via_backend_trait() {
+        // Verify that Backend::invalidate_loop() properly sets the flag.
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+
+        let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
+        guard_inv.pos = OpRef(OpRef::NONE.0);
+        guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard_inv,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        let mut token = LoopToken::new(103);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Before invalidation
+        let frame = backend.execute_token(&token, &[Value::Int(99)]);
+        // Finish (fail_index 1)
+        assert_eq!(backend.get_int_value(&frame, 0), 99);
+
+        // Invalidate via the Backend trait method
+        backend.invalidate_loop(&token);
+        assert!(token.is_invalidated());
+
+        // After invalidation: guard fails
+        let frame = backend.execute_token(&token, &[Value::Int(99)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 99);
     }
 }

@@ -3,6 +3,9 @@
 /// Translated from rpython/jit/backend/model.py (AbstractCPU).
 /// The Backend trait is the contract between the JIT frontend (tracing + optimization)
 /// and the code generation backend (Cranelift, etc.).
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use majit_ir::{FailDescr, InputArg, Op, Type, Value};
 
 /// Result of compiling a loop or bridge.
@@ -22,6 +25,10 @@ pub struct LoopToken {
     pub inputarg_types: Vec<Type>,
     /// Backend-specific compiled data.
     pub compiled: Option<Box<dyn std::any::Any + Send>>,
+    /// Flag indicating whether the compiled code has been invalidated.
+    /// When set to `true`, any `GUARD_NOT_INVALIDATED` in the compiled
+    /// code will fail, causing execution to bail out to the interpreter.
+    pub invalidated: Arc<AtomicBool>,
 }
 
 impl LoopToken {
@@ -30,7 +37,19 @@ impl LoopToken {
             number,
             inputarg_types: Vec::new(),
             compiled: None,
+            invalidated: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Mark this loop as invalidated. Any subsequent execution of
+    /// GUARD_NOT_INVALIDATED in the compiled code will fail.
+    pub fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
+    }
+
+    /// Check whether this loop has been invalidated.
+    pub fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
     }
 }
 

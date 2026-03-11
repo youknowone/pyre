@@ -16,3 +16,4 @@ target-lexicon = "0.12"
 [dev-dependencies]
 majit-opt = { path = "../majit-opt" }
 majit-trace = { path = "../majit-trace" }
+smallvec = "1"
