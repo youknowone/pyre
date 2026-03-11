@@ -178,6 +178,7 @@ pub enum OpCode {
     IntMul,
     UintMulHigh,
     IntFloorDiv,
+    IntMod,
     IntAnd,
     IntOr,
     IntXor,
@@ -191,6 +192,8 @@ pub enum OpCode {
     FloatSub,
     FloatMul,
     FloatTrueDiv,
+    FloatFloorDiv,
+    FloatMod,
     FloatNeg,
     FloatAbs,
 
@@ -911,6 +914,7 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(IntMul, 2);
     set!(UintMulHigh, 2);
     set!(IntFloorDiv, 2);
+    set!(IntMod, 2);
     set!(IntAnd, 2);
     set!(IntOr, 2);
     set!(IntXor, 2);
@@ -922,6 +926,8 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(FloatSub, 2);
     set!(FloatMul, 2);
     set!(FloatTrueDiv, 2);
+    set!(FloatFloorDiv, 2);
+    set!(FloatMod, 2);
     set!(FloatNeg, 1);
     set!(FloatAbs, 1);
     // Casts (unary)
@@ -1283,6 +1289,7 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         IntMul,
         UintMulHigh,
         IntFloorDiv,
+        IntMod,
         IntAnd,
         IntOr,
         IntXor,
@@ -1373,6 +1380,8 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         FloatSub,
         FloatMul,
         FloatTrueDiv,
+        FloatFloorDiv,
+        FloatMod,
         FloatNeg,
         FloatAbs,
         CastIntToFloat,
@@ -1492,6 +1501,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         IntMul,
         UintMulHigh,
         IntFloorDiv,
+        IntMod,
         IntAnd,
         IntOr,
         IntXor,
@@ -1503,6 +1513,8 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         FloatSub,
         FloatMul,
         FloatTrueDiv,
+        FloatFloorDiv,
+        FloatMod,
         FloatNeg,
         FloatAbs,
         CastFloatToInt,
