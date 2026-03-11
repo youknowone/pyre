@@ -9,7 +9,5 @@ members = [
     "majit-gc",
     "majit-macros",
     "majit-runtime",
-    "examples/calc",
     "examples/tlr",
-    "examples/tl",
 ]

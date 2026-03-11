@@ -1,188 +1,103 @@
-/// The bytecode interpreter for TLR (Toy Language - Register).
+/// Interpreter for TLR — direct translation of rpython/jit/tl/tlr.py:interpret().
 ///
-/// Port of rpython/jit/tl/tlr.py:interpret().
-/// Register-based with a single accumulator.
-use crate::bytecode::ByteCode;
+/// Bytecode format is identical: &[u8] with single-byte opcodes and args.
 
-pub struct TlrInterp {
-    /// Accumulator register.
-    a: i64,
-    /// General-purpose register file.
-    regs: Vec<i64>,
-    /// Program counter.
-    pc: usize,
-}
+const MOV_A_R: u8 = 1;
+const MOV_R_A: u8 = 2;
+const JUMP_IF_A: u8 = 3;
+const SET_A: u8 = 4;
+const ADD_R_TO_A: u8 = 5;
+const RETURN_A: u8 = 6;
+const ALLOCATE: u8 = 7;
+const NEG_A: u8 = 8;
 
-impl TlrInterp {
-    pub fn new() -> Self {
-        Self {
-            a: 0,
-            regs: Vec::new(),
-            pc: 0,
-        }
-    }
+pub fn interpret(bytecode: &[u8], a: i64) -> i64 {
+    let mut regs: Vec<i64> = Vec::new();
+    let mut pc: usize = 0;
+    let mut a = a;
 
-    pub fn reset(&mut self) {
-        self.a = 0;
-        self.regs.clear();
-        self.pc = 0;
-    }
+    loop {
+        // jitdriver.jit_merge_point(...)
+        let opcode = bytecode[pc];
+        pc += 1;
 
-    /// Execute the bytecode program with initial accumulator value.
-    pub fn run(&mut self, bytecode: &[ByteCode], initial_a: i64) -> i64 {
-        self.a = initial_a;
-        self.pc = 0;
-        self.regs.clear();
-
-        loop {
-            let instr = &bytecode[self.pc];
-            self.pc += 1;
-            match instr {
-                ByteCode::MovAR(n) => {
-                    self.regs[*n as usize] = self.a;
-                }
-                ByteCode::MovRA(n) => {
-                    self.a = self.regs[*n as usize];
-                }
-                ByteCode::JumpIfA(target) => {
-                    if self.a != 0 {
-                        self.pc = *target as usize;
-                    }
-                }
-                ByteCode::SetA(val) => {
-                    self.a = *val;
-                }
-                ByteCode::AddRToA(n) => {
-                    self.a += self.regs[*n as usize];
-                }
-                ByteCode::ReturnA => {
-                    return self.a;
-                }
-                ByteCode::Allocate(n) => {
-                    self.regs = vec![0; *n as usize];
-                }
-                ByteCode::NegA => {
-                    self.a = -self.a;
-                }
+        if opcode == MOV_A_R {
+            let n = bytecode[pc] as usize;
+            pc += 1;
+            regs[n] = a;
+        } else if opcode == MOV_R_A {
+            let n = bytecode[pc] as usize;
+            pc += 1;
+            a = regs[n];
+        } else if opcode == JUMP_IF_A {
+            let target = bytecode[pc] as usize;
+            pc += 1;
+            if a != 0 {
+                // if target < pc: can_enter_jit(...)
+                pc = target;
             }
+        } else if opcode == SET_A {
+            a = bytecode[pc] as i64;
+            pc += 1;
+        } else if opcode == ADD_R_TO_A {
+            let n = bytecode[pc] as usize;
+            pc += 1;
+            a += regs[n];
+        } else if opcode == RETURN_A {
+            return a;
+        } else if opcode == ALLOCATE {
+            let n = bytecode[pc] as usize;
+            pc += 1;
+            regs = vec![0; n];
+        } else if opcode == NEG_A {
+            a = -a;
         }
-    }
-
-    // -- Public accessors for JIT integration --
-
-    pub fn pc(&self) -> usize {
-        self.pc
-    }
-
-    pub fn set_pc(&mut self, pc: usize) {
-        self.pc = pc;
-    }
-
-    pub fn accumulator(&self) -> i64 {
-        self.a
-    }
-
-    pub fn set_accumulator(&mut self, a: i64) {
-        self.a = a;
-    }
-
-    pub fn get_reg(&self, n: u8) -> i64 {
-        self.regs[n as usize]
-    }
-
-    pub fn set_reg(&mut self, n: u8, val: i64) {
-        self.regs[n as usize] = val;
-    }
-
-    pub fn num_regs(&self) -> usize {
-        self.regs.len()
-    }
-
-    pub fn ensure_regs(&mut self, n: usize) {
-        if self.regs.len() < n {
-            self.regs.resize(n, 0);
-        }
-    }
-}
-
-impl Default for TlrInterp {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::*;
 
-    #[test]
-    fn test_set_and_return() {
-        let prog = vec![ByteCode::SetA(42), ByteCode::ReturnA];
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, 0), 42);
+    fn square_bytecode() -> Vec<u8> {
+        vec![
+            ALLOCATE, 3, MOV_A_R, 0, MOV_A_R, 1, SET_A, 0, MOV_A_R, 2,
+            SET_A, 1, NEG_A, ADD_R_TO_A, 0, MOV_A_R, 0,
+            MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2,
+            MOV_R_A, 0, JUMP_IF_A, 10,
+            MOV_R_A, 2, RETURN_A,
+        ]
     }
 
     #[test]
-    fn test_accumulator_passthrough() {
-        let prog = vec![ByteCode::ReturnA];
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, 99), 99);
-    }
-
-    #[test]
-    fn test_allocate_and_mov() {
-        let prog = vec![
-            ByteCode::Allocate(3),
-            ByteCode::SetA(7),
-            ByteCode::MovAR(1),
-            ByteCode::SetA(0),
-            ByteCode::AddRToA(1),
-            ByteCode::ReturnA,
-        ];
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, 0), 7);
-    }
-
-    #[test]
-    fn test_neg() {
-        let prog = vec![ByteCode::SetA(5), ByteCode::NegA, ByteCode::ReturnA];
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, 0), -5);
+    fn test_square_1() {
+        assert_eq!(interpret(&square_bytecode(), 1), 1);
     }
 
     #[test]
     fn test_square_5() {
-        let (prog, a) = square_program(5);
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, a), 25);
+        assert_eq!(interpret(&square_bytecode(), 5), 25);
+    }
+
+    #[test]
+    fn test_square_10() {
+        assert_eq!(interpret(&square_bytecode(), 10), 100);
     }
 
     #[test]
     fn test_square_100() {
-        let (prog, a) = square_program(100);
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, a), 10_000);
+        assert_eq!(interpret(&square_bytecode(), 100), 10_000);
     }
 
     #[test]
-    fn test_sum_10() {
-        let (prog, a) = sum_program(10);
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, a), 45);
+    fn test_simple_return() {
+        let prog = vec![RETURN_A];
+        assert_eq!(interpret(&prog, 42), 42);
     }
 
     #[test]
-    fn test_sum_100() {
-        let (prog, a) = sum_program(100);
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, a), 4950);
-    }
-
-    #[test]
-    fn test_sum_1000() {
-        let (prog, a) = sum_program(1000);
-        let mut interp = TlrInterp::new();
-        assert_eq!(interp.run(&prog, a), 499_500);
+    fn test_set_and_return() {
+        let prog = vec![SET_A, 7, RETURN_A];
+        assert_eq!(interpret(&prog, 0), 7);
     }
 }
