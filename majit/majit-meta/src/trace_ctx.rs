@@ -1,0 +1,284 @@
+use majit_ir::{DescrRef, OpCode, OpRef, Type};
+use majit_trace::recorder::TraceRecorder;
+
+use crate::call_descr::make_call_descr;
+use crate::constant_pool::ConstantPool;
+use crate::fail_descr::make_fail_descr;
+use crate::symbolic_stack::SymbolicStack;
+use crate::TraceAction;
+
+/// Tracing context: wraps TraceRecorder + ConstantPool with convenience API.
+///
+/// The interpreter uses this during trace recording to:
+/// - Record IR operations
+/// - Manage constants (with deduplication)
+/// - Record guards (with auto-generated FailDescr)
+/// - Record function calls (with auto-generated CallDescr)
+pub struct TraceCtx {
+    pub(crate) recorder: TraceRecorder,
+    pub(crate) green_key: u64,
+    pub(crate) constants: ConstantPool,
+}
+
+impl TraceCtx {
+    pub(crate) fn new(recorder: TraceRecorder, green_key: u64) -> Self {
+        TraceCtx {
+            recorder,
+            green_key,
+            constants: ConstantPool::new(),
+        }
+    }
+
+    /// Get or create a constant OpRef for a given i64 value.
+    pub fn const_int(&mut self, value: i64) -> OpRef {
+        self.constants.get_or_insert(value)
+    }
+
+    /// Record a regular IR operation.
+    pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
+        self.recorder.record_op(opcode, args)
+    }
+
+    /// Record an operation with a descriptor (e.g., calls).
+    pub fn record_op_with_descr(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: DescrRef,
+    ) -> OpRef {
+        self.recorder.record_op_with_descr(opcode, args, descr)
+    }
+
+    /// Record a guard with auto-generated FailDescr.
+    ///
+    /// `num_live` is the number of live integer values (for the FailDescr).
+    pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
+        let descr = make_fail_descr(num_live);
+        self.recorder.record_guard(opcode, args, descr)
+    }
+
+    /// Record a guard with explicit fail_args.
+    pub fn record_guard_with_fail_args(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        num_live: usize,
+        fail_args: &[OpRef],
+    ) -> OpRef {
+        let descr = make_fail_descr(num_live);
+        self.recorder
+            .record_guard_with_fail_args(opcode, args, descr, fail_args)
+    }
+
+    /// Record a void-returning function call (CallN).
+    ///
+    /// Automatically registers the function pointer as a constant and
+    /// creates a CallDescr. The interpreter doesn't need to manage
+    /// function pointer constants or CallDescr implementations.
+    pub fn call_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Void);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallN, &call_args, descr);
+    }
+
+    /// Record an integer-returning function call (CallI).
+    ///
+    /// Same convenience as `call_void` but returns an OpRef for the result.
+    pub fn call_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Int);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallI, &call_args, descr)
+    }
+
+    /// Whether the trace has exceeded the maximum allowed length.
+    pub fn is_too_long(&self) -> bool {
+        self.recorder.is_too_long()
+    }
+
+    /// The green key (loop header PC) for this trace.
+    pub fn green_key(&self) -> u64 {
+        self.green_key
+    }
+
+    /// Record a promote: emit GuardValue to specialize on a runtime value.
+    ///
+    /// In RPython this is `jit.promote(x)` — it records a `GUARD_VALUE`
+    /// that asserts the runtime value equals the constant captured during
+    /// tracing. After the guard, the optimizer treats the value as constant.
+    ///
+    /// `opref` is the traced value, `runtime_value` is the current concrete
+    /// value seen at trace time.
+    pub fn promote_int(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
+        let const_ref = self.const_int(runtime_value);
+        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        const_ref
+    }
+
+    /// Record a ref-typed promote (GUARD_VALUE for GC references).
+    pub fn promote_ref(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
+        let const_ref = self.const_int(runtime_value);
+        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        const_ref
+    }
+
+    /// Record a call to an elidable (pure) function.
+    ///
+    /// In RPython, `@jit.elidable` marks a function whose result depends
+    /// only on its arguments and has no side effects. The optimizer can
+    /// constant-fold calls where all args are constants, or CSE identical calls.
+    ///
+    /// This records a CALL_PURE_I (or CALL_PURE_R/CALL_PURE_N) which the
+    /// optimizer's pure pass can eliminate.
+    pub fn call_elidable_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Int);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallPureI, &call_args, descr)
+    }
+
+    /// Record a void-returning call to a may-force function (e.g., one that
+    /// may trigger GC or exceptions).
+    ///
+    /// In RPython this is `call_may_force` — a call that may force virtualizable
+    /// frames or raise exceptions. Must be followed by `GUARD_NOT_FORCED`.
+    pub fn call_may_force_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Int);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallMayForceI, &call_args, descr)
+    }
+
+    /// Record a ref-returning call to a may-force function.
+    pub fn call_may_force_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Ref);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallMayForceR, &call_args, descr)
+    }
+
+    /// Record a void-returning call to a may-force function.
+    pub fn call_may_force_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Void);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallMayForceN, &call_args, descr);
+    }
+
+    /// Record a call with GIL release (for C extensions / external libs).
+    ///
+    /// In RPython this is `call_release_gil`. The GIL is released before the
+    /// call and reacquired after. Used for long-running C functions.
+    pub fn call_release_gil_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Int);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallReleaseGilI, &call_args, descr)
+    }
+
+    /// Record a call to a loop-invariant function.
+    ///
+    /// The result is cached for the duration of one loop iteration.
+    /// In RPython, `@jit.loop_invariant` marks such functions.
+    pub fn call_loopinvariant_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Int);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallLoopinvariantI, &call_args, descr)
+    }
+
+    /// Record GUARD_NOT_FORCED (must follow a call_may_force).
+    pub fn guard_not_forced(&mut self, num_live: usize) -> OpRef {
+        self.record_guard(OpCode::GuardNotForced, &[], num_live)
+    }
+
+    /// Record GUARD_NO_EXCEPTION (check no pending exception).
+    pub fn guard_no_exception(&mut self, num_live: usize) -> OpRef {
+        self.record_guard(OpCode::GuardNoException, &[], num_live)
+    }
+
+    /// Record GUARD_NOT_INVALIDATED (check loop not invalidated).
+    pub fn guard_not_invalidated(&mut self, num_live: usize) -> OpRef {
+        self.record_guard(OpCode::GuardNotInvalidated, &[], num_live)
+    }
+
+    // ── Convenience methods for common trace patterns ───────────────
+
+    /// Pop two operands, record a binary operation, push the result.
+    ///
+    /// Handles the common stack pattern: `a, b → op(a, b)`.
+    /// Note: pops in stack order (top first), but passes to IR as `[second, first]`
+    /// so that the left operand comes first.
+    pub fn trace_binop(&mut self, stack: &mut SymbolicStack, opcode: OpCode) {
+        let r1 = stack.pop().unwrap();
+        let r2 = stack.pop().unwrap();
+        let result = self.record_op(opcode, &[r2, r1]);
+        stack.push(result);
+    }
+
+    /// Push a constant integer value onto the symbolic stack.
+    pub fn trace_push_const(&mut self, stack: &mut SymbolicStack, value: i64) {
+        let opref = self.const_int(value);
+        stack.push(opref);
+    }
+
+    /// Pop one value and call a void function with it.
+    ///
+    /// Common pattern for output operations (e.g., POPNUM, POPCHAR).
+    pub fn trace_call_void_1(&mut self, stack: &mut SymbolicStack, func_ptr: *const ()) {
+        let value = stack.pop().unwrap();
+        self.call_void(func_ptr, &[value]);
+    }
+
+    /// Pop a boolean-like stack value, record the matching guard, and return
+    /// whether tracing should continue or close the loop.
+    ///
+    /// `branch_taken` is the runtime branch result, while `taken_when_true`
+    /// describes whether the interpreter takes the branch on a non-zero value.
+    pub fn trace_branch_guard(
+        &mut self,
+        stack: &mut SymbolicStack,
+        branch_taken: bool,
+        taken_when_true: bool,
+        num_live: usize,
+        close_loop_on_taken: bool,
+    ) -> TraceAction {
+        let cond = stack.pop().unwrap();
+        let opcode = if branch_taken == taken_when_true {
+            OpCode::GuardTrue
+        } else {
+            OpCode::GuardFalse
+        };
+        self.record_guard(opcode, &[cond], num_live);
+        if branch_taken && close_loop_on_taken {
+            TraceAction::CloseLoop
+        } else {
+            TraceAction::Continue
+        }
+    }
+}

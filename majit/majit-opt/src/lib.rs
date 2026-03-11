@@ -18,6 +18,7 @@ pub mod rewrite;
 pub mod simplify;
 pub mod unroll;
 pub mod virtualize;
+pub mod virtualstate;
 pub mod vstring;
 
 use majit_ir::{Op, OpRef, Value};
