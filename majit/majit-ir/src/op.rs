@@ -63,6 +63,68 @@ impl Op {
     }
 }
 
+impl std::fmt::Display for Op {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.opcode.is_guard() {
+            write!(f, "{:?}(", self.opcode)?;
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "v{}", arg.0)?;
+            }
+            write!(f, ")")
+        } else if self.opcode.result_type() != Type::Void {
+            write!(f, "v{} = {:?}(", self.pos.0, self.opcode)?;
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "v{}", arg.0)?;
+            }
+            write!(f, ")")
+        } else {
+            write!(f, "{:?}(", self.opcode)?;
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "v{}", arg.0)?;
+            }
+            write!(f, ")")
+        }
+    }
+}
+
+/// Format a trace (list of ops) with optional constants for debugging.
+pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for op in ops {
+        // Replace known constants in display
+        write!(out, "  ").unwrap();
+        if op.opcode.is_guard() {
+            write!(out, "{:?}(", op.opcode).unwrap();
+        } else if op.opcode.result_type() != Type::Void {
+            write!(out, "v{} = {:?}(", op.pos.0, op.opcode).unwrap();
+        } else {
+            write!(out, "{:?}(", op.opcode).unwrap();
+        }
+        for (i, arg) in op.args.iter().enumerate() {
+            if i > 0 {
+                write!(out, ", ").unwrap();
+            }
+            if let Some(&val) = constants.get(&arg.0) {
+                write!(out, "{val}").unwrap();
+            } else {
+                write!(out, "v{}", arg.0).unwrap();
+            }
+        }
+        writeln!(out, ")").unwrap();
+    }
+    out
+}
+
 /// All JIT IR opcodes.
 ///
 /// Faithfully mirrors rpython/jit/metainterp/resoperation.py `_oplist`.

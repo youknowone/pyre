@@ -7,5 +7,5 @@ pub use descr::{
     ArrayDescr, CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, FailDescr, FieldDescr,
     InteriorFieldDescr, OopSpecIndex, SizeDescr,
 };
-pub use op::{Op, OpCode, OpRef, OPCODE_COUNT};
+pub use op::{format_trace, Op, OpCode, OpRef, OPCODE_COUNT};
 pub use value::{Const, GcRef, InputArg, Type, Value, FAILARGS_LIMIT};

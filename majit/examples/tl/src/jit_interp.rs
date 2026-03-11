@@ -361,7 +361,18 @@ impl JitTlInterp {
 
         let mut optimizer = Optimizer::default_pipeline();
         let mut constants = state.constants;
+
+        if std::env::var("MAJIT_LOG").is_ok() {
+            eprintln!("--- trace (before opt) ---");
+            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
+        }
+
         let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
+
+        if std::env::var("MAJIT_LOG").is_ok() {
+            eprintln!("--- trace (after opt) ---");
+            eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
+        }
 
         self.backend.set_constants(constants);
 
