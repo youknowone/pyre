@@ -297,6 +297,9 @@ pub enum OpCode {
     LoadFromGcTable,
     LoadEffectiveAddress,
 
+    // ── Thread-local reference ──
+    ThreadlocalrefGet,
+
     // ── No side effect (but not always pure) ──
     GcLoadI,
     GcLoadR,
@@ -310,6 +313,7 @@ pub enum OpCode {
     GetarrayitemGcR,
     GetarrayitemGcF,
     GetarrayitemRawI,
+    GetarrayitemRawR,
     GetarrayitemRawF,
     RawLoadI,
     RawLoadF,
@@ -421,6 +425,7 @@ pub enum OpCode {
     CallLoopinvariantF,
     CallLoopinvariantN,
     CallReleaseGilI,
+    CallReleaseGilR,
     CallReleaseGilF,
     CallReleaseGilN,
     CallPureI,
@@ -620,7 +625,7 @@ impl OpCode {
     pub fn is_call_release_gil(self) -> bool {
         matches!(
             self,
-            OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN
+            OpCode::CallReleaseGilI | OpCode::CallReleaseGilR | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN
         )
     }
 
@@ -1015,6 +1020,8 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(Unicodegetitem, 2);
     set!(LoadFromGcTable, 1);
     set!(LoadEffectiveAddress, 4);
+    // Thread-local
+    set!(ThreadlocalrefGet, 0);
     // GC load
     set!(GcLoadI, 3);
     set!(GcLoadR, 3);
@@ -1027,6 +1034,7 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(GetarrayitemGcR, 2);
     set!(GetarrayitemGcF, 2);
     set!(GetarrayitemRawI, 2);
+    set!(GetarrayitemRawR, 2);
     set!(GetarrayitemRawF, 2);
     set!(RawLoadI, 2);
     set!(RawLoadF, 2);
@@ -1149,6 +1157,7 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         GetarrayitemGcR,
         GetarrayitemGcF,
         GetarrayitemRawI,
+        GetarrayitemRawR,
         GetarrayitemRawF,
         RawLoadI,
         RawLoadF,
@@ -1209,6 +1218,7 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         CallLoopinvariantF,
         CallLoopinvariantN,
         CallReleaseGilI,
+        CallReleaseGilR,
         CallReleaseGilF,
         CallReleaseGilN,
         CallPureI,
@@ -1216,6 +1226,7 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         CallPureF,
         CallPureN,
         CallMallocNurseryVarsize,
+        ThreadlocalrefGet,
         RecordKnownResult
     );
     t
@@ -1424,6 +1435,7 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         GcLoadR,
         GcLoadIndexedR,
         GetarrayitemGcR,
+        GetarrayitemRawR,
         GetinteriorfieldGcR,
         GetfieldGcR,
         GetfieldRawR,
@@ -1443,6 +1455,8 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         CallMayForceR,
         CallAssemblerR,
         CallLoopinvariantR,
+        CallReleaseGilR,
+        ThreadlocalrefGet,
         CallMallocNursery,
         CallMallocNurseryVarsize,
         CallMallocNurseryVarsizeFrame,
@@ -1595,6 +1609,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         Unicodegetitem,
         LoadFromGcTable,
         LoadEffectiveAddress,
+        ThreadlocalrefGet,
         GcLoadI,
         GcLoadR,
         GcLoadF,
@@ -1605,6 +1620,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         GetarrayitemGcR,
         GetarrayitemGcF,
         GetarrayitemRawI,
+        GetarrayitemRawR,
         GetarrayitemRawF,
         RawLoadI,
         RawLoadF,
@@ -1690,6 +1706,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         CallLoopinvariantF,
         CallLoopinvariantN,
         CallReleaseGilI,
+        CallReleaseGilR,
         CallReleaseGilF,
         CallReleaseGilN,
         CallPureI,
