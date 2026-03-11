@@ -13,4 +13,5 @@ members = [
     "examples/tl",
     "examples/tla",
     "examples/tiny2",
+    "examples/tiny3",
 ]
