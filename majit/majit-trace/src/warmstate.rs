@@ -6,10 +6,12 @@
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseJitCell
 use std::collections::HashMap;
+use std::time::Duration;
 
 use majit_codegen::LoopToken;
 
 use crate::counter::JitCounter;
+use crate::jitlog::JitLog;
 use crate::recorder::TraceRecorder;
 
 /// Flags on a JitCell, mirroring warmstate.py JC_* constants.
@@ -71,6 +73,9 @@ pub enum JitState {
 /// The interpreter calls `maybe_compile()` at loop headers;
 /// WarmState decides whether to start tracing, continue interpreting,
 /// or dispatch to compiled code.
+/// Default number of guard failures before triggering bridge compilation.
+const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
+
 pub struct WarmState {
     /// Global hot counter.
     counter: JitCounter,
@@ -78,8 +83,12 @@ pub struct WarmState {
     cells: HashMap<u64, JitCell>,
     /// Compilation threshold (copied from counter for easy access).
     threshold: u32,
+    /// Guard failure threshold for triggering bridge compilation.
+    bridge_threshold: u32,
     /// Next token number for compiled loops.
     next_token_number: u64,
+    /// Optional profiling logger, enabled via MAJIT_STATS=1 or MAJIT_LOG=1.
+    jitlog: Option<JitLog>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -96,12 +105,27 @@ pub enum HotResult {
 
 impl WarmState {
     /// Create a new WarmState with the given threshold.
+    /// Automatically enables JitLog if MAJIT_STATS=1 or MAJIT_LOG=1.
     pub fn new(threshold: u32) -> Self {
         WarmState {
             counter: JitCounter::new(threshold),
             cells: HashMap::new(),
             threshold,
+            bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
             next_token_number: 0,
+            jitlog: JitLog::from_env(),
+        }
+    }
+
+    /// Create a new WarmState with an explicit JitLog.
+    pub fn with_jitlog(threshold: u32, jitlog: Option<JitLog>) -> Self {
+        WarmState {
+            counter: JitCounter::new(threshold),
+            cells: HashMap::new(),
+            threshold,
+            bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
+            next_token_number: 0,
+            jitlog,
         }
     }
 
@@ -155,6 +179,9 @@ impl WarmState {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
             }
         }
+        if let Some(log) = &mut self.jitlog {
+            log.log_abort();
+        }
     }
 
     /// Install a compiled loop token for a green key.
@@ -200,6 +227,39 @@ impl WarmState {
     /// Get a reference to the JitCell for a green key, if it exists.
     pub fn get_cell(&self, green_key_hash: u64) -> Option<&JitCell> {
         self.cells.get(&green_key_hash)
+    }
+
+    /// Log a successful trace compilation. No-op if JitLog is disabled.
+    pub fn log_compile(
+        &mut self,
+        green_key: u64,
+        ops_before_opt: usize,
+        ops_after_opt: usize,
+        opt_time: Duration,
+        compile_time: Duration,
+    ) {
+        if let Some(log) = &mut self.jitlog {
+            log.log_compile(green_key, ops_before_opt, ops_after_opt, opt_time, compile_time);
+        }
+    }
+
+    /// Log a guard failure. No-op if JitLog is disabled.
+    pub fn log_guard_failure(&mut self, guard_index: u32) {
+        if let Some(log) = &mut self.jitlog {
+            log.log_guard_failure(guard_index);
+        }
+    }
+
+    /// Log a loop entry. No-op if JitLog is disabled.
+    pub fn log_loop_entry(&mut self, green_key: u64) {
+        if let Some(log) = &mut self.jitlog {
+            log.log_loop_entry(green_key);
+        }
+    }
+
+    /// Get a reference to the JitLog, if enabled.
+    pub fn jitlog(&self) -> Option<&JitLog> {
+        self.jitlog.as_ref()
     }
 }
 

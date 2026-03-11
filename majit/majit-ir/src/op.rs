@@ -177,6 +177,7 @@ pub enum OpCode {
     IntSub,
     IntMul,
     UintMulHigh,
+    IntFloorDiv,
     IntAnd,
     IntOr,
     IntXor,
@@ -909,6 +910,7 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(IntSub, 2);
     set!(IntMul, 2);
     set!(UintMulHigh, 2);
+    set!(IntFloorDiv, 2);
     set!(IntAnd, 2);
     set!(IntOr, 2);
     set!(IntXor, 2);
@@ -1280,6 +1282,7 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         IntSub,
         IntMul,
         UintMulHigh,
+        IntFloorDiv,
         IntAnd,
         IntOr,
         IntXor,
@@ -1488,6 +1491,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         IntSub,
         IntMul,
         UintMulHigh,
+        IntFloorDiv,
         IntAnd,
         IntOr,
         IntXor,
