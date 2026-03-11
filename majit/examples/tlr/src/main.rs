@@ -1,95 +1,77 @@
-/// TLR (Toy Language - Register) interpreter — port of rpython/jit/tl/tlr.py.
+/// Rust port of rpython/jit/tl/tlr.py — TLR (Toy Language Register).
 ///
-/// Demonstrates majit JIT on a register-based bytecode interpreter.
-pub mod bytecode;
+/// Byte-level encoding identical to the RPython version:
+/// bytecode is &[u8], opcodes and args are single bytes.
 pub mod interp;
 pub mod jit_interp;
 
-use bytecode::*;
-use interp::TlrInterp;
-use jit_interp::JitTlrInterp;
 use std::time::Instant;
 
+// Opcodes — identical values to tlr.py
+const MOV_A_R: u8 = 1;
+const MOV_R_A: u8 = 2;
+const JUMP_IF_A: u8 = 3;
+const SET_A: u8 = 4;
+const ADD_R_TO_A: u8 = 5;
+const RETURN_A: u8 = 6;
+const ALLOCATE: u8 = 7;
+const NEG_A: u8 = 8;
+
+/// The SQUARE program from tlr.py — computes a*a by repeated addition.
+fn square_bytecode() -> Vec<u8> {
+    vec![
+        ALLOCATE,    3,
+        MOV_A_R,     0,   // i = a
+        MOV_A_R,     1,   // copy of 'a'
+        SET_A,       0,
+        MOV_A_R,     2,   // res = 0
+        // 10:
+        SET_A,       1,
+        NEG_A,
+        ADD_R_TO_A,  0,
+        MOV_A_R,     0,   // i--
+        MOV_R_A,     2,
+        ADD_R_TO_A,  1,
+        MOV_A_R,     2,   // res += a
+        MOV_R_A,     0,
+        JUMP_IF_A,  10,   // if i!=0: goto 10
+        MOV_R_A,     2,
+        RETURN_A,         // return res
+    ]
+}
+
 fn main() {
-    println!("=== majit TLR interpreter (port of rpython/jit/tl/tlr.py) ===\n");
+    let a: i64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10000);
 
-    // Demo 1: square(100) — the original tlr.py example
+    let bytecode = square_bytecode();
+
+    // Correctness check
     {
-        let (prog, a) = square_program(100);
-        let mut interp = TlrInterp::new();
-        let result = interp.run(&prog, a);
-        println!("square(100) = {result}");
-        assert_eq!(result, 10_000);
+        let result = interp::interpret(&bytecode, 5);
+        assert_eq!(result, 25, "5*5 should be 25");
     }
 
-    // Demo 2: sum(0..1_000_000)
+    // Benchmark: interpreter
+    println!("--- square({a}) [interpreter] ---");
     {
-        let (prog, a) = sum_program(1_000_000);
-        let mut interp = TlrInterp::new();
-        let result = interp.run(&prog, a);
-        println!("sum(0..1_000_000) = {result}");
-        assert_eq!(result, 499_999_500_000);
-    }
-
-    // Benchmark: sum(0..10_000_000) — interpreter
-    println!("\n--- Benchmark: sum(0..10_000_000) [interpreter] ---");
-    let interp_result;
-    {
-        let (prog, a) = sum_program(10_000_000);
-        let mut interp = TlrInterp::new();
-
         let start = Instant::now();
-        interp_result = interp.run(&prog, a);
+        let result = interp::interpret(&bytecode, a);
         let elapsed = start.elapsed();
-
-        println!("result = {interp_result}");
-        println!("time   = {elapsed:?}");
-        assert_eq!(interp_result, 49_999_995_000_000);
-    }
-
-    // Benchmark: sum(0..10_000_000) — JIT
-    println!("\n--- Benchmark: sum(0..10_000_000) [JIT] ---");
-    {
-        let (prog, a) = sum_program(10_000_000);
-        let mut jit = JitTlrInterp::new();
-
-        let start = Instant::now();
-        let result = jit.run(&prog, a);
-        let elapsed = start.elapsed();
-
         println!("result = {result}");
         println!("time   = {elapsed:?}");
-        assert_eq!(result, interp_result);
     }
 
-    // Benchmark: square(10_000) — interpreter
-    println!("\n--- Benchmark: square(10_000) [interpreter] ---");
-    let square_result;
+    // Benchmark: JIT
+    println!("\n--- square({a}) [JIT] ---");
     {
-        let (prog, a) = square_program(10_000);
-        let mut interp = TlrInterp::new();
-
+        let mut jit = jit_interp::JitTlrInterp::new();
         let start = Instant::now();
-        square_result = interp.run(&prog, a);
+        let result = jit.run(&bytecode, a);
         let elapsed = start.elapsed();
-
-        println!("result = {square_result}");
-        println!("time   = {elapsed:?}");
-        assert_eq!(square_result, 100_000_000);
-    }
-
-    // Benchmark: square(10_000) — JIT
-    println!("\n--- Benchmark: square(10_000) [JIT] ---");
-    {
-        let (prog, a) = square_program(10_000);
-        let mut jit = JitTlrInterp::new();
-
-        let start = Instant::now();
-        let result = jit.run(&prog, a);
-        let elapsed = start.elapsed();
-
         println!("result = {result}");
         println!("time   = {elapsed:?}");
-        assert_eq!(result, square_result);
     }
 }

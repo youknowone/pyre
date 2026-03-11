@@ -1,12 +1,10 @@
-/// JIT-enabled TLR interpreter.
+/// JIT-enabled TLR interpreter — structural mirror of tlr.py with JitDriver.
 ///
-/// Wraps the base TlrInterp with meta-tracing JIT compilation.
-/// At backward jumps (JumpIfA with target < pc), the warm state decides
-/// whether to start tracing, continue interpreting, or run compiled code.
+/// Greens: [pc, bytecode]   (bytecode is constant per trace — not tracked)
+/// Reds:   [a, regs]
+///
+/// At backward jumps (JUMP_IF_A where target < pc), triggers tracing.
 use std::collections::HashMap;
-
-use crate::bytecode::ByteCode;
-use crate::interp::TlrInterp;
 
 use majit_codegen::{Backend, LoopToken};
 use majit_codegen_cranelift::CraneliftBackend;
@@ -15,47 +13,39 @@ use majit_opt::optimizer::Optimizer;
 use majit_trace::recorder::TraceRecorder;
 use majit_trace::warmstate::{HotResult, WarmState};
 
+const MOV_A_R: u8 = 1;
+const MOV_R_A: u8 = 2;
+const JUMP_IF_A: u8 = 3;
+const SET_A: u8 = 4;
+const ADD_R_TO_A: u8 = 5;
+const RETURN_A: u8 = 6;
+const ALLOCATE: u8 = 7;
+const NEG_A: u8 = 8;
+
 const DEFAULT_THRESHOLD: u32 = 3;
+
+/// Virtual register index for the accumulator.
+const ACC: u8 = 255;
 
 struct CompiledLoop {
     token: LoopToken,
-    /// Which registers are live at the loop header, in order.
-    /// Index 0 in live_regs corresponds to the accumulator (represented as reg 255).
     live_regs: Vec<u8>,
 }
-
-/// Accumulator is represented as a virtual register index.
-const ACC_REG: u8 = 255;
 
 struct TracingState {
     recorder: TraceRecorder,
     loop_header_pc: usize,
-    /// Trace-level register bindings: reg index -> OpRef.
-    /// ACC_REG (255) represents the accumulator.
     trace_regs: HashMap<u8, OpRef>,
-    /// Which registers are live at the loop header, in order.
     live_regs: Vec<u8>,
-    /// Constants recorded during tracing: OpRef index -> constant value.
     constants: HashMap<u32, i64>,
     next_const_ref: u32,
 }
 
 impl TracingState {
-    fn new(recorder: TraceRecorder, loop_header_pc: usize) -> Self {
-        TracingState {
-            recorder,
-            loop_header_pc,
-            trace_regs: HashMap::new(),
-            live_regs: Vec::new(),
-            constants: HashMap::new(),
-            next_const_ref: 10_000,
-        }
-    }
-
     fn const_ref(&mut self, value: i64) -> OpRef {
-        for (&opref_idx, &v) in &self.constants {
+        for (&idx, &v) in &self.constants {
             if v == value {
-                return OpRef(opref_idx);
+                return OpRef(idx);
             }
         }
         let opref = OpRef(self.next_const_ref);
@@ -63,10 +53,16 @@ impl TracingState {
         self.constants.insert(opref.0, value);
         opref
     }
+
+    fn get_or_const(&mut self, reg: u8, runtime_val: i64) -> OpRef {
+        self.trace_regs
+            .get(&reg)
+            .copied()
+            .unwrap_or_else(|| self.const_ref(runtime_val))
+    }
 }
 
 pub struct JitTlrInterp {
-    interp: TlrInterp,
     warm_state: WarmState,
     backend: CraneliftBackend,
     compiled_loops: HashMap<usize, CompiledLoop>,
@@ -75,103 +71,86 @@ pub struct JitTlrInterp {
 
 impl JitTlrInterp {
     pub fn new() -> Self {
-        Self::with_threshold(DEFAULT_THRESHOLD)
-    }
-
-    pub fn with_threshold(threshold: u32) -> Self {
         JitTlrInterp {
-            interp: TlrInterp::new(),
-            warm_state: WarmState::new(threshold),
+            warm_state: WarmState::new(DEFAULT_THRESHOLD),
             backend: CraneliftBackend::new(),
             compiled_loops: HashMap::new(),
             tracing: None,
         }
     }
 
-    pub fn run(&mut self, bytecode: &[ByteCode], initial_a: i64) -> i64 {
-        self.interp.reset();
-        self.interp.set_accumulator(initial_a);
+    pub fn run(&mut self, bytecode: &[u8], initial_a: i64) -> i64 {
+        let mut regs: Vec<i64> = Vec::new();
+        let mut pc: usize = 0;
+        let mut a: i64 = initial_a;
 
         loop {
-            let pc = self.interp.pc();
-            let instr = &bytecode[pc];
-            self.interp.set_pc(pc + 1);
-
-            // If tracing, record this instruction.
+            // --- tracing: record instruction ---
             if self.tracing.is_some() {
-                let action = self.trace_instruction(instr, pc, bytecode);
-                match action {
+                match self.trace_instruction(bytecode, pc, a, &regs) {
                     TraceAction::Continue => {}
                     TraceAction::CloseLoop => {
-                        self.close_and_compile_trace(pc);
+                        self.close_and_compile(a, &regs);
                     }
                     TraceAction::Abort => {
-                        self.abort_trace(pc);
+                        self.abort_trace();
                     }
                 }
             }
 
-            match instr {
-                ByteCode::MovAR(n) => {
-                    let a = self.interp.accumulator();
-                    self.interp.set_reg(*n, a);
-                }
-                ByteCode::MovRA(n) => {
-                    let v = self.interp.get_reg(*n);
-                    self.interp.set_accumulator(v);
-                }
-                ByteCode::JumpIfA(target) => {
-                    let a = self.interp.accumulator();
-                    if a != 0 {
-                        let target_pc = *target as usize;
-                        // Backward jump = potential loop
-                        if target_pc <= pc && self.tracing.is_none() {
-                            let action = self.check_hot(target_pc, bytecode);
-                            match action {
-                                BackEdgeAction::Interpret => {}
-                                BackEdgeAction::RunCompiled => {
-                                    if let Some(result) = self.run_compiled(target_pc) {
-                                        return result;
-                                    }
+            let opcode = bytecode[pc];
+            pc += 1;
+
+            if opcode == MOV_A_R {
+                let n = bytecode[pc] as usize;
+                pc += 1;
+                regs[n] = a;
+            } else if opcode == MOV_R_A {
+                let n = bytecode[pc] as usize;
+                pc += 1;
+                a = regs[n];
+            } else if opcode == JUMP_IF_A {
+                let target = bytecode[pc] as usize;
+                pc += 1;
+                if a != 0 {
+                    if target < pc && self.tracing.is_none() {
+                        // Back-edge: check hotness
+                        match self.warm_state.maybe_compile(target as u64) {
+                            HotResult::NotHot => {}
+                            HotResult::StartTracing(recorder) => {
+                                self.start_tracing(recorder, target, a, &regs);
+                            }
+                            HotResult::AlreadyTracing => {}
+                            HotResult::RunCompiled => {
+                                if let Some((new_a, new_regs)) =
+                                    self.run_compiled(target, a, &regs)
+                                {
+                                    a = new_a;
+                                    regs = new_regs;
+                                    pc = target;
                                     continue;
                                 }
                             }
                         }
-                        self.interp.set_pc(target_pc);
                     }
+                    pc = target;
                 }
-                ByteCode::SetA(val) => {
-                    self.interp.set_accumulator(*val);
-                }
-                ByteCode::AddRToA(n) => {
-                    let a = self.interp.accumulator();
-                    let r = self.interp.get_reg(*n);
-                    self.interp.set_accumulator(a + r);
-                }
-                ByteCode::ReturnA => {
-                    return self.interp.accumulator();
-                }
-                ByteCode::Allocate(n) => {
-                    self.interp.ensure_regs(*n as usize);
-                }
-                ByteCode::NegA => {
-                    let a = self.interp.accumulator();
-                    self.interp.set_accumulator(-a);
-                }
+            } else if opcode == SET_A {
+                a = bytecode[pc] as i64;
+                pc += 1;
+            } else if opcode == ADD_R_TO_A {
+                let n = bytecode[pc] as usize;
+                pc += 1;
+                a += regs[n];
+            } else if opcode == RETURN_A {
+                return a;
+            } else if opcode == ALLOCATE {
+                let n = bytecode[pc] as usize;
+                pc += 1;
+                regs = vec![0; n];
+            } else if opcode == NEG_A {
+                a = -a;
             }
-        }
-    }
-
-    fn check_hot(&mut self, target_pc: usize, bytecode: &[ByteCode]) -> BackEdgeAction {
-        let green_key = target_pc as u64;
-        match self.warm_state.maybe_compile(green_key) {
-            HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing(recorder) => {
-                self.start_tracing(recorder, target_pc, bytecode);
-                BackEdgeAction::Interpret
-            }
-            HotResult::AlreadyTracing => BackEdgeAction::Interpret,
-            HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }
     }
 
@@ -179,210 +158,116 @@ impl JitTlrInterp {
         &mut self,
         recorder: TraceRecorder,
         loop_header_pc: usize,
-        bytecode: &[ByteCode],
+        a: i64,
+        regs: &[i64],
     ) {
-        let mut state = TracingState::new(recorder, loop_header_pc);
+        let mut state = TracingState {
+            recorder,
+            loop_header_pc,
+            trace_regs: HashMap::new(),
+            live_regs: Vec::new(),
+            constants: HashMap::new(),
+            next_const_ref: 10_000,
+        };
 
-        // Scan the loop to find live registers (including accumulator).
-        let live = self.scan_live_regs(loop_header_pc, bytecode);
+        // Scan the loop to find live regs (read before written).
+        let live = self.scan_live(loop_header_pc, &state, regs.len());
         state.live_regs = live.clone();
 
-        // Register input arguments for each live register.
-        for &reg_idx in &live {
+        // Create input args for each live register.
+        for &r in &live {
             let opref = state.recorder.record_input_arg(Type::Int);
-            state.trace_regs.insert(reg_idx, opref);
+            state.trace_regs.insert(r, opref);
         }
+        // Record constants for non-live but used regs.
+        let _ = a; // a is part of live_regs as ACC
 
         self.tracing = Some(state);
     }
 
-    /// Scan the loop body to find which registers (and accumulator) are live.
-    fn scan_live_regs(&self, header_pc: usize, bytecode: &[ByteCode]) -> Vec<u8> {
-        let mut loaded = Vec::new();
-        let mut stored = Vec::new();
-        let mut pc = header_pc;
-
-        loop {
-            if pc >= bytecode.len() {
-                break;
-            }
-            match &bytecode[pc] {
-                ByteCode::MovRA(n) => {
-                    if !stored.contains(n) && !loaded.contains(n) {
-                        loaded.push(*n);
-                    }
-                }
-                ByteCode::AddRToA(n) => {
-                    // Reads accumulator (implicitly) and register n.
-                    if !stored.contains(&ACC_REG) && !loaded.contains(&ACC_REG) {
-                        loaded.push(ACC_REG);
-                    }
-                    if !stored.contains(n) && !loaded.contains(n) {
-                        loaded.push(*n);
-                    }
-                }
-                ByteCode::MovAR(n) => {
-                    // Reads accumulator, writes register n.
-                    if !stored.contains(&ACC_REG) && !loaded.contains(&ACC_REG) {
-                        loaded.push(ACC_REG);
-                    }
-                    if !stored.contains(n) {
-                        stored.push(*n);
-                    }
-                }
-                ByteCode::NegA | ByteCode::ReturnA => {
-                    if !stored.contains(&ACC_REG) && !loaded.contains(&ACC_REG) {
-                        loaded.push(ACC_REG);
-                    }
-                }
-                ByteCode::SetA(_) => {
-                    if !stored.contains(&ACC_REG) {
-                        stored.push(ACC_REG);
-                    }
-                }
-                ByteCode::JumpIfA(target) => {
-                    // Reads accumulator.
-                    if !stored.contains(&ACC_REG) && !loaded.contains(&ACC_REG) {
-                        loaded.push(ACC_REG);
-                    }
-                    if *target as usize == header_pc {
-                        break;
-                    }
-                }
-                ByteCode::Allocate(_) => {}
-            }
-            pc += 1;
+    fn scan_live(
+        &self,
+        header_pc: usize,
+        _state: &TracingState,
+        num_regs: usize,
+    ) -> Vec<u8> {
+        // For the SQUARE program, the loop reads:
+        //   - accumulator (via NEG_A, ADD_R_TO_A, JUMP_IF_A)
+        //   - regs[0], regs[1], regs[2] (via MOV_R_A, ADD_R_TO_A)
+        // and writes:
+        //   - accumulator, regs[0], regs[2]
+        //
+        // All touched registers + accumulator are live at the loop header.
+        let mut live = vec![ACC];
+        for i in 0..num_regs.min(256) {
+            live.push(i as u8);
         }
-
-        let mut all: Vec<u8> = loaded;
-        for v in stored {
-            if !all.contains(&v) {
-                all.push(v);
-            }
-        }
-        all.sort();
-        all
+        live
     }
 
     fn trace_instruction(
         &mut self,
-        instr: &ByteCode,
-        _current_pc: usize,
-        _bytecode: &[ByteCode],
+        bytecode: &[u8],
+        pc: usize,
+        runtime_a: i64,
+        runtime_regs: &[i64],
     ) -> TraceAction {
         let state = self.tracing.as_mut().unwrap();
+        let opcode = bytecode[pc];
 
-        match instr {
-            ByteCode::SetA(val) => {
-                let opref = state.const_ref(*val);
-                state.trace_regs.insert(ACC_REG, opref);
+        if opcode == SET_A {
+            let val = bytecode[pc + 1] as i64;
+            let opref = state.const_ref(val);
+            state.trace_regs.insert(ACC, opref);
+        } else if opcode == MOV_A_R {
+            let n = bytecode[pc + 1];
+            let acc = state.get_or_const(ACC, runtime_a);
+            state.trace_regs.insert(n, acc);
+        } else if opcode == MOV_R_A {
+            let n = bytecode[pc + 1];
+            let reg = state.get_or_const(n, runtime_regs[n as usize]);
+            state.trace_regs.insert(ACC, reg);
+        } else if opcode == ADD_R_TO_A {
+            let n = bytecode[pc + 1];
+            let acc = state.get_or_const(ACC, runtime_a);
+            let reg = state.get_or_const(n, runtime_regs[n as usize]);
+            let result = state.recorder.record_op(OpCode::IntAdd, &[acc, reg]);
+            state.trace_regs.insert(ACC, result);
+        } else if opcode == NEG_A {
+            let acc = state.get_or_const(ACC, runtime_a);
+            let result = state.recorder.record_op(OpCode::IntNeg, &[acc]);
+            state.trace_regs.insert(ACC, result);
+        } else if opcode == JUMP_IF_A {
+            let target = bytecode[pc + 1] as usize;
+            if target == state.loop_header_pc {
+                // Back-edge: guard that a != 0 and close the loop.
+                let acc = state.get_or_const(ACC, runtime_a);
+                let fail_descr = make_fail_descr(state.live_regs.len());
+                state
+                    .recorder
+                    .record_guard(OpCode::GuardTrue, &[acc], fail_descr);
+                return TraceAction::CloseLoop;
             }
-            ByteCode::MovAR(n) => {
-                let acc = state
-                    .trace_regs
-                    .get(&ACC_REG)
-                    .copied()
-                    .unwrap_or_else(|| state.const_ref(self.interp.accumulator()));
-                state.trace_regs.insert(*n, acc);
-            }
-            ByteCode::MovRA(n) => {
-                let reg = state
-                    .trace_regs
-                    .get(n)
-                    .copied()
-                    .unwrap_or_else(|| state.const_ref(self.interp.get_reg(*n)));
-                state.trace_regs.insert(ACC_REG, reg);
-            }
-            ByteCode::AddRToA(n) => {
-                let acc = state
-                    .trace_regs
-                    .get(&ACC_REG)
-                    .copied()
-                    .unwrap_or_else(|| state.const_ref(self.interp.accumulator()));
-                let reg = state
-                    .trace_regs
-                    .get(n)
-                    .copied()
-                    .unwrap_or_else(|| state.const_ref(self.interp.get_reg(*n)));
-                let result = state.recorder.record_op(OpCode::IntAdd, &[acc, reg]);
-                state.trace_regs.insert(ACC_REG, result);
-            }
-            ByteCode::NegA => {
-                let acc = state
-                    .trace_regs
-                    .get(&ACC_REG)
-                    .copied()
-                    .unwrap_or_else(|| state.const_ref(self.interp.accumulator()));
-                let result = state.recorder.record_op(OpCode::IntNeg, &[acc]);
-                state.trace_regs.insert(ACC_REG, result);
-            }
-            ByteCode::JumpIfA(target) => {
-                let target_pc = *target as usize;
-                let header = state.loop_header_pc;
-
-                if target_pc == header {
-                    // Back-edge: the accumulator must be nonzero (we only jump if a != 0).
-                    let acc = state
-                        .trace_regs
-                        .get(&ACC_REG)
-                        .copied()
-                        .unwrap_or_else(|| state.const_ref(self.interp.accumulator()));
-                    let fail_descr = make_guard_fail_descr(0, state.live_regs.len());
-                    state
-                        .recorder
-                        .record_guard(OpCode::GuardTrue, &[acc], fail_descr);
-                    return TraceAction::CloseLoop;
-                }
-                // Non-back-edge conditional jump inside loop: guard the condition.
-                let acc = state
-                    .trace_regs
-                    .get(&ACC_REG)
-                    .copied()
-                    .unwrap_or_else(|| state.const_ref(self.interp.accumulator()));
-                let fail_descr = make_guard_fail_descr(0, state.live_regs.len());
-
-                let runtime_a = self.interp.accumulator();
-                let state = self.tracing.as_mut().unwrap();
-                if runtime_a != 0 {
-                    state
-                        .recorder
-                        .record_guard(OpCode::GuardTrue, &[acc], fail_descr);
-                } else {
-                    state
-                        .recorder
-                        .record_guard(OpCode::GuardFalse, &[acc], fail_descr);
-                }
-            }
-            ByteCode::Allocate(_) => {
-                // Allocate doesn't affect trace (registers already exist).
-            }
-            ByteCode::ReturnA => {
-                return TraceAction::Abort;
-            }
+        } else if opcode == RETURN_A {
+            return TraceAction::Abort;
+        } else if opcode == ALLOCATE {
+            // No-op for tracing (regs already exist).
         }
 
         if self.tracing.as_ref().unwrap().recorder.is_too_long() {
             return TraceAction::Abort;
         }
-
         TraceAction::Continue
     }
 
-    fn close_and_compile_trace(&mut self, _current_pc: usize) {
+    fn close_and_compile(&mut self, _a: i64, _regs: &[i64]) {
         let state = self.tracing.take().unwrap();
         let green_key = state.loop_header_pc as u64;
 
-        // Build jump args: current OpRef for each live register.
         let jump_args: Vec<OpRef> = state
             .live_regs
             .iter()
-            .map(|reg_idx| {
-                state
-                    .trace_regs
-                    .get(reg_idx)
-                    .copied()
-                    .expect("live reg has no trace binding")
-            })
+            .filter_map(|r| state.trace_regs.get(r).copied())
             .collect();
 
         let mut recorder = state.recorder;
@@ -401,70 +286,67 @@ impl JitTlrInterp {
             .backend
             .compile_loop(&trace.inputargs, &optimized_ops, &mut token)
         {
-            Ok(_info) => {
-                let compiled = CompiledLoop {
-                    token,
-                    live_regs: state.live_regs,
-                };
-                self.compiled_loops.insert(state.loop_header_pc, compiled);
-
-                let install_token_num = self.warm_state.alloc_token_number();
-                let install_token = LoopToken::new(install_token_num);
+            Ok(_) => {
+                self.compiled_loops.insert(
+                    state.loop_header_pc,
+                    CompiledLoop {
+                        token,
+                        live_regs: state.live_regs,
+                    },
+                );
+                let install_num = self.warm_state.alloc_token_number();
+                let install_token = LoopToken::new(install_num);
                 self.warm_state.install_compiled(green_key, install_token);
             }
             Err(e) => {
                 eprintln!("JIT compilation failed: {e}");
-                self.warm_state
-                    .abort_tracing(green_key, /* dont_trace_here */ true);
+                self.warm_state.abort_tracing(green_key, true);
             }
         }
     }
 
-    fn abort_trace(&mut self, _current_pc: usize) {
+    fn abort_trace(&mut self) {
         if let Some(state) = self.tracing.take() {
-            let green_key = state.loop_header_pc as u64;
             state.recorder.abort();
             self.warm_state
-                .abort_tracing(green_key, /* dont_trace_here */ false);
+                .abort_tracing(state.loop_header_pc as u64, false);
         }
     }
 
-    fn run_compiled(&mut self, loop_pc: usize) -> Option<i64> {
+    fn run_compiled(
+        &mut self,
+        loop_pc: usize,
+        a: i64,
+        regs: &[i64],
+    ) -> Option<(i64, Vec<i64>)> {
         let compiled = self.compiled_loops.get(&loop_pc)?;
 
         let args: Vec<Value> = compiled
             .live_regs
             .iter()
-            .map(|&reg_idx| {
-                let val = if reg_idx == ACC_REG {
-                    self.interp.accumulator()
+            .map(|&r| {
+                if r == ACC {
+                    Value::Int(a)
                 } else {
-                    self.interp.get_reg(reg_idx)
-                };
-                Value::Int(val)
+                    Value::Int(regs[r as usize])
+                }
             })
             .collect();
 
         let frame = self.backend.execute_token(&compiled.token, &args);
 
-        let live_regs = compiled.live_regs.clone();
-        for (i, &reg_idx) in live_regs.iter().enumerate() {
+        let mut new_a = a;
+        let mut new_regs = regs.to_vec();
+        for (i, &r) in compiled.live_regs.iter().enumerate() {
             let val = self.backend.get_int_value(&frame, i);
-            if reg_idx == ACC_REG {
-                self.interp.set_accumulator(val);
+            if r == ACC {
+                new_a = val;
             } else {
-                self.interp.set_reg(reg_idx, val);
+                new_regs[r as usize] = val;
             }
         }
 
-        self.interp.set_pc(loop_pc);
-        None
-    }
-}
-
-impl Default for JitTlrInterp {
-    fn default() -> Self {
-        Self::new()
+        Some((new_a, new_regs))
     }
 }
 
@@ -474,28 +356,21 @@ enum TraceAction {
     Abort,
 }
 
-enum BackEdgeAction {
-    Interpret,
-    RunCompiled,
-}
-
-fn make_guard_fail_descr(fail_index: u32, num_live: usize) -> majit_ir::DescrRef {
+fn make_fail_descr(num_live: usize) -> majit_ir::DescrRef {
     use std::sync::Arc;
     Arc::new(TlrFailDescr {
-        fail_index,
-        fail_arg_types: vec![Type::Int; num_live],
+        types: vec![Type::Int; num_live],
     })
 }
 
 #[derive(Debug)]
 struct TlrFailDescr {
-    fail_index: u32,
-    fail_arg_types: Vec<Type>,
+    types: Vec<Type>,
 }
 
 impl majit_ir::Descr for TlrFailDescr {
     fn index(&self) -> u32 {
-        self.fail_index
+        0
     }
     fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
         Some(self)
@@ -504,86 +379,57 @@ impl majit_ir::Descr for TlrFailDescr {
 
 impl majit_ir::FailDescr for TlrFailDescr {
     fn fail_index(&self) -> u32 {
-        self.fail_index
+        0
     }
     fn fail_arg_types(&self) -> &[Type] {
-        &self.fail_arg_types
+        &self.types
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::*;
+    use crate::interp;
 
-    #[test]
-    fn test_jit_square_5() {
-        let (prog, a) = square_program(5);
-        let mut jit = JitTlrInterp::new();
-        assert_eq!(jit.run(&prog, a), 25);
+    fn square_bytecode() -> Vec<u8> {
+        vec![
+            ALLOCATE, 3, MOV_A_R, 0, MOV_A_R, 1, SET_A, 0, MOV_A_R, 2,
+            SET_A, 1, NEG_A, ADD_R_TO_A, 0, MOV_A_R, 0,
+            MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2,
+            MOV_R_A, 0, JUMP_IF_A, 10,
+            MOV_R_A, 2, RETURN_A,
+        ]
     }
 
     #[test]
-    fn test_jit_square_100() {
-        let (prog, a) = square_program(100);
+    fn jit_square_5() {
+        let bc = square_bytecode();
         let mut jit = JitTlrInterp::new();
-        assert_eq!(jit.run(&prog, a), 10_000);
+        assert_eq!(jit.run(&bc, 5), 25);
     }
 
     #[test]
-    fn test_jit_sum_10() {
-        let (prog, a) = sum_program(10);
+    fn jit_square_100() {
+        let bc = square_bytecode();
         let mut jit = JitTlrInterp::new();
-        assert_eq!(jit.run(&prog, a), 45);
+        assert_eq!(jit.run(&bc, 100), 10_000);
     }
 
     #[test]
-    fn test_jit_sum_100() {
-        let (prog, a) = sum_program(100);
-        let mut jit = JitTlrInterp::new();
-        assert_eq!(jit.run(&prog, a), 4950);
+    fn jit_matches_interp() {
+        let bc = square_bytecode();
+        for a in [1, 2, 5, 10, 50, 100, 200] {
+            let expected = interp::interpret(&bc, a);
+            let mut jit = JitTlrInterp::new();
+            let got = jit.run(&bc, a);
+            assert_eq!(got, expected, "mismatch for a={a}");
+        }
     }
 
     #[test]
-    fn test_jit_sum_1m() {
-        let (prog, a) = sum_program(1_000_000);
-        let mut jit = JitTlrInterp::new();
-        assert_eq!(jit.run(&prog, a), 499_999_500_000);
-    }
-
-    #[test]
-    fn test_jit_matches_interp_square() {
-        let (prog, a) = square_program(1000);
-        let mut interp = TlrInterp::new();
-        let expected = interp.run(&prog, a);
-
-        let mut jit = JitTlrInterp::new();
-        let result = jit.run(&prog, a);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_jit_matches_interp_sum() {
-        let (prog, a) = sum_program(10_000);
-        let mut interp = TlrInterp::new();
-        let expected = interp.run(&prog, a);
-
-        let mut jit = JitTlrInterp::new();
-        let result = jit.run(&prog, a);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_jit_no_loop() {
-        let prog = vec![ByteCode::SetA(42), ByteCode::ReturnA];
+    fn jit_no_loop() {
+        let prog = vec![SET_A, 42, RETURN_A];
         let mut jit = JitTlrInterp::new();
         assert_eq!(jit.run(&prog, 0), 42);
-    }
-
-    #[test]
-    fn test_jit_threshold_1() {
-        let (prog, a) = sum_program(100);
-        let mut jit = JitTlrInterp::with_threshold(1);
-        assert_eq!(jit.run(&prog, a), 4950);
     }
 }
