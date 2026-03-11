@@ -5,6 +5,8 @@
 /// The optimizer chains multiple passes, each implementing the OptimizationPass trait.
 /// Operations flow through the chain: IntBounds → Rewrite → Virtualize → String →
 /// Pure → Guard → Simplify → Heap (configurable).
+pub mod bridgeopt;
+pub mod earlyforce;
 pub mod guard;
 pub mod heap;
 pub mod info;
