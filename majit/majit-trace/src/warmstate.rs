@@ -261,6 +261,29 @@ impl WarmState {
     pub fn jitlog(&self) -> Option<&JitLog> {
         self.jitlog.as_ref()
     }
+
+    /// Get the bridge compilation threshold.
+    pub fn bridge_threshold(&self) -> u32 {
+        self.bridge_threshold
+    }
+
+    /// Set the bridge compilation threshold.
+    pub fn set_bridge_threshold(&mut self, threshold: u32) {
+        self.bridge_threshold = threshold;
+    }
+
+    /// Check whether a guard failure count has reached the bridge threshold.
+    /// Returns true if bridge compilation should be triggered.
+    pub fn should_compile_bridge(&self, guard_fail_count: u32) -> bool {
+        guard_fail_count >= self.bridge_threshold
+    }
+
+    /// Log a bridge compilation. No-op if JitLog is disabled.
+    pub fn log_bridge_compile(&mut self, guard_index: u32) {
+        if let Some(log) = &mut self.jitlog {
+            log.log_bridge_compile(guard_index);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +472,27 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
 
         drop(recorder);
+    }
+
+    #[test]
+    fn test_bridge_threshold_default() {
+        let ws = WarmState::new(3);
+        assert_eq!(ws.bridge_threshold(), 5);
+    }
+
+    #[test]
+    fn test_bridge_threshold_custom() {
+        let mut ws = WarmState::new(3);
+        ws.set_bridge_threshold(10);
+        assert_eq!(ws.bridge_threshold(), 10);
+    }
+
+    #[test]
+    fn test_should_compile_bridge() {
+        let ws = WarmState::new(3);
+        assert!(!ws.should_compile_bridge(0));
+        assert!(!ws.should_compile_bridge(4));
+        assert!(ws.should_compile_bridge(5));
+        assert!(ws.should_compile_bridge(100));
     }
 }

@@ -14,6 +14,7 @@ pub mod optimizer;
 pub mod pure;
 pub mod rewrite;
 pub mod simplify;
+pub mod unroll;
 pub mod virtualize;
 pub mod vstring;
 

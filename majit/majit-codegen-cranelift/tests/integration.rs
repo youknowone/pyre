@@ -343,3 +343,110 @@ fn test_multiple_optimization_passes() {
     let frame = backend.execute_token(&token, &[Value::Int(-3), Value::Int(3)]);
     assert_eq!(backend.get_int_value(&frame, 0), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Test 6: Bridge compilation end-to-end
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bridge_end_to_end() {
+    // Main trace: sum loop counting down from N.
+    //   input(i, sum) -> sum2 = sum + i -> i2 = i - 1
+    //   -> cmp = i2 > 0 -> guard_true(cmp) -> jump(i2, sum2)
+    //
+    // When guard fails (i2 <= 0), compile a bridge that doubles the sum.
+    let mut rec = TraceRecorder::new();
+    let i = rec.record_input_arg(Type::Int);
+    let sum = rec.record_input_arg(Type::Int);
+
+    let const_one = OpRef(1000);
+    let const_zero = OpRef(1001);
+
+    let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
+    let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
+    let cmp = rec.record_op(OpCode::IntGt, &[i2, const_zero]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp], make_descr(0));
+    rec.close_loop(&[i2, sum2]);
+    let trace = rec.get_trace();
+
+    // Optimize
+    let mut opt = new_optimizer();
+    let optimized = opt.optimize(&trace.ops);
+
+    // Compile main loop
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 1i64);
+    constants.insert(1001, 0i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(10);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("compilation should succeed");
+
+    // Execute without bridge: i=5, sum=0
+    // Loop counts 5,4,3,2,1 -> guard fails when i2=0
+    // At guard failure we get: i=1, sum=5049? No, with small N=5:
+    //   iter1: i=5,sum=0 -> sum2=5, i2=4, pass -> jump(4,5)
+    //   iter2: i=4,sum=5 -> sum2=9, i2=3, pass -> jump(3,9)
+    //   iter3: i=3,sum=9 -> sum2=12, i2=2, pass -> jump(2,12)
+    //   iter4: i=2,sum=12 -> sum2=14, i2=1, pass -> jump(1,14)
+    //   iter5: i=1,sum=14 -> sum2=15, i2=0, fail
+    // Guard saves input args (i=1, sum=14)
+    let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(0)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(descr.fail_index(), 0);
+    assert_eq!(backend.get_int_value(&frame, 0), 1);  // i
+    assert_eq!(backend.get_int_value(&frame, 1), 14); // sum
+
+    // Now compile a bridge for the guard failure.
+    // Bridge takes (i, sum) and returns sum * 2.
+    let mut bridge_rec = TraceRecorder::new();
+    let bi = bridge_rec.record_input_arg(Type::Int);
+    let bsum = bridge_rec.record_input_arg(Type::Int);
+    let _ = bi; // bridge ignores i
+
+    let bridge_const_two = OpRef(1000);
+    let result = bridge_rec.record_op(OpCode::IntMul, &[bsum, bridge_const_two]);
+    bridge_rec.finish(&[result], make_descr(1));
+    let bridge_trace = bridge_rec.get_trace();
+
+    let mut bridge_opt = new_optimizer();
+    let bridge_optimized = bridge_opt.optimize(&bridge_trace.ops);
+
+    let mut bridge_constants = HashMap::new();
+    bridge_constants.insert(1000, 2i64);
+    backend.set_constants(bridge_constants);
+
+    // We need a CraneliftFailDescr to pass to compile_bridge.
+    // The fail_index matches the guard's index in the original loop.
+    let bridge_fail_descr = majit_codegen_cranelift::guard::CraneliftFailDescr::new(
+        0,
+        vec![Type::Int, Type::Int],
+    );
+
+    let bridge_info = backend
+        .compile_bridge(
+            &bridge_fail_descr,
+            &bridge_trace.inputargs,
+            &bridge_optimized,
+            &token,
+        )
+        .expect("bridge compilation should succeed");
+    assert!(bridge_info.code_addr != 0);
+
+    // Execute with bridge: i=5, sum=0
+    // Loop runs same as before, guard fails with i=1, sum=14
+    // Bridge runs: sum * 2 = 14 * 2 = 28
+    let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(0)]);
+    assert_eq!(backend.get_int_value(&frame, 0), 28);
+
+    // Also test with different initial values: i=3, sum=0
+    //   iter1: i=3,sum=0 -> sum2=3, i2=2, pass -> jump(2,3)
+    //   iter2: i=2,sum=3 -> sum2=5, i2=1, pass -> jump(1,5)
+    //   iter3: i=1,sum=5 -> sum2=6, i2=0, fail
+    // Guard saves i=1, sum=5 -> bridge: 5 * 2 = 10
+    let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
+    assert_eq!(backend.get_int_value(&frame, 0), 10);
+}

@@ -38,6 +38,8 @@ pub struct JitLog {
     compiled: Vec<TraceRecord>,
     /// Number of traces that were aborted.
     aborted: u64,
+    /// Number of bridges compiled from guard failures.
+    bridges_compiled: u64,
     /// Guard failure counts, keyed by guard index.
     guard_failures: HashMap<u32, u64>,
     /// Loop entry counts, keyed by green key hash.
@@ -53,6 +55,7 @@ impl JitLog {
         JitLog {
             compiled: Vec::new(),
             aborted: 0,
+            bridges_compiled: 0,
             guard_failures: HashMap::new(),
             loop_entries: HashMap::new(),
             print_on_drop,
@@ -100,6 +103,16 @@ impl JitLog {
     /// Record a loop entry for the given green key.
     pub fn log_loop_entry(&mut self, green_key: u64) {
         *self.loop_entries.entry(green_key).or_insert(0) += 1;
+    }
+
+    /// Record a bridge compilation for the given guard index.
+    pub fn log_bridge_compile(&mut self, _guard_index: u32) {
+        self.bridges_compiled += 1;
+    }
+
+    /// Number of bridges compiled.
+    pub fn bridges_compiled(&self) -> u64 {
+        self.bridges_compiled
     }
 
     /// Number of successfully compiled traces.
