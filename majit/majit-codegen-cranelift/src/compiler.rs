@@ -428,6 +428,11 @@ impl CraneliftBackend {
                     let r = builder.ins().sdiv(a, b);
                     builder.def_var(var(vi), r);
                 }
+                OpCode::IntMod => {
+                    let (a, b) = resolve_binop(&mut builder, &constants, op);
+                    let r = builder.ins().srem(a, b);
+                    builder.def_var(var(vi), r);
+                }
 
                 // ── Overflow arithmetic ──
                 // Compute the result normally, then detect signed overflow
@@ -1366,6 +1371,27 @@ impl CraneliftBackend {
                         OpCode::FloatTrueDiv => builder.ins().fdiv(fa, fb),
                         _ => unreachable!(),
                     };
+                    let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
+                    builder.def_var(var(vi), r);
+                }
+                OpCode::FloatFloorDiv => {
+                    let (a, b) = resolve_binop(&mut builder, &constants, op);
+                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                    let fdiv = builder.ins().fdiv(fa, fb);
+                    let fr = builder.ins().floor(fdiv);
+                    let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
+                    builder.def_var(var(vi), r);
+                }
+                OpCode::FloatMod => {
+                    // Python's float mod: a - floor(a/b) * b
+                    let (a, b) = resolve_binop(&mut builder, &constants, op);
+                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                    let fdiv = builder.ins().fdiv(fa, fb);
+                    let ffloor = builder.ins().floor(fdiv);
+                    let prod = builder.ins().fmul(ffloor, fb);
+                    let fr = builder.ins().fsub(fa, prod);
                     let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
                     builder.def_var(var(vi), r);
                 }
@@ -3181,5 +3207,224 @@ mod tests {
             &[Value::Ref(GcRef(ptr)), Value::Int(2), Value::Int(777)],
         );
         assert_eq!(backend.get_int_value(&frame, 0), 777);
+    }
+
+    // ── Bridge compilation and execution tests ──
+
+    #[test]
+    fn test_bridge_attaches_to_guard() {
+        // Compile a loop: input(x) -> guard_true(x > 0) -> finish(x * 2)
+        // When guard fails (x <= 0), compile a bridge that returns x + 100.
+        // After attaching the bridge, executing with x <= 0 should run the
+        // bridge and return x + 100 instead of falling back.
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntGt, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::IntMul, &[OpRef(0), OpRef(101)], 2),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, 0i64);   // guard: x > 0
+        constants.insert(101, 2i64);   // x * 2
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(200);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // First: verify guard fails when x = -5
+        let frame = backend.execute_token(&token, &[Value::Int(-5)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert_eq!(descr.fail_index(), 0); // guard_true is guard index 0
+        assert_eq!(backend.get_int_value(&frame, 0), -5);
+
+        // Now compile a bridge for guard 0: bridge takes x, returns x + 100
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut bridge_constants = HashMap::new();
+        bridge_constants.insert(100, 100i64);
+        backend.set_constants(bridge_constants);
+
+        let fail_descr = CraneliftFailDescr::new(0, vec![Type::Int]);
+        let bridge_info = backend
+            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token)
+            .unwrap();
+        assert!(bridge_info.code_addr != 0);
+
+        // Now execute again with x = -5: the bridge should execute
+        let frame = backend.execute_token(&token, &[Value::Int(-5)]);
+        // Bridge returns -5 + 100 = 95
+        assert_eq!(backend.get_int_value(&frame, 0), 95);
+
+        // Execute with x = 0 (also fails guard): bridge returns 0 + 100 = 100
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 100);
+
+        // Execute with x = 5 (guard passes): original path returns 5 * 2 = 10
+        let frame = backend.execute_token(&token, &[Value::Int(5)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 10);
+    }
+
+    #[test]
+    fn test_guard_failure_counting() {
+        // Verify that guard failures are counted.
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        let mut token = LoopToken::new(201);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Execute with x = 0 (guard fails) multiple times
+        for i in 1..=5 {
+            let _frame = backend.execute_token(&token, &[Value::Int(0)]);
+            let compiled = token
+                .compiled
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<CompiledLoop>()
+                .unwrap();
+            let descr = &compiled.fail_descrs[0];
+            assert_eq!(descr.get_fail_count(), i);
+        }
+
+        // Execute with x = 1 (guard passes, reaches finish)
+        let _frame = backend.execute_token(&token, &[Value::Int(1)]);
+        // The finish descr also gets its count incremented (it's index 1)
+        let compiled = token
+            .compiled
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let guard_descr = &compiled.fail_descrs[0];
+        assert_eq!(guard_descr.get_fail_count(), 5); // Still 5
+        let finish_descr = &compiled.fail_descrs[1];
+        assert_eq!(finish_descr.get_fail_count(), 1);
+    }
+
+    #[test]
+    fn test_bridge_with_loop() {
+        // Main loop: counts down from N, guard fails when counter reaches 0.
+        // Bridge: takes the counter value and adds 1000, then finishes.
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)]; // i0 = counter
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntSub, &[OpRef(0), OpRef(100)], 1),    // i1 = i0 - 1
+            mk_op(OpCode::IntGt, &[OpRef(1), OpRef(101)], 2),     // i2 = i1 > 0
+            mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0), // guard_true(i2)
+            mk_op(OpCode::Jump, &[OpRef(1)], OpRef::NONE.0),      // jump(i1)
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, 1i64);
+        constants.insert(101, 0i64);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(202);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Without bridge: run with N=5, guard fails when counter=0
+        // The guard saves the input arg (i0), which at the point of failure is 1
+        // (i0=1, i1=0, guard fails)
+        let frame = backend.execute_token(&token, &[Value::Int(5)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+
+        // Compile bridge: takes the counter and returns it + 1000
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut bridge_constants = HashMap::new();
+        bridge_constants.insert(100, 1000i64);
+        backend.set_constants(bridge_constants);
+
+        let fail_descr = CraneliftFailDescr::new(0, vec![Type::Int]);
+        backend
+            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token)
+            .unwrap();
+
+        // With bridge: run with N=5, guard fails at counter=1, bridge runs
+        let frame = backend.execute_token(&token, &[Value::Int(5)]);
+        // Bridge gets i0=1 (the input arg saved at guard failure), returns 1 + 1000 = 1001
+        assert_eq!(backend.get_int_value(&frame, 0), 1001);
+
+        // Run with N=3
+        let frame = backend.execute_token(&token, &[Value::Int(3)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 1001);
+    }
+
+    #[test]
+    fn test_bridge_with_explicit_fail_args() {
+        // Test that when a guard has explicit fail_args, the bridge receives
+        // those values as inputs.
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        // Explicit fail_args: save both i0 and i1 plus the computed sum (i0+i1)
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0), OpRef(1)]));
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            guard_op,
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+
+        let mut token = LoopToken::new(203);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Without bridge: guard fails on x=0, y=42
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(42)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);  // x
+        assert_eq!(backend.get_int_value(&frame, 1), 42); // y
+
+        // Compile bridge that takes the fail_args (x, y) and returns x + y + 1000
+        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
+            mk_op(OpCode::IntAdd, &[OpRef(2), OpRef(100)], 3),
+            mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
+        ];
+
+        let mut bridge_constants = HashMap::new();
+        bridge_constants.insert(100, 1000i64);
+        backend.set_constants(bridge_constants);
+
+        let fail_descr = CraneliftFailDescr::new(0, vec![Type::Int, Type::Int]);
+        backend
+            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token)
+            .unwrap();
+
+        // With bridge: guard fails on x=0, y=42 -> bridge returns 0 + 42 + 1000 = 1042
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(42)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 1042);
+
+        // Guard passes on x=5, y=7 -> original path returns 5 + 7 = 12
+        let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(7)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 12);
     }
 }

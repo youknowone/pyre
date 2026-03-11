@@ -38,6 +38,13 @@ impl OptRewrite {
                     None
                 }
             }
+            OpCode::IntMod => {
+                if rhs != 0 {
+                    Some(lhs.wrapping_rem(rhs))
+                } else {
+                    None
+                }
+            }
             OpCode::IntAnd => Some(lhs & rhs),
             OpCode::IntOr => Some(lhs | rhs),
             OpCode::IntXor => Some(lhs ^ rhs),
@@ -223,6 +230,23 @@ impl OptRewrite {
         if let Some(1) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
             return PassResult::Remove;
+        }
+
+        PassResult::PassOn
+    }
+
+    /// Try algebraic simplification for INT_MOD.
+    /// Constant fold when both operands are known.
+    fn optimize_int_mod(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        // Constant fold
+        if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
+            if let Some(result) = self.try_fold_binary_int(OpCode::IntMod, a, b) {
+                ctx.make_constant(op.pos, Value::Int(result));
+                return PassResult::Remove;
+            }
         }
 
         PassResult::PassOn
@@ -625,6 +649,7 @@ impl OptimizationPass for OptRewrite {
             OpCode::IntSub => self.optimize_int_sub(op, ctx),
             OpCode::IntMul => self.optimize_int_mul(op, ctx),
             OpCode::IntFloorDiv => self.optimize_int_floor_div(op, ctx),
+            OpCode::IntMod => self.optimize_int_mod(op, ctx),
             OpCode::IntAnd => self.optimize_int_and(op, ctx),
             OpCode::IntOr => self.optimize_int_or(op, ctx),
             OpCode::IntXor => self.optimize_int_xor(op, ctx),
