@@ -2,14 +2,15 @@ use std::collections::HashMap;
 
 use majit_codegen::{Backend, LoopToken};
 use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{OpRef, Type, Value};
+use majit_ir::{OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
 use majit_trace::trace::Trace;
 use majit_trace::warmstate::{HotResult, WarmState};
 
 use crate::io_buffer;
-use crate::resume::ResumeData;
+use crate::resume::{ResumeData, ResumeDataBuilder};
 use crate::trace_ctx::TraceCtx;
+use crate::virtualizable::VirtualizableInfo;
 
 /// Result of checking a back-edge.
 pub enum BackEdgeAction {
@@ -69,6 +70,33 @@ pub struct MetaInterp<M: Clone> {
     /// Trace eagerness: start tracing from a guard failure point
     /// after this many failures (0 = never trace from guards).
     trace_eagerness: u32,
+    /// Virtualizable info for interpreter frame virtualization.
+    ///
+    /// When set, the JIT will:
+    /// 1. Read virtualizable fields at trace entry (synchronize)
+    /// 2. Write them back on guard failure (force)
+    /// 3. Track field access as IR ops during tracing
+    virtualizable_info: Option<VirtualizableInfo>,
+    /// JIT hooks for profiling and debugging.
+    hooks: JitHooks,
+}
+
+/// Callback hooks for JIT events (compilation, guard failures, etc.).
+///
+/// Mirrors RPython's jit_hook_loop, jit_hook_bridge, etc.
+/// All fields are optional closures.
+#[derive(Default)]
+pub struct JitHooks {
+    /// Called when a loop is compiled. Args: (green_key, num_ops_before, num_ops_after).
+    pub on_compile_loop: Option<Box<dyn Fn(u64, usize, usize) + Send>>,
+    /// Called when a bridge is compiled. Args: (green_key, fail_index, num_ops).
+    pub on_compile_bridge: Option<Box<dyn Fn(u64, u32, usize) + Send>>,
+    /// Called on guard failure. Args: (green_key, fail_index, fail_count).
+    pub on_guard_failure: Option<Box<dyn Fn(u64, u32, u32) + Send>>,
+    /// Called when tracing starts. Args: (green_key).
+    pub on_trace_start: Option<Box<dyn Fn(u64) + Send>>,
+    /// Called when tracing is aborted. Args: (green_key, permanent).
+    pub on_trace_abort: Option<Box<dyn Fn(u64, bool) + Send>>,
 }
 
 impl<M: Clone> MetaInterp<M> {
@@ -80,6 +108,8 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: HashMap::new(),
             tracing: None,
             trace_eagerness: 200,
+            virtualizable_info: None,
+            hooks: JitHooks::default(),
         }
     }
 
@@ -101,6 +131,44 @@ impl<M: Clone> MetaInterp<M> {
     /// Decay all counters to avoid stale hotness data.
     pub fn decay_counters(&mut self) {
         self.warm_state.decay_counters();
+    }
+
+    /// Set virtualizable info for interpreter frame virtualization.
+    ///
+    /// This tells the JIT how to read/write interpreter frame fields
+    /// during trace entry/exit.
+    pub fn set_virtualizable_info(&mut self, info: VirtualizableInfo) {
+        self.virtualizable_info = Some(info);
+    }
+
+    /// Get the virtualizable info.
+    pub fn virtualizable_info(&self) -> Option<&VirtualizableInfo> {
+        self.virtualizable_info.as_ref()
+    }
+
+    /// Set a callback for loop compilation events.
+    pub fn set_on_compile_loop(&mut self, f: impl Fn(u64, usize, usize) + Send + 'static) {
+        self.hooks.on_compile_loop = Some(Box::new(f));
+    }
+
+    /// Set a callback for bridge compilation events.
+    pub fn set_on_compile_bridge(&mut self, f: impl Fn(u64, u32, usize) + Send + 'static) {
+        self.hooks.on_compile_bridge = Some(Box::new(f));
+    }
+
+    /// Set a callback for guard failure events.
+    pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
+        self.hooks.on_guard_failure = Some(Box::new(f));
+    }
+
+    /// Set a callback for trace start events.
+    pub fn set_on_trace_start(&mut self, f: impl Fn(u64) + Send + 'static) {
+        self.hooks.on_trace_start = Some(Box::new(f));
+    }
+
+    /// Set a callback for trace abort events.
+    pub fn set_on_trace_abort(&mut self, f: impl Fn(u64, bool) + Send + 'static) {
+        self.hooks.on_trace_abort = Some(Box::new(f));
     }
 
     /// Check a back-edge: is this location hot enough to trace or run?
@@ -133,6 +201,9 @@ impl<M: Clone> MetaInterp<M> {
                 }
 
                 self.tracing = Some(TraceCtx::new(recorder, green_key));
+                if let Some(ref hook) = self.hooks.on_trace_start {
+                    hook(green_key);
+                }
                 BackEdgeAction::StartedTracing
             }
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
@@ -190,7 +261,9 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
         }
 
+        let num_ops_before = trace.ops.len();
         let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
+        let num_ops_after = optimized_ops.len();
 
         if std::env::var("MAJIT_LOG").is_ok() {
             eprintln!("--- trace (after opt) ---");
@@ -214,6 +287,9 @@ impl<M: Clone> MetaInterp<M> {
                         trace.inputargs.len()
                     );
                 }
+                // Build resume data for all guards in the optimized trace.
+                let resume_data = build_resume_data_for_guards(&optimized_ops, green_key);
+
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
@@ -221,12 +297,16 @@ impl<M: Clone> MetaInterp<M> {
                         num_inputs: trace.inputargs.len(),
                         meta,
                         guard_failures: HashMap::new(),
-                        resume_data: HashMap::new(),
+                        resume_data,
                     },
                 );
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = LoopToken::new(install_num);
                 self.warm_state.install_compiled(green_key, install_token);
+
+                if let Some(ref hook) = self.hooks.on_compile_loop {
+                    hook(green_key, num_ops_before, num_ops_after);
+                }
             }
             Err(e) => {
                 eprintln!("JIT compilation failed: {e}");
@@ -249,6 +329,9 @@ impl<M: Clone> MetaInterp<M> {
             }
             ctx.recorder.abort();
             self.warm_state.abort_tracing(green_key, permanent);
+            if let Some(ref hook) = self.hooks.on_trace_abort {
+                hook(green_key, permanent);
+            }
         }
     }
 
@@ -289,10 +372,13 @@ impl<M: Clone> MetaInterp<M> {
         // Track guard failures for bridge compilation decisions
         if fail_index > 0 {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled.guard_failures.entry(fail_index).or_insert(GuardFailureInfo {
-                fail_count: 0,
-                bridge_compiled: false,
-            });
+            let info = compiled
+                .guard_failures
+                .entry(fail_index)
+                .or_insert(GuardFailureInfo {
+                    fail_count: 0,
+                    bridge_compiled: false,
+                });
             info.fail_count += 1;
 
             if std::env::var("MAJIT_LOG").is_ok() {
@@ -303,6 +389,10 @@ impl<M: Clone> MetaInterp<M> {
             }
 
             self.warm_state.log_guard_failure(fail_index);
+
+            if let Some(ref hook) = self.hooks.on_guard_failure {
+                hook(green_key, fail_index, info.fail_count);
+            }
         }
 
         let compiled = self.compiled_loops.get(&green_key).unwrap();
@@ -340,12 +430,19 @@ impl<M: Clone> MetaInterp<M> {
         // Track guard failures
         if fail_index > 0 {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled.guard_failures.entry(fail_index).or_insert(GuardFailureInfo {
-                fail_count: 0,
-                bridge_compiled: false,
-            });
+            let info = compiled
+                .guard_failures
+                .entry(fail_index)
+                .or_insert(GuardFailureInfo {
+                    fail_count: 0,
+                    bridge_compiled: false,
+                });
             info.fail_count += 1;
             self.warm_state.log_guard_failure(fail_index);
+
+            if let Some(ref hook) = self.hooks.on_guard_failure {
+                hook(green_key, fail_index, info.fail_count);
+            }
         }
 
         let compiled = self.compiled_loops.get(&green_key).unwrap();
@@ -365,12 +462,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// This allows the interpreter to later reconstruct its full state
     /// when the guard fails, using `get_resume_data`.
-    pub fn attach_resume_data(
-        &mut self,
-        green_key: u64,
-        fail_index: u32,
-        resume_data: ResumeData,
-    ) {
+    pub fn attach_resume_data(&mut self, green_key: u64, fail_index: u32, resume_data: ResumeData) {
         if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
             compiled.resume_data.insert(fail_index, resume_data);
         }
@@ -389,8 +481,7 @@ impl<M: Clone> MetaInterp<M> {
             .get(&green_key)
             .and_then(|c| c.guard_failures.get(&fail_index))
             .is_some_and(|info| {
-                !info.bridge_compiled
-                    && self.warm_state.should_compile_bridge(info.fail_count)
+                !info.bridge_compiled && self.warm_state.should_compile_bridge(info.fail_count)
             })
     }
 
@@ -504,6 +595,10 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 }
                 self.warm_state.log_bridge_compile(fail_index);
+
+                if let Some(ref hook) = self.hooks.on_compile_bridge {
+                    hook(green_key, fail_index, optimized_ops.len());
+                }
                 true
             }
             Err(e) => {
@@ -561,11 +656,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// This is a convenience wrapper around `run_compiled_detailed` +
     /// `handle_guard_failure`.
-    pub fn run_and_recover(
-        &mut self,
-        green_key: u64,
-        live_values: &[i64],
-    ) -> Option<RunResult<M>> {
+    pub fn run_and_recover(&mut self, green_key: u64, live_values: &[i64]) -> Option<RunResult<M>> {
         let result = self.run_compiled_detailed(green_key, live_values)?;
         let fail_index = result.fail_index;
         let values = result.values.clone();
@@ -600,12 +691,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `live_values` are the concrete values at the guard failure point.
     ///
     /// Returns `true` if retracing was started, `false` if not possible.
-    pub fn start_retrace(
-        &mut self,
-        green_key: u64,
-        _fail_index: u32,
-        live_values: &[i64],
-    ) -> bool {
+    pub fn start_retrace(&mut self, green_key: u64, _fail_index: u32, live_values: &[i64]) -> bool {
         if self.tracing.is_some() {
             return false; // already tracing
         }
@@ -652,11 +738,57 @@ impl<M: Clone> MetaInterp<M> {
 
         // If we're already tracing, we can potentially inline.
         if self.tracing.is_some() {
+            // Check recursion depth (max inlining depth = 10).
+            if let Some(ref ctx) = self.tracing {
+                if ctx.inline_depth() >= MAX_INLINE_DEPTH {
+                    return InlineDecision::ResidualCall;
+                }
+            }
             return InlineDecision::Inline;
         }
 
         // Otherwise, emit a regular residual call.
         InlineDecision::ResidualCall
+    }
+
+    /// Begin inlining a function call during tracing.
+    ///
+    /// Records ENTER_PORTAL_FRAME marker and pushes an inline frame.
+    /// The caller should then trace the callee's body normally.
+    /// Call `leave_inline_frame()` when the callee returns.
+    ///
+    /// Returns `true` if inlining started, `false` if not tracing or depth exceeded.
+    pub fn enter_inline_frame(&mut self, callee_key: u64) -> bool {
+        let ctx = match self.tracing.as_mut() {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+        if ctx.inline_depth() >= MAX_INLINE_DEPTH {
+            return false;
+        }
+
+        let key_ref = ctx.const_int(callee_key as i64);
+        ctx.record_op(OpCode::EnterPortalFrame, &[key_ref]);
+        ctx.push_inline_frame(callee_key);
+        true
+    }
+
+    /// Leave an inlined function call during tracing.
+    ///
+    /// Records LEAVE_PORTAL_FRAME marker and pops the inline frame.
+    pub fn leave_inline_frame(&mut self) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.record_op(OpCode::LeavePortalFrame, &[]);
+            ctx.pop_inline_frame();
+        }
+    }
+
+    /// Get the current inlining depth.
+    pub fn inline_depth(&self) -> usize {
+        self.tracing
+            .as_ref()
+            .map(|ctx| ctx.inline_depth())
+            .unwrap_or(0)
     }
 
     /// Access the backend directly (for advanced operations).
@@ -669,6 +801,9 @@ impl<M: Clone> MetaInterp<M> {
         &mut self.backend
     }
 }
+
+/// Maximum inlining depth during tracing.
+const MAX_INLINE_DEPTH: usize = 10;
 
 /// Describes the recovery state after a guard failure.
 #[derive(Debug, Clone)]
@@ -698,10 +833,7 @@ pub enum GuardRecoveryAction {
 #[derive(Debug, Clone)]
 pub enum RunResult<M> {
     /// The loop finished normally.
-    Finished {
-        values: Vec<i64>,
-        meta: M,
-    },
+    Finished { values: Vec<i64>, meta: M },
     /// A guard failed.
     GuardFailure {
         values: Vec<i64>,
@@ -709,6 +841,43 @@ pub enum RunResult<M> {
         fail_index: u32,
         recovery: Option<GuardRecovery>,
     },
+}
+
+/// Build resume data for all guards in a compiled trace.
+///
+/// Scans the ops for guard operations (those with fail_args) and creates
+/// a ResumeData for each one. The ResumeData maps each guard's fail_args
+/// back to slot positions so the interpreter can reconstruct its state
+/// after a guard failure.
+///
+/// Returns a map from fail_index to ResumeData.
+fn build_resume_data_for_guards(
+    ops: &[majit_ir::Op],
+    pc: u64,
+) -> HashMap<u32, ResumeData> {
+    let mut result = HashMap::new();
+
+    for (op_idx, op) in ops.iter().enumerate() {
+        if !op.opcode.is_guard() {
+            continue;
+        }
+        // Guards that have fail_args produce resume data
+        if let Some(ref fail_args) = op.fail_args {
+            // Use (op_idx + 1) as fail_index since 0 means "no guard failure"
+            let fail_index = (op_idx + 1) as u32;
+
+            let mut builder = ResumeDataBuilder::new();
+            builder.push_frame(pc);
+
+            for (slot_idx, _) in fail_args.iter().enumerate() {
+                builder.map_slot(slot_idx, slot_idx);
+            }
+
+            result.insert(fail_index, builder.build());
+        }
+    }
+
+    result
 }
 
 /// Decision about how to handle a function call during tracing.

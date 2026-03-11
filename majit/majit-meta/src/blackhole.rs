@@ -10,6 +10,40 @@ use std::collections::HashMap;
 
 use majit_ir::{Op, OpCode, OpRef};
 
+/// Exception state tracked during blackhole execution.
+///
+/// Mirrors RPython's exception tracking in the meta-interpreter.
+/// Guards like GUARD_EXCEPTION and GUARD_NO_EXCEPTION check this state.
+#[derive(Debug, Clone, Default)]
+pub struct ExceptionState {
+    /// The exception class pointer (0 = no exception pending).
+    pub exc_class: i64,
+    /// The exception value pointer.
+    pub exc_value: i64,
+}
+
+impl ExceptionState {
+    /// Whether an exception is currently pending.
+    pub fn is_pending(&self) -> bool {
+        self.exc_class != 0
+    }
+
+    /// Set a pending exception.
+    pub fn set(&mut self, exc_class: i64, exc_value: i64) {
+        self.exc_class = exc_class;
+        self.exc_value = exc_value;
+    }
+
+    /// Clear the pending exception and return (class, value).
+    pub fn clear(&mut self) -> (i64, i64) {
+        let cls = self.exc_class;
+        let val = self.exc_value;
+        self.exc_class = 0;
+        self.exc_value = 0;
+        (cls, val)
+    }
+}
+
 /// Result of blackhole execution.
 pub enum BlackholeResult {
     /// Reached a Finish operation with output values.
@@ -38,6 +72,7 @@ pub fn blackhole_execute(
     start_index: usize,
 ) -> BlackholeResult {
     let mut values: HashMap<u32, i64> = initial_values.clone();
+    let mut exc_state = ExceptionState::default();
 
     // Merge constants into values
     for (&k, &v) in constants {
@@ -46,7 +81,7 @@ pub fn blackhole_execute(
 
     for op_idx in start_index..ops.len() {
         let op = &ops[op_idx];
-        let result = execute_one(op, &values);
+        let result = execute_one(op, &values, &mut exc_state);
 
         match result {
             OpResult::Value(v) => {
@@ -56,17 +91,11 @@ pub fn blackhole_execute(
             }
             OpResult::Void => {}
             OpResult::Finish(args) => {
-                let vals: Vec<i64> = args
-                    .iter()
-                    .map(|&r| resolve(&values, r))
-                    .collect();
+                let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
                 return BlackholeResult::Finish(vals);
             }
             OpResult::Jump(args) => {
-                let vals: Vec<i64> = args
-                    .iter()
-                    .map(|&r| resolve(&values, r))
-                    .collect();
+                let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
                 return BlackholeResult::Jump(vals);
             }
             OpResult::GuardFailed => {
@@ -103,16 +132,12 @@ enum OpResult {
     Unsupported(String),
 }
 
-fn execute_one(op: &Op, values: &HashMap<u32, i64>) -> OpResult {
+fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) -> OpResult {
     match op.opcode {
         // ── Control flow ──
         OpCode::Label => OpResult::Void,
-        OpCode::Finish => {
-            OpResult::Finish(op.args.to_vec())
-        }
-        OpCode::Jump => {
-            OpResult::Jump(op.args.to_vec())
-        }
+        OpCode::Finish => OpResult::Finish(op.args.to_vec()),
+        OpCode::Jump => OpResult::Jump(op.args.to_vec()),
 
         // ── Integer arithmetic ──
         OpCode::IntAdd => {
@@ -324,25 +349,35 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>) -> OpResult {
             // In blackhole, overflow checks are moot (we use wrapping)
             OpResult::Void
         }
-        OpCode::GuardOverflow => {
-            OpResult::Void
-        }
+        OpCode::GuardOverflow => OpResult::Void,
         OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
-            // In blackhole, force tokens are not used
-            OpResult::Void
+            // In blackhole, check if a call set an exception (simulated force).
+            if exc.is_pending() {
+                OpResult::GuardFailed
+            } else {
+                OpResult::Void
+            }
         }
-        OpCode::GuardNotInvalidated | OpCode::GuardFutureCondition => {
-            OpResult::Void
-        }
-        OpCode::GuardAlwaysFails => {
-            OpResult::GuardFailed
-        }
+        OpCode::GuardNotInvalidated | OpCode::GuardFutureCondition => OpResult::Void,
+        OpCode::GuardAlwaysFails => OpResult::GuardFailed,
         OpCode::GuardNoException => {
-            // In blackhole, no exception state to check
-            OpResult::Void
+            if exc.is_pending() {
+                OpResult::GuardFailed
+            } else {
+                OpResult::Void
+            }
         }
         OpCode::GuardException => {
-            // If no exception pending, guard fails
+            // Guard expects an exception of a specific class.
+            // arg(0) is the expected exception class.
+            if exc.is_pending() {
+                let expected_class = resolve(values, op.args[0]);
+                if exc.exc_class == expected_class {
+                    // Match — return the exception value and clear exception state.
+                    let (_, val) = exc.clear();
+                    return OpResult::Value(val);
+                }
+            }
             OpResult::GuardFailed
         }
         OpCode::GuardGcType => {
@@ -383,10 +418,28 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>) -> OpResult {
         }
 
         // ── Exception operations ──
-        OpCode::SaveException | OpCode::SaveExcClass => {
-            OpResult::Value(0)
+        OpCode::SaveException => {
+            // Return the pending exception value.
+            OpResult::Value(exc.exc_value)
         }
-        OpCode::RestoreException | OpCode::CheckMemoryError => {
+        OpCode::SaveExcClass => {
+            // Return the pending exception class.
+            OpResult::Value(exc.exc_class)
+        }
+        OpCode::RestoreException => {
+            // Restore exception state from (class, value) args.
+            let cls = resolve(values, op.args[0]);
+            let val = resolve(values, op.args[1]);
+            exc.set(cls, val);
+            OpResult::Void
+        }
+        OpCode::CheckMemoryError => {
+            // If the allocation returned null, set a MemoryError exception.
+            let ptr = resolve(values, op.args[0]);
+            if ptr == 0 {
+                // Set a generic memory error (class=1 by convention).
+                exc.set(1, 0);
+            }
             OpResult::Void
         }
 
@@ -464,9 +517,7 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>) -> OpResult {
             // Placeholder: full blackhole would actually invoke the function
             OpResult::Value(0)
         }
-        OpCode::CallMayForceI | OpCode::CallMayForceR | OpCode::CallMayForceF => {
-            OpResult::Value(0)
-        }
+        OpCode::CallMayForceI | OpCode::CallMayForceR | OpCode::CallMayForceF => OpResult::Value(0),
         OpCode::CallN | OpCode::CallMayForceN => OpResult::Void,
 
         OpCode::CallReleaseGilI | OpCode::CallReleaseGilR | OpCode::CallReleaseGilF => {
@@ -477,78 +528,61 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>) -> OpResult {
         // ── Memory access (raw) ──
         // In a full blackhole, these would dereference actual pointers.
         // For now, return 0 as placeholder.
-        OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF
-        | OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
-        | OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF => {
-            OpResult::Value(0)
-        }
-        OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-            OpResult::Void
-        }
+        OpCode::GetfieldGcI
+        | OpCode::GetfieldGcR
+        | OpCode::GetfieldGcF
+        | OpCode::GetfieldRawI
+        | OpCode::GetfieldRawR
+        | OpCode::GetfieldRawF
+        | OpCode::GetfieldGcPureI
+        | OpCode::GetfieldGcPureR
+        | OpCode::GetfieldGcPureF => OpResult::Value(0),
+        OpCode::SetfieldGc | OpCode::SetfieldRaw => OpResult::Void,
 
         // ── Array access ──
-        OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF
-        | OpCode::GetarrayitemRawI | OpCode::GetarrayitemRawR | OpCode::GetarrayitemRawF
-        | OpCode::GetarrayitemGcPureI | OpCode::GetarrayitemGcPureR | OpCode::GetarrayitemGcPureF => {
-            OpResult::Value(0)
-        }
-        OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-            OpResult::Void
-        }
+        OpCode::GetarrayitemGcI
+        | OpCode::GetarrayitemGcR
+        | OpCode::GetarrayitemGcF
+        | OpCode::GetarrayitemRawI
+        | OpCode::GetarrayitemRawR
+        | OpCode::GetarrayitemRawF
+        | OpCode::GetarrayitemGcPureI
+        | OpCode::GetarrayitemGcPureR
+        | OpCode::GetarrayitemGcPureF => OpResult::Value(0),
+        OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => OpResult::Void,
 
         // ── Array/string length ──
-        OpCode::ArraylenGc => {
-            OpResult::Value(0)
-        }
-        OpCode::Strlen | OpCode::Unicodelen => {
-            OpResult::Value(0)
-        }
+        OpCode::ArraylenGc => OpResult::Value(0),
+        OpCode::Strlen | OpCode::Unicodelen => OpResult::Value(0),
 
         // ── Allocation (no-op in blackhole, objects already materialized) ──
-        OpCode::New | OpCode::NewWithVtable => {
-            OpResult::Value(0)
-        }
-        OpCode::NewArray | OpCode::NewArrayClear => {
-            OpResult::Value(0)
-        }
-        OpCode::Newstr | OpCode::Newunicode => {
-            OpResult::Value(0)
-        }
+        OpCode::New | OpCode::NewWithVtable => OpResult::Value(0),
+        OpCode::NewArray | OpCode::NewArrayClear => OpResult::Value(0),
+        OpCode::Newstr | OpCode::Newunicode => OpResult::Value(0),
 
         // ── String/char access ──
-        OpCode::Strgetitem | OpCode::Unicodegetitem => {
-            OpResult::Value(0)
-        }
-        OpCode::Strsetitem | OpCode::Unicodesetitem => {
-            OpResult::Void
-        }
-        OpCode::Strhash | OpCode::Unicodehash => {
-            OpResult::Value(0)
-        }
+        OpCode::Strgetitem | OpCode::Unicodegetitem => OpResult::Value(0),
+        OpCode::Strsetitem | OpCode::Unicodesetitem => OpResult::Void,
+        OpCode::Strhash | OpCode::Unicodehash => OpResult::Value(0),
 
         // ── Interior field access ──
-        OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcR
-        | OpCode::GetinteriorfieldGcF => {
+        OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcR | OpCode::GetinteriorfieldGcF => {
             OpResult::Value(0)
         }
-        OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
-            OpResult::Void
-        }
+        OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => OpResult::Void,
 
         // ── Raw memory ──
         OpCode::RawStore => OpResult::Void,
         OpCode::RawLoadI | OpCode::RawLoadF => OpResult::Value(0),
 
         // ── GC write barriers (no-op in blackhole) ──
-        OpCode::CondCallGcWb | OpCode::CondCallGcWbArray | OpCode::ZeroArray => {
-            OpResult::Void
-        }
+        OpCode::CondCallGcWb | OpCode::CondCallGcWbArray | OpCode::ZeroArray => OpResult::Void,
 
         // ── Nursery allocation (no-op in blackhole) ──
-        OpCode::CallMallocNursery | OpCode::CallMallocNurseryVarsize
-        | OpCode::CallMallocNurseryVarsizeFrame | OpCode::NurseryPtrIncrement => {
-            OpResult::Value(0)
-        }
+        OpCode::CallMallocNursery
+        | OpCode::CallMallocNurseryVarsize
+        | OpCode::CallMallocNurseryVarsizeFrame
+        | OpCode::NurseryPtrIncrement => OpResult::Value(0),
 
         // ── Pointer comparisons/casts ──
         OpCode::PtrEq | OpCode::InstancePtrEq => {
@@ -575,19 +609,16 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>) -> OpResult {
         OpCode::CallAssemblerN => OpResult::Void,
 
         // ── Cond call (conditional function call) ──
-        OpCode::CondCallValueI | OpCode::CondCallValueR => {
-            OpResult::Value(0)
-        }
+        OpCode::CondCallValueI | OpCode::CondCallValueR => OpResult::Value(0),
         OpCode::CondCallN => OpResult::Void,
 
         // ── Thread-local ref ──
-        OpCode::ThreadlocalrefGet => {
-            OpResult::Value(0)
-        }
+        OpCode::ThreadlocalrefGet => OpResult::Value(0),
 
         // ── Loopinvariant calls ──
-        OpCode::CallLoopinvariantI | OpCode::CallLoopinvariantR
-        | OpCode::CallLoopinvariantF => OpResult::Value(0),
+        OpCode::CallLoopinvariantI | OpCode::CallLoopinvariantR | OpCode::CallLoopinvariantF => {
+            OpResult::Value(0)
+        }
         OpCode::CallLoopinvariantN => OpResult::Void,
 
         // ── GC loads ──
@@ -629,8 +660,10 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>) -> OpResult {
         }
 
         // ── Debug / portal frame markers ──
-        OpCode::DebugMergePoint | OpCode::EnterPortalFrame
-        | OpCode::LeavePortalFrame | OpCode::JitDebug => OpResult::Void,
+        OpCode::DebugMergePoint
+        | OpCode::EnterPortalFrame
+        | OpCode::LeavePortalFrame
+        | OpCode::JitDebug => OpResult::Void,
 
         // ── Escape ops (testing) ──
         OpCode::EscapeI | OpCode::EscapeR | OpCode::EscapeF => OpResult::Value(0),
@@ -687,10 +720,13 @@ mod tests {
 
         match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
             BlackholeResult::Finish(vals) => assert_eq!(vals, vec![30]),
-            other => panic!("expected Finish, got {:?}", match other {
-                BlackholeResult::Abort(s) => s,
-                _ => "other".to_string(),
-            }),
+            other => panic!(
+                "expected Finish, got {:?}",
+                match other {
+                    BlackholeResult::Abort(s) => s,
+                    _ => "other".to_string(),
+                }
+            ),
         }
     }
 
@@ -707,6 +743,99 @@ mod tests {
         match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
             BlackholeResult::Finish(vals) => assert_eq!(vals, vec![1]),
             _ => panic!("expected Finish"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_exception_guard_no_exception_passes() {
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 42i64);
+
+        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+            BlackholeResult::Finish(vals) => assert_eq!(vals, vec![42]),
+            _ => panic!("expected Finish when no exception is pending"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_exception_save_exc_class() {
+        // RestoreException sets exception state, then SaveExcClass reads it.
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(
+                OpCode::RestoreException,
+                &[OpRef(0), OpRef(1)],
+                OpRef::NONE.0,
+            ),
+            mk_op(OpCode::SaveExcClass, &[], 2),
+            mk_op(OpCode::SaveException, &[], 3),
+            mk_op(OpCode::Finish, &[OpRef(2), OpRef(3)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 100i64); // exc_class
+        initial.insert(1, 200i64); // exc_value
+
+        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+            BlackholeResult::Finish(vals) => assert_eq!(vals, vec![100, 200]),
+            _ => panic!("expected Finish"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_guard_no_exception_fails_with_exception() {
+        // RestoreException then GuardNoException should fail.
+        let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(
+                OpCode::RestoreException,
+                &[OpRef(0), OpRef(1)],
+                OpRef::NONE.0,
+            ),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 100i64);
+        initial.insert(1, 200i64);
+
+        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+            BlackholeResult::GuardFailed { .. } => {} // expected
+            _ => panic!("expected GuardFailed when exception is pending"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_guard_exception_matches() {
+        // Set exception, then GuardException with matching class should pass.
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(
+                OpCode::RestoreException,
+                &[OpRef(0), OpRef(1)],
+                OpRef::NONE.0,
+            ),
+            // GuardException expects class in arg(0)
+            mk_op(OpCode::GuardException, &[OpRef(0)], 2),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 100i64); // exc_class
+        initial.insert(1, 200i64); // exc_value
+
+        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+            BlackholeResult::Finish(vals) => {
+                // GuardException should return the exc_value
+                assert_eq!(vals, vec![200]);
+            }
+            _ => panic!("expected Finish when exception class matches"),
         }
     }
 

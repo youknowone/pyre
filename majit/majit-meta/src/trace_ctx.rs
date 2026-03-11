@@ -18,6 +18,8 @@ pub struct TraceCtx {
     pub(crate) recorder: TraceRecorder,
     pub(crate) green_key: u64,
     pub(crate) constants: ConstantPool,
+    /// Stack of inlined function frames (callee green_keys).
+    inline_frames: Vec<u64>,
 }
 
 impl TraceCtx {
@@ -26,7 +28,23 @@ impl TraceCtx {
             recorder,
             green_key,
             constants: ConstantPool::new(),
+            inline_frames: Vec::new(),
         }
+    }
+
+    /// Get the current inlining depth.
+    pub fn inline_depth(&self) -> usize {
+        self.inline_frames.len()
+    }
+
+    /// Push an inline frame (entering a callee).
+    pub(crate) fn push_inline_frame(&mut self, callee_key: u64) {
+        self.inline_frames.push(callee_key);
+    }
+
+    /// Pop an inline frame (returning from a callee).
+    pub(crate) fn pop_inline_frame(&mut self) {
+        self.inline_frames.pop();
     }
 
     /// Get or create a constant OpRef for a given i64 value.
@@ -160,6 +178,52 @@ impl TraceCtx {
         call_args.extend_from_slice(args);
         self.recorder
             .record_op_with_descr(OpCode::CallMayForceI, &call_args, descr)
+    }
+
+    /// Record a virtualizable field read (GETFIELD_GC_I/R/F).
+    ///
+    /// During tracing, reading a virtualizable field is recorded as a
+    /// GETFIELD_GC operation. The optimizer's virtualize pass may later
+    /// eliminate this operation if the field is virtual.
+    pub fn vable_getfield_int(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+    ) -> OpRef {
+        let offset_ref = self.const_int(field_offset as i64);
+        self.record_op(OpCode::GetfieldGcI, &[vable_opref, offset_ref])
+    }
+
+    /// Record a virtualizable field write (SETFIELD_GC).
+    pub fn vable_setfield(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+        value: OpRef,
+    ) {
+        let offset_ref = self.const_int(field_offset as i64);
+        self.record_op(OpCode::SetfieldGc, &[vable_opref, offset_ref, value]);
+    }
+
+    /// Record a virtualizable array item read (GETARRAYITEM_GC_I/R/F).
+    pub fn vable_getarrayitem_int(
+        &mut self,
+        array_opref: OpRef,
+        index: OpRef,
+    ) -> OpRef {
+        let zero = self.const_int(0); // descr placeholder
+        self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
+    }
+
+    /// Record a virtualizable array item write (SETARRAYITEM_GC).
+    pub fn vable_setarrayitem(
+        &mut self,
+        array_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+    ) {
+        let zero = self.const_int(0); // descr placeholder
+        self.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
     }
 
     /// Record a ref-returning call to a may-force function.
