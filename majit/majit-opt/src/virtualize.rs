@@ -491,6 +491,46 @@ impl OptimizationPass for OptVirtualize {
                 self.optimize_escaping_op(op, ctx)
             }
 
+            // ── Record hint opcodes ──
+            // These record information about values that downstream passes can use.
+            // The hints themselves are removed (no code emitted).
+
+            // RECORD_EXACT_CLASS(ref, class_const): record that ref has class class_const.
+            // Enables subsequent GUARD_CLASS elimination.
+            OpCode::RecordExactClass => {
+                let ref_opref = ctx.get_replacement(op.arg(0));
+                if let Some(&Value::Ref(class_ref)) = ctx.get_constant(op.arg(1)) {
+                    self.set_info(
+                        ref_opref,
+                        PtrInfo::KnownClass {
+                            class_ptr: class_ref,
+                            is_nonnull: true,
+                        },
+                    );
+                }
+                PassResult::Remove
+            }
+
+            // RECORD_EXACT_VALUE_I(ref, int_const): record that ref has exact int value.
+            OpCode::RecordExactValueI => {
+                let ref_opref = ctx.get_replacement(op.arg(0));
+                if let Some(val) = ctx.get_constant_int(op.arg(1)) {
+                    ctx.make_constant(ref_opref, Value::Int(val));
+                }
+                PassResult::Remove
+            }
+
+            // RECORD_EXACT_VALUE_R(ref, ref_const): record that ref equals ref_const.
+            OpCode::RecordExactValueR => {
+                let ref_opref = ctx.get_replacement(op.arg(0));
+                ctx.replace_op(ref_opref, ctx.get_replacement(op.arg(1)));
+                PassResult::Remove
+            }
+
+            // RECORD_KNOWN_RESULT: record that a call with given args produces known result.
+            // Consumed by pure pass (CSE) — just remove here.
+            OpCode::RecordKnownResult => PassResult::Remove,
+
             // Everything else passes through
             _ => PassResult::PassOn,
         }
