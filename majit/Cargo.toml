@@ -10,4 +10,5 @@ members = [
     "majit-macros",
     "majit-runtime",
     "examples/tlr",
+    "examples/tl",
 ]
