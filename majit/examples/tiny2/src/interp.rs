@@ -168,24 +168,19 @@ mod tests {
 
     #[test]
     fn test_factorial() {
-        let prog: Vec<&str> =
-            "The factorial of #1 is 1 { #1 MUL #1 1 SUB ->#1 #1 }"
-                .split_whitespace()
-                .collect();
+        let prog: Vec<&str> = "The factorial of #1 is 1 { #1 MUL #1 1 SUB ->#1 #1 }"
+            .split_whitespace()
+            .collect();
         let result = interpret(&prog, &mut [Box::Int(5)]);
         assert_eq!(repr_stack(&result), "The factorial of 5 is 120");
     }
 
     #[test]
     fn test_fibonacci() {
-        let prog: Vec<&str> =
-            "Fibonacci numbers: { #1 #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 }"
-                .split_whitespace()
-                .collect();
-        let result = interpret(
-            &prog,
-            &mut [Box::Int(1), Box::Int(1), Box::Int(10)],
-        );
+        let prog: Vec<&str> = "Fibonacci numbers: { #1 #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 }"
+            .split_whitespace()
+            .collect();
+        let result = interpret(&prog, &mut [Box::Int(1), Box::Int(1), Box::Int(10)]);
         assert_eq!(
             repr_stack(&result),
             "Fibonacci numbers: 1 1 2 3 5 8 13 21 34 55"

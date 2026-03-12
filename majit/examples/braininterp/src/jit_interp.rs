@@ -155,21 +155,14 @@ impl JitBrainInterp {
                         match self.warm_state.maybe_compile(target as u64) {
                             HotResult::NotHot => {}
                             HotResult::StartTracing(recorder) => {
-                                self.start_tracing(
-                                    recorder, code, target, &tape, pointer,
-                                );
+                                self.start_tracing(recorder, code, target, &tape, pointer);
                             }
                             HotResult::AlreadyTracing => {}
                             HotResult::RunCompiled => {
-                                if let Some(new_cells) =
-                                    self.run_compiled(target, &tape)
-                                {
+                                if let Some(new_cells) = self.run_compiled(target, &tape) {
                                     // Write results back to tape.
-                                    let compiled =
-                                        self.compiled_loops.get(&target).unwrap();
-                                    for (i, &pos) in
-                                        compiled.tape_positions.iter().enumerate()
-                                    {
+                                    let compiled = self.compiled_loops.get(&target).unwrap();
+                                    for (i, &pos) in compiled.tape_positions.iter().enumerate() {
                                         tape[pos] = new_cells[i] as u8;
                                     }
                                     // After compiled loop, the `[` condition is
@@ -275,17 +268,13 @@ impl JitBrainInterp {
             let fail_descr = make_fail_descr(state.entry_positions.len());
             if runtime_val == 0 {
                 // Loop skipped: guard that cell is zero.
-                let cmp = state
-                    .recorder
-                    .record_op(OpCode::IntEq, &[cell, zero]);
+                let cmp = state.recorder.record_op(OpCode::IntEq, &[cell, zero]);
                 state
                     .recorder
                     .record_guard(OpCode::GuardTrue, &[cmp], fail_descr);
             } else {
                 // Loop entered: guard that cell is non-zero.
-                let cmp = state
-                    .recorder
-                    .record_op(OpCode::IntNe, &[cell, zero]);
+                let cmp = state.recorder.record_op(OpCode::IntNe, &[cell, zero]);
                 state
                     .recorder
                     .record_guard(OpCode::GuardTrue, &[cmp], fail_descr);
@@ -301,9 +290,7 @@ impl JitBrainInterp {
                 let target = find_matching_open(code, pc);
 
                 let fail_descr = make_fail_descr(state.entry_positions.len());
-                let cmp = state
-                    .recorder
-                    .record_op(OpCode::IntNe, &[cell, zero]);
+                let cmp = state.recorder.record_op(OpCode::IntNe, &[cell, zero]);
                 state
                     .recorder
                     .record_guard(OpCode::GuardTrue, &[cmp], fail_descr);
@@ -316,9 +303,7 @@ impl JitBrainInterp {
             } else {
                 // Loop exit: guard that cell is zero.
                 let fail_descr = make_fail_descr(state.entry_positions.len());
-                let cmp = state
-                    .recorder
-                    .record_op(OpCode::IntEq, &[cell, zero]);
+                let cmp = state.recorder.record_op(OpCode::IntEq, &[cell, zero]);
                 state
                     .recorder
                     .record_guard(OpCode::GuardTrue, &[cmp], fail_descr);
@@ -397,11 +382,7 @@ impl JitBrainInterp {
         }
     }
 
-    fn run_compiled(
-        &mut self,
-        loop_pc: usize,
-        tape: &[u8],
-    ) -> Option<Vec<i64>> {
+    fn run_compiled(&mut self, loop_pc: usize, tape: &[u8]) -> Option<Vec<i64>> {
         let compiled = self.compiled_loops.get(&loop_pc)?;
 
         let args: Vec<Value> = compiled

@@ -9,6 +9,7 @@ members = [
     "majit-gc",
     "majit-macros",
     "majit-runtime",
+    "majit-meta",
     "examples/tlr",
     "examples/tl",
     "examples/tla",
