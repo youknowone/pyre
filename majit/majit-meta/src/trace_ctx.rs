@@ -19,11 +19,22 @@ use crate::TraceAction;
 pub struct JitDriverDescriptor {
     /// All variables in declaration order.
     pub vars: Vec<JitDriverVar>,
+    /// Optional name of the virtualizable red variable.
+    pub virtualizable: Option<String>,
 }
 
 impl JitDriverDescriptor {
     /// Create a descriptor from green and red variable lists.
     pub fn new(greens: Vec<(&str, Type)>, reds: Vec<(&str, Type)>) -> Self {
+        Self::with_virtualizable(greens, reds, None)
+    }
+
+    /// Create a descriptor with optional virtualizable metadata.
+    pub fn with_virtualizable(
+        greens: Vec<(&str, Type)>,
+        reds: Vec<(&str, Type)>,
+        virtualizable: Option<&str>,
+    ) -> Self {
         let mut vars = Vec::new();
         for (name, tp) in greens {
             vars.push(JitDriverVar::green(name, tp));
@@ -31,7 +42,10 @@ impl JitDriverDescriptor {
         for (name, tp) in reds {
             vars.push(JitDriverVar::red(name, tp));
         }
-        JitDriverDescriptor { vars }
+        JitDriverDescriptor {
+            vars,
+            virtualizable: virtualizable.map(str::to_string),
+        }
     }
 
     /// Get only the green variables.
@@ -62,6 +76,32 @@ impl JitDriverDescriptor {
     pub fn num_reds(&self) -> usize {
         self.vars.iter().filter(|v| v.kind == VarKind::Red).count()
     }
+
+    /// Get the virtualizable variable, if any.
+    pub fn virtualizable(&self) -> Option<&JitDriverVar> {
+        let name = self.virtualizable.as_deref()?;
+        self.vars.iter().find(|var| var.name == name)
+    }
+}
+
+/// Trait implemented by declarative `#[jit_driver]` marker types.
+///
+/// This provides a stable seam between proc-macro-generated driver metadata
+/// and the runtime `JitDriver` orchestration layer.
+pub trait DeclarativeJitDriver {
+    const GREENS: &'static [&'static str];
+    const REDS: &'static [&'static str];
+    const NUM_VARS: usize;
+    const NUM_GREENS: usize;
+    const NUM_REDS: usize;
+    const VIRTUALIZABLE: Option<&'static str>;
+
+    fn descriptor(
+        green_types: &[Type],
+        red_types: &[Type],
+    ) -> Result<JitDriverDescriptor, &'static str>;
+
+    fn green_key(values: &[i64]) -> Result<GreenKey, &'static str>;
 }
 
 /// Tracing context: wraps TraceRecorder + ConstantPool with convenience API.
@@ -79,6 +119,8 @@ pub struct TraceCtx {
     inline_frames: Vec<u64>,
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
+    /// Declarative driver layout metadata, if provided by the interpreter.
+    driver_descriptor: Option<JitDriverDescriptor>,
 }
 
 impl TraceCtx {
@@ -89,6 +131,7 @@ impl TraceCtx {
             constants: ConstantPool::new(),
             inline_frames: Vec::new(),
             green_key_values: None,
+            driver_descriptor: None,
         }
     }
 
@@ -104,6 +147,7 @@ impl TraceCtx {
             constants: ConstantPool::new(),
             inline_frames: Vec::new(),
             green_key_values: Some(green_key_values),
+            driver_descriptor: None,
         }
     }
 
@@ -214,6 +258,16 @@ impl TraceCtx {
     /// Set the structured green key values.
     pub fn set_green_key_values(&mut self, values: GreenKey) {
         self.green_key_values = Some(values);
+    }
+
+    /// The declarative JitDriver descriptor, if provided.
+    pub fn driver_descriptor(&self) -> Option<&JitDriverDescriptor> {
+        self.driver_descriptor.as_ref()
+    }
+
+    /// Attach declarative JitDriver metadata to the active trace.
+    pub fn set_driver_descriptor(&mut self, descriptor: JitDriverDescriptor) {
+        self.driver_descriptor = Some(descriptor);
     }
 
     /// Record a promote: emit GuardValue to specialize on a runtime value.
@@ -361,6 +415,186 @@ impl TraceCtx {
     /// Record GUARD_NOT_INVALIDATED (check loop not invalidated).
     pub fn guard_not_invalidated(&mut self, num_live: usize) -> OpRef {
         self.record_guard(OpCode::GuardNotInvalidated, &[], num_live)
+    }
+
+    // ── Generic typed call ──────────────────────────────────────────
+
+    /// Record a function call with explicit argument and return types.
+    ///
+    /// All type-specific call convenience methods delegate to this.
+    /// `opcode` selects the call family (CallI/R/F/N, CallPureI/R/F/N, etc.).
+    pub fn call_typed(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+    ) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr = make_call_descr(arg_types, ret_type);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(opcode, &call_args, descr)
+    }
+
+    // ── Ref/Float call variants ─────────────────────────────────────
+
+    /// Record a ref-returning function call (CallR).
+    pub fn call_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Ref);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallR, &call_args, descr)
+    }
+
+    /// Record a float-returning function call (CallF).
+    pub fn call_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Float);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallF, &call_args, descr)
+    }
+
+    /// Record a ref-returning elidable (pure) call (CallPureR).
+    pub fn call_elidable_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Ref);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallPureR, &call_args, descr)
+    }
+
+    /// Record a float-returning elidable (pure) call (CallPureF).
+    pub fn call_elidable_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Float);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallPureF, &call_args, descr)
+    }
+
+    /// Record a float-returning may-force call (CallMayForceF).
+    pub fn call_may_force_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Float);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallMayForceF, &call_args, descr)
+    }
+
+    /// Record a void-returning GIL-release call (CallReleaseGilN).
+    pub fn call_release_gil_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Void);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallReleaseGilN, &call_args, descr);
+    }
+
+    /// Record a ref-returning GIL-release call (CallReleaseGilR).
+    pub fn call_release_gil_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Ref);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallReleaseGilR, &call_args, descr)
+    }
+
+    /// Record a float-returning GIL-release call (CallReleaseGilF).
+    pub fn call_release_gil_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Float);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallReleaseGilF, &call_args, descr)
+    }
+
+    /// Record a ref-returning loop-invariant call (CallLoopinvariantR).
+    pub fn call_loopinvariant_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Ref);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallLoopinvariantR, &call_args, descr)
+    }
+
+    /// Record a float-returning loop-invariant call (CallLoopinvariantF).
+    pub fn call_loopinvariant_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_descr(&arg_types, Type::Float);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CallLoopinvariantF, &call_args, descr)
+    }
+
+    // ── Exception handling ──────────────────────────────────────────
+
+    /// Record GUARD_EXCEPTION: assert that the pending exception matches
+    /// the given class, and produce a ref to the exception value.
+    pub fn guard_exception(&mut self, exc_class: OpRef, num_live: usize) -> OpRef {
+        self.record_guard(OpCode::GuardException, &[exc_class], num_live)
+    }
+
+    /// Record SAVE_EXCEPTION: capture the pending exception value as a ref.
+    pub fn save_exception(&mut self) -> OpRef {
+        self.record_op(OpCode::SaveException, &[])
+    }
+
+    /// Record SAVE_EXC_CLASS: capture the pending exception's class as an int.
+    pub fn save_exc_class(&mut self) -> OpRef {
+        self.record_op(OpCode::SaveExcClass, &[])
+    }
+
+    /// Record RESTORE_EXCEPTION: restore exception state from saved
+    /// class and value refs.
+    pub fn restore_exception(&mut self, exc_class: OpRef, exc_value: OpRef) {
+        self.record_op(OpCode::RestoreException, &[exc_class, exc_value]);
+    }
+
+    // ── Object allocation ───────────────────────────────────────────
+
+    /// Record NEW: allocate a new object described by `descr`.
+    pub fn record_new(&mut self, descr: DescrRef) -> OpRef {
+        self.record_op_with_descr(OpCode::New, &[], descr)
+    }
+
+    /// Record NEW_WITH_VTABLE: allocate a new object with an explicit vtable pointer.
+    pub fn record_new_with_vtable(&mut self, vtable: OpRef, descr: DescrRef) -> OpRef {
+        self.record_op_with_descr(OpCode::NewWithVtable, &[vtable], descr)
+    }
+
+    /// Record NEW_ARRAY: allocate a new array with the given length.
+    pub fn record_new_array(&mut self, length: OpRef, descr: DescrRef) -> OpRef {
+        self.record_op_with_descr(OpCode::NewArray, &[length], descr)
+    }
+
+    /// Record NEW_ARRAY_CLEAR: allocate a zero-initialized array.
+    pub fn record_new_array_clear(&mut self, length: OpRef, descr: DescrRef) -> OpRef {
+        self.record_op_with_descr(OpCode::NewArrayClear, &[length], descr)
     }
 
     // ── Convenience methods for common trace patterns ───────────────
