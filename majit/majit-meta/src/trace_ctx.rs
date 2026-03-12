@@ -340,10 +340,34 @@ impl TraceCtx {
         self.record_op(OpCode::SetfieldGc, &[vable_opref, offset_ref, value]);
     }
 
-    /// Record a virtualizable array item read (GETARRAYITEM_GC_I/R/F).
+    /// Record a virtualizable ref field read (GETFIELD_GC_R).
+    pub fn vable_getfield_ref(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
+        let offset_ref = self.const_int(field_offset as i64);
+        self.record_op(OpCode::GetfieldGcR, &[vable_opref, offset_ref])
+    }
+
+    /// Record a virtualizable float field read (GETFIELD_GC_F).
+    pub fn vable_getfield_float(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
+        let offset_ref = self.const_int(field_offset as i64);
+        self.record_op(OpCode::GetfieldGcF, &[vable_opref, offset_ref])
+    }
+
+    /// Record a virtualizable array item read (GETARRAYITEM_GC_I).
     pub fn vable_getarrayitem_int(&mut self, array_opref: OpRef, index: OpRef) -> OpRef {
         let zero = self.const_int(0); // descr placeholder
         self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
+    }
+
+    /// Record a virtualizable array item read (GETARRAYITEM_GC_R).
+    pub fn vable_getarrayitem_ref(&mut self, array_opref: OpRef, index: OpRef) -> OpRef {
+        let zero = self.const_int(0); // descr placeholder
+        self.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero])
+    }
+
+    /// Record a virtualizable array item read (GETARRAYITEM_GC_F).
+    pub fn vable_getarrayitem_float(&mut self, array_opref: OpRef, index: OpRef) -> OpRef {
+        let zero = self.const_int(0); // descr placeholder
+        self.record_op(OpCode::GetarrayitemGcF, &[array_opref, index, zero])
     }
 
     /// Record a virtualizable array item write (SETARRAYITEM_GC).
@@ -595,6 +619,74 @@ impl TraceCtx {
     /// Record NEW_ARRAY_CLEAR: allocate a zero-initialized array.
     pub fn record_new_array_clear(&mut self, length: OpRef, descr: DescrRef) -> OpRef {
         self.record_op_with_descr(OpCode::NewArrayClear, &[length], descr)
+    }
+
+    // ── Overflow-checked arithmetic ────────────────────────────────
+
+    /// Record overflow-checked integer add + GuardNoOverflow.
+    ///
+    /// Returns the result OpRef. On overflow at trace time, the caller
+    /// should abort tracing.
+    pub fn int_add_ovf(&mut self, lhs: OpRef, rhs: OpRef, num_live: usize) -> OpRef {
+        let result = self.record_op(OpCode::IntAddOvf, &[lhs, rhs]);
+        self.record_guard(OpCode::GuardNoOverflow, &[], num_live);
+        result
+    }
+
+    /// Record overflow-checked integer sub + GuardNoOverflow.
+    pub fn int_sub_ovf(&mut self, lhs: OpRef, rhs: OpRef, num_live: usize) -> OpRef {
+        let result = self.record_op(OpCode::IntSubOvf, &[lhs, rhs]);
+        self.record_guard(OpCode::GuardNoOverflow, &[], num_live);
+        result
+    }
+
+    /// Record overflow-checked integer mul + GuardNoOverflow.
+    pub fn int_mul_ovf(&mut self, lhs: OpRef, rhs: OpRef, num_live: usize) -> OpRef {
+        let result = self.record_op(OpCode::IntMulOvf, &[lhs, rhs]);
+        self.record_guard(OpCode::GuardNoOverflow, &[], num_live);
+        result
+    }
+
+    // ── String operations ───────────────────────────────────────────
+
+    /// Record NEWSTR: allocate a new string with given length.
+    pub fn newstr(&mut self, length: OpRef) -> OpRef {
+        self.record_op(OpCode::Newstr, &[length])
+    }
+
+    /// Record STRLEN: get string length.
+    pub fn strlen(&mut self, string: OpRef) -> OpRef {
+        self.record_op(OpCode::Strlen, &[string])
+    }
+
+    /// Record STRGETITEM: read character at index.
+    pub fn strgetitem(&mut self, string: OpRef, index: OpRef) -> OpRef {
+        self.record_op(OpCode::Strgetitem, &[string, index])
+    }
+
+    /// Record STRSETITEM: write character at index.
+    pub fn strsetitem(&mut self, string: OpRef, index: OpRef, value: OpRef) {
+        self.record_op(OpCode::Strsetitem, &[string, index, value]);
+    }
+
+    /// Record COPYSTRCONTENT: copy characters between strings.
+    pub fn copystrcontent(
+        &mut self,
+        src: OpRef,
+        dst: OpRef,
+        src_start: OpRef,
+        dst_start: OpRef,
+        length: OpRef,
+    ) {
+        self.record_op(
+            OpCode::Copystrcontent,
+            &[src, dst, src_start, dst_start, length],
+        );
+    }
+
+    /// Record STRHASH: compute string hash.
+    pub fn strhash(&mut self, string: OpRef) -> OpRef {
+        self.record_op(OpCode::Strhash, &[string])
     }
 
     // ── Convenience methods for common trace patterns ───────────────

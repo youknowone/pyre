@@ -29,6 +29,22 @@ const BC_PUSH_TO: u8 = 20;
 const BC_MOVE_I: u8 = 21;
 const BC_CALL_INT: u8 = 22;
 const BC_CALL_PURE_INT: u8 = 23;
+// Ref-typed bytecodes
+const BC_LOAD_CONST_R: u8 = 24;
+const BC_POP_R: u8 = 25;
+const BC_PUSH_R: u8 = 26;
+const BC_MOVE_R: u8 = 27;
+const BC_CALL_REF: u8 = 28;
+const BC_CALL_PURE_REF: u8 = 29;
+// Float-typed bytecodes
+const BC_LOAD_CONST_F: u8 = 30;
+const BC_POP_F: u8 = 31;
+const BC_PUSH_F: u8 = 32;
+const BC_MOVE_F: u8 = 33;
+const BC_CALL_FLOAT: u8 = 34;
+const BC_CALL_PURE_FLOAT: u8 = 35;
+const BC_RECORD_BINOP_F: u8 = 36;
+const BC_RECORD_UNARY_F: u8 = 37;
 const MAX_HOST_CALL_ARITY: usize = 8;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -119,8 +135,14 @@ pub struct MIFrame<'a> {
     pub code_cursor: usize,
     pub int_regs: Vec<Option<OpRef>>,
     pub int_values: Vec<Option<i64>>,
+    pub ref_regs: Vec<Option<OpRef>>,
+    pub ref_values: Vec<Option<i64>>,
+    pub float_regs: Vec<Option<OpRef>>,
+    pub float_values: Vec<Option<i64>>,
     pub inline_frame: bool,
     pub return_i: Option<(usize, usize)>,
+    pub return_r: Option<(usize, usize)>,
+    pub return_f: Option<(usize, usize)>,
 }
 
 impl<'a> MIFrame<'a> {
@@ -131,8 +153,14 @@ impl<'a> MIFrame<'a> {
             code_cursor: 0,
             int_regs: vec![None; jitcode.num_regs[0] as usize],
             int_values: vec![None; jitcode.num_regs[0] as usize],
+            ref_regs: vec![None; jitcode.num_regs[1] as usize],
+            ref_values: vec![None; jitcode.num_regs[1] as usize],
+            float_regs: vec![None; jitcode.num_regs[2] as usize],
+            float_values: vec![None; jitcode.num_regs[2] as usize],
             inline_frame: false,
             return_i: None,
+            return_r: None,
+            return_f: None,
         }
     }
 
@@ -227,10 +255,18 @@ where
             if finished_frame.inline_frame {
                 ctx.pop_inline_frame();
             }
-            if let Some((callee_src, caller_dst)) = finished_frame.return_i {
-                if let Some(parent) = self.frames.frames.last_mut() {
+            if let Some(parent) = self.frames.frames.last_mut() {
+                if let Some((callee_src, caller_dst)) = finished_frame.return_i {
                     parent.int_regs[caller_dst] = finished_frame.int_regs[callee_src];
                     parent.int_values[caller_dst] = finished_frame.int_values[callee_src];
+                }
+                if let Some((callee_src, caller_dst)) = finished_frame.return_r {
+                    parent.ref_regs[caller_dst] = finished_frame.ref_regs[callee_src];
+                    parent.ref_values[caller_dst] = finished_frame.ref_values[callee_src];
+                }
+                if let Some((callee_src, caller_dst)) = finished_frame.return_f {
+                    parent.float_regs[caller_dst] = finished_frame.float_regs[callee_src];
+                    parent.float_values[caller_dst] = finished_frame.float_values[callee_src];
                 }
             }
             return TraceAction::Continue;
@@ -325,8 +361,20 @@ where
                 };
                 let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
                 let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
-                let value = eval_binop_i(opcode, lhs_value, rhs_value);
-                self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+                if opcode.is_ovf() {
+                    // Overflow-checked op: abort trace if overflow occurs.
+                    match eval_binop_ovf(opcode, lhs_value, rhs_value) {
+                        Some(value) => {
+                            let result = ctx.record_op(opcode, &[lhs, rhs]);
+                            ctx.record_guard(OpCode::GuardNoOverflow, &[], sym.total_slots());
+                            self.set_int_reg(dst, Some(result), Some(value));
+                        }
+                        None => return TraceAction::Abort,
+                    }
+                } else {
+                    let value = eval_binop_i(opcode, lhs_value, rhs_value);
+                    self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+                }
             }
             BC_RECORD_UNARY_I => {
                 let (dst, src_idx, opcode) = {
@@ -529,6 +577,182 @@ where
                 let concrete = call_int_function(fn_ptr, &concrete_args);
                 self.set_int_reg(dst, Some(traced), Some(concrete));
             }
+            // ── Ref-typed bytecodes ────────────────────────────────
+            BC_LOAD_CONST_R => {
+                let (dst, value) = {
+                    let frame = self.frames.current_mut();
+                    let dst = frame.next_u16() as usize;
+                    let const_idx = frame.next_u16() as usize;
+                    let value = *frame
+                        .jitcode
+                        .constants_i
+                        .get(const_idx)
+                        .expect("jitcode const index out of bounds");
+                    (dst, value)
+                };
+                self.set_ref_reg(dst, Some(ctx.const_int(value)), Some(value));
+            }
+            BC_POP_R => {
+                let dst = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let symbolic = {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.pop()
+                };
+                let concrete = self.runtime_stack_mut(selected, runtime).pop();
+                self.set_ref_reg(dst, symbolic, concrete);
+            }
+            BC_PUSH_R => {
+                let src = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let (value, concrete) = self.read_ref_reg(src);
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.push(value);
+                self.runtime_stack_mut(selected, runtime).push(concrete);
+            }
+            BC_MOVE_R => {
+                let (dst, src) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                };
+                let (value, concrete) = self.read_ref_reg(src);
+                self.set_ref_reg(dst, Some(value), Some(concrete));
+            }
+            BC_CALL_REF | BC_CALL_PURE_REF => {
+                let (opcode, fn_ptr_idx, dst, arg_regs) = {
+                    let frame = self.frames.current_mut();
+                    let opcode = bytecode;
+                    let fn_ptr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_u16() as usize;
+                    let num_args = frame.next_u16() as usize;
+                    let mut arg_regs = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        arg_regs.push(frame.next_u16() as usize);
+                    }
+                    (opcode, fn_ptr_idx, dst, arg_regs)
+                };
+                let mut args = Vec::with_capacity(arg_regs.len());
+                let mut concrete_args = Vec::with_capacity(arg_regs.len());
+                for src in arg_regs {
+                    let (arg, concrete) = self.read_int_reg(src);
+                    args.push(arg);
+                    concrete_args.push(concrete);
+                }
+                let fn_ptr = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                let traced = match opcode {
+                    BC_CALL_REF => ctx.call_ref(fn_ptr, &args),
+                    BC_CALL_PURE_REF => ctx.call_elidable_ref(fn_ptr, &args),
+                    _ => unreachable!(),
+                };
+                let concrete = call_int_function(fn_ptr, &concrete_args);
+                self.set_ref_reg(dst, Some(traced), Some(concrete));
+            }
+            // ── Float-typed bytecodes ───────────────────────────────
+            BC_LOAD_CONST_F => {
+                let (dst, value) = {
+                    let frame = self.frames.current_mut();
+                    let dst = frame.next_u16() as usize;
+                    let const_idx = frame.next_u16() as usize;
+                    let value = *frame
+                        .jitcode
+                        .constants_i
+                        .get(const_idx)
+                        .expect("jitcode const index out of bounds");
+                    (dst, value)
+                };
+                self.set_float_reg(dst, Some(ctx.const_int(value)), Some(value));
+            }
+            BC_POP_F => {
+                let dst = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let symbolic = {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.pop()
+                };
+                let concrete = self.runtime_stack_mut(selected, runtime).pop();
+                self.set_float_reg(dst, symbolic, concrete);
+            }
+            BC_PUSH_F => {
+                let src = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let (value, concrete) = self.read_float_reg(src);
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.push(value);
+                self.runtime_stack_mut(selected, runtime).push(concrete);
+            }
+            BC_MOVE_F => {
+                let (dst, src) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                };
+                let (value, concrete) = self.read_float_reg(src);
+                self.set_float_reg(dst, Some(value), Some(concrete));
+            }
+            BC_CALL_FLOAT | BC_CALL_PURE_FLOAT => {
+                let (opcode, fn_ptr_idx, dst, arg_regs) = {
+                    let frame = self.frames.current_mut();
+                    let opcode = bytecode;
+                    let fn_ptr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_u16() as usize;
+                    let num_args = frame.next_u16() as usize;
+                    let mut arg_regs = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        arg_regs.push(frame.next_u16() as usize);
+                    }
+                    (opcode, fn_ptr_idx, dst, arg_regs)
+                };
+                let mut args = Vec::with_capacity(arg_regs.len());
+                let mut concrete_args = Vec::with_capacity(arg_regs.len());
+                for src in arg_regs {
+                    let (arg, concrete) = self.read_int_reg(src);
+                    args.push(arg);
+                    concrete_args.push(concrete);
+                }
+                let fn_ptr = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                let traced = match opcode {
+                    BC_CALL_FLOAT => ctx.call_float(fn_ptr, &args),
+                    BC_CALL_PURE_FLOAT => ctx.call_elidable_float(fn_ptr, &args),
+                    _ => unreachable!(),
+                };
+                let concrete = call_int_function(fn_ptr, &concrete_args);
+                self.set_float_reg(dst, Some(traced), Some(concrete));
+            }
+            BC_RECORD_BINOP_F => {
+                let (dst, lhs_idx, rhs_idx, opcode) = {
+                    let frame = self.frames.current_mut();
+                    let dst = frame.next_u16() as usize;
+                    let opcode_idx = frame.next_u16() as usize;
+                    let lhs_idx = frame.next_u16() as usize;
+                    let rhs_idx = frame.next_u16() as usize;
+                    let opcode = *frame
+                        .jitcode
+                        .opcodes
+                        .get(opcode_idx)
+                        .expect("jitcode opcode index out of bounds");
+                    (dst, lhs_idx, rhs_idx, opcode)
+                };
+                let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
+                let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
+                let value = eval_binop_f(opcode, lhs_value, rhs_value);
+                self.set_float_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+            }
+            BC_RECORD_UNARY_F => {
+                let (dst, src_idx, opcode) = {
+                    let frame = self.frames.current_mut();
+                    let dst = frame.next_u16() as usize;
+                    let opcode_idx = frame.next_u16() as usize;
+                    let src_idx = frame.next_u16() as usize;
+                    let opcode = *frame
+                        .jitcode
+                        .opcodes
+                        .get(opcode_idx)
+                        .expect("jitcode opcode index out of bounds");
+                    (dst, src_idx, opcode)
+                };
+                let (src, src_value) = self.read_float_reg(src_idx);
+                let value = eval_unary_f(opcode, src_value);
+                self.set_float_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
+            }
             BC_ABORT => return TraceAction::Abort,
             BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
             other => panic!("unknown jitcode bytecode {other}"),
@@ -559,12 +783,42 @@ where
             frame.int_values[reg].expect("jitcode concrete register was uninitialized"),
         )
     }
+
+    fn set_ref_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
+        let frame = self.frames.current_mut();
+        frame.ref_regs[reg] = opref;
+        frame.ref_values[reg] = value;
+    }
+
+    fn read_ref_reg(&mut self, reg: usize) -> (OpRef, i64) {
+        let frame = self.frames.current_mut();
+        (
+            frame.ref_regs[reg].expect("jitcode ref register was uninitialized"),
+            frame.ref_values[reg].expect("jitcode concrete ref register was uninitialized"),
+        )
+    }
+
+    fn set_float_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
+        let frame = self.frames.current_mut();
+        frame.float_regs[reg] = opref;
+        frame.float_values[reg] = value;
+    }
+
+    fn read_float_reg(&mut self, reg: usize) -> (OpRef, i64) {
+        let frame = self.frames.current_mut();
+        (
+            frame.float_regs[reg].expect("jitcode float register was uninitialized"),
+            frame.float_values[reg].expect("jitcode concrete float register was uninitialized"),
+        )
+    }
 }
 
 #[derive(Default)]
 pub struct JitCodeBuilder {
     code: Vec<u8>,
     num_regs_i: u16,
+    num_regs_r: u16,
+    num_regs_f: u16,
     constants_i: Vec<i64>,
     opcodes: Vec<OpCode>,
     labels: Vec<Option<usize>>,
@@ -785,6 +1039,120 @@ impl JitCodeBuilder {
         self.num_regs_i = max(self.num_regs_i, count);
     }
 
+    pub fn ensure_r_regs(&mut self, count: u16) {
+        self.num_regs_r = max(self.num_regs_r, count);
+    }
+
+    pub fn ensure_f_regs(&mut self, count: u16) {
+        self.num_regs_f = max(self.num_regs_f, count);
+    }
+
+    // ── Ref-typed builder methods ─────────────────────────────
+
+    pub fn load_const_r_value(&mut self, dst: u16, value: i64) {
+        let const_idx = self.add_const_i(value);
+        self.load_const_r(dst, const_idx);
+    }
+
+    pub fn load_const_r(&mut self, dst: u16, const_idx: u16) {
+        self.touch_ref_reg(dst);
+        self.push_u8(BC_LOAD_CONST_R);
+        self.push_u16(dst);
+        self.push_u16(const_idx);
+    }
+
+    pub fn pop_r(&mut self, dst: u16) {
+        self.touch_ref_reg(dst);
+        self.push_u8(BC_POP_R);
+        self.push_u16(dst);
+    }
+
+    pub fn push_r(&mut self, src: u16) {
+        self.touch_ref_reg(src);
+        self.push_u8(BC_PUSH_R);
+        self.push_u16(src);
+    }
+
+    pub fn move_r(&mut self, dst: u16, src: u16) {
+        self.touch_ref_reg(dst);
+        self.touch_ref_reg(src);
+        self.push_u8(BC_MOVE_R);
+        self.push_u16(dst);
+        self.push_u16(src);
+    }
+
+    pub fn call_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.call_ref_like(BC_CALL_REF, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_pure_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.call_ref_like(BC_CALL_PURE_REF, fn_ptr_idx, arg_regs, dst);
+    }
+
+    // ── Float-typed builder methods ───────────────────────────
+
+    pub fn load_const_f_value(&mut self, dst: u16, value: i64) {
+        let const_idx = self.add_const_i(value);
+        self.load_const_f(dst, const_idx);
+    }
+
+    pub fn load_const_f(&mut self, dst: u16, const_idx: u16) {
+        self.touch_float_reg(dst);
+        self.push_u8(BC_LOAD_CONST_F);
+        self.push_u16(dst);
+        self.push_u16(const_idx);
+    }
+
+    pub fn pop_f(&mut self, dst: u16) {
+        self.touch_float_reg(dst);
+        self.push_u8(BC_POP_F);
+        self.push_u16(dst);
+    }
+
+    pub fn push_f(&mut self, src: u16) {
+        self.touch_float_reg(src);
+        self.push_u8(BC_PUSH_F);
+        self.push_u16(src);
+    }
+
+    pub fn move_f(&mut self, dst: u16, src: u16) {
+        self.touch_float_reg(dst);
+        self.touch_float_reg(src);
+        self.push_u8(BC_MOVE_F);
+        self.push_u16(dst);
+        self.push_u16(src);
+    }
+
+    pub fn call_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.call_float_like(BC_CALL_FLOAT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_pure_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.call_float_like(BC_CALL_PURE_FLOAT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn record_binop_f(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
+        let opcode_idx = self.intern_opcode(opcode);
+        self.touch_float_reg(dst);
+        self.touch_float_reg(lhs);
+        self.touch_float_reg(rhs);
+        self.push_u8(BC_RECORD_BINOP_F);
+        self.push_u16(dst);
+        self.push_u16(opcode_idx);
+        self.push_u16(lhs);
+        self.push_u16(rhs);
+    }
+
+    pub fn record_unary_f(&mut self, dst: u16, opcode: OpCode, src: u16) {
+        let opcode_idx = self.intern_opcode(opcode);
+        self.touch_float_reg(dst);
+        self.touch_float_reg(src);
+        self.push_u8(BC_RECORD_UNARY_F);
+        self.push_u16(dst);
+        self.push_u16(opcode_idx);
+        self.push_u16(src);
+    }
+
     pub fn add_sub_jitcode(&mut self, jitcode: JitCode) -> u16 {
         let idx = self.sub_jitcodes.len() as u16;
         self.sub_jitcodes.push(jitcode);
@@ -804,7 +1172,7 @@ impl JitCodeBuilder {
         self.patch_labels();
         JitCode {
             code: self.code,
-            num_regs: [self.num_regs_i, 0, 0],
+            num_regs: [self.num_regs_i, self.num_regs_r, self.num_regs_f],
             constants_i: self.constants_i,
             liveness: Vec::new(),
             opcodes: self.opcodes,
@@ -843,6 +1211,42 @@ impl JitCodeBuilder {
 
     fn touch_reg(&mut self, reg: u16) {
         self.num_regs_i = max(self.num_regs_i, reg.saturating_add(1));
+    }
+
+    fn touch_ref_reg(&mut self, reg: u16) {
+        self.num_regs_r = max(self.num_regs_r, reg.saturating_add(1));
+    }
+
+    fn touch_float_reg(&mut self, reg: u16) {
+        self.num_regs_f = max(self.num_regs_f, reg.saturating_add(1));
+    }
+
+    fn call_ref_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.touch_ref_reg(dst);
+        for &arg in arg_regs {
+            self.touch_reg(arg);
+        }
+        self.push_u8(opcode);
+        self.push_u16(fn_ptr_idx);
+        self.push_u16(dst);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u16(arg);
+        }
+    }
+
+    fn call_float_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.touch_float_reg(dst);
+        for &arg in arg_regs {
+            self.touch_reg(arg);
+        }
+        self.push_u8(opcode);
+        self.push_u16(fn_ptr_idx);
+        self.push_u16(dst);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u16(arg);
+        }
     }
 
     fn patch_labels(&mut self) {
@@ -932,11 +1336,48 @@ fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
     }
 }
 
+/// Evaluate an overflow-checked binop. Returns `None` on overflow.
+fn eval_binop_ovf(opcode: OpCode, lhs: i64, rhs: i64) -> Option<i64> {
+    match opcode {
+        OpCode::IntAddOvf => lhs.checked_add(rhs),
+        OpCode::IntSubOvf => lhs.checked_sub(rhs),
+        OpCode::IntMulOvf => lhs.checked_mul(rhs),
+        other => panic!("unsupported jitcode overflow binop {other:?}"),
+    }
+}
+
 fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
     match opcode {
         OpCode::IntNeg => value.wrapping_neg(),
         other => panic!("unsupported jitcode integer unary op {other:?}"),
     }
+}
+
+/// Evaluate a float binary operation. Values are stored as i64 (bit-cast).
+fn eval_binop_f(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
+    let a = f64::from_bits(lhs as u64);
+    let b = f64::from_bits(rhs as u64);
+    let result = match opcode {
+        OpCode::FloatAdd => a + b,
+        OpCode::FloatSub => a - b,
+        OpCode::FloatMul => a * b,
+        OpCode::FloatTrueDiv => a / b,
+        OpCode::FloatFloorDiv => (a / b).floor(),
+        OpCode::FloatMod => a % b,
+        other => panic!("unsupported jitcode float binop {other:?}"),
+    };
+    f64::to_bits(result) as i64
+}
+
+/// Evaluate a float unary operation.
+fn eval_unary_f(opcode: OpCode, value: i64) -> i64 {
+    let a = f64::from_bits(value as u64);
+    let result = match opcode {
+        OpCode::FloatNeg => -a,
+        OpCode::FloatAbs => a.abs(),
+        other => panic!("unsupported jitcode float unary op {other:?}"),
+    };
+    f64::to_bits(result) as i64
 }
 
 fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {

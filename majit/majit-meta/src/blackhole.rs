@@ -69,6 +69,16 @@ pub trait BlackholeMemory {
         let _ = (func, args);
         0
     }
+    /// Call a function pointer returning a ref (as i64 pointer bits).
+    fn call_r(&self, func: i64, args: &[i64]) -> i64 {
+        let _ = (func, args);
+        0
+    }
+    /// Call a function pointer returning a float (as i64 bit-cast).
+    fn call_f(&self, func: i64, args: &[i64]) -> i64 {
+        let _ = (func, args);
+        0
+    }
     /// Call a function pointer returning void.
     fn call_n(&self, func: i64, args: &[i64]) {
         let _ = (func, args);
@@ -309,6 +319,16 @@ fn execute_one_with_memory(
             let func = resolve(values, op.args[0]);
             let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
             OpResult::Value(memory.call_i(func, &args))
+        }
+        OpCode::CallR | OpCode::CallPureR => {
+            let func = resolve(values, op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            OpResult::Value(memory.call_r(func, &args))
+        }
+        OpCode::CallF | OpCode::CallPureF => {
+            let func = resolve(values, op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallN | OpCode::CallPureN => {
             let func = resolve(values, op.args[0]);
@@ -793,28 +813,20 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) ->
         // ── Call operations (pass through with concrete values) ──
         // In blackhole mode, calls should re-execute with concrete args.
         // For now, we handle CALL_PURE variants (can evaluate if all args known).
-        OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF => {
-            // Cannot actually call in blackhole — result depends on runtime.
-            // Return 0 as a placeholder. Full blackhole would re-execute the call.
-            OpResult::Value(0)
-        }
+        // Call operations — return placeholder 0 in no-memory path.
+        // The execute_one_with_memory path handles actual dispatch.
+        OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF => OpResult::Value(0),
         OpCode::CallPureN => OpResult::Void,
-
-        // Regular calls and residual calls — blackhole cannot execute these
-        // without access to the actual function pointers. In a full implementation,
-        // the blackhole would use the constant pool to resolve the function
-        // pointer and call it. For now, treat as opaque.
-        OpCode::CallI | OpCode::CallR | OpCode::CallF => {
-            // Placeholder: full blackhole would actually invoke the function
-            OpResult::Value(0)
-        }
-        OpCode::CallMayForceI | OpCode::CallMayForceR | OpCode::CallMayForceF => OpResult::Value(0),
-        OpCode::CallN | OpCode::CallMayForceN => OpResult::Void,
-
-        OpCode::CallReleaseGilI | OpCode::CallReleaseGilR | OpCode::CallReleaseGilF => {
-            OpResult::Value(0)
-        }
-        OpCode::CallReleaseGilN => OpResult::Void,
+        OpCode::CallI
+        | OpCode::CallR
+        | OpCode::CallF
+        | OpCode::CallMayForceI
+        | OpCode::CallMayForceR
+        | OpCode::CallMayForceF
+        | OpCode::CallReleaseGilI
+        | OpCode::CallReleaseGilR
+        | OpCode::CallReleaseGilF => OpResult::Value(0),
+        OpCode::CallN | OpCode::CallMayForceN | OpCode::CallReleaseGilN => OpResult::Void,
 
         // ── Memory access (raw) ──
         // In a full blackhole, these would dereference actual pointers.
