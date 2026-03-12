@@ -1035,7 +1035,7 @@ impl OptimizationPass for OptIntBounds {
                 self.postprocess_int_force_ge_zero(op, ctx);
                 PassResult::PassOn
             }
-            OpCode::IntIsZero | OpCode::IntIsTrue => {
+            OpCode::IntIsZero | OpCode::IntIsTrue | OpCode::IntBetween => {
                 self.postprocess_bool_result(op);
                 PassResult::PassOn
             }

@@ -162,7 +162,7 @@ fn test_sum_loop() {
     // So it saves var(0)=i=1 and var(1)=sum=5049.
     //
     // The sum2 and i2 have NOT been written back to the input vars yet (that happens at Jump).
-    assert_eq!(backend.get_int_value(&frame, 0), 1);   // i at guard failure
+    assert_eq!(backend.get_int_value(&frame, 0), 1); // i at guard failure
     assert_eq!(backend.get_int_value(&frame, 1), 5049); // sum at guard failure
 
     // The total sum 1+2+...+100 = 5050.
@@ -397,7 +397,7 @@ fn test_bridge_end_to_end() {
     let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(0)]);
     let descr = backend.get_latest_descr(&frame);
     assert_eq!(descr.fail_index(), 0);
-    assert_eq!(backend.get_int_value(&frame, 0), 1);  // i
+    assert_eq!(backend.get_int_value(&frame, 0), 1); // i
     assert_eq!(backend.get_int_value(&frame, 1), 14); // sum
 
     // Now compile a bridge for the guard failure.
@@ -421,10 +421,8 @@ fn test_bridge_end_to_end() {
 
     // We need a CraneliftFailDescr to pass to compile_bridge.
     // The fail_index matches the guard's index in the original loop.
-    let bridge_fail_descr = majit_codegen_cranelift::guard::CraneliftFailDescr::new(
-        0,
-        vec![Type::Int, Type::Int],
-    );
+    let bridge_fail_descr =
+        majit_codegen_cranelift::guard::CraneliftFailDescr::new(0, vec![Type::Int, Type::Int]);
 
     let bridge_info = backend
         .compile_bridge(

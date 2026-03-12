@@ -177,47 +177,32 @@ mod tests {
         // "The factorial of #1 is 1 { #1 MUL #1 1 SUB ->#1 #1 }"
         // tiny3 ignores non-numeric words, so "The", "factorial", "of", "is" are dropped.
         // Use the numeric-only version:
-        let prog: Vec<&str> = "1 { #1 MUL #1 1 SUB ->#1 #1 }"
-            .split_whitespace()
-            .collect();
+        let prog: Vec<&str> = "1 { #1 MUL #1 1 SUB ->#1 #1 }".split_whitespace().collect();
         let result = interpret(&prog, &mut [Box::Int(5)]);
         assert_eq!(repr_stack(&result), "120");
     }
 
     #[test]
     fn test_fibonacci() {
-        let prog: Vec<&str> =
-            "{ #1 #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 }"
-                .split_whitespace()
-                .collect();
-        let result = interpret(
-            &prog,
-            &mut [Box::Int(1), Box::Int(1), Box::Int(10)],
-        );
-        assert_eq!(
-            repr_stack(&result),
-            "1 1 2 3 5 8 13 21 34 55"
-        );
+        let prog: Vec<&str> = "{ #1 #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 }"
+            .split_whitespace()
+            .collect();
+        let result = interpret(&prog, &mut [Box::Int(1), Box::Int(1), Box::Int(10)]);
+        assert_eq!(repr_stack(&result), "1 1 2 3 5 8 13 21 34 55");
     }
 
     #[test]
     fn test_fibonacci_single() {
-        let prog: Vec<&str> =
-            "#3 1 SUB ->#3 { #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 } #1"
-                .split_whitespace()
-                .collect();
-        let result = interpret(
-            &prog,
-            &mut [Box::Int(1), Box::Int(1), Box::Int(11)],
-        );
+        let prog: Vec<&str> = "#3 1 SUB ->#3 { #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 } #1"
+            .split_whitespace()
+            .collect();
+        let result = interpret(&prog, &mut [Box::Int(1), Box::Int(1), Box::Int(11)]);
         assert_eq!(repr_stack(&result), "89");
     }
 
     #[test]
     fn test_loop_countdown() {
-        let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }"
-            .split_whitespace()
-            .collect();
+        let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }".split_whitespace().collect();
         let result = interpret(&prog, &mut [Box::Int(5)]);
         assert_eq!(repr_stack(&result), "5 4 3 2 1");
     }

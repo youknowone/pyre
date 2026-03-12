@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 use majit_ir::{Descr, DescrRef, FieldDescr, Op, OpCode, OpRef, Value};
 
-use crate::info::{PtrInfo, VirtualArrayInfo, VirtualInfo, VirtualStructInfo};
+use crate::info::{
+    PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
+    VirtualStructInfo,
+};
 use crate::{OptContext, OptimizationPass, PassResult};
 
 /// The virtualize optimization pass.
@@ -75,6 +78,10 @@ impl OptVirtualize {
             PtrInfo::Virtual(vinfo) => self.force_virtual_instance(resolved, vinfo, ctx),
             PtrInfo::VirtualArray(vinfo) => self.force_virtual_array(resolved, vinfo, ctx),
             PtrInfo::VirtualStruct(vinfo) => self.force_virtual_struct(resolved, vinfo, ctx),
+            PtrInfo::VirtualArrayStruct(vinfo) => {
+                self.force_virtual_array_struct(resolved, vinfo, ctx)
+            }
+            PtrInfo::VirtualRawBuffer(vinfo) => self.force_virtual_raw_buffer(resolved, vinfo, ctx),
             _ => resolved,
         }
     }
@@ -174,6 +181,73 @@ impl OptVirtualize {
             let value_ref = ctx.get_replacement(value_ref);
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(make_field_index_descr(field_idx));
+            ctx.emit(set_op);
+        }
+
+        alloc_ref
+    }
+
+    fn force_virtual_array_struct(
+        &mut self,
+        opref: OpRef,
+        vinfo: VirtualArrayStructInfo,
+        ctx: &mut OptContext,
+    ) -> OpRef {
+        let num_elements = vinfo.element_fields.len();
+
+        // Mark as no longer virtual FIRST
+        self.set_info(opref, PtrInfo::NonNull);
+
+        // Emit NEW_ARRAY for the outer array
+        let len_ref = self.emit_constant_int(ctx, num_elements as i64);
+        let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
+        alloc_op.descr = Some(vinfo.descr.clone());
+        let alloc_ref = ctx.emit(alloc_op);
+
+        if opref != alloc_ref {
+            ctx.replace_op(opref, alloc_ref);
+        }
+
+        // Emit SETINTERIORFIELD_GC for each element's fields
+        for (elem_idx, fields) in vinfo.element_fields.iter().enumerate() {
+            let idx_ref = self.emit_constant_int(ctx, elem_idx as i64);
+            for (field_idx, value_ref) in fields {
+                let value_ref = self.force_virtual(*value_ref, ctx);
+                let value_ref = ctx.get_replacement(value_ref);
+                let mut set_op =
+                    Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, value_ref]);
+                set_op.descr = Some(make_field_index_descr(*field_idx));
+                ctx.emit(set_op);
+            }
+        }
+
+        alloc_ref
+    }
+
+    fn force_virtual_raw_buffer(
+        &mut self,
+        opref: OpRef,
+        vinfo: VirtualRawBufferInfo,
+        ctx: &mut OptContext,
+    ) -> OpRef {
+        // Mark as no longer virtual FIRST
+        self.set_info(opref, PtrInfo::NonNull);
+
+        // Emit CALL_MALLOC_NURSERY or equivalent raw allocation
+        let size_ref = self.emit_constant_int(ctx, vinfo.size as i64);
+        let alloc_op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
+        let alloc_ref = ctx.emit(alloc_op);
+
+        if opref != alloc_ref {
+            ctx.replace_op(opref, alloc_ref);
+        }
+
+        // Emit RAW_STORE for each tracked entry
+        for (offset, value_ref) in &vinfo.entries {
+            let value_ref = self.force_virtual(*value_ref, ctx);
+            let value_ref = ctx.get_replacement(value_ref);
+            let offset_ref = self.emit_constant_int(ctx, *offset as i64);
+            let set_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
             ctx.emit(set_op);
         }
 
@@ -352,13 +426,93 @@ impl OptVirtualize {
         PassResult::PassOn
     }
 
+    fn optimize_getinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let array_ref = ctx.get_replacement(op.arg(0));
+        let index_ref = op.arg(1);
+        let field_idx = descr_index(&op.descr);
+
+        if let Some(index) = ctx.get_constant_int(index_ref) {
+            if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = self.get_info(array_ref) {
+                let elem_idx = index as usize;
+                if elem_idx < vinfo.element_fields.len() {
+                    if let Some(val) = get_field(&vinfo.element_fields[elem_idx], field_idx) {
+                        ctx.replace_op(op.pos, val);
+                        return PassResult::Remove;
+                    }
+                }
+            }
+        }
+        PassResult::PassOn
+    }
+
+    fn optimize_setinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let array_ref = ctx.get_replacement(op.arg(0));
+        let index_ref = op.arg(1);
+        let value_ref = ctx.get_replacement(op.arg(2));
+        let field_idx = descr_index(&op.descr);
+
+        if let Some(index) = ctx.get_constant_int(index_ref) {
+            if let Some(info) = self.get_info_mut(array_ref) {
+                if let PtrInfo::VirtualArrayStruct(vinfo) = info {
+                    let elem_idx = index as usize;
+                    if elem_idx < vinfo.element_fields.len() {
+                        set_field(&mut vinfo.element_fields[elem_idx], field_idx, value_ref);
+                        return PassResult::Remove;
+                    }
+                }
+            }
+        }
+        PassResult::PassOn
+    }
+
+    fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let buf_ref = ctx.get_replacement(op.arg(0));
+        let offset_ref = op.arg(1);
+
+        if let Some(offset) = ctx.get_constant_int(offset_ref) {
+            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = self.get_info(buf_ref) {
+                let offset = offset as usize;
+                if let Some((_, val_ref)) = vinfo.entries.iter().find(|(off, _)| *off == offset) {
+                    ctx.replace_op(op.pos, *val_ref);
+                    return PassResult::Remove;
+                }
+            }
+        }
+        PassResult::PassOn
+    }
+
+    fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let buf_ref = ctx.get_replacement(op.arg(0));
+        let offset_ref = op.arg(1);
+        let value_ref = ctx.get_replacement(op.arg(2));
+
+        if let Some(offset) = ctx.get_constant_int(offset_ref) {
+            if let Some(info) = self.get_info_mut(buf_ref) {
+                if let PtrInfo::VirtualRawBuffer(vinfo) = info {
+                    let offset = offset as usize;
+                    // Update or insert entry
+                    if let Some(entry) = vinfo.entries.iter_mut().find(|(off, _)| *off == offset) {
+                        entry.1 = value_ref;
+                    } else {
+                        vinfo.entries.push((offset, value_ref));
+                    }
+                    return PassResult::Remove;
+                }
+            }
+        }
+        PassResult::PassOn
+    }
+
     fn optimize_guard_class(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         let obj_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(info) = self.get_info(obj_ref) {
             match info {
                 // Virtual objects have a known allocation type — guard is redundant
-                PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_) => {
+                PtrInfo::Virtual(_)
+                | PtrInfo::VirtualStruct(_)
+                | PtrInfo::VirtualArrayStruct(_)
+                | PtrInfo::VirtualRawBuffer(_) => {
                     return PassResult::Remove;
                 }
                 PtrInfo::KnownClass { .. } => {
@@ -400,7 +554,11 @@ impl OptVirtualize {
 
         if let Some(info) = self.get_info(obj_ref) {
             match info {
-                PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_) | PtrInfo::VirtualArray(_) => {
+                PtrInfo::Virtual(_)
+                | PtrInfo::VirtualStruct(_)
+                | PtrInfo::VirtualArray(_)
+                | PtrInfo::VirtualArrayStruct(_)
+                | PtrInfo::VirtualRawBuffer(_) => {
                     return PassResult::Remove;
                 }
                 PtrInfo::KnownClass {
@@ -473,6 +631,16 @@ impl OptimizationPass for OptVirtualize {
             // Array length
             OpCode::ArraylenGc => self.optimize_arraylen_gc(op, ctx),
             OpCode::Strlen => self.optimize_strlen(op, ctx),
+
+            // Interior field access on potentially-virtual array-of-structs
+            OpCode::GetinteriorfieldGcI
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetinteriorfieldGcF => self.optimize_getinteriorfield_gc(op, ctx),
+            OpCode::SetinteriorfieldGc => self.optimize_setinteriorfield_gc(op, ctx),
+
+            // Raw memory access on potentially-virtual raw buffers
+            OpCode::RawLoadI | OpCode::RawLoadF => self.optimize_raw_load(op, ctx),
+            OpCode::RawStore => self.optimize_raw_store(op, ctx),
 
             // Guards that can be eliminated based on known info
             OpCode::GuardClass => self.optimize_guard_class(op, ctx),
@@ -547,7 +715,11 @@ impl PtrInfo {
     fn is_virtual(&self) -> bool {
         matches!(
             self,
-            PtrInfo::Virtual(_) | PtrInfo::VirtualArray(_) | PtrInfo::VirtualStruct(_)
+            PtrInfo::Virtual(_)
+                | PtrInfo::VirtualArray(_)
+                | PtrInfo::VirtualStruct(_)
+                | PtrInfo::VirtualArrayStruct(_)
+                | PtrInfo::VirtualRawBuffer(_)
         )
     }
 
@@ -555,7 +727,11 @@ impl PtrInfo {
         match self {
             PtrInfo::NonNull => true,
             PtrInfo::KnownClass { is_nonnull, .. } => *is_nonnull,
-            PtrInfo::Virtual(_) | PtrInfo::VirtualArray(_) | PtrInfo::VirtualStruct(_) => true,
+            PtrInfo::Virtual(_)
+            | PtrInfo::VirtualArray(_)
+            | PtrInfo::VirtualStruct(_)
+            | PtrInfo::VirtualArrayStruct(_)
+            | PtrInfo::VirtualRawBuffer(_) => true,
             PtrInfo::Constant(gcref) => !gcref.is_null(),
         }
     }

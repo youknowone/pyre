@@ -38,6 +38,18 @@ impl TraceRecorder {
         }
     }
 
+    /// Create a trace recorder pre-configured for retracing from a guard.
+    ///
+    /// The recorder starts with `num_inputs` int-typed input args,
+    /// matching the guard's fail_args.
+    pub fn with_num_inputs(num_inputs: usize) -> Self {
+        let mut recorder = Self::new();
+        for _ in 0..num_inputs {
+            recorder.record_input_arg(Type::Int);
+        }
+        recorder
+    }
+
     /// Register an input argument of the given type.
     /// Returns an OpRef that can be used as an argument to subsequent operations.
     /// Input arguments are numbered starting from 0; the OpRef index matches

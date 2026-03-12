@@ -78,6 +78,20 @@ pub enum JitState {
 /// Default number of guard failures before triggering bridge compilation.
 const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
 
+/// Default function call threshold before inlining during tracing.
+///
+/// Mirrors RPython's `function_threshold` from warmstate.py.
+/// When a function is called fewer than this many times during tracing,
+/// it is left as a residual call. After this threshold, the meta-interpreter
+/// starts inlining the function's body into the trace.
+const DEFAULT_FUNCTION_THRESHOLD: u32 = 4;
+
+/// Maximum depth of inlined function calls during tracing.
+///
+/// Prevents unbounded recursion and excessively long traces.
+/// Mirrors RPython's `MAX_INLINE_DEPTH` from warmstate.py.
+const DEFAULT_MAX_INLINE_DEPTH: u32 = 10;
+
 pub struct WarmState {
     /// Global hot counter.
     counter: JitCounter,
@@ -87,6 +101,14 @@ pub struct WarmState {
     threshold: u32,
     /// Guard failure threshold for triggering bridge compilation.
     bridge_threshold: u32,
+    /// Function call threshold for inlining during tracing.
+    ///
+    /// Mirrors RPython's `function_threshold` in warmstate.py.
+    /// A function must be called at least this many times before
+    /// the meta-interpreter inlines it into the trace.
+    function_threshold: u32,
+    /// Maximum depth of inlined function calls during tracing.
+    max_inline_depth: u32,
     /// Next token number for compiled loops.
     next_token_number: u64,
     /// Optional profiling logger, enabled via MAJIT_STATS=1 or MAJIT_LOG=1.
@@ -99,6 +121,12 @@ pub struct WarmState {
     ///
     /// Mirrors rpython/jit/metainterp/quasiimmut.py QuasiImmut.
     quasiimmut_deps: HashMap<u64, HashSet<u64>>,
+    /// Per-function call counts during the current trace.
+    ///
+    /// Tracks how many times each function (identified by callee_key) has been
+    /// encountered during tracing. Used by `should_inline_function()` to decide
+    /// whether to inline or leave as residual call.
+    function_call_counts: HashMap<u64, u32>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -122,9 +150,12 @@ impl WarmState {
             cells: HashMap::new(),
             threshold,
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
+            function_threshold: DEFAULT_FUNCTION_THRESHOLD,
+            max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
             next_token_number: 0,
             jitlog: JitLog::from_env(),
             quasiimmut_deps: HashMap::new(),
+            function_call_counts: HashMap::new(),
         }
     }
 
@@ -135,9 +166,12 @@ impl WarmState {
             cells: HashMap::new(),
             threshold,
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
+            function_threshold: DEFAULT_FUNCTION_THRESHOLD,
+            max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
             next_token_number: 0,
             jitlog,
             quasiimmut_deps: HashMap::new(),
+            function_call_counts: HashMap::new(),
         }
     }
 
@@ -171,6 +205,15 @@ impl WarmState {
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
 
         HotResult::StartTracing(TraceRecorder::new())
+    }
+
+    /// Start a retrace from a guard failure point.
+    ///
+    /// Creates a new TraceRecorder for retracing, similar to starting a
+    /// fresh trace but from a guard's failure inputs.
+    pub fn start_retrace(&mut self, num_inputs: usize) -> TraceRecorder {
+        self.reset_function_counts();
+        TraceRecorder::with_num_inputs(num_inputs)
     }
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
@@ -294,6 +337,56 @@ impl WarmState {
     /// Returns true if bridge compilation should be triggered.
     pub fn should_compile_bridge(&self, guard_fail_count: u32) -> bool {
         guard_fail_count >= self.bridge_threshold
+    }
+
+    /// Get the function inlining threshold.
+    pub fn function_threshold(&self) -> u32 {
+        self.function_threshold
+    }
+
+    /// Set the function inlining threshold.
+    pub fn set_function_threshold(&mut self, threshold: u32) {
+        self.function_threshold = threshold;
+    }
+
+    /// Set the maximum inline depth.
+    pub fn set_max_inline_depth(&mut self, depth: u32) {
+        self.max_inline_depth = depth;
+    }
+
+    /// Get the maximum inline depth.
+    pub fn max_inline_depth(&self) -> u32 {
+        self.max_inline_depth
+    }
+
+    /// Record a function call during tracing and decide whether to inline it.
+    ///
+    /// Mirrors RPython's inlining heuristic: a function must be called
+    /// at least `function_threshold` times before being inlined,
+    /// and the current inline depth must not exceed `max_inline_depth`.
+    /// Returns `true` if the function should be inlined.
+    pub fn should_inline_function(&mut self, callee_key: u64) -> bool {
+        let count = self.function_call_counts.entry(callee_key).or_insert(0);
+        *count += 1;
+        *count >= self.function_threshold
+    }
+
+    /// Check if inlining is allowed at the given depth.
+    pub fn can_inline_at_depth(&self, current_depth: usize) -> bool {
+        (current_depth as u32) < self.max_inline_depth
+    }
+
+    /// Reset function call counts (called when tracing ends).
+    pub fn reset_function_counts(&mut self) {
+        self.function_call_counts.clear();
+    }
+
+    /// Get the current call count for a specific function.
+    pub fn function_call_count(&self, callee_key: u64) -> u32 {
+        self.function_call_counts
+            .get(&callee_key)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Log a bridge compilation. No-op if JitLog is disabled.
@@ -633,6 +726,65 @@ mod tests {
             let cell = ws.get_cell(green_key).unwrap();
             assert!(cell.loop_token.as_ref().unwrap().is_invalidated());
         }
+    }
+
+    // ── Function threshold tests ──
+
+    #[test]
+    fn test_function_threshold_default() {
+        let ws = WarmState::new(3);
+        assert_eq!(ws.function_threshold(), 4); // DEFAULT_FUNCTION_THRESHOLD
+    }
+
+    #[test]
+    fn test_function_threshold_custom() {
+        let mut ws = WarmState::new(3);
+        ws.set_function_threshold(10);
+        assert_eq!(ws.function_threshold(), 10);
+    }
+
+    #[test]
+    fn test_should_inline_function_below_threshold() {
+        let mut ws = WarmState::new(3);
+        ws.set_function_threshold(3);
+
+        // First two calls: below threshold, don't inline
+        assert!(!ws.should_inline_function(42));
+        assert!(!ws.should_inline_function(42));
+
+        // Third call: reaches threshold, inline
+        assert!(ws.should_inline_function(42));
+
+        // Subsequent calls: still inline
+        assert!(ws.should_inline_function(42));
+    }
+
+    #[test]
+    fn test_should_inline_function_different_keys() {
+        let mut ws = WarmState::new(3);
+        ws.set_function_threshold(2);
+
+        assert!(!ws.should_inline_function(1));
+        assert!(!ws.should_inline_function(2));
+        // Key 1 reaches threshold on second call
+        assert!(ws.should_inline_function(1));
+        // Key 2 reaches threshold on second call
+        assert!(ws.should_inline_function(2));
+    }
+
+    #[test]
+    fn test_function_count_reset() {
+        let mut ws = WarmState::new(3);
+        ws.set_function_threshold(2);
+
+        assert!(!ws.should_inline_function(42));
+        assert_eq!(ws.function_call_count(42), 1);
+
+        ws.reset_function_counts();
+        assert_eq!(ws.function_call_count(42), 0);
+
+        // After reset, needs to reach threshold again
+        assert!(!ws.should_inline_function(42));
     }
 
     #[test]

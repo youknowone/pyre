@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 majit-ir = { path = "../majit-ir" }
 majit-codegen = { path = "../majit-codegen" }
+majit-gc = { path = "../majit-gc" }
 cranelift-codegen = "0.116"
 cranelift-frontend = "0.116"
 cranelift-jit = "0.116"

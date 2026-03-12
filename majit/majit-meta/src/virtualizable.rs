@@ -137,10 +137,7 @@ impl VirtualizableInfo {
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object with the
 /// layout described by `info`.
-pub unsafe fn read_virtualizable_boxes(
-    info: &VirtualizableInfo,
-    obj_ptr: *const u8,
-) -> Vec<i64> {
+pub unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<i64> {
     let mut boxes = Vec::with_capacity(info.num_static_fields);
 
     // Read static fields
@@ -173,11 +170,7 @@ pub unsafe fn read_virtualizable_boxes(
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object with the
 /// layout described by `info`.
-pub unsafe fn write_virtualizable_boxes(
-    info: &VirtualizableInfo,
-    obj_ptr: *mut u8,
-    boxes: &[i64],
-) {
+pub unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, boxes: &[i64]) {
     for (i, field) in info.static_fields.iter().enumerate() {
         if i >= boxes.len() {
             break;
@@ -358,9 +351,7 @@ pub unsafe fn write_all_virtualizable_boxes(
 /// to read/write virtualizable fields without going through the heap.
 ///
 /// In RPython, this is done by `virtualizable.py`'s `_generate_ACCESS()`.
-pub fn generate_field_accessors(
-    _info: &VirtualizableInfo,
-) -> Vec<(FieldGetter, FieldSetter)> {
+pub fn generate_field_accessors(_info: &VirtualizableInfo) -> Vec<(FieldGetter, FieldSetter)> {
     // In the final implementation, these would be generated functions
     // that know how to extract fields from the JIT's frame/registers.
     // For now, we provide the offset-based accessors.

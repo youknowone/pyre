@@ -196,10 +196,7 @@ mod tests {
         }
         let result = opt.optimize(&ops);
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
-        let add_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::IntAdd)
-            .count();
+        let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
         // Jump should still be present.
         assert_eq!(result.last().unwrap().opcode, OpCode::Jump);

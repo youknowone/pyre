@@ -124,9 +124,7 @@ impl JitTinyFrameInterp {
                             }
                             HotResult::AlreadyTracing => {}
                             HotResult::RunCompiled => {
-                                if let Some(new_regs) =
-                                    self.run_compiled(tgt, &regs)
-                                {
+                                if let Some(new_regs) = self.run_compiled(tgt, &regs) {
                                     regs = new_regs;
                                     // JIT ran the loop. Continue from after the loop.
                                     // The loop exits at JUMP_IF_ABOVE when condition
@@ -149,12 +147,7 @@ impl JitTinyFrameInterp {
         panic!("fell off end of code");
     }
 
-    fn start_tracing(
-        &mut self,
-        recorder: TraceRecorder,
-        loop_header_pc: usize,
-        regs: &[i64],
-    ) {
+    fn start_tracing(&mut self, recorder: TraceRecorder, loop_header_pc: usize, regs: &[i64]) {
         let mut state = TracingState {
             recorder,
             loop_header_pc,
@@ -175,12 +168,7 @@ impl JitTinyFrameInterp {
         self.tracing = Some(state);
     }
 
-    fn trace_instruction(
-        &mut self,
-        bytecode: &[u8],
-        pc: usize,
-        _regs: &[i64],
-    ) -> TraceAction {
+    fn trace_instruction(&mut self, bytecode: &[u8], pc: usize, _regs: &[i64]) -> TraceAction {
         let state = self.tracing.as_mut().unwrap();
         let opcode = bytecode[pc];
 

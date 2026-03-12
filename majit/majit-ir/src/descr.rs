@@ -63,6 +63,19 @@ pub trait FailDescr: Descr {
 
     /// The types of the fail arguments.
     fn fail_arg_types(&self) -> &[Type];
+
+    /// Whether this fail descriptor represents a FINISH exit.
+    fn is_finish(&self) -> bool {
+        false
+    }
+
+    /// Identifier of the compiled trace that owns this exit.
+    ///
+    /// Backends that lower loops and bridges as separate compiled traces use
+    /// this to let the frontend distinguish root-loop exits from bridge exits.
+    fn trace_id(&self) -> u64 {
+        0
+    }
 }
 
 /// Descriptor for a fixed-size struct/object allocation.
@@ -149,6 +162,14 @@ pub trait ArrayDescr: Descr {
         self.item_type() == Type::Float
     }
 
+    /// Whether integer items should be sign-extended on loads.
+    ///
+    /// RPython array descriptors distinguish signed from unsigned integer
+    /// storage. Backends should ignore this for non-integer item types.
+    fn is_item_signed(&self) -> bool {
+        true
+    }
+
     /// Descriptor for the length field.
     fn len_descr(&self) -> Option<&dyn FieldDescr> {
         None
@@ -181,8 +202,82 @@ pub trait CallDescr: Descr {
         true
     }
 
+    /// Target compiled loop token for `CALL_ASSEMBLER_*`, if this call
+    /// descriptor represents a nested JIT-to-JIT call.
+    fn call_target_token(&self) -> Option<u64> {
+        None
+    }
+
     /// Side effect information.
     fn effect_info(&self) -> &EffectInfo;
+}
+
+/// Descriptor for `DebugMergePoint` operations — carries source position
+/// information at merge points (bytecode boundaries in the traced interpreter).
+///
+/// Mirrors rpython/jit/metainterp/resoperation.py DebugMergePoint.
+/// RPython's meta-interpreter emits these at each bytecode boundary
+/// during tracing. They carry:
+/// - The JitDriver name (which interpreter generated this trace)
+/// - A source-level representation (e.g., "bytecode 42 in function foo")
+/// - The call depth (for inlined functions)
+///
+/// These are used by jitviewer and profiling tools to map compiled code
+/// back to the source interpreter's bytecode positions.
+#[derive(Clone, Debug)]
+pub struct DebugMergePointInfo {
+    /// Name of the JitDriver that generated this trace.
+    /// E.g., "pypyjit" for PyPy's main interpreter.
+    pub jd_name: String,
+    /// Source-level representation: a human-readable string identifying
+    /// the position in the traced interpreter's code.
+    /// E.g., "bytecode LOAD_FAST at offset 12 in function foo".
+    pub source_repr: String,
+    /// Bytecode index (program counter value) in the traced interpreter.
+    pub bytecode_index: i64,
+    /// Call depth: 0 for the outermost (root) trace, incremented for
+    /// each level of inlined function calls.
+    pub call_depth: u32,
+}
+
+impl DebugMergePointInfo {
+    pub fn new(
+        jd_name: impl Into<String>,
+        source_repr: impl Into<String>,
+        bytecode_index: i64,
+        call_depth: u32,
+    ) -> Self {
+        DebugMergePointInfo {
+            jd_name: jd_name.into(),
+            source_repr: source_repr.into(),
+            bytecode_index,
+            call_depth,
+        }
+    }
+}
+
+/// Concrete descriptor wrapping `DebugMergePointInfo` for attachment to IR ops.
+#[derive(Debug)]
+pub struct DebugMergePointDescr {
+    pub info: DebugMergePointInfo,
+}
+
+impl DebugMergePointDescr {
+    pub fn new(info: DebugMergePointInfo) -> Self {
+        DebugMergePointDescr { info }
+    }
+}
+
+impl Descr for DebugMergePointDescr {
+    fn repr(&self) -> String {
+        format!(
+            "debug_merge_point({}, '{}', pc={}, depth={})",
+            self.info.jd_name,
+            self.info.source_repr,
+            self.info.bytecode_index,
+            self.info.call_depth
+        )
+    }
 }
 
 /// Side effect classification for calls.

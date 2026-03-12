@@ -8,7 +8,6 @@
 ///
 /// This pass must run BEFORE the main optimizer pipeline so that all
 /// forcing happens in the correct order.
-
 use majit_ir::{Op, OpCode};
 
 use crate::{OptContext, OptimizationPass, PassResult};
@@ -73,9 +72,7 @@ mod tests {
 
     #[test]
     fn test_earlyforce_resolves_call_may_force_args() {
-        let mut ops = vec![
-            Op::new(OpCode::CallMayForceN, &[OpRef(100), OpRef(101)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::CallMayForceN, &[OpRef(100), OpRef(101)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -88,9 +85,7 @@ mod tests {
 
     #[test]
     fn test_earlyforce_passthrough_non_call() {
-        let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -103,9 +98,7 @@ mod tests {
 
     #[test]
     fn test_earlyforce_call_assembler_handled() {
-        let mut ops = vec![
-            Op::new(OpCode::CallAssemblerI, &[OpRef(100)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::CallAssemblerI, &[OpRef(100)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();

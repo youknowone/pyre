@@ -130,39 +130,39 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
 
+        let key = target_pc as u64;
+
+        // Fast path: compiled code exists — use cached meta, skip build_meta()
+        if self.meta.has_compiled_loop(key) {
+            let live = {
+                let compiled_meta = self.meta.get_compiled_meta(key).unwrap();
+                if !state.is_compatible(compiled_meta) {
+                    return false;
+                }
+                state.extract_live(compiled_meta)
+            };
+
+            pre_run();
+
+            if let Some((new_values, run_meta)) = self.meta.run_compiled(key, &live) {
+                state.restore(run_meta, &new_values);
+                return true;
+            }
+            return false;
+        }
+
+        // Slow path: no compiled code yet — need build_meta for tracing
         let meta = state.build_meta(target_pc, env);
         let live = state.extract_live(&meta);
 
-        match self.meta.on_back_edge(target_pc as u64, &live) {
+        match self.meta.on_back_edge(key, &live) {
             BackEdgeAction::Interpret => false,
             BackEdgeAction::StartedTracing => {
                 self.sym = Some(S::create_sym(&meta, target_pc));
                 self.trace_meta = Some(meta);
                 false
             }
-            BackEdgeAction::AlreadyTracing => false,
-            BackEdgeAction::RunCompiled => {
-                // Check compatibility before executing
-                let compatible = self
-                    .meta
-                    .get_compiled_meta(target_pc as u64)
-                    .is_some_and(|m| state.is_compatible(m));
-                if !compatible {
-                    return false;
-                }
-
-                pre_run();
-
-                let live = state.extract_live(&meta);
-                if let Some((new_values, run_meta)) =
-                    self.meta.run_compiled(target_pc as u64, &live)
-                {
-                    let restore_meta = run_meta.clone();
-                    state.restore(&restore_meta, &new_values);
-                    return true;
-                }
-                false
-            }
+            BackEdgeAction::AlreadyTracing | BackEdgeAction::RunCompiled => false,
         }
     }
 

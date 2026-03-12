@@ -1,4 +1,4 @@
-use majit_ir::{DescrRef, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, GreenKey, JitDriverVar, OpCode, OpRef, Type, VarKind};
 use majit_trace::recorder::TraceRecorder;
 
 use crate::call_descr::make_call_descr;
@@ -6,6 +6,63 @@ use crate::constant_pool::ConstantPool;
 use crate::fail_descr::make_fail_descr;
 use crate::symbolic_stack::SymbolicStack;
 use crate::TraceAction;
+
+/// Descriptor for a JitDriver's variable layout.
+///
+/// Mirrors RPython's `JitDriver(greens=[...], reds=[...])`:
+/// - `greens` are compile-time constants identifying the loop header
+/// - `reds` are runtime values carried as InputArgs
+///
+/// The interpreter declares this once per JitDriver and passes it to
+/// MetaInterp for structured green/red handling.
+#[derive(Clone, Debug)]
+pub struct JitDriverDescriptor {
+    /// All variables in declaration order.
+    pub vars: Vec<JitDriverVar>,
+}
+
+impl JitDriverDescriptor {
+    /// Create a descriptor from green and red variable lists.
+    pub fn new(greens: Vec<(&str, Type)>, reds: Vec<(&str, Type)>) -> Self {
+        let mut vars = Vec::new();
+        for (name, tp) in greens {
+            vars.push(JitDriverVar::green(name, tp));
+        }
+        for (name, tp) in reds {
+            vars.push(JitDriverVar::red(name, tp));
+        }
+        JitDriverDescriptor { vars }
+    }
+
+    /// Get only the green variables.
+    pub fn greens(&self) -> Vec<&JitDriverVar> {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Green)
+            .collect()
+    }
+
+    /// Get only the red variables.
+    pub fn reds(&self) -> Vec<&JitDriverVar> {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Red)
+            .collect()
+    }
+
+    /// Number of green variables.
+    pub fn num_greens(&self) -> usize {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Green)
+            .count()
+    }
+
+    /// Number of red variables.
+    pub fn num_reds(&self) -> usize {
+        self.vars.iter().filter(|v| v.kind == VarKind::Red).count()
+    }
+}
 
 /// Tracing context: wraps TraceRecorder + ConstantPool with convenience API.
 ///
@@ -20,6 +77,8 @@ pub struct TraceCtx {
     pub(crate) constants: ConstantPool,
     /// Stack of inlined function frames (callee green_keys).
     inline_frames: Vec<u64>,
+    /// Structured green key values (if provided by the interpreter).
+    green_key_values: Option<GreenKey>,
 }
 
 impl TraceCtx {
@@ -29,6 +88,22 @@ impl TraceCtx {
             green_key,
             constants: ConstantPool::new(),
             inline_frames: Vec::new(),
+            green_key_values: None,
+        }
+    }
+
+    /// Create a TraceCtx with a structured green key.
+    pub(crate) fn with_green_key(
+        recorder: TraceRecorder,
+        green_key: u64,
+        green_key_values: GreenKey,
+    ) -> Self {
+        TraceCtx {
+            recorder,
+            green_key,
+            constants: ConstantPool::new(),
+            inline_frames: Vec::new(),
+            green_key_values: Some(green_key_values),
         }
     }
 
@@ -38,8 +113,13 @@ impl TraceCtx {
     }
 
     /// Push an inline frame (entering a callee).
-    pub(crate) fn push_inline_frame(&mut self, callee_key: u64) {
+    /// Returns false if the max inline depth has been exceeded.
+    pub(crate) fn push_inline_frame(&mut self, callee_key: u64, max_depth: u32) -> bool {
+        if (self.inline_frames.len() as u32) >= max_depth {
+            return false;
+        }
         self.inline_frames.push(callee_key);
+        true
     }
 
     /// Pop an inline frame (returning from a callee).
@@ -121,9 +201,19 @@ impl TraceCtx {
         self.recorder.is_too_long()
     }
 
-    /// The green key (loop header PC) for this trace.
+    /// The green key hash (loop header PC) for this trace.
     pub fn green_key(&self) -> u64 {
         self.green_key
+    }
+
+    /// The structured green key values, if provided.
+    pub fn green_key_values(&self) -> Option<&GreenKey> {
+        self.green_key_values.as_ref()
+    }
+
+    /// Set the structured green key values.
+    pub fn set_green_key_values(&mut self, values: GreenKey) {
+        self.green_key_values = Some(values);
     }
 
     /// Record a promote: emit GuardValue to specialize on a runtime value.
@@ -185,43 +275,25 @@ impl TraceCtx {
     /// During tracing, reading a virtualizable field is recorded as a
     /// GETFIELD_GC operation. The optimizer's virtualize pass may later
     /// eliminate this operation if the field is virtual.
-    pub fn vable_getfield_int(
-        &mut self,
-        vable_opref: OpRef,
-        field_offset: usize,
-    ) -> OpRef {
+    pub fn vable_getfield_int(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
         let offset_ref = self.const_int(field_offset as i64);
         self.record_op(OpCode::GetfieldGcI, &[vable_opref, offset_ref])
     }
 
     /// Record a virtualizable field write (SETFIELD_GC).
-    pub fn vable_setfield(
-        &mut self,
-        vable_opref: OpRef,
-        field_offset: usize,
-        value: OpRef,
-    ) {
+    pub fn vable_setfield(&mut self, vable_opref: OpRef, field_offset: usize, value: OpRef) {
         let offset_ref = self.const_int(field_offset as i64);
         self.record_op(OpCode::SetfieldGc, &[vable_opref, offset_ref, value]);
     }
 
     /// Record a virtualizable array item read (GETARRAYITEM_GC_I/R/F).
-    pub fn vable_getarrayitem_int(
-        &mut self,
-        array_opref: OpRef,
-        index: OpRef,
-    ) -> OpRef {
+    pub fn vable_getarrayitem_int(&mut self, array_opref: OpRef, index: OpRef) -> OpRef {
         let zero = self.const_int(0); // descr placeholder
         self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
     }
 
     /// Record a virtualizable array item write (SETARRAYITEM_GC).
-    pub fn vable_setarrayitem(
-        &mut self,
-        array_opref: OpRef,
-        index: OpRef,
-        value: OpRef,
-    ) {
+    pub fn vable_setarrayitem(&mut self, array_opref: OpRef, index: OpRef, value: OpRef) {
         let zero = self.const_int(0); // descr placeholder
         self.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
     }

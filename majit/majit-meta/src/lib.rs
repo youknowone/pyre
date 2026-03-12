@@ -20,6 +20,7 @@ mod driver;
 mod fail_descr;
 pub mod io_buffer;
 mod jit_state;
+mod jitcode;
 mod meta_interp;
 pub mod parity;
 pub mod resume;
@@ -35,15 +36,27 @@ pub use io_buffer::{
     emit_commit_io, io_buffer_commit, io_buffer_discard, io_buffer_write, io_buffer_write_fmt,
 };
 pub use jit_state::JitState;
-pub use meta_interp::{BackEdgeAction, JitHooks, MetaInterp};
+pub use jitcode::{
+    trace_jitcode, ClosureRuntime, JitCode, JitCodeBuilder, JitCodeMachine, JitCodeRuntime,
+    JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
+};
+pub use meta_interp::{BackEdgeAction, BlackholeRunResult, JitHooks, MetaInterp};
 pub use parity::{assert_trace_parity, normalize_ops, normalize_trace, TraceParityCase};
 pub use symbolic_stack::SymbolicStack;
-pub use trace_ctx::TraceCtx;
+pub use trace_ctx::{JitDriverDescriptor, TraceCtx};
+
+/// Whether `MAJIT_LOG` is set, cached at first access.
+pub fn majit_log_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("MAJIT_LOG").is_ok());
+    *ENABLED
+}
 
 /// Result of tracing a single instruction.
 ///
 /// Returned by the interpreter's `trace_instruction()` function
 /// to indicate what the framework should do next.
+#[derive(Debug)]
 pub enum TraceAction {
     /// Continue tracing the next instruction.
     Continue,

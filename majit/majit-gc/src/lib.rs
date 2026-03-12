@@ -62,8 +62,25 @@ pub trait GcAllocator: Send {
     /// Allocate a fixed-size object in the nursery.
     fn alloc_nursery(&mut self, size: usize) -> GcRef;
 
+    /// Allocate a fixed-size object without triggering collection.
+    ///
+    /// Implementations may fall back to old-gen allocation when the nursery
+    /// cannot satisfy the request.
+    fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef;
+
     /// Allocate a variable-size object (array/string).
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef;
+
+    /// Allocate a variable-size object without triggering collection.
+    ///
+    /// Implementations may fall back to old-gen allocation when the nursery
+    /// cannot satisfy the request.
+    fn alloc_varsize_no_collect(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> GcRef;
 
     /// Perform a write barrier check on `obj`.
     /// Must be called before storing a GC reference into `obj`.
@@ -74,6 +91,19 @@ pub trait GcAllocator: Send {
 
     /// Trigger a full collection.
     fn collect_full(&mut self);
+
+    /// Register a stack/root slot that contains a `GcRef`.
+    ///
+    /// The pointer must remain valid until removed. Backends use this to
+    /// expose shadow-root buffers around collecting helper calls.
+    ///
+    /// # Safety
+    /// The caller must ensure the slot remains valid for the duration of the
+    /// registration.
+    unsafe fn add_root(&mut self, _root: *mut GcRef) {}
+
+    /// Remove a previously-registered root slot.
+    fn remove_root(&mut self, _root: *mut GcRef) {}
 
     /// Current nursery free pointer.
     fn nursery_free(&self) -> *mut u8;

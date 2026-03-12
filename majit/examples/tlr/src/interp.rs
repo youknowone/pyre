@@ -61,10 +61,8 @@ mod tests {
 
     fn square_bytecode() -> Vec<u8> {
         vec![
-            ALLOCATE, 3, MOV_A_R, 0, MOV_A_R, 1, SET_A, 0, MOV_A_R, 2,
-            SET_A, 1, NEG_A, ADD_R_TO_A, 0, MOV_A_R, 0,
-            MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2,
-            MOV_R_A, 0, JUMP_IF_A, 10,
+            ALLOCATE, 3, MOV_A_R, 0, MOV_A_R, 1, SET_A, 0, MOV_A_R, 2, SET_A, 1, NEG_A, ADD_R_TO_A,
+            0, MOV_A_R, 0, MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2, MOV_R_A, 0, JUMP_IF_A, 10,
             MOV_R_A, 2, RETURN_A,
         ]
     }

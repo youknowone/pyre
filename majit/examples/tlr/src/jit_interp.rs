@@ -122,8 +122,7 @@ impl JitTlrInterp {
                             }
                             HotResult::AlreadyTracing => {}
                             HotResult::RunCompiled => {
-                                if let Some((new_a, new_regs)) =
-                                    self.run_compiled(target, a, &regs)
+                                if let Some((new_a, new_regs)) = self.run_compiled(target, a, &regs)
                                 {
                                     a = new_a;
                                     regs = new_regs;
@@ -185,12 +184,7 @@ impl JitTlrInterp {
         self.tracing = Some(state);
     }
 
-    fn scan_live(
-        &self,
-        header_pc: usize,
-        _state: &TracingState,
-        num_regs: usize,
-    ) -> Vec<u8> {
+    fn scan_live(&self, header_pc: usize, _state: &TracingState, num_regs: usize) -> Vec<u8> {
         // For the SQUARE program, the loop reads:
         //   - accumulator (via NEG_A, ADD_R_TO_A, JUMP_IF_A)
         //   - regs[0], regs[1], regs[2] (via MOV_R_A, ADD_R_TO_A)
@@ -325,12 +319,7 @@ impl JitTlrInterp {
         }
     }
 
-    fn run_compiled(
-        &mut self,
-        loop_pc: usize,
-        a: i64,
-        regs: &[i64],
-    ) -> Option<(i64, Vec<i64>)> {
+    fn run_compiled(&mut self, loop_pc: usize, a: i64, regs: &[i64]) -> Option<(i64, Vec<i64>)> {
         let compiled = self.compiled_loops.get(&loop_pc)?;
 
         let args: Vec<Value> = compiled
@@ -405,10 +394,8 @@ mod tests {
 
     fn square_bytecode() -> Vec<u8> {
         vec![
-            ALLOCATE, 3, MOV_A_R, 0, MOV_A_R, 1, SET_A, 0, MOV_A_R, 2,
-            SET_A, 1, NEG_A, ADD_R_TO_A, 0, MOV_A_R, 0,
-            MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2,
-            MOV_R_A, 0, JUMP_IF_A, 10,
+            ALLOCATE, 3, MOV_A_R, 0, MOV_A_R, 1, SET_A, 0, MOV_A_R, 2, SET_A, 1, NEG_A, ADD_R_TO_A,
+            0, MOV_A_R, 0, MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2, MOV_R_A, 0, JUMP_IF_A, 10,
             MOV_R_A, 2, RETURN_A,
         ]
     }

@@ -297,7 +297,11 @@ mod tests {
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
 
-        assert_eq!(result.len(), 2, "guards on different values should both be kept");
+        assert_eq!(
+            result.len(),
+            2,
+            "guards on different values should both be kept"
+        );
     }
 
     #[test]
@@ -309,7 +313,11 @@ mod tests {
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
 
-        assert_eq!(result.len(), 2, "guard_true and guard_false on same arg are not duplicates");
+        assert_eq!(
+            result.len(),
+            2,
+            "guard_true and guard_false on same arg are not duplicates"
+        );
     }
 
     // ── Guard ordering preservation ─────────────────────────────────────
@@ -484,7 +492,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardTrue)
             .count();
-        assert_eq!(guard_count, 1, "duplicate guard should be removed in full pipeline");
+        assert_eq!(
+            guard_count, 1,
+            "duplicate guard should be removed in full pipeline"
+        );
     }
 
     #[test]

@@ -16,7 +16,10 @@ use std::collections::HashMap;
 
 use majit_ir::{DescrRef, GcRef, OpRef, Value};
 
-use crate::info::{PtrInfo, VirtualArrayInfo, VirtualInfo, VirtualStructInfo};
+use crate::info::{
+    PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
+    VirtualStructInfo,
+};
 use crate::intutils::IntBound;
 use crate::OptContext;
 
@@ -45,10 +48,18 @@ pub enum VirtualStateInfo {
         descr: DescrRef,
         fields: Vec<(u32, Box<VirtualStateInfo>)>,
     },
-    /// Value has a known class (non-null).
-    KnownClass {
-        class_ptr: GcRef,
+    /// Value is a virtual array of structs.
+    VirtualArrayStruct {
+        descr: DescrRef,
+        element_fields: Vec<Vec<(u32, Box<VirtualStateInfo>)>>,
     },
+    /// Value is a virtual raw buffer.
+    VirtualRawBuffer {
+        size: usize,
+        entries: Vec<(usize, Box<VirtualStateInfo>)>,
+    },
+    /// Value has a known class (non-null).
+    KnownClass { class_ptr: GcRef },
     /// Value is known non-null.
     NonNull,
     /// Value has known integer bounds.
@@ -98,10 +109,7 @@ impl VirtualStateInfo {
                 }
                 // All fields in self must have compatible counterparts in other
                 for (idx, info) in f1 {
-                    let other_info = f2
-                        .iter()
-                        .find(|(i, _)| i == idx)
-                        .map(|(_, v)| v.as_ref());
+                    let other_info = f2.iter().find(|(i, _)| i == idx).map(|(_, v)| v.as_ref());
                     match other_info {
                         Some(oi) => {
                             if !info.is_compatible(oi) {
@@ -128,9 +136,7 @@ impl VirtualStateInfo {
                 if d1.index() != d2.index() || i1.len() != i2.len() {
                     return false;
                 }
-                i1.iter()
-                    .zip(i2.iter())
-                    .all(|(a, b)| a.is_compatible(b))
+                i1.iter().zip(i2.iter()).all(|(a, b)| a.is_compatible(b))
             }
 
             // Virtual struct: same as virtual instance
@@ -148,10 +154,7 @@ impl VirtualStateInfo {
                     return false;
                 }
                 for (idx, info) in f1 {
-                    let other_info = f2
-                        .iter()
-                        .find(|(i, _)| i == idx)
-                        .map(|(_, v)| v.as_ref());
+                    let other_info = f2.iter().find(|(i, _)| i == idx).map(|(_, v)| v.as_ref());
                     match other_info {
                         Some(oi) => {
                             if !info.is_compatible(oi) {
@@ -164,12 +167,58 @@ impl VirtualStateInfo {
                 true
             }
 
+            // Virtual array struct
+            (
+                VirtualStateInfo::VirtualArrayStruct {
+                    descr: d1,
+                    element_fields: ef1,
+                },
+                VirtualStateInfo::VirtualArrayStruct {
+                    descr: d2,
+                    element_fields: ef2,
+                },
+            ) => {
+                if d1.index() != d2.index() || ef1.len() != ef2.len() {
+                    return false;
+                }
+                ef1.iter().zip(ef2.iter()).all(|(fields1, fields2)| {
+                    for (idx, info) in fields1 {
+                        let other_info = fields2
+                            .iter()
+                            .find(|(i, _)| i == idx)
+                            .map(|(_, v)| v.as_ref());
+                        match other_info {
+                            Some(oi) if info.is_compatible(oi) => {}
+                            _ => return false,
+                        }
+                    }
+                    true
+                })
+            }
+
+            // Virtual raw buffer
+            (
+                VirtualStateInfo::VirtualRawBuffer {
+                    size: s1,
+                    entries: e1,
+                },
+                VirtualStateInfo::VirtualRawBuffer {
+                    size: s2,
+                    entries: e2,
+                },
+            ) => {
+                if s1 != s2 || e1.len() != e2.len() {
+                    return false;
+                }
+                e1.iter()
+                    .zip(e2.iter())
+                    .all(|((off1, v1), (off2, v2))| off1 == off2 && v1.is_compatible(v2))
+            }
+
             // KnownClass: other must have the same class (or be virtual with matching class)
             (VirtualStateInfo::KnownClass { class_ptr: c1 }, other_info) => match other_info {
                 VirtualStateInfo::KnownClass { class_ptr: c2 } => c1 == c2,
-                VirtualStateInfo::Virtual { known_class, .. } => {
-                    known_class.as_ref() == Some(c1)
-                }
+                VirtualStateInfo::Virtual { known_class, .. } => known_class.as_ref() == Some(c1),
                 _ => false,
             },
 
@@ -179,7 +228,9 @@ impl VirtualStateInfo {
                 | VirtualStateInfo::KnownClass { .. }
                 | VirtualStateInfo::Virtual { .. }
                 | VirtualStateInfo::VirtualArray { .. }
-                | VirtualStateInfo::VirtualStruct { .. } => true,
+                | VirtualStateInfo::VirtualStruct { .. }
+                | VirtualStateInfo::VirtualArrayStruct { .. }
+                | VirtualStateInfo::VirtualRawBuffer { .. } => true,
                 VirtualStateInfo::Constant(Value::Ref(r)) => !r.is_null(),
                 _ => false,
             },
@@ -207,6 +258,8 @@ impl VirtualStateInfo {
             VirtualStateInfo::Virtual { .. }
                 | VirtualStateInfo::VirtualArray { .. }
                 | VirtualStateInfo::VirtualStruct { .. }
+                | VirtualStateInfo::VirtualArrayStruct { .. }
+                | VirtualStateInfo::VirtualRawBuffer { .. }
         )
     }
 }
@@ -249,9 +302,7 @@ impl VirtualState {
     pub fn generate_guards(&self, other: &VirtualState) -> Vec<GuardRequirement> {
         let mut guards = Vec::new();
 
-        for (i, (expected, incoming)) in
-            self.state.iter().zip(other.state.iter()).enumerate()
-        {
+        for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
             Self::generate_guards_for_entry(i, expected, incoming, &mut guards);
         }
 
@@ -275,9 +326,7 @@ impl VirtualState {
 
             // If expected is nonnull but incoming is unknown, need a guard_nonnull
             (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown) => {
-                guards.push(GuardRequirement::GuardNonnull {
-                    arg_index: arg_idx,
-                });
+                guards.push(GuardRequirement::GuardNonnull { arg_index: arg_idx });
             }
 
             // If expected has bounds but incoming doesn't
@@ -317,10 +366,7 @@ pub enum GuardRequirement {
         expected_value: Value,
     },
     /// Emit integer bounds guards on the arg at this index.
-    GuardBounds {
-        arg_index: usize,
-        bounds: IntBound,
-    },
+    GuardBounds { arg_index: usize, bounds: IntBound },
 }
 
 /// Export the abstract state of loop-carried values.
@@ -371,8 +417,7 @@ fn export_single_value(
                     .fields
                     .iter()
                     .map(|(field_idx, field_ref)| {
-                        let field_state =
-                            export_single_value(*field_ref, ctx, ptr_info, visited);
+                        let field_state = export_single_value(*field_ref, ctx, ptr_info, visited);
                         (*field_idx, Box::new(field_state))
                     })
                     .collect();
@@ -387,8 +432,7 @@ fn export_single_value(
                     .items
                     .iter()
                     .map(|item_ref| {
-                        let item_state =
-                            export_single_value(*item_ref, ctx, ptr_info, visited);
+                        let item_state = export_single_value(*item_ref, ctx, ptr_info, visited);
                         Box::new(item_state)
                     })
                     .collect();
@@ -402,14 +446,47 @@ fn export_single_value(
                     .fields
                     .iter()
                     .map(|(field_idx, field_ref)| {
-                        let field_state =
-                            export_single_value(*field_ref, ctx, ptr_info, visited);
+                        let field_state = export_single_value(*field_ref, ctx, ptr_info, visited);
                         (*field_idx, Box::new(field_state))
                     })
                     .collect();
                 return VirtualStateInfo::VirtualStruct {
                     descr: vinfo.descr.clone(),
                     fields,
+                };
+            }
+            PtrInfo::VirtualArrayStruct(vinfo) => {
+                let element_fields = vinfo
+                    .element_fields
+                    .iter()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|(field_idx, field_ref)| {
+                                let field_state =
+                                    export_single_value(*field_ref, ctx, ptr_info, visited);
+                                (*field_idx, Box::new(field_state))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                return VirtualStateInfo::VirtualArrayStruct {
+                    descr: vinfo.descr.clone(),
+                    element_fields,
+                };
+            }
+            PtrInfo::VirtualRawBuffer(vinfo) => {
+                let entries = vinfo
+                    .entries
+                    .iter()
+                    .map(|(offset, value_ref)| {
+                        let val_state = export_single_value(*value_ref, ctx, ptr_info, visited);
+                        (*offset, Box::new(val_state))
+                    })
+                    .collect();
+                return VirtualStateInfo::VirtualRawBuffer {
+                    size: vinfo.size,
+                    entries,
                 };
             }
             PtrInfo::KnownClass {
@@ -473,10 +550,8 @@ fn import_single_value(
             let mut vfields = Vec::new();
             for (field_idx, field_info) in fields {
                 // Create a synthetic OpRef for the field value
-                let field_opref = ctx.emit(majit_ir::Op::new(
-                    majit_ir::OpCode::SameAsI,
-                    &[OpRef::NONE],
-                ));
+                let field_opref =
+                    ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
                 import_single_value(field_info, field_opref, ctx, ptr_info);
                 vfields.push((*field_idx, field_opref));
             }
@@ -489,10 +564,8 @@ fn import_single_value(
         VirtualStateInfo::VirtualArray { descr, items } => {
             let mut vitems = Vec::new();
             for item_info in items {
-                let item_opref = ctx.emit(majit_ir::Op::new(
-                    majit_ir::OpCode::SameAsI,
-                    &[OpRef::NONE],
-                ));
+                let item_opref =
+                    ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
                 import_single_value(item_info, item_opref, ctx, ptr_info);
                 vitems.push(item_opref);
             }
@@ -504,16 +577,47 @@ fn import_single_value(
         VirtualStateInfo::VirtualStruct { descr, fields } => {
             let mut vfields = Vec::new();
             for (field_idx, field_info) in fields {
-                let field_opref = ctx.emit(majit_ir::Op::new(
-                    majit_ir::OpCode::SameAsI,
-                    &[OpRef::NONE],
-                ));
+                let field_opref =
+                    ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
                 import_single_value(field_info, field_opref, ctx, ptr_info);
                 vfields.push((*field_idx, field_opref));
             }
             ptr_info[idx] = Some(PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vfields,
+            }));
+        }
+        VirtualStateInfo::VirtualArrayStruct {
+            descr,
+            element_fields,
+        } => {
+            let mut imported_elements = Vec::new();
+            for fields in element_fields {
+                let mut imported_fields = Vec::new();
+                for (field_idx, field_info) in fields {
+                    let field_opref =
+                        ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
+                    import_single_value(field_info, field_opref, ctx, ptr_info);
+                    imported_fields.push((*field_idx, field_opref));
+                }
+                imported_elements.push(imported_fields);
+            }
+            ptr_info[idx] = Some(PtrInfo::VirtualArrayStruct(VirtualArrayStructInfo {
+                descr: descr.clone(),
+                element_fields: imported_elements,
+            }));
+        }
+        VirtualStateInfo::VirtualRawBuffer { size, entries } => {
+            let mut imported_entries = Vec::new();
+            for (offset, entry_info) in entries {
+                let entry_opref =
+                    ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
+                import_single_value(entry_info, entry_opref, ctx, ptr_info);
+                imported_entries.push((*offset, entry_opref));
+            }
+            ptr_info[idx] = Some(PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
+                size: *size,
+                entries: imported_entries,
             }));
         }
         VirtualStateInfo::KnownClass { class_ptr } => {
@@ -631,10 +735,7 @@ mod tests {
         let v3 = VirtualStateInfo::Virtual {
             descr: descr.clone(),
             known_class: None,
-            fields: vec![(
-                0,
-                Box::new(VirtualStateInfo::Constant(Value::Int(99))),
-            )],
+            fields: vec![(0, Box::new(VirtualStateInfo::Constant(Value::Int(99))))],
         };
 
         assert!(v1.is_compatible(&v2)); // field 0 matches, field 1 is Unknown (accepts anything)
@@ -683,10 +784,7 @@ mod tests {
 
     #[test]
     fn test_virtual_state_compatible() {
-        let s1 = VirtualState::new(vec![
-            VirtualStateInfo::Unknown,
-            VirtualStateInfo::NonNull,
-        ]);
+        let s1 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::NonNull]);
         let s2 = VirtualState::new(vec![
             VirtualStateInfo::Constant(Value::Int(42)),
             VirtualStateInfo::KnownClass {
@@ -700,10 +798,7 @@ mod tests {
     #[test]
     fn test_virtual_state_incompatible_length() {
         let s1 = VirtualState::new(vec![VirtualStateInfo::Unknown]);
-        let s2 = VirtualState::new(vec![
-            VirtualStateInfo::Unknown,
-            VirtualStateInfo::Unknown,
-        ]);
+        let s2 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::Unknown]);
 
         assert!(!s1.is_compatible(&s2));
     }
@@ -716,10 +811,7 @@ mod tests {
             },
             VirtualStateInfo::NonNull,
         ]);
-        let s2 = VirtualState::new(vec![
-            VirtualStateInfo::Unknown,
-            VirtualStateInfo::Unknown,
-        ]);
+        let s2 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::Unknown]);
 
         let guards = s1.generate_guards(&s2);
         assert_eq!(guards.len(), 2);

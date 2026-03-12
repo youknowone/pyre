@@ -151,8 +151,7 @@ impl OptimizationPass for OptUnroll {
 
             // Emit the final Jump with remapped args pointing to the
             // original body's ops.
-            let body_base =
-                ctx.new_operations.len() as u32 - self.buffer.len() as u32;
+            let body_base = ctx.new_operations.len() as u32 - self.buffer.len() as u32;
             let mut jump = op.clone();
 
             // Build ref map for Jump args (same as orig_ref_map).
@@ -256,7 +255,11 @@ mod tests {
 
         let result = run_unroll_pass(&ops);
 
-        assert_eq!(result.len(), 4, "expected: peeled_add, Label, original_add, Jump");
+        assert_eq!(
+            result.len(),
+            4,
+            "expected: peeled_add, Label, original_add, Jump"
+        );
         assert_eq!(result[0].opcode, OpCode::IntAdd); // peeled
         assert_eq!(result[1].opcode, OpCode::Label);
         assert_eq!(result[2].opcode, OpCode::IntAdd); // original body
@@ -379,7 +382,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardTrue)
             .count();
-        assert_eq!(guard_count, 2, "guard should appear in both peeled and body");
+        assert_eq!(
+            guard_count, 2,
+            "guard should appear in both peeled and body"
+        );
     }
 
     #[test]
@@ -514,16 +520,10 @@ mod tests {
 
         // First Jump triggers peeling of the IntAdd.
         // After that, IntSub and second Jump pass through.
-        let jump_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::Jump)
-            .count();
+        let jump_count = result.iter().filter(|o| o.opcode == OpCode::Jump).count();
         assert_eq!(jump_count, 2, "both jumps should be in output");
 
-        let label_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::Label)
-            .count();
+        let label_count = result.iter().filter(|o| o.opcode == OpCode::Label).count();
         assert_eq!(label_count, 1, "only one Label from the first peeling");
     }
 
@@ -564,7 +564,11 @@ mod tests {
 
         // All ops should have valid (non-NONE) positions.
         for op in &result {
-            assert!(!op.pos.is_none(), "op {:?} should have a valid pos", op.opcode);
+            assert!(
+                !op.pos.is_none(),
+                "op {:?} should have a valid pos",
+                op.opcode
+            );
         }
     }
 

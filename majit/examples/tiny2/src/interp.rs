@@ -189,22 +189,16 @@ mod tests {
 
     #[test]
     fn test_fibonacci_single() {
-        let prog: Vec<&str> =
-            "#3 1 SUB ->#3 { #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 } #1"
-                .split_whitespace()
-                .collect();
-        let result = interpret(
-            &prog,
-            &mut [Box::Int(1), Box::Int(1), Box::Int(11)],
-        );
+        let prog: Vec<&str> = "#3 1 SUB ->#3 { #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 } #1"
+            .split_whitespace()
+            .collect();
+        let result = interpret(&prog, &mut [Box::Int(1), Box::Int(1), Box::Int(11)]);
         assert_eq!(repr_stack(&result), "89");
     }
 
     #[test]
     fn test_loop_countdown() {
-        let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }"
-            .split_whitespace()
-            .collect();
+        let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }".split_whitespace().collect();
         let result = interpret(&prog, &mut [Box::Int(5)]);
         assert_eq!(repr_stack(&result), "5 4 3 2 1");
     }

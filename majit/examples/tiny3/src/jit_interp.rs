@@ -148,12 +148,7 @@ impl JitTiny3Interp {
         }
     }
 
-    fn start_tracing(
-        &mut self,
-        recorder: TraceRecorder,
-        loop_header_pos: usize,
-        args: &[i64],
-    ) {
+    fn start_tracing(&mut self, recorder: TraceRecorder, loop_header_pos: usize, args: &[i64]) {
         let num_args = args.len();
         let mut state = TracingState {
             recorder,
@@ -173,11 +168,7 @@ impl JitTiny3Interp {
         self.tracing = Some(state);
     }
 
-    fn trace_instruction(
-        &mut self,
-        bytecode: &[&str],
-        pos: usize,
-    ) -> TraceAction {
+    fn trace_instruction(&mut self, bytecode: &[&str], pos: usize) -> TraceAction {
         let state = self.tracing.as_mut().unwrap();
         let opcode = bytecode[pos];
 
@@ -358,10 +349,9 @@ mod tests {
 
     #[test]
     fn jit_fibonacci_single() {
-        let prog: Vec<&str> =
-            "#3 1 SUB ->#3 { #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 } #1"
-                .split_whitespace()
-                .collect();
+        let prog: Vec<&str> = "#3 1 SUB ->#3 { #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 } #1"
+            .split_whitespace()
+            .collect();
         let mut jit = JitTiny3Interp::new();
         let mut args = vec![1i64, 1, 11];
         let result = jit.run(&prog, &mut args);
@@ -386,19 +376,13 @@ mod tests {
             let mut jit_args = vec![1i64, 1, n];
             let jit_result = jit.run(&prog, &mut jit_args);
 
-            assert_eq!(
-                jit_result.to_string(),
-                expected,
-                "fib({n}) mismatch"
-            );
+            assert_eq!(jit_result.to_string(), expected, "fib({n}) mismatch");
         }
     }
 
     #[test]
     fn jit_countdown() {
-        let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }"
-            .split_whitespace()
-            .collect();
+        let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }".split_whitespace().collect();
         let mut jit = JitTiny3Interp::new();
         let mut args = vec![5i64];
         jit.run(&prog, &mut args);

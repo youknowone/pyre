@@ -161,6 +161,7 @@ pub enum OpCode {
     GuardGcType,
     GuardIsObject,
     GuardSubclass,
+    GuardCompatible,
     // ── Guards (non-foldable) ──
     GuardNoException,
     GuardException,
@@ -268,6 +269,7 @@ pub enum OpCode {
     IntNeg,
     IntInvert,
     IntForceGeZero,
+    IntBetween,
 
     // ── Always pure: identity / cast ──
     SameAsI,
@@ -275,6 +277,7 @@ pub enum OpCode {
     SameAsF,
     CastPtrToInt,
     CastIntToPtr,
+    CastOpaquePtr,
 
     // ── Always pure: pointer comparisons ──
     PtrEq,
@@ -452,7 +455,7 @@ const FINAL_LAST: u16 = OpCode::Finish as u16;
 
 const GUARD_FIRST: u16 = OpCode::GuardTrue as u16;
 const GUARD_FOLDABLE_FIRST: u16 = OpCode::GuardTrue as u16;
-const GUARD_FOLDABLE_LAST: u16 = OpCode::GuardSubclass as u16;
+const GUARD_FOLDABLE_LAST: u16 = OpCode::GuardCompatible as u16;
 const GUARD_LAST: u16 = OpCode::GuardAlwaysFails as u16;
 
 const ALWAYS_PURE_FIRST: u16 = OpCode::IntAdd as u16;
@@ -625,7 +628,10 @@ impl OpCode {
     pub fn is_call_release_gil(self) -> bool {
         matches!(
             self,
-            OpCode::CallReleaseGilI | OpCode::CallReleaseGilR | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN
+            OpCode::CallReleaseGilI
+                | OpCode::CallReleaseGilR
+                | OpCode::CallReleaseGilF
+                | OpCode::CallReleaseGilN
         )
     }
 
@@ -859,6 +865,53 @@ impl OpCode {
             _ => None,
         }
     }
+
+    /// Whether this opcode accesses memory (load/store).
+    pub fn is_memory_access(self) -> bool {
+        matches!(
+            self,
+            // Typed getfield
+            OpCode::GetfieldGcI
+                | OpCode::GetfieldGcR
+                | OpCode::GetfieldGcF
+                | OpCode::GetfieldRawI
+                | OpCode::GetfieldRawR
+                | OpCode::GetfieldRawF
+                | OpCode::GetfieldGcPureI
+                | OpCode::GetfieldGcPureR
+                | OpCode::GetfieldGcPureF
+                // Untyped setfield
+                | OpCode::SetfieldGc
+                | OpCode::SetfieldRaw
+                // Typed getarrayitem
+                | OpCode::GetarrayitemGcI
+                | OpCode::GetarrayitemGcR
+                | OpCode::GetarrayitemGcF
+                | OpCode::GetarrayitemGcPureI
+                | OpCode::GetarrayitemGcPureR
+                | OpCode::GetarrayitemGcPureF
+                | OpCode::GetarrayitemRawI
+                | OpCode::GetarrayitemRawR
+                | OpCode::GetarrayitemRawF
+                // Untyped setarrayitem
+                | OpCode::SetarrayitemGc
+                | OpCode::SetarrayitemRaw
+                // Raw load/store
+                | OpCode::RawLoadI
+                | OpCode::RawLoadF
+                | OpCode::RawStore
+                // GC load (typed)
+                | OpCode::GcLoadI
+                | OpCode::GcLoadR
+                | OpCode::GcLoadF
+                | OpCode::GcLoadIndexedI
+                | OpCode::GcLoadIndexedR
+                | OpCode::GcLoadIndexedF
+                // GC store (untyped)
+                | OpCode::GcStore
+                | OpCode::GcStoreIndexed
+        )
+    }
 }
 
 // ── Metadata tables ──
@@ -904,6 +957,7 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(GuardGcType, 2);
     set!(GuardIsObject, 1);
     set!(GuardSubclass, 2);
+    set!(GuardCompatible, 2);
     set!(GuardNoException, 0);
     set!(GuardException, 1);
     set!(GuardNoOverflow, 0);
@@ -997,12 +1051,14 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(IntNeg, 1);
     set!(IntInvert, 1);
     set!(IntForceGeZero, 1);
+    set!(IntBetween, 3);
     // Identity/cast
     set!(SameAsI, 1);
     set!(SameAsR, 1);
     set!(SameAsF, 1);
     set!(CastPtrToInt, 1);
     set!(CastIntToPtr, 1);
+    set!(CastOpaquePtr, 1);
     // Pointer comparisons
     set!(PtrEq, 2);
     set!(PtrNe, 2);
@@ -1139,6 +1195,7 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         GuardGcType,
         GuardIsObject,
         GuardSubclass,
+        GuardCompatible,
         GuardNoException,
         GuardException,
         GuardNoOverflow,
@@ -1260,6 +1317,7 @@ static OPBOOL: [bool; OPCODE_COUNT] = {
         FloatGe,
         IntIsZero,
         IntIsTrue,
+        IntBetween,
         PtrEq,
         PtrNe,
         InstancePtrEq,
@@ -1348,6 +1406,7 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         IntNeg,
         IntInvert,
         IntForceGeZero,
+        IntBetween,
         SameAsI,
         CastPtrToInt,
         PtrEq,
@@ -1428,6 +1487,7 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
 
     ref_!(
         CastIntToPtr,
+        CastOpaquePtr,
         SameAsR,
         NurseryPtrIncrement,
         GetarrayitemGcPureR,
@@ -1501,6 +1561,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         GuardGcType,
         GuardIsObject,
         GuardSubclass,
+        GuardCompatible,
         GuardNoException,
         GuardException,
         GuardNoOverflow,
@@ -1589,11 +1650,13 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         IntNeg,
         IntInvert,
         IntForceGeZero,
+        IntBetween,
         SameAsI,
         SameAsR,
         SameAsF,
         CastPtrToInt,
         CastIntToPtr,
+        CastOpaquePtr,
         PtrEq,
         PtrNe,
         InstancePtrEq,

@@ -180,9 +180,7 @@ impl JitTlInterp {
                             }
                             HotResult::AlreadyTracing => {}
                             HotResult::RunCompiled => {
-                                if let Some(new_stack) =
-                                    self.run_compiled(target, &stack)
-                                {
+                                if let Some(new_stack) = self.run_compiled(target, &stack) {
                                     stack = new_stack;
                                     pc = target;
                                     continue;
@@ -204,12 +202,7 @@ impl JitTlInterp {
         stack.pop().unwrap()
     }
 
-    fn start_tracing(
-        &mut self,
-        recorder: TraceRecorder,
-        loop_header_pc: usize,
-        stack: &[i64],
-    ) {
+    fn start_tracing(&mut self, recorder: TraceRecorder, loop_header_pc: usize, stack: &[i64]) {
         let num_stack_slots = stack.len();
         let mut state = TracingState {
             recorder,
@@ -410,11 +403,7 @@ impl JitTlInterp {
         }
     }
 
-    fn run_compiled(
-        &mut self,
-        loop_pc: usize,
-        stack: &[i64],
-    ) -> Option<Vec<i64>> {
+    fn run_compiled(&mut self, loop_pc: usize, stack: &[i64]) -> Option<Vec<i64>> {
         let compiled = self.compiled_loops.get(&loop_pc)?;
 
         let args: Vec<Value> = stack.iter().map(|&v| Value::Int(v)).collect();
@@ -483,22 +472,19 @@ mod tests {
         const ADD: u8 = 8;
         const SUB: u8 = 9;
         vec![
-            PUSH, 0,      // acc = 0
-            PUSHARG,       // counter = N
+            PUSH, 0,       // acc = 0
+            PUSHARG, // counter = N
             // loop (offset 3):
-            PICK, 0,       // dup counter
-            BR_COND, 2,    // if counter != 0, skip to body (offset 9)
-            POP,           // pop counter
-            RETURN,
-            // body (offset 9):
-            SWAP,          // [counter, acc]
-            PICK, 1,       // [counter, acc, counter]
-            ADD,           // [counter, acc+counter]
-            SWAP,          // [acc+counter, counter]
-            PUSH, 1,
-            SUB,           // [acc, counter-1]
-            PUSH, 1,
-            BR_COND, 238,  // -18: jump to loop (offset 3)
+            PICK, 0, // dup counter
+            BR_COND, 2,      // if counter != 0, skip to body (offset 9)
+            POP,    // pop counter
+            RETURN, // body (offset 9):
+            SWAP,   // [counter, acc]
+            PICK, 1,    // [counter, acc, counter]
+            ADD,  // [counter, acc+counter]
+            SWAP, // [acc+counter, counter]
+            PUSH, 1, SUB, // [acc, counter-1]
+            PUSH, 1, BR_COND, 238, // -18: jump to loop (offset 3)
         ]
     }
 

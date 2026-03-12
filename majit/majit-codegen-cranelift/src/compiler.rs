@@ -163,6 +163,7 @@ struct RegisteredLoopTarget {
     num_ref_roots: usize,
     max_output_slots: usize,
     inputarg_types: Vec<Type>,
+    needs_force_frame: bool,
 }
 
 unsafe impl Send for RegisteredLoopTarget {}
@@ -322,13 +323,13 @@ pub fn jit_exc_is_pending() -> bool {
     JIT_EXC_VALUE.with(|c| c.get()) != 0
 }
 
-fn take_pending_jit_exception_ref() -> GcRef {
+fn take_pending_jit_exception_state() -> (i64, GcRef) {
     let value = JIT_EXC_VALUE.with(|c| c.replace(0));
-    JIT_EXC_TYPE.with(|c| c.set(0));
+    let exc_type = JIT_EXC_TYPE.with(|c| c.replace(0));
     if value == 0 {
-        GcRef::NULL
+        (0, GcRef::NULL)
     } else {
-        GcRef(value as usize)
+        (exc_type, GcRef(value as usize))
     }
 }
 
@@ -629,6 +630,7 @@ fn register_call_assembler_target(token: &LoopToken, compiled: &CompiledLoop) {
             num_ref_roots: compiled.num_ref_roots,
             max_output_slots: compiled.max_output_slots,
             inputarg_types: token.inputarg_types.clone(),
+            needs_force_frame: compiled.needs_force_frame,
         },
     );
 }
@@ -789,13 +791,14 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     let fail_descr = pending.fail_descr.clone();
     let raw_values = pending.into_raw_values(frame.gc_runtime_id);
     let saved_data = take_force_frame_saved_data(&frame);
-    let exception = take_pending_jit_exception_ref();
+    let (exception_class, exception) = take_pending_jit_exception_state();
     DeadFrame {
         data: Box::new(FrameData::new_with_savedata_and_exception(
             raw_values,
             fail_descr,
             frame.gc_runtime_id,
             saved_data,
+            exception_class,
             (!exception.is_null()).then_some(exception),
         )),
     }
@@ -875,6 +878,16 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> GcRef {
     panic!("unsupported dead frame type for exception value");
 }
 
+pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> i64 {
+    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
+        return frame_data.get_exception_class();
+    }
+    if frame.data.downcast_ref::<PreviewFrameData>().is_some() {
+        return 0;
+    }
+    panic!("unsupported dead frame type for exception class");
+}
+
 extern "C" fn call_assembler_shim(target_token: u64, args_ptr: u64) -> u64 {
     let target = lookup_call_assembler_target(target_token)
         .unwrap_or_else(|| panic!("missing call_assembler target token {target_token}"));
@@ -897,6 +910,7 @@ extern "C" fn call_assembler_shim(target_token: u64, args_ptr: u64) -> u64 {
         target.num_ref_roots,
         target.max_output_slots,
         input_slice,
+        target.needs_force_frame,
     );
     assert_eq!(
         fail_index as usize, 0,
@@ -1731,6 +1745,9 @@ struct CompiledLoop {
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
+    /// Whether any guard in this loop uses FORCE_TOKEN slots.
+    /// When false, force frame registration can be skipped entirely.
+    needs_force_frame: bool,
 }
 
 unsafe impl Send for CompiledLoop {}
@@ -1742,14 +1759,22 @@ fn run_compiled_code(
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &[i64],
-) -> (u32, Vec<i64>, u64, Arc<ActiveForceFrame>) {
+    needs_force_frame: bool,
+) -> (u32, Vec<i64>, u64, Option<Arc<ActiveForceFrame>>) {
     let mut outputs = vec![0i64; max_output_slots.max(1)];
     let mut roots = vec![GcRef::NULL; num_ref_roots];
     let func: unsafe extern "C" fn(*const i64, *mut i64, *mut i64) -> i64 =
         unsafe { std::mem::transmute(code_ptr) };
-    let (handle, force_frame) = register_force_frame(fail_descrs, gc_runtime_id);
-    // Set we_are_jitted() = true while executing compiled code
+
     let _jitted_guard = majit_codegen::JittedGuard::enter();
+
+    let (handle, force_frame) = if needs_force_frame {
+        let (h, f) = register_force_frame(fail_descrs, gc_runtime_id);
+        (h, Some(f))
+    } else {
+        (0, None)
+    };
+
     let fail_index = with_active_force_frame(handle, || unsafe {
         func(
             inputs.as_ptr(),
@@ -1795,6 +1820,8 @@ pub struct CraneliftBackend {
     constants: HashMap<u32, i64>,
     func_counter: u32,
     gc_runtime_id: Option<u64>,
+    trace_counter: u64,
+    next_trace_id: Option<u64>,
 }
 
 impl CraneliftBackend {
@@ -1817,6 +1844,8 @@ impl CraneliftBackend {
             constants: HashMap::new(),
             func_counter: 0,
             gc_runtime_id: None,
+            trace_counter: 1,
+            next_trace_id: None,
         }
     }
 
@@ -1837,6 +1866,11 @@ impl CraneliftBackend {
     /// Register constants available during the next `compile_loop` call.
     pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
         self.constants = constants;
+    }
+
+    /// Force the next compile call to assign a specific trace id to all exits.
+    pub fn set_next_trace_id(&mut self, trace_id: u64) {
+        self.next_trace_id = Some(trace_id);
     }
 
     fn gc_rewriter(&self) -> Option<GcRewriterImpl> {
@@ -1870,6 +1904,56 @@ impl CraneliftBackend {
 
     /// Execute a compiled bridge, returning the DeadFrame from the bridge's
     /// exit point (either a Finish or a further guard failure).
+    /// Run compiled code with raw i64 inputs.
+    ///
+    /// Shared by `execute_token` (after Value→i64 conversion) and
+    /// `execute_token_ints` (direct pass-through).
+    fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
+        let (fail_index, outputs, handle, force_frame) = run_compiled_code(
+            compiled.code_ptr,
+            &compiled.fail_descrs,
+            compiled.gc_runtime_id,
+            compiled.num_ref_roots,
+            compiled.max_output_slots,
+            inputs,
+            compiled.needs_force_frame,
+        );
+
+        let fail_descr = &compiled.fail_descrs[fail_index as usize];
+
+        // Increment guard failure count.
+        fail_descr.increment_fail_count();
+
+        // If a bridge is attached to this guard, execute it.
+        let bridge_guard = fail_descr.bridge.lock().unwrap();
+        if let Some(ref bridge) = *bridge_guard {
+            release_force_token(handle);
+            return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+        }
+        drop(bridge_guard);
+
+        let saved_data = if let Some(ref ff) = force_frame {
+            take_force_frame_saved_data(ff)
+        } else {
+            None
+        };
+        let (exception_class, exception) = take_pending_jit_exception_state();
+        if fail_descr.force_token_slots.is_empty() {
+            release_force_token(handle);
+        }
+
+        DeadFrame {
+            data: Box::new(FrameData::new_with_savedata_and_exception(
+                outputs,
+                fail_descr.clone(),
+                compiled.gc_runtime_id,
+                saved_data,
+                exception_class,
+                (!exception.is_null()).then_some(exception),
+            )),
+        }
+    }
+
     ///
     /// If the bridge itself hits a guard that has another bridge attached,
     /// this chains through until a final exit is reached.
@@ -1889,6 +1973,7 @@ impl CraneliftBackend {
             bridge.num_ref_roots,
             bridge.max_output_slots,
             bridge_inputs,
+            bridge.needs_force_frame,
         );
 
         let fail_descr = &bridge.fail_descrs[fail_index as usize];
@@ -1897,15 +1982,17 @@ impl CraneliftBackend {
         // Check for chained bridges.
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref next_bridge) = *bridge_guard {
-            if !jit_exc_is_pending() {
-                release_force_token(handle);
-                return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
-            }
+            release_force_token(handle);
+            return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
         }
         drop(bridge_guard);
 
-        let saved_data = take_force_frame_saved_data(&force_frame);
-        let exception = take_pending_jit_exception_ref();
+        let saved_data = if let Some(ref ff) = force_frame {
+            take_force_frame_saved_data(ff)
+        } else {
+            None
+        };
+        let (exception_class, exception) = take_pending_jit_exception_state();
         if fail_descr.force_token_slots.is_empty() {
             release_force_token(handle);
         }
@@ -1916,6 +2003,7 @@ impl CraneliftBackend {
                 fail_descr.clone(),
                 bridge.gc_runtime_id,
                 saved_data,
+                exception_class,
                 (!exception.is_null()).then_some(exception),
             )),
         }
@@ -1929,6 +2017,11 @@ impl CraneliftBackend {
     ) -> Result<CompiledLoop, BackendError> {
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let ops = prepared_ops.as_slice();
+        let trace_id = self.next_trace_id.take().unwrap_or_else(|| {
+            let trace_id = self.trace_counter;
+            self.trace_counter += 1;
+            trace_id
+        });
         let ptr_type = self.module.target_config().pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
 
@@ -1961,6 +2054,7 @@ impl CraneliftBackend {
             &mut fail_descrs,
             &mut guard_infos,
             &mut max_output_slots,
+            trace_id,
         )?;
 
         let num_inputs = inputargs.len();
@@ -2200,6 +2294,17 @@ impl CraneliftBackend {
                     let r = builder.ins().select(cmp, zero, a);
                     builder.def_var(var(vi), r);
                 }
+                OpCode::IntBetween => {
+                    // int_between(a, b, c) => a <= b < c
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let c = resolve_opref(&mut builder, &constants, op.arg(2));
+                    let cmp1 = builder.ins().icmp(IntCC::SignedLessThanOrEqual, a, b);
+                    let cmp2 = builder.ins().icmp(IntCC::SignedLessThan, b, c);
+                    let both = builder.ins().band(cmp1, cmp2);
+                    let r = builder.ins().uextend(cl_types::I64, both);
+                    builder.def_var(var(vi), r);
+                }
 
                 // ── Integer comparisons ──
                 OpCode::IntLt => emit_icmp(&mut builder, &constants, IntCC::SignedLessThan, op, vi),
@@ -2274,7 +2379,8 @@ impl CraneliftBackend {
                 | OpCode::SameAsR
                 | OpCode::SameAsF
                 | OpCode::CastPtrToInt
-                | OpCode::CastIntToPtr => {
+                | OpCode::CastIntToPtr
+                | OpCode::CastOpaquePtr => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     builder.def_var(var(vi), a);
                 }
@@ -2665,10 +2771,10 @@ impl CraneliftBackend {
                     builder.seal_block(cont_block);
                 }
 
-                OpCode::GuardSubclass => {
-                    // args[0] = object ref, args[1] = expected parent class ref.
-                    // Load object's class from GC header type_id, compare.
-                    // Simplified: for now, treat same as GuardClass (value comparison).
+                OpCode::GuardSubclass | OpCode::GuardCompatible => {
+                    // GuardSubclass: args[0] = object ref, args[1] = expected parent class ref.
+                    // GuardCompatible: args[0] = object ref, args[1] = expected compatible value.
+                    // Both guard that two values are equal; fail otherwise.
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
@@ -4587,6 +4693,20 @@ impl CraneliftBackend {
 
         let code_ptr = self.module.get_finalized_function(func_id);
 
+        let needs_force_frame = ops.iter().any(|op| {
+            matches!(
+                op.opcode,
+                OpCode::ForceToken
+                    | OpCode::CallMayForceI
+                    | OpCode::CallMayForceR
+                    | OpCode::CallMayForceF
+                    | OpCode::CallMayForceN
+                    | OpCode::CallAssemblerI
+                    | OpCode::CallAssemblerR
+                    | OpCode::CallAssemblerF
+                    | OpCode::CallAssemblerN
+            )
+        });
         Ok(CompiledLoop {
             _func_id: func_id,
             code_ptr,
@@ -4596,6 +4716,7 @@ impl CraneliftBackend {
             num_inputs: inputargs.len(),
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
+            needs_force_frame,
         })
     }
 }
@@ -4614,6 +4735,7 @@ fn collect_guards(
     fail_descrs: &mut Vec<Arc<CraneliftFailDescr>>,
     guard_infos: &mut Vec<GuardInfo>,
     max_output_slots: &mut usize,
+    trace_id: u64,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     let value_types = build_value_type_map(inputargs, ops);
@@ -4654,12 +4776,15 @@ fn collect_guards(
             .filter_map(|(slot, opref)| force_tokens.contains(&opref.0).then_some(slot))
             .collect();
 
-        let descr = Arc::new(CraneliftFailDescr::new_with_kind_and_force_tokens(
-            fail_index,
-            fail_arg_types,
-            is_finish,
-            force_token_slots,
-        ));
+        let descr = Arc::new(
+            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+                fail_index,
+                trace_id,
+                fail_arg_types,
+                is_finish,
+                force_token_slots,
+            ),
+        );
         fail_descrs.push(descr);
         guard_infos.push(GuardInfo {
             fail_index,
@@ -4732,6 +4857,7 @@ impl majit_codegen::Backend for CraneliftBackend {
                 num_inputs: compiled.num_inputs,
                 num_ref_roots: compiled.num_ref_roots,
                 max_output_slots: compiled.max_output_slots,
+                needs_force_frame: compiled.needs_force_frame,
             });
         }
 
@@ -4756,45 +4882,85 @@ impl majit_codegen::Backend for CraneliftBackend {
             });
         }
 
-        let (fail_index, outputs, handle, force_frame) = run_compiled_code(
+        Self::execute_with_inputs(compiled, &inputs)
+    }
+
+    fn execute_token_ints(&self, token: &LoopToken, args: &[i64]) -> DeadFrame {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .expect("token has no compiled code")
+            .downcast_ref::<CompiledLoop>()
+            .expect("compiled data is not CompiledLoop");
+
+        Self::execute_with_inputs(compiled, args)
+    }
+
+    fn execute_token_ints_raw(
+        &self,
+        token: &LoopToken,
+        args: &[i64],
+    ) -> majit_codegen::RawExecResult {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .expect("token has no compiled code")
+            .downcast_ref::<CompiledLoop>()
+            .expect("compiled data is not CompiledLoop");
+
+        let (fail_index, mut outputs, handle, force_frame) = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
             compiled.gc_runtime_id,
             compiled.num_ref_roots,
             compiled.max_output_slots,
-            &inputs,
+            args,
+            compiled.needs_force_frame,
         );
 
         let fail_descr = &compiled.fail_descrs[fail_index as usize];
-
-        // Increment guard failure count.
         fail_descr.increment_fail_count();
 
-        // If a bridge is attached to this guard, execute it.
-        // The bridge receives the guard's fail args as its inputs.
+        // If a bridge is attached, fall back to the full DeadFrame path.
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref bridge) = *bridge_guard {
-            if !jit_exc_is_pending() {
-                release_force_token(handle);
-                return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            release_force_token(handle);
+            let frame = Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            let descr = frame
+                .data
+                .downcast_ref::<FrameData>()
+                .expect("bridge returned unexpected frame type");
+            let arity = descr.fail_descr.fail_arg_types().len();
+            let mut result = Vec::with_capacity(arity);
+            for i in 0..arity {
+                result.push(descr.get_int(i));
             }
+            return majit_codegen::RawExecResult {
+                outputs: result,
+                fail_index: descr.fail_descr.fail_index(),
+                trace_id: descr.fail_descr.trace_id(),
+                is_finish: descr.fail_descr.is_finish(),
+            };
         }
         drop(bridge_guard);
 
-        let saved_data = take_force_frame_saved_data(&force_frame);
-        let exception = take_pending_jit_exception_ref();
+        // No bridge — skip DeadFrame, return outputs directly.
+        if let Some(ref ff) = force_frame {
+            take_force_frame_saved_data(ff);
+        }
+        take_pending_jit_exception_state();
         if fail_descr.force_token_slots.is_empty() {
             release_force_token(handle);
         }
 
-        DeadFrame {
-            data: Box::new(FrameData::new_with_savedata_and_exception(
-                outputs,
-                fail_descr.clone(),
-                compiled.gc_runtime_id,
-                saved_data,
-                (!exception.is_null()).then_some(exception),
-            )),
+        let exit_arity = fail_descr.fail_arg_types().len();
+        outputs.truncate(exit_arity);
+
+        majit_codegen::RawExecResult {
+            outputs,
+            fail_index,
+            trace_id: fail_descr.trace_id(),
+            is_finish: fail_descr.is_finish(),
         }
     }
 
@@ -4852,6 +5018,10 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
         grab_exc_value_from_deadframe(frame)
+    }
+
+    fn grab_exc_class(&self, frame: &DeadFrame) -> i64 {
+        grab_exc_class_from_deadframe(frame)
     }
 
     fn invalidate_loop(&self, token: &LoopToken) {
@@ -5667,12 +5837,14 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0xABCDusize));
+        assert_eq!(backend.grab_exc_class(&frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.grab_exc_class(&frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
     }
@@ -5708,6 +5880,7 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.grab_exc_class(&frame), 0x2222);
         assert_eq!(backend.grab_exc_value(&frame), GcRef(0xBEEFusize));
         assert!(!jit_exc_is_pending());
     }
@@ -5743,12 +5916,14 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.grab_exc_class(&frame), 0x1111);
         assert_eq!(backend.grab_exc_value(&frame), GcRef(0xCAFEusize));
         assert!(!jit_exc_is_pending());
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.grab_exc_class(&frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
     }
@@ -5802,6 +5977,7 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0xD00Dusize));
+        assert_eq!(backend.grab_exc_class(&frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert_eq!(test_exception_call_log_snapshot(), vec![false, false]);
         assert!(!jit_exc_is_pending());
@@ -5854,6 +6030,7 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         with_gc_runtime(runtime_id, |gc| gc.collect_nursery());
 
+        assert_eq!(backend.grab_exc_class(&frame), 0x4444);
         let moved = backend.grab_exc_value(&frame);
         assert!(!moved.is_null());
         assert_ne!(moved, exception_ref);
@@ -7347,6 +7524,64 @@ mod tests {
         // Execute with x = 5 (guard passes): original path returns 5 * 2 = 10
         let frame = backend.execute_token(&token, &[Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 10);
+    }
+
+    #[test]
+    fn test_bridge_from_guard_no_exception_can_consume_pending_exception() {
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(0xE11Eusize as i64, 0x4545);
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(101)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, maybe_raise_test_exception as *const () as i64);
+        constants.insert(101, 0);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(202);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(1)]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.grab_exc_class(&frame), 0x4545);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef(0xE11Eusize));
+
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let mut bridge_guard = mk_op(OpCode::GuardException, &[OpRef(100)], 1);
+        bridge_guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            bridge_guard,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut bridge_constants = HashMap::new();
+        bridge_constants.insert(100, 0x4545);
+        backend.set_constants(bridge_constants);
+
+        let fail_descr = CraneliftFailDescr::new(0, vec![Type::Int]);
+        backend
+            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token)
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(1)]);
+        assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0xE11Eusize));
+        assert_eq!(backend.grab_exc_class(&frame), 0);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert!(!jit_exc_is_pending());
     }
 
     #[test]
