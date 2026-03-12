@@ -6,21 +6,96 @@
 // Reference: rpython/rlib/jit.py
 
 /// Hint to the JIT that this value should be treated as a compile-time constant.
-/// In tracing mode, the tracer records the current value as a constant.
-/// In normal mode, this is a no-op that returns the value unchanged.
+///
+/// In RPython this is `jit.promote(x)`. During tracing, the tracer records
+/// a `GUARD_VALUE` that specializes on the current concrete value.
+/// In normal (non-tracing) mode, this is a no-op that returns the value unchanged.
 #[inline(always)]
 pub fn hint_promote<T: Copy>(val: T) -> T {
     val
 }
 
+/// Hint that a string value should be promoted (specialized).
+///
+/// Like `hint_promote` but for string-typed values that need special
+/// handling in the optimizer (string interning, hash caching, etc.).
+#[inline(always)]
+pub fn hint_promote_string<T: Copy>(val: T) -> T {
+    val
+}
+
 /// Hint that the following call's result only depends on its arguments.
-/// The JIT can cache the result.
+/// The JIT can cache the result (CSE / constant folding).
+///
+/// In RPython this is `@jit.elidable`. Functions marked elidable are
+/// recorded as `CALL_PURE_*` in the trace, enabling the optimizer to
+/// eliminate calls where all arguments are known constants.
 #[inline(always)]
 pub fn hint_elidable() {}
 
 /// Hint to not trace into the following function.
+///
+/// In RPython this is `@jit.dont_look_inside`. The function will be
+/// called as a residual (opaque) call during tracing.
 #[inline(always)]
 pub fn hint_dont_look_inside() {}
+
+/// Hint that a loop in the following function should be unrolled.
+///
+/// In RPython this is `@jit.unroll_safe`. Without this hint, loops
+/// inside traced functions would cause the tracer to abort.
+#[inline(always)]
+pub fn hint_unroll_safe() {}
+
+/// Hint that the following function is loop-invariant.
+///
+/// In RPython this is `@jit.loop_invariant`. The result is cached
+/// for the duration of one loop iteration.
+#[inline(always)]
+pub fn hint_loop_invariant() {}
+
+/// Hint that a conditional branch is expected to take the given path.
+///
+/// In RPython this is `jit.conditional_call()`. Helps the JIT generate
+/// better guard placement.
+#[inline(always)]
+pub fn hint_conditional_call() {}
+
+/// Hint that a virtual reference may be used.
+///
+/// In RPython this is `jit.virtual_ref(obj)`. Creates a virtual reference
+/// that the optimizer can keep virtual (avoiding allocation) as long as
+/// the reference doesn't escape the trace.
+#[inline(always)]
+pub fn hint_virtual_ref<T>(val: T) -> T {
+    val
+}
+
+/// Hint that a virtual reference is no longer needed.
+///
+/// In RPython this is `jit.virtual_ref_finish(vref, obj)`.
+#[inline(always)]
+pub fn hint_virtual_ref_finish() {}
+
+/// Hint that a value is expected to be a compile-time constant.
+///
+/// Unlike `hint_promote`, this doesn't generate a guard — it's a
+/// lighter hint used when the value is expected to already be constant
+/// (e.g., after a previous promote).
+#[inline(always)]
+pub fn hint_isconstant<T: Copy>(val: T) -> bool {
+    // In non-JIT mode, nothing is a JIT constant
+    false
+}
+
+/// Hint that a value should be treated as an "is virtual" check.
+///
+/// In RPython this is `jit.isvirtual(x)`. Returns true if the JIT
+/// has virtualized the given object (only meaningful during tracing).
+#[inline(always)]
+pub fn hint_isvirtual<T>(_val: &T) -> bool {
+    false
+}
 
 /// Tell the JIT that we're at a merge point (loop header).
 /// `green_key` identifies the position in the interpreter.
@@ -217,10 +292,7 @@ mod tests {
             JitError::CompilationFailed("oom".into()).to_string(),
             "compilation failed: oom"
         );
-        assert_eq!(
-            JitError::LoopInvalidated.to_string(),
-            "loop invalidated"
-        );
+        assert_eq!(JitError::LoopInvalidated.to_string(), "loop invalidated");
     }
 
     #[test]

@@ -9,10 +9,11 @@
 /// - SETFIELD_GC with a Ref-typed value -> COND_CALL_GC_WB + SETFIELD_GC
 ///
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use majit_ir::descr::FieldDescr;
+use majit_ir::descr::{DescrRef, FieldDescr};
 use majit_ir::op::{Op, OpCode, OpRef};
+use majit_ir::Type;
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
@@ -44,7 +45,8 @@ pub struct GcRewriterImpl {
 struct RewriteState {
     /// Output operation list.
     out: Vec<Op>,
-    /// Next position index for emitted ops.
+    /// Next position index for emitted result ops that do not have an
+    /// explicit source position to preserve.
     next_pos: u32,
 
     // ── Nursery batching ──
@@ -64,26 +66,56 @@ struct RewriteState {
     /// (freshly allocated objects, or objects we already issued a WB for).
     /// Cleared whenever we emit an operation that can trigger a collection.
     wb_applied: HashSet<u32>,
+    /// Forwarding map from original result OpRefs to rewritten result OpRefs.
+    forwarding: HashMap<u32, OpRef>,
+    /// One-shot marker for an already-emitted array write barrier.
+    ///
+    /// Re-running the rewriter over an already-rewritten trace should not
+    /// duplicate a `COND_CALL_GC_WB_ARRAY` immediately followed by the
+    /// corresponding `SETARRAYITEM_GC`.
+    pending_array_wb: Option<u32>,
 }
 
 impl RewriteState {
-    fn new(hint: usize) -> Self {
+    fn new(hint: usize, next_pos: u32) -> Self {
         RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
-            next_pos: 0,
+            next_pos,
             pending_malloc_idx: None,
             pending_malloc_total: 0,
             previous_size: 0,
             last_malloced_ref: OpRef::NONE,
             wb_applied: HashSet::new(),
+            forwarding: HashMap::new(),
+            pending_array_wb: None,
         }
     }
 
-    /// Emit an op and assign it a position index.
+    /// Emit an op. Void ops do not consume a result id.
     fn emit(&mut self, mut op: Op) -> OpRef {
-        let pos = OpRef(self.next_pos);
+        let pos = if op.result_type() == Type::Void {
+            OpRef::NONE
+        } else {
+            let pos = OpRef(self.next_pos);
+            self.next_pos += 1;
+            pos
+        };
         op.pos = pos;
-        self.next_pos += 1;
+        self.out.push(op);
+        pos
+    }
+
+    /// Emit a result-producing op, preserving the provided position when the
+    /// source trace already assigned one.
+    fn emit_result(&mut self, mut op: Op, preferred_pos: OpRef) -> OpRef {
+        let pos = if preferred_pos.is_none() {
+            let pos = OpRef(self.next_pos);
+            self.next_pos += 1;
+            pos
+        } else {
+            preferred_pos
+        };
+        op.pos = pos;
         self.out.push(op);
         pos
     }
@@ -93,6 +125,7 @@ impl RewriteState {
     fn emitting_can_collect(&mut self) {
         self.pending_malloc_idx = None;
         self.wb_applied.clear();
+        self.pending_array_wb = None;
     }
 
     fn remember_wb(&mut self, r: OpRef) {
@@ -101,6 +134,51 @@ impl RewriteState {
 
     fn wb_already_applied(&self, r: OpRef) -> bool {
         self.wb_applied.contains(&r.0)
+    }
+
+    fn resolve(&self, r: OpRef) -> OpRef {
+        if r.is_none() {
+            return r;
+        }
+        self.forwarding.get(&r.0).copied().unwrap_or(r)
+    }
+
+    fn rewrite_op(&self, op: &Op) -> Op {
+        let mut rewritten = op.clone();
+        for arg in rewritten.args.iter_mut() {
+            *arg = self.resolve(*arg);
+        }
+        if let Some(fail_args) = rewritten.fail_args.as_mut() {
+            for arg in fail_args.iter_mut() {
+                *arg = self.resolve(*arg);
+            }
+        }
+        rewritten.pos = OpRef::NONE;
+        rewritten
+    }
+
+    fn record_result_mapping(&mut self, old_pos: OpRef, new_pos: OpRef) {
+        if !old_pos.is_none() {
+            self.forwarding.insert(old_pos.0, new_pos);
+        }
+    }
+
+    fn emit_rewritten_from(&mut self, original: &Op, rewritten: Op) -> OpRef {
+        let result = if original.result_type() == Type::Void {
+            self.emit(rewritten)
+        } else {
+            self.emit_result(rewritten, original.pos)
+        };
+        if original.result_type() != Type::Void {
+            self.record_result_mapping(original.pos, result);
+        }
+        result
+    }
+
+    fn take_pending_array_wb(&mut self, obj: OpRef) -> bool {
+        let matched = self.pending_array_wb == Some(obj.0);
+        self.pending_array_wb = None;
+        matched
     }
 }
 
@@ -125,7 +203,8 @@ impl GcRewriterImpl {
         let size = round_up(descr.size());
         let type_id = descr.type_id();
 
-        let obj_ref = self.gen_malloc_nursery(size, st);
+        let obj_ref = self.gen_malloc_nursery(size, op.pos, st);
+        st.record_result_mapping(op.pos, obj_ref);
 
         // Initialize the tid header field.
         self.gen_initialize_tid(obj_ref, type_id, st);
@@ -153,22 +232,20 @@ impl GcRewriterImpl {
             .expect("NEW_ARRAY descr must be ArrayDescr");
 
         let _item_size = descr.item_size();
-        let v_length = op.arg(0); // the length operand
+        let v_length = st.resolve(op.arg(0)); // the length operand
 
         // Emit CALL_MALLOC_NURSERY_VARSIZE(itemsize_const, length).
         // This is a potentially-collecting call, so flush state first.
         st.emitting_can_collect();
 
-        let mut varsize_op = Op::new(
-            OpCode::CallMallocNurseryVarsize,
-            &[v_length],
-        );
+        let mut varsize_op = Op::new(OpCode::CallMallocNurseryVarsize, &[v_length]);
         varsize_op.descr = op.descr.clone();
-        let result = st.emit(varsize_op);
+        let result = st.emit_result(varsize_op, op.pos);
+        st.record_result_mapping(op.pos, result);
 
         // Initialize the array length field.
         if let Some(len_descr) = descr.len_descr() {
-            self.gen_initialize_len(result, v_length, len_descr, st);
+            self.gen_initialize_len(result, v_length, descr_ref.clone(), len_descr, st);
         }
 
         // Don't add to wb_applied: large young arrays may need card
@@ -180,7 +257,8 @@ impl GcRewriterImpl {
     // ────────────────────────────────────────────────────────
 
     fn handle_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
-        let obj = op.arg(0);
+        let rewritten = st.rewrite_op(op);
+        let obj = rewritten.arg(0);
 
         // Determine whether the stored value is a Ref type from the field descriptor.
         let is_ref_store = op
@@ -198,7 +276,7 @@ impl GcRewriterImpl {
         }
 
         // Emit the original SETFIELD_GC unchanged.
-        st.emit(op.clone());
+        st.emit(rewritten);
     }
 
     // ────────────────────────────────────────────────────────
@@ -206,7 +284,8 @@ impl GcRewriterImpl {
     // ────────────────────────────────────────────────────────
 
     fn handle_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
-        let obj = op.arg(0);
+        let rewritten = st.rewrite_op(op);
+        let obj = rewritten.arg(0);
         // arg(1) = index, arg(2) = value
 
         let is_ref_store = op
@@ -216,16 +295,21 @@ impl GcRewriterImpl {
             .map(|ad| ad.is_array_of_pointers())
             .unwrap_or(false);
 
+        if st.take_pending_array_wb(obj) {
+            st.emit(rewritten);
+            return;
+        }
+
         if is_ref_store && !st.wb_already_applied(obj) {
             // For arrays we emit the array variant which also passes the index.
-            let index = op.arg(1);
+            let index = rewritten.arg(1);
             let wb_op = Op::new(OpCode::CondCallGcWbArray, &[obj, index]);
             st.emit(wb_op);
             // Array WB is not enough to skip future barriers (card marking).
             // So we intentionally do NOT remember_wb here.
         }
 
-        st.emit(op.clone());
+        st.emit(rewritten);
     }
 
     // ────────────────────────────────────────────────────────
@@ -234,7 +318,7 @@ impl GcRewriterImpl {
 
     /// Try to emit (or extend) a CALL_MALLOC_NURSERY for `size` bytes.
     /// Returns the OpRef of the newly allocated object.
-    fn gen_malloc_nursery(&self, size: usize, st: &mut RewriteState) -> OpRef {
+    fn gen_malloc_nursery(&self, size: usize, result_pos: OpRef, st: &mut RewriteState) -> OpRef {
         let size = round_up(size);
 
         if !self.can_use_nursery(size) {
@@ -242,7 +326,7 @@ impl GcRewriterImpl {
             // will turn into a slow-path call. We still flush state.
             st.emitting_can_collect();
             let op = Op::new(OpCode::CallMallocNursery, &[OpRef(size as u32)]);
-            let r = st.emit(op);
+            let r = st.emit_result(op, result_pos);
             st.remember_wb(r);
             return r;
         }
@@ -261,7 +345,7 @@ impl GcRewriterImpl {
                     OpCode::NurseryPtrIncrement,
                     &[st.last_malloced_ref, OpRef(st.previous_size as u32)],
                 );
-                let r = st.emit(incr_op);
+                let r = st.emit_result(incr_op, result_pos);
                 st.previous_size = size;
                 st.last_malloced_ref = r;
                 st.remember_wb(r);
@@ -272,7 +356,7 @@ impl GcRewriterImpl {
         // Emit a fresh CALL_MALLOC_NURSERY.
         st.emitting_can_collect();
         let op = Op::new(OpCode::CallMallocNursery, &[OpRef(size as u32)]);
-        let r = st.emit(op);
+        let r = st.emit_result(op, result_pos);
         st.pending_malloc_idx = Some(st.out.len() - 1);
         st.pending_malloc_total = size;
         st.previous_size = size;
@@ -296,10 +380,7 @@ impl GcRewriterImpl {
 
     /// Emit a GcStore to write the vtable pointer.
     fn gen_initialize_vtable(&self, obj: OpRef, vtable: usize, st: &mut RewriteState) {
-        let store = Op::new(
-            OpCode::GcStore,
-            &[obj, OpRef(1), OpRef(vtable as u32)],
-        );
+        let store = Op::new(OpCode::GcStore, &[obj, OpRef(1), OpRef(vtable as u32)]);
         st.emit(store);
     }
 
@@ -308,19 +389,33 @@ impl GcRewriterImpl {
         &self,
         obj: OpRef,
         length: OpRef,
+        array_descr: DescrRef,
         _len_descr: &dyn FieldDescr,
         st: &mut RewriteState,
     ) {
-        let store = Op::new(OpCode::GcStore, &[obj, OpRef(2), length]);
+        let mut store = Op::new(OpCode::GcStore, &[obj, OpRef(2), length]);
+        store.descr = Some(array_descr);
         st.emit(store);
     }
 }
 
 impl GcRewriter for GcRewriterImpl {
     fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op> {
-        let mut st = RewriteState::new(ops.len());
+        let next_pos = ops
+            .iter()
+            .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.0))
+            .max()
+            .map_or(0, |max_pos| max_pos.saturating_add(1));
+        let mut st = RewriteState::new(ops.len(), next_pos);
 
         for op in ops {
+            if !matches!(
+                op.opcode,
+                OpCode::SetarrayitemGc | OpCode::CondCallGcWbArray | OpCode::DebugMergePoint
+            ) {
+                st.pending_array_wb = None;
+            }
+
             match op.opcode {
                 // Skip debug merge points (they carry no semantics).
                 OpCode::DebugMergePoint => continue,
@@ -348,18 +443,33 @@ impl GcRewriter for GcRewriterImpl {
                 // ── Operations that can trigger GC ──
                 _ if op.opcode.can_malloc() => {
                     st.emitting_can_collect();
-                    st.emit(op.clone());
+                    let rewritten = st.rewrite_op(op);
+                    st.emit_rewritten_from(op, rewritten);
                 }
 
                 // ── Guards flush pending zeros (not yet implemented) but
                 //    do not invalidate WB tracking. ──
                 _ if op.opcode.is_guard() => {
-                    st.emit(op.clone());
+                    let rewritten = st.rewrite_op(op);
+                    st.emit(rewritten);
                 }
 
                 // ── Everything else: pass through unchanged. ──
+                OpCode::CondCallGcWb => {
+                    let rewritten = st.rewrite_op(op);
+                    let obj = rewritten.arg(0);
+                    st.emit(rewritten);
+                    st.remember_wb(obj);
+                }
+                OpCode::CondCallGcWbArray => {
+                    let rewritten = st.rewrite_op(op);
+                    let obj = rewritten.arg(0);
+                    st.emit(rewritten);
+                    st.pending_array_wb = Some(obj.0);
+                }
                 _ => {
-                    st.emit(op.clone());
+                    let rewritten = st.rewrite_op(op);
+                    st.emit_rewritten_from(op, rewritten);
                 }
             }
         }
@@ -478,6 +588,18 @@ mod tests {
         }
     }
 
+    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
+        let mut op = Op::new(opcode, args);
+        op.pos = OpRef(pos);
+        op
+    }
+
+    fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
+        let mut op = Op::with_descr(opcode, args, descr);
+        op.pos = OpRef(pos);
+        op
+    }
+
     fn size_descr(size: usize, type_id: u32) -> DescrRef {
         Arc::new(TestSizeDescr {
             size,
@@ -533,11 +655,7 @@ mod tests {
     #[test]
     fn test_new_rewrite() {
         let rw = make_rewriter();
-        let ops = vec![Op::with_descr(
-            OpCode::New,
-            &[],
-            size_descr(32, 7),
-        )];
+        let ops = vec![Op::with_descr(OpCode::New, &[], size_descr(32, 7))];
 
         let result = rw.rewrite_for_gc(&ops);
 
@@ -564,7 +682,9 @@ mod tests {
         let result = rw.rewrite_for_gc(&ops);
 
         // Expect: CallMallocNurseryVarsize
-        assert!(result.iter().any(|o| o.opcode == OpCode::CallMallocNurseryVarsize));
+        assert!(result
+            .iter()
+            .any(|o| o.opcode == OpCode::CallMallocNurseryVarsize));
         let varsize = result
             .iter()
             .find(|o| o.opcode == OpCode::CallMallocNurseryVarsize)
@@ -649,9 +769,7 @@ mod tests {
         // Second NEW: NurseryPtrIncrement + GcStore(tid)
         // And the original CallMallocNursery should have been updated
         // to the combined size.
-        assert!(result
-            .iter()
-            .any(|o| o.opcode == OpCode::CallMallocNursery));
+        assert!(result.iter().any(|o| o.opcode == OpCode::CallMallocNursery));
         assert!(result
             .iter()
             .any(|o| o.opcode == OpCode::NurseryPtrIncrement));
@@ -837,5 +955,67 @@ mod tests {
             .filter(|o| o.opcode == OpCode::CondCallGcWb)
             .count();
         assert_eq!(wb_count, 2);
+    }
+
+    #[test]
+    fn test_explicit_result_positions_are_preserved_through_rewrite() {
+        let rw = make_rewriter();
+        let ops = vec![
+            mk_op_with_descr(OpCode::New, &[], 2, size_descr(24, 1)),
+            mk_op_with_descr(OpCode::New, &[], 3, size_descr(16, 2)),
+            mk_op(OpCode::Finish, &[OpRef(3)], 4),
+        ];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        let first_alloc = result
+            .iter()
+            .find(|op| op.opcode == OpCode::CallMallocNursery)
+            .unwrap();
+        let second_alloc = result
+            .iter()
+            .find(|op| op.opcode == OpCode::NurseryPtrIncrement)
+            .unwrap();
+        let finish = result.last().unwrap();
+
+        assert_eq!(first_alloc.pos, OpRef(2));
+        assert_eq!(second_alloc.pos, OpRef(3));
+        assert_eq!(finish.opcode, OpCode::Finish);
+        assert_eq!(finish.args[0], OpRef(3));
+        assert!(result
+            .iter()
+            .filter(|op| op.opcode == OpCode::GcStore)
+            .all(|op| op.pos.is_none()));
+    }
+
+    #[test]
+    fn test_rewrite_is_idempotent_for_existing_array_wb_sequence() {
+        let rw = make_rewriter();
+        let once = vec![
+            mk_op(OpCode::CondCallGcWbArray, &[OpRef(5), OpRef(1)], 7),
+            mk_op_with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(5), OpRef(1), OpRef(6)],
+                8,
+                array_descr_ref(),
+            ),
+        ];
+
+        let twice = rw.rewrite_for_gc(&once);
+
+        assert_eq!(
+            twice
+                .iter()
+                .filter(|op| op.opcode == OpCode::CondCallGcWbArray)
+                .count(),
+            1
+        );
+        assert_eq!(
+            twice
+                .iter()
+                .filter(|op| op.opcode == OpCode::SetarrayitemGc)
+                .count(),
+            1
+        );
     }
 }

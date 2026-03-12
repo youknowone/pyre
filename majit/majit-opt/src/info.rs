@@ -61,6 +61,10 @@ pub enum PtrInfo {
     VirtualArray(VirtualArrayInfo),
     /// Virtual struct (no vtable).
     VirtualStruct(VirtualStructInfo),
+    /// Virtual array of structs (interior field access).
+    VirtualArrayStruct(VirtualArrayStructInfo),
+    /// Virtual raw buffer.
+    VirtualRawBuffer(VirtualRawBufferInfo),
 }
 
 /// A virtual object whose allocation has been removed.
@@ -92,4 +96,29 @@ pub struct VirtualStructInfo {
     pub descr: DescrRef,
     /// Field values.
     pub fields: Vec<(u32, OpRef)>,
+}
+
+/// A virtual array of structs (interior field access pattern).
+///
+/// Mirrors RPython's VArrayStructInfo where each array element
+/// is a fixed-size struct with named fields. Used for RPython arrays
+/// with complex item types (e.g., hash table entries with key+value fields).
+#[derive(Clone, Debug)]
+pub struct VirtualArrayStructInfo {
+    /// The array descriptor.
+    pub descr: DescrRef,
+    /// Per-element fields: outer Vec = elements, inner Vec = (field_descr_index, value_opref).
+    pub element_fields: Vec<Vec<(u32, OpRef)>>,
+}
+
+/// A virtual raw memory buffer.
+///
+/// Mirrors RPython's VRawBufferInfo for virtualized raw_malloc allocations.
+/// Tracks writes to byte offsets within the buffer.
+#[derive(Clone, Debug)]
+pub struct VirtualRawBufferInfo {
+    /// Size of the buffer in bytes.
+    pub size: usize,
+    /// Values stored at byte offsets: (offset, value_opref).
+    pub entries: Vec<(usize, OpRef)>,
 }

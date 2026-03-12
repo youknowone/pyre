@@ -649,9 +649,9 @@ mod tests {
     fn test_call_loopinvariant_mixed_with_pure() {
         // Loop-invariant and pure CSE should coexist.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),       // pure
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // pure
             Op::new(OpCode::CallLoopinvariantI, &[OpRef(200), OpRef(201)]), // loopinvariant
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),       // pure dup → removed
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // pure dup → removed
             Op::new(OpCode::CallLoopinvariantI, &[OpRef(200), OpRef(201)]), // loopinvariant dup → removed
         ];
         assign_positions(&mut ops);

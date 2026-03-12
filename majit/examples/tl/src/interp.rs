@@ -184,10 +184,7 @@ mod tests {
     #[test]
     fn test_roll() {
         // ROLL 3: rotate top 3 elements up → bottom element comes to top
-        assert_eq!(
-            interpret(&[PUSH, 1, PUSH, 2, PUSH, 3, ROLL, 3], 0),
-            1
-        );
+        assert_eq!(interpret(&[PUSH, 1, PUSH, 2, PUSH, 3, ROLL, 3], 0), 1);
     }
 
     #[test]
@@ -216,22 +213,19 @@ mod tests {
     /// sum(N) = 1 + 2 + ... + N
     fn sum_bytecode() -> Vec<u8> {
         vec![
-            PUSH, 0,      // acc = 0
-            PUSHARG,       // counter = N
+            PUSH, 0,       // acc = 0
+            PUSHARG, // counter = N
             // loop (offset 3):
-            PICK, 0,       // dup counter
-            BR_COND, 2,    // if counter != 0, skip to body (offset 9)
-            POP,           // pop counter
-            RETURN,
-            // body (offset 9):
-            SWAP,          // [counter, acc]
-            PICK, 1,       // [counter, acc, counter]
-            ADD,           // [counter, acc+counter]
-            SWAP,          // [acc+counter, counter]
-            PUSH, 1,
-            SUB,           // [acc, counter-1]
-            PUSH, 1,
-            BR_COND, 238,  // -18: jump to loop (offset 3)
+            PICK, 0, // dup counter
+            BR_COND, 2,      // if counter != 0, skip to body (offset 9)
+            POP,    // pop counter
+            RETURN, // body (offset 9):
+            SWAP,   // [counter, acc]
+            PICK, 1,    // [counter, acc, counter]
+            ADD,  // [counter, acc+counter]
+            SWAP, // [acc+counter, counter]
+            PUSH, 1, SUB, // [acc, counter-1]
+            PUSH, 1, BR_COND, 238, // -18: jump to loop (offset 3)
         ]
     }
 
@@ -239,22 +233,19 @@ mod tests {
     fn factorial_bytecode() -> Vec<u8> {
         vec![
             PUSH, 1,       // acc = 1
-            PUSHARG,        // counter = N
+            PUSHARG, // counter = N
             // loop (offset 3):
-            PICK, 0,        // dup counter
-            PUSH, 1,
-            LE,             // counter <= 1?
-            BR_COND, 12,    // if true, goto exit (offset 22)
-            SWAP,           // [counter, acc]
-            PICK, 1,        // [counter, acc, counter]
-            MUL,            // [counter, acc*counter]
-            SWAP,           // [acc*counter, counter]
-            PUSH, 1,
-            SUB,            // counter -= 1
-            PUSH, 1,
-            BR_COND, 237,   // -19: jump to loop (offset 3)
+            PICK, 0, // dup counter
+            PUSH, 1, LE, // counter <= 1?
+            BR_COND, 12,   // if true, goto exit (offset 22)
+            SWAP, // [counter, acc]
+            PICK, 1,    // [counter, acc, counter]
+            MUL,  // [counter, acc*counter]
+            SWAP, // [acc*counter, counter]
+            PUSH, 1, SUB, // counter -= 1
+            PUSH, 1, BR_COND, 237, // -19: jump to loop (offset 3)
             // exit (offset 22):
-            POP,            // pop counter
+            POP, // pop counter
             RETURN,
         ]
     }

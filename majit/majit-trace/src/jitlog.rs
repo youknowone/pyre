@@ -201,9 +201,7 @@ Compilation time: {:.1}ms",
 
 impl Drop for JitLog {
     fn drop(&mut self) {
-        if self.print_on_drop
-            && (self.traces_compiled() > 0 || self.traces_aborted() > 0)
-        {
+        if self.print_on_drop && (self.traces_compiled() > 0 || self.traces_aborted() > 0) {
             eprintln!("{}", self.summary());
         }
     }
@@ -245,7 +243,13 @@ mod tests {
     #[test]
     fn test_jitlog_compile() {
         let mut log = JitLog::new(false);
-        log.log_compile(42, 100, 60, Duration::from_millis(2), Duration::from_millis(3));
+        log.log_compile(
+            42,
+            100,
+            60,
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+        );
         assert_eq!(log.traces_compiled(), 1);
         assert_eq!(log.total_ops_before(), 100);
         assert_eq!(log.total_ops_after(), 60);
@@ -285,8 +289,20 @@ mod tests {
     #[test]
     fn test_jitlog_summary_format() {
         let mut log = JitLog::new(false);
-        log.log_compile(1, 50, 30, Duration::from_millis(1), Duration::from_millis(2));
-        log.log_compile(2, 100, 55, Duration::from_millis(1), Duration::from_millis(3));
+        log.log_compile(
+            1,
+            50,
+            30,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
+        log.log_compile(
+            2,
+            100,
+            55,
+            Duration::from_millis(1),
+            Duration::from_millis(3),
+        );
         log.log_abort();
         log.log_guard_failure(0);
         log.log_guard_failure(1);
@@ -345,7 +361,13 @@ mod tests {
     #[test]
     fn test_compiled_traces_accessor() {
         let mut log = JitLog::new(false);
-        log.log_compile(42, 100, 60, Duration::from_millis(1), Duration::from_millis(2));
+        log.log_compile(
+            42,
+            100,
+            60,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
         let traces = log.compiled_traces();
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].green_key, 42);

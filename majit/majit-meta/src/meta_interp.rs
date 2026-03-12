@@ -7,8 +7,12 @@ use majit_opt::optimizer::Optimizer;
 use majit_trace::trace::Trace;
 use majit_trace::warmstate::{HotResult, WarmState};
 
+use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionState};
 use crate::io_buffer;
-use crate::resume::{ResumeData, ResumeDataBuilder};
+use crate::resume::{
+    EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
+    ResumeData, ResumeDataBuilder,
+};
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
 
@@ -32,8 +36,14 @@ pub struct CompileResult<'a, M> {
     pub values: Vec<i64>,
     /// The interpreter-specific metadata for this loop.
     pub meta: &'a M,
-    /// Index of the failed guard (0 for Finish, >0 for guard failures).
+    /// Backend fail-index for this exit.
     pub fail_index: u32,
+    /// Compiled trace identifier for this exit (root loop or bridge).
+    pub trace_id: u64,
+    /// Whether this exit is a FINISH rather than a guard failure.
+    pub is_finish: bool,
+    /// Pending exception state captured from the backend deadframe.
+    pub exception: ExceptionState,
 }
 
 /// Per-guard failure tracking for bridge compilation decisions.
@@ -44,14 +54,39 @@ struct GuardFailureInfo {
     bridge_compiled: bool,
 }
 
+struct CompiledTrace {
+    /// Resume data for each guard, keyed by fail_index.
+    resume_data: HashMap<u32, StoredResumeData>,
+    /// Optimized ops for blackhole fallback from compiled guard failures.
+    ops: Vec<majit_ir::Op>,
+    /// Constant pool paired with `ops` for blackhole fallback.
+    constants: HashMap<u32, i64>,
+    /// Mapping from backend fail_index to the corresponding guard op index.
+    guard_op_indices: HashMap<u32, usize>,
+}
+
+struct StoredResumeData {
+    semantic: ResumeData,
+    encoded: EncodedResumeData,
+}
+
+impl StoredResumeData {
+    fn new(semantic: ResumeData) -> Self {
+        let encoded = semantic.encode();
+        StoredResumeData { semantic, encoded }
+    }
+}
+
 struct CompiledEntry<M> {
     token: LoopToken,
     num_inputs: usize,
     meta: M,
-    /// Per-guard failure tracking, keyed by fail_index.
-    guard_failures: HashMap<u32, GuardFailureInfo>,
-    /// Resume data for each guard, keyed by fail_index.
-    resume_data: HashMap<u32, ResumeData>,
+    /// Trace id of the root compiled loop.
+    root_trace_id: u64,
+    /// Per-guard failure tracking, keyed by (trace_id, fail_index).
+    guard_failures: HashMap<(u64, u32), GuardFailureInfo>,
+    /// Metadata for the root loop and any attached bridges, keyed by trace id.
+    traces: HashMap<u64, CompiledTrace>,
 }
 
 /// The meta-tracing JIT engine.
@@ -67,6 +102,7 @@ pub struct MetaInterp<M: Clone> {
     backend: CraneliftBackend,
     compiled_loops: HashMap<u64, CompiledEntry<M>>,
     tracing: Option<TraceCtx>,
+    next_trace_id: u64,
     /// Trace eagerness: start tracing from a guard failure point
     /// after this many failures (0 = never trace from guards).
     trace_eagerness: u32,
@@ -100,6 +136,31 @@ pub struct JitHooks {
 }
 
 impl<M: Clone> MetaInterp<M> {
+    fn alloc_trace_id(&mut self) -> u64 {
+        let trace_id = self.next_trace_id;
+        self.next_trace_id += 1;
+        trace_id
+    }
+
+    fn normalize_trace_id(compiled: &CompiledEntry<M>, trace_id: u64) -> u64 {
+        if trace_id == 0 {
+            compiled.root_trace_id
+        } else {
+            trace_id
+        }
+    }
+
+    fn trace_for_exit<'a>(
+        compiled: &'a CompiledEntry<M>,
+        trace_id: u64,
+    ) -> Option<(u64, &'a CompiledTrace)> {
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        compiled
+            .traces
+            .get(&trace_id)
+            .map(|trace| (trace_id, trace))
+    }
+
     /// Create a new MetaInterp with the given compilation threshold.
     pub fn new(threshold: u32) -> Self {
         MetaInterp {
@@ -107,6 +168,7 @@ impl<M: Clone> MetaInterp<M> {
             backend: CraneliftBackend::new(),
             compiled_loops: HashMap::new(),
             tracing: None,
+            next_trace_id: 1,
             trace_eagerness: 200,
             virtualizable_info: None,
             hooks: JitHooks::default(),
@@ -126,6 +188,14 @@ impl<M: Clone> MetaInterp<M> {
     /// Set the main compilation threshold.
     pub fn set_threshold(&mut self, threshold: u32) {
         self.warm_state.set_threshold(threshold);
+    }
+
+    /// Set the function inlining threshold.
+    ///
+    /// A function must be called at least this many times during tracing
+    /// before it is inlined. Default is 4 (matching RPython).
+    pub fn set_function_threshold(&mut self, threshold: u32) {
+        self.warm_state.set_function_threshold(threshold);
     }
 
     /// Decay all counters to avoid stale hotness data.
@@ -192,7 +262,7 @@ impl<M: Clone> MetaInterp<M> {
                     recorder.record_input_arg(Type::Int);
                 }
 
-                if std::env::var("MAJIT_LOG").is_ok() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] start tracing at key={}, num_inputs={}",
                         green_key,
@@ -256,7 +326,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut optimizer = Optimizer::default_pipeline();
         let mut constants = ctx.constants.into_inner();
 
-        if std::env::var("MAJIT_LOG").is_ok() {
+        if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) ---");
             eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
         }
@@ -265,22 +335,25 @@ impl<M: Clone> MetaInterp<M> {
         let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
         let num_ops_after = optimized_ops.len();
 
-        if std::env::var("MAJIT_LOG").is_ok() {
+        if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
+        let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
 
         let token_num = self.warm_state.alloc_token_number();
         let mut token = LoopToken::new(token_num);
+        let trace_id = self.alloc_trace_id();
+        self.backend.set_next_trace_id(trace_id);
 
         match self
             .backend
             .compile_loop(&trace.inputargs, &optimized_ops, &mut token)
         {
             Ok(_) => {
-                if std::env::var("MAJIT_LOG").is_ok() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
                         green_key,
@@ -288,7 +361,18 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // Build resume data for all guards in the optimized trace.
-                let resume_data = build_resume_data_for_guards(&optimized_ops, green_key);
+                let (resume_data, guard_op_indices) =
+                    build_guard_metadata(&optimized_ops, green_key);
+                let mut traces = HashMap::new();
+                traces.insert(
+                    trace_id,
+                    CompiledTrace {
+                        resume_data,
+                        ops: optimized_ops,
+                        constants: compiled_constants,
+                        guard_op_indices,
+                    },
+                );
 
                 self.compiled_loops.insert(
                     green_key,
@@ -296,8 +380,9 @@ impl<M: Clone> MetaInterp<M> {
                         token,
                         num_inputs: trace.inputargs.len(),
                         meta,
+                        root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
-                        resume_data,
+                        traces,
                     },
                 );
                 let install_num = self.warm_state.alloc_token_number();
@@ -313,6 +398,8 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state.abort_tracing(green_key, true);
             }
         }
+        // Reset per-trace function call counts.
+        self.warm_state.reset_function_counts();
     }
 
     /// Abort the current trace.
@@ -321,7 +408,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn abort_trace(&mut self, permanent: bool) {
         if let Some(ctx) = self.tracing.take() {
             let green_key = ctx.green_key;
-            if std::env::var("MAJIT_LOG").is_ok() {
+            if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] abort trace at key={} (permanent={})",
                     green_key, permanent
@@ -329,6 +416,8 @@ impl<M: Clone> MetaInterp<M> {
             }
             ctx.recorder.abort();
             self.warm_state.abort_tracing(green_key, permanent);
+            // Reset per-trace function call counts.
+            self.warm_state.reset_function_counts();
             if let Some(ref hook) = self.hooks.on_trace_abort {
                 hook(green_key, permanent);
             }
@@ -357,31 +446,28 @@ impl<M: Clone> MetaInterp<M> {
     pub fn run_compiled(&mut self, green_key: u64, live_values: &[i64]) -> Option<(Vec<i64>, &M)> {
         let compiled = self.compiled_loops.get(&green_key)?;
 
-        let args: Vec<Value> = live_values.iter().map(|&v| Value::Int(v)).collect();
-
         io_buffer::io_buffer_discard();
-        let _jitted = majit_codegen::JittedGuard::enter();
-        let frame = self.backend.execute_token(&compiled.token, &args);
-        drop(_jitted);
+        let result = self
+            .backend
+            .execute_token_ints_raw(&compiled.token, live_values);
         io_buffer::io_buffer_discard();
 
-        // Read guard failure information
-        let descr = self.backend.get_latest_descr(&frame);
-        let fail_index = descr.fail_index();
+        let fail_index = result.fail_index;
+        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
-        // Track guard failures for bridge compilation decisions
-        if fail_index > 0 {
+        // Track guard failures for bridge compilation decisions.
+        if !result.is_finish {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
                 .guard_failures
-                .entry(fail_index)
+                .entry((trace_id, fail_index))
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
                 });
             info.fail_count += 1;
 
-            if std::env::var("MAJIT_LOG").is_ok() {
+            if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}, count={}",
                     green_key, fail_index, info.fail_count
@@ -396,12 +482,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let compiled = self.compiled_loops.get(&green_key).unwrap();
-        let mut output = Vec::with_capacity(compiled.num_inputs);
-        for i in 0..compiled.num_inputs {
-            output.push(self.backend.get_int_value(&frame, i));
-        }
-
-        Some((output, &compiled.meta))
+        Some((result.outputs, &compiled.meta))
     }
 
     /// Run compiled code and return detailed guard failure information.
@@ -416,23 +497,24 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<CompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
 
-        let args: Vec<Value> = live_values.iter().map(|&v| Value::Int(v)).collect();
-
         io_buffer::io_buffer_discard();
-        let _jitted = majit_codegen::JittedGuard::enter();
-        let frame = self.backend.execute_token(&compiled.token, &args);
-        drop(_jitted);
+        let frame = self
+            .backend
+            .execute_token_ints(&compiled.token, live_values);
+
         io_buffer::io_buffer_discard();
 
         let descr = self.backend.get_latest_descr(&frame);
         let fail_index = descr.fail_index();
+        let trace_id = Self::normalize_trace_id(compiled, descr.trace_id());
+        let is_finish = descr.is_finish();
 
         // Track guard failures
-        if fail_index > 0 {
+        if !is_finish {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
                 .guard_failures
-                .entry(fail_index)
+                .entry((trace_id, fail_index))
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
@@ -445,16 +527,24 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
+        let exit_arity = descr.fail_arg_types().len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
-        let mut values = Vec::with_capacity(compiled.num_inputs);
-        for i in 0..compiled.num_inputs {
+        let mut values = Vec::with_capacity(exit_arity);
+        for i in 0..exit_arity {
             values.push(self.backend.get_int_value(&frame, i));
         }
+        let exception = ExceptionState {
+            exc_class: self.backend.grab_exc_class(&frame),
+            exc_value: self.backend.grab_exc_value(&frame).0 as i64,
+        };
 
         Some(CompileResult {
             values,
             meta: &compiled.meta,
             fail_index,
+            trace_id,
+            is_finish,
+            exception,
         })
     }
 
@@ -463,26 +553,64 @@ impl<M: Clone> MetaInterp<M> {
     /// This allows the interpreter to later reconstruct its full state
     /// when the guard fails, using `get_resume_data`.
     pub fn attach_resume_data(&mut self, green_key: u64, fail_index: u32, resume_data: ResumeData) {
+        let Some(trace_id) = self.compiled_loops.get(&green_key).map(|c| c.root_trace_id) else {
+            return;
+        };
+        self.attach_resume_data_to_trace(green_key, trace_id, fail_index, resume_data);
+    }
+
+    /// Attach resume data to a specific guard in a specific compiled trace.
+    pub fn attach_resume_data_to_trace(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        resume_data: ResumeData,
+    ) {
         if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
-            compiled.resume_data.insert(fail_index, resume_data);
+            let trace_id = if trace_id == 0 {
+                compiled.root_trace_id
+            } else {
+                trace_id
+            };
+            if let Some(trace) = compiled.traces.get_mut(&trace_id) {
+                trace
+                    .resume_data
+                    .insert(fail_index, StoredResumeData::new(resume_data));
+            }
         }
     }
 
     /// Get resume data for a specific guard failure.
     pub fn get_resume_data(&self, green_key: u64, fail_index: u32) -> Option<&ResumeData> {
-        self.compiled_loops
-            .get(&green_key)
-            .and_then(|c| c.resume_data.get(&fail_index))
+        let trace_id = self.compiled_loops.get(&green_key)?.root_trace_id;
+        self.get_resume_data_in_trace(green_key, trace_id, fail_index)
+    }
+
+    /// Get resume data for a specific guard failure in a specific trace.
+    pub fn get_resume_data_in_trace(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<&ResumeData> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let (_, trace) = Self::trace_for_exit(compiled, trace_id)?;
+        trace
+            .resume_data
+            .get(&fail_index)
+            .map(|data| &data.semantic)
     }
 
     /// Check whether a guard has failed enough times to warrant bridge compilation.
     pub fn should_compile_bridge(&self, green_key: u64, fail_index: u32) -> bool {
-        self.compiled_loops
-            .get(&green_key)
-            .and_then(|c| c.guard_failures.get(&fail_index))
-            .is_some_and(|info| {
-                !info.bridge_compiled && self.warm_state.should_compile_bridge(info.fail_count)
-            })
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return false;
+        };
+        let key = (compiled.root_trace_id, fail_index);
+        compiled.guard_failures.get(&key).is_some_and(|info| {
+            !info.bridge_compiled && self.warm_state.should_compile_bridge(info.fail_count)
+        })
     }
 
     /// Invalidate a compiled loop (e.g., due to GUARD_NOT_INVALIDATED).
@@ -493,7 +621,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn invalidate_loop(&mut self, green_key: u64) {
         if let Some(compiled) = self.compiled_loops.get(&green_key) {
             compiled.token.invalidate();
-            if std::env::var("MAJIT_LOG").is_ok() {
+            if crate::majit_log_enabled() {
                 eprintln!("[jit] invalidated loop at key={}", green_key);
             }
         }
@@ -503,7 +631,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn get_guard_failure_count(&self, green_key: u64, fail_index: u32) -> u32 {
         self.compiled_loops
             .get(&green_key)
-            .and_then(|c| c.guard_failures.get(&fail_index))
+            .and_then(|c| c.guard_failures.get(&(c.root_trace_id, fail_index)))
             .map(|info| info.fail_count)
             .unwrap_or(0)
     }
@@ -537,6 +665,43 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.contains_key(&green_key)
     }
 
+    /// Check whether a guard in a specific compiled trace should get a bridge.
+    pub fn should_compile_bridge_in_trace(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> bool {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return false;
+        };
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        compiled
+            .guard_failures
+            .get(&(trace_id, fail_index))
+            .is_some_and(|info| {
+                !info.bridge_compiled && self.warm_state.should_compile_bridge(info.fail_count)
+            })
+    }
+
+    /// Get the failure count for a guard in a specific compiled trace.
+    pub fn get_guard_failure_count_in_trace(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> u32 {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return 0;
+        };
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        compiled
+            .guard_failures
+            .get(&(trace_id, fail_index))
+            .map(|info| info.fail_count)
+            .unwrap_or(0)
+    }
+
     // ── Bridge Compilation ──────────────────────────────────────
 
     /// Compile a bridge from a guard failure point.
@@ -567,8 +732,12 @@ impl<M: Clone> MetaInterp<M> {
         let mut optimizer = Optimizer::default_pipeline();
         let mut constants = constants;
         let optimized_ops = optimizer.optimize_with_constants(bridge_ops, &mut constants);
+        let num_optimized_ops = optimized_ops.len();
+        let compiled_constants = constants.clone();
+        let bridge_trace_id = self.alloc_trace_id();
 
         self.backend.set_constants(constants);
+        self.backend.set_next_trace_id(bridge_trace_id);
 
         let result = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
@@ -582,7 +751,7 @@ impl<M: Clone> MetaInterp<M> {
 
         match result {
             Ok(_) => {
-                if std::env::var("MAJIT_LOG").is_ok() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled bridge at key={}, guard={}",
                         green_key, fail_index
@@ -590,14 +759,38 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
-                    if let Some(info) = compiled.guard_failures.get_mut(&fail_index) {
-                        info.bridge_compiled = true;
-                    }
+                    let source_trace_id = {
+                        let trace_id = fail_descr.trace_id();
+                        if trace_id == 0 {
+                            compiled.root_trace_id
+                        } else {
+                            trace_id
+                        }
+                    };
+                    compiled
+                        .guard_failures
+                        .entry((source_trace_id, fail_index))
+                        .or_insert(GuardFailureInfo {
+                            fail_count: 0,
+                            bridge_compiled: false,
+                        })
+                        .bridge_compiled = true;
+                    let (resume_data, guard_op_indices) =
+                        build_guard_metadata(&optimized_ops, green_key);
+                    compiled.traces.insert(
+                        bridge_trace_id,
+                        CompiledTrace {
+                            resume_data,
+                            ops: optimized_ops,
+                            constants: compiled_constants,
+                            guard_op_indices,
+                        },
+                    );
                 }
                 self.warm_state.log_bridge_compile(fail_index);
 
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
-                    hook(green_key, fail_index, optimized_ops.len());
+                    hook(green_key, fail_index, num_optimized_ops);
                 }
                 true
             }
@@ -606,6 +799,56 @@ impl<M: Clone> MetaInterp<M> {
                 false
             }
         }
+    }
+
+    /// Start retracing from a guard failure point.
+    ///
+    /// When a guard fails enough times (>= trace_eagerness) and is not yet
+    /// eligible for bridge compilation, we start a new trace from the
+    /// guard failure point. The resulting trace replaces the original guard.
+    ///
+    /// Returns true if retracing was started.
+    pub fn start_retrace_from_guard(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+    ) -> bool {
+        let compiled = match self.compiled_loops.get(&green_key) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+
+        // Find the guard's fail_arg_types to set up inputs
+        let (_, trace) = match Self::trace_for_exit(compiled, trace_id) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        let guard_op_index = match trace.guard_op_indices.get(&fail_index) {
+            Some(&idx) => idx,
+            None => return false,
+        };
+
+        let guard_op = match trace.ops.get(guard_op_index) {
+            Some(op) => op,
+            None => return false,
+        };
+
+        let num_inputs = guard_op.fail_args.as_ref().map(|fa| fa.len()).unwrap_or(0);
+
+        // Create a new trace recorder for the retrace
+        let recorder = self.warm_state.start_retrace(num_inputs);
+        self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
+
+        if let Some(ref hook) = self.hooks.on_trace_start {
+            hook(green_key);
+        }
+
+        true
     }
 
     // ── Guard Failure Recovery ─────────────────────────────────
@@ -622,21 +865,51 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         fail_index: u32,
         fail_values: &[i64],
+        exception: ExceptionState,
+    ) -> Option<GuardRecovery> {
+        let trace_id = self.compiled_loops.get(&green_key)?.root_trace_id;
+        self.handle_guard_failure_in_trace(green_key, trace_id, fail_index, fail_values, exception)
+    }
+
+    /// Handle a guard failure in a specific compiled trace (root loop or bridge).
+    ///
+    /// This is the trace-aware counterpart to `handle_guard_failure()`. Callers
+    /// should use the `trace_id` reported by `run_compiled_detailed()` when the
+    /// failing exit may come from a bridge.
+    pub fn handle_guard_failure_in_trace(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+        exception: ExceptionState,
     ) -> Option<GuardRecovery> {
         let compiled = self.compiled_loops.get(&green_key)?;
+        let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
 
         // Reconstruct interpreter state from resume data if available
-        let reconstructed = if let Some(resume_data) = compiled.resume_data.get(&fail_index) {
-            let frames = resume_data.reconstruct(fail_values);
-            Some(frames)
+        let reconstructed_state = if let Some(resume_data) = trace.resume_data.get(&fail_index) {
+            Some(resume_data.encoded.reconstruct_state(fail_values))
         } else {
             None
         };
+        let reconstructed = reconstructed_state
+            .as_ref()
+            .map(|state| state.frames.clone());
+        let materialized_virtuals = reconstructed_state
+            .as_ref()
+            .map(|state| state.virtuals.clone())
+            .unwrap_or_default();
+        let pending_field_writes = reconstructed_state
+            .as_ref()
+            .map(|state| state.pending_fields.clone())
+            .unwrap_or_default();
 
         // Decide what to do next
-        let action = if self.should_compile_bridge(green_key, fail_index) {
+        let action = if self.should_compile_bridge_in_trace(green_key, trace_id, fail_index) {
             GuardRecoveryAction::CompileBridge
-        } else if self.get_guard_failure_count(green_key, fail_index) >= self.trace_eagerness
+        } else if self.get_guard_failure_count_in_trace(green_key, trace_id, fail_index)
+            >= self.trace_eagerness
             && self.trace_eagerness > 0
         {
             GuardRecoveryAction::RetraceFromGuard
@@ -645,9 +918,14 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         Some(GuardRecovery {
+            trace_id,
             fail_index,
             fail_values: fail_values.to_vec(),
             reconstructed_frames: reconstructed,
+            reconstructed_state,
+            materialized_virtuals,
+            pending_field_writes,
+            exception,
             action,
         })
     }
@@ -659,23 +937,225 @@ impl<M: Clone> MetaInterp<M> {
     pub fn run_and_recover(&mut self, green_key: u64, live_values: &[i64]) -> Option<RunResult<M>> {
         let result = self.run_compiled_detailed(green_key, live_values)?;
         let fail_index = result.fail_index;
+        let trace_id = result.trace_id;
+        let is_finish = result.is_finish;
         let values = result.values.clone();
+        let exception = result.exception.clone();
         let meta = result.meta.clone();
 
-        if fail_index == 0 {
+        if is_finish {
             // Normal finish (not a guard failure)
             return Some(RunResult::Finished { values, meta });
         }
 
         // Guard failure — recover
-        let recovery = self.handle_guard_failure(green_key, fail_index, &values);
+        let recovery =
+            self.handle_guard_failure_in_trace(green_key, trace_id, fail_index, &values, exception);
 
         Some(RunResult::GuardFailure {
             values,
             meta,
+            trace_id,
             fail_index,
             recovery,
         })
+    }
+
+    fn blackhole_guard_failure(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+        exception: ExceptionState,
+    ) -> Option<(BlackholeResult, ExceptionState)> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let (_, trace) = Self::trace_for_exit(compiled, trace_id)?;
+        let guard_op_index = *trace.guard_op_indices.get(&fail_index)?;
+        let guard_op = trace.ops.get(guard_op_index)?;
+        let fail_args = guard_op.fail_args.as_ref()?;
+
+        let mut initial_values = HashMap::with_capacity(fail_args.len());
+        for (arg, value) in fail_args.iter().zip(fail_values.iter().copied()) {
+            initial_values.insert(arg.0, value);
+        }
+
+        Some(blackhole_execute_with_state(
+            &trace.ops,
+            &trace.constants,
+            &initial_values,
+            guard_op_index + 1,
+            exception,
+        ))
+    }
+
+    /// Run compiled code and, on guard failure, immediately continue through the
+    /// blackhole interpreter for the subset where majit can replay the remaining
+    /// optimized ops directly.
+    pub fn run_with_blackhole_fallback(
+        &mut self,
+        green_key: u64,
+        live_values: &[i64],
+    ) -> Option<BlackholeRunResult<M>> {
+        let result = self.run_compiled_detailed(green_key, live_values)?;
+        let fail_index = result.fail_index;
+        let trace_id = result.trace_id;
+        let is_finish = result.is_finish;
+        let values = result.values.clone();
+        let exception = result.exception.clone();
+        let meta = result.meta.clone();
+
+        if is_finish {
+            return Some(BlackholeRunResult::Finished {
+                values,
+                meta,
+                via_blackhole: false,
+                exception,
+            });
+        }
+
+        let initial_recovery = self.handle_guard_failure_in_trace(
+            green_key,
+            trace_id,
+            fail_index,
+            &values,
+            exception.clone(),
+        );
+
+        let Some((blackhole_result, blackhole_exception)) = self.blackhole_guard_failure(
+            green_key,
+            trace_id,
+            fail_index,
+            &values,
+            exception.clone(),
+        ) else {
+            return Some(BlackholeRunResult::GuardFailure {
+                trace_id,
+                fail_index,
+                fail_values: values,
+                meta,
+                recovery: initial_recovery,
+                materialized_virtuals: Vec::new(),
+                pending_field_writes: Vec::new(),
+                via_blackhole: false,
+                exception,
+            });
+        };
+
+        match blackhole_result {
+            BlackholeResult::Finish(values) => Some(BlackholeRunResult::Finished {
+                values,
+                meta,
+                via_blackhole: true,
+                exception: blackhole_exception,
+            }),
+            BlackholeResult::Jump(values) => Some(BlackholeRunResult::Jump {
+                values,
+                meta,
+                exception: blackhole_exception,
+            }),
+            BlackholeResult::GuardFailed {
+                guard_index,
+                fail_values,
+            } => {
+                let (
+                    fallback_trace_id,
+                    fallback_fail_index,
+                    materialized_virtuals,
+                    pending_field_writes,
+                ) = {
+                    let compiled = self.compiled_loops.get(&green_key)?;
+                    let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
+                    let fallback_fail_index = trace
+                        .guard_op_indices
+                        .iter()
+                        .find_map(|(&idx, &op_index)| (op_index == guard_index).then_some(idx))
+                        .unwrap_or(fail_index);
+                    let materialized_virtuals = trace
+                        .resume_data
+                        .get(&fallback_fail_index)
+                        .map(|resume_data| resume_data.encoded.materialize_virtuals(&fail_values))
+                        .unwrap_or_default();
+                    let pending_field_writes = trace
+                        .resume_data
+                        .get(&fallback_fail_index)
+                        .map(|resume_data| {
+                            resume_data
+                                .encoded
+                                .resolve_pending_field_writes(&fail_values)
+                        })
+                        .unwrap_or_default();
+                    (
+                        trace_id,
+                        fallback_fail_index,
+                        materialized_virtuals,
+                        pending_field_writes,
+                    )
+                };
+                let recovery = self.handle_guard_failure_in_trace(
+                    green_key,
+                    fallback_trace_id,
+                    fallback_fail_index,
+                    &fail_values,
+                    blackhole_exception.clone(),
+                );
+                Some(BlackholeRunResult::GuardFailure {
+                    trace_id: fallback_trace_id,
+                    fail_index: fallback_fail_index,
+                    fail_values,
+                    meta,
+                    recovery,
+                    materialized_virtuals,
+                    pending_field_writes,
+                    via_blackhole: true,
+                    exception: blackhole_exception,
+                })
+            }
+            BlackholeResult::GuardFailedWithVirtuals {
+                guard_index,
+                fail_values,
+                materialized_virtuals,
+                pending_field_writes,
+            } => {
+                let (fallback_trace_id, fallback_fail_index) = {
+                    let compiled = self.compiled_loops.get(&green_key)?;
+                    let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
+                    let fallback_fail_index = trace
+                        .guard_op_indices
+                        .iter()
+                        .find_map(|(&idx, &op_index)| (op_index == guard_index).then_some(idx))
+                        .unwrap_or(fail_index);
+                    (trace_id, fallback_fail_index)
+                };
+                let recovery = self.handle_guard_failure_in_trace(
+                    green_key,
+                    fallback_trace_id,
+                    fallback_fail_index,
+                    &fail_values,
+                    blackhole_exception.clone(),
+                );
+                Some(BlackholeRunResult::GuardFailure {
+                    trace_id: fallback_trace_id,
+                    fail_index: fallback_fail_index,
+                    fail_values,
+                    meta,
+                    recovery,
+                    materialized_virtuals,
+                    pending_field_writes,
+                    via_blackhole: true,
+                    exception: blackhole_exception,
+                })
+            }
+            BlackholeResult::Abort(message) => Some(BlackholeRunResult::Abort {
+                trace_id,
+                fail_index,
+                fail_values: values,
+                meta,
+                recovery: initial_recovery,
+                message,
+                exception: blackhole_exception,
+            }),
+        }
     }
 
     // ── Retrace Support ──────────────────────────────────────
@@ -706,7 +1186,7 @@ impl<M: Clone> MetaInterp<M> {
             recorder.record_input_arg(Type::Int);
         }
 
-        if std::env::var("MAJIT_LOG").is_ok() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] start retrace at key={}, num_inputs={}",
                 green_key,
@@ -722,14 +1202,16 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Check if a function call should be inlined during tracing.
     ///
-    /// In RPython, the meta-interpreter decides whether to trace into
-    /// a called function (inline it) or emit a residual call. Factors:
-    /// - Does the callee have a JitDriver (is it jittable)?
-    /// - Has the callee been compiled before?
-    /// - Is the call recursion depth too deep?
+    /// Mirrors RPython's inlining heuristic from warmstate.py:
+    /// 1. If the callee already has compiled code → CALL_ASSEMBLER
+    /// 2. If not tracing → residual call
+    /// 3. If recursion depth too deep → residual call
+    /// 4. If the function hasn't been called enough times → residual call
+    ///    (controlled by `function_threshold`)
+    /// 5. Otherwise → inline
     ///
     /// `callee_key` identifies the called function's JitDriver.
-    pub fn should_inline(&self, callee_key: u64) -> InlineDecision {
+    pub fn should_inline(&mut self, callee_key: u64) -> InlineDecision {
         // If the callee already has compiled code, don't inline —
         // use CALL_ASSEMBLER instead.
         if self.compiled_loops.contains_key(&callee_key) {
@@ -744,6 +1226,14 @@ impl<M: Clone> MetaInterp<M> {
                     return InlineDecision::ResidualCall;
                 }
             }
+
+            // Check function_threshold: has the function been called enough
+            // times to warrant inlining? This mirrors RPython's
+            // function_threshold heuristic in warmstate.py.
+            if !self.warm_state.should_inline_function(callee_key) {
+                return InlineDecision::ResidualCall;
+            }
+
             return InlineDecision::Inline;
         }
 
@@ -769,7 +1259,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let key_ref = ctx.const_int(callee_key as i64);
         ctx.record_op(OpCode::EnterPortalFrame, &[key_ref]);
-        ctx.push_inline_frame(callee_key);
+        ctx.push_inline_frame(callee_key, MAX_INLINE_DEPTH as u32);
         true
     }
 
@@ -802,18 +1292,29 @@ impl<M: Clone> MetaInterp<M> {
     }
 }
 
-/// Maximum inlining depth during tracing.
+/// Default maximum inlining depth during tracing.
+/// Configurable via WarmState::set_max_inline_depth().
 const MAX_INLINE_DEPTH: usize = 10;
 
 /// Describes the recovery state after a guard failure.
 #[derive(Debug, Clone)]
 pub struct GuardRecovery {
+    /// Compiled trace identifier for the failing exit.
+    pub trace_id: u64,
     /// Index of the failed guard.
     pub fail_index: u32,
     /// Raw fail_values from the DeadFrame.
     pub fail_values: Vec<i64>,
     /// Reconstructed interpreter frames (if resume data was available).
     pub reconstructed_frames: Option<Vec<crate::resume::ReconstructedFrame>>,
+    /// Full reconstructed state, including materialized virtuals.
+    pub reconstructed_state: Option<ReconstructedState>,
+    /// Materialized virtuals referenced by the reconstructed state.
+    pub materialized_virtuals: Vec<MaterializedVirtual>,
+    /// Deferred heap writes reconstructed from resume data.
+    pub pending_field_writes: Vec<ResolvedPendingFieldWrite>,
+    /// Pending exception state captured from the failing deadframe.
+    pub exception: ExceptionState,
     /// Recommended action after recovery.
     pub action: GuardRecoveryAction,
 }
@@ -838,46 +1339,92 @@ pub enum RunResult<M> {
     GuardFailure {
         values: Vec<i64>,
         meta: M,
+        trace_id: u64,
         fail_index: u32,
         recovery: Option<GuardRecovery>,
     },
 }
 
-/// Build resume data for all guards in a compiled trace.
+/// Result of running compiled code with automatic blackhole fallback.
+#[derive(Debug, Clone)]
+pub enum BlackholeRunResult<M> {
+    /// The trace produced final values, either directly or via blackhole replay.
+    Finished {
+        values: Vec<i64>,
+        meta: M,
+        via_blackhole: bool,
+        exception: ExceptionState,
+    },
+    /// The blackhole replay reached a jump back-edge.
+    Jump {
+        values: Vec<i64>,
+        meta: M,
+        exception: ExceptionState,
+    },
+    /// Execution still ended in a guard failure.
+    GuardFailure {
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: Vec<i64>,
+        meta: M,
+        recovery: Option<GuardRecovery>,
+        materialized_virtuals: Vec<MaterializedVirtual>,
+        pending_field_writes: Vec<ResolvedPendingFieldWrite>,
+        via_blackhole: bool,
+        exception: ExceptionState,
+    },
+    /// Blackhole replay could not continue the trace.
+    Abort {
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: Vec<i64>,
+        meta: M,
+        recovery: Option<GuardRecovery>,
+        message: String,
+        exception: ExceptionState,
+    },
+}
+
+/// Build guard metadata for a compiled trace.
 ///
-/// Scans the ops for guard operations (those with fail_args) and creates
-/// a ResumeData for each one. The ResumeData maps each guard's fail_args
-/// back to slot positions so the interpreter can reconstruct its state
-/// after a guard failure.
-///
-/// Returns a map from fail_index to ResumeData.
-fn build_resume_data_for_guards(
+/// The backend numbers every guard and finish in a single exit table, so this
+/// helper mirrors that numbering and records only the guard entries that need
+/// resume data plus the corresponding op index for blackhole fallback.
+fn build_guard_metadata(
     ops: &[majit_ir::Op],
     pc: u64,
-) -> HashMap<u32, ResumeData> {
+) -> (HashMap<u32, StoredResumeData>, HashMap<u32, usize>) {
     let mut result = HashMap::new();
+    let mut guard_op_indices = HashMap::new();
+    let mut fail_index = 0u32;
 
     for (op_idx, op) in ops.iter().enumerate() {
-        if !op.opcode.is_guard() {
+        let is_guard = op.opcode.is_guard();
+        let is_finish = op.opcode == OpCode::Finish;
+        if !is_guard && !is_finish {
             continue;
         }
-        // Guards that have fail_args produce resume data
-        if let Some(ref fail_args) = op.fail_args {
-            // Use (op_idx + 1) as fail_index since 0 means "no guard failure"
-            let fail_index = (op_idx + 1) as u32;
 
-            let mut builder = ResumeDataBuilder::new();
-            builder.push_frame(pc);
-
-            for (slot_idx, _) in fail_args.iter().enumerate() {
-                builder.map_slot(slot_idx, slot_idx);
-            }
-
-            result.insert(fail_index, builder.build());
+        if is_guard {
+            guard_op_indices.insert(fail_index, op_idx);
         }
+        // Guards that have fail_args produce resume data.
+        if is_guard {
+            if let Some(ref fail_args) = op.fail_args {
+                let mut builder = ResumeDataBuilder::new();
+                builder.push_frame(pc);
+
+                for (slot_idx, _) in fail_args.iter().enumerate() {
+                    builder.map_slot(slot_idx, slot_idx);
+                }
+
+                result.insert(fail_index, StoredResumeData::new(builder.build()));
+            }
+        }
+        fail_index += 1;
     }
 
-    result
+    (result, guard_op_indices)
 }
 
 /// Decision about how to handle a function call during tracing.
@@ -889,4 +1436,558 @@ pub enum InlineDecision {
     CallAssembler,
     /// Emit a residual (opaque) call.
     ResidualCall,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
+    use majit_codegen::Backend;
+    use majit_codegen_cranelift::guard::CraneliftFailDescr;
+    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+
+    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
+        let mut op = Op::new(opcode, args);
+        op.pos = OpRef(pos);
+        op
+    }
+
+    fn install_compiled_entry(
+        meta: &mut MetaInterp<()>,
+        green_key: u64,
+        inputargs: &[InputArg],
+        ops: Vec<Op>,
+        constants: HashMap<u32, i64>,
+    ) {
+        meta.backend.set_constants(constants.clone());
+        let mut token = LoopToken::new(green_key + 1000);
+        let trace_id = meta.alloc_trace_id();
+        meta.backend.set_next_trace_id(trace_id);
+        meta.backend
+            .compile_loop(inputargs, &ops, &mut token)
+            .expect("loop should compile");
+        let (resume_data, guard_op_indices) = build_guard_metadata(&ops, green_key);
+        let mut traces = HashMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                resume_data,
+                ops,
+                constants,
+                guard_op_indices,
+            },
+        );
+
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token,
+                num_inputs: inputargs.len(),
+                meta: (),
+                root_trace_id: trace_id,
+                guard_failures: HashMap::new(),
+                traces,
+            },
+        );
+    }
+
+    #[test]
+    fn test_handle_guard_failure_preserves_exception_state_in_recovery() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 7;
+        let fail_index = 3;
+        let mut resume_data = HashMap::new();
+        resume_data.insert(fail_index, StoredResumeData::new(ResumeData::simple(99, 2)));
+        let trace_id = meta.alloc_trace_id();
+        let mut traces = HashMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                resume_data,
+                ops: Vec::new(),
+                constants: HashMap::new(),
+                guard_op_indices: HashMap::new(),
+            },
+        );
+
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: LoopToken::new(1),
+                num_inputs: 2,
+                meta: (),
+                root_trace_id: trace_id,
+                guard_failures: HashMap::new(),
+                traces,
+            },
+        );
+
+        let recovery = meta
+            .handle_guard_failure(
+                green_key,
+                fail_index,
+                &[11, 22],
+                ExceptionState {
+                    exc_class: 0x1234,
+                    exc_value: 0xABCD,
+                },
+            )
+            .expect("compiled loop should exist");
+
+        assert_eq!(recovery.fail_index, fail_index);
+        assert_eq!(recovery.trace_id, trace_id);
+        assert_eq!(recovery.fail_values, vec![11, 22]);
+        assert_eq!(recovery.exception.exc_class, 0x1234);
+        assert_eq!(recovery.exception.exc_value, 0xABCD);
+        assert_eq!(recovery.action, GuardRecoveryAction::ResumeInterpreter);
+        assert!(recovery.materialized_virtuals.is_empty());
+
+        let reconstructed = recovery
+            .reconstructed_frames
+            .expect("resume data should reconstruct one frame");
+        assert_eq!(reconstructed.len(), 1);
+        assert_eq!(reconstructed[0].pc, 99);
+        assert_eq!(
+            reconstructed[0].values,
+            vec![ReconstructedValue::Value(11), ReconstructedValue::Value(22)]
+        );
+    }
+
+    #[test]
+    fn test_handle_guard_failure_reconstructs_pending_field_writes() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 17;
+        let fail_index = 1;
+        let mut resume_data = HashMap::new();
+        resume_data.insert(
+            fail_index,
+            StoredResumeData::new(ResumeData {
+                frames: vec![crate::resume::FrameInfo {
+                    pc: 44,
+                    slot_map: vec![FrameSlotSource::FailArg(0)],
+                }],
+                virtuals: Vec::new(),
+                pending_fields: vec![crate::resume::PendingFieldInfo {
+                    descr_index: 12,
+                    target: crate::resume::ResumeValueSource::FailArg(0),
+                    value: crate::resume::ResumeValueSource::Constant(99),
+                    item_index: Some(4),
+                }],
+            }),
+        );
+        let trace_id = meta.alloc_trace_id();
+        let mut traces = HashMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                resume_data,
+                ops: Vec::new(),
+                constants: HashMap::new(),
+                guard_op_indices: HashMap::new(),
+            },
+        );
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: LoopToken::new(2),
+                num_inputs: 1,
+                meta: (),
+                root_trace_id: trace_id,
+                guard_failures: HashMap::new(),
+                traces,
+            },
+        );
+
+        let recovery = meta
+            .handle_guard_failure(green_key, fail_index, &[123], ExceptionState::default())
+            .expect("recovery should exist");
+
+        assert_eq!(
+            recovery.pending_field_writes,
+            vec![ResolvedPendingFieldWrite {
+                descr_index: 12,
+                target: 123,
+                value: 99,
+                item_index: Some(4),
+            }]
+        );
+        assert_eq!(
+            recovery
+                .reconstructed_state
+                .as_ref()
+                .expect("reconstructed state")
+                .pending_fields,
+            recovery.pending_field_writes
+        );
+    }
+
+    #[test]
+    fn test_run_and_recover_uses_backend_finish_kind_instead_of_fail_index_zero() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 11;
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+
+        match meta.run_and_recover(green_key, &[0]) {
+            Some(RunResult::Finished { values, .. }) => assert_eq!(values, vec![0]),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_with_blackhole_fallback_finishes_after_compiled_guard_failure() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 12;
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+
+        match meta.run_with_blackhole_fallback(green_key, &[1]) {
+            Some(BlackholeRunResult::Finished {
+                values,
+                via_blackhole,
+                exception,
+                ..
+            }) => {
+                assert_eq!(values, vec![2]);
+                assert!(via_blackhole);
+                assert_eq!(exception, ExceptionState::default());
+            }
+            other => panic!("expected blackhole Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_with_blackhole_fallback_materializes_virtuals_on_nested_guard_failure() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 13;
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        meta.attach_resume_data(
+            green_key,
+            1,
+            ResumeData {
+                frames: vec![crate::resume::FrameInfo {
+                    pc: green_key,
+                    slot_map: vec![FrameSlotSource::FailArg(0)],
+                }],
+                virtuals: vec![crate::resume::VirtualInfo::VStruct {
+                    type_id: 0,
+                    descr_index: 7,
+                    fields: vec![(3, crate::resume::VirtualFieldSource::Constant(55))],
+                }],
+                pending_fields: Vec::new(),
+            },
+        );
+
+        match meta.run_with_blackhole_fallback(green_key, &[1]) {
+            Some(BlackholeRunResult::GuardFailure {
+                fail_index,
+                fail_values,
+                materialized_virtuals,
+                pending_field_writes,
+                via_blackhole,
+                exception,
+                recovery,
+                ..
+            }) => {
+                assert_eq!(fail_index, 1);
+                assert_eq!(fail_values, vec![1]);
+                assert!(via_blackhole);
+                assert_eq!(exception, ExceptionState::default());
+                assert_eq!(materialized_virtuals.len(), 1);
+                assert!(pending_field_writes.is_empty());
+                match &materialized_virtuals[0] {
+                    crate::resume::MaterializedVirtual::Struct {
+                        descr_index,
+                        fields,
+                        ..
+                    } => {
+                        assert_eq!(*descr_index, 7);
+                        assert_eq!(fields, &vec![(3, 55)]);
+                    }
+                    other => panic!("unexpected virtual: {other:?}"),
+                }
+                let recovery = recovery.expect("fallback guard should reconstruct state");
+                assert_eq!(
+                    recovery.trace_id,
+                    meta.compiled_loops[&green_key].root_trace_id
+                );
+                assert_eq!(recovery.fail_index, 1);
+                assert_eq!(recovery.fail_values, vec![1]);
+                assert_eq!(recovery.materialized_virtuals.len(), 1);
+            }
+            other => panic!("expected blackhole GuardFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_with_blackhole_fallback_surfaces_pending_field_writes_on_nested_guard_failure() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 18;
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        meta.attach_resume_data(
+            green_key,
+            1,
+            ResumeData {
+                frames: vec![crate::resume::FrameInfo {
+                    pc: green_key,
+                    slot_map: vec![FrameSlotSource::FailArg(0)],
+                }],
+                virtuals: Vec::new(),
+                pending_fields: vec![crate::resume::PendingFieldInfo {
+                    descr_index: 12,
+                    target: crate::resume::ResumeValueSource::FailArg(0),
+                    value: crate::resume::ResumeValueSource::Constant(99),
+                    item_index: Some(4),
+                }],
+            },
+        );
+
+        match meta.run_with_blackhole_fallback(green_key, &[1]) {
+            Some(BlackholeRunResult::GuardFailure {
+                fail_index,
+                fail_values,
+                materialized_virtuals,
+                pending_field_writes,
+                via_blackhole,
+                exception,
+                recovery,
+                ..
+            }) => {
+                assert_eq!(fail_index, 1);
+                assert_eq!(fail_values, vec![1]);
+                assert!(via_blackhole);
+                assert_eq!(exception, ExceptionState::default());
+                assert!(materialized_virtuals.is_empty());
+                assert_eq!(
+                    pending_field_writes,
+                    vec![ResolvedPendingFieldWrite {
+                        descr_index: 12,
+                        target: 1,
+                        value: 99,
+                        item_index: Some(4),
+                    }]
+                );
+                let recovery = recovery.expect("fallback guard should reconstruct state");
+                assert_eq!(recovery.pending_field_writes, pending_field_writes);
+            }
+            other => panic!("expected blackhole GuardFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_with_blackhole_fallback_uses_bridge_trace_metadata() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 14;
+        let inputargs = vec![InputArg::new_int(0)];
+        let root_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(100)], OpRef::NONE.0),
+        ];
+        let mut root_constants = HashMap::new();
+        root_constants.insert(100, 99);
+        install_compiled_entry(&mut meta, green_key, &inputargs, root_ops, root_constants);
+
+        let detailed = meta
+            .run_compiled_detailed(green_key, &[1])
+            .expect("root guard should fail");
+        let fail_index = detailed.fail_index;
+        assert_eq!(fail_index, 0);
+        let source_trace_id = detailed.trace_id;
+        let fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            fail_index,
+            source_trace_id,
+            vec![Type::Int],
+            false,
+            Vec::new(),
+        );
+
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut bridge_constants = HashMap::new();
+        bridge_constants.insert(100, 5);
+        assert!(meta.compile_bridge(
+            green_key,
+            fail_index,
+            &fail_descr,
+            &bridge_ops,
+            &bridge_inputargs,
+            bridge_constants,
+        ));
+
+        let bridge_trace_id = meta.compiled_loops[&green_key]
+            .traces
+            .keys()
+            .copied()
+            .find(|&trace_id| trace_id != source_trace_id)
+            .expect("bridge trace should be registered");
+
+        match meta.run_with_blackhole_fallback(green_key, &[1]) {
+            Some(BlackholeRunResult::Finished {
+                values,
+                via_blackhole,
+                ..
+            }) => {
+                assert_eq!(values, vec![6]);
+                assert!(via_blackhole);
+            }
+            other => panic!("expected bridge blackhole Finish, got {other:?}"),
+        }
+
+        let detailed = meta
+            .run_compiled_detailed(green_key, &[1])
+            .expect("bridge exit should be observable");
+        assert_eq!(detailed.trace_id, bridge_trace_id);
+    }
+
+    #[test]
+    fn test_handle_guard_failure_in_trace_uses_bridge_resume_data() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 15;
+        let inputargs = vec![InputArg::new_int(0)];
+        let root_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(100)], OpRef::NONE.0),
+        ];
+        let mut root_constants = HashMap::new();
+        root_constants.insert(100, 77);
+        install_compiled_entry(&mut meta, green_key, &inputargs, root_ops, root_constants);
+
+        let root_failure = meta
+            .run_compiled_detailed(green_key, &[1])
+            .expect("root guard should fail");
+        let root_fail_index = root_failure.fail_index;
+        let root_trace_id = root_failure.trace_id;
+        let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            root_fail_index,
+            root_trace_id,
+            vec![Type::Int],
+            false,
+            Vec::new(),
+        );
+        let _ = root_failure;
+
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        assert!(meta.compile_bridge(
+            green_key,
+            root_fail_index,
+            &bridge_fail_descr,
+            &bridge_ops,
+            &bridge_inputargs,
+            HashMap::new(),
+        ));
+
+        let bridge_trace_id = meta.compiled_loops[&green_key]
+            .traces
+            .keys()
+            .copied()
+            .find(|&trace_id| trace_id != root_trace_id)
+            .expect("bridge trace should exist");
+        meta.attach_resume_data_to_trace(green_key, bridge_trace_id, 0, ResumeData::simple(555, 1));
+
+        let bridge_failure = meta
+            .run_compiled_detailed(green_key, &[1])
+            .expect("bridge guard should fail");
+        let bridge_failure_trace_id = bridge_failure.trace_id;
+        let bridge_fail_index = bridge_failure.fail_index;
+        let bridge_fail_values = bridge_failure.values.clone();
+        let bridge_failure_exception = bridge_failure.exception.clone();
+        assert_eq!(bridge_failure_trace_id, bridge_trace_id);
+        let _ = bridge_failure;
+
+        let recovery = meta
+            .handle_guard_failure_in_trace(
+                green_key,
+                bridge_failure_trace_id,
+                bridge_fail_index,
+                &bridge_fail_values,
+                bridge_failure_exception,
+            )
+            .expect("bridge recovery should succeed");
+        assert_eq!(recovery.trace_id, bridge_trace_id);
+        assert_eq!(recovery.fail_index, 0);
+        let reconstructed = recovery
+            .reconstructed_frames
+            .expect("bridge resume data should reconstruct frame");
+        assert_eq!(reconstructed[0].pc, 555);
+        assert_eq!(reconstructed[0].values, vec![ReconstructedValue::Value(1)]);
+    }
 }

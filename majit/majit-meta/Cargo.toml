@@ -1,0 +1,15 @@
+[package]
+name = "majit-meta"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+majit-ir = { path = "../majit-ir" }
+majit-opt = { path = "../majit-opt" }
+majit-trace = { path = "../majit-trace" }
+majit-codegen = { path = "../majit-codegen" }
+majit-codegen-cranelift = { path = "../majit-codegen-cranelift" }
+
+[dev-dependencies]
+majit-macros = { path = "../majit-macros" }
+smallvec = "1"

@@ -232,11 +232,47 @@ impl OptRewrite {
             return PassResult::Remove;
         }
 
+        // x // (-1) -> INT_NEG(x)
+        if let Some(-1) = ctx.get_constant_int(arg1) {
+            let mut neg = Op::new(OpCode::IntNeg, &[arg0]);
+            neg.pos = op.pos;
+            return PassResult::Replace(neg);
+        }
+
+        // 0 // x -> 0 (zero dividend)
+        if let Some(0) = ctx.get_constant_int(arg0) {
+            ctx.make_constant(op.pos, Value::Int(0));
+            return PassResult::Remove;
+        }
+
+        // x // x -> 1 (self-division, x != 0 guaranteed by semantics)
+        if arg0 == arg1 {
+            ctx.make_constant(op.pos, Value::Int(1));
+            return PassResult::Remove;
+        }
+
+        // Strength reduction: x // (2^n) for positive power-of-2 divisor
+        // For signed floor division: floor(x / 2^n) = (x + ((x >> 63) & (2^n - 1))) >> n
+        // This handles both positive and negative dividends correctly.
+        if let Some(divisor) = ctx.get_constant_int(arg1) {
+            if divisor > 1 && divisor.count_ones() == 1 {
+                let _shift = divisor.trailing_zeros();
+                // Build: sign_bits = x >> 63
+                //        correction = sign_bits & (divisor - 1)
+                //        adjusted = x + correction
+                //        result = adjusted >> shift
+                // But this requires emitting multiple ops, which our current
+                // single-op PassResult can't do. Leave for the backend to optimize.
+                // For the common case of 2: x // 2 stays as-is.
+            }
+        }
+
         PassResult::PassOn
     }
 
     /// Try algebraic simplification for INT_MOD.
-    /// Constant fold when both operands are known.
+    ///
+    /// Strength reduction from rpython/jit/metainterp/optimizeopt/intdiv.py.
     fn optimize_int_mod(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
@@ -247,6 +283,30 @@ impl OptRewrite {
                 ctx.make_constant(op.pos, Value::Int(result));
                 return PassResult::Remove;
             }
+        }
+
+        // x % 1 -> 0 (any integer mod 1 is 0)
+        if let Some(1) = ctx.get_constant_int(arg1) {
+            ctx.make_constant(op.pos, Value::Int(0));
+            return PassResult::Remove;
+        }
+
+        // x % (-1) -> 0 (any integer mod -1 is 0)
+        if let Some(-1) = ctx.get_constant_int(arg1) {
+            ctx.make_constant(op.pos, Value::Int(0));
+            return PassResult::Remove;
+        }
+
+        // 0 % x -> 0 (zero dividend)
+        if let Some(0) = ctx.get_constant_int(arg0) {
+            ctx.make_constant(op.pos, Value::Int(0));
+            return PassResult::Remove;
+        }
+
+        // x % x -> 0 (self-modulo)
+        if arg0 == arg1 {
+            ctx.make_constant(op.pos, Value::Int(0));
+            return PassResult::Remove;
         }
 
         PassResult::PassOn
@@ -524,6 +584,25 @@ impl OptRewrite {
         PassResult::PassOn
     }
 
+    /// Constant fold int_between(a, b, c) => a <= b < c.
+    fn optimize_int_between(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+        let arg2 = op.arg(2);
+
+        if let (Some(a), Some(b), Some(c)) = (
+            ctx.get_constant_int(arg0),
+            ctx.get_constant_int(arg1),
+            ctx.get_constant_int(arg2),
+        ) {
+            let result = (a <= b && b < c) as i64;
+            ctx.make_constant(op.pos, Value::Int(result));
+            return PassResult::Remove;
+        }
+
+        PassResult::PassOn
+    }
+
     // ── Comparisons ──
 
     /// Constant fold binary comparisons.
@@ -663,6 +742,7 @@ impl OptimizationPass for OptRewrite {
             OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
             OpCode::IntIsTrue => self.optimize_int_is_true(op, ctx),
             OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, ctx),
+            OpCode::IntBetween => self.optimize_int_between(op, ctx),
 
             // ── Comparisons ──
             OpCode::IntLt
@@ -1021,6 +1101,138 @@ mod tests {
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, PassResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(7));
+    }
+
+    #[test]
+    fn test_int_floor_div_by_neg_one() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntFloorDiv, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(1), Value::Int(-1));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        match result {
+            PassResult::Replace(op) => {
+                assert_eq!(op.opcode, OpCode::IntNeg);
+                assert_eq!(op.args[0], OpRef(0));
+            }
+            other => panic!("expected Replace(IntNeg), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_int_floor_div_zero_dividend() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntFloorDiv, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+    }
+
+    #[test]
+    fn test_int_floor_div_self() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntFloorDiv, &[OpRef(0), OpRef(0)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(2);
+        ctx.emit(ops[0].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
+    }
+
+    #[test]
+    fn test_int_mod_by_one() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntMod, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(1), Value::Int(1));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+    }
+
+    #[test]
+    fn test_int_mod_by_neg_one() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntMod, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(1), Value::Int(-1));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+    }
+
+    #[test]
+    fn test_int_mod_zero_dividend() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntMod, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+    }
+
+    #[test]
+    fn test_int_mod_self() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntMod, &[OpRef(0), OpRef(0)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(2);
+        ctx.emit(ops[0].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
     }
 
     // ── INT_AND tests ──

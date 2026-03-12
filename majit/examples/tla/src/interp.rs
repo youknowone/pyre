@@ -141,10 +141,7 @@ mod tests {
 
     #[test]
     fn test_newstr() {
-        let res = run(
-            &[POP, NEWSTR, b'x', RETURN],
-            WObject::Int(0),
-        );
+        let res = run(&[POP, NEWSTR, b'x', RETURN], WObject::Int(0));
         match res {
             WObject::Str(s) => assert_eq!(s, "x"),
             _ => panic!("expected string"),
@@ -155,13 +152,13 @@ mod tests {
     /// Bytecodes: DUP, CONST_INT 1, SUB, DUP, JUMP_IF 1, POP, RETURN
     fn countdown_bytecode() -> Vec<u8> {
         vec![
-            DUP,              // 0
-            CONST_INT, 1,     // 1, 2
-            SUB,              // 3
-            DUP,              // 4
-            JUMP_IF, 1,       // 5, 6 → back to CONST_INT
-            POP,              // 7
-            RETURN,           // 8
+            DUP, // 0
+            CONST_INT, 1,   // 1, 2
+            SUB, // 3
+            DUP, // 4
+            JUMP_IF, 1,      // 5, 6 → back to CONST_INT
+            POP,    // 7
+            RETURN, // 8
         ]
     }
 

@@ -1,0 +1,1043 @@
+use std::cmp::max;
+use std::collections::HashMap;
+use std::marker::PhantomData;
+
+use majit_ir::{OpCode, OpRef};
+
+use crate::{emit_commit_io, SymbolicStack, TraceAction, TraceCtx};
+
+const BC_LOAD_CONST_I: u8 = 1;
+const BC_POP_I: u8 = 2;
+const BC_PEEK_I: u8 = 3;
+const BC_PUSH_I: u8 = 4;
+const BC_POP_DISCARD: u8 = 5;
+const BC_DUP_STACK: u8 = 6;
+const BC_SWAP_STACK: u8 = 7;
+const BC_RECORD_BINOP_I: u8 = 8;
+const BC_RECORD_UNARY_I: u8 = 9;
+const BC_REQUIRE_STACK: u8 = 10;
+const BC_BRANCH_ZERO: u8 = 11;
+const BC_JUMP_TARGET: u8 = 12;
+const BC_ABORT: u8 = 13;
+const BC_ABORT_PERMANENT: u8 = 14;
+const BC_BRANCH_REG_ZERO: u8 = 15;
+const BC_JUMP: u8 = 16;
+const BC_INLINE_CALL: u8 = 17;
+const BC_RESIDUAL_CALL_VOID: u8 = 18;
+const BC_SET_SELECTED: u8 = 19;
+const BC_PUSH_TO: u8 = 20;
+const BC_MOVE_I: u8 = 21;
+const BC_CALL_INT: u8 = 22;
+const BC_CALL_PURE_INT: u8 = 23;
+const MAX_HOST_CALL_ARITY: usize = 8;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LivenessInfo {
+    pub pc: u16,
+    pub live_i_regs: Vec<u16>,
+}
+
+/// Serialized interpreter step description, mirroring RPython's `JitCode`
+/// at a much smaller subset for the current proc-macro tracing surface.
+#[derive(Clone, Debug, Default)]
+pub struct JitCode {
+    /// Encoded bytecode stream.
+    pub code: Vec<u8>,
+    /// Number of registers by kind: int/ref/float.
+    pub num_regs: [u16; 3],
+    /// Integer constant pool.
+    pub constants_i: Vec<i64>,
+    /// Liveness metadata for GC / deopt expansion.
+    pub liveness: Vec<LivenessInfo>,
+    /// Pool of majit IR opcodes referenced from the bytecode stream.
+    pub opcodes: Vec<OpCode>,
+    /// Sub-JitCodes for `inline_call` targets (compound methods).
+    pub sub_jitcodes: Vec<JitCode>,
+    /// Function pointers for `residual_call` targets (I/O shims, external calls).
+    pub fn_ptrs: Vec<*const ()>,
+}
+
+// SAFETY: fn_ptrs are function pointers to extern "C" functions — no mutable state.
+unsafe impl Send for JitCode {}
+unsafe impl Sync for JitCode {}
+
+pub trait JitCodeSym {
+    fn current_selected(&self) -> usize;
+    fn set_current_selected(&mut self, selected: usize);
+    fn stack(&self, selected: usize) -> Option<&SymbolicStack>;
+    fn stack_mut(&mut self, selected: usize) -> Option<&mut SymbolicStack>;
+    fn total_slots(&self) -> usize;
+    fn loop_header_pc(&self) -> usize;
+    /// Create a symbolic stack for a storage not in the initial layout.
+    fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize);
+}
+
+pub trait JitCodeRuntime {
+    fn stack_len(&self, selected: usize) -> usize;
+    fn stack_peek(&self, selected: usize, pos: usize) -> i64;
+    fn label_at(&self, pc: usize) -> usize;
+}
+
+pub struct ClosureRuntime<FLen, FPeek, FLabel> {
+    stack_len: FLen,
+    stack_peek: FPeek,
+    label_at: FLabel,
+}
+
+impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel> {
+    pub fn new(stack_len: FLen, stack_peek: FPeek, label_at: FLabel) -> Self {
+        Self {
+            stack_len,
+            stack_peek,
+            label_at,
+        }
+    }
+}
+
+impl<FLen, FPeek, FLabel> JitCodeRuntime for ClosureRuntime<FLen, FPeek, FLabel>
+where
+    FLen: Fn(usize) -> usize,
+    FPeek: Fn(usize, usize) -> i64,
+    FLabel: Fn(usize) -> usize,
+{
+    fn stack_len(&self, selected: usize) -> usize {
+        (self.stack_len)(selected)
+    }
+
+    fn stack_peek(&self, selected: usize, pos: usize) -> i64 {
+        (self.stack_peek)(selected, pos)
+    }
+
+    fn label_at(&self, pc: usize) -> usize {
+        (self.label_at)(pc)
+    }
+}
+
+pub struct MIFrame<'a> {
+    pub jitcode: &'a JitCode,
+    pub pc: usize,
+    pub code_cursor: usize,
+    pub int_regs: Vec<Option<OpRef>>,
+    pub int_values: Vec<Option<i64>>,
+    pub inline_frame: bool,
+    pub return_i: Option<(usize, usize)>,
+}
+
+impl<'a> MIFrame<'a> {
+    pub fn new(jitcode: &'a JitCode, pc: usize) -> Self {
+        Self {
+            jitcode,
+            pc,
+            code_cursor: 0,
+            int_regs: vec![None; jitcode.num_regs[0] as usize],
+            int_values: vec![None; jitcode.num_regs[0] as usize],
+            inline_frame: false,
+            return_i: None,
+        }
+    }
+
+    pub fn next_u8(&mut self) -> u8 {
+        read_u8(&self.jitcode.code, &mut self.code_cursor)
+    }
+
+    pub fn next_u16(&mut self) -> u16 {
+        read_u16(&self.jitcode.code, &mut self.code_cursor)
+    }
+
+    pub fn finished(&self) -> bool {
+        self.code_cursor >= self.jitcode.code.len()
+    }
+}
+
+pub struct MIFrameStack<'a> {
+    frames: Vec<MIFrame<'a>>,
+}
+
+impl<'a> MIFrameStack<'a> {
+    pub fn new(root: MIFrame<'a>) -> Self {
+        Self { frames: vec![root] }
+    }
+
+    pub fn current_mut(&mut self) -> &mut MIFrame<'a> {
+        self.frames.last_mut().expect("empty JitCode frame stack")
+    }
+
+    pub fn push(&mut self, frame: MIFrame<'a>) {
+        self.frames.push(frame);
+    }
+
+    pub fn pop(&mut self) -> Option<MIFrame<'a>> {
+        self.frames.pop()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
+pub struct JitCodeMachine<'a, S, R> {
+    frames: MIFrameStack<'a>,
+    runtime_stacks: HashMap<usize, Vec<i64>>,
+    marker: PhantomData<(S, R)>,
+}
+
+impl<'a, S, R> JitCodeMachine<'a, S, R>
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    pub fn new(root: MIFrame<'a>, _sub_jitcodes: &'a [JitCode], _fn_ptrs: &'a [*const ()]) -> Self {
+        Self {
+            frames: MIFrameStack::new(root),
+            runtime_stacks: HashMap::new(),
+            marker: PhantomData,
+        }
+    }
+
+    pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        while !self.frames.is_empty() {
+            let action = self.run_one_step(ctx, sym, runtime);
+            if !matches!(action, TraceAction::Continue) {
+                return action;
+            }
+        }
+
+        if ctx.is_too_long() {
+            TraceAction::AbortPermanent
+        } else {
+            TraceAction::Continue
+        }
+    }
+
+    pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        if self.frames.is_empty() {
+            return if ctx.is_too_long() {
+                TraceAction::AbortPermanent
+            } else {
+                TraceAction::Continue
+            };
+        }
+
+        let finished = {
+            let frame = self.frames.current_mut();
+            frame.finished()
+        };
+        if finished {
+            let finished_frame = self.frames.pop().expect("finished frame stack was empty");
+            if finished_frame.inline_frame {
+                ctx.pop_inline_frame();
+            }
+            if let Some((callee_src, caller_dst)) = finished_frame.return_i {
+                if let Some(parent) = self.frames.frames.last_mut() {
+                    parent.int_regs[caller_dst] = finished_frame.int_regs[callee_src];
+                    parent.int_values[caller_dst] = finished_frame.int_values[callee_src];
+                }
+            }
+            return TraceAction::Continue;
+        }
+
+        let bytecode = self.frames.current_mut().next_u8();
+        match bytecode {
+            BC_LOAD_CONST_I => {
+                let (dst, value) = {
+                    let frame = self.frames.current_mut();
+                    let dst = frame.next_u16() as usize;
+                    let const_idx = frame.next_u16() as usize;
+                    let value = *frame
+                        .jitcode
+                        .constants_i
+                        .get(const_idx)
+                        .expect("jitcode const index out of bounds");
+                    (dst, value)
+                };
+                self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
+            }
+            BC_POP_I => {
+                let dst = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let symbolic = {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.pop()
+                };
+                let concrete = self.runtime_stack_mut(selected, runtime).pop();
+                self.set_int_reg(dst, symbolic, concrete);
+            }
+            BC_PEEK_I => {
+                let dst = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let symbolic = {
+                    let stack = sym.stack(selected).expect("missing symbolic stack");
+                    stack.peek()
+                };
+                let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
+                self.set_int_reg(dst, symbolic, concrete);
+            }
+            BC_PUSH_I => {
+                let src = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let (value, concrete) = self.read_int_reg(src);
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.push(value);
+                self.runtime_stack_mut(selected, runtime).push(concrete);
+            }
+            BC_POP_DISCARD => {
+                let selected = sym.current_selected();
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                let _ = stack.pop();
+                let _ = self.runtime_stack_mut(selected, runtime).pop();
+            }
+            BC_DUP_STACK => {
+                let selected = sym.current_selected();
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.dup();
+                let value = self
+                    .runtime_stack_mut(selected, runtime)
+                    .last()
+                    .copied()
+                    .expect("cannot dup from empty runtime stack");
+                self.runtime_stack_mut(selected, runtime).push(value);
+            }
+            BC_SWAP_STACK => {
+                let selected = sym.current_selected();
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.swap();
+                let stack = self.runtime_stack_mut(selected, runtime);
+                let len = stack.len();
+                assert!(
+                    len >= 2,
+                    "cannot swap runtime stack with fewer than two values"
+                );
+                stack.swap(len - 1, len - 2);
+            }
+            BC_RECORD_BINOP_I => {
+                let (dst, lhs_idx, rhs_idx, opcode) = {
+                    let frame = self.frames.current_mut();
+                    let dst = frame.next_u16() as usize;
+                    let opcode_idx = frame.next_u16() as usize;
+                    let lhs_idx = frame.next_u16() as usize;
+                    let rhs_idx = frame.next_u16() as usize;
+                    let opcode = *frame
+                        .jitcode
+                        .opcodes
+                        .get(opcode_idx)
+                        .expect("jitcode opcode index out of bounds");
+                    (dst, lhs_idx, rhs_idx, opcode)
+                };
+                let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
+                let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
+                let value = eval_binop_i(opcode, lhs_value, rhs_value);
+                self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+            }
+            BC_RECORD_UNARY_I => {
+                let (dst, src_idx, opcode) = {
+                    let frame = self.frames.current_mut();
+                    let dst = frame.next_u16() as usize;
+                    let opcode_idx = frame.next_u16() as usize;
+                    let src_idx = frame.next_u16() as usize;
+                    let opcode = *frame
+                        .jitcode
+                        .opcodes
+                        .get(opcode_idx)
+                        .expect("jitcode opcode index out of bounds");
+                    (dst, src_idx, opcode)
+                };
+                let (src, src_value) = self.read_int_reg(src_idx);
+                let value = eval_unary_i(opcode, src_value);
+                self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
+            }
+            BC_REQUIRE_STACK => {
+                let required = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                if self.runtime_stack_mut(selected, runtime).len() < required {
+                    return TraceAction::Abort;
+                }
+            }
+            BC_BRANCH_ZERO => {
+                let selected = sym.current_selected();
+                let stack_len = self.runtime_stack_mut(selected, runtime).len();
+                if stack_len == 0 {
+                    return TraceAction::Abort;
+                }
+                let runtime_cond = self.runtime_stack_mut(selected, runtime)[stack_len - 1];
+                let pc = self.frames.current_mut().pc;
+                let close_loop = runtime.label_at(pc) == sym.loop_header_pc();
+                let action = {
+                    let num_live = sym.total_slots();
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    ctx.trace_branch_guard(stack, runtime_cond == 0, false, num_live, close_loop)
+                };
+                if matches!(action, TraceAction::CloseLoop) {
+                    emit_commit_io(ctx);
+                    return TraceAction::CloseLoop;
+                }
+            }
+            BC_BRANCH_REG_ZERO => {
+                let (cond_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                };
+                let (cond, cond_value) = self.read_int_reg(cond_idx);
+                let branch_taken = cond_value == 0;
+                let opcode = if branch_taken {
+                    OpCode::GuardFalse
+                } else {
+                    OpCode::GuardTrue
+                };
+                ctx.record_guard(opcode, &[cond], sym.total_slots());
+                if branch_taken {
+                    self.frames.current_mut().code_cursor = target;
+                }
+            }
+            BC_JUMP_TARGET => {
+                let pc = self.frames.current_mut().pc;
+                if runtime.label_at(pc) == sym.loop_header_pc() {
+                    emit_commit_io(ctx);
+                    return TraceAction::CloseLoop;
+                }
+            }
+            BC_JUMP => {
+                let target = self.frames.current_mut().next_u16() as usize;
+                self.frames.current_mut().code_cursor = target;
+            }
+            BC_INLINE_CALL => {
+                let (sub_idx, arg_pairs, return_i) = {
+                    let frame = self.frames.current_mut();
+                    let sub_idx = frame.next_u16() as usize;
+                    let num_args = frame.next_u16() as usize;
+                    let mut arg_pairs = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        arg_pairs.push((frame.next_u16() as usize, frame.next_u16() as usize));
+                    }
+                    let return_src = frame.next_u16() as usize;
+                    let return_dst = frame.next_u16() as usize;
+                    let return_i =
+                        if return_src == u16::MAX as usize && return_dst == u16::MAX as usize {
+                            None
+                        } else {
+                            Some((return_src, return_dst))
+                        };
+                    (sub_idx, arg_pairs, return_i)
+                };
+                let pc = self.frames.current_mut().pc;
+                let sub_jitcode = &self.frames.current_mut().jitcode.sub_jitcodes[sub_idx];
+                let sub_frame = MIFrame::new(sub_jitcode, pc);
+                let mut sub_frame = sub_frame;
+                ctx.push_inline_frame(((pc as u64) << 32) | sub_idx as u64, u32::MAX);
+                sub_frame.inline_frame = true;
+                for (caller_src, callee_dst) in arg_pairs {
+                    let (value, concrete) = self.read_int_reg(caller_src);
+                    sub_frame.int_regs[callee_dst] = Some(value);
+                    sub_frame.int_values[callee_dst] = Some(concrete);
+                }
+                sub_frame.return_i = return_i;
+                self.frames.push(sub_frame);
+            }
+            BC_RESIDUAL_CALL_VOID => {
+                let (fn_ptr_idx, arg_regs) = {
+                    let frame = self.frames.current_mut();
+                    let fn_ptr_idx = frame.next_u16() as usize;
+                    let num_args = frame.next_u16() as usize;
+                    let mut arg_regs = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        arg_regs.push(frame.next_u16() as usize);
+                    }
+                    (fn_ptr_idx, arg_regs)
+                };
+                let mut args = Vec::with_capacity(arg_regs.len());
+                let mut concrete_args = Vec::with_capacity(arg_regs.len());
+                for src in arg_regs {
+                    let (arg, concrete) = self.read_int_reg(src);
+                    args.push(arg);
+                    concrete_args.push(concrete);
+                }
+                let fn_ptr = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                ctx.call_void(fn_ptr, &args);
+                call_void_function(fn_ptr, &concrete_args);
+            }
+            BC_SET_SELECTED => {
+                let const_idx = {
+                    let frame = self.frames.current_mut();
+                    frame.next_u16() as usize
+                };
+                let new_selected = {
+                    let frame = self.frames.current_mut();
+                    *frame
+                        .jitcode
+                        .constants_i
+                        .get(const_idx)
+                        .expect("jitcode const index out of bounds") as usize
+                };
+                // Ensure the target storage has a symbolic stack and runtime mirror.
+                if sym.stack(new_selected).is_none() {
+                    let len = runtime.stack_len(new_selected);
+                    let offset = sym.total_slots();
+                    sym.ensure_stack(new_selected, offset, len);
+                    let _ = self.runtime_stack_mut(new_selected, runtime);
+                }
+                sym.set_current_selected(new_selected);
+            }
+            BC_PUSH_TO => {
+                let (src_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                };
+                let (value, concrete) = self.read_int_reg(src_idx);
+                if sym.stack(target).is_none() {
+                    let len = runtime.stack_len(target);
+                    let offset = sym.total_slots();
+                    sym.ensure_stack(target, offset, len);
+                    let _ = self.runtime_stack_mut(target, runtime);
+                }
+                let stack = sym.stack_mut(target).expect("missing target stack");
+                stack.push(value);
+                self.runtime_stack_mut(target, runtime).push(concrete);
+            }
+            BC_MOVE_I => {
+                let (dst, src) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                };
+                let (value, concrete) = self.read_int_reg(src);
+                self.set_int_reg(dst, Some(value), Some(concrete));
+            }
+            BC_CALL_INT | BC_CALL_PURE_INT => {
+                let (opcode, fn_ptr_idx, dst, arg_regs) = {
+                    let frame = self.frames.current_mut();
+                    let opcode = bytecode;
+                    let fn_ptr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_u16() as usize;
+                    let num_args = frame.next_u16() as usize;
+                    let mut arg_regs = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        arg_regs.push(frame.next_u16() as usize);
+                    }
+                    (opcode, fn_ptr_idx, dst, arg_regs)
+                };
+                let mut args = Vec::with_capacity(arg_regs.len());
+                let mut concrete_args = Vec::with_capacity(arg_regs.len());
+                for src in arg_regs {
+                    let (arg, concrete) = self.read_int_reg(src);
+                    args.push(arg);
+                    concrete_args.push(concrete);
+                }
+                let fn_ptr = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                let traced = match opcode {
+                    BC_CALL_INT => ctx.call_int(fn_ptr, &args),
+                    BC_CALL_PURE_INT => ctx.call_elidable_int(fn_ptr, &args),
+                    _ => unreachable!(),
+                };
+                let concrete = call_int_function(fn_ptr, &concrete_args);
+                self.set_int_reg(dst, Some(traced), Some(concrete));
+            }
+            BC_ABORT => return TraceAction::Abort,
+            BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
+            other => panic!("unknown jitcode bytecode {other}"),
+        }
+
+        TraceAction::Continue
+    }
+
+    fn runtime_stack_mut(&mut self, selected: usize, runtime: &R) -> &mut Vec<i64> {
+        self.runtime_stacks.entry(selected).or_insert_with(|| {
+            let len = runtime.stack_len(selected);
+            (0..len)
+                .map(|index| runtime.stack_peek(selected, index))
+                .collect()
+        })
+    }
+
+    fn set_int_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
+        let frame = self.frames.current_mut();
+        frame.int_regs[reg] = opref;
+        frame.int_values[reg] = value;
+    }
+
+    fn read_int_reg(&mut self, reg: usize) -> (OpRef, i64) {
+        let frame = self.frames.current_mut();
+        (
+            frame.int_regs[reg].expect("jitcode register was uninitialized"),
+            frame.int_values[reg].expect("jitcode concrete register was uninitialized"),
+        )
+    }
+}
+
+#[derive(Default)]
+pub struct JitCodeBuilder {
+    code: Vec<u8>,
+    num_regs_i: u16,
+    constants_i: Vec<i64>,
+    opcodes: Vec<OpCode>,
+    labels: Vec<Option<usize>>,
+    patches: Vec<(usize, usize)>,
+    sub_jitcodes: Vec<JitCode>,
+    fn_ptrs: Vec<*const ()>,
+}
+
+impl JitCodeBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_const_i(&mut self, value: i64) -> u16 {
+        if let Some(index) = self
+            .constants_i
+            .iter()
+            .position(|&existing| existing == value)
+        {
+            return index as u16;
+        }
+        let index = self.constants_i.len() as u16;
+        self.constants_i.push(value);
+        index
+    }
+
+    pub fn load_const_i_value(&mut self, dst: u16, value: i64) {
+        let const_idx = self.add_const_i(value);
+        self.load_const_i(dst, const_idx);
+    }
+
+    pub fn load_const_i(&mut self, dst: u16, const_idx: u16) {
+        self.touch_reg(dst);
+        self.push_u8(BC_LOAD_CONST_I);
+        self.push_u16(dst);
+        self.push_u16(const_idx);
+    }
+
+    pub fn pop_i(&mut self, dst: u16) {
+        self.touch_reg(dst);
+        self.push_u8(BC_POP_I);
+        self.push_u16(dst);
+    }
+
+    pub fn peek_i(&mut self, dst: u16) {
+        self.touch_reg(dst);
+        self.push_u8(BC_PEEK_I);
+        self.push_u16(dst);
+    }
+
+    pub fn push_i(&mut self, src: u16) {
+        self.touch_reg(src);
+        self.push_u8(BC_PUSH_I);
+        self.push_u16(src);
+    }
+
+    pub fn pop_discard(&mut self) {
+        self.push_u8(BC_POP_DISCARD);
+    }
+
+    pub fn dup_stack(&mut self) {
+        self.push_u8(BC_DUP_STACK);
+    }
+
+    pub fn swap_stack(&mut self) {
+        self.push_u8(BC_SWAP_STACK);
+    }
+
+    pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
+        let opcode_idx = self.intern_opcode(opcode);
+        self.touch_reg(dst);
+        self.touch_reg(lhs);
+        self.touch_reg(rhs);
+        self.push_u8(BC_RECORD_BINOP_I);
+        self.push_u16(dst);
+        self.push_u16(opcode_idx);
+        self.push_u16(lhs);
+        self.push_u16(rhs);
+    }
+
+    pub fn record_unary_i(&mut self, dst: u16, opcode: OpCode, src: u16) {
+        let opcode_idx = self.intern_opcode(opcode);
+        self.touch_reg(dst);
+        self.touch_reg(src);
+        self.push_u8(BC_RECORD_UNARY_I);
+        self.push_u16(dst);
+        self.push_u16(opcode_idx);
+        self.push_u16(src);
+    }
+
+    pub fn require_stack(&mut self, required: u16) {
+        self.push_u8(BC_REQUIRE_STACK);
+        self.push_u16(required);
+    }
+
+    pub fn branch_zero(&mut self) {
+        self.push_u8(BC_BRANCH_ZERO);
+    }
+
+    pub fn new_label(&mut self) -> u16 {
+        let label = self.labels.len() as u16;
+        self.labels.push(None);
+        label
+    }
+
+    pub fn mark_label(&mut self, label: u16) {
+        let slot = self
+            .labels
+            .get_mut(label as usize)
+            .expect("jitcode label out of bounds");
+        *slot = Some(self.code.len());
+    }
+
+    pub fn branch_reg_zero(&mut self, reg: u16, label: u16) {
+        self.touch_reg(reg);
+        self.push_u8(BC_BRANCH_REG_ZERO);
+        self.push_u16(reg);
+        self.push_label_ref(label);
+    }
+
+    pub fn jump(&mut self, label: u16) {
+        self.push_u8(BC_JUMP);
+        self.push_label_ref(label);
+    }
+
+    pub fn jump_target(&mut self) {
+        self.push_u8(BC_JUMP_TARGET);
+    }
+
+    pub fn abort(&mut self) {
+        self.push_u8(BC_ABORT);
+    }
+
+    pub fn abort_permanent(&mut self) {
+        self.push_u8(BC_ABORT_PERMANENT);
+    }
+
+    pub fn inline_call(&mut self, sub_jitcode_idx: u16) {
+        self.inline_call_i(sub_jitcode_idx, &[], None);
+    }
+
+    pub fn inline_call_i(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args: &[(u16, u16)],
+        return_i: Option<(u16, u16)>,
+    ) {
+        for &(caller_src, _) in args {
+            self.touch_reg(caller_src);
+        }
+        if let Some((_, caller_dst)) = return_i {
+            self.touch_reg(caller_dst);
+        }
+        self.push_u8(BC_INLINE_CALL);
+        self.push_u16(sub_jitcode_idx);
+        self.push_u16(args.len() as u16);
+        for &(caller_src, callee_dst) in args {
+            self.push_u16(caller_src);
+            self.push_u16(callee_dst);
+        }
+        match return_i {
+            Some((callee_src, caller_dst)) => {
+                self.push_u16(callee_src);
+                self.push_u16(caller_dst);
+            }
+            None => {
+                self.push_u16(u16::MAX);
+                self.push_u16(u16::MAX);
+            }
+        }
+    }
+
+    pub fn residual_call_void(&mut self, fn_ptr_idx: u16, src_reg: u16) {
+        self.residual_call_void_args(fn_ptr_idx, &[src_reg]);
+    }
+
+    pub fn residual_call_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
+        for &arg in arg_regs {
+            self.touch_reg(arg);
+        }
+        self.push_u8(BC_RESIDUAL_CALL_VOID);
+        self.push_u16(fn_ptr_idx);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u16(arg);
+        }
+    }
+
+    pub fn call_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.call_int_like(BC_CALL_INT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_pure_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.call_int_like(BC_CALL_PURE_INT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn set_selected(&mut self, const_idx: u16) {
+        self.push_u8(BC_SET_SELECTED);
+        self.push_u16(const_idx);
+    }
+
+    pub fn push_to(&mut self, src_reg: u16, target_stack: u16) {
+        self.touch_reg(src_reg);
+        self.push_u8(BC_PUSH_TO);
+        self.push_u16(src_reg);
+        self.push_u16(target_stack);
+    }
+
+    pub fn move_i(&mut self, dst: u16, src: u16) {
+        self.touch_reg(dst);
+        self.touch_reg(src);
+        self.push_u8(BC_MOVE_I);
+        self.push_u16(dst);
+        self.push_u16(src);
+    }
+
+    pub fn ensure_i_regs(&mut self, count: u16) {
+        self.num_regs_i = max(self.num_regs_i, count);
+    }
+
+    pub fn add_sub_jitcode(&mut self, jitcode: JitCode) -> u16 {
+        let idx = self.sub_jitcodes.len() as u16;
+        self.sub_jitcodes.push(jitcode);
+        idx
+    }
+
+    pub fn add_fn_ptr(&mut self, ptr: *const ()) -> u16 {
+        if let Some(index) = self.fn_ptrs.iter().position(|&existing| existing == ptr) {
+            return index as u16;
+        }
+        let idx = self.fn_ptrs.len() as u16;
+        self.fn_ptrs.push(ptr);
+        idx
+    }
+
+    pub fn finish(mut self) -> JitCode {
+        self.patch_labels();
+        JitCode {
+            code: self.code,
+            num_regs: [self.num_regs_i, 0, 0],
+            constants_i: self.constants_i,
+            liveness: Vec::new(),
+            opcodes: self.opcodes,
+            sub_jitcodes: self.sub_jitcodes,
+            fn_ptrs: self.fn_ptrs,
+        }
+    }
+
+    fn push_u8(&mut self, value: u8) {
+        self.code.push(value);
+    }
+
+    fn push_u16(&mut self, value: u16) {
+        self.code.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn call_int_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        self.touch_reg(dst);
+        for &arg in arg_regs {
+            self.touch_reg(arg);
+        }
+        self.push_u8(opcode);
+        self.push_u16(fn_ptr_idx);
+        self.push_u16(dst);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u16(arg);
+        }
+    }
+
+    fn push_label_ref(&mut self, label: u16) {
+        let patch_offset = self.code.len();
+        self.push_u16(0);
+        self.patches.push((label as usize, patch_offset));
+    }
+
+    fn touch_reg(&mut self, reg: u16) {
+        self.num_regs_i = max(self.num_regs_i, reg.saturating_add(1));
+    }
+
+    fn patch_labels(&mut self) {
+        for &(label_idx, patch_offset) in &self.patches {
+            let target = self.labels[label_idx].expect("jitcode label was never marked") as u16;
+            let bytes = target.to_le_bytes();
+            self.code[patch_offset] = bytes[0];
+            self.code[patch_offset + 1] = bytes[1];
+        }
+    }
+
+    fn intern_opcode(&mut self, opcode: OpCode) -> u16 {
+        if let Some(index) = self.opcodes.iter().position(|&existing| existing == opcode) {
+            return index as u16;
+        }
+        let index = self.opcodes.len() as u16;
+        self.opcodes.push(opcode);
+        index
+    }
+}
+
+pub fn trace_jitcode<S, FLen, FPeek, FLabel>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    pc: usize,
+    runtime_stack_len: FLen,
+    runtime_stack_peek: FPeek,
+    label_at: FLabel,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    FLen: Fn(usize) -> usize,
+    FPeek: Fn(usize, usize) -> i64,
+    FLabel: Fn(usize) -> usize,
+{
+    let runtime = ClosureRuntime::new(runtime_stack_len, runtime_stack_peek, label_at);
+    let root = MIFrame::new(jitcode, pc);
+    let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
+    machine.run_to_end(ctx, sym, &runtime)
+}
+
+fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
+    let value = *code.get(*cursor).expect("truncated jitcode");
+    *cursor += 1;
+    value
+}
+
+fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {
+    let lo = *code.get(*cursor).expect("truncated jitcode");
+    let hi = *code.get(*cursor + 1).expect("truncated jitcode");
+    *cursor += 2;
+    u16::from_le_bytes([lo, hi])
+}
+
+fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
+    match opcode {
+        OpCode::IntAdd => lhs.wrapping_add(rhs),
+        OpCode::IntSub => lhs.wrapping_sub(rhs),
+        OpCode::IntMul => lhs.wrapping_mul(rhs),
+        OpCode::IntFloorDiv => {
+            if rhs == 0 {
+                0
+            } else {
+                lhs.wrapping_div(rhs)
+            }
+        }
+        OpCode::IntMod => {
+            if rhs == 0 {
+                0
+            } else {
+                lhs.wrapping_rem(rhs)
+            }
+        }
+        OpCode::IntAnd => lhs & rhs,
+        OpCode::IntOr => lhs | rhs,
+        OpCode::IntXor => lhs ^ rhs,
+        OpCode::IntLshift => lhs.wrapping_shl(rhs as u32),
+        OpCode::IntRshift => lhs.wrapping_shr(rhs as u32),
+        OpCode::IntEq => i64::from(lhs == rhs),
+        OpCode::IntNe => i64::from(lhs != rhs),
+        OpCode::IntLt => i64::from(lhs < rhs),
+        OpCode::IntLe => i64::from(lhs <= rhs),
+        OpCode::IntGt => i64::from(lhs > rhs),
+        OpCode::IntGe => i64::from(lhs >= rhs),
+        other => panic!("unsupported jitcode integer binop {other:?}"),
+    }
+}
+
+fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
+    match opcode {
+        OpCode::IntNeg => value.wrapping_neg(),
+        other => panic!("unsupported jitcode integer unary op {other:?}"),
+    }
+}
+
+fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
+    unsafe {
+        match args {
+            [] => {
+                let func: extern "C" fn() -> i64 = std::mem::transmute(func_ptr);
+                func()
+            }
+            [a0] => {
+                let func: extern "C" fn(i64) -> i64 = std::mem::transmute(func_ptr);
+                func(*a0)
+            }
+            [a0, a1] => {
+                let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr);
+                func(*a0, *a1)
+            }
+            [a0, a1, a2] => {
+                let func: extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2)
+            }
+            [a0, a1, a2, a3] => {
+                let func: extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3)
+            }
+            [a0, a1, a2, a3, a4] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4)
+            }
+            [a0, a1, a2, a3, a4, a5] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5)
+            }
+            [a0, a1, a2, a3, a4, a5, a6] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7)
+            }
+            _ => panic!(
+                "unsupported JitCode int call arity {} (max {})",
+                args.len(),
+                MAX_HOST_CALL_ARITY
+            ),
+        }
+    }
+}
+
+fn call_void_function(func_ptr: *const (), args: &[i64]) {
+    unsafe {
+        match args {
+            [] => {
+                let func: extern "C" fn() = std::mem::transmute(func_ptr);
+                func()
+            }
+            [a0] => {
+                let func: extern "C" fn(i64) = std::mem::transmute(func_ptr);
+                func(*a0)
+            }
+            [a0, a1] => {
+                let func: extern "C" fn(i64, i64) = std::mem::transmute(func_ptr);
+                func(*a0, *a1)
+            }
+            [a0, a1, a2] => {
+                let func: extern "C" fn(i64, i64, i64) = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2)
+            }
+            [a0, a1, a2, a3] => {
+                let func: extern "C" fn(i64, i64, i64, i64) = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3)
+            }
+            [a0, a1, a2, a3, a4] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64) = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4)
+            }
+            [a0, a1, a2, a3, a4, a5] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64) =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5)
+            }
+            [a0, a1, a2, a3, a4, a5, a6] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7)
+            }
+            _ => panic!(
+                "unsupported JitCode void call arity {} (max {})",
+                args.len(),
+                MAX_HOST_CALL_ARITY
+            ),
+        }
+    }
+}

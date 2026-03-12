@@ -663,10 +663,7 @@ pub fn compile(source: &str, pool: &mut ConstantPool) -> Vec<u8> {
         }
     }
 
-    bytecode
-        .iter()
-        .map(|&b| (b & 0xff) as u8)
-        .collect()
+    bytecode.iter().map(|&b| (b & 0xff) as u8).collect()
 }
 
 /// Convert bytecode list to byte string (for test compatibility).

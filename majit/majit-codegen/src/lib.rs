@@ -3,10 +3,26 @@
 /// Translated from rpython/jit/backend/model.py (AbstractCPU).
 /// The Backend trait is the contract between the JIT frontend (tracing + optimization)
 /// and the code generation backend (Cranelift, etc.).
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use majit_ir::{FailDescr, InputArg, Op, Type, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, Type, Value};
+
+/// Lightweight execution result that avoids DeadFrame boxing.
+///
+/// Used by `execute_token_ints_raw` to return guard failure data
+/// without heap-allocating a DeadFrame.
+pub struct RawExecResult {
+    /// Output values from the guard exit, truncated to `exit_arity`.
+    pub outputs: Vec<i64>,
+    /// Backend fail-index for this exit.
+    pub fail_index: u32,
+    /// Compiled trace identifier for this exit.
+    pub trace_id: u64,
+    /// Whether this exit is a FINISH rather than a guard failure.
+    pub is_finish: bool,
+}
 
 /// Result of compiling a loop or bridge.
 #[derive(Debug)]
@@ -93,6 +109,61 @@ pub trait Backend: Send {
     /// Execute compiled code starting at the given token.
     fn execute_token(&self, token: &LoopToken, args: &[Value]) -> DeadFrame;
 
+    /// Execute compiled code with integer-only arguments.
+    ///
+    /// Avoids the `Value::Int` wrapping/unwrapping overhead when all
+    /// arguments are known to be integers (the common case for loop entry).
+    fn execute_token_ints(&self, token: &LoopToken, args: &[i64]) -> DeadFrame {
+        let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
+        self.execute_token(token, &values)
+    }
+
+    /// Execute compiled code and return a lightweight result without
+    /// DeadFrame boxing.
+    ///
+    /// Returns the output values directly, avoiding the intermediate
+    /// DeadFrame heap allocation and the per-value downcast extraction loop.
+    fn execute_token_ints_raw(&self, token: &LoopToken, args: &[i64]) -> RawExecResult {
+        let frame = self.execute_token_ints(token, args);
+        let descr = self.get_latest_descr(&frame);
+        let exit_arity = descr.fail_arg_types().len();
+        let mut outputs = Vec::with_capacity(exit_arity);
+        for i in 0..exit_arity {
+            outputs.push(self.get_int_value(&frame, i));
+        }
+        RawExecResult {
+            outputs,
+            fail_index: descr.fail_index(),
+            trace_id: descr.trace_id(),
+            is_finish: descr.is_finish(),
+        }
+    }
+
+    /// Force a frame identified by a `FORCE_TOKEN` result.
+    fn force(&self, _force_token: GcRef) -> DeadFrame {
+        panic!("backend does not implement force()");
+    }
+
+    /// Store a saved-data GC ref on a dead frame.
+    fn set_savedata_ref(&self, _frame: &mut DeadFrame, _data: GcRef) {
+        panic!("backend does not implement set_savedata_ref()");
+    }
+
+    /// Read a saved-data GC ref from a dead frame.
+    fn get_savedata_ref(&self, _frame: &DeadFrame) -> GcRef {
+        panic!("backend does not implement get_savedata_ref()");
+    }
+
+    /// Read a pending exception GC ref from a dead frame.
+    fn grab_exc_value(&self, _frame: &DeadFrame) -> GcRef {
+        panic!("backend does not implement grab_exc_value()");
+    }
+
+    /// Read the pending exception class from a dead frame.
+    fn grab_exc_class(&self, _frame: &DeadFrame) -> i64 {
+        panic!("backend does not implement grab_exc_class()");
+    }
+
     /// Read the FailDescr from the last guard failure.
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr;
 
@@ -138,3 +209,46 @@ impl std::fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+// ── we_are_jitted / JIT mode flag ──
+
+thread_local! {
+    static JIT_MODE_FLAG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns `true` when executing inside JIT-compiled code.
+///
+/// Interpreters can use this to choose optimized code paths that
+/// the JIT can trace more efficiently.
+#[inline]
+pub fn we_are_jitted() -> bool {
+    JIT_MODE_FLAG.with(|f| f.get())
+}
+
+/// Set the JIT mode flag. Called by the backend when entering compiled code.
+pub fn set_jitted(jitted: bool) {
+    JIT_MODE_FLAG.with(|f| f.set(jitted));
+}
+
+/// RAII guard for the JIT mode flag.
+///
+/// Sets `we_are_jitted()` to `true` on creation, restores the previous
+/// value on drop.
+pub struct JittedGuard {
+    prev: bool,
+}
+
+impl JittedGuard {
+    /// Create a new guard, setting `we_are_jitted()` to `true`.
+    pub fn enter() -> Self {
+        let prev = we_are_jitted();
+        set_jitted(true);
+        JittedGuard { prev }
+    }
+}
+
+impl Drop for JittedGuard {
+    fn drop(&mut self) {
+        set_jitted(self.prev);
+    }
+}

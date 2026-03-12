@@ -8,13 +8,82 @@
 
 use std::collections::HashMap;
 
+use crate::resume::{MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData};
 use majit_ir::{Op, OpCode, OpRef};
+
+/// Trait for blackhole memory access: the interpreter supplies
+/// concrete load/store implementations so that the blackhole can
+/// actually execute field access ops instead of returning placeholders.
+///
+/// Mirrors RPython's `_execute_*` methods in `blackhole.py` that
+/// delegate to the CPU's raw memory operations.
+pub trait BlackholeMemory {
+    /// Load a GC-managed field from `base + offset`.
+    fn gc_load_i(&self, base: i64, offset: i64) -> i64 {
+        let _ = (base, offset);
+        0
+    }
+    /// Load a GC ref field.
+    fn gc_load_r(&self, base: i64, offset: i64) -> i64 {
+        let _ = (base, offset);
+        0
+    }
+    /// Load a float field (returned as bits).
+    fn gc_load_f(&self, base: i64, offset: i64) -> i64 {
+        let _ = (base, offset);
+        0
+    }
+    /// Store an int value into a GC object field.
+    fn gc_store(&self, base: i64, offset: i64, value: i64) {
+        let _ = (base, offset, value);
+    }
+    /// Load from array at `base + index * scale + offset`.
+    fn gc_load_indexed_i(&self, base: i64, index: i64, scale: i64, offset: i64) -> i64 {
+        let _ = (base, index, scale, offset);
+        0
+    }
+    fn gc_load_indexed_r(&self, base: i64, index: i64, scale: i64, offset: i64) -> i64 {
+        let _ = (base, index, scale, offset);
+        0
+    }
+    fn gc_load_indexed_f(&self, base: i64, index: i64, scale: i64, offset: i64) -> i64 {
+        let _ = (base, index, scale, offset);
+        0
+    }
+    /// Store into array at `base + index * scale + offset`.
+    fn gc_store_indexed(&self, base: i64, index: i64, scale: i64, offset: i64, value: i64) {
+        let _ = (base, index, scale, offset, value);
+    }
+    /// Get array length.
+    fn arraylen(&self, base: i64) -> i64 {
+        let _ = base;
+        0
+    }
+    /// Get string length.
+    fn strlen(&self, base: i64) -> i64 {
+        let _ = base;
+        0
+    }
+    /// Call a function pointer with integer args, returning an integer.
+    fn call_i(&self, func: i64, args: &[i64]) -> i64 {
+        let _ = (func, args);
+        0
+    }
+    /// Call a function pointer returning void.
+    fn call_n(&self, func: i64, args: &[i64]) {
+        let _ = (func, args);
+    }
+}
+
+/// Default no-op memory implementation (returns 0 for all loads).
+pub struct DefaultBlackholeMemory;
+impl BlackholeMemory for DefaultBlackholeMemory {}
 
 /// Exception state tracked during blackhole execution.
 ///
 /// Mirrors RPython's exception tracking in the meta-interpreter.
 /// Guards like GUARD_EXCEPTION and GUARD_NO_EXCEPTION check this state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExceptionState {
     /// The exception class pointer (0 = no exception pending).
     pub exc_class: i64,
@@ -55,6 +124,13 @@ pub enum BlackholeResult {
         guard_index: usize,
         fail_values: Vec<i64>,
     },
+    /// A guard failed and resume-data virtuals were materialized for recovery.
+    GuardFailedWithVirtuals {
+        guard_index: usize,
+        fail_values: Vec<i64>,
+        materialized_virtuals: Vec<MaterializedVirtual>,
+        pending_field_writes: Vec<ResolvedPendingFieldWrite>,
+    },
     /// Abort: encountered an unhandled operation.
     Abort(String),
 }
@@ -71,8 +147,189 @@ pub fn blackhole_execute(
     initial_values: &HashMap<u32, i64>,
     start_index: usize,
 ) -> BlackholeResult {
+    blackhole_execute_with_exception(
+        ops,
+        constants,
+        initial_values,
+        start_index,
+        ExceptionState::default(),
+    )
+}
+
+/// Evaluate with a concrete memory backend for load/store operations.
+pub fn blackhole_execute_with_memory(
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    initial_values: &HashMap<u32, i64>,
+    start_index: usize,
+    memory: &dyn BlackholeMemory,
+) -> BlackholeResult {
+    blackhole_execute_full(
+        ops,
+        constants,
+        initial_values,
+        start_index,
+        ExceptionState::default(),
+        memory,
+    )
+    .0
+}
+
+fn blackhole_execute_full(
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    initial_values: &HashMap<u32, i64>,
+    start_index: usize,
+    initial_exception: ExceptionState,
+    memory: &dyn BlackholeMemory,
+) -> (BlackholeResult, ExceptionState) {
     let mut values: HashMap<u32, i64> = initial_values.clone();
-    let mut exc_state = ExceptionState::default();
+    let mut exc_state = initial_exception;
+
+    for (&k, &v) in constants {
+        values.entry(k).or_insert(v);
+    }
+
+    for op_idx in start_index..ops.len() {
+        let op = &ops[op_idx];
+        let result = execute_one_with_memory(op, &values, &mut exc_state, memory);
+
+        match result {
+            OpResult::Value(v) => {
+                if !op.pos.is_none() {
+                    values.insert(op.pos.0, v);
+                }
+            }
+            OpResult::Void => {}
+            OpResult::Finish(args) => {
+                let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
+                return (BlackholeResult::Finish(vals), exc_state);
+            }
+            OpResult::Jump(args) => {
+                let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
+                return (BlackholeResult::Jump(vals), exc_state);
+            }
+            OpResult::GuardFailed => {
+                let fail_values = if let Some(ref fail_args) = op.fail_args {
+                    fail_args.iter().map(|&r| resolve(&values, r)).collect()
+                } else {
+                    vec![]
+                };
+                return (
+                    BlackholeResult::GuardFailed {
+                        guard_index: op_idx,
+                        fail_values,
+                    },
+                    exc_state,
+                );
+            }
+            OpResult::Unsupported(msg) => {
+                return (BlackholeResult::Abort(msg), exc_state);
+            }
+        }
+    }
+
+    (
+        BlackholeResult::Abort("reached end of ops without finish/jump".to_string()),
+        exc_state,
+    )
+}
+
+/// Dispatch an op using real memory access when a BlackholeMemory backend is available.
+fn execute_one_with_memory(
+    op: &Op,
+    values: &HashMap<u32, i64>,
+    exc: &mut ExceptionState,
+    memory: &dyn BlackholeMemory,
+) -> OpResult {
+    match op.opcode {
+        // Memory access ops with real backend
+        OpCode::GcLoadI => {
+            let base = resolve(values, op.args[0]);
+            let offset = resolve(values, op.args[1]);
+            OpResult::Value(memory.gc_load_i(base, offset))
+        }
+        OpCode::GcLoadR => {
+            let base = resolve(values, op.args[0]);
+            let offset = resolve(values, op.args[1]);
+            OpResult::Value(memory.gc_load_r(base, offset))
+        }
+        OpCode::GcLoadF => {
+            let base = resolve(values, op.args[0]);
+            let offset = resolve(values, op.args[1]);
+            OpResult::Value(memory.gc_load_f(base, offset))
+        }
+        OpCode::GcStore => {
+            let base = resolve(values, op.args[0]);
+            let offset = resolve(values, op.args[1]);
+            let value = resolve(values, op.args[2]);
+            memory.gc_store(base, offset, value);
+            OpResult::Void
+        }
+        OpCode::GcLoadIndexedI => {
+            let base = resolve(values, op.args[0]);
+            let index = resolve(values, op.args[1]);
+            let scale = resolve(values, op.args[2]);
+            let offset = resolve(values, op.args[3]);
+            OpResult::Value(memory.gc_load_indexed_i(base, index, scale, offset))
+        }
+        OpCode::GcLoadIndexedR => {
+            let base = resolve(values, op.args[0]);
+            let index = resolve(values, op.args[1]);
+            let scale = resolve(values, op.args[2]);
+            let offset = resolve(values, op.args[3]);
+            OpResult::Value(memory.gc_load_indexed_r(base, index, scale, offset))
+        }
+        OpCode::GcLoadIndexedF => {
+            let base = resolve(values, op.args[0]);
+            let index = resolve(values, op.args[1]);
+            let scale = resolve(values, op.args[2]);
+            let offset = resolve(values, op.args[3]);
+            OpResult::Value(memory.gc_load_indexed_f(base, index, scale, offset))
+        }
+        OpCode::GcStoreIndexed => {
+            let base = resolve(values, op.args[0]);
+            let index = resolve(values, op.args[1]);
+            let value = resolve(values, op.args[2]);
+            let scale = resolve(values, op.args[3]);
+            let offset = resolve(values, op.args[4]);
+            memory.gc_store_indexed(base, index, scale, offset, value);
+            OpResult::Void
+        }
+        OpCode::ArraylenGc => {
+            let base = resolve(values, op.args[0]);
+            OpResult::Value(memory.arraylen(base))
+        }
+        OpCode::Strlen | OpCode::Unicodelen => {
+            let base = resolve(values, op.args[0]);
+            OpResult::Value(memory.strlen(base))
+        }
+        // Call with real dispatch
+        OpCode::CallI | OpCode::CallPureI => {
+            let func = resolve(values, op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            OpResult::Value(memory.call_i(func, &args))
+        }
+        OpCode::CallN | OpCode::CallPureN => {
+            let func = resolve(values, op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            memory.call_n(func, &args);
+            OpResult::Void
+        }
+        // Fall through to the default execute_one for everything else
+        _ => execute_one(op, values, exc),
+    }
+}
+
+pub(crate) fn blackhole_execute_with_state(
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    initial_values: &HashMap<u32, i64>,
+    start_index: usize,
+    initial_exception: ExceptionState,
+) -> (BlackholeResult, ExceptionState) {
+    let mut values: HashMap<u32, i64> = initial_values.clone();
+    let mut exc_state = initial_exception;
 
     // Merge constants into values
     for (&k, &v) in constants {
@@ -92,11 +349,11 @@ pub fn blackhole_execute(
             OpResult::Void => {}
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
-                return BlackholeResult::Finish(vals);
+                return (BlackholeResult::Finish(vals), exc_state);
             }
             OpResult::Jump(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
-                return BlackholeResult::Jump(vals);
+                return (BlackholeResult::Jump(vals), exc_state);
             }
             OpResult::GuardFailed => {
                 let fail_values = if let Some(ref fail_args) = op.fail_args {
@@ -104,19 +361,43 @@ pub fn blackhole_execute(
                 } else {
                     vec![]
                 };
-                return BlackholeResult::GuardFailed {
-                    guard_index: op_idx,
-                    fail_values,
-                };
+                return (
+                    BlackholeResult::GuardFailed {
+                        guard_index: op_idx,
+                        fail_values,
+                    },
+                    exc_state,
+                );
             }
             OpResult::Unsupported(msg) => {
-                return BlackholeResult::Abort(msg);
+                return (BlackholeResult::Abort(msg), exc_state);
             }
         }
     }
 
-    // Fell off the end (shouldn't happen in well-formed traces)
-    BlackholeResult::Abort("reached end of ops without finish/jump".to_string())
+    (
+        BlackholeResult::Abort("reached end of ops without finish/jump".to_string()),
+        exc_state,
+    )
+}
+
+/// Evaluate IR operations sequentially with concrete i64 values and an
+/// already-pending exception state.
+pub fn blackhole_execute_with_exception(
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    initial_values: &HashMap<u32, i64>,
+    start_index: usize,
+    initial_exception: ExceptionState,
+) -> BlackholeResult {
+    blackhole_execute_with_state(
+        ops,
+        constants,
+        initial_values,
+        start_index,
+        initial_exception,
+    )
+    .0
 }
 
 fn resolve(values: &HashMap<u32, i64>, opref: OpRef) -> i64 {
@@ -261,6 +542,13 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) ->
             let a = unop(values, op);
             OpResult::Value(a.max(0))
         }
+        OpCode::IntBetween => {
+            // int_between(a, b, c) => a <= b < c
+            let a = resolve(values, op.args[0]);
+            let b = resolve(values, op.args[1]);
+            let c = resolve(values, op.args[2]);
+            OpResult::Value((a <= b && b < c) as i64)
+        }
 
         // ── Float operations ──
         OpCode::FloatAdd => {
@@ -337,7 +625,10 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) ->
                 OpResult::GuardFailed
             }
         }
-        OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardSubclass => {
+        OpCode::GuardClass
+        | OpCode::GuardNonnullClass
+        | OpCode::GuardSubclass
+        | OpCode::GuardCompatible => {
             let (a, b) = binop(values, op);
             if a == b {
                 OpResult::Void
@@ -597,7 +888,7 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) ->
             let a = unop(values, op);
             OpResult::Value(a)
         }
-        OpCode::CastIntToPtr => {
+        OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
             let a = unop(values, op);
             OpResult::Value(a)
         }
@@ -696,9 +987,57 @@ fn float_unop(values: &HashMap<u32, i64>, op: &Op) -> f64 {
     f64::from_bits(resolve(values, op.args[0]) as u64)
 }
 
+/// Blackhole execution with virtual object materialization.
+///
+/// When a guard fails, some values in the DeadFrame may correspond to
+/// virtual objects that were never allocated. This function:
+/// 1. Materializes virtual objects from resume data
+/// 2. Provides the materialized objects as `BlackholeResult::GuardFailedWithVirtuals`
+///
+/// `allocator_fn` is called for each virtual that needs heap allocation.
+/// It receives a `MaterializedVirtual` and returns the allocated object address.
+///
+/// Mirrors RPython's `_prepare_virtuals()` in resume.py.
+pub fn blackhole_with_virtuals(
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    initial_values: &HashMap<u32, i64>,
+    start_index: usize,
+    resume_data: Option<&ResumeData>,
+) -> BlackholeResult {
+    let result = blackhole_execute(ops, constants, initial_values, start_index);
+
+    // If guard failed and we have resume data with virtuals, materialize them
+    if let BlackholeResult::GuardFailed {
+        guard_index,
+        ref fail_values,
+    } = result
+    {
+        if let Some(rd) = resume_data {
+            if !rd.virtuals.is_empty() || !rd.pending_fields.is_empty() {
+                let materialized = rd.materialize_virtuals(fail_values);
+                let pending_field_writes =
+                    ResumeData::resolve_pending_field_writes(&rd.pending_fields, fail_values);
+                return BlackholeResult::GuardFailedWithVirtuals {
+                    guard_index,
+                    fail_values: fail_values.clone(),
+                    materialized_virtuals: materialized,
+                    pending_field_writes,
+                };
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resume::{
+        PendingFieldInfo as ResumePendingFieldInfo, VirtualFieldSource,
+        VirtualInfo as ResumeVirtualInfo,
+    };
     use majit_ir::OpRef;
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
@@ -759,6 +1098,59 @@ mod tests {
         match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
             BlackholeResult::Finish(vals) => assert_eq!(vals, vec![42]),
             _ => panic!("expected Finish when no exception is pending"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_initial_exception_fails_guard_no_exception_without_restore() {
+        let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 42i64);
+
+        match blackhole_execute_with_exception(
+            &ops,
+            &HashMap::new(),
+            &initial,
+            0,
+            ExceptionState {
+                exc_class: 100,
+                exc_value: 200,
+            },
+        ) {
+            BlackholeResult::GuardFailed { .. } => {}
+            _ => panic!("expected GuardFailed when initial exception is pending"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_initial_exception_satisfies_guard_exception_without_restore() {
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::GuardException, &[OpRef(0)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 100i64);
+
+        match blackhole_execute_with_exception(
+            &ops,
+            &HashMap::new(),
+            &initial,
+            0,
+            ExceptionState {
+                exc_class: 100,
+                exc_value: 200,
+            },
+        ) {
+            BlackholeResult::Finish(vals) => assert_eq!(vals, vec![200]),
+            _ => panic!("expected Finish when initial exception class matches"),
         }
     }
 
@@ -857,6 +1249,104 @@ mod tests {
                 assert_eq!(fail_values, vec![0]);
             }
             _ => panic!("expected GuardFailed"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_with_virtuals_materializes_resume_virtuals() {
+        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 0i64);
+
+        let resume_data = ResumeData {
+            frames: vec![],
+            virtuals: vec![ResumeVirtualInfo::VStruct {
+                type_id: 0,
+                descr_index: 7,
+                fields: vec![(3, VirtualFieldSource::Constant(55))],
+            }],
+            pending_fields: Vec::new(),
+        };
+
+        match blackhole_with_virtuals(&ops, &HashMap::new(), &initial, 0, Some(&resume_data)) {
+            BlackholeResult::GuardFailedWithVirtuals {
+                guard_index,
+                fail_values,
+                materialized_virtuals,
+                pending_field_writes,
+            } => {
+                assert_eq!(guard_index, 1);
+                assert_eq!(fail_values, vec![0]);
+                assert_eq!(materialized_virtuals.len(), 1);
+                assert!(pending_field_writes.is_empty());
+                match &materialized_virtuals[0] {
+                    MaterializedVirtual::Struct {
+                        type_id,
+                        descr_index,
+                        fields,
+                    } => {
+                        assert_eq!(*type_id, 0);
+                        assert_eq!(*descr_index, 7);
+                        assert_eq!(fields, &vec![(3, 55)]);
+                    }
+                    other => panic!("unexpected materialized virtual: {other:?}"),
+                }
+            }
+            _ => panic!("expected GuardFailedWithVirtuals"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_with_virtuals_surfaces_pending_field_writes() {
+        let mut guard_op = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 1i64);
+
+        let resume_data = ResumeData {
+            frames: vec![],
+            virtuals: vec![],
+            pending_fields: vec![ResumePendingFieldInfo {
+                descr_index: 9,
+                target: VirtualFieldSource::FailArg(0),
+                value: VirtualFieldSource::Constant(77),
+                item_index: Some(2),
+            }],
+        };
+
+        match blackhole_with_virtuals(&ops, &HashMap::new(), &initial, 0, Some(&resume_data)) {
+            BlackholeResult::GuardFailedWithVirtuals {
+                guard_index,
+                fail_values,
+                materialized_virtuals,
+                pending_field_writes,
+            } => {
+                assert_eq!(guard_index, 1);
+                assert_eq!(fail_values, vec![1]);
+                assert!(materialized_virtuals.is_empty());
+                assert_eq!(
+                    pending_field_writes,
+                    vec![crate::resume::ResolvedPendingFieldWrite {
+                        descr_index: 9,
+                        target: 1,
+                        value: 77,
+                        item_index: Some(2),
+                    }]
+                );
+            }
+            _ => panic!("expected GuardFailedWithVirtuals"),
         }
     }
 }

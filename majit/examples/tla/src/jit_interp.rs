@@ -130,9 +130,7 @@ impl JitTlaInterp {
                             }
                             HotResult::AlreadyTracing => {}
                             HotResult::RunCompiled => {
-                                if let Some(new_stack) =
-                                    self.run_compiled(target, &stack)
-                                {
+                                if let Some(new_stack) = self.run_compiled(target, &stack) {
                                     stack = new_stack;
                                     pc = target;
                                     continue;
@@ -150,12 +148,7 @@ impl JitTlaInterp {
         WObject::Int(stack.pop().unwrap())
     }
 
-    fn start_tracing(
-        &mut self,
-        recorder: TraceRecorder,
-        loop_header_pc: usize,
-        stack: &[i64],
-    ) {
+    fn start_tracing(&mut self, recorder: TraceRecorder, loop_header_pc: usize, stack: &[i64]) {
         let num_stack_slots = stack.len();
         let mut state = TracingState {
             recorder,
@@ -296,11 +289,7 @@ impl JitTlaInterp {
         }
     }
 
-    fn run_compiled(
-        &mut self,
-        loop_pc: usize,
-        stack: &[i64],
-    ) -> Option<Vec<i64>> {
+    fn run_compiled(&mut self, loop_pc: usize, stack: &[i64]) -> Option<Vec<i64>> {
         let compiled = self.compiled_loops.get(&loop_pc)?;
         let args: Vec<Value> = stack.iter().map(|&v| Value::Int(v)).collect();
         let frame = self.backend.execute_token(&compiled.token, &args);
@@ -355,13 +344,13 @@ mod tests {
 
     fn countdown_bytecode() -> Vec<u8> {
         vec![
-            DUP,              // 0
-            CONST_INT, 1,     // 1, 2
-            SUB,              // 3
-            DUP,              // 4
-            JUMP_IF, 1,       // 5, 6 → back to CONST_INT
-            POP,              // 7
-            RETURN,           // 8
+            DUP, // 0
+            CONST_INT, 1,   // 1, 2
+            SUB, // 3
+            DUP, // 4
+            JUMP_IF, 1,      // 5, 6 → back to CONST_INT
+            POP,    // 7
+            RETURN, // 8
         ]
     }
 

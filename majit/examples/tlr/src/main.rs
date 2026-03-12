@@ -20,23 +20,14 @@ const NEG_A: u8 = 8;
 /// The SQUARE program from tlr.py — computes a*a by repeated addition.
 fn square_bytecode() -> Vec<u8> {
     vec![
-        ALLOCATE,    3,
-        MOV_A_R,     0,   // i = a
-        MOV_A_R,     1,   // copy of 'a'
-        SET_A,       0,
-        MOV_A_R,     2,   // res = 0
+        ALLOCATE, 3, MOV_A_R, 0, // i = a
+        MOV_A_R, 1, // copy of 'a'
+        SET_A, 0, MOV_A_R, 2, // res = 0
         // 10:
-        SET_A,       1,
-        NEG_A,
-        ADD_R_TO_A,  0,
-        MOV_A_R,     0,   // i--
-        MOV_R_A,     2,
-        ADD_R_TO_A,  1,
-        MOV_A_R,     2,   // res += a
-        MOV_R_A,     0,
-        JUMP_IF_A,  10,   // if i!=0: goto 10
-        MOV_R_A,     2,
-        RETURN_A,         // return res
+        SET_A, 1, NEG_A, ADD_R_TO_A, 0, MOV_A_R, 0, // i--
+        MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2, // res += a
+        MOV_R_A, 0, JUMP_IF_A, 10, // if i!=0: goto 10
+        MOV_R_A, 2, RETURN_A, // return res
     ]
 }
 

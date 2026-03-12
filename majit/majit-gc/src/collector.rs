@@ -543,6 +543,135 @@ impl Default for SafepointMap {
     }
 }
 
+/// Registry of compiled code regions and their safepoint maps.
+///
+/// When the GC needs to scan the stack during collection, it uses the return
+/// address to find which compiled code region is active, then looks up the
+/// safepoint map to determine which frame slots contain GC references.
+///
+/// From rpython/jit/backend/llsupport/gc.py GcRootMap_asmgcc / GcRootMap_shadowstack.
+pub struct CompiledCodeRegistry {
+    /// Compiled code regions, sorted by start address for binary search.
+    regions: Vec<CompiledCodeRegion>,
+}
+
+/// A single compiled code region with its safepoint map.
+#[derive(Debug, Clone)]
+pub struct CompiledCodeRegion {
+    /// Start address of the compiled code.
+    pub code_start: usize,
+    /// Size of the compiled code in bytes.
+    pub code_size: usize,
+    /// Safepoint map for this region.
+    pub safepoint_map: SafepointMap,
+    /// Frame size in slots (each slot = 8 bytes).
+    pub frame_size_slots: u32,
+    /// LoopToken number for identification.
+    pub loop_token: u64,
+}
+
+impl CompiledCodeRegistry {
+    pub fn new() -> Self {
+        CompiledCodeRegistry {
+            regions: Vec::new(),
+        }
+    }
+
+    /// Register a compiled code region.
+    pub fn register(&mut self, region: CompiledCodeRegion) {
+        self.regions.push(region);
+        // Keep sorted by code_start for binary search
+        self.regions.sort_by_key(|r| r.code_start);
+    }
+
+    /// Unregister a compiled code region (e.g., when invalidating a loop).
+    pub fn unregister(&mut self, loop_token: u64) {
+        self.regions.retain(|r| r.loop_token != loop_token);
+    }
+
+    /// Look up a compiled code region containing the given return address.
+    ///
+    /// Returns the region and the offset within it.
+    pub fn find_region(&self, return_addr: usize) -> Option<(&CompiledCodeRegion, u32)> {
+        // Binary search for the region containing this address
+        let idx = self
+            .regions
+            .binary_search_by(|r| {
+                if return_addr < r.code_start {
+                    std::cmp::Ordering::Greater
+                } else if return_addr >= r.code_start + r.code_size {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
+
+        let region = &self.regions[idx];
+        let offset = (return_addr - region.code_start) as u32;
+        Some((region, offset))
+    }
+
+    /// Scan a compiled frame for GC references using the safepoint map.
+    ///
+    /// Given a return address (from the call stack) and the frame base pointer,
+    /// enumerates all frame slots that contain GC references.
+    ///
+    /// # Safety
+    /// `frame_base` must point to a valid JIT frame with at least
+    /// `region.frame_size_slots` slots.
+    pub unsafe fn scan_frame(
+        &self,
+        return_addr: usize,
+        frame_base: *const usize,
+    ) -> Vec<*mut GcRef> {
+        let mut roots = Vec::new();
+
+        let (region, offset) = match self.find_region(return_addr) {
+            Some(r) => r,
+            None => return roots,
+        };
+
+        let gc_map = match region.safepoint_map.lookup(offset) {
+            Some(map) => map,
+            None => return roots,
+        };
+
+        // Enumerate all slots marked as GC references
+        for word_idx in 0..gc_map.ref_bitmap.len() {
+            let mut bits = gc_map.ref_bitmap[word_idx];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let slot_idx = word_idx * 64 + bit;
+
+                if slot_idx < region.frame_size_slots as usize {
+                    let slot_ptr = frame_base.add(slot_idx) as *mut GcRef;
+                    roots.push(slot_ptr);
+                }
+
+                bits &= bits - 1; // Clear lowest set bit
+            }
+        }
+
+        roots
+    }
+
+    /// Number of registered regions.
+    pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+}
+
+impl Default for CompiledCodeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Default for MiniMarkGC {
     fn default() -> Self {
         Self::new()

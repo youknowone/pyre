@@ -249,8 +249,7 @@ impl Parser {
 
             if line.starts_with('@') {
                 // Label
-                self.labels
-                    .insert(line[1..].to_string(), self.code.len());
+                self.labels.insert(line[1..].to_string(), self.code.len());
                 continue;
             }
 
@@ -348,10 +347,12 @@ impl Parser {
         let r0 = self.rint(parts[0]);
         let r1 = self.rint(parts[1]);
         let label = parts[2].trim_start_matches('@');
-        let target = *self.labels.get(label).unwrap_or_else(|| {
-            panic!("unknown label: {label}")
-        });
-        self.code.extend_from_slice(&[JUMP_IF_ABOVE, r0, r1, target as u8]);
+        let target = *self
+            .labels
+            .get(label)
+            .unwrap_or_else(|| panic!("unknown label: {label}"));
+        self.code
+            .extend_from_slice(&[JUMP_IF_ABOVE, r0, r1, target as u8]);
     }
 
     fn compile_load_function(&mut self, args: &str) {
@@ -363,7 +364,8 @@ impl Parser {
             .position(|(n, _)| n == name)
             .unwrap_or_else(|| panic!("unknown function: {name}"));
         let r = self.rint(result.trim());
-        self.code.extend_from_slice(&[LOAD_FUNCTION, func_idx as u8, r]);
+        self.code
+            .extend_from_slice(&[LOAD_FUNCTION, func_idx as u8, r]);
     }
 
     fn compile_call(&mut self, args: &str) {

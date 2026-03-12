@@ -8,7 +8,6 @@
 ///
 /// This pass imports that knowledge so guards in the bridge body can be
 /// removed or simplified.
-
 use std::collections::HashMap;
 
 use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
@@ -85,7 +84,9 @@ impl OptimizationPass for OptBridgeOpt {
             OpCode::GuardValue => {
                 let obj = ctx.get_replacement(op.arg(0));
                 let expected = ctx.get_replacement(op.arg(1));
-                if let (Some(a), Some(b)) = (ctx.get_constant_int(obj), ctx.get_constant_int(expected)) {
+                if let (Some(a), Some(b)) =
+                    (ctx.get_constant_int(obj), ctx.get_constant_int(expected))
+                {
                     if a == b {
                         return PassResult::Remove;
                     }
@@ -139,30 +140,33 @@ mod tests {
         let mut knowledge = BridgeKnowledge::new();
         knowledge.known_nonnull.push(OpRef(100));
 
-        let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::GuardNonnull, &[OpRef(100)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
         let result = opt.optimize(&ops);
 
-        assert!(result.is_empty(), "guard_nonnull should be removed when known nonnull");
+        assert!(
+            result.is_empty(),
+            "guard_nonnull should be removed when known nonnull"
+        );
     }
 
     #[test]
     fn test_bridgeopt_keeps_guard_nonnull_without_knowledge() {
-        let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::GuardNonnull, &[OpRef(100)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::new()));
         let result = opt.optimize(&ops);
 
-        assert_eq!(result.len(), 1, "guard_nonnull should be kept without knowledge");
+        assert_eq!(
+            result.len(),
+            1,
+            "guard_nonnull should be kept without knowledge"
+        );
     }
 
     #[test]
@@ -170,16 +174,17 @@ mod tests {
         let mut knowledge = BridgeKnowledge::new();
         knowledge.known_classes.insert(OpRef(100), GcRef::NULL);
 
-        let mut ops = vec![
-            Op::new(OpCode::GuardClass, &[OpRef(100), OpRef(200)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::GuardClass, &[OpRef(100), OpRef(200)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
         let result = opt.optimize(&ops);
 
-        assert!(result.is_empty(), "guard_class should be removed when class known");
+        assert!(
+            result.is_empty(),
+            "guard_class should be removed when class known"
+        );
     }
 
     #[test]
@@ -187,9 +192,7 @@ mod tests {
         let mut knowledge = BridgeKnowledge::new();
         knowledge.known_constants.insert(OpRef(100), 42);
 
-        let mut ops = vec![
-            Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(200)]),
-        ];
+        let mut ops = vec![Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(200)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -204,12 +207,15 @@ mod tests {
         let result = pass.propagate_forward(&ops[0], &mut ctx);
         match result {
             PassResult::Remove => {} // expected
-            other => panic!("expected Remove, got {:?}", match other {
-                PassResult::PassOn => "PassOn",
-                PassResult::Emit(_) => "Emit",
-                PassResult::Replace(_) => "Replace",
-                _ => "other",
-            }),
+            other => panic!(
+                "expected Remove, got {:?}",
+                match other {
+                    PassResult::PassOn => "PassOn",
+                    PassResult::Emit(_) => "Emit",
+                    PassResult::Replace(_) => "Replace",
+                    _ => "other",
+                }
+            ),
         }
     }
 }

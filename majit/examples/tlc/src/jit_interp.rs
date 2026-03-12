@@ -541,7 +541,10 @@ mod tests {
 
     /// Fibonacci using ROLL — pure integer loop, good JIT candidate.
     fn fibo_bytecode(pool: &mut ConstantPool) -> Vec<u8> {
-        interp::compile(include_str!("../../../../rpython/jit/tl/fibo.tlc.src"), pool)
+        interp::compile(
+            include_str!("../../../../rpython/jit/tl/fibo.tlc.src"),
+            pool,
+        )
     }
 
     #[test]

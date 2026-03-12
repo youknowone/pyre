@@ -152,12 +152,7 @@ impl JitTiny2Interp {
         }
     }
 
-    fn start_tracing(
-        &mut self,
-        recorder: TraceRecorder,
-        loop_header_pos: usize,
-        args: &[i64],
-    ) {
+    fn start_tracing(&mut self, recorder: TraceRecorder, loop_header_pos: usize, args: &[i64]) {
         let num_args = args.len();
         let mut state = TracingState {
             recorder,
@@ -380,10 +375,9 @@ mod tests {
 
     #[test]
     fn jit_fibonacci_single() {
-        let prog: Vec<&str> =
-            "#3 1 SUB ->#3 { #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 } #1"
-                .split_whitespace()
-                .collect();
+        let prog: Vec<&str> = "#3 1 SUB ->#3 { #2 #1 #2 ADD ->#2 ->#1 #3 1 SUB ->#3 #3 } #1"
+            .split_whitespace()
+            .collect();
         let mut jit = JitTiny2Interp::new();
         let mut args = vec![1i64, 1, 11];
         let result = jit.run(&prog, &mut args);
@@ -410,19 +404,13 @@ mod tests {
             let mut jit_args = vec![1i64, 1, n];
             let jit_result = jit.run(&prog, &mut jit_args);
 
-            assert_eq!(
-                jit_result.to_string(),
-                expected,
-                "fib({n}) mismatch"
-            );
+            assert_eq!(jit_result.to_string(), expected, "fib({n}) mismatch");
         }
     }
 
     #[test]
     fn jit_factorial() {
-        let prog: Vec<&str> = "1 { #1 MUL #1 1 SUB ->#1 #1 }"
-            .split_whitespace()
-            .collect();
+        let prog: Vec<&str> = "1 { #1 MUL #1 1 SUB ->#1 #1 }".split_whitespace().collect();
 
         // This computes factorial using a stack + args:
         // Push 1 (accumulator), then loop: multiply acc by arg1, decrement arg1
@@ -439,9 +427,7 @@ mod tests {
         // Simple countdown: just decrements arg1 each iteration
         // Loop body: #1 #1 1 SUB ->#1 #1
         // This pushes arg1, then decrements arg1, then pushes new arg1 as flag
-        let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }"
-            .split_whitespace()
-            .collect();
+        let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }".split_whitespace().collect();
         let mut jit = JitTiny2Interp::new();
         let mut args = vec![5i64];
         jit.run(&prog, &mut args);

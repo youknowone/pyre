@@ -19,13 +19,13 @@ const RETURN: u8 = 3;
 /// Tests loop tracing with object dispatch overhead.
 fn countdown_bytecode() -> Vec<u8> {
     vec![
-        DUP,              // 0
-        CONST_INT, 1,     // 1, 2
-        SUB,              // 3
-        DUP,              // 4
-        JUMP_IF, 1,       // 5, 6 → back to CONST_INT
-        POP,              // 7
-        RETURN,           // 8
+        DUP, // 0
+        CONST_INT, 1,   // 1, 2
+        SUB, // 3
+        DUP, // 4
+        JUMP_IF, 1,      // 5, 6 → back to CONST_INT
+        POP,    // 7
+        RETURN, // 8
     ]
 }
 

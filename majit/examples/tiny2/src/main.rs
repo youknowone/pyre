@@ -25,7 +25,11 @@ fn main() {
 
     // Correctness check
     {
-        let mut args = vec![interp::Box::Int(1), interp::Box::Int(1), interp::Box::Int(11)];
+        let mut args = vec![
+            interp::Box::Int(1),
+            interp::Box::Int(1),
+            interp::Box::Int(11),
+        ];
         let result = interp::interpret(&prog, &mut args);
         assert_eq!(interp::repr_stack(&result), "89", "fib(11) should be 89");
     }
@@ -34,7 +38,11 @@ fn main() {
     println!("--- fibonacci({n}) [interpreter] ---");
     {
         let start = Instant::now();
-        let mut args = vec![interp::Box::Int(1), interp::Box::Int(1), interp::Box::Int(n)];
+        let mut args = vec![
+            interp::Box::Int(1),
+            interp::Box::Int(1),
+            interp::Box::Int(n),
+        ];
         let result = interp::interpret(&prog, &mut args);
         let elapsed = start.elapsed();
         println!("result = {}", interp::repr_stack(&result));
