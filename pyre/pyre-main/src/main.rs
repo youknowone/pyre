@@ -5,10 +5,12 @@
 //!   pyre -c <code>         Execute a Python expression/statement
 //!   pyre                   Interactive REPL (Phase 2+)
 
+use std::rc::Rc;
+
 use pyre_bytecode::*;
 use pyre_interp::eval::eval_frame;
 use pyre_interp::frame::PyFrame;
-use pyre_object::pyobject::PyDisplay;
+use pyre_runtime::{PyDisplay, PyExecutionContext};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -36,7 +38,8 @@ fn main() {
         }
     };
 
-    let mut frame = PyFrame::new(code);
+    let execution_context = Rc::new(PyExecutionContext::default());
+    let mut frame = PyFrame::new_with_context(code, execution_context);
     match eval_frame(&mut frame) {
         Ok(result) => {
             if !result.is_null() && !unsafe { pyre_object::is_none(result) } {

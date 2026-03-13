@@ -3,7 +3,7 @@
 //! A `W_BuiltinFunction` wraps a Rust function pointer that implements
 //! a Python builtin like `print`, `len`, etc.
 
-use crate::pyobject::*;
+use pyre_object::pyobject::*;
 
 /// Type descriptor for built-in functions.
 pub static BUILTIN_FUNC_TYPE: PyType = PyType {

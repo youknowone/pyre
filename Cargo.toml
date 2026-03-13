@@ -25,6 +25,7 @@ members = [
     "majit/examples/tlc",
     # pyre
     "pyre/pyre-object",
+    "pyre/pyre-runtime",
     "pyre/pyre-objspace",
     "pyre/pyre-bytecode",
     "pyre/pyre-interp",
@@ -35,6 +36,7 @@ members = [
 [workspace.dependencies]
 # pyre internal crates
 pyre-object = { path = "pyre/pyre-object" }
+pyre-runtime = { path = "pyre/pyre-runtime" }
 pyre-objspace = { path = "pyre/pyre-objspace" }
 pyre-bytecode = { path = "pyre/pyre-bytecode" }
 pyre-interp = { path = "pyre/pyre-interp" }
@@ -48,3 +50,8 @@ rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython", b
 majit-meta = { path = "majit/majit-meta" }
 majit-ir = { path = "majit/majit-ir" }
 majit-trace = { path = "majit/majit-trace" }
+
+# shared dependencies
+malachite-bigint = "0.9"
+num-traits = "0.2"
+num-integer = "0.1"

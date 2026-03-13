@@ -1,8 +1,9 @@
 [package]
-name = "pyre-object"
+name = "pyre-runtime"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+pyre-object = { workspace = true }
 malachite-bigint = { workspace = true }
 num-traits = { workspace = true }
