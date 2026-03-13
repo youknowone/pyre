@@ -12,4 +12,5 @@ majit-codegen-cranelift = { path = "../majit-codegen-cranelift" }
 
 [dev-dependencies]
 majit-macros = { path = "../majit-macros" }
+majit-gc = { path = "../majit-gc" }
 smallvec = "1"

@@ -1,0 +1,12 @@
+[package]
+name = "pyre-jit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pyre-object = { workspace = true }
+pyre-bytecode = { workspace = true }
+pyre-objspace = { workspace = true }
+majit-meta = { workspace = true }
+majit-ir = { workspace = true }
+num-traits = "0.2"

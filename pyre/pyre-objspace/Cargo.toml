@@ -1,0 +1,7 @@
+[package]
+name = "pyre-objspace"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pyre-object = { workspace = true }

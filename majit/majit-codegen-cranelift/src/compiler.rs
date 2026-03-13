@@ -4932,11 +4932,33 @@ impl majit_codegen::Backend for CraneliftBackend {
                 .expect("bridge returned unexpected frame type");
             let arity = descr.fail_descr.fail_arg_types().len();
             let mut result = Vec::with_capacity(arity);
-            for i in 0..arity {
-                result.push(descr.get_int(i));
+            let mut typed_result = Vec::with_capacity(arity);
+            for (i, &tp) in descr.fail_descr.fail_arg_types().iter().enumerate() {
+                match tp {
+                    Type::Int => {
+                        let value = descr.get_int(i);
+                        result.push(value);
+                        typed_result.push(Value::Int(value));
+                    }
+                    Type::Ref => {
+                        let value = descr.get_ref(i);
+                        result.push(value.as_usize() as i64);
+                        typed_result.push(Value::Ref(value));
+                    }
+                    Type::Float => {
+                        let value = descr.get_float(i);
+                        result.push(value.to_bits() as i64);
+                        typed_result.push(Value::Float(value));
+                    }
+                    Type::Void => {
+                        result.push(0);
+                        typed_result.push(Value::Void);
+                    }
+                }
             }
             return majit_codegen::RawExecResult {
                 outputs: result,
+                typed_outputs: typed_result,
                 fail_index: descr.fail_descr.fail_index(),
                 trace_id: descr.fail_descr.trace_id(),
                 is_finish: descr.fail_descr.is_finish(),
@@ -4955,9 +4977,19 @@ impl majit_codegen::Backend for CraneliftBackend {
 
         let exit_arity = fail_descr.fail_arg_types().len();
         outputs.truncate(exit_arity);
+        let mut typed_outputs = Vec::with_capacity(exit_arity);
+        for (&raw, &tp) in outputs.iter().zip(fail_descr.fail_arg_types().iter()) {
+            match tp {
+                Type::Int => typed_outputs.push(Value::Int(raw)),
+                Type::Ref => typed_outputs.push(Value::Ref(GcRef(raw as usize))),
+                Type::Float => typed_outputs.push(Value::Float(f64::from_bits(raw as u64))),
+                Type::Void => typed_outputs.push(Value::Void),
+            }
+        }
 
         majit_codegen::RawExecResult {
             outputs,
+            typed_outputs,
             fail_index,
             trace_id: fail_descr.trace_id(),
             is_finish: fail_descr.is_finish(),

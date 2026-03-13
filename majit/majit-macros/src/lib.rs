@@ -91,7 +91,9 @@ fn primitive_type_ident(ty: &Type) -> Option<&Ident> {
 
 fn is_supported_helper_return_type(ty: &Type) -> bool {
     matches!(
-        primitive_type_ident(ty).map(|ident| ident.to_string()).as_deref(),
+        primitive_type_ident(ty)
+            .map(|ident| ident.to_string())
+            .as_deref(),
         Some("i64" | "isize")
     )
 }
@@ -151,9 +153,12 @@ fn emit_helper_call_target_fn(
             }
         },
         ReturnType::Type(_, ty) if is_supported_helper_return_type(ty) => {
-            let Some(converted_return) = helper_return_to_i64(quote! {
-                #helper_name(#(#converted_args),*)
-            }, ty) else {
+            let Some(converted_return) = helper_return_to_i64(
+                quote! {
+                    #helper_name(#(#converted_args),*)
+                },
+                ty,
+            ) else {
                 return Ok(None);
             };
             quote! {
@@ -180,12 +185,16 @@ fn helper_policy_tokens_for_fn(
     };
     match &func.sig.output {
         ReturnType::Default => Ok(match attr_name {
-            "dont_look_inside" => quote! { (1u8, std::ptr::null(), #call_target_name as *const ()) },
+            "dont_look_inside" => {
+                quote! { (1u8, std::ptr::null(), #call_target_name as *const ()) }
+            }
             _ => unsupported,
         }),
         ReturnType::Type(_, ty) if is_supported_helper_return_type(ty) => Ok(match attr_name {
             "elidable" => quote! { (3u8, std::ptr::null(), #call_target_name as *const ()) },
-            "dont_look_inside" => quote! { (2u8, std::ptr::null(), #call_target_name as *const ()) },
+            "dont_look_inside" => {
+                quote! { (2u8, std::ptr::null(), #call_target_name as *const ()) }
+            }
             _ => unsupported,
         }),
         _ => Ok(unsupported),
