@@ -4,8 +4,6 @@
 //! Concrete types (W_IntObject, W_BoolObject, etc.) embed this header as their
 //! first field, enabling safe pointer casts between `*mut PyObject` and typed pointers.
 
-use std::fmt;
-
 /// Type descriptor for Python objects.
 ///
 /// Each built-in type has a single static `PyType` instance.
@@ -45,6 +43,12 @@ pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
 
 pub static INT_TYPE: PyType = PyType { tp_name: "int" };
 pub static BOOL_TYPE: PyType = PyType { tp_name: "bool" };
+pub static FLOAT_TYPE: PyType = PyType { tp_name: "float" };
+pub static STR_TYPE: PyType = PyType { tp_name: "str" };
+pub static LIST_TYPE: PyType = PyType { tp_name: "list" };
+pub static TUPLE_TYPE: PyType = PyType { tp_name: "tuple" };
+pub static DICT_TYPE: PyType = PyType { tp_name: "dict" };
+pub static LONG_TYPE: PyType = PyType { tp_name: "int" };
 pub static NONE_TYPE: PyType = PyType {
     tp_name: "NoneType",
 };
@@ -74,53 +78,36 @@ pub unsafe fn is_bool(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+pub unsafe fn is_float(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &FLOAT_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_long(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &LONG_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_int_or_long(obj: PyObjectRef) -> bool {
+    unsafe { is_int(obj) || is_long(obj) }
+}
+
+#[inline]
+pub unsafe fn is_list(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &LIST_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &TUPLE_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_dict(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &DICT_TYPE) }
+}
+
+#[inline]
 pub unsafe fn is_none(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &NONE_TYPE) }
-}
-
-// ── Debug formatting ──────────────────────────────────────────────────
-
-/// Format a PyObjectRef for debug display.
-///
-/// # Safety
-/// `obj` must be a valid pointer to a known Python object type.
-pub unsafe fn py_repr(obj: PyObjectRef) -> String {
-    if obj.is_null() {
-        return "NULL".to_string();
-    }
-    unsafe {
-        let tp = (*obj).ob_type;
-        if std::ptr::eq(tp, &INT_TYPE as *const PyType) {
-            let int_obj = obj as *const super::intobject::W_IntObject;
-            format!("{}", (*int_obj).intval)
-        } else if std::ptr::eq(tp, &BOOL_TYPE as *const PyType) {
-            let bool_obj = obj as *const super::boolobject::W_BoolObject;
-            if (*bool_obj).boolval {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            }
-        } else if std::ptr::eq(tp, &NONE_TYPE as *const PyType) {
-            "None".to_string()
-        } else if std::ptr::eq(tp, &super::builtinfunc::BUILTIN_FUNC_TYPE as *const PyType) {
-            let name = super::builtinfunc::w_builtin_func_name(obj);
-            format!("<built-in function {name}>")
-        } else {
-            format!("<{} object at {:?}>", (*tp).tp_name, obj)
-        }
-    }
-}
-
-/// Display wrapper for PyObjectRef.
-pub struct PyDisplay(pub PyObjectRef);
-
-impl fmt::Display for PyDisplay {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_null() {
-            write!(f, "NULL")
-        } else {
-            // Safety: caller ensures the pointer is valid
-            write!(f, "{}", unsafe { py_repr(self.0) })
-        }
-    }
 }

@@ -53,3 +53,24 @@ pub fn make_field_descr(
         signed,
     })
 }
+
+// ── Range iterator field descriptors ─────────────────────────────────
+
+use pyre_object::rangeobject::{
+    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
+};
+
+/// Field descriptor for `W_RangeIterator.current` (i64, signed).
+pub fn range_iter_current_descr() -> DescrRef {
+    make_field_descr(RANGE_ITER_CURRENT_OFFSET, 8, Type::Int, true)
+}
+
+/// Field descriptor for `W_RangeIterator.stop` (i64, signed).
+pub fn range_iter_stop_descr() -> DescrRef {
+    make_field_descr(RANGE_ITER_STOP_OFFSET, 8, Type::Int, true)
+}
+
+/// Field descriptor for `W_RangeIterator.step` (i64, signed).
+pub fn range_iter_step_descr() -> DescrRef {
+    make_field_descr(RANGE_ITER_STEP_OFFSET, 8, Type::Int, true)
+}

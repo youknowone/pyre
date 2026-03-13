@@ -226,3 +226,20 @@ fn value_to_ptr(value: &Value) -> PyObjectRef {
         _ => std::ptr::null_mut(),
     }
 }
+
+// ── Virtualizable configuration ──────────────────────────────────────
+//
+// PyPy's `pypy/interpreter/pyframe.py` declares:
+//
+//     _virtualizable_ = ['locals_stack_w[*]', 'valuestackdepth',
+//                         'last_instr', ...]
+//
+// Our Rust equivalent uses explicit byte offsets instead of name-based
+// introspection. The JIT optimizer's Virtualize pass uses this info
+// to keep frame fields in CPU registers, eliminating heap accesses
+// for LoadFast/StoreFast and stack push/pop during compiled code.
+//
+// `build_pyframe_virtualizable_info()` lives in `pyre-interp/src/frame.rs`
+// alongside the PyFrame struct and its offset constants, because
+// `pyre-jit` cannot depend on `pyre-interp` (reverse dependency).
+// The driver registration call happens in `pyre-interp/src/eval.rs`.

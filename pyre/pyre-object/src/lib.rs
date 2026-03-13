@@ -1,11 +1,23 @@
 pub mod boolobject;
-pub mod builtinfunc;
+pub mod dictobject;
+pub mod floatobject;
 pub mod intobject;
+pub mod listobject;
+pub mod longobject;
 pub mod noneobject;
 pub mod pyobject;
+pub mod rangeobject;
+pub mod strobject;
+pub mod tupleobject;
 
 pub use boolobject::*;
-pub use builtinfunc::*;
+pub use dictobject::*;
+pub use floatobject::*;
 pub use intobject::*;
+pub use listobject::*;
+pub use longobject::*;
 pub use noneobject::*;
 pub use pyobject::*;
+pub use rangeobject::*;
+pub use strobject::*;
+pub use tupleobject::*;

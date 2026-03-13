@@ -9,46 +9,30 @@
 // additional unsafe block adds noise without safety benefit.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use malachite_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::ToPrimitive;
+
+use pyre_object::strobject::is_str;
 use pyre_object::*;
+pub use pyre_runtime::{PyError, PyErrorKind, PyResult};
 
-/// Result type for Python operations.
-///
-/// `Ok(PyObjectRef)` for normal return, `Err(PyError)` for exceptions.
-pub type PyResult = Result<PyObjectRef, PyError>;
+// ── BigInt helpers ──────────────────────────────────────────────────
 
-/// Python exception (simplified for Phase 1).
-#[derive(Debug, Clone)]
-pub struct PyError {
-    pub kind: PyErrorKind,
-    pub message: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum PyErrorKind {
-    TypeError,
-    ZeroDivisionError,
-    NameError,
-}
-
-impl PyError {
-    pub fn type_error(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::TypeError,
-            message: msg.into(),
-        }
-    }
-
-    pub fn zero_division(msg: impl Into<String>) -> Self {
-        PyError {
-            kind: PyErrorKind::ZeroDivisionError,
-            message: msg.into(),
-        }
+/// Extract a BigInt from an int or long object.
+unsafe fn as_bigint(obj: PyObjectRef) -> BigInt {
+    if is_int(obj) {
+        BigInt::from(w_int_get_value(obj))
+    } else {
+        w_long_get_value(obj).clone()
     }
 }
 
-impl std::fmt::Display for PyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.message)
+/// Box a BigInt result, demoting to W_IntObject if it fits in i64.
+fn bigint_result(value: BigInt) -> PyObjectRef {
+    match value.to_i64() {
+        Some(v) => w_int_new(v),
+        None => w_long_new(value),
     }
 }
 
@@ -66,19 +50,28 @@ impl std::fmt::Display for PyError {
 unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = w_int_get_value(a);
     let vb = w_int_get_value(b);
-    Ok(w_int_new(va + vb))
+    match va.checked_add(vb) {
+        Some(r) => Ok(w_int_new(r)),
+        None => Ok(w_long_new(BigInt::from(va) + BigInt::from(vb))),
+    }
 }
 
 unsafe fn int_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = w_int_get_value(a);
     let vb = w_int_get_value(b);
-    Ok(w_int_new(va - vb))
+    match va.checked_sub(vb) {
+        Some(r) => Ok(w_int_new(r)),
+        None => Ok(w_long_new(BigInt::from(va) - BigInt::from(vb))),
+    }
 }
 
 unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = w_int_get_value(a);
     let vb = w_int_get_value(b);
-    Ok(w_int_new(va * vb))
+    match va.checked_mul(vb) {
+        Some(r) => Ok(w_int_new(r)),
+        None => Ok(w_long_new(BigInt::from(va) * BigInt::from(vb))),
+    }
 }
 
 unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -87,7 +80,11 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if vb == 0 {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
-    Ok(w_int_new(va.div_euclid(vb)))
+    // i64::MIN / -1 overflows
+    match va.checked_div_euclid(vb) {
+        Some(r) => Ok(w_int_new(r)),
+        None => Ok(bigint_result(BigInt::from(va).div_floor(&BigInt::from(vb)))),
+    }
 }
 
 unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -97,6 +94,121 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     Ok(w_int_new(va.rem_euclid(vb)))
+}
+
+// ── Long (BigInt) arithmetic operations ─────────────────────────────
+
+unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bigint_result(as_bigint(a) + as_bigint(b)))
+}
+
+unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bigint_result(as_bigint(a) - as_bigint(b)))
+}
+
+unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bigint_result(as_bigint(a) * as_bigint(b)))
+}
+
+unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let vb = as_bigint(b);
+    if vb == BigInt::from(0) {
+        return Err(PyError::zero_division("integer division or modulo by zero"));
+    }
+    Ok(bigint_result(as_bigint(a).div_floor(&vb)))
+}
+
+unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let vb = as_bigint(b);
+    if vb == BigInt::from(0) {
+        return Err(PyError::zero_division("integer division or modulo by zero"));
+    }
+    Ok(bigint_result(as_bigint(a).mod_floor(&vb)))
+}
+
+// ── Float arithmetic operations ──────────────────────────────────────
+
+/// Coerce an operand to f64. Works for int, long, and float objects.
+unsafe fn as_float(obj: PyObjectRef) -> f64 {
+    if is_float(obj) {
+        w_float_get_value(obj)
+    } else if is_int(obj) {
+        w_int_get_value(obj) as f64
+    } else {
+        // long → f64 (may lose precision for very large values)
+        w_long_get_value(obj).to_f64().unwrap_or(f64::INFINITY)
+    }
+}
+
+/// True if both operands are numeric and at least one is float.
+unsafe fn is_float_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
+    let a_num = is_int(a) || is_float(a) || is_long(a);
+    let b_num = is_int(b) || is_float(b) || is_long(b);
+    a_num && b_num && (is_float(a) || is_float(b))
+}
+
+unsafe fn float_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_float_new(as_float(a) + as_float(b)))
+}
+
+unsafe fn float_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_float_new(as_float(a) - as_float(b)))
+}
+
+unsafe fn float_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_float_new(as_float(a) * as_float(b)))
+}
+
+unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let vb = as_float(b);
+    if vb == 0.0 {
+        return Err(PyError::zero_division("float division by zero"));
+    }
+    Ok(w_float_new(as_float(a) / vb))
+}
+
+unsafe fn float_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let vb = as_float(b);
+    if vb == 0.0 {
+        return Err(PyError::zero_division("float floor division by zero"));
+    }
+    Ok(w_float_new((as_float(a) / vb).floor()))
+}
+
+unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let vb = as_float(b);
+    if vb == 0.0 {
+        return Err(PyError::zero_division("float modulo"));
+    }
+    let va = as_float(a);
+    // Python modulo: result has the sign of the divisor
+    let r = va % vb;
+    let result = if r != 0.0 && ((r > 0.0) != (vb > 0.0)) {
+        r + vb
+    } else {
+        r
+    };
+    Ok(w_float_new(result))
+}
+
+// ── String operations ────────────────────────────────────────────────
+
+/// Concatenate two str objects.
+unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let sa = w_str_get_value(a);
+    let sb = w_str_get_value(b);
+    let mut result = String::with_capacity(sa.len() + sb.len());
+    result.push_str(sa);
+    result.push_str(sb);
+    Ok(w_str_new(&result))
+}
+
+/// Repeat a str object `n` times.
+unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
+    let sv = w_str_get_value(s);
+    let nv = w_int_get_value(n);
+    let count = if nv < 0 { 0 } else { nv as usize };
+    Ok(w_str_new(&sv.repeat(count)))
 }
 
 // ── Comparison operations ─────────────────────────────────────────────
@@ -125,6 +237,30 @@ unsafe fn int_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_bool_from(w_int_get_value(a) != w_int_get_value(b)))
 }
 
+unsafe fn float_lt(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_bool_from(as_float(a) < as_float(b)))
+}
+
+unsafe fn float_le(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_bool_from(as_float(a) <= as_float(b)))
+}
+
+unsafe fn float_gt(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_bool_from(as_float(a) > as_float(b)))
+}
+
+unsafe fn float_ge(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_bool_from(as_float(a) >= as_float(b)))
+}
+
+unsafe fn float_eq(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_bool_from(as_float(a) == as_float(b)))
+}
+
+unsafe fn float_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_bool_from(as_float(a) != as_float(b)))
+}
+
 // ── Public dispatch API ───────────────────────────────────────────────
 
 /// Binary operation dispatch.
@@ -135,6 +271,15 @@ pub fn py_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) && is_int(b) {
             return int_add(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_add(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_add(a, b);
+        }
+        if is_str(a) && is_str(b) {
+            return str_concat(a, b);
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
@@ -149,6 +294,12 @@ pub fn py_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int(a) && is_int(b) {
             return int_sub(a, b);
         }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_sub(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_sub(a, b);
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for -: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -161,6 +312,18 @@ pub fn py_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) && is_int(b) {
             return int_mul(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_mul(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_mul(a, b);
+        }
+        if is_str(a) && is_int(b) {
+            return str_repeat(a, b);
+        }
+        if is_int(a) && is_str(b) {
+            return str_repeat(b, a);
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for *: '{}' and '{}'",
@@ -175,6 +338,12 @@ pub fn py_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int(a) && is_int(b) {
             return int_floordiv(a, b);
         }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_floordiv(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_floordiv(a, b);
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for //: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -188,8 +357,30 @@ pub fn py_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int(a) && is_int(b) {
             return int_mod(a, b);
         }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_mod(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_mod(a, b);
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for %: '{}' and '{}'",
+            (*(*a).ob_type).tp_name,
+            (*(*b).ob_type).tp_name,
+        )))
+    }
+}
+
+/// True division (`/` operator) — always produces a float result.
+pub fn py_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        let a_num = is_int(a) || is_float(a) || is_long(a);
+        let b_num = is_int(b) || is_float(b) || is_long(b);
+        if a_num && b_num {
+            return float_truediv(a, b);
+        }
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for /: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
             (*(*b).ob_type).tp_name,
         )))
@@ -208,6 +399,40 @@ pub fn py_compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Eq => int_eq(a, b),
                 CompareOp::Ne => int_ne(a, b),
             };
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            let va = as_bigint(a);
+            let vb = as_bigint(b);
+            return Ok(w_bool_from(match op {
+                CompareOp::Lt => va < vb,
+                CompareOp::Le => va <= vb,
+                CompareOp::Gt => va > vb,
+                CompareOp::Ge => va >= vb,
+                CompareOp::Eq => va == vb,
+                CompareOp::Ne => va != vb,
+            }));
+        }
+        if is_float_pair(a, b) {
+            return match op {
+                CompareOp::Lt => float_lt(a, b),
+                CompareOp::Le => float_le(a, b),
+                CompareOp::Gt => float_gt(a, b),
+                CompareOp::Ge => float_ge(a, b),
+                CompareOp::Eq => float_eq(a, b),
+                CompareOp::Ne => float_ne(a, b),
+            };
+        }
+        if is_str(a) && is_str(b) {
+            let sa = w_str_get_value(a);
+            let sb = w_str_get_value(b);
+            return Ok(w_bool_from(match op {
+                CompareOp::Lt => sa < sb,
+                CompareOp::Le => sa <= sb,
+                CompareOp::Gt => sa > sb,
+                CompareOp::Ge => sa >= sb,
+                CompareOp::Eq => sa == sb,
+                CompareOp::Ne => sa != sb,
+            }));
         }
         Err(PyError::type_error(format!(
             "'{op:?}' not supported between instances of '{}' and '{}'",
@@ -242,6 +467,24 @@ pub fn py_is_true(obj: PyObjectRef) -> bool {
         if is_int(obj) {
             return w_int_get_value(obj) != 0;
         }
+        if is_long(obj) {
+            return *w_long_get_value(obj) != BigInt::from(0);
+        }
+        if is_float(obj) {
+            return w_float_get_value(obj) != 0.0;
+        }
+        if is_str(obj) {
+            return !w_str_get_value(obj).is_empty();
+        }
+        if is_list(obj) {
+            return w_list_len(obj) > 0;
+        }
+        if is_tuple(obj) {
+            return w_tuple_len(obj) > 0;
+        }
+        if is_dict(obj) {
+            return w_dict_len(obj) > 0;
+        }
         if is_none(obj) {
             return false;
         }
@@ -253,12 +496,126 @@ pub fn py_is_true(obj: PyObjectRef) -> bool {
 pub fn py_negative(a: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) {
-            return Ok(w_int_new(-w_int_get_value(a)));
+            let v = w_int_get_value(a);
+            return match v.checked_neg() {
+                Some(r) => Ok(w_int_new(r)),
+                None => Ok(w_long_new(-BigInt::from(v))),
+            };
+        }
+        if is_long(a) {
+            return Ok(bigint_result(-w_long_get_value(a).clone()));
+        }
+        if is_float(a) {
+            return Ok(w_float_new(-w_float_get_value(a)));
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary -: '{}'",
             (*(*a).ob_type).tp_name,
         )))
+    }
+}
+
+// ── Subscript operations ─────────────────────────────────────────────
+
+/// Get item by index: `obj[index]`.
+///
+/// Dispatches based on the type of `obj`.
+pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_list(obj) {
+            if !is_int(index) {
+                return Err(PyError::type_error("list indices must be integers"));
+            }
+            let idx = w_int_get_value(index);
+            match w_list_getitem(obj, idx) {
+                Some(val) => Ok(val),
+                None => Err(PyError {
+                    kind: PyErrorKind::IndexError,
+                    message: "list index out of range".to_string(),
+                }),
+            }
+        } else if is_tuple(obj) {
+            if !is_int(index) {
+                return Err(PyError::type_error("tuple indices must be integers"));
+            }
+            let idx = w_int_get_value(index);
+            match w_tuple_getitem(obj, idx) {
+                Some(val) => Ok(val),
+                None => Err(PyError {
+                    kind: PyErrorKind::IndexError,
+                    message: "tuple index out of range".to_string(),
+                }),
+            }
+        } else if is_dict(obj) {
+            if !is_int(index) {
+                return Err(PyError::type_error("dict keys must be integers in Phase 1"));
+            }
+            let key = w_int_get_value(index);
+            match w_dict_getitem(obj, key) {
+                Some(val) => Ok(val),
+                None => Err(PyError {
+                    kind: PyErrorKind::KeyError,
+                    message: format!("{key}"),
+                }),
+            }
+        } else {
+            Err(PyError::type_error(format!(
+                "'{}' object is not subscriptable",
+                (*(*obj).ob_type).tp_name,
+            )))
+        }
+    }
+}
+
+/// Set item by index: `obj[index] = value`.
+pub fn py_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_list(obj) {
+            if !is_int(index) {
+                return Err(PyError::type_error("list indices must be integers"));
+            }
+            let idx = w_int_get_value(index);
+            if w_list_setitem(obj, idx, value) {
+                Ok(w_none())
+            } else {
+                Err(PyError {
+                    kind: PyErrorKind::IndexError,
+                    message: "list assignment index out of range".to_string(),
+                })
+            }
+        } else if is_dict(obj) {
+            if !is_int(index) {
+                return Err(PyError::type_error("dict keys must be integers in Phase 1"));
+            }
+            let key = w_int_get_value(index);
+            w_dict_setitem(obj, key, value);
+            Ok(w_none())
+        } else {
+            Err(PyError::type_error(format!(
+                "'{}' object does not support item assignment",
+                (*(*obj).ob_type).tp_name,
+            )))
+        }
+    }
+}
+
+/// Get the length of a container: `len(obj)`.
+pub fn py_len(obj: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_list(obj) {
+            Ok(w_int_new(w_list_len(obj) as i64))
+        } else if is_tuple(obj) {
+            Ok(w_int_new(w_tuple_len(obj) as i64))
+        } else if is_dict(obj) {
+            Ok(w_int_new(w_dict_len(obj) as i64))
+        } else if is_str(obj) {
+            Ok(w_int_new(w_str_get_value(obj).len() as i64))
+        } else {
+            Err(PyError::type_error(format!(
+                "object of type '{}' has no len()",
+                (*(*obj).ob_type).tp_name,
+            )))
+        }
     }
 }
 
@@ -296,5 +653,99 @@ mod tests {
         assert!(!py_is_true(w_none()));
         assert!(py_is_true(w_bool_from(true)));
         assert!(!py_is_true(w_bool_from(false)));
+    }
+
+    #[test]
+    fn test_int_add_overflow() {
+        let a = w_int_new(i64::MAX);
+        let b = w_int_new(1);
+        let result = py_add(a, b).unwrap();
+        unsafe {
+            assert!(is_long(result));
+            assert_eq!(
+                *w_long_get_value(result),
+                BigInt::from(i64::MAX) + BigInt::from(1)
+            );
+        }
+    }
+
+    #[test]
+    fn test_int_sub_overflow() {
+        let a = w_int_new(i64::MIN);
+        let b = w_int_new(1);
+        let result = py_sub(a, b).unwrap();
+        unsafe {
+            assert!(is_long(result));
+            assert_eq!(
+                *w_long_get_value(result),
+                BigInt::from(i64::MIN) - BigInt::from(1)
+            );
+        }
+    }
+
+    #[test]
+    fn test_int_mul_overflow() {
+        let a = w_int_new(i64::MAX);
+        let b = w_int_new(2);
+        let result = py_mul(a, b).unwrap();
+        unsafe {
+            assert!(is_long(result));
+            assert_eq!(
+                *w_long_get_value(result),
+                BigInt::from(i64::MAX) * BigInt::from(2)
+            );
+        }
+    }
+
+    #[test]
+    fn test_long_add() {
+        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
+        let b = w_int_new(100);
+        let result = py_add(a, b).unwrap();
+        unsafe {
+            assert!(is_long(result));
+            assert_eq!(
+                *w_long_get_value(result),
+                BigInt::from(i64::MAX) + BigInt::from(101)
+            );
+        }
+    }
+
+    #[test]
+    fn test_long_demote_to_int() {
+        // long + long that fits back in i64 → W_IntObject
+        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
+        let b = w_int_new(-1);
+        let result = py_add(a, b).unwrap();
+        unsafe {
+            assert!(is_int(result));
+            assert_eq!(w_int_get_value(result), i64::MAX);
+        }
+    }
+
+    #[test]
+    fn test_negate_min_int() {
+        let a = w_int_new(i64::MIN);
+        let result = py_negative(a).unwrap();
+        unsafe {
+            assert!(is_long(result));
+            assert_eq!(*w_long_get_value(result), -BigInt::from(i64::MIN));
+        }
+    }
+
+    #[test]
+    fn test_long_compare() {
+        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
+        let b = w_int_new(i64::MAX);
+        let result = py_compare(a, b, CompareOp::Gt).unwrap();
+        unsafe { assert!(w_bool_get_value(result)) };
+    }
+
+    #[test]
+    fn test_long_truthiness() {
+        assert!(py_is_true(w_long_new(
+            BigInt::from(i64::MAX) + BigInt::from(1)
+        )));
+        assert!(!py_is_true(w_long_new(BigInt::from(0))));
     }
 }
