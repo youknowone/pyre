@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    # majit
+    "majit/majit-ir",
+    "majit/majit-opt",
+    "majit/majit-trace",
+    "majit/majit-codegen",
+    "majit/majit-codegen-cranelift",
+    "majit/majit-gc",
+    "majit/majit-macros",
+    "majit/majit-runtime",
+    "majit/majit-meta",
+    "majit/examples/tlr",
+    "majit/examples/tl",
+    "majit/examples/tla",
+    "majit/examples/tiny2",
+    "majit/examples/tiny3",
+    "majit/examples/tinyframe",
+    "majit/examples/braininterp",
+    "majit/examples/tlc",
+    # pyre
+    "pyre/pyre-object",
+    "pyre/pyre-objspace",
+    "pyre/pyre-bytecode",
+    "pyre/pyre-interp",
+    "pyre/pyre-jit",
+    "pyre/pyre-main",
+]
+
+[workspace.dependencies]
+# pyre internal crates
+pyre-object = { path = "pyre/pyre-object" }
+pyre-objspace = { path = "pyre/pyre-objspace" }
+pyre-bytecode = { path = "pyre/pyre-bytecode" }
+pyre-interp = { path = "pyre/pyre-interp" }
+pyre-jit = { path = "pyre/pyre-jit" }
+
+# RustPython compiler toolchain
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython", branch = "main" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython", branch = "main" }
+
+# majit JIT framework
+majit-meta = { path = "majit/majit-meta" }
+majit-ir = { path = "majit/majit-ir" }
+majit-trace = { path = "majit/majit-trace" }

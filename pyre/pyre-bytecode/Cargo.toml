@@ -1,0 +1,8 @@
+[package]
+name = "pyre-bytecode"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustpython-compiler = { workspace = true }
+rustpython-compiler-core = { workspace = true }

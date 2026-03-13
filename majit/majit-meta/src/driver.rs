@@ -1,8 +1,9 @@
 use crate::jit_state::JitState;
-use crate::meta_interp::{BackEdgeAction, JitHooks, MetaInterp};
+use crate::meta_interp::{BackEdgeAction, MetaInterp};
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
 use crate::TraceAction;
+use majit_ir::Value;
 
 /// High-level JIT driver that automates the tracing lifecycle.
 ///
@@ -134,18 +135,31 @@ impl<S: JitState> JitDriver<S> {
 
         // Fast path: compiled code exists — use cached meta, skip build_meta()
         if self.meta.has_compiled_loop(key) {
-            let live = {
+            let live_values = {
                 let compiled_meta = self.meta.get_compiled_meta(key).unwrap();
                 if !state.is_compatible(compiled_meta) {
                     return false;
                 }
-                state.extract_live(compiled_meta)
+                state.extract_live_values(compiled_meta)
             };
 
             pre_run();
 
-            if let Some((new_values, run_meta)) = self.meta.run_compiled(key, &live) {
-                state.restore(run_meta, &new_values);
+            let result = if let Some(ints) = live_values
+                .iter()
+                .map(|value| match value {
+                    Value::Int(v) => Some(*v),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+            {
+                self.meta.run_compiled_values(key, &ints)
+            } else {
+                self.meta.run_compiled_with_values(key, &live_values)
+            };
+
+            if let Some((new_values, run_meta)) = result {
+                state.restore_values(run_meta, &new_values);
                 return true;
             }
             return false;
@@ -214,5 +228,81 @@ impl<S: JitState> JitDriver<S> {
     /// Check whether a compiled loop exists for a given green key.
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.meta.has_compiled_loop(green_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_ir::{OpCode, OpRef, Value};
+
+    #[derive(Default)]
+    struct TypedRestoreState {
+        restored_values: Vec<Value>,
+        restore_called: bool,
+    }
+
+    impl JitState for TypedRestoreState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {
+            self.restore_called = true;
+        }
+
+        fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
+            self.restored_values = values.to_vec();
+        }
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn back_edge_uses_typed_restore_values_on_compiled_fast_path() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        let key = 7u64;
+
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[]),
+            BackEdgeAction::StartedTracing
+        ));
+
+        {
+            let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
+            let cond = ctx.const_int(1);
+            let value = ctx.const_int(7);
+            let float = ctx.record_op(OpCode::CastIntToFloat, &[value]);
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[float]);
+        }
+        driver.meta.close_and_compile(&[], ());
+        assert!(driver.has_compiled_loop(key));
+
+        let mut state = TypedRestoreState::default();
+        assert!(driver.back_edge(key as usize, &mut state, &(), || {}));
+        assert!(!state.restore_called);
+        assert_eq!(state.restored_values, vec![Value::Float(7.0)]);
     }
 }

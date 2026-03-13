@@ -1,0 +1,13 @@
+[package]
+name = "pyre-interp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pyre-object = { workspace = true }
+pyre-objspace = { workspace = true }
+pyre-bytecode = { workspace = true }
+pyre-jit = { workspace = true }
+majit-meta = { workspace = true }
+majit-ir = { workspace = true }
+num-traits = "0.2"

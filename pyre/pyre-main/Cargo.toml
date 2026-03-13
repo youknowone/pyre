@@ -1,0 +1,9 @@
+[package]
+name = "pyre-main"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pyre-object = { workspace = true }
+pyre-bytecode = { workspace = true }
+pyre-interp = { workspace = true }

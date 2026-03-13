@@ -34,6 +34,8 @@ pub enum BackEdgeAction {
 pub struct CompileResult<'a, M> {
     /// The live values at the point of guard failure (or loop finish).
     pub values: Vec<i64>,
+    /// Typed exit values decoded from the backend deadframe.
+    pub typed_values: Vec<Value>,
     /// The interpreter-specific metadata for this loop.
     pub meta: &'a M,
     /// Backend fail-index for this exit.
@@ -485,6 +487,102 @@ impl<M: Clone> MetaInterp<M> {
         Some((result.outputs, &compiled.meta))
     }
 
+    /// Run the compiled loop and return typed output values.
+    ///
+    /// This is the typed counterpart to [`run_compiled`]. It still uses the
+    /// lightweight raw backend exit path, but preserves mixed `Int` / `Ref` /
+    /// `Float` outputs instead of forcing callers to decode raw words.
+    pub fn run_compiled_values(
+        &mut self,
+        green_key: u64,
+        live_values: &[i64],
+    ) -> Option<(Vec<Value>, &M)> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+
+        io_buffer::io_buffer_discard();
+        let result = self
+            .backend
+            .execute_token_ints_raw(&compiled.token, live_values);
+        io_buffer::io_buffer_discard();
+
+        let fail_index = result.fail_index;
+        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
+
+        if !result.is_finish {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let info = compiled
+                .guard_failures
+                .entry((trace_id, fail_index))
+                .or_insert(GuardFailureInfo {
+                    fail_count: 0,
+                    bridge_compiled: false,
+                });
+            info.fail_count += 1;
+
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] guard failure at key={}, guard={}, count={}",
+                    green_key, fail_index, info.fail_count
+                );
+            }
+
+            self.warm_state.log_guard_failure(fail_index);
+
+            if let Some(ref hook) = self.hooks.on_guard_failure {
+                hook(green_key, fail_index, info.fail_count);
+            }
+        }
+
+        let compiled = self.compiled_loops.get(&green_key).unwrap();
+        Some((result.typed_outputs, &compiled.meta))
+    }
+
+    /// Run the compiled loop with typed live inputs and return typed outputs.
+    ///
+    /// This is the fully typed raw execution path for already-compiled loops.
+    pub fn run_compiled_with_values(
+        &mut self,
+        green_key: u64,
+        live_values: &[Value],
+    ) -> Option<(Vec<Value>, &M)> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+
+        io_buffer::io_buffer_discard();
+        let result = self.backend.execute_token_raw(&compiled.token, live_values);
+        io_buffer::io_buffer_discard();
+
+        let fail_index = result.fail_index;
+        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
+
+        if !result.is_finish {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let info = compiled
+                .guard_failures
+                .entry((trace_id, fail_index))
+                .or_insert(GuardFailureInfo {
+                    fail_count: 0,
+                    bridge_compiled: false,
+                });
+            info.fail_count += 1;
+
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] guard failure at key={}, guard={}, count={}",
+                    green_key, fail_index, info.fail_count
+                );
+            }
+
+            self.warm_state.log_guard_failure(fail_index);
+
+            if let Some(ref hook) = self.hooks.on_guard_failure {
+                hook(green_key, fail_index, info.fail_count);
+            }
+        }
+
+        let compiled = self.compiled_loops.get(&green_key).unwrap();
+        Some((result.typed_outputs, &compiled.meta))
+    }
+
     /// Run compiled code and return detailed guard failure information.
     ///
     /// Unlike `run_compiled`, this returns the full `CompileResult` including
@@ -527,11 +625,33 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let exit_arity = descr.fail_arg_types().len();
+        let exit_types = descr.fail_arg_types();
+        let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let mut values = Vec::with_capacity(exit_arity);
-        for i in 0..exit_arity {
-            values.push(self.backend.get_int_value(&frame, i));
+        let mut typed_values = Vec::with_capacity(exit_arity);
+        for (i, &tp) in exit_types.iter().enumerate() {
+            match tp {
+                Type::Int => {
+                    let value = self.backend.get_int_value(&frame, i);
+                    values.push(value);
+                    typed_values.push(Value::Int(value));
+                }
+                Type::Ref => {
+                    let value = self.backend.get_ref_value(&frame, i);
+                    values.push(value.as_usize() as i64);
+                    typed_values.push(Value::Ref(value));
+                }
+                Type::Float => {
+                    let value = self.backend.get_float_value(&frame, i);
+                    values.push(value.to_bits() as i64);
+                    typed_values.push(Value::Float(value));
+                }
+                Type::Void => {
+                    values.push(0);
+                    typed_values.push(Value::Void);
+                }
+            }
         }
         let exception = ExceptionState {
             exc_class: self.backend.grab_exc_class(&frame),
@@ -540,6 +660,7 @@ impl<M: Clone> MetaInterp<M> {
 
         Some(CompileResult {
             values,
+            typed_values,
             meta: &compiled.meta,
             fail_index,
             trace_id,
@@ -813,7 +934,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
-        fail_values: &[i64],
+        _fail_values: &[i64],
     ) -> bool {
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
@@ -868,7 +989,14 @@ impl<M: Clone> MetaInterp<M> {
         exception: ExceptionState,
     ) -> Option<GuardRecovery> {
         let trace_id = self.compiled_loops.get(&green_key)?.root_trace_id;
-        self.handle_guard_failure_in_trace(green_key, trace_id, fail_index, fail_values, exception)
+        self.handle_guard_failure_in_trace(
+            green_key,
+            trace_id,
+            fail_index,
+            fail_values,
+            None,
+            exception,
+        )
     }
 
     /// Handle a guard failure in a specific compiled trace (root loop or bridge).
@@ -882,6 +1010,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
+        typed_fail_values: Option<&[Value]>,
         exception: ExceptionState,
     ) -> Option<GuardRecovery> {
         let compiled = self.compiled_loops.get(&green_key)?;
@@ -921,6 +1050,7 @@ impl<M: Clone> MetaInterp<M> {
             trace_id,
             fail_index,
             fail_values: fail_values.to_vec(),
+            typed_fail_values: typed_fail_values.map(|values| values.to_vec()),
             reconstructed_frames: reconstructed,
             reconstructed_state,
             materialized_virtuals,
@@ -940,6 +1070,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = result.trace_id;
         let is_finish = result.is_finish;
         let values = result.values.clone();
+        let typed_values = result.typed_values.clone();
         let exception = result.exception.clone();
         let meta = result.meta.clone();
 
@@ -949,8 +1080,14 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Guard failure — recover
-        let recovery =
-            self.handle_guard_failure_in_trace(green_key, trace_id, fail_index, &values, exception);
+        let recovery = self.handle_guard_failure_in_trace(
+            green_key,
+            trace_id,
+            fail_index,
+            &values,
+            Some(&typed_values),
+            exception,
+        );
 
         Some(RunResult::GuardFailure {
             values,
@@ -1002,12 +1139,14 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = result.trace_id;
         let is_finish = result.is_finish;
         let values = result.values.clone();
+        let typed_values = result.typed_values.clone();
         let exception = result.exception.clone();
         let meta = result.meta.clone();
 
         if is_finish {
             return Some(BlackholeRunResult::Finished {
                 values,
+                typed_values: Some(typed_values),
                 meta,
                 via_blackhole: false,
                 exception,
@@ -1019,6 +1158,7 @@ impl<M: Clone> MetaInterp<M> {
             trace_id,
             fail_index,
             &values,
+            Some(&typed_values),
             exception.clone(),
         );
 
@@ -1033,6 +1173,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 fail_values: values,
+                typed_fail_values: Some(typed_values),
                 meta,
                 recovery: initial_recovery,
                 materialized_virtuals: Vec::new(),
@@ -1045,12 +1186,14 @@ impl<M: Clone> MetaInterp<M> {
         match blackhole_result {
             BlackholeResult::Finish(values) => Some(BlackholeRunResult::Finished {
                 values,
+                typed_values: None,
                 meta,
                 via_blackhole: true,
                 exception: blackhole_exception,
             }),
             BlackholeResult::Jump(values) => Some(BlackholeRunResult::Jump {
                 values,
+                typed_values: None,
                 meta,
                 exception: blackhole_exception,
             }),
@@ -1097,12 +1240,14 @@ impl<M: Clone> MetaInterp<M> {
                     fallback_trace_id,
                     fallback_fail_index,
                     &fail_values,
+                    None,
                     blackhole_exception.clone(),
                 );
                 Some(BlackholeRunResult::GuardFailure {
                     trace_id: fallback_trace_id,
                     fail_index: fallback_fail_index,
                     fail_values,
+                    typed_fail_values: None,
                     meta,
                     recovery,
                     materialized_virtuals,
@@ -1132,12 +1277,14 @@ impl<M: Clone> MetaInterp<M> {
                     fallback_trace_id,
                     fallback_fail_index,
                     &fail_values,
+                    None,
                     blackhole_exception.clone(),
                 );
                 Some(BlackholeRunResult::GuardFailure {
                     trace_id: fallback_trace_id,
                     fail_index: fallback_fail_index,
                     fail_values,
+                    typed_fail_values: None,
                     meta,
                     recovery,
                     materialized_virtuals,
@@ -1150,6 +1297,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 fail_values: values,
+                typed_fail_values: Some(typed_values),
                 meta,
                 recovery: initial_recovery,
                 message,
@@ -1305,6 +1453,8 @@ pub struct GuardRecovery {
     pub fail_index: u32,
     /// Raw fail_values from the DeadFrame.
     pub fail_values: Vec<i64>,
+    /// Typed fail values decoded from the backend deadframe, when available.
+    pub typed_fail_values: Option<Vec<Value>>,
     /// Reconstructed interpreter frames (if resume data was available).
     pub reconstructed_frames: Option<Vec<crate::resume::ReconstructedFrame>>,
     /// Full reconstructed state, including materialized virtuals.
@@ -1351,6 +1501,7 @@ pub enum BlackholeRunResult<M> {
     /// The trace produced final values, either directly or via blackhole replay.
     Finished {
         values: Vec<i64>,
+        typed_values: Option<Vec<Value>>,
         meta: M,
         via_blackhole: bool,
         exception: ExceptionState,
@@ -1358,6 +1509,7 @@ pub enum BlackholeRunResult<M> {
     /// The blackhole replay reached a jump back-edge.
     Jump {
         values: Vec<i64>,
+        typed_values: Option<Vec<Value>>,
         meta: M,
         exception: ExceptionState,
     },
@@ -1366,6 +1518,7 @@ pub enum BlackholeRunResult<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: Vec<i64>,
+        typed_fail_values: Option<Vec<Value>>,
         meta: M,
         recovery: Option<GuardRecovery>,
         materialized_virtuals: Vec<MaterializedVirtual>,
@@ -1378,6 +1531,7 @@ pub enum BlackholeRunResult<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: Vec<i64>,
+        typed_fail_values: Option<Vec<Value>>,
         meta: M,
         recovery: Option<GuardRecovery>,
         message: String,
@@ -1444,6 +1598,7 @@ mod tests {
     use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     use majit_codegen::Backend;
     use majit_codegen_cranelift::guard::CraneliftFailDescr;
+    use majit_gc::collector::MiniMarkGC;
     use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
@@ -1979,6 +2134,7 @@ mod tests {
                 bridge_failure_trace_id,
                 bridge_fail_index,
                 &bridge_fail_values,
+                None,
                 bridge_failure_exception,
             )
             .expect("bridge recovery should succeed");
@@ -1989,5 +2145,132 @@ mod tests {
             .expect("bridge resume data should reconstruct frame");
         assert_eq!(reconstructed[0].pc, 555);
         assert_eq!(reconstructed[0].values, vec![ReconstructedValue::Value(1)]);
+    }
+
+    #[test]
+    fn test_run_compiled_detailed_decodes_float_exit_values() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 16;
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(OpCode::Label, &[], OpRef::NONE.0),
+            mk_op(OpCode::CastIntToFloat, &[OpRef(100)], 0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 7);
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+
+        let result = meta
+            .run_compiled_detailed(green_key, &[])
+            .expect("compiled loop should finish");
+        assert!(result.is_finish);
+        assert_eq!(result.values, vec![7.0f64.to_bits() as i64]);
+        assert_eq!(result.typed_values, vec![Value::Float(7.0)]);
+    }
+
+    #[test]
+    fn test_run_compiled_values_preserves_mixed_type_fast_path_outputs() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.backend.set_gc_allocator(Box::new(MiniMarkGC::new()));
+        let green_key = 20;
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(OpCode::Label, &[], OpRef::NONE.0),
+            mk_op(OpCode::Newstr, &[OpRef(100)], 0),
+            mk_op(OpCode::CastIntToFloat, &[OpRef(101)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1), OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 7);
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+
+        let (values, _) = meta
+            .run_compiled_values(green_key, &[])
+            .expect("compiled loop should finish");
+        match values.as_slice() {
+            [Value::Float(value), Value::Ref(gcref)] => {
+                assert_eq!(*value, 7.0);
+                assert!(!gcref.is_null());
+            }
+            other => panic!("unexpected typed outputs: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_compiled_with_values_accepts_float_inputs() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 21;
+        let inputargs = vec![InputArg::new_float(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+
+        let (values, _) = meta
+            .run_compiled_with_values(green_key, &[Value::Float(3.5)])
+            .expect("compiled loop should finish");
+        assert_eq!(values, vec![Value::Float(3.5)]);
+    }
+
+    #[test]
+    fn test_handle_guard_failure_in_trace_preserves_typed_ref_fail_values() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.backend.set_gc_allocator(Box::new(MiniMarkGC::new()));
+        let green_key = 19;
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(OpCode::Label, &[], OpRef::NONE.0),
+            mk_op(OpCode::Newstr, &[OpRef(100)], 0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(101)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 1);
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+
+        let result = meta
+            .run_compiled_detailed(green_key, &[])
+            .expect("guard should fail");
+        assert!(!result.is_finish);
+        let trace_id = result.trace_id;
+        let fail_index = result.fail_index;
+        let exception = result.exception.clone();
+        let typed_values = result.typed_values.clone();
+        let raw_values = result.values.clone();
+        let _ = result;
+        let recovery = meta
+            .handle_guard_failure_in_trace(
+                green_key,
+                trace_id,
+                fail_index,
+                &raw_values,
+                Some(&typed_values),
+                exception,
+            )
+            .expect("recovery should exist");
+
+        match recovery
+            .typed_fail_values
+            .as_deref()
+            .expect("typed fail values should be preserved")
+        {
+            [Value::Ref(gcref)] => {
+                assert!(!gcref.is_null());
+                assert_eq!(raw_values, vec![gcref.as_usize() as i64]);
+            }
+            other => panic!("unexpected typed fail values: {other:?}"),
+        }
     }
 }

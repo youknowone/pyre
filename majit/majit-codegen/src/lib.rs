@@ -16,6 +16,8 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, Type, Value};
 pub struct RawExecResult {
     /// Output values from the guard exit, truncated to `exit_arity`.
     pub outputs: Vec<i64>,
+    /// Typed output values decoded from the exit slots.
+    pub typed_outputs: Vec<Value>,
     /// Backend fail-index for this exit.
     pub fail_index: u32,
     /// Compiled trace identifier for this exit.
@@ -118,25 +120,56 @@ pub trait Backend: Send {
         self.execute_token(token, &values)
     }
 
+    /// Execute compiled code with typed arguments and return a lightweight result.
+    ///
+    /// This preserves mixed `Int` / `Ref` / `Float` arguments while still
+    /// avoiding explicit deadframe decoding in the caller.
+    fn execute_token_raw(&self, token: &LoopToken, args: &[Value]) -> RawExecResult {
+        let frame = self.execute_token(token, args);
+        let descr = self.get_latest_descr(&frame);
+        let exit_arity = descr.fail_arg_types().len();
+        let mut outputs = Vec::with_capacity(exit_arity);
+        let mut typed_outputs = Vec::with_capacity(exit_arity);
+        for (i, &tp) in descr.fail_arg_types().iter().enumerate() {
+            match tp {
+                Type::Int => {
+                    let value = self.get_int_value(&frame, i);
+                    outputs.push(value);
+                    typed_outputs.push(Value::Int(value));
+                }
+                Type::Ref => {
+                    let value = self.get_ref_value(&frame, i);
+                    outputs.push(value.as_usize() as i64);
+                    typed_outputs.push(Value::Ref(value));
+                }
+                Type::Float => {
+                    let value = self.get_float_value(&frame, i);
+                    outputs.push(value.to_bits() as i64);
+                    typed_outputs.push(Value::Float(value));
+                }
+                Type::Void => {
+                    outputs.push(0);
+                    typed_outputs.push(Value::Void);
+                }
+            }
+        }
+        RawExecResult {
+            outputs,
+            typed_outputs,
+            fail_index: descr.fail_index(),
+            trace_id: descr.trace_id(),
+            is_finish: descr.is_finish(),
+        }
+    }
+
     /// Execute compiled code and return a lightweight result without
     /// DeadFrame boxing.
     ///
     /// Returns the output values directly, avoiding the intermediate
     /// DeadFrame heap allocation and the per-value downcast extraction loop.
     fn execute_token_ints_raw(&self, token: &LoopToken, args: &[i64]) -> RawExecResult {
-        let frame = self.execute_token_ints(token, args);
-        let descr = self.get_latest_descr(&frame);
-        let exit_arity = descr.fail_arg_types().len();
-        let mut outputs = Vec::with_capacity(exit_arity);
-        for i in 0..exit_arity {
-            outputs.push(self.get_int_value(&frame, i));
-        }
-        RawExecResult {
-            outputs,
-            fail_index: descr.fail_index(),
-            trace_id: descr.trace_id(),
-            is_finish: descr.is_finish(),
-        }
+        let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
+        self.execute_token_raw(token, &values)
     }
 
     /// Force a frame identified by a `FORCE_TOKEN` result.
