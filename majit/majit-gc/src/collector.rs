@@ -8,12 +8,12 @@
 /// Modeled after incminimark's minor/major collection.
 use majit_ir::GcRef;
 
+use crate::GcAllocator;
 use crate::flags;
-use crate::header::{header_of, GcHeader};
-use crate::nursery::{Nursery, DEFAULT_NURSERY_SIZE};
+use crate::header::{GcHeader, header_of};
+use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
 use crate::oldgen::OldGen;
 use crate::trace::{TypeInfo, TypeRegistry};
-use crate::GcAllocator;
 
 /// Configuration for the MiniMarkGC.
 pub struct GcConfig {

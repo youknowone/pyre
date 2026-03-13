@@ -7,13 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{
     AbiParam, Function, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
 };
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -23,7 +23,7 @@ use cranelift_codegen::ir::Value as CValue;
 use majit_codegen::{AsmInfo, BackendError, DeadFrame, LoopToken};
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
-use majit_gc::{flags as gc_flags, GcAllocator, GcRewriter, WriteBarrierDescr};
+use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr, flags as gc_flags};
 use majit_ir::{
     CallDescr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRef, Type, Value,
 };
@@ -5079,7 +5079,7 @@ mod tests {
     use majit_codegen::Backend;
     use majit_gc::collector::{GcConfig, MiniMarkGC};
     use majit_gc::flags;
-    use majit_gc::header::{header_of, GcHeader};
+    use majit_gc::header::{GcHeader, header_of};
     use majit_gc::trace::TypeInfo;
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
     use std::collections::HashMap;

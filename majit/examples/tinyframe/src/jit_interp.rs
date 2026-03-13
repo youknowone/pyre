@@ -14,7 +14,7 @@ use majit_opt::optimizer::Optimizer;
 use majit_trace::recorder::TraceRecorder;
 use majit_trace::warmstate::{HotResult, WarmState};
 
-use crate::interp::{Code, Object, ADD, JUMP_IF_ABOVE, LOAD, RETURN};
+use crate::interp::{ADD, Code, JUMP_IF_ABOVE, LOAD, Object, RETURN};
 
 const DEFAULT_THRESHOLD: u32 = 3;
 

@@ -8,7 +8,7 @@ use std::alloc::{self, Layout};
 use std::ptr;
 
 use crate::flags;
-use crate::header::{header_of, GcHeader};
+use crate::header::{GcHeader, header_of};
 
 /// A single old-generation allocation record.
 struct OldObject {

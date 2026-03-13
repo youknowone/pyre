@@ -4,8 +4,8 @@
 /// The Backend trait is the contract between the JIT frontend (tracing + optimization)
 /// and the code generation backend (Cranelift, etc.).
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_ir::{FailDescr, GcRef, InputArg, Op, Type, Value};
 
