@@ -10,7 +10,7 @@
 /// - Cache invalidation on calls and side-effecting operations
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use majit_ir::{Op, OpCode, OpRef};
 
@@ -30,6 +30,11 @@ type ArrayItemKey = (OpRef, u32, i64);
 /// Green field optimization: immutable field caches survive cache invalidation
 /// by calls and side-effecting operations. When an immutable field is read from
 /// a constant object, the result is also a constant (green field folding).
+///
+/// Aliasing analysis: objects allocated during the trace (NEW, NEW_WITH_VTABLE,
+/// NEW_ARRAY, etc.) cannot alias each other or pre-existing objects. Their field
+/// caches survive writes to other objects. Objects that haven't escaped (not
+/// passed to calls or stored into the heap) keep their caches across calls.
 pub struct OptHeap {
     /// Cached field values: field_key -> value OpRef.
     cached_fields: HashMap<FieldKey, OpRef>,
@@ -43,7 +48,18 @@ pub struct OptHeap {
     seen_guard_not_invalidated: bool,
     /// Descriptor indices known to be immutable (green fields).
     /// Cached values for these descriptors survive invalidation.
-    immutable_field_descrs: std::collections::HashSet<u32>,
+    immutable_field_descrs: HashSet<u32>,
+
+    // ── Aliasing analysis state ──
+
+    /// Objects allocated during this trace (NEW/NEW_WITH_VTABLE/NEW_ARRAY/etc.).
+    /// These cannot alias each other or pre-existing (input arg) objects.
+    seen_allocation: HashSet<OpRef>,
+    /// Subset of `seen_allocation`: objects that haven't escaped.
+    /// An object escapes when it is passed to a call or stored into another
+    /// object's field via SETFIELD_GC / SETARRAYITEM_GC.
+    /// Caches for unescaped objects survive calls (calls can't access them).
+    unescaped: HashSet<OpRef>,
 }
 
 impl OptHeap {
@@ -54,7 +70,9 @@ impl OptHeap {
             cached_arrayitems: HashMap::new(),
             lazy_setarrayitems: HashMap::new(),
             seen_guard_not_invalidated: false,
-            immutable_field_descrs: std::collections::HashSet::new(),
+            immutable_field_descrs: HashSet::new(),
+            seen_allocation: HashSet::new(),
+            unescaped: HashSet::new(),
         }
     }
 
@@ -109,18 +127,70 @@ impl OptHeap {
         self.force_all_lazy_setarrayitems(ctx);
     }
 
-    /// Invalidate caches for mutable fields/arrays. Called on side-effecting operations.
+    /// Invalidate caches on calls and other side-effecting operations.
     ///
-    /// Immutable (green) field caches survive invalidation: their values never
-    /// change, so calls and stores cannot affect them.
+    /// Caches that survive:
+    /// - Immutable (green) field caches: values never change.
+    /// - Unescaped object caches: calls cannot access objects that haven't
+    ///   been passed to a call or stored into the heap.
     fn invalidate_caches(&mut self) {
-        if self.immutable_field_descrs.is_empty() {
-            self.cached_fields.clear();
+        let has_survivors =
+            !self.immutable_field_descrs.is_empty() || !self.unescaped.is_empty();
+
+        if has_survivors {
+            self.cached_fields.retain(|&(obj, descr_idx), _| {
+                if self.immutable_field_descrs.contains(&descr_idx) {
+                    return true;
+                }
+                if self.unescaped.contains(&obj) {
+                    return true;
+                }
+                false
+            });
+            self.cached_arrayitems
+                .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
         } else {
-            self.cached_fields
-                .retain(|(_obj, descr_idx), _| self.immutable_field_descrs.contains(descr_idx));
+            self.cached_fields.clear();
+            self.cached_arrayitems.clear();
         }
-        self.cached_arrayitems.clear();
+    }
+
+    /// Invalidate field caches affected by a write to `obj` for field `field_idx`.
+    ///
+    /// Uses aliasing analysis: objects allocated in this trace (seen_allocation)
+    /// cannot alias each other. A write to a seen-allocation object only
+    /// invalidates caches for unknown-origin objects with the same field.
+    /// A write to an unknown-origin object invalidates all non-seen-allocation
+    /// caches for that field.
+    fn invalidate_field_caches_for_write(&mut self, obj: OpRef, field_idx: u32) {
+        let obj_is_seen_alloc = self.seen_allocation.contains(&obj);
+
+        self.cached_fields.retain(|&(cached_obj, cached_field), _| {
+            if cached_field != field_idx {
+                return true;
+            }
+            // The exact same (obj, field) entry will be replaced after this,
+            // so removing it here is fine.
+            if cached_obj == obj {
+                return false;
+            }
+            if obj_is_seen_alloc {
+                // Writer is a seen allocation. It can't alias other seen allocations,
+                // so keep their caches. Only invalidate unknown-origin objects.
+                self.seen_allocation.contains(&cached_obj)
+            } else {
+                // Writer is unknown origin. It might alias other unknown-origin
+                // objects, but can't alias seen allocations.
+                self.seen_allocation.contains(&cached_obj)
+            }
+        });
+    }
+
+    /// Mark call arguments as escaped.
+    fn mark_args_escaped(&mut self, op: &Op) {
+        for &arg in &op.args {
+            self.unescaped.remove(&arg);
+        }
     }
 
     // ── Handlers for specific opcodes ──
@@ -165,7 +235,11 @@ impl OptHeap {
             None => return PassResult::Emit(op.clone()),
         };
 
+        let (obj, field_idx) = key;
         let new_value = op.arg(1);
+
+        // The stored value escapes (it becomes reachable via the heap).
+        self.unescaped.remove(&new_value);
 
         // Check if we already have this value cached (writing the same value again).
         if let Some(lazy_op) = self.lazy_setfields.get(&key) {
@@ -181,11 +255,14 @@ impl OptHeap {
             }
         }
 
+        // Aliasing-aware invalidation: only invalidate caches that might
+        // be affected by this write.
+        self.invalidate_field_caches_for_write(obj, field_idx);
+
         // Write-after-write: if there is already a lazy set for this key,
         // replace it (the old write is dead).
         // Either way, store as a new lazy set.
         self.lazy_setfields.insert(key, op.clone());
-        self.cached_fields.remove(&key);
 
         PassResult::Remove
     }
@@ -216,6 +293,10 @@ impl OptHeap {
     }
 
     fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        // The stored value escapes (becomes reachable via the heap).
+        let stored_value = op.arg(2);
+        self.unescaped.remove(&stored_value);
+
         let key = match Self::arrayitem_key(op, ctx) {
             Some(k) => k,
             None => {
@@ -249,8 +330,16 @@ impl OptHeap {
 
     /// Handle operations that may have side effects.
     /// Forces lazy sets and invalidates caches as needed.
+    /// Tracks allocations for aliasing analysis.
     fn handle_side_effects(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         let opcode = op.opcode;
+
+        // Track allocations for aliasing analysis.
+        if opcode.is_malloc() {
+            self.seen_allocation.insert(op.pos);
+            self.unescaped.insert(op.pos);
+            return PassResult::Emit(op.clone());
+        }
 
         // Guards: force lazy sets but keep caches (guards don't mutate the heap).
         if opcode.is_guard() {
@@ -264,8 +353,9 @@ impl OptHeap {
             return PassResult::Emit(op.clone());
         }
 
-        // Calls: force lazy sets and invalidate caches.
+        // Calls: mark arguments as escaped, force lazy sets, and invalidate.
         if opcode.is_call() {
+            self.mark_args_escaped(op);
             self.force_all_lazy(ctx);
             self.invalidate_caches();
             return PassResult::Emit(op.clone());
@@ -350,6 +440,8 @@ impl OptimizationPass for OptHeap {
         self.lazy_setarrayitems.clear();
         self.seen_guard_not_invalidated = false;
         self.immutable_field_descrs.clear();
+        self.seen_allocation.clear();
+        self.unescaped.clear();
     }
 
     fn flush(&mut self) {
@@ -364,6 +456,8 @@ impl OptimizationPass for OptHeap {
         self.cached_arrayitems.clear();
         self.lazy_setarrayitems.clear();
         self.immutable_field_descrs.clear();
+        self.seen_allocation.clear();
+        self.unescaped.clear();
     }
 
     fn name(&self) -> &'static str {
@@ -1037,5 +1131,262 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::GetfieldGcI);
         assert_eq!(result[2].opcode, OpCode::CallN);
         assert_eq!(result[3].opcode, OpCode::Jump);
+    }
+
+    // ── Aliasing analysis tests ──
+
+    // ── Test 24: Two NEW objects don't alias — write to one preserves cache of the other ──
+
+    #[test]
+    fn test_seen_allocation_no_alias() {
+        // p0 = new()
+        // p1 = new()
+        // setfield_gc(p0, i10, descr=d0)
+        // i1 = getfield_gc_i(p0, descr=d0)   <- cached from set
+        // setfield_gc(p1, i20, descr=d0)      <- same field, different seen alloc
+        // i2 = getfield_gc_i(p0, descr=d0)   <- still cached! p1 can't alias p0
+        let d = descr(0);
+        let mut ops = vec![
+            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
+            Op::new(OpCode::New, &[]),                                              // pos=1 -> p1
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),  // set p0.f = i10
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),            // read p0.f -> cached
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(20)], d.clone()),  // set p1.f = i20
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),            // read p0.f -> still cached
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // NEW + NEW + SETFIELD(p0) + SETFIELD(p1) + Jump.
+        // Both GETFIELDs eliminated (p0 cache survives write to p1).
+        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
+        assert!(
+            !opcodes.contains(&OpCode::GetfieldGcI),
+            "both GETFIELDs should be eliminated, got: {opcodes:?}"
+        );
+        assert_eq!(
+            result.iter().filter(|o| o.opcode == OpCode::SetfieldGc).count(),
+            2
+        );
+    }
+
+    // ── Test 25: Unknown-origin object write invalidates other unknown caches ──
+
+    #[test]
+    fn test_unknown_object_write_invalidates() {
+        // p0 = InputRef(100), p1 = InputRef(200)  — both unknown origin
+        // i1 = getfield_gc_i(p0, descr=d0)
+        // setfield_gc(p1, i20, descr=d0)   <- p1 is unknown, might alias p0
+        // i2 = getfield_gc_i(p0, descr=d0) <- must re-emit (might have been clobbered)
+        let d = descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(200), OpRef(20)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // GETFIELD + SETFIELD + GETFIELD (re-emitted) + Jump.
+        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        assert_eq!(get_count, 2, "second GETFIELD must be re-emitted for unknown-origin objects");
+    }
+
+    // ── Test 26: Unescaped allocation's cache survives call ──
+
+    #[test]
+    fn test_unescaped_survives_call() {
+        // p0 = new()
+        // setfield_gc(p0, i10, descr=d0)
+        // call_n(some_func)               <- p0 NOT passed to call
+        // i1 = getfield_gc_i(p0, descr=d0) <- still cached (p0 is unescaped)
+        let d = descr(0);
+        let mut ops = vec![
+            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),                                  // some unrelated func
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // NEW + SETFIELD(forced by call) + CALL + Jump.
+        // GETFIELD eliminated (unescaped object cache survives call).
+        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
+        assert!(
+            !opcodes.contains(&OpCode::GetfieldGcI),
+            "GETFIELD should be eliminated for unescaped object, got: {opcodes:?}"
+        );
+    }
+
+    // ── Test 27: Escaped allocation's cache is invalidated by call ──
+
+    #[test]
+    fn test_escaped_invalidated_by_call() {
+        // p0 = new()
+        // setfield_gc(p0, i10, descr=d0)
+        // call_n(p0)                       <- p0 is passed to call, escapes
+        // i1 = getfield_gc_i(p0, descr=d0) <- must re-emit (call might have modified p0)
+        let d = descr(0);
+        let mut ops = vec![
+            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(0)]),                                    // pass p0 to call
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // NEW + SETFIELD + CALL + GETFIELD (re-emitted) + Jump.
+        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        assert_eq!(get_count, 1, "GETFIELD must be re-emitted after escape via call");
+    }
+
+    // ── Test 28: SetfieldGc marks stored value as escaped ──
+
+    #[test]
+    fn test_setfield_marks_escape() {
+        // p0 = new()       <- unescaped
+        // p1 = new()       <- unescaped
+        // setfield_gc(p0, i10, descr=d0)
+        // setfield_gc(p1, p0, descr=d1)   <- p0 is stored into p1's field, p0 escapes
+        // call_n(p1)                       <- p1 escapes; p0 already escaped via setfield
+        // i1 = getfield_gc_i(p0, descr=d0) <- must re-emit (p0 escaped)
+        let d0 = descr(0);
+        let d1 = descr(1);
+        let mut ops = vec![
+            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
+            Op::new(OpCode::New, &[]),                                              // pos=1 -> p1
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d0.clone()), // p0.f0 = i10
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(0)], d1.clone()),  // p1.f1 = p0 (p0 escapes)
+            Op::new(OpCode::CallN, &[OpRef(1)]),                                    // call(p1) (p1 escapes)
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d0.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // p0 escaped via setfield, so its cache is invalidated by the call.
+        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        assert_eq!(get_count, 1, "GETFIELD must be re-emitted after p0 escaped via setfield");
+    }
+
+    // ── Test 29: Seen-allocation cache survives write from unknown-origin object ──
+
+    #[test]
+    fn test_seen_alloc_survives_unknown_write() {
+        // p0 = new()
+        // setfield_gc(p0, i10, descr=d0)
+        // setfield_gc(p_unknown, i20, descr=d0)  <- unknown-origin write, same field
+        // i1 = getfield_gc_i(p0, descr=d0)       <- still cached (p0 is seen alloc, can't alias unknown)
+        let d = descr(0);
+        let mut ops = vec![
+            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(20)], d.clone()), // unknown object
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // NEW + SETFIELD(p0) + SETFIELD(unknown) + Jump.
+        // GETFIELD eliminated (p0 cache survives write to unknown object).
+        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
+        assert!(
+            !opcodes.contains(&OpCode::GetfieldGcI),
+            "GETFIELD should be eliminated for seen-alloc object, got: {opcodes:?}"
+        );
+    }
+
+    // ── Test 30: Different field descriptors are not affected by aliasing ──
+
+    #[test]
+    fn test_aliasing_different_fields_independent() {
+        // Even with unknown-origin objects, writes to field d0 don't
+        // invalidate caches for field d1.
+        let d0 = descr(0);
+        let d1 = descr(1);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(200), OpRef(20)], d0.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()), // different field
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // GETFIELD(d1) + SETFIELD(d0) + Jump. Second GETFIELD eliminated.
+        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        assert_eq!(get_count, 1, "write to d0 should not invalidate d1 cache");
+    }
+
+    // ── Test 31: Unescaped array cache survives call ──
+
+    #[test]
+    fn test_unescaped_array_survives_call() {
+        // p0 = new_array(5)
+        // setarrayitem_gc(p0, idx, i10, descr=d0)
+        // call_n(some_func)                <- p0 not passed
+        // i1 = getarrayitem_gc_i(p0, idx, descr=d0) <- still cached
+        let d = descr(0);
+        let idx = OpRef(50);
+        let mut ops = vec![
+            Op::new(OpCode::NewArray, &[OpRef(5)]),                                     // pos=0 -> p0
+            Op::with_descr(OpCode::SetarrayitemGc, &[OpRef(0), idx, OpRef(10)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(0), idx], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(idx, majit_ir::Value::Int(3));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Remove => {}
+                PassResult::Replace(replaced) => { ctx.emit(replaced); }
+                PassResult::PassOn => { ctx.emit(resolved); }
+            }
+        }
+
+        let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
+        assert!(
+            !opcodes.contains(&OpCode::GetarrayitemGcI),
+            "GETARRAYITEM should be eliminated for unescaped array, got: {opcodes:?}"
+        );
+    }
+
+    // ── Test 32: Multiple calls — unescaped object stays cached ──
+
+    #[test]
+    fn test_unescaped_survives_multiple_calls() {
+        // p0 = new()
+        // setfield_gc(p0, i10, descr=d0)
+        // call_n(f1)
+        // call_n(f2)
+        // i1 = getfield_gc_i(p0, descr=d0) <- still cached
+        let d = descr(0);
+        let mut ops = vec![
+            Op::new(OpCode::New, &[]),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::new(OpCode::CallN, &[OpRef(201)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
+        assert!(
+            !opcodes.contains(&OpCode::GetfieldGcI),
+            "GETFIELD should be eliminated for unescaped object across multiple calls, got: {opcodes:?}"
+        );
     }
 }
