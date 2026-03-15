@@ -608,6 +608,17 @@ impl OptimizationPass for OptHeap {
                 PassResult::Remove
             }
 
+            // ── GC_LOAD / GC_LOAD_INDEXED: generic memory loads ──
+            // These could read from any field/array slot, so force all
+            // pending lazy writes to ensure correct values.
+            OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF
+            | OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
+                self.force_all_lazy_setfields(ctx);
+                self.force_all_lazy_setarrayitems(ctx);
+                self.known_nonnull.insert(op.arg(0));
+                PassResult::Emit(op.clone())
+            }
+
             // ── SETFIELD_RAW / SETARRAYITEM_RAW: no effect on GC caches ──
             OpCode::SetfieldRaw | OpCode::SetarrayitemRaw => PassResult::Emit(op.clone()),
 
@@ -2139,7 +2150,49 @@ mod tests {
         assert_eq!(gni_count, 1, "GUARD_NOT_INVALIDATED should be emitted");
     }
 
-    // ── Test 50: QUASIIMMUT_FIELD on field 0 doesn't affect field 1 ──
+    // ── Test 50: GC_LOAD forces lazy setfields ──
+
+    #[test]
+    fn test_gc_load_forces_lazy_setfields() {
+        // setfield_gc(p0, i1, descr=d0)   <- lazy, not emitted yet
+        // i2 = gc_load_i(p1, offset, size) <- generic load, forces all lazy writes
+        // The SETFIELD must be emitted before the GC_LOAD.
+        let d = descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d.clone()),
+            Op::new(OpCode::GcLoadI, &[OpRef(200), OpRef(8), OpRef(4)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // SETFIELD (forced by GcLoadI) + GcLoadI + Jump.
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[1].opcode, OpCode::GcLoadI);
+        assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    // ── Test 51: GC_LOAD marks base as nonnull ──
+
+    #[test]
+    fn test_gc_load_marks_nonnull() {
+        // i1 = gc_load_i(p0, offset, size)  <- dereferences p0, so p0 is nonnull
+        // guard_nonnull(p0)                  <- redundant
+        let mut ops = vec![
+            Op::new(OpCode::GcLoadI, &[OpRef(100), OpRef(8), OpRef(4)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 0, "guard_nonnull after gc_load should be removed");
+    }
+
+    // ── Test 52: QUASIIMMUT_FIELD on field 0 doesn't affect field 1 ──
 
     #[test]
     fn test_quasiimmut_field_different_field_not_cached() {
