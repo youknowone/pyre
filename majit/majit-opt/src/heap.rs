@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRef, OopSpecIndex};
 
 use crate::{OptContext, OptimizationPass, PassResult};
 
@@ -81,6 +81,11 @@ pub struct OptHeap {
     /// Cache for loop-invariant call results: (descr_index, args_hash) -> result OpRef.
     /// Survives calls and side-effecting operations (only cleared on setup).
     loopinvariant_cache: HashMap<(u32, u64), OpRef>,
+
+    /// Fields known to be quasi-immutable: (obj, field_idx) -> cached value OpRef.
+    /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
+    /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
+    quasi_immut_cache: HashMap<FieldKey, OpRef>,
 }
 
 impl OptHeap {
@@ -96,6 +101,7 @@ impl OptHeap {
             unescaped: HashSet::new(),
             known_nonnull: HashSet::new(),
             loopinvariant_cache: HashMap::new(),
+            quasi_immut_cache: HashMap::new(),
         }
     }
 
@@ -218,6 +224,40 @@ impl OptHeap {
         });
     }
 
+    /// Invalidate only array cache entries affected by an ARRAYCOPY/ARRAYMOVE.
+    ///
+    /// Instead of clearing all array caches, only remove entries for the
+    /// destination array within the copied index range. Entries for other
+    /// arrays, or entries outside the range, are kept.
+    fn invalidate_array_caches_for_copy(
+        &mut self,
+        dest_ref: OpRef,
+        dest_start: Option<i64>,
+        length: Option<i64>,
+    ) {
+        self.cached_arrayitems.retain(|&(obj, _descr_idx, index), _| {
+            if obj != dest_ref {
+                return true; // different array, keep
+            }
+            // If we know both start and length, only invalidate entries within range
+            if let (Some(start), Some(len)) = (dest_start, length) {
+                if index < start || index >= start + len {
+                    return true; // outside copy range, keep
+                }
+            }
+            false // within range or unknown range, invalidate
+        });
+    }
+
+    /// Extract OopSpecIndex from a call op's descriptor, if available.
+    fn get_oopspec_index(op: &Op) -> OopSpecIndex {
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .map(|cd| cd.effect_info().oopspec_index)
+            .unwrap_or(OopSpecIndex::None)
+    }
+
     /// Mark call arguments as escaped.
     fn mark_args_escaped(&mut self, op: &Op) {
         for &arg in &op.args {
@@ -254,6 +294,22 @@ impl OptHeap {
             let cached = ctx.get_replacement(cached);
             ctx.replace_op(op.pos, cached);
             return PassResult::Remove;
+        }
+
+        // Check quasi-immutable cache: if this field was marked by
+        // QUASIIMMUT_FIELD, the value is stable (guarded by GUARD_NOT_INVALIDATED).
+        if let Some(&qi_cached) = self.quasi_immut_cache.get(&key) {
+            if !qi_cached.is_none() {
+                // Subsequent read: reuse the cached value.
+                let qi_cached = ctx.get_replacement(qi_cached);
+                ctx.replace_op(op.pos, qi_cached);
+                return PassResult::Remove;
+            }
+            // First read after QUASIIMMUT_FIELD: emit the load, then cache
+            // the result so it survives calls (unlike normal mutable fields).
+            self.quasi_immut_cache.insert(key, op.pos);
+            self.cached_fields.insert(key, op.pos);
+            return PassResult::Emit(op.clone());
         }
 
         // Cache miss: emit the load and cache the result.
@@ -431,10 +487,54 @@ impl OptHeap {
 
         // Calls: mark arguments as escaped, force lazy sets, and invalidate.
         if opcode.is_call() {
-            self.mark_args_escaped(op);
-            self.force_all_lazy(ctx);
-            self.invalidate_caches();
-            return PassResult::Emit(op.clone());
+            let oopspec = Self::get_oopspec_index(op);
+            match oopspec {
+                OopSpecIndex::Arraycopy | OopSpecIndex::Arraymove => {
+                    // ARRAYCOPY/ARRAYMOVE: only invalidate affected array entries.
+                    // Call args: [func_addr, source, dest, source_start, dest_start, length, ...]
+                    // args[2] = dest array, args[4] = dest_start, args[5] = length
+                    self.mark_args_escaped(op);
+                    self.force_all_lazy(ctx);
+
+                    let dest_ref = if op.args.len() > 2 { op.arg(2) } else { OpRef::NONE };
+                    let dest_start = if op.args.len() > 4 {
+                        ctx.get_constant_int(op.arg(4))
+                    } else {
+                        None
+                    };
+                    let length = if op.args.len() > 5 {
+                        ctx.get_constant_int(op.arg(5))
+                    } else {
+                        None
+                    };
+
+                    if !dest_ref.is_none() {
+                        self.invalidate_array_caches_for_copy(dest_ref, dest_start, length);
+                    } else {
+                        self.invalidate_caches();
+                    }
+
+                    // Field caches and nonnull are not affected by arraycopy,
+                    // but we still invalidate field caches conservatively.
+                    self.cached_fields.retain(|&(obj, descr_idx), _| {
+                        if self.immutable_field_descrs.contains(&descr_idx) {
+                            return true;
+                        }
+                        if self.unescaped.contains(&obj) {
+                            return true;
+                        }
+                        false
+                    });
+
+                    return PassResult::Emit(op.clone());
+                }
+                _ => {
+                    self.mark_args_escaped(op);
+                    self.force_all_lazy(ctx);
+                    self.invalidate_caches();
+                    return PassResult::Emit(op.clone());
+                }
+            }
         }
 
         // Other side-effecting ops: force and invalidate.
@@ -497,6 +597,13 @@ impl OptimizationPass for OptHeap {
                     self.force_all_lazy(ctx);
                     ctx.emit(guard_op);
                 }
+                // Mark this (obj, field) as quasi-immutable for subsequent GETFIELD.
+                // The value is not yet known; it will be captured on the first read.
+                let obj = op.arg(0);
+                if let Some(descr) = &op.descr {
+                    let field_idx = descr.index();
+                    self.quasi_immut_cache.insert((obj, field_idx), OpRef::NONE);
+                }
                 // The QUASIIMMUT_FIELD itself is a no-op marker.
                 PassResult::Remove
             }
@@ -526,6 +633,7 @@ impl OptimizationPass for OptHeap {
         self.unescaped.clear();
         self.known_nonnull.clear();
         self.loopinvariant_cache.clear();
+        self.quasi_immut_cache.clear();
     }
 
     fn flush(&mut self) {
@@ -544,6 +652,7 @@ impl OptimizationPass for OptHeap {
         self.unescaped.clear();
         self.known_nonnull.clear();
         self.loopinvariant_cache.clear();
+        self.quasi_immut_cache.clear();
     }
 
     fn name(&self) -> &'static str {
@@ -555,7 +664,9 @@ impl OptimizationPass for OptHeap {
 mod tests {
     use std::sync::Arc;
 
-    use majit_ir::{Descr, DescrRef, Op, OpCode, OpRef};
+    use majit_ir::{
+        CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Op, OpCode, OpRef,
+    };
 
     use crate::optimizer::Optimizer;
     use crate::{OptContext, OptimizationPass, PassResult};
@@ -1805,5 +1916,253 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(nonnull_count, 0, "guard_nonnull after new_array should be removed");
+    }
+
+    // ── Call descriptor with OopSpecIndex for arraycopy tests ──
+
+    /// Call descriptor with configurable EffectInfo for testing.
+    #[derive(Debug)]
+    struct TestCallDescr {
+        idx: u32,
+        effect: EffectInfo,
+    }
+
+    impl Descr for TestCallDescr {
+        fn index(&self) -> u32 {
+            self.idx
+        }
+        fn as_call_descr(&self) -> Option<&dyn CallDescr> {
+            Some(self)
+        }
+    }
+
+    impl CallDescr for TestCallDescr {
+        fn arg_types(&self) -> &[majit_ir::Type] {
+            &[]
+        }
+        fn result_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Void
+        }
+        fn result_size(&self) -> usize {
+            0
+        }
+        fn effect_info(&self) -> &EffectInfo {
+            &self.effect
+        }
+    }
+
+    fn arraycopy_descr(idx: u32) -> DescrRef {
+        Arc::new(TestCallDescr {
+            idx,
+            effect: EffectInfo {
+                extra_effect: ExtraEffect::CanRaise,
+                oopspec_index: OopSpecIndex::Arraycopy,
+            },
+        })
+    }
+
+    // ── ARRAYCOPY cache invalidation tests ──
+
+    // ── Test 47: ARRAYCOPY only invalidates destination range ──
+
+    #[test]
+    fn test_arraycopy_only_invalidates_dest_range() {
+        // p_src = OpRef(100), p_dst = OpRef(200)
+        // setarrayitem_gc(p_dst, idx=0, val=i10)   <- cache dest[0]
+        // setarrayitem_gc(p_dst, idx=5, val=i11)   <- cache dest[5]
+        // call_n(arraycopy_func, p_src, p_dst, src_start=0, dst_start=2, length=3)
+        //   -> copies to dest[2..5], so dest[0] survives, dest[5] survives
+        // getarrayitem_gc_i(p_dst, idx=0)           <- still cached
+        // getarrayitem_gc_i(p_dst, idx=5)           <- still cached
+        let d = descr(0);
+        let ac_d = arraycopy_descr(50);
+        let idx0 = OpRef(60);
+        let idx5 = OpRef(61);
+        let dst_start_ref = OpRef(62);
+        let length_ref = OpRef(63);
+        let src_start_ref = OpRef(64);
+
+        let mut ops = vec![
+            // pos=0: setarrayitem_gc(dst, idx=0, val)
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(200), idx0, OpRef(10)],
+                d.clone(),
+            ),
+            // pos=1: setarrayitem_gc(dst, idx=5, val)
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(200), idx5, OpRef(11)],
+                d.clone(),
+            ),
+            // pos=2: call_n(func, src, dst, src_start, dst_start, length)
+            Op::with_descr(
+                OpCode::CallN,
+                &[OpRef(300), OpRef(100), OpRef(200), src_start_ref, dst_start_ref, length_ref],
+                ac_d,
+            ),
+            // pos=3: getarrayitem_gc_i(dst, idx=0)
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx0], d.clone()),
+            // pos=4: getarrayitem_gc_i(dst, idx=5)
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx5], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(idx0, majit_ir::Value::Int(0));
+        ctx.make_constant(idx5, majit_ir::Value::Int(5));
+        ctx.make_constant(dst_start_ref, majit_ir::Value::Int(2));
+        ctx.make_constant(length_ref, majit_ir::Value::Int(3));
+        ctx.make_constant(src_start_ref, majit_ir::Value::Int(0));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Remove => {}
+                PassResult::Replace(replaced) => { ctx.emit(replaced); }
+                PassResult::PassOn => { ctx.emit(resolved); }
+            }
+        }
+
+        // Both GETARRAYITEMs should be eliminated (dest[0] and dest[5] are outside [2..5)).
+        let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
+        let get_count = opcodes.iter().filter(|&&o| o == OpCode::GetarrayitemGcI).count();
+        assert_eq!(
+            get_count, 0,
+            "dest[0] and dest[5] outside copy range [2..5) should be cached, got: {opcodes:?}"
+        );
+    }
+
+    // ── Test 48: ARRAYCOPY with unknown length invalidates all dest entries ──
+
+    #[test]
+    fn test_arraycopy_unknown_range_invalidates_all() {
+        // setarrayitem_gc(p_dst, idx=0, val=i10)
+        // call_n(arraycopy_func, src, dst, src_start, dst_start, length)
+        //   length is NOT a constant -> invalidates all dest array entries
+        // getarrayitem_gc_i(p_dst, idx=0)   <- must re-emit
+        let d = descr(0);
+        let ac_d = arraycopy_descr(50);
+        let idx0 = OpRef(60);
+        let dst_start_ref = OpRef(62);
+        let length_ref = OpRef(63); // NOT constant
+        let src_start_ref = OpRef(64);
+
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(200), idx0, OpRef(10)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::CallN,
+                &[OpRef(300), OpRef(100), OpRef(200), src_start_ref, dst_start_ref, length_ref],
+                ac_d,
+            ),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx0], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(idx0, majit_ir::Value::Int(0));
+        ctx.make_constant(dst_start_ref, majit_ir::Value::Int(2));
+        ctx.make_constant(src_start_ref, majit_ir::Value::Int(0));
+        // length_ref is NOT a constant
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Remove => {}
+                PassResult::Replace(replaced) => { ctx.emit(replaced); }
+                PassResult::PassOn => { ctx.emit(resolved); }
+            }
+        }
+
+        // GETARRAYITEM must be re-emitted (unknown length invalidates all dest entries).
+        let get_count = ctx.new_operations.iter()
+            .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "unknown arraycopy length must invalidate all dest array entries"
+        );
+    }
+
+    // ── Quasi-immutable field tests ──
+
+    // ── Test 49: QUASIIMMUT_FIELD caches value across calls ──
+
+    #[test]
+    fn test_quasiimmut_field_caches_value() {
+        // quasiimmut_field(p0, descr=d0)
+        // i1 = getfield_gc_i(p0, descr=d0)   <- first read, cached as quasi-immut
+        // call_n(some_func)                   <- would normally invalidate, but quasi-immut survives
+        // i2 = getfield_gc_i(p0, descr=d0)   <- reuses cached value
+        let d = descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::QuasiimmutField, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // GUARD_NOT_INVALIDATED + GETFIELD (first read) + CALL + Jump.
+        // Second GETFIELD eliminated (quasi-immut cache survives call).
+        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        assert_eq!(
+            get_count, 1,
+            "second GETFIELD after call should be eliminated for quasi-immutable field"
+        );
+        // GUARD_NOT_INVALIDATED should be emitted.
+        let gni_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNotInvalidated)
+            .count();
+        assert_eq!(gni_count, 1, "GUARD_NOT_INVALIDATED should be emitted");
+    }
+
+    // ── Test 50: QUASIIMMUT_FIELD on field 0 doesn't affect field 1 ──
+
+    #[test]
+    fn test_quasiimmut_field_different_field_not_cached() {
+        // quasiimmut_field(p0, descr=d0)      <- marks field 0 as quasi-immut
+        // i1 = getfield_gc_i(p0, descr=d1)   <- different field, NOT quasi-immut
+        // call_n(some_func)
+        // i2 = getfield_gc_i(p0, descr=d1)   <- must re-emit (d1 is mutable)
+        let d0 = descr(0);
+        let d1 = descr(1);
+        let mut ops = vec![
+            Op::with_descr(OpCode::QuasiimmutField, &[OpRef(100)], d0),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // GUARD_NOT_INVALIDATED + GETFIELD(d1) + CALL + GETFIELD(d1, re-emitted) + Jump.
+        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        assert_eq!(
+            get_count, 2,
+            "quasi-immut on field 0 should not affect field 1"
+        );
     }
 }
