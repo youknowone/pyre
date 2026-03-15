@@ -161,6 +161,7 @@ impl majit_ir::CallDescr for CallAssemblerDescr {
 struct RegisteredLoopTarget {
     trace_id: u64,
     header_pc: u64,
+    green_key: u64,
     source_guard: Option<(u64, u32)>,
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     code_ptr: *const u8,
@@ -905,6 +906,14 @@ const CALL_ASSEMBLER_OUTCOME_DEADFRAME: i64 = 1;
 /// to completion, returning the result as an i64.
 static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::new();
 
+/// Bridge compilation callback: (frame_ptr, fail_index, trace_id, green_key) -> result.
+/// Called when a call_assembler guard fails enough times to warrant bridge compilation.
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<extern "C" fn(i64, u32, u64, u64) -> i64> =
+    OnceLock::new();
+
+/// Guard failure threshold before triggering bridge compilation.
+const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
+
 thread_local! {
     /// Thread-local cache for call_assembler target lookups.
     /// The HashMap holds Arc ownership; CA_FAST_PTR caches a raw pointer
@@ -967,6 +976,10 @@ fn invalidate_ca_thread_cache(token_number: u64) {
 /// Register a force callback for call_assembler guard failures.
 pub fn register_call_assembler_force(f: extern "C" fn(i64) -> i64) {
     let _ = CALL_ASSEMBLER_FORCE_FN.set(f);
+}
+
+pub fn register_call_assembler_bridge(f: extern "C" fn(i64, u32, u64, u64) -> i64) {
+    let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
 const CALL_ASSEMBLER_DEADFRAME_SENTINEL: u32 = u32::MAX - 1;
@@ -1186,6 +1199,7 @@ fn register_call_assembler_target(
     let target = RegisteredLoopTarget {
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
+        green_key: 0, // Populated by the meta-interp layer if needed
         source_guard: None,
         caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: compiled.code_ptr,
@@ -1754,7 +1768,7 @@ fn call_assembler_fast_path(
         };
     }
 
-    // Guard failure — use force callback directly
+    // Guard failure — force callee frame through interpreter
     fail_descr.increment_fail_count();
     release_force_token(handle);
 
@@ -1819,8 +1833,10 @@ fn call_assembler_fast_path_heap(
         };
     }
 
+    // Guard failure — force callee frame through interpreter
     fail_descr.increment_fail_count();
     release_force_token(handle);
+
     let callee_frame_ptr = outputs[0];
     let result = force_fn(callee_frame_ptr);
     unsafe {
@@ -6069,8 +6085,13 @@ impl CraneliftBackend {
                             let items_total = builder.ins().imul(len, item_size);
                             builder.ins().iadd_imm(items_total, 16)
                         } else {
-                            // Fixed-size object: use descriptor's size_of if available, else 16
-                            builder.ins().iconst(cl_types::I64, 16)
+                            // Fixed-size object: use SizeDescr if available, else 16
+                            let alloc_size = op
+                                .descr
+                                .as_ref()
+                                .and_then(|d| d.as_size_descr())
+                                .map_or(16, |sd| sd.size() as i64);
+                            builder.ins().iconst(cl_types::I64, alloc_size)
                         };
 
                     let result = emit_host_call(

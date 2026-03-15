@@ -50,6 +50,9 @@ pub struct OptContext {
     pub constants: Vec<Option<Value>>,
     /// Forwarding chain: maps old OpRef to replacement OpRef.
     pub forwarding: Vec<OpRef>,
+    /// Number of input arguments, used to offset emitted op positions
+    /// so that variable indices don't collide with input arg indices.
+    num_inputs: u32,
 }
 
 impl OptContext {
@@ -58,15 +61,31 @@ impl OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
             forwarding: Vec::new(),
+            num_inputs: 0,
+        }
+    }
+
+    pub fn with_num_inputs(estimated_ops: usize, num_inputs: usize) -> Self {
+        OptContext {
+            new_operations: Vec::with_capacity(estimated_ops),
+            constants: Vec::new(),
+            forwarding: Vec::new(),
+            num_inputs: num_inputs as u32,
         }
     }
 
     /// Emit an operation to the output.
-    pub fn emit(&mut self, op: Op) -> OpRef {
+    ///
+    /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
+    /// so the backend's variable numbering stays consistent.
+    pub fn emit(&mut self, mut op: Op) -> OpRef {
         let idx = self.new_operations.len();
-        let opref = OpRef(idx as u32);
+        let pos_ref = OpRef(self.num_inputs + idx as u32);
+        if op.pos.is_none() {
+            op.pos = pos_ref;
+        }
         self.new_operations.push(op);
-        opref
+        pos_ref
     }
 
     /// Record that `old` should be replaced by `new` wherever it appears.

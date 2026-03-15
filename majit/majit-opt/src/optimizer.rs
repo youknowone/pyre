@@ -44,8 +44,20 @@ impl Optimizer {
         ops: &[Op],
         constants: &mut std::collections::HashMap<u32, i64>,
     ) -> Vec<Op> {
+        self.optimize_with_constants_and_inputs(ops, constants, 0)
+    }
+
+    /// Like `optimize_with_constants`, but also takes `num_inputs` so that
+    /// ops emitted by the optimizer (e.g. from force_virtual) get pos values
+    /// that don't collide with input argument variable indices.
+    pub fn optimize_with_constants_and_inputs(
+        &mut self,
+        ops: &[Op],
+        constants: &mut std::collections::HashMap<u32, i64>,
+        num_inputs: usize,
+    ) -> Vec<Op> {
         use majit_ir::{OpRef, Value};
-        let mut ctx = OptContext::new(ops.len());
+        let mut ctx = OptContext::with_num_inputs(ops.len(), num_inputs);
 
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {
