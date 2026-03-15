@@ -94,8 +94,8 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
         state.pending_fields,
         vec![majit_meta::resume::ResolvedPendingFieldWrite {
             descr_index: 5,
-            target: 7,
-            value: 123,
+            target: majit_meta::resume::MaterializedValue::Value(7),
+            value: majit_meta::resume::MaterializedValue::Value(123),
             item_index: Some(2),
         }]
     );
@@ -104,7 +104,10 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
         majit_meta::resume::MaterializedVirtual::Obj {
             type_id: 1,
             descr_index: 3,
-            fields: vec![(0, 88), (1, 99)],
+            fields: vec![
+                (0, majit_meta::resume::MaterializedValue::Value(88)),
+                (1, majit_meta::resume::MaterializedValue::Value(99)),
+            ],
         }
     );
 }

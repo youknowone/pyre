@@ -13,10 +13,9 @@ pub(crate) mod jitcode_lower;
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
-    braced, bracketed,
+    Expr, Ident, ItemFn, LitBool, Path, Token, braced, bracketed,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
-    Expr, Ident, ItemFn, LitBool, Path, Token,
 };
 
 /// Parsed configuration from `#[jit_interp(...)]` attributes.
@@ -35,6 +34,8 @@ pub struct JitInterpConfig {
     pub calls: Vec<(Path, Option<Ident>)>,
     /// Whether direct helper calls should be auto-inferred from sidecar metadata.
     pub auto_calls: bool,
+    /// Optional structured green-key expressions for marker rewrite.
+    pub greens: Vec<Expr>,
 }
 
 /// Multi-storage configuration parsed from `storage = { ... }`.
@@ -60,6 +61,7 @@ impl Parse for JitInterpConfig {
         let mut io_shims = None;
         let mut calls = None;
         let mut auto_calls = None;
+        let mut greens = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -87,6 +89,9 @@ impl Parse for JitInterpConfig {
                 "auto_calls" => {
                     auto_calls = Some(input.parse::<LitBool>()?.value);
                 }
+                "greens" => {
+                    greens = Some(parse_expr_list(input)?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -113,8 +118,16 @@ impl Parse for JitInterpConfig {
             io_shims: io_shims.unwrap_or_default(),
             calls: calls.unwrap_or_default(),
             auto_calls: auto_calls.unwrap_or(false),
+            greens: greens.unwrap_or_default(),
         })
     }
+}
+
+fn parse_expr_list(input: ParseStream) -> syn::Result<Vec<Expr>> {
+    let content;
+    bracketed!(content in input);
+    let exprs: Punctuated<Expr, Token![,]> = content.parse_terminated(Expr::parse, Token![,])?;
+    Ok(exprs.into_iter().collect())
 }
 
 /// Parse `{ pool: EXPR, selector: EXPR, untraceable: [...], scan: IDENT }`.
@@ -265,7 +278,13 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let sel_expr = &config.storage.selector;
 
     // Rewrite the function body, replacing marker macros
-    let body = rewrite_body(&func.block, &trace_fn_name, pool_expr, sel_expr);
+    let body = rewrite_body(
+        &func.block,
+        &trace_fn_name,
+        pool_expr,
+        sel_expr,
+        &config.greens,
+    );
 
     quote! {
         #(#attrs)*
@@ -281,13 +300,112 @@ fn rewrite_body(
     trace_fn_name: &Ident,
     pool_expr: &Expr,
     sel_expr: &Expr,
+    default_greens: &[Expr],
 ) -> TokenStream {
     use syn::visit_mut::VisitMut;
+
+    #[derive(Default, Clone)]
+    struct MergePointArgs {
+        driver: Option<Expr>,
+        env: Option<Expr>,
+        pc: Option<Expr>,
+        greens: Vec<Expr>,
+    }
+
+    impl Parse for MergePointArgs {
+        fn parse(input: ParseStream) -> syn::Result<Self> {
+            if input.is_empty() {
+                return Ok(Self::default());
+            }
+            let driver: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let env: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let pc: Expr = input.parse()?;
+            let mut greens = Vec::new();
+            if input.peek(Token![;]) {
+                input.parse::<Token![;]>()?;
+                let exprs: Punctuated<Expr, Token![,]> =
+                    input.parse_terminated(Expr::parse, Token![,])?;
+                greens = exprs.into_iter().collect();
+            }
+            Ok(Self {
+                driver: Some(driver),
+                env: Some(env),
+                pc: Some(pc),
+                greens,
+            })
+        }
+    }
+
+    struct CanEnterJitArgs {
+        driver: Expr,
+        target: Expr,
+        state: Expr,
+        env: Expr,
+        pre_run: Expr,
+        pc: Option<Expr>,
+        stacksize: Option<Expr>,
+        greens: Vec<Expr>,
+    }
+
+    impl Parse for CanEnterJitArgs {
+        fn parse(input: ParseStream) -> syn::Result<Self> {
+            let driver: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let target: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let state: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let env: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let pre_run: Expr = input.parse()?;
+
+            let mut pc = None;
+            let mut stacksize = None;
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+                pc = Some(input.parse::<Expr>()?);
+                input.parse::<Token![,]>()?;
+                stacksize = Some(input.parse::<Expr>()?);
+            }
+
+            let mut greens = Vec::new();
+            if input.peek(Token![;]) {
+                input.parse::<Token![;]>()?;
+                let exprs: Punctuated<Expr, Token![,]> =
+                    input.parse_terminated(Expr::parse, Token![,])?;
+                greens = exprs.into_iter().collect();
+            }
+
+            Ok(Self {
+                driver,
+                target,
+                state,
+                env,
+                pre_run,
+                pc,
+                stacksize,
+                greens,
+            })
+        }
+    }
+
+    fn green_key_expr(target: &Expr, greens: &[Expr]) -> Option<TokenStream> {
+        if greens.is_empty() {
+            None
+        } else {
+            Some(quote! {
+                majit_ir::GreenKey::new(vec![(#target) as i64, #((#greens) as i64),*])
+            })
+        }
+    }
 
     struct MarkerRewriter {
         trace_fn_name: Ident,
         pool_expr: Expr,
         sel_expr: Expr,
+        default_greens: Vec<Expr>,
     }
 
     impl VisitMut for MarkerRewriter {
@@ -307,12 +425,17 @@ fn rewrite_body(
                     .join("::");
 
                 if path_str == "jit_merge_point" || path_str.ends_with("::jit_merge_point") {
+                    let args =
+                        syn::parse2::<MergePointArgs>(mac.tokens.clone()).unwrap_or_default();
                     let trace_fn = &self.trace_fn_name;
+                    let driver = args.driver.unwrap_or_else(|| syn::parse_quote!(driver));
+                    let env = args.env.unwrap_or_else(|| syn::parse_quote!(program));
+                    let pc = args.pc.unwrap_or_else(|| syn::parse_quote!(pc));
                     let pool = &self.pool_expr;
                     let sel = &self.sel_expr;
                     let new_tokens: TokenStream = quote! {
-                        driver.merge_point(|__ctx, __sym| {
-                            #trace_fn(__ctx, __sym, program, pc, &#pool, #sel)
+                        #driver.merge_point(|__ctx, __sym| {
+                            #trace_fn(__ctx, __sym, #env, #pc, &#pool, #sel)
                         });
                     };
                     *stmt =
@@ -339,7 +462,7 @@ fn rewrite_body(
             while i < block.stmts.len() {
                 let stmt = &block.stmts[i];
 
-                // Check if this is can_enter_jit!(driver, target, state, env, pre_run)
+                // Check if this is can_enter_jit!(driver, target, state, env, pre_run, ...)
                 if let syn::Stmt::Macro(stmt_macro) = stmt {
                     let mac = &stmt_macro.mac;
                     let path_str = mac
@@ -353,18 +476,45 @@ fn rewrite_body(
                     if path_str == "can_enter_jit" || path_str.ends_with("::can_enter_jit") {
                         let tokens = &mac.tokens;
                         if let Ok(args) = syn::parse2::<CanEnterJitArgs>(tokens.clone()) {
-                            let driver_ident = &args.driver;
+                            let driver_expr = &args.driver;
                             let target_expr = &args.target;
                             let state_expr = &args.state;
                             let env_expr = &args.env;
                             let pre_run_expr = &args.pre_run;
+                            let pc_expr = args
+                                .pc
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| syn::parse_quote!(pc));
+                            let stacksize_expr = args
+                                .stacksize
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| syn::parse_quote!(stacksize));
+                            let greens = if args.greens.is_empty() {
+                                self.default_greens.clone()
+                            } else {
+                                args.greens.clone()
+                            };
                             let pool = &pool_expr;
                             let sel = &sel_expr;
-                            let back_edge: TokenStream = quote! {
-                                if #driver_ident.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr) {
-                                    pc = #target_expr;
-                                    stacksize = #pool.get(#sel).len() as i32;
-                                    continue;
+                            let back_edge: TokenStream = if let Some(green_key) =
+                                green_key_expr(target_expr, &greens)
+                            {
+                                quote! {
+                                    if #driver_expr.back_edge_structured(#green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr) {
+                                        #pc_expr = #target_expr;
+                                        #stacksize_expr = #pool.get(#sel).len() as i32;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    if #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr) {
+                                        #pc_expr = #target_expr;
+                                        #stacksize_expr = #pool.get(#sel).len() as i32;
+                                        continue;
+                                    }
                                 }
                             };
                             let parsed: syn::Stmt =
@@ -385,41 +535,12 @@ fn rewrite_body(
         }
     }
 
-    /// Parsed arguments for `can_enter_jit!(driver, target, &mut state, program, || { ... })`.
-    struct CanEnterJitArgs {
-        driver: Ident,
-        target: Expr,
-        state: Expr,
-        env: Expr,
-        pre_run: Expr,
-    }
-
-    impl Parse for CanEnterJitArgs {
-        fn parse(input: ParseStream) -> syn::Result<Self> {
-            let driver: Ident = input.parse()?;
-            input.parse::<Token![,]>()?;
-            let target: Expr = input.parse()?;
-            input.parse::<Token![,]>()?;
-            let state: Expr = input.parse()?;
-            input.parse::<Token![,]>()?;
-            let env: Expr = input.parse()?;
-            input.parse::<Token![,]>()?;
-            let pre_run: Expr = input.parse()?;
-            Ok(CanEnterJitArgs {
-                driver,
-                target,
-                state,
-                env,
-                pre_run,
-            })
-        }
-    }
-
     let mut cloned_block = block.clone();
     let mut rewriter = MarkerRewriter {
         trace_fn_name: trace_fn_name.clone(),
         pool_expr: pool_expr.clone(),
         sel_expr: sel_expr.clone(),
+        default_greens: default_greens.to_vec(),
     };
     rewriter.visit_block_mut(&mut cloned_block);
 

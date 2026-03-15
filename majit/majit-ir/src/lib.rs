@@ -7,7 +7,7 @@ pub use descr::{
     ArrayDescr, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr, DescrRef, EffectInfo,
     ExtraEffect, FailDescr, FieldDescr, InteriorFieldDescr, OopSpecIndex, SizeDescr,
 };
-pub use op::{format_trace, Op, OpCode, OpRef, OPCODE_COUNT};
+pub use op::{OPCODE_COUNT, Op, OpCode, OpRef, format_trace};
 pub use value::{
-    Const, GcRef, GreenKey, InputArg, JitDriverVar, Type, Value, VarKind, FAILARGS_LIMIT,
+    Const, FAILARGS_LIMIT, GcRef, GreenKey, InputArg, JitDriverVar, Type, Value, VarKind,
 };

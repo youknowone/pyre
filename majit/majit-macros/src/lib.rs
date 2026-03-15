@@ -9,8 +9,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse::Parse, parse::ParseStream, parse_macro_input, Ident, ItemFn, Path, ReturnType, Token,
-    Type,
+    Ident, ItemFn, Path, ReturnType, Token, Type, parse::Parse, parse::ParseStream,
+    parse_macro_input,
 };
 
 mod jit_interp;
@@ -218,6 +218,7 @@ fn emit_helper_policy_fn(
 struct JitDriverArgs {
     greens: Vec<Ident>,
     reds: Vec<Ident>,
+    virtualizable: Option<Ident>,
 }
 
 /// Parse a bracketed list of identifiers: `[a, b, c]`.
@@ -232,6 +233,7 @@ impl Parse for JitDriverArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut greens = None;
         let mut reds = None;
+        let mut virtualizable = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -250,6 +252,12 @@ impl Parse for JitDriverArgs {
                     }
                     reds = Some(parse_ident_list(input)?);
                 }
+                "virtualizable" => {
+                    if virtualizable.is_some() {
+                        return Err(syn::Error::new(key.span(), "duplicate `virtualizable`"));
+                    }
+                    virtualizable = Some(input.parse::<Ident>()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -267,7 +275,11 @@ impl Parse for JitDriverArgs {
         let reds =
             reds.ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "missing `reds`"))?;
 
-        Ok(JitDriverArgs { greens, reds })
+        Ok(JitDriverArgs {
+            greens,
+            reds,
+            virtualizable,
+        })
     }
 }
 
@@ -295,6 +307,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let struct_name = &input.ident;
+    let virtualizable = args.virtualizable.clone();
 
     let green_strs: Vec<String> = args.greens.iter().map(|id| id.to_string()).collect();
     let red_strs: Vec<String> = args.reds.iter().map(|id| id.to_string()).collect();
@@ -304,6 +317,32 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
     let num_greens = green_strs.len();
     let num_reds = red_strs.len();
     let num_vars = num_greens + num_reds;
+
+    let mut seen = std::collections::HashSet::new();
+    for green in &args.greens {
+        if !seen.insert(green.to_string()) {
+            return syn::Error::new(green.span(), "duplicate variable in `greens`")
+                .to_compile_error()
+                .into();
+        }
+    }
+    for red in &args.reds {
+        if !seen.insert(red.to_string()) {
+            return syn::Error::new(red.span(), "green/red variables must be distinct")
+                .to_compile_error()
+                .into();
+        }
+    }
+    if let Some(virtualizable) = &virtualizable {
+        if !args.reds.iter().any(|red| red == virtualizable) {
+            return syn::Error::new(
+                virtualizable.span(),
+                "`virtualizable` must name one of the red variables",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
 
     let doc = format!("JIT driver: greens=[{greens_joined}], reds=[{reds_joined}]");
 
@@ -330,6 +369,12 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let virtualizable_value = if let Some(virtualizable) = &virtualizable {
+        quote! { Some(stringify!(#virtualizable)) }
+    } else {
+        quote! { None }
+    };
+
     let expanded = quote! {
         #struct_token
 
@@ -344,6 +389,69 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub const NUM_GREENS: usize = #num_greens;
             /// Number of red variables.
             pub const NUM_REDS: usize = #num_reds;
+            /// Name of the virtualizable red variable, if any.
+            pub const VIRTUALIZABLE: Option<&'static str> = #virtualizable_value;
+
+            pub fn descriptor(
+                green_types: &[majit_ir::Type],
+                red_types: &[majit_ir::Type],
+            ) -> Result<majit_meta::JitDriverDescriptor, &'static str> {
+                if green_types.len() != Self::NUM_GREENS {
+                    return Err("wrong number of green variable types");
+                }
+                if red_types.len() != Self::NUM_REDS {
+                    return Err("wrong number of red variable types");
+                }
+
+                let greens = Self::GREENS
+                    .iter()
+                    .zip(green_types.iter().copied())
+                    .map(|(name, tp)| (*name, tp))
+                    .collect::<Vec<_>>();
+                let reds = Self::REDS
+                    .iter()
+                    .zip(red_types.iter().copied())
+                    .map(|(name, tp)| (*name, tp))
+                    .collect::<Vec<_>>();
+                let descriptor = majit_meta::JitDriverDescriptor::with_virtualizable(
+                    greens,
+                    reds,
+                    Self::VIRTUALIZABLE,
+                );
+                if let Some(virtualizable) = descriptor.virtualizable() {
+                    if virtualizable.tp != majit_ir::Type::Ref {
+                        return Err("virtualizable red must have Ref type");
+                    }
+                }
+                Ok(descriptor)
+            }
+
+            pub fn green_key(values: &[i64]) -> Result<majit_ir::GreenKey, &'static str> {
+                if values.len() != Self::NUM_GREENS {
+                    return Err("wrong number of green key values");
+                }
+                Ok(majit_ir::GreenKey::new(values.to_vec()))
+            }
+        }
+
+        impl #generics majit_meta::DeclarativeJitDriver for #struct_name #generics {
+            const GREENS: &'static [&'static str] = <Self>::GREENS;
+            const REDS: &'static [&'static str] = <Self>::REDS;
+            const NUM_VARS: usize = <Self>::NUM_VARS;
+            const NUM_GREENS: usize = <Self>::NUM_GREENS;
+            const NUM_REDS: usize = <Self>::NUM_REDS;
+            const VIRTUALIZABLE: Option<&'static str> = <Self>::VIRTUALIZABLE;
+
+            fn descriptor(
+                green_types: &[majit_ir::Type],
+                red_types: &[majit_ir::Type],
+            ) -> Result<majit_meta::JitDriverDescriptor, &'static str> {
+                <Self>::descriptor(green_types, red_types)
+            }
+
+            fn green_key(values: &[i64]) -> Result<majit_ir::GreenKey, &'static str> {
+                <Self>::green_key(values)
+            }
         }
     };
 

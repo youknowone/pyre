@@ -9,6 +9,7 @@
 /// failures, execution transfers to the bridge instead of returning to
 /// the interpreter.
 use crate::compiler::{register_gc_roots, release_force_token, unregister_gc_roots};
+use majit_codegen::FailDescrLayout;
 use majit_gc::GcMap;
 use majit_ir::{FailDescr, GcRef, Type};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -185,6 +186,23 @@ impl CraneliftFailDescr {
     pub fn is_force_token_slot(&self, slot: usize) -> bool {
         self.force_token_slots.binary_search(&slot).is_ok()
     }
+
+    pub fn layout(&self) -> FailDescrLayout {
+        let gc_ref_slots = self
+            .fail_arg_types
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, _)| self.gc_map.is_ref(slot).then_some(slot))
+            .collect();
+        FailDescrLayout {
+            fail_index: self.fail_index,
+            trace_id: self.trace_id,
+            fail_arg_types: self.fail_arg_types.clone(),
+            is_finish: self.is_finish,
+            gc_ref_slots,
+            force_token_slots: self.force_token_slots.clone(),
+        }
+    }
 }
 
 impl majit_ir::Descr for CraneliftFailDescr {
@@ -212,6 +230,14 @@ impl FailDescr for CraneliftFailDescr {
 
     fn trace_id(&self) -> u64 {
         self.trace_id
+    }
+
+    fn is_gc_ref_slot(&self, slot: usize) -> bool {
+        self.gc_map.is_ref(slot)
+    }
+
+    fn force_token_slots(&self) -> &[usize] {
+        &self.force_token_slots
     }
 }
 

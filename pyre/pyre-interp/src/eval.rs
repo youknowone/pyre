@@ -26,10 +26,11 @@ const JIT_THRESHOLD: u32 = 1039;
 /// or `None` if the code falls through without returning.
 pub fn eval_frame(frame: &mut PyFrame) -> PyResult {
     let mut driver: JitDriver<PyreJitState> = JitDriver::new(JIT_THRESHOLD);
+    let virtualizable_info = build_pyframe_virtualizable_info();
 
     // Register virtualizable info so the JIT knows which PyFrame fields
     // can live in CPU registers during compiled code execution.
-    driver.set_virtualizable_info(build_pyframe_virtualizable_info());
+    driver.set_virtualizable_info(virtualizable_info.clone());
 
     let env = PyreEnv;
     let mut arg_state = OpArgState::default();
@@ -48,7 +49,7 @@ pub fn eval_frame(frame: &mut PyFrame) -> PyResult {
         if driver.is_tracing() {
             let pc = frame.next_instr;
             let stack_snapshot: Vec<PyObjectRef> =
-                frame.value_stack_w[..frame.stack_depth].to_vec();
+                frame.value_stack_w.as_slice()[..frame.stack_depth].to_vec();
             driver.merge_point(|ctx, sym| trace_bytecode(ctx, sym, &code, pc, &stack_snapshot));
         }
 
@@ -291,9 +292,9 @@ pub fn eval_frame(frame: &mut PyFrame) -> PyResult {
                 let target_idx = base - d;
 
                 // JIT back-edge detection: backward jumps trigger hot counting
-                let mut jit_state = build_jit_state(frame);
+                let mut jit_state = build_jit_state(frame, &virtualizable_info);
                 if driver.back_edge(target_idx, &mut jit_state, &env, || {}) {
-                    sync_jit_state_to_frame(&jit_state, frame);
+                    sync_jit_state_to_frame(&jit_state, frame, &virtualizable_info);
                     continue;
                 }
 
@@ -560,7 +561,10 @@ fn binary_op(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> PyResult {
 /// Build a `PyreJitState` from the current frame state.
 ///
 /// Namespace entries are sorted by key for deterministic ordering.
-fn build_jit_state(frame: &PyFrame) -> PyreJitState {
+fn build_jit_state(
+    frame: &PyFrame,
+    virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
+) -> PyreJitState {
     let mut ns_keys: Vec<String> = frame.namespace.keys().cloned().collect();
     ns_keys.sort();
     let ns_values: Vec<PyObjectRef> = ns_keys
@@ -568,34 +572,53 @@ fn build_jit_state(frame: &PyFrame) -> PyreJitState {
         .map(|k| *frame.namespace.get(k).unwrap())
         .collect();
 
-    PyreJitState {
+    let mut jit_state = PyreJitState {
+        frame: frame as *const PyFrame as usize,
         next_instr: frame.next_instr,
-        locals: frame.locals_w.clone(),
+        local_count: frame.locals_w.len(),
+        locals: Vec::new(),
         ns_keys,
         ns_values,
-        stack: frame.value_stack_w[..frame.stack_depth].to_vec(),
+        stack_capacity: frame.value_stack_w.len(),
+        stack: Vec::new(),
         stack_depth: frame.stack_depth,
+    };
+
+    if !jit_state.sync_from_virtualizable(virtualizable_info) {
+        jit_state.next_instr = frame.next_instr;
+        jit_state.locals = frame.locals_w.to_vec();
+        jit_state.stack = frame.value_stack_w.to_vec();
+        jit_state.stack_depth = frame.stack_depth;
     }
+
+    jit_state
 }
 
 /// Restore frame state from a `PyreJitState` after JIT code execution.
-fn sync_jit_state_to_frame(jit_state: &PyreJitState, frame: &mut PyFrame) {
+fn sync_jit_state_to_frame(
+    jit_state: &PyreJitState,
+    frame: &mut PyFrame,
+    virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
+) {
+    if !jit_state.sync_to_virtualizable(virtualizable_info) {
+        frame.next_instr = jit_state.next_instr;
+
+        let local_count = jit_state.locals.len().min(frame.locals_w.len());
+        frame.locals_w.as_mut_slice()[..local_count]
+            .copy_from_slice(&jit_state.locals[..local_count]);
+
+        let stack_count = jit_state.stack.len().min(frame.value_stack_w.len());
+        frame.value_stack_w.as_mut_slice()[..stack_count]
+            .copy_from_slice(&jit_state.stack[..stack_count]);
+        frame.stack_depth = jit_state.stack_depth;
+    }
+
     frame.next_instr = jit_state.next_instr;
-
-    // Restore fast locals
-    let local_count = jit_state.locals.len().min(frame.locals_w.len());
-    frame.locals_w[..local_count].copy_from_slice(&jit_state.locals[..local_count]);
-
-    // Restore namespace
     frame.namespace.clear();
     for (k, &v) in jit_state.ns_keys.iter().zip(&jit_state.ns_values) {
         frame.namespace.insert(k.clone(), v);
     }
-
-    // Restore stack
-    let sd = jit_state.stack_depth;
-    frame.value_stack_w[..sd].copy_from_slice(&jit_state.stack[..sd]);
-    frame.stack_depth = sd;
+    frame.stack_depth = jit_state.stack_depth;
 }
 
 #[cfg(test)]
@@ -611,17 +634,23 @@ mod tests {
         eval_frame(&mut frame)
     }
 
-    fn run_exec(source: &str) -> PyResult {
-        let code = compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
-        eval_frame(&mut frame)
-    }
-
     fn run_exec_frame(source: &str) -> (PyResult, PyFrame) {
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
         let result = eval_frame(&mut frame);
         (result, frame)
+    }
+
+    fn nested_function_code(source: &str) -> CodeObject {
+        let module = compile_exec(source).expect("compile failed");
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } => Some(code.as_ref().clone()),
+                _ => None,
+            })
+            .expect("expected nested function code object")
     }
 
     #[test]
@@ -636,6 +665,70 @@ mod tests {
         }
         eprintln!("\nNames: {:?}", code.names);
         eprintln!("Varnames: {:?}", code.varnames);
+    }
+
+    #[test]
+    fn test_build_jit_state_imports_virtualizable_frame_state() {
+        let code = nested_function_code("def f(x):\n    y = x\n    return y");
+        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        frame.next_instr = 7;
+        frame.stack_depth = 1;
+        frame.locals_w[0] = w_int_new(11);
+        frame.locals_w[1] = w_int_new(13);
+        frame.value_stack_w[0] = w_int_new(29);
+        frame.namespace.insert("x".to_string(), w_int_new(41));
+
+        let info = build_pyframe_virtualizable_info();
+        let jit_state = build_jit_state(&frame, &info);
+        let x_idx = jit_state
+            .ns_keys
+            .iter()
+            .position(|key| key == "x")
+            .expect("x must be present in namespace snapshot");
+
+        assert_eq!(jit_state.frame, &frame as *const PyFrame as usize);
+        assert_eq!(jit_state.next_instr, 7);
+        assert_eq!(jit_state.stack_depth, 1);
+        assert_eq!(jit_state.local_count, frame.locals_w.len());
+        assert_eq!(jit_state.stack_capacity, frame.value_stack_w.len());
+        unsafe {
+            assert_eq!(w_int_get_value(jit_state.locals[0]), 11);
+            assert_eq!(w_int_get_value(jit_state.locals[1]), 13);
+            assert_eq!(w_int_get_value(jit_state.stack[0]), 29);
+            assert_eq!(w_int_get_value(jit_state.ns_values[x_idx]), 41);
+        }
+    }
+
+    #[test]
+    fn test_sync_jit_state_to_frame_exports_virtualizable_state() {
+        let code = nested_function_code("def f(x):\n    y = x\n    return y");
+        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        frame.namespace.insert("x".to_string(), w_int_new(5));
+
+        let info = build_pyframe_virtualizable_info();
+        let mut jit_state = build_jit_state(&frame, &info);
+        let x_idx = jit_state
+            .ns_keys
+            .iter()
+            .position(|key| key == "x")
+            .expect("x must be present in namespace snapshot");
+        jit_state.next_instr = 13;
+        jit_state.stack_depth = 1;
+        jit_state.locals[0] = w_int_new(17);
+        jit_state.locals[1] = w_int_new(19);
+        jit_state.stack[0] = w_int_new(23);
+        jit_state.ns_values[x_idx] = w_int_new(31);
+
+        sync_jit_state_to_frame(&jit_state, &mut frame, &info);
+
+        assert_eq!(frame.next_instr, 13);
+        assert_eq!(frame.stack_depth, 1);
+        unsafe {
+            assert_eq!(w_int_get_value(frame.locals_w[0]), 17);
+            assert_eq!(w_int_get_value(frame.locals_w[1]), 19);
+            assert_eq!(w_int_get_value(frame.value_stack_w[0]), 23);
+            assert_eq!(w_int_get_value(*frame.namespace.get("x").unwrap()), 31);
+        }
     }
 
     #[test]

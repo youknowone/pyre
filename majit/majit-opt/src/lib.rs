@@ -11,6 +11,7 @@ pub mod guard;
 pub mod heap;
 pub mod info;
 pub mod intbounds;
+pub mod intdiv;
 pub mod intutils;
 pub mod optimizer;
 pub mod pure;

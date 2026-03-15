@@ -1,0 +1,376 @@
+/// Integer division by constant using magic number multiplication.
+///
+/// Translated from rpython/jit/metainterp/optimizeopt/intdiv.py.
+///
+/// Replaces signed integer division by a constant with a sequence of
+/// UINT_MUL_HIGH + shift operations, avoiding the expensive `idiv` instruction.
+use majit_ir::{Op, OpCode, OpRef, Value};
+
+use crate::OptContext;
+
+/// Compute magic numbers for division by constant `m`.
+///
+/// Returns `(k, i)` where `k` is the multiplier and `i` is the shift amount.
+/// The relationship is: `k = 2^(64+i) / m + 1`.
+///
+/// Preconditions: `m >= 3`, `m` is not a power of two.
+pub fn magic_numbers(m: i64) -> (u64, u32) {
+    debug_assert!(m >= 3);
+    debug_assert!(m & (m - 1) != 0, "m must not be a power of two");
+    debug_assert!(m == m as i64, "m must fit in signed i64"); // always true
+
+    let m_u = m as u64;
+
+    // Find i such that 2^i < m < 2^(i+1)
+    let mut i: u32 = 1;
+    while (1u64 << (i + 1)) < m_u {
+        i += 1;
+    }
+
+    // Compute quotient = 2^(64+i) // m using bit-by-bit long division.
+    // We cannot represent 2^(64+i) directly, so we use the fact that
+    // UINT_MUL_HIGH(t, m) gives us the high 64 bits of t*m.
+    let high_word_dividend = 1u64 << i;
+    let mut quotient: u64 = 0;
+    for bit in (0..64).rev() {
+        let t = quotient + (1u64 << bit);
+        // Check: is t * m < 2^(64+i)?
+        // Equivalently: UINT_MUL_HIGH(t, m) < high_word_dividend
+        let (_, high) = full_mul_u64(t, m_u);
+        if high < high_word_dividend {
+            quotient = t;
+        }
+    }
+
+    // k = 2^(64+i) // m + 1
+    let k = quotient + 1;
+
+    debug_assert!(k != 0);
+    // k > 2^63 because m < 2^(i+1) implies 2^(64+i) // m >= 2^63
+    debug_assert!(k > (1u64 << 63));
+
+    (k, i)
+}
+
+/// Full 128-bit multiplication of two u64 values.
+/// Returns (low, high) halves.
+#[inline]
+fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
+    let result = (a as u128) * (b as u128);
+    (result as u64, (result >> 64) as u64)
+}
+
+/// Emit a constant integer into the optimization context.
+pub(crate) fn emit_constant_int(ctx: &mut OptContext, value: i64) -> OpRef {
+    let mut op = Op::new(OpCode::SameAsI, &[OpRef::NONE]);
+    op.pos = OpRef::NONE;
+    let opref = ctx.emit(op);
+    ctx.make_constant(opref, Value::Int(value));
+    opref
+}
+
+/// Generate division operations: `n // m` using multiply-and-shift.
+///
+/// Emits ops into `ctx` and returns the OpRef of the final result.
+///
+/// Algorithm:
+/// ```text
+///   t = n >> 63            (sign bits: 0 or -1)
+///   nt = n ^ t             (absolute value - 1 if negative)
+///   mul = UINT_MUL_HIGH(nt, k)
+///   sh = UINT_RSHIFT(mul, i)
+///   result = sh ^ t        (negate back if needed)
+/// ```
+///
+/// When `known_nonneg` is true, skips sign correction (saves 3 ops):
+/// ```text
+///   mul = UINT_MUL_HIGH(n, k)
+///   result = UINT_RSHIFT(mul, i)
+/// ```
+pub fn division_operations(
+    n_ref: OpRef,
+    m: i64,
+    known_nonneg: bool,
+    ctx: &mut OptContext,
+) -> OpRef {
+    let (k, i) = magic_numbers(m);
+
+    let k_ref = emit_constant_int(ctx, k as i64);
+    let i_ref = emit_constant_int(ctx, i as i64);
+
+    if !known_nonneg {
+        // t = n >> 63
+        let shift63_ref = emit_constant_int(ctx, 63);
+        let t_ref = ctx.emit(Op::new(OpCode::IntRshift, &[n_ref, shift63_ref]));
+
+        // nt = n ^ t
+        let nt_ref = ctx.emit(Op::new(OpCode::IntXor, &[n_ref, t_ref]));
+
+        // mul = UINT_MUL_HIGH(nt, k)
+        let mul_ref = ctx.emit(Op::new(OpCode::UintMulHigh, &[nt_ref, k_ref]));
+
+        // sh = UINT_RSHIFT(mul, i)
+        let sh_ref = ctx.emit(Op::new(OpCode::UintRshift, &[mul_ref, i_ref]));
+
+        // result = sh ^ t
+        ctx.emit(Op::new(OpCode::IntXor, &[sh_ref, t_ref]))
+    } else {
+        // mul = UINT_MUL_HIGH(n, k)
+        let mul_ref = ctx.emit(Op::new(OpCode::UintMulHigh, &[n_ref, k_ref]));
+
+        // result = UINT_RSHIFT(mul, i)
+        ctx.emit(Op::new(OpCode::UintRshift, &[mul_ref, i_ref]))
+    }
+}
+
+/// Generate modulo operations: `n % m` using division + multiply + subtract.
+///
+/// Computes: `n - (n // m) * m`.
+pub fn modulo_operations(
+    n_ref: OpRef,
+    m: i64,
+    known_nonneg: bool,
+    ctx: &mut OptContext,
+) -> OpRef {
+    let div_ref = division_operations(n_ref, m, known_nonneg, ctx);
+
+    // product = div_result * m
+    let m_ref = emit_constant_int(ctx, m);
+    let product_ref = ctx.emit(Op::new(OpCode::IntMul, &[div_ref, m_ref]));
+
+    // remainder = n - product
+    ctx.emit(Op::new(OpCode::IntSub, &[n_ref, product_ref]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── magic_numbers tests ──
+
+    #[test]
+    fn test_magic_numbers_3() {
+        let (k, i) = magic_numbers(3);
+        assert_eq!(i, 1);
+        // k = 2^(64+1) // 3 + 1
+        // 2^65 // 3 = 12297829382473034410
+        // k = 12297829382473034411
+        assert_eq!(k, 0xAAAAAAAAAAAAAAABu64);
+    }
+
+    #[test]
+    fn test_magic_numbers_7() {
+        let (k, i) = magic_numbers(7);
+        assert_eq!(i, 2);
+        // k should be > 2^63
+        assert!(k > (1u64 << 63));
+    }
+
+    #[test]
+    fn test_magic_numbers_10() {
+        let (k, i) = magic_numbers(10);
+        assert_eq!(i, 3);
+        assert!(k > (1u64 << 63));
+    }
+
+    #[test]
+    fn test_magic_numbers_various() {
+        for m in [3, 5, 6, 7, 9, 10, 11, 12, 13, 100, 1000, 127, 255] {
+            let (k, i) = magic_numbers(m);
+            assert!(k > (1u64 << 63), "k too small for m={m}");
+            assert!(i < 64, "i too large for m={m}");
+        }
+    }
+
+    /// Verify the magic number multiplication gives correct division results.
+    #[test]
+    fn test_magic_numbers_correctness() {
+        for m in [3i64, 5, 7, 10, 13, 100, 127, 1000] {
+            let (k, i) = magic_numbers(m);
+            // Test with positive dividends
+            for n in [0i64, 1, 2, m - 1, m, m + 1, 100, 999, 10000, i64::MAX / 2] {
+                let expected = n / m; // positive n: floor == trunc
+                let actual = apply_magic_div(n, k, i);
+                assert_eq!(
+                    actual, expected,
+                    "division failed: {n} / {m} = expected {expected}, got {actual}"
+                );
+            }
+            // Test with negative dividends.
+            // The algorithm produces floor division (towards -inf),
+            // matching Python's // operator.
+            for n in [-1i64, -2, -(m - 1), -m, -(m + 1), -100, -999, -10000] {
+                let expected = floor_div(n, m);
+                let actual = apply_magic_div(n, k, i);
+                assert_eq!(
+                    actual, expected,
+                    "division failed: {n} // {m} = expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    /// Apply the magic number division algorithm manually.
+    fn apply_magic_div(n: i64, k: u64, i: u32) -> i64 {
+        let t = n >> 63; // 0 or -1
+        let nt = n ^ t; // if negative: ~n; if positive: n
+        let (_, high) = full_mul_u64(nt as u64, k);
+        let sh = high >> i;
+        (sh as i64) ^ t
+    }
+
+    /// Floor division (towards negative infinity), matching Python's // operator.
+    fn floor_div(a: i64, b: i64) -> i64 {
+        let d = a / b;
+        let r = a % b;
+        if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d }
+    }
+
+    // ── division_operations tests ──
+
+    #[test]
+    fn test_division_ops_emits_correct_sequence() {
+        let mut ctx = OptContext::new(16);
+        // op0 = input variable n
+        let n_op = Op::new(OpCode::SameAsI, &[]);
+        let n_ref = ctx.emit(n_op);
+
+        let result_ref = division_operations(n_ref, 7, false, &mut ctx);
+
+        // Should emit: const(k), const(i), const(63), IntRshift, IntXor,
+        //              UintMulHigh, UintRshift, IntXor
+        // Total: 3 constants + 5 operations = 8 ops after n
+        assert_eq!(ctx.new_operations.len(), 9); // 1 (n) + 8
+
+        // Check the final op is IntXor (sign correction)
+        let final_op = &ctx.new_operations[result_ref.0 as usize];
+        assert_eq!(final_op.opcode, OpCode::IntXor);
+
+        // Verify UintMulHigh is present
+        let has_mul_high = ctx
+            .new_operations
+            .iter()
+            .any(|op| op.opcode == OpCode::UintMulHigh);
+        assert!(has_mul_high, "should contain UintMulHigh");
+
+        // Verify UintRshift is present
+        let has_rshift = ctx
+            .new_operations
+            .iter()
+            .any(|op| op.opcode == OpCode::UintRshift);
+        assert!(has_rshift, "should contain UintRshift");
+    }
+
+    #[test]
+    fn test_division_ops_known_nonneg() {
+        let mut ctx = OptContext::new(8);
+        let n_op = Op::new(OpCode::SameAsI, &[]);
+        let n_ref = ctx.emit(n_op);
+
+        let result_ref = division_operations(n_ref, 7, true, &mut ctx);
+
+        // known_nonneg: const(k), const(i), UintMulHigh, UintRshift = 4 ops
+        assert_eq!(ctx.new_operations.len(), 5); // 1 (n) + 4
+
+        let final_op = &ctx.new_operations[result_ref.0 as usize];
+        assert_eq!(final_op.opcode, OpCode::UintRshift);
+    }
+
+    // ── modulo_operations tests ──
+
+    #[test]
+    fn test_modulo_ops_emits_correct_sequence() {
+        let mut ctx = OptContext::new(16);
+        let n_op = Op::new(OpCode::SameAsI, &[]);
+        let n_ref = ctx.emit(n_op);
+
+        let result_ref = modulo_operations(n_ref, 7, false, &mut ctx);
+
+        // Division (8 ops) + const(m) + IntMul + IntSub = 11 ops after n
+        assert_eq!(ctx.new_operations.len(), 12); // 1 (n) + 11
+
+        let final_op = &ctx.new_operations[result_ref.0 as usize];
+        assert_eq!(final_op.opcode, OpCode::IntSub);
+
+        // Verify IntMul is present (div_result * m)
+        let has_mul = ctx
+            .new_operations
+            .iter()
+            .any(|op| op.opcode == OpCode::IntMul);
+        assert!(has_mul, "should contain IntMul for div*m");
+    }
+
+    #[test]
+    fn test_modulo_ops_known_nonneg() {
+        let mut ctx = OptContext::new(12);
+        let n_op = Op::new(OpCode::SameAsI, &[]);
+        let n_ref = ctx.emit(n_op);
+
+        let result_ref = modulo_operations(n_ref, 7, true, &mut ctx);
+
+        // Division nonneg (4 ops) + const(m) + IntMul + IntSub = 7 ops after n
+        assert_eq!(ctx.new_operations.len(), 8); // 1 (n) + 7
+
+        let final_op = &ctx.new_operations[result_ref.0 as usize];
+        assert_eq!(final_op.opcode, OpCode::IntSub);
+    }
+
+    // ── Integration-style correctness tests ──
+
+    /// Verify that the division sequence is mathematically correct
+    /// by checking the emitted constants match the magic numbers.
+    #[test]
+    fn test_division_ops_constants_match_magic() {
+        for m in [3i64, 5, 7, 10, 13, 100, 127] {
+            let (expected_k, expected_i) = magic_numbers(m);
+
+            let mut ctx = OptContext::new(16);
+            let n_op = Op::new(OpCode::SameAsI, &[]);
+            let n_ref = ctx.emit(n_op);
+            division_operations(n_ref, m, false, &mut ctx);
+
+            // First constant emitted should be k
+            let k_val = ctx.get_constant_int(OpRef(1)).unwrap();
+            assert_eq!(
+                k_val as u64, expected_k,
+                "k mismatch for m={m}: got {k_val}, expected {expected_k}"
+            );
+
+            // Second constant should be i
+            let i_val = ctx.get_constant_int(OpRef(2)).unwrap();
+            assert_eq!(
+                i_val as u32, expected_i,
+                "i mismatch for m={m}: got {i_val}, expected {expected_i}"
+            );
+        }
+    }
+
+    // ── Edge cases ──
+
+    #[test]
+    #[should_panic]
+    fn test_magic_numbers_panics_for_power_of_two() {
+        magic_numbers(4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_magic_numbers_panics_for_two() {
+        magic_numbers(2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_magic_numbers_panics_for_one() {
+        magic_numbers(1);
+    }
+
+    #[test]
+    fn test_magic_numbers_large_divisor() {
+        // Large odd divisor
+        let m = (1i64 << 50) + 1;
+        let (k, i) = magic_numbers(m);
+        assert!(k > (1u64 << 63));
+        assert!(i < 64);
+    }
+}
