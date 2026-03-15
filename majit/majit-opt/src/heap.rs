@@ -11,10 +11,20 @@
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use majit_ir::{Op, OpCode, OpRef};
 
 use crate::{OptContext, OptimizationPass, PassResult};
+
+/// Hash the argument OpRefs of an operation for loop-invariant call caching.
+fn hash_args(args: &[OpRef]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for arg in args {
+        arg.0.hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
 /// Cache key for a field access: (struct OpRef, field descriptor index).
 type FieldKey = (OpRef, u32);
@@ -60,6 +70,17 @@ pub struct OptHeap {
     /// object's field via SETFIELD_GC / SETARRAYITEM_GC.
     /// Caches for unescaped objects survive calls (calls can't access them).
     unescaped: HashSet<OpRef>,
+
+    // ── Nullity tracking ──
+
+    /// Values known to be non-null: proven by guards (GuardNonnull, GuardClass,
+    /// GuardNonnullClass, GuardValue) or by allocation (New, NewWithVtable, etc.).
+    /// Used to eliminate redundant GuardNonnull checks.
+    known_nonnull: HashSet<OpRef>,
+
+    /// Cache for loop-invariant call results: (descr_index, args_hash) -> result OpRef.
+    /// Survives calls and side-effecting operations (only cleared on setup).
+    loopinvariant_cache: HashMap<(u32, u64), OpRef>,
 }
 
 impl OptHeap {
@@ -73,6 +94,8 @@ impl OptHeap {
             immutable_field_descrs: HashSet::new(),
             seen_allocation: HashSet::new(),
             unescaped: HashSet::new(),
+            known_nonnull: HashSet::new(),
+            loopinvariant_cache: HashMap::new(),
         }
     }
 
@@ -152,6 +175,15 @@ impl OptHeap {
         } else {
             self.cached_fields.clear();
             self.cached_arrayitems.clear();
+        }
+
+        // Nullity: allocated objects are permanently non-null.
+        // Other nonnull knowledge is invalidated conservatively.
+        if !self.seen_allocation.is_empty() {
+            self.known_nonnull
+                .retain(|v| self.seen_allocation.contains(v));
+        } else {
+            self.known_nonnull.clear();
         }
     }
 
@@ -328,6 +360,30 @@ impl OptHeap {
         PassResult::Remove
     }
 
+    /// Handle CALL_LOOPINVARIANT_*: cache the result by (descr_index, args_hash).
+    ///
+    /// If the same call (same descriptor + same arguments) was already seen,
+    /// replace with the cached result. Otherwise, emit and cache the result.
+    fn optimize_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let descr_idx = op.descr.as_ref().map(|d| d.index()).unwrap_or(0);
+        let args_hash = hash_args(&op.args);
+        let cache_key = (descr_idx, args_hash);
+
+        if let Some(&cached_result) = self.loopinvariant_cache.get(&cache_key) {
+            let cached_result = ctx.get_replacement(cached_result);
+            ctx.replace_op(op.pos, cached_result);
+            return PassResult::Remove;
+        }
+
+        // First time: cache the result, then treat as a normal call for
+        // heap cache purposes (force lazy sets, invalidate mutable caches).
+        self.loopinvariant_cache.insert(cache_key, op.pos);
+        self.mark_args_escaped(op);
+        self.force_all_lazy(ctx);
+        self.invalidate_caches();
+        PassResult::Emit(op.clone())
+    }
+
     /// Handle operations that may have side effects.
     /// Forces lazy sets and invalidates caches as needed.
     /// Tracks allocations for aliasing analysis.
@@ -335,14 +391,34 @@ impl OptHeap {
         let opcode = op.opcode;
 
         // Track allocations for aliasing analysis.
+        // Allocated objects are always non-null.
         if opcode.is_malloc() {
             self.seen_allocation.insert(op.pos);
             self.unescaped.insert(op.pos);
+            self.known_nonnull.insert(op.pos);
             return PassResult::Emit(op.clone());
         }
 
         // Guards: force lazy sets but keep caches (guards don't mutate the heap).
+        // Track nullity implications from guards.
         if opcode.is_guard() {
+            // GuardNonnull on a value already known non-null is redundant.
+            if opcode == OpCode::GuardNonnull {
+                let arg = op.arg(0);
+                if self.known_nonnull.contains(&arg) || self.seen_allocation.contains(&arg) {
+                    return PassResult::Remove;
+                }
+                self.known_nonnull.insert(arg);
+            }
+
+            // GuardClass / GuardNonnullClass / GuardValue imply non-null.
+            match opcode {
+                OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardValue => {
+                    self.known_nonnull.insert(op.arg(0));
+                }
+                _ => {}
+            }
+
             self.force_all_lazy(ctx);
             return PassResult::Emit(op.clone());
         }
@@ -428,6 +504,12 @@ impl OptimizationPass for OptHeap {
             // ── SETFIELD_RAW / SETARRAYITEM_RAW: no effect on GC caches ──
             OpCode::SetfieldRaw | OpCode::SetarrayitemRaw => PassResult::Emit(op.clone()),
 
+            // ── Loop-invariant calls: cache results across the trace ──
+            OpCode::CallLoopinvariantI
+            | OpCode::CallLoopinvariantR
+            | OpCode::CallLoopinvariantF
+            | OpCode::CallLoopinvariantN => self.optimize_call_loopinvariant(op, ctx),
+
             // ── Everything else: check for side effects ──
             _ => self.handle_side_effects(op, ctx),
         }
@@ -442,6 +524,8 @@ impl OptimizationPass for OptHeap {
         self.immutable_field_descrs.clear();
         self.seen_allocation.clear();
         self.unescaped.clear();
+        self.known_nonnull.clear();
+        self.loopinvariant_cache.clear();
     }
 
     fn flush(&mut self) {
@@ -458,6 +542,8 @@ impl OptimizationPass for OptHeap {
         self.immutable_field_descrs.clear();
         self.seen_allocation.clear();
         self.unescaped.clear();
+        self.known_nonnull.clear();
+        self.loopinvariant_cache.clear();
     }
 
     fn name(&self) -> &'static str {
@@ -1388,5 +1474,336 @@ mod tests {
             !opcodes.contains(&OpCode::GetfieldGcI),
             "GETFIELD should be eliminated for unescaped object across multiple calls, got: {opcodes:?}"
         );
+    }
+
+    // ── Loop-invariant call caching tests ──
+
+    // ── Test 33: Two identical CallLoopinvariantI → second removed ──
+
+    #[test]
+    fn test_loopinvariant_call_cached() {
+        let d = descr(10);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(100), OpRef(101)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(100), OpRef(101)],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // Only the first CallLoopinvariantI + Jump.
+        let loopinv_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
+            .count();
+        assert_eq!(loopinv_count, 1, "second identical loopinvariant call should be eliminated");
+        assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
+    }
+
+    // ── Test 34: Different args → both kept ──
+
+    #[test]
+    fn test_loopinvariant_different_args_not_cached() {
+        let d = descr(10);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(100), OpRef(101)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(100), OpRef(102)],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let loopinv_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
+            .count();
+        assert_eq!(loopinv_count, 2, "different args should keep both calls");
+    }
+
+    // ── Test 35: Cache survives intervening CallN ──
+
+    #[test]
+    fn test_loopinvariant_survives_call() {
+        let d = descr(10);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(100), OpRef(101)],
+                d.clone(),
+            ),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(100), OpRef(101)],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // CallLoopinvariantI + CallN + Jump. Second loopinvariant removed.
+        let loopinv_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
+            .count();
+        assert_eq!(
+            loopinv_count, 1,
+            "loopinvariant cache should survive intervening calls"
+        );
+        assert!(
+            result.iter().any(|o| o.opcode == OpCode::CallN),
+            "the intervening CallN should remain"
+        );
+    }
+
+    // ── Test 36: Different descriptor → both kept ──
+
+    #[test]
+    fn test_loopinvariant_different_descr_not_cached() {
+        let d1 = descr(10);
+        let d2 = descr(20);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(100), OpRef(101)],
+                d1,
+            ),
+            Op::with_descr(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(100), OpRef(101)],
+                d2,
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let loopinv_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
+            .count();
+        assert_eq!(
+            loopinv_count, 2,
+            "different descriptors should keep both calls"
+        );
+    }
+
+    // ── Nullity tracking tests ──
+
+    // ── Test 37: GuardNonnull after allocation is removed ──
+
+    #[test]
+    fn test_guard_nonnull_after_allocation() {
+        // p0 = new()
+        // guard_nonnull(p0)   <- redundant, allocation is always non-null
+        let mut ops = vec![
+            Op::new(OpCode::New, &[]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 0, "guard_nonnull after allocation should be removed");
+    }
+
+    // ── Test 38: GuardNonnull after GuardNonnull is removed ──
+
+    #[test]
+    fn test_guard_nonnull_after_guard_nonnull() {
+        // guard_nonnull(p0)
+        // guard_nonnull(p0)   <- redundant
+        let mut ops = vec![
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 1, "second guard_nonnull should be removed");
+    }
+
+    // ── Test 39: GuardNonnull after GuardClass is removed ──
+
+    #[test]
+    fn test_guard_nonnull_after_guard_class() {
+        // guard_class(p0, cls)  <- implies non-null
+        // guard_nonnull(p0)     <- redundant
+        let mut ops = vec![
+            Op::new(OpCode::GuardClass, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 0, "guard_nonnull after guard_class should be removed");
+    }
+
+    // ── Test 40: GuardNonnull on unknown input arg is kept ──
+
+    #[test]
+    fn test_guard_nonnull_unknown_not_removed() {
+        // guard_nonnull(p0)  <- first time seeing p0, must keep
+        let mut ops = vec![
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 1, "guard_nonnull on unknown should be kept");
+    }
+
+    // ── Test 41: Nonnull from allocation survives call ──
+
+    #[test]
+    fn test_known_nonnull_survives_call_for_allocation() {
+        // p0 = new()
+        // call_n(some_func)    <- invalidates caches, but not allocation nonnull
+        // guard_nonnull(p0)    <- still redundant (allocation is always non-null)
+        let mut ops = vec![
+            Op::new(OpCode::New, &[]),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(
+            nonnull_count, 0,
+            "guard_nonnull after allocation should be removed even after call"
+        );
+    }
+
+    // ── Test 42: Nonnull from guard does NOT survive call ──
+
+    #[test]
+    fn test_known_nonnull_from_guard_invalidated_by_call() {
+        // guard_nonnull(p0)
+        // call_n(some_func)   <- invalidates guard-derived nonnull
+        // guard_nonnull(p0)   <- must re-emit
+        let mut ops = vec![
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(
+            nonnull_count, 2,
+            "guard_nonnull after call should be re-emitted for non-allocation values"
+        );
+    }
+
+    // ── Test 43: GuardNonnull after GuardNonnullClass is removed ──
+
+    #[test]
+    fn test_guard_nonnull_after_guard_nonnull_class() {
+        // guard_nonnull_class(p0, cls) <- implies non-null
+        // guard_nonnull(p0)            <- redundant
+        let mut ops = vec![
+            Op::new(OpCode::GuardNonnullClass, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 0, "guard_nonnull after guard_nonnull_class should be removed");
+    }
+
+    // ── Test 44: GuardNonnull after GuardValue is removed ──
+
+    #[test]
+    fn test_guard_nonnull_after_guard_value() {
+        // guard_value(p0, c) <- implies non-null
+        // guard_nonnull(p0)  <- redundant
+        let mut ops = vec![
+            Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 0, "guard_nonnull after guard_value should be removed");
+    }
+
+    // ── Test 45: GuardNonnull after NewWithVtable is removed ──
+
+    #[test]
+    fn test_guard_nonnull_after_new_with_vtable() {
+        let mut ops = vec![
+            Op::new(OpCode::NewWithVtable, &[]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 0, "guard_nonnull after new_with_vtable should be removed");
+    }
+
+    // ── Test 46: GuardNonnull after NewArray is removed ──
+
+    #[test]
+    fn test_guard_nonnull_after_new_array() {
+        let mut ops = vec![
+            Op::new(OpCode::NewArray, &[OpRef(5)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let nonnull_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnull)
+            .count();
+        assert_eq!(nonnull_count, 0, "guard_nonnull after new_array should be removed");
     }
 }
