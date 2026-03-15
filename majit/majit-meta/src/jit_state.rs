@@ -184,6 +184,31 @@ pub trait JitState: Sized {
         None
     }
 
+    /// Called before a residual call (CALL_MAY_FORCE) during tracing.
+    ///
+    /// Writes virtualizable state to heap via SETFIELD_GC ops so the callee
+    /// can observe up-to-date virtualizable fields. Interpreters that use
+    /// virtualizable objects should override this to emit the necessary
+    /// SETFIELD_GC operations for each tracked field.
+    ///
+    /// Default: no-op (interpreters without virtualizable fields).
+    fn sync_virtualizable_before_residual_call(&self, _ctx: &mut crate::trace_ctx::TraceCtx) {}
+
+    /// Called after a residual call (CALL_MAY_FORCE) during tracing.
+    ///
+    /// Re-reads virtualizable state from heap via GETFIELD_GC ops because
+    /// the callee may have modified virtualizable fields. Returns a list
+    /// of (field_index, new_opref) pairs so the caller can track the
+    /// updated symbolic values.
+    ///
+    /// Default: no-op (interpreters without virtualizable fields).
+    fn sync_virtualizable_after_residual_call(
+        &self,
+        _ctx: &mut crate::trace_ctx::TraceCtx,
+    ) -> Vec<(u32, OpRef)> {
+        Vec::new()
+    }
+
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef>;
 
     fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {

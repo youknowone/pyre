@@ -53,7 +53,7 @@ pub use meta_interp::{
 pub use parity::{assert_trace_parity, normalize_ops, normalize_trace, TraceParityCase};
 pub use quasi_immut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;
-pub use trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx};
+pub use trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx, VableSyncField};
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 pub fn majit_log_enabled() -> bool {
