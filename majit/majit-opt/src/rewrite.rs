@@ -718,6 +718,196 @@ impl OptRewrite {
         None
     }
 
+    // ── Float algebraic simplifications ──
+
+    /// Constant fold a binary float operation.
+    fn try_fold_binary_float(&self, opcode: OpCode, lhs: f64, rhs: f64) -> Option<f64> {
+        match opcode {
+            OpCode::FloatAdd => Some(lhs + rhs),
+            OpCode::FloatSub => Some(lhs - rhs),
+            OpCode::FloatMul => Some(lhs * rhs),
+            OpCode::FloatTrueDiv => {
+                if rhs != 0.0 {
+                    Some(lhs / rhs)
+                } else {
+                    None
+                }
+            }
+            OpCode::FloatFloorDiv => {
+                if rhs != 0.0 {
+                    Some((lhs / rhs).floor())
+                } else {
+                    None
+                }
+            }
+            OpCode::FloatMod => {
+                if rhs != 0.0 {
+                    Some(lhs % rhs)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `FloatAdd(x, 0.0) -> x`, `FloatAdd(0.0, x) -> x`, constant fold.
+    fn optimize_float_add(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
+            if let Some(result) = self.try_fold_binary_float(OpCode::FloatAdd, a, b) {
+                ctx.make_constant(op.pos, Value::Float(result));
+                return PassResult::Remove;
+            }
+        }
+
+        // x + 0.0 -> x
+        if let Some(v) = ctx.get_constant_float(arg1) {
+            if v == 0.0 {
+                ctx.replace_op(op.pos, arg0);
+                return PassResult::Remove;
+            }
+        }
+        // 0.0 + x -> x
+        if let Some(v) = ctx.get_constant_float(arg0) {
+            if v == 0.0 {
+                ctx.replace_op(op.pos, arg1);
+                return PassResult::Remove;
+            }
+        }
+
+        PassResult::PassOn
+    }
+
+    /// `FloatSub(x, 0.0) -> x`, constant fold.
+    fn optimize_float_sub(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
+            if let Some(result) = self.try_fold_binary_float(OpCode::FloatSub, a, b) {
+                ctx.make_constant(op.pos, Value::Float(result));
+                return PassResult::Remove;
+            }
+        }
+
+        // x - 0.0 -> x
+        if let Some(v) = ctx.get_constant_float(arg1) {
+            if v == 0.0 {
+                ctx.replace_op(op.pos, arg0);
+                return PassResult::Remove;
+            }
+        }
+
+        PassResult::PassOn
+    }
+
+    /// `FloatMul(x, 1.0) -> x`, `FloatMul(1.0, x) -> x`, constant fold.
+    fn optimize_float_mul(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
+            if let Some(result) = self.try_fold_binary_float(OpCode::FloatMul, a, b) {
+                ctx.make_constant(op.pos, Value::Float(result));
+                return PassResult::Remove;
+            }
+        }
+
+        // x * 1.0 -> x
+        if let Some(v) = ctx.get_constant_float(arg1) {
+            if v == 1.0 {
+                ctx.replace_op(op.pos, arg0);
+                return PassResult::Remove;
+            }
+        }
+        // 1.0 * x -> x
+        if let Some(v) = ctx.get_constant_float(arg0) {
+            if v == 1.0 {
+                ctx.replace_op(op.pos, arg1);
+                return PassResult::Remove;
+            }
+        }
+
+        PassResult::PassOn
+    }
+
+    /// `FloatTrueDiv(x, 1.0) -> x`, constant fold.
+    fn optimize_float_truediv(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
+            if let Some(result) = self.try_fold_binary_float(OpCode::FloatTrueDiv, a, b) {
+                ctx.make_constant(op.pos, Value::Float(result));
+                return PassResult::Remove;
+            }
+        }
+
+        // x / 1.0 -> x
+        if let Some(v) = ctx.get_constant_float(arg1) {
+            if v == 1.0 {
+                ctx.replace_op(op.pos, arg0);
+                return PassResult::Remove;
+            }
+        }
+
+        PassResult::PassOn
+    }
+
+    /// `FloatNeg(FloatNeg(x)) -> x`, constant fold.
+    fn optimize_float_neg(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+
+        if let Some(a) = ctx.get_constant_float(arg0) {
+            ctx.make_constant(op.pos, Value::Float(-a));
+            return PassResult::Remove;
+        }
+
+        // FloatNeg(FloatNeg(x)) -> x (double negation elimination)
+        if let Some(inner_op) = ctx.new_operations.iter().find(|o| o.pos == arg0) {
+            if inner_op.opcode == OpCode::FloatNeg {
+                let inner_arg = inner_op.arg(0);
+                ctx.replace_op(op.pos, inner_arg);
+                return PassResult::Remove;
+            }
+        }
+
+        PassResult::PassOn
+    }
+
+    /// Constant fold FloatFloorDiv.
+    fn optimize_float_floordiv(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
+            if let Some(result) = self.try_fold_binary_float(OpCode::FloatFloorDiv, a, b) {
+                ctx.make_constant(op.pos, Value::Float(result));
+                return PassResult::Remove;
+            }
+        }
+
+        PassResult::PassOn
+    }
+
+    /// Constant fold FloatMod.
+    fn optimize_float_mod(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
+            if let Some(result) = self.try_fold_binary_float(OpCode::FloatMod, a, b) {
+                ctx.make_constant(op.pos, Value::Float(result));
+                return PassResult::Remove;
+            }
+        }
+
+        PassResult::PassOn
+    }
+
     // ── Helper ──
 
     /// Emit a constant integer value into the trace and return its OpRef.
@@ -776,6 +966,15 @@ impl OptimizationPass for OptRewrite {
             OpCode::GuardTrue => self.optimize_guard_true(op, ctx),
             OpCode::GuardFalse => self.optimize_guard_false(op, ctx),
             OpCode::GuardValue => self.optimize_guard_value(op, ctx),
+
+            // ── Float arithmetic ──
+            OpCode::FloatAdd => self.optimize_float_add(op, ctx),
+            OpCode::FloatSub => self.optimize_float_sub(op, ctx),
+            OpCode::FloatMul => self.optimize_float_mul(op, ctx),
+            OpCode::FloatTrueDiv => self.optimize_float_truediv(op, ctx),
+            OpCode::FloatNeg => self.optimize_float_neg(op, ctx),
+            OpCode::FloatFloorDiv => self.optimize_float_floordiv(op, ctx),
+            OpCode::FloatMod => self.optimize_float_mod(op, ctx),
 
             // ── Identity ops ──
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => self.optimize_same_as(op, ctx),
@@ -2064,5 +2263,299 @@ mod tests {
         assert!(matches!(result, PassResult::Remove));
         // u64::MAX >> 1 = i64::MAX
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(i64::MAX));
+    }
+
+    // ── Float optimization tests ──
+
+    #[test]
+    fn test_float_add_zero_right() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]), // op0: x
+            Op::new(OpCode::SameAsF, &[]), // op1: 0.0
+            Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(1), Value::Float(0.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+    }
+
+    #[test]
+    fn test_float_add_zero_left() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]), // op0: 0.0
+            Op::new(OpCode::SameAsF, &[]), // op1: x
+            Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Float(0.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+    }
+
+    #[test]
+    fn test_float_add_constant_fold() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Float(1.5));
+        ctx.make_constant(OpRef(1), Value::Float(2.5));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(4.0));
+    }
+
+    #[test]
+    fn test_float_sub_zero() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatSub, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(1), Value::Float(0.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+    }
+
+    #[test]
+    fn test_float_sub_constant_fold() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatSub, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Float(5.0));
+        ctx.make_constant(OpRef(1), Value::Float(3.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(2.0));
+    }
+
+    #[test]
+    fn test_float_mul_one_right() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatMul, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(1), Value::Float(1.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+    }
+
+    #[test]
+    fn test_float_mul_one_left() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatMul, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Float(1.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+    }
+
+    #[test]
+    fn test_float_mul_constant_fold() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatMul, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Float(3.0));
+        ctx.make_constant(OpRef(1), Value::Float(4.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(12.0));
+    }
+
+    #[test]
+    fn test_float_truediv_one() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatTrueDiv, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(1), Value::Float(1.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+    }
+
+    #[test]
+    fn test_float_truediv_constant_fold() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatTrueDiv, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Float(10.0));
+        ctx.make_constant(OpRef(1), Value::Float(2.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(5.0));
+    }
+
+    #[test]
+    fn test_float_neg_constant_fold() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatNeg, &[OpRef(0)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(2);
+        ctx.make_constant(OpRef(0), Value::Float(3.14));
+        ctx.emit(ops[0].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_float(OpRef(1)), Some(-3.14));
+    }
+
+    #[test]
+    fn test_float_neg_double_negation() {
+        // FloatNeg(FloatNeg(x)) -> x
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),              // op0: x
+            Op::new(OpCode::FloatNeg, &[OpRef(0)]),     // op1: -x
+            Op::new(OpCode::FloatNeg, &[OpRef(1)]),     // op2: -(-x) -> x
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.emit(ops[0].clone());
+
+        let mut pass = OptRewrite::new();
+        // Process op1 first (pass it through)
+        let result1 = pass.propagate_forward(&ops[1], &mut ctx);
+        assert!(matches!(result1, PassResult::PassOn));
+        ctx.emit(ops[1].clone());
+
+        // Process op2: should detect double negation
+        let result2 = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result2, PassResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+    }
+
+    #[test]
+    fn test_float_floordiv_constant_fold() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatFloorDiv, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Float(7.0));
+        ctx.make_constant(OpRef(1), Value::Float(2.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(3.0));
+    }
+
+    #[test]
+    fn test_float_mod_constant_fold() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatMod, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.make_constant(OpRef(0), Value::Float(7.0));
+        ctx.make_constant(OpRef(1), Value::Float(3.0));
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::Remove));
+        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(1.0));
+    }
+
+    #[test]
+    fn test_float_add_no_constants() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(1)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(3);
+        ctx.emit(ops[0].clone());
+        ctx.emit(ops[1].clone());
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        assert!(matches!(result, PassResult::PassOn));
     }
 }

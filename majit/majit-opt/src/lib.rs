@@ -138,6 +138,14 @@ impl OptContext {
             _ => None,
         })
     }
+
+    /// Get constant float value, if known.
+    pub fn get_constant_float(&self, opref: OpRef) -> Option<f64> {
+        self.get_constant(opref).and_then(|v| match v {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        })
+    }
 }
 
 /// An optimization pass.
