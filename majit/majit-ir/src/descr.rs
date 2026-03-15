@@ -52,6 +52,14 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn is_always_pure(&self) -> bool {
         false
     }
+
+    /// Whether this descriptor marks a loop version guard.
+    ///
+    /// Loop version guards have their alternative path compiled immediately
+    /// after the main loop, rather than lazily on failure.
+    fn is_loop_version(&self) -> bool {
+        false
+    }
 }
 
 /// Descriptor for guard failures — carries resume information.
