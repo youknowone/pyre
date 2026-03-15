@@ -9,7 +9,7 @@
 /// failures, execution transfers to the bridge instead of returning to
 /// the interpreter.
 use crate::compiler::{register_gc_roots, release_force_token, unregister_gc_roots};
-use majit_codegen::FailDescrLayout;
+use majit_codegen::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
 use majit_gc::GcMap;
 use majit_ir::{FailDescr, GcRef, Type};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -20,6 +20,16 @@ use std::sync::{Arc, Mutex};
 /// When a bridge is compiled, its code pointer and metadata are stored
 /// here so `execute_token` can dispatch to the bridge on guard failure.
 pub struct BridgeData {
+    /// Compiled trace identifier for this bridge.
+    pub trace_id: u64,
+    /// Input types expected at the bridge header.
+    pub input_types: Vec<Type>,
+    /// Interpreter header pc associated with this bridge trace.
+    pub header_pc: u64,
+    /// Source guard this bridge is attached to.
+    pub source_guard: (u64, u32),
+    /// Recovery-layout caller prefix inherited from the source guard.
+    pub caller_prefix_layout: Option<ExitRecoveryLayout>,
     /// Function pointer to the bridge's compiled code.
     /// Same calling convention as a compiled loop:
     ///   fn(inputs_ptr: *const i64, outputs_ptr: *mut i64, roots_ptr: *mut i64) -> i64
@@ -36,6 +46,8 @@ pub struct BridgeData {
     pub max_output_slots: usize,
     /// Whether any guard in this bridge uses FORCE_TOKEN slots.
     pub needs_force_frame: bool,
+    /// Static terminal-exit layouts within the bridge trace.
+    pub terminal_exit_layouts: Mutex<Vec<TerminalExitLayout>>,
 }
 
 unsafe impl Send for BridgeData {}
@@ -44,10 +56,19 @@ unsafe impl Sync for BridgeData {}
 impl std::fmt::Debug for BridgeData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BridgeData")
+            .field("trace_id", &self.trace_id)
+            .field("input_types", &self.input_types)
+            .field("header_pc", &self.header_pc)
+            .field("source_guard", &self.source_guard)
+            .field("caller_prefix_layout", &self.caller_prefix_layout)
             .field("code_ptr", &self.code_ptr)
             .field("gc_runtime_id", &self.gc_runtime_id)
             .field("num_inputs", &self.num_inputs)
             .field("num_ref_roots", &self.num_ref_roots)
+            .field(
+                "terminal_exit_layouts",
+                &self.terminal_exit_layouts.lock().unwrap().clone(),
+            )
             .finish()
     }
 }
@@ -61,11 +82,14 @@ impl std::fmt::Debug for BridgeData {
 /// should be executed instead of returning to the interpreter.
 pub struct CraneliftFailDescr {
     pub fail_index: u32,
+    pub source_op_index: Option<usize>,
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
     pub gc_map: GcMap,
     pub is_finish: bool,
     pub force_token_slots: Vec<usize>,
+    pub trace_info: Mutex<Option<CompiledTraceInfo>>,
+    pub recovery_layout: Mutex<Option<ExitRecoveryLayout>>,
     /// Number of times this guard has failed (for bridge compilation heuristics).
     pub fail_count: AtomicU32,
     /// Compiled bridge attached to this guard, if any.
@@ -76,11 +100,17 @@ impl std::fmt::Debug for CraneliftFailDescr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CraneliftFailDescr")
             .field("fail_index", &self.fail_index)
+            .field("source_op_index", &self.source_op_index)
             .field("trace_id", &self.trace_id)
             .field("fail_arg_types", &self.fail_arg_types)
             .field("gc_map", &self.gc_map)
             .field("is_finish", &self.is_finish)
             .field("force_token_slots", &self.force_token_slots)
+            .field("trace_info", &self.trace_info.lock().unwrap().clone())
+            .field(
+                "recovery_layout",
+                &self.recovery_layout.lock().unwrap().clone(),
+            )
             .field("fail_count", &self.fail_count.load(Ordering::Relaxed))
             .field("has_bridge", &self.bridge.lock().unwrap().is_some())
             .finish()
@@ -106,6 +136,7 @@ impl CraneliftFailDescr {
             fail_arg_types,
             false,
             Vec::new(),
+            None,
         )
     }
 
@@ -116,6 +147,7 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish,
             Vec::new(),
+            None,
         )
     }
 
@@ -131,6 +163,7 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish,
             force_token_slots,
+            None,
         )
     }
 
@@ -140,16 +173,20 @@ impl CraneliftFailDescr {
         fail_arg_types: Vec<Type>,
         is_finish: bool,
         mut force_token_slots: Vec<usize>,
+        recovery_layout: Option<ExitRecoveryLayout>,
     ) -> Self {
         force_token_slots.sort_unstable();
         force_token_slots.dedup();
         CraneliftFailDescr {
             fail_index,
+            source_op_index: None,
             trace_id,
             gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
             is_finish,
             force_token_slots,
+            trace_info: Mutex::new(None),
+            recovery_layout: Mutex::new(recovery_layout),
             fail_count: AtomicU32::new(0),
             bridge: Mutex::new(None),
         }
@@ -175,6 +212,18 @@ impl CraneliftFailDescr {
         *self.bridge.lock().unwrap() = Some(bridge);
     }
 
+    pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
+        *self.recovery_layout.lock().unwrap() = Some(recovery_layout);
+    }
+
+    pub fn set_source_op_index(&mut self, source_op_index: usize) {
+        self.source_op_index = Some(source_op_index);
+    }
+
+    pub fn set_trace_info(&self, trace_info: CompiledTraceInfo) {
+        *self.trace_info.lock().unwrap() = Some(trace_info);
+    }
+
     pub fn gc_map(&self) -> &GcMap {
         &self.gc_map
     }
@@ -196,11 +245,14 @@ impl CraneliftFailDescr {
             .collect();
         FailDescrLayout {
             fail_index: self.fail_index,
+            source_op_index: self.source_op_index,
             trace_id: self.trace_id,
+            trace_info: self.trace_info.lock().unwrap().clone(),
             fail_arg_types: self.fail_arg_types.clone(),
             is_finish: self.is_finish,
             gc_ref_slots,
             force_token_slots: self.force_token_slots.clone(),
+            recovery_layout: self.recovery_layout.lock().unwrap().clone(),
         }
     }
 }
@@ -389,6 +441,27 @@ impl FrameData {
         }
     }
 
+    pub fn take_ref_for_call_result(&mut self, index: usize) -> GcRef {
+        match self.fail_descr.fail_arg_types[index] {
+            Type::Ref => {
+                if self.fail_descr.is_force_token_slot(index) {
+                    let handle = self.raw_values[index] as u64;
+                    if let Some(position) = self
+                        .owned_force_tokens
+                        .iter()
+                        .position(|owned| *owned == handle)
+                    {
+                        self.owned_force_tokens.swap_remove(position);
+                    }
+                    return GcRef(handle as usize);
+                }
+                let rooted_index = self.ref_slot_map[index].expect("missing rooted ref slot");
+                self.rooted_refs[rooted_index]
+            }
+            other => panic!("expected Ref at index {index}, got {other:?}"),
+        }
+    }
+
     pub fn set_savedata_ref(&mut self, data: GcRef) {
         if let Some(saved_data) = self.saved_data.as_mut() {
             if let Some(runtime_id) = self.gc_runtime_id {
@@ -413,6 +486,10 @@ impl FrameData {
             .as_ref()
             .map(|saved_data| **saved_data)
             .expect("dead frame has no saved-data ref")
+    }
+
+    pub fn try_get_savedata_ref(&self) -> Option<GcRef> {
+        self.saved_data.as_ref().map(|saved_data| **saved_data)
     }
 
     pub fn get_exception_ref(&self) -> GcRef {

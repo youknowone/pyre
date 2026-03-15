@@ -6,8 +6,7 @@
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseJitCell
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use majit_codegen::LoopToken;
@@ -91,6 +90,7 @@ const DEFAULT_FUNCTION_THRESHOLD: u32 = 4;
 /// Prevents unbounded recursion and excessively long traces.
 /// Mirrors RPython's `MAX_INLINE_DEPTH` from warmstate.py.
 const DEFAULT_MAX_INLINE_DEPTH: u32 = 10;
+static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(0);
 
 pub struct WarmState {
     /// Global hot counter.
@@ -109,8 +109,6 @@ pub struct WarmState {
     function_threshold: u32,
     /// Maximum depth of inlined function calls during tracing.
     max_inline_depth: u32,
-    /// Next token number for compiled loops.
-    next_token_number: u64,
     /// Optional profiling logger, enabled via MAJIT_STATS=1 or MAJIT_LOG=1.
     jitlog: Option<JitLog>,
     /// Quasi-immutable field invalidation registry.
@@ -152,7 +150,6 @@ impl WarmState {
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
             function_threshold: DEFAULT_FUNCTION_THRESHOLD,
             max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
-            next_token_number: 0,
             jitlog: JitLog::from_env(),
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
@@ -168,7 +165,6 @@ impl WarmState {
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
             function_threshold: DEFAULT_FUNCTION_THRESHOLD,
             max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
-            next_token_number: 0,
             jitlog,
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
@@ -197,6 +193,33 @@ impl WarmState {
         }
 
         // Threshold reached: start tracing
+        self.counter.reset(green_key_hash);
+        let cell = self
+            .cells
+            .entry(green_key_hash)
+            .or_insert_with(JitCell::new);
+        cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+
+        HotResult::StartTracing(TraceRecorder::new())
+    }
+
+    /// Force-start tracing for a green key, bypassing the hot counter.
+    ///
+    /// Used by function-entry tracing where the caller has already
+    /// determined that tracing should begin.
+    pub fn force_start_tracing(&mut self, green_key_hash: u64) -> HotResult {
+        if let Some(cell) = self.cells.get(&green_key_hash) {
+            if cell.is_compiled() {
+                return HotResult::RunCompiled;
+            }
+            if cell.is_tracing() {
+                return HotResult::AlreadyTracing;
+            }
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+                return HotResult::NotHot;
+            }
+        }
+
         self.counter.reset(green_key_hash);
         let cell = self
             .cells
@@ -258,9 +281,7 @@ impl WarmState {
 
     /// Allocate a new unique LoopToken number.
     pub fn alloc_token_number(&mut self) -> u64 {
-        let n = self.next_token_number;
-        self.next_token_number += 1;
-        n
+        NEXT_GLOBAL_TOKEN_NUMBER.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Get the current threshold.
@@ -585,9 +606,11 @@ mod tests {
     #[test]
     fn test_alloc_token_number() {
         let mut ws = WarmState::new(10);
-        assert_eq!(ws.alloc_token_number(), 0);
-        assert_eq!(ws.alloc_token_number(), 1);
-        assert_eq!(ws.alloc_token_number(), 2);
+        let first = ws.alloc_token_number();
+        let second = ws.alloc_token_number();
+        let third = ws.alloc_token_number();
+        assert_eq!(second, first + 1);
+        assert_eq!(third, second + 1);
     }
 
     #[test]

@@ -2,9 +2,10 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
+use majit_codegen::LoopToken;
 use majit_ir::{OpCode, OpRef};
 
-use crate::{emit_commit_io, SymbolicStack, TraceAction, TraceCtx};
+use crate::{SymbolicStack, TraceAction, TraceCtx};
 
 const BC_LOAD_CONST_I: u8 = 1;
 const BC_POP_I: u8 = 2;
@@ -45,6 +46,22 @@ const BC_CALL_FLOAT: u8 = 34;
 const BC_CALL_PURE_FLOAT: u8 = 35;
 const BC_RECORD_BINOP_F: u8 = 36;
 const BC_RECORD_UNARY_F: u8 = 37;
+const BC_CALL_MAY_FORCE_INT: u8 = 38;
+const BC_CALL_MAY_FORCE_REF: u8 = 39;
+const BC_CALL_MAY_FORCE_FLOAT: u8 = 40;
+const BC_CALL_MAY_FORCE_VOID: u8 = 41;
+const BC_CALL_RELEASE_GIL_INT: u8 = 42;
+const BC_CALL_RELEASE_GIL_REF: u8 = 43;
+const BC_CALL_RELEASE_GIL_FLOAT: u8 = 44;
+const BC_CALL_RELEASE_GIL_VOID: u8 = 45;
+const BC_CALL_LOOPINVARIANT_INT: u8 = 46;
+const BC_CALL_LOOPINVARIANT_REF: u8 = 47;
+const BC_CALL_LOOPINVARIANT_FLOAT: u8 = 48;
+const BC_CALL_LOOPINVARIANT_VOID: u8 = 49;
+const BC_CALL_ASSEMBLER_INT: u8 = 50;
+const BC_CALL_ASSEMBLER_REF: u8 = 51;
+const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;
+const BC_CALL_ASSEMBLER_VOID: u8 = 53;
 const MAX_HOST_CALL_ARITY: usize = 8;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -70,22 +87,116 @@ pub struct JitCode {
     /// Sub-JitCodes for `inline_call` targets (compound methods).
     pub sub_jitcodes: Vec<JitCode>,
     /// Function pointers for `residual_call` targets (I/O shims, external calls).
-    pub fn_ptrs: Vec<*const ()>,
+    pub fn_ptrs: Vec<JitCallTarget>,
+    /// CALL_ASSEMBLER targets keyed by loop token number plus a concrete hook.
+    assembler_targets: Vec<JitCallAssemblerTarget>,
 }
 
-// SAFETY: fn_ptrs are function pointers to extern "C" functions — no mutable state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitCallTarget {
+    pub trace_ptr: *const (),
+    pub concrete_ptr: *const (),
+}
+
+impl JitCallTarget {
+    pub fn new(trace_ptr: *const (), concrete_ptr: *const ()) -> Self {
+        Self {
+            trace_ptr,
+            concrete_ptr,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JitCallAssemblerTarget {
+    token_number: u64,
+    concrete_ptr: *const (),
+}
+
+impl JitCallAssemblerTarget {
+    fn new(token_number: u64, concrete_ptr: *const ()) -> Self {
+        Self {
+            token_number,
+            concrete_ptr,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JitArgKind {
+    Int = 0,
+    Ref = 1,
+    Float = 2,
+}
+
+impl JitArgKind {
+    fn encode(self) -> u8 {
+        self as u8
+    }
+
+    fn decode(byte: u8) -> Self {
+        match byte {
+            0 => Self::Int,
+            1 => Self::Ref,
+            2 => Self::Float,
+            other => panic!("unknown jitcode arg kind {other}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitCallArg {
+    pub kind: JitArgKind,
+    pub reg: u16,
+}
+
+impl JitCallArg {
+    pub fn int(reg: u16) -> Self {
+        Self {
+            kind: JitArgKind::Int,
+            reg,
+        }
+    }
+
+    pub fn reference(reg: u16) -> Self {
+        Self {
+            kind: JitArgKind::Ref,
+            reg,
+        }
+    }
+
+    pub fn float(reg: u16) -> Self {
+        Self {
+            kind: JitArgKind::Float,
+            reg,
+        }
+    }
+}
+
+// SAFETY: call targets are function pointers to immutable code.
 unsafe impl Send for JitCode {}
 unsafe impl Sync for JitCode {}
 
 pub trait JitCodeSym {
     fn current_selected(&self) -> usize;
+    fn current_selected_value(&self) -> Option<OpRef>;
     fn set_current_selected(&mut self, selected: usize);
+    fn set_current_selected_value(&mut self, selected: usize, value: OpRef);
     fn stack(&self, selected: usize) -> Option<&SymbolicStack>;
     fn stack_mut(&mut self, selected: usize) -> Option<&mut SymbolicStack>;
     fn total_slots(&self) -> usize;
     fn loop_header_pc(&self) -> usize;
     /// Create a symbolic stack for a storage not in the initial layout.
     fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize);
+    /// Full interpreter-visible state to materialize on guard failure.
+    ///
+    /// When `None`, guards fall back to the legacy auto-generated fail args.
+    fn fail_args(&self) -> Option<Vec<OpRef>>;
+
+    /// Current stack lengths in the same storage order as `fail_args()`.
+    fn fail_storage_lengths(&self) -> Option<Vec<usize>> {
+        None
+    }
 }
 
 pub trait JitCodeRuntime {
@@ -214,7 +325,33 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    pub fn new(root: MIFrame<'a>, _sub_jitcodes: &'a [JitCode], _fn_ptrs: &'a [*const ()]) -> Self {
+    fn record_state_guard(
+        ctx: &mut TraceCtx,
+        sym: &S,
+        opcode: OpCode,
+        args: &[OpRef],
+        extra_fail_args: &[OpRef],
+    ) {
+        if let Some(mut fail_args) = sym.fail_args() {
+            if let Some(lengths) = sym.fail_storage_lengths() {
+                fail_args.extend(lengths.into_iter().map(|len| ctx.const_int(len as i64)));
+            }
+            let selected = sym
+                .current_selected_value()
+                .unwrap_or_else(|| ctx.const_int(sym.current_selected() as i64));
+            fail_args.push(selected);
+            fail_args.extend_from_slice(extra_fail_args);
+            ctx.record_guard_with_fail_args(opcode, args, fail_args.len(), &fail_args);
+        } else {
+            ctx.record_guard(opcode, args, sym.total_slots());
+        }
+    }
+
+    pub fn new(
+        root: MIFrame<'a>,
+        _sub_jitcodes: &'a [JitCode],
+        _fn_ptrs: &'a [JitCallTarget],
+    ) -> Self {
         Self {
             frames: MIFrameStack::new(root),
             runtime_stacks: HashMap::new(),
@@ -366,7 +503,14 @@ where
                     match eval_binop_ovf(opcode, lhs_value, rhs_value) {
                         Some(value) => {
                             let result = ctx.record_op(opcode, &[lhs, rhs]);
-                            ctx.record_guard(OpCode::GuardNoOverflow, &[], sym.total_slots());
+                            let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
+                            Self::record_state_guard(
+                                ctx,
+                                sym,
+                                OpCode::GuardNoOverflow,
+                                &[],
+                                &[resume_pc],
+                            );
                             self.set_int_reg(dst, Some(result), Some(value));
                         }
                         None => return TraceAction::Abort,
@@ -402,20 +546,32 @@ where
             }
             BC_BRANCH_ZERO => {
                 let selected = sym.current_selected();
-                let stack_len = self.runtime_stack_mut(selected, runtime).len();
-                if stack_len == 0 {
-                    return TraceAction::Abort;
-                }
-                let runtime_cond = self.runtime_stack_mut(selected, runtime)[stack_len - 1];
+                let runtime_cond = {
+                    let runtime_stack = self.runtime_stack_mut(selected, runtime);
+                    let Some(value) = runtime_stack.pop() else {
+                        return TraceAction::Abort;
+                    };
+                    value
+                };
                 let pc = self.frames.current_mut().pc;
                 let close_loop = runtime.label_at(pc) == sym.loop_header_pc();
-                let action = {
-                    let num_live = sym.total_slots();
+                let cond = {
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    ctx.trace_branch_guard(stack, runtime_cond == 0, false, num_live, close_loop)
+                    stack.pop().expect("branch_zero on empty symbolic stack")
                 };
-                if matches!(action, TraceAction::CloseLoop) {
-                    emit_commit_io(ctx);
+                let opcode = if runtime_cond == 0 {
+                    OpCode::GuardFalse
+                } else {
+                    OpCode::GuardTrue
+                };
+                let resume_pc = if runtime_cond == 0 {
+                    (pc + 1) as i64
+                } else {
+                    runtime.label_at(pc) as i64
+                };
+                let resume_pc = ctx.const_int(resume_pc);
+                Self::record_state_guard(ctx, sym, opcode, &[cond], &[resume_pc]);
+                if runtime_cond == 0 && close_loop {
                     return TraceAction::CloseLoop;
                 }
             }
@@ -431,7 +587,8 @@ where
                 } else {
                     OpCode::GuardTrue
                 };
-                ctx.record_guard(opcode, &[cond], sym.total_slots());
+                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
+                Self::record_state_guard(ctx, sym, opcode, &[cond], &[resume_pc]);
                 if branch_taken {
                     self.frames.current_mut().code_cursor = target;
                 }
@@ -439,7 +596,6 @@ where
             BC_JUMP_TARGET => {
                 let pc = self.frames.current_mut().pc;
                 if runtime.label_at(pc) == sym.loop_header_pc() {
-                    emit_commit_io(ctx);
                     return TraceAction::CloseLoop;
                 }
             }
@@ -480,27 +636,64 @@ where
                 sub_frame.return_i = return_i;
                 self.frames.push(sub_frame);
             }
-            BC_RESIDUAL_CALL_VOID => {
+            BC_RESIDUAL_CALL_VOID
+            | BC_CALL_MAY_FORCE_VOID
+            | BC_CALL_RELEASE_GIL_VOID
+            | BC_CALL_LOOPINVARIANT_VOID
+            | BC_CALL_ASSEMBLER_VOID => {
                 let (fn_ptr_idx, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
-                        arg_regs.push(frame.next_u16() as usize);
+                        let kind = JitArgKind::decode(frame.next_u8());
+                        let reg = frame.next_u16();
+                        arg_regs.push(JitCallArg { kind, reg });
                     }
                     (fn_ptr_idx, arg_regs)
                 };
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                for src in arg_regs {
-                    let (arg, concrete) = self.read_int_reg(src);
+                let mut arg_types = Vec::with_capacity(arg_regs.len());
+                for arg_spec in arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(arg_spec);
                     args.push(arg);
                     concrete_args.push(concrete);
+                    arg_types.push(arg_type);
                 }
-                let fn_ptr = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
-                ctx.call_void(fn_ptr, &args);
-                call_void_function(fn_ptr, &concrete_args);
+                if bytecode == BC_CALL_ASSEMBLER_VOID {
+                    let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
+                    let token = LoopToken::new(target.token_number);
+                    ctx.call_assembler_void_typed(&token, &args, &arg_types);
+                    call_void_function(target.concrete_ptr, &concrete_args);
+                } else {
+                    let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                    let trace_ptr = if target.trace_ptr.is_null() {
+                        target.concrete_ptr
+                    } else {
+                        target.trace_ptr
+                    };
+                    let concrete_ptr = if target.concrete_ptr.is_null() {
+                        trace_ptr
+                    } else {
+                        target.concrete_ptr
+                    };
+                    match bytecode {
+                        BC_RESIDUAL_CALL_VOID => ctx.call_void_typed(trace_ptr, &args, &arg_types),
+                        BC_CALL_MAY_FORCE_VOID => {
+                            ctx.call_may_force_void_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_RELEASE_GIL_VOID => {
+                            ctx.call_release_gil_void_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_LOOPINVARIANT_VOID => {
+                            ctx.call_loopinvariant_void_typed(trace_ptr, &args, &arg_types)
+                        }
+                        _ => unreachable!(),
+                    }
+                    call_void_function(concrete_ptr, &concrete_args);
+                }
             }
             BC_SET_SELECTED => {
                 let const_idx = {
@@ -522,7 +715,8 @@ where
                     sym.ensure_stack(new_selected, offset, len);
                     let _ = self.runtime_stack_mut(new_selected, runtime);
                 }
-                sym.set_current_selected(new_selected);
+                let selected_value = ctx.const_int(new_selected as i64);
+                sym.set_current_selected_value(new_selected, selected_value);
             }
             BC_PUSH_TO => {
                 let (src_idx, target) = {
@@ -548,7 +742,12 @@ where
                 let (value, concrete) = self.read_int_reg(src);
                 self.set_int_reg(dst, Some(value), Some(concrete));
             }
-            BC_CALL_INT | BC_CALL_PURE_INT => {
+            BC_CALL_INT
+            | BC_CALL_PURE_INT
+            | BC_CALL_MAY_FORCE_INT
+            | BC_CALL_RELEASE_GIL_INT
+            | BC_CALL_LOOPINVARIANT_INT
+            | BC_CALL_ASSEMBLER_INT => {
                 let (opcode, fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let opcode = bytecode;
@@ -557,25 +756,58 @@ where
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
-                        arg_regs.push(frame.next_u16() as usize);
+                        let kind = JitArgKind::decode(frame.next_u8());
+                        let reg = frame.next_u16();
+                        arg_regs.push(JitCallArg { kind, reg });
                     }
                     (opcode, fn_ptr_idx, dst, arg_regs)
                 };
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                for src in arg_regs {
-                    let (arg, concrete) = self.read_int_reg(src);
+                let mut arg_types = Vec::with_capacity(arg_regs.len());
+                for arg_spec in arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(arg_spec);
                     args.push(arg);
                     concrete_args.push(concrete);
+                    arg_types.push(arg_type);
                 }
-                let fn_ptr = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
-                let traced = match opcode {
-                    BC_CALL_INT => ctx.call_int(fn_ptr, &args),
-                    BC_CALL_PURE_INT => ctx.call_elidable_int(fn_ptr, &args),
-                    _ => unreachable!(),
-                };
-                let concrete = call_int_function(fn_ptr, &concrete_args);
-                self.set_int_reg(dst, Some(traced), Some(concrete));
+                if opcode == BC_CALL_ASSEMBLER_INT {
+                    let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
+                    let token = LoopToken::new(target.token_number);
+                    let traced = ctx.call_assembler_int_typed(&token, &args, &arg_types);
+                    let concrete = call_int_function(target.concrete_ptr, &concrete_args);
+                    self.set_int_reg(dst, Some(traced), Some(concrete));
+                } else {
+                    let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                    let trace_ptr = if target.trace_ptr.is_null() {
+                        target.concrete_ptr
+                    } else {
+                        target.trace_ptr
+                    };
+                    let concrete_ptr = if target.concrete_ptr.is_null() {
+                        trace_ptr
+                    } else {
+                        target.concrete_ptr
+                    };
+                    let traced = match opcode {
+                        BC_CALL_INT => ctx.call_int_typed(trace_ptr, &args, &arg_types),
+                        BC_CALL_PURE_INT => {
+                            ctx.call_elidable_int_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_MAY_FORCE_INT => {
+                            ctx.call_may_force_int_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_RELEASE_GIL_INT => {
+                            ctx.call_release_gil_int_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_LOOPINVARIANT_INT => {
+                            ctx.call_loopinvariant_int_typed(trace_ptr, &args, &arg_types)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
+                    self.set_int_reg(dst, Some(traced), Some(concrete));
+                }
             }
             // ── Ref-typed bytecodes ────────────────────────────────
             BC_LOAD_CONST_R => {
@@ -618,7 +850,12 @@ where
                 let (value, concrete) = self.read_ref_reg(src);
                 self.set_ref_reg(dst, Some(value), Some(concrete));
             }
-            BC_CALL_REF | BC_CALL_PURE_REF => {
+            BC_CALL_REF
+            | BC_CALL_PURE_REF
+            | BC_CALL_MAY_FORCE_REF
+            | BC_CALL_RELEASE_GIL_REF
+            | BC_CALL_LOOPINVARIANT_REF
+            | BC_CALL_ASSEMBLER_REF => {
                 let (opcode, fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let opcode = bytecode;
@@ -627,25 +864,58 @@ where
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
-                        arg_regs.push(frame.next_u16() as usize);
+                        let kind = JitArgKind::decode(frame.next_u8());
+                        let reg = frame.next_u16();
+                        arg_regs.push(JitCallArg { kind, reg });
                     }
                     (opcode, fn_ptr_idx, dst, arg_regs)
                 };
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                for src in arg_regs {
-                    let (arg, concrete) = self.read_int_reg(src);
+                let mut arg_types = Vec::with_capacity(arg_regs.len());
+                for arg_spec in arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(arg_spec);
                     args.push(arg);
                     concrete_args.push(concrete);
+                    arg_types.push(arg_type);
                 }
-                let fn_ptr = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
-                let traced = match opcode {
-                    BC_CALL_REF => ctx.call_ref(fn_ptr, &args),
-                    BC_CALL_PURE_REF => ctx.call_elidable_ref(fn_ptr, &args),
-                    _ => unreachable!(),
-                };
-                let concrete = call_int_function(fn_ptr, &concrete_args);
-                self.set_ref_reg(dst, Some(traced), Some(concrete));
+                if opcode == BC_CALL_ASSEMBLER_REF {
+                    let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
+                    let token = LoopToken::new(target.token_number);
+                    let traced = ctx.call_assembler_ref_typed(&token, &args, &arg_types);
+                    let concrete = call_int_function(target.concrete_ptr, &concrete_args);
+                    self.set_ref_reg(dst, Some(traced), Some(concrete));
+                } else {
+                    let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                    let trace_ptr = if target.trace_ptr.is_null() {
+                        target.concrete_ptr
+                    } else {
+                        target.trace_ptr
+                    };
+                    let concrete_ptr = if target.concrete_ptr.is_null() {
+                        trace_ptr
+                    } else {
+                        target.concrete_ptr
+                    };
+                    let traced = match opcode {
+                        BC_CALL_REF => ctx.call_ref_typed(trace_ptr, &args, &arg_types),
+                        BC_CALL_PURE_REF => {
+                            ctx.call_elidable_ref_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_MAY_FORCE_REF => {
+                            ctx.call_may_force_ref_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_RELEASE_GIL_REF => {
+                            ctx.call_release_gil_ref_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_LOOPINVARIANT_REF => {
+                            ctx.call_loopinvariant_ref_typed(trace_ptr, &args, &arg_types)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
+                    self.set_ref_reg(dst, Some(traced), Some(concrete));
+                }
             }
             // ── Float-typed bytecodes ───────────────────────────────
             BC_LOAD_CONST_F => {
@@ -688,7 +958,12 @@ where
                 let (value, concrete) = self.read_float_reg(src);
                 self.set_float_reg(dst, Some(value), Some(concrete));
             }
-            BC_CALL_FLOAT | BC_CALL_PURE_FLOAT => {
+            BC_CALL_FLOAT
+            | BC_CALL_PURE_FLOAT
+            | BC_CALL_MAY_FORCE_FLOAT
+            | BC_CALL_RELEASE_GIL_FLOAT
+            | BC_CALL_LOOPINVARIANT_FLOAT
+            | BC_CALL_ASSEMBLER_FLOAT => {
                 let (opcode, fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let opcode = bytecode;
@@ -697,25 +972,58 @@ where
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
-                        arg_regs.push(frame.next_u16() as usize);
+                        let kind = JitArgKind::decode(frame.next_u8());
+                        let reg = frame.next_u16();
+                        arg_regs.push(JitCallArg { kind, reg });
                     }
                     (opcode, fn_ptr_idx, dst, arg_regs)
                 };
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                for src in arg_regs {
-                    let (arg, concrete) = self.read_int_reg(src);
+                let mut arg_types = Vec::with_capacity(arg_regs.len());
+                for arg_spec in arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(arg_spec);
                     args.push(arg);
                     concrete_args.push(concrete);
+                    arg_types.push(arg_type);
                 }
-                let fn_ptr = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
-                let traced = match opcode {
-                    BC_CALL_FLOAT => ctx.call_float(fn_ptr, &args),
-                    BC_CALL_PURE_FLOAT => ctx.call_elidable_float(fn_ptr, &args),
-                    _ => unreachable!(),
-                };
-                let concrete = call_int_function(fn_ptr, &concrete_args);
-                self.set_float_reg(dst, Some(traced), Some(concrete));
+                if opcode == BC_CALL_ASSEMBLER_FLOAT {
+                    let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
+                    let token = LoopToken::new(target.token_number);
+                    let traced = ctx.call_assembler_float_typed(&token, &args, &arg_types);
+                    let concrete = call_int_function(target.concrete_ptr, &concrete_args);
+                    self.set_float_reg(dst, Some(traced), Some(concrete));
+                } else {
+                    let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                    let trace_ptr = if target.trace_ptr.is_null() {
+                        target.concrete_ptr
+                    } else {
+                        target.trace_ptr
+                    };
+                    let concrete_ptr = if target.concrete_ptr.is_null() {
+                        trace_ptr
+                    } else {
+                        target.concrete_ptr
+                    };
+                    let traced = match opcode {
+                        BC_CALL_FLOAT => ctx.call_float_typed(trace_ptr, &args, &arg_types),
+                        BC_CALL_PURE_FLOAT => {
+                            ctx.call_elidable_float_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_MAY_FORCE_FLOAT => {
+                            ctx.call_may_force_float_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_RELEASE_GIL_FLOAT => {
+                            ctx.call_release_gil_float_typed(trace_ptr, &args, &arg_types)
+                        }
+                        BC_CALL_LOOPINVARIANT_FLOAT => {
+                            ctx.call_loopinvariant_float_typed(trace_ptr, &args, &arg_types)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
+                    self.set_float_reg(dst, Some(traced), Some(concrete));
+                }
             }
             BC_RECORD_BINOP_F => {
                 let (dst, lhs_idx, rhs_idx, opcode) = {
@@ -811,6 +1119,23 @@ where
             frame.float_values[reg].expect("jitcode concrete float register was uninitialized"),
         )
     }
+
+    fn read_call_arg(&mut self, arg: JitCallArg) -> (OpRef, i64, majit_ir::Type) {
+        match arg.kind {
+            JitArgKind::Int => {
+                let (opref, value) = self.read_int_reg(arg.reg as usize);
+                (opref, value, majit_ir::Type::Int)
+            }
+            JitArgKind::Ref => {
+                let (opref, value) = self.read_ref_reg(arg.reg as usize);
+                (opref, value, majit_ir::Type::Ref)
+            }
+            JitArgKind::Float => {
+                let (opref, value) = self.read_float_reg(arg.reg as usize);
+                (opref, value, majit_ir::Type::Float)
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -824,7 +1149,8 @@ pub struct JitCodeBuilder {
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
     sub_jitcodes: Vec<JitCode>,
-    fn_ptrs: Vec<*const ()>,
+    fn_ptrs: Vec<JitCallTarget>,
+    assembler_targets: Vec<JitCallAssemblerTarget>,
 }
 
 impl JitCodeBuilder {
@@ -996,22 +1322,111 @@ impl JitCodeBuilder {
     }
 
     pub fn residual_call_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
-        for &arg in arg_regs {
-            self.touch_reg(arg);
-        }
-        self.push_u8(BC_RESIDUAL_CALL_VOID);
-        self.push_u16(fn_ptr_idx);
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u16(arg);
-        }
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.residual_call_void_typed_args(fn_ptr_idx, &args);
+    }
+
+    pub fn residual_call_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
+        self.call_void_like(BC_RESIDUAL_CALL_VOID, fn_ptr_idx, arg_regs);
+    }
+
+    pub fn call_may_force_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_may_force_void_typed_args(fn_ptr_idx, &args);
+    }
+
+    pub fn call_may_force_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
+        self.call_void_like(BC_CALL_MAY_FORCE_VOID, fn_ptr_idx, arg_regs);
+    }
+
+    pub fn call_release_gil_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_release_gil_void_typed_args(fn_ptr_idx, &args);
+    }
+
+    pub fn call_release_gil_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
+        self.call_void_like(BC_CALL_RELEASE_GIL_VOID, fn_ptr_idx, arg_regs);
+    }
+
+    pub fn call_loopinvariant_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_loopinvariant_void_typed_args(fn_ptr_idx, &args);
+    }
+
+    pub fn call_loopinvariant_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
+        self.call_void_like(BC_CALL_LOOPINVARIANT_VOID, fn_ptr_idx, arg_regs);
+    }
+
+    pub fn call_assembler_void_args(&mut self, target_idx: u16, arg_regs: &[u16]) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_assembler_void_typed_args(target_idx, &args);
+    }
+
+    pub fn call_assembler_void_typed_args(&mut self, target_idx: u16, arg_regs: &[JitCallArg]) {
+        self.call_assembler_void_like(BC_CALL_ASSEMBLER_VOID, target_idx, arg_regs);
+    }
+
+    pub fn call_may_force_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_may_force_int_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_may_force_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
+        self.call_int_like(BC_CALL_MAY_FORCE_INT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_release_gil_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_release_gil_int_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_release_gil_int_typed(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.call_int_like(BC_CALL_RELEASE_GIL_INT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_loopinvariant_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_loopinvariant_int_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_loopinvariant_int_typed(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.call_int_like(BC_CALL_LOOPINVARIANT_INT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_assembler_int(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_assembler_int_typed(target_idx, &args, dst);
+    }
+
+    pub fn call_assembler_int_typed(&mut self, target_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
+        self.call_assembler_int_like(BC_CALL_ASSEMBLER_INT, target_idx, arg_regs, dst);
     }
 
     pub fn call_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        self.call_int_like(BC_CALL_INT, fn_ptr_idx, arg_regs, dst);
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_int_typed(fn_ptr_idx, &args, dst);
     }
 
     pub fn call_pure_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_pure_int_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
+        self.call_int_like(BC_CALL_INT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_pure_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.call_int_like(BC_CALL_PURE_INT, fn_ptr_idx, arg_regs, dst);
     }
 
@@ -1082,11 +1497,67 @@ impl JitCodeBuilder {
     }
 
     pub fn call_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        self.call_ref_like(BC_CALL_REF, fn_ptr_idx, arg_regs, dst);
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_ref_typed(fn_ptr_idx, &args, dst);
     }
 
     pub fn call_pure_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_pure_ref_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
+        self.call_ref_like(BC_CALL_REF, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_pure_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.call_ref_like(BC_CALL_PURE_REF, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_may_force_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_may_force_ref_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_may_force_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
+        self.call_ref_like(BC_CALL_MAY_FORCE_REF, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_release_gil_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_release_gil_ref_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_release_gil_ref_typed(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.call_ref_like(BC_CALL_RELEASE_GIL_REF, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_loopinvariant_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_loopinvariant_ref_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_loopinvariant_ref_typed(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.call_ref_like(BC_CALL_LOOPINVARIANT_REF, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_assembler_ref(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_assembler_ref_typed(target_idx, &args, dst);
+    }
+
+    pub fn call_assembler_ref_typed(&mut self, target_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
+        self.call_assembler_ref_like(BC_CALL_ASSEMBLER_REF, target_idx, arg_regs, dst);
     }
 
     // ── Float-typed builder methods ───────────────────────────
@@ -1124,11 +1595,77 @@ impl JitCodeBuilder {
     }
 
     pub fn call_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        self.call_float_like(BC_CALL_FLOAT, fn_ptr_idx, arg_regs, dst);
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_float_typed(fn_ptr_idx, &args, dst);
     }
 
     pub fn call_pure_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_pure_float_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_float_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
+        self.call_float_like(BC_CALL_FLOAT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_pure_float_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.call_float_like(BC_CALL_PURE_FLOAT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_may_force_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_may_force_float_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_may_force_float_typed(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.call_float_like(BC_CALL_MAY_FORCE_FLOAT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_release_gil_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_release_gil_float_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_release_gil_float_typed(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.call_float_like(BC_CALL_RELEASE_GIL_FLOAT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_loopinvariant_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_loopinvariant_float_typed(fn_ptr_idx, &args, dst);
+    }
+
+    pub fn call_loopinvariant_float_typed(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.call_float_like(BC_CALL_LOOPINVARIANT_FLOAT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    pub fn call_assembler_float(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.call_assembler_float_typed(target_idx, &args, dst);
+    }
+
+    pub fn call_assembler_float_typed(
+        &mut self,
+        target_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.call_assembler_float_like(BC_CALL_ASSEMBLER_FLOAT, target_idx, arg_regs, dst);
     }
 
     pub fn record_binop_f(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
@@ -1160,12 +1697,43 @@ impl JitCodeBuilder {
     }
 
     pub fn add_fn_ptr(&mut self, ptr: *const ()) -> u16 {
-        if let Some(index) = self.fn_ptrs.iter().position(|&existing| existing == ptr) {
+        self.add_call_target(ptr, ptr)
+    }
+
+    pub fn add_call_target(&mut self, trace_ptr: *const (), concrete_ptr: *const ()) -> u16 {
+        let target = JitCallTarget::new(trace_ptr, concrete_ptr);
+        if let Some(index) = self.fn_ptrs.iter().position(|existing| *existing == target) {
             return index as u16;
         }
         let idx = self.fn_ptrs.len() as u16;
-        self.fn_ptrs.push(ptr);
+        self.fn_ptrs.push(target);
         idx
+    }
+
+    pub fn add_call_assembler_target_number(
+        &mut self,
+        token_number: u64,
+        concrete_ptr: *const (),
+    ) -> u16 {
+        let target = JitCallAssemblerTarget::new(token_number, concrete_ptr);
+        if let Some(index) = self
+            .assembler_targets
+            .iter()
+            .position(|existing| *existing == target)
+        {
+            return index as u16;
+        }
+        let idx = self.assembler_targets.len() as u16;
+        self.assembler_targets.push(target);
+        idx
+    }
+
+    pub fn add_call_assembler_target(
+        &mut self,
+        target: &LoopToken,
+        concrete_ptr: *const (),
+    ) -> u16 {
+        self.add_call_assembler_target_number(target.number, concrete_ptr)
     }
 
     pub fn finish(mut self) -> JitCode {
@@ -1178,6 +1746,7 @@ impl JitCodeBuilder {
             opcodes: self.opcodes,
             sub_jitcodes: self.sub_jitcodes,
             fn_ptrs: self.fn_ptrs,
+            assembler_targets: self.assembler_targets,
         }
     }
 
@@ -1189,17 +1758,44 @@ impl JitCodeBuilder {
         self.code.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn call_int_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+    fn call_int_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.touch_reg(dst);
         for &arg in arg_regs {
-            self.touch_reg(arg);
+            self.touch_call_arg(arg);
         }
         self.push_u8(opcode);
         self.push_u16(fn_ptr_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
-            self.push_u16(arg);
+            self.push_u8(arg.kind.encode());
+            self.push_u16(arg.reg);
+        }
+    }
+
+    fn call_void_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
+        for &arg in arg_regs {
+            self.touch_call_arg(arg);
+        }
+        self.push_u8(opcode);
+        self.push_u16(fn_ptr_idx);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u8(arg.kind.encode());
+            self.push_u16(arg.reg);
+        }
+    }
+
+    fn call_assembler_void_like(&mut self, opcode: u8, target_idx: u16, arg_regs: &[JitCallArg]) {
+        for &arg in arg_regs {
+            self.touch_call_arg(arg);
+        }
+        self.push_u8(opcode);
+        self.push_u16(target_idx);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u8(arg.kind.encode());
+            self.push_u16(arg.reg);
         }
     }
 
@@ -1221,31 +1817,104 @@ impl JitCodeBuilder {
         self.num_regs_f = max(self.num_regs_f, reg.saturating_add(1));
     }
 
-    fn call_ref_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+    fn call_ref_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.touch_ref_reg(dst);
         for &arg in arg_regs {
-            self.touch_reg(arg);
+            self.touch_call_arg(arg);
         }
         self.push_u8(opcode);
         self.push_u16(fn_ptr_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
-            self.push_u16(arg);
+            self.push_u8(arg.kind.encode());
+            self.push_u16(arg.reg);
         }
     }
 
-    fn call_float_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
+    fn call_assembler_int_like(
+        &mut self,
+        opcode: u8,
+        target_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.touch_reg(dst);
+        for &arg in arg_regs {
+            self.touch_call_arg(arg);
+        }
+        self.push_u8(opcode);
+        self.push_u16(target_idx);
+        self.push_u16(dst);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u8(arg.kind.encode());
+            self.push_u16(arg.reg);
+        }
+    }
+
+    fn call_assembler_ref_like(
+        &mut self,
+        opcode: u8,
+        target_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.touch_ref_reg(dst);
+        for &arg in arg_regs {
+            self.touch_call_arg(arg);
+        }
+        self.push_u8(opcode);
+        self.push_u16(target_idx);
+        self.push_u16(dst);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u8(arg.kind.encode());
+            self.push_u16(arg.reg);
+        }
+    }
+
+    fn call_float_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.touch_float_reg(dst);
         for &arg in arg_regs {
-            self.touch_reg(arg);
+            self.touch_call_arg(arg);
         }
         self.push_u8(opcode);
         self.push_u16(fn_ptr_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
-            self.push_u16(arg);
+            self.push_u8(arg.kind.encode());
+            self.push_u16(arg.reg);
+        }
+    }
+
+    fn call_assembler_float_like(
+        &mut self,
+        opcode: u8,
+        target_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.touch_float_reg(dst);
+        for &arg in arg_regs {
+            self.touch_call_arg(arg);
+        }
+        self.push_u8(opcode);
+        self.push_u16(target_idx);
+        self.push_u16(dst);
+        self.push_u16(arg_regs.len() as u16);
+        for &arg in arg_regs {
+            self.push_u8(arg.kind.encode());
+            self.push_u16(arg.reg);
+        }
+    }
+
+    fn touch_call_arg(&mut self, arg: JitCallArg) {
+        match arg.kind {
+            JitArgKind::Int => self.touch_reg(arg.reg),
+            JitArgKind::Ref => self.touch_ref_reg(arg.reg),
+            JitArgKind::Float => self.touch_float_reg(arg.reg),
         }
     }
 

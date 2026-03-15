@@ -2,557 +2,596 @@
 //!
 //! The main dispatch loop processes RustPython instructions.
 //! `JitDriver` merge points and back-edge hooks are integrated from day 1.
+//!
+//! The JitDriver lives in an `UnsafeCell` to allow re-entrant access from
+//! recursive function calls. When compiled code makes a residual call,
+//! the callee's `eval_frame` can access the same driver for function-entry
+//! JIT — matching PyPy's single-MetaInterp-per-thread model.
 
 use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction, OpArgState};
 use pyre_object::*;
 use pyre_objspace::*;
 use pyre_runtime::{
-    PyError, PyErrorKind, PyResult, is_builtin_func, is_func, w_builtin_func_get, w_code_get_ptr,
-    w_func_get_code_ptr, w_func_new,
+    ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
+    IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
+    PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
+    build_list_from_refs, build_map_from_refs, build_tuple_from_refs, ensure_range_iter,
+    execute_opcode_step, make_function_from_code_obj, namespace_load, namespace_store,
+    range_iter_continues, range_iter_next_or_null, stack_underflow_error, unpack_sequence_exact,
+    w_code_new,
 };
 
-use majit_meta::JitDriver;
-use pyre_jit::state::{PyreEnv, PyreJitState};
-use pyre_jit::trace::trace_bytecode;
+use std::cell::{Cell, UnsafeCell};
+use std::collections::HashMap;
 
+use majit_meta::{DetailedDriverRunOutcome, JitDriver};
+use crate::jit::state::{PyreEnv, PyreJitState};
+use crate::jit::trace::trace_bytecode;
+
+use crate::call::{call_callable, install_jit_call_bridge};
 use crate::frame::{PyFrame, build_pyframe_virtualizable_info};
 
-/// JIT hot-count threshold. After this many back-edge hits, tracing starts.
+/// JIT hot-count threshold for back-edge (loop) detection.
 const JIT_THRESHOLD: u32 = 1039;
+
+/// Function-entry tracing threshold. Kept low so that tracing starts
+/// early in a deep recursion (when n is still large), capturing the
+/// recursive path rather than the base case.
+const FUNC_ENTRY_THRESHOLD: u32 = 7;
+
+type JitDriverPair = (
+    JitDriver<PyreJitState>,
+    majit_meta::virtualizable::VirtualizableInfo,
+);
+
+thread_local! {
+    /// Shared JitDriver accessed via `UnsafeCell` to allow re-entrant
+    /// access from recursive function calls.
+    ///
+    /// SAFETY: thread_local guarantees single-thread access. Re-entrant
+    /// calls through compiled-code residual calls create overlapping
+    /// `&mut` references on the stack, but the outer reference is never
+    /// accessed while the inner one is active — the JitDriver's state
+    /// is consistent at each re-entry point.
+    static JIT_DRIVER: UnsafeCell<JitDriverPair> = UnsafeCell::new({
+        let info = build_pyframe_virtualizable_info();
+        let mut d = JitDriver::new(JIT_THRESHOLD);
+        d.set_virtualizable_info(info.clone());
+        (d, info)
+    });
+}
+
+thread_local! {
+    /// Per-code-object function-entry counter. Tracks how many times
+    /// each function has been entered, using the code object pointer
+    /// as key. Only when the count reaches JIT_THRESHOLD do we invoke
+    /// the expensive driver path (build_meta, extract_live, etc.).
+    static FUNC_ENTRY_COUNTS: UnsafeCell<HashMap<u64, u32>> =
+        UnsafeCell::new(HashMap::new());
+
+    /// JIT call depth counter. Tracks how deep we are in nested
+    /// eval_frame calls due to JIT activity (tracing or compiled code).
+    ///
+    /// When > 0, this eval_loop is executing a residual call from
+    /// either the traced function or compiled code. Effects:
+    ///   - merge_points are skipped (inner instructions must not
+    ///     pollute the outer trace)
+    ///   - try_function_entry_jit is skipped (prevents infinite
+    ///     recursion: compiled fib → residual call → run compiled
+    ///     fib → residual call → ...)
+    ///
+    /// Matches PyPy's model where residual calls run in a
+    /// "blackhole" interpreter without JIT hooks.
+    /// JIT call depth counter. When > 0, this eval_loop is executing
+    /// a residual call — merge_points and function-entry JIT are
+    /// suppressed.
+    static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
+
+    /// Lightweight tracing-active flag. Mirrors `driver.is_tracing()`
+    /// to avoid the expensive UnsafeCell TLS lookup per call.
+    static JIT_TRACING: Cell<bool> = Cell::new(false);
+}
+
+/// Get a mutable reference to the thread-local JitDriver pair.
+///
+/// SAFETY: Only call from `eval_frame` and its JIT helper functions.
+/// The caller must ensure that no other live `&mut` reference to the
+/// driver is being actively used (suspended references on the call
+/// stack from re-entrant compiled-code execution are acceptable).
+#[inline]
+pub(crate) fn driver_pair() -> &'static mut JitDriverPair {
+    JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
+}
+
+#[inline]
+#[allow(dead_code)]
+fn func_entry_counts() -> &'static mut HashMap<u64, u32> {
+    FUNC_ENTRY_COUNTS.with(|cell| unsafe { &mut *cell.get() })
+}
+
+/// RAII guard that decrements `JIT_CALL_DEPTH` on drop.
+pub struct JitCallDepthGuard;
+
+impl Drop for JitCallDepthGuard {
+    fn drop(&mut self) {
+        JIT_CALL_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// Bump the JIT call depth. Returns a guard that restores the
+/// depth when dropped. Only bumps if we're inside a JIT context
+/// (depth > 0 or tracing active).
+#[inline]
+pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
+    let depth = JIT_CALL_DEPTH.with(|d| d.get());
+    if depth > 0 || JIT_TRACING.with(|t| t.get()) {
+        JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
+        Some(JitCallDepthGuard)
+    } else {
+        None
+    }
+}
 
 /// Execute a Python code object and return its result.
 ///
 /// The returned value is the result of `ReturnValue`,
 /// or `None` if the code falls through without returning.
 pub fn eval_frame(frame: &mut PyFrame) -> PyResult {
-    let mut driver: JitDriver<PyreJitState> = JitDriver::new(JIT_THRESHOLD);
-    let virtualizable_info = build_pyframe_virtualizable_info();
+    install_jit_call_bridge();
+    frame.fix_array_ptrs();
+    if let Some(result) = try_function_entry_jit(frame) {
+        return result;
+    }
+    // If function-entry triggered tracing, use the JIT-enabled loop
+    // so merge_point records trace ops. Without this, eval_loop would
+    // skip merge points and the trace would never complete.
+    let (driver, _) = driver_pair();
+    if driver.is_tracing() {
+        return eval_loop_jit(frame);
+    }
+    eval_loop(frame)
+}
 
-    // Register virtualizable info so the JIT knows which PyFrame fields
-    // can live in CPU registers during compiled code execution.
-    driver.set_virtualizable_info(virtualizable_info.clone());
+/// Run the interpreter on a frame whose state was partially updated by
+/// compiled code (call_assembler guard failure forcing).
+///
+/// Skips the JIT function-entry check and runs the plain eval_loop
+/// from the frame's current next_instr.
+pub(crate) fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
+    eval_loop(frame)
+}
 
-    let env = PyreEnv;
+/// Evaluation loop with deferred JIT initialization.
+///
+/// The JitDriver TLS lookup is deferred until the first back-edge
+/// (CloseLoop). Functions without loops (like fib) never pay the
+/// driver_pair() TLS cost. Once a back-edge is seen, we switch to
+/// the full JIT-enabled loop for the remainder of the function.
+fn eval_loop(frame: &mut PyFrame) -> PyResult {
     let mut arg_state = OpArgState::default();
-    // Clone Rc to avoid borrowing frame.code while mutating frame
-    let code = frame.code.clone();
+    let code = unsafe { &*frame.code };
 
     loop {
         if frame.next_instr >= code.instructions.len() {
-            // Fell off the end of the code — return None
             return Ok(w_none());
-        }
-
-        // ── JIT merge point ──────────────────────────────────────
-        // When tracing is active, record IR for the current instruction.
-        // The closure captures only immutable data (code, pc, stack snapshot).
-        if driver.is_tracing() {
-            let pc = frame.next_instr;
-            let stack_snapshot: Vec<PyObjectRef> =
-                frame.value_stack_w.as_slice()[..frame.stack_depth].to_vec();
-            driver.merge_point(|ctx, sym| trace_bytecode(ctx, sym, &code, pc, &stack_snapshot));
         }
 
         let code_unit = code.instructions[frame.next_instr];
         let (instruction, op_arg) = arg_state.get(code_unit);
         frame.next_instr += 1;
-
-        match instruction {
-            Instruction::ExtendedArg => {
-                // OpArgState handles this internally; just continue to next instruction
+        let next_instr = frame.next_instr;
+        match execute_opcode_step(frame, &code, instruction, op_arg, next_instr)? {
+            StepResult::Continue => {}
+            StepResult::CloseLoop(_) => {
+                // First back-edge: switch to the JIT-enabled loop
+                // that fetches the driver and handles merge points.
+                return eval_loop_jit(frame);
             }
+            StepResult::Return(result) => return Ok(result),
+        }
+    }
+}
 
-            Instruction::Resume { .. }
-            | Instruction::Nop
-            | Instruction::Cache
-            | Instruction::NotTaken => {
-                // No-op
+/// JIT-enabled evaluation loop, entered after the first back-edge.
+///
+/// The JitDriver reference is obtained once via TLS lookup and held
+/// as a local variable. Recursive calls through `call_callable`
+/// re-enter `eval_frame` → `eval_loop` (the deferred variant),
+/// creating a new `&mut` alias only if they also hit a back-edge.
+fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
+    let env = PyreEnv;
+    let mut arg_state = OpArgState::default();
+    let code = unsafe { &*frame.code };
+    let (driver, info) = driver_pair();
+
+    loop {
+        if frame.next_instr >= code.instructions.len() {
+            return Ok(w_none());
+        }
+
+        // ── JIT merge point ──────────────────────────────────────
+        // Only record trace ops at depth 0 (the function being traced).
+        // Deeper levels are residual calls whose instructions must not
+        // pollute the outer trace.
+        if driver.is_tracing() {
+            JIT_TRACING.with(|t| t.set(true));
+            if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
+                let pc = frame.next_instr;
+                let concrete_frame = frame as *mut PyFrame as usize;
+                driver.merge_point(|ctx, sym| trace_bytecode(ctx, sym, code, pc, concrete_frame));
             }
-
-            // ── Constants & variables ─────────────────────────────────
-            Instruction::LoadConst { consti } => {
-                let const_idx = consti.get(op_arg);
-                let value = PyFrame::load_const(&code.constants[const_idx]);
-                frame.push(value);
+            // Tracing may have ended inside merge_point (abort/compile).
+            if !driver.is_tracing() {
+                JIT_TRACING.with(|t| t.set(false));
             }
+        }
 
-            Instruction::LoadSmallInt { i } => {
-                let value = i.get(op_arg) as i64;
-                frame.push(w_int_new(value));
-            }
-
-            Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
-                let idx = var_num.get(op_arg).as_usize();
-                let value = frame.locals_w[idx];
-                if value.is_null() {
-                    let name = &code.varnames[idx];
-                    return Err(PyError {
-                        kind: PyErrorKind::NameError,
-                        message: format!("local variable '{name}' referenced before assignment"),
-                    });
-                }
-                frame.push(value);
-            }
-
-            Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
-                let pair = var_nums.get(op_arg);
-                let idx1 = (pair >> 4) as usize;
-                let idx2 = (pair & 15) as usize;
-                let v1 = frame.locals_w[idx1];
-                let v2 = frame.locals_w[idx2];
-                if v1.is_null() {
-                    let name = &code.varnames[idx1];
-                    return Err(PyError {
-                        kind: PyErrorKind::NameError,
-                        message: format!("local variable '{name}' referenced before assignment"),
-                    });
-                }
-                if v2.is_null() {
-                    let name = &code.varnames[idx2];
-                    return Err(PyError {
-                        kind: PyErrorKind::NameError,
-                        message: format!("local variable '{name}' referenced before assignment"),
-                    });
-                }
-                frame.push(v1);
-                frame.push(v2);
-            }
-
-            Instruction::StoreFast { var_num } => {
-                let idx = var_num.get(op_arg).as_usize();
-                let value = frame.pop();
-                frame.locals_w[idx] = value;
-            }
-
-            Instruction::LoadFastCheck { var_num } => {
-                let idx = var_num.get(op_arg).as_usize();
-                let value = frame.locals_w[idx];
-                if value.is_null() {
-                    let name = &code.varnames[idx];
-                    return Err(PyError {
-                        kind: PyErrorKind::NameError,
-                        message: format!("local variable '{name}' referenced before assignment"),
-                    });
-                }
-                frame.push(value);
-            }
-
-            Instruction::LoadFastLoadFast { var_nums } => {
-                let pair = var_nums.get(op_arg);
-                let idx1 = (pair >> 4) as usize;
-                let idx2 = (pair & 15) as usize;
-                frame.push(frame.locals_w[idx1]);
-                frame.push(frame.locals_w[idx2]);
-            }
-
-            Instruction::StoreFastLoadFast { var_nums } => {
-                let pair = var_nums.get(op_arg);
-                let store_idx = pair.store_idx() as usize;
-                let load_idx = pair.load_idx() as usize;
-                let val = frame.pop();
-                frame.locals_w[store_idx] = val;
-                frame.push(frame.locals_w[load_idx]);
-            }
-
-            Instruction::StoreFastStoreFast { var_nums } => {
-                let pair = var_nums.get(op_arg);
-                let idx1 = (pair >> 4) as usize;
-                let idx2 = (pair & 15) as usize;
-                let v1 = frame.pop();
-                frame.locals_w[idx1] = v1;
-                let v2 = frame.pop();
-                frame.locals_w[idx2] = v2;
-            }
-
-            Instruction::StoreName { namei } | Instruction::StoreGlobal { namei } => {
-                let idx = namei.get(op_arg) as usize;
-                let name = code.names[idx].to_string();
-                let value = frame.pop();
-                frame.namespace.insert(name, value);
-            }
-
-            Instruction::LoadName { namei } => {
-                let idx = namei.get(op_arg) as usize;
-                let name: &str = code.names[idx].as_ref();
-                match frame.namespace.get(name) {
-                    Some(&value) => frame.push(value),
-                    None => {
-                        return Err(PyError {
-                            kind: PyErrorKind::NameError,
-                            message: format!("name '{name}' is not defined"),
-                        });
+        let code_unit = code.instructions[frame.next_instr];
+        let (instruction, op_arg) = arg_state.get(code_unit);
+        frame.next_instr += 1;
+        let next_instr = frame.next_instr;
+        match execute_opcode_step(frame, &code, instruction, op_arg, next_instr)? {
+            StepResult::Continue => {}
+            StepResult::CloseLoop(_) => {
+                let mut jit_state = build_jit_state(frame, info);
+                if let Some(outcome) =
+                    driver.back_edge_or_run_compiled(frame.next_instr, &mut jit_state, &env, || {})
+                {
+                    if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
+                        return result;
                     }
+                    // Guard failure with restored state — continue interpreting
                 }
             }
+            StepResult::Return(result) => return Ok(result),
+        }
+    }
+}
 
-            Instruction::LoadGlobal { namei } => {
-                // In 3.14, oparg encodes: name_idx = oparg >> 1,
-                // push_null = oparg & 1 (for the call protocol).
-                // Push order: value first, then NULL (callable at bottom,
-                // self_or_null above it).
-                let raw = namei.get(op_arg) as usize;
-                let name_idx = raw >> 1;
-                let push_null = (raw & 1) != 0;
-                let name: &str = code.names[name_idx].as_ref();
-                match frame.namespace.get(name) {
-                    Some(&value) => frame.push(value),
-                    None => {
-                        return Err(PyError {
-                            kind: PyErrorKind::NameError,
-                            message: format!("name '{name}' is not defined"),
-                        });
-                    }
-                }
-                if push_null {
-                    frame.push(PY_NULL);
-                }
+/// Try running compiled code or count function entry.
+///
+/// Uses the code object pointer as a green key, so all calls to the
+/// same function share one counter and one compiled trace.
+///
+/// Fast path: increment a lightweight local counter. Only call into
+/// the expensive driver path when the counter reaches the threshold
+/// or when compiled code already exists for this key.
+///
+fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
+    // Residual calls (from tracing or compiled code) run in pure
+    // interpreter — no JIT hooks. Matches PyPy's blackhole model.
+    if JIT_CALL_DEPTH.with(|d| d.get()) > 0 {
+        return None;
+    }
+
+    let green_key = frame.code as u64;
+    let (driver, info) = driver_pair();
+
+    // Run compiled code if available.
+    if driver.has_compiled_loop(green_key) {
+        let env = PyreEnv;
+        let mut jit_state = build_jit_state(frame, info);
+        if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
+            green_key,
+            frame.next_instr,
+            &mut jit_state,
+            &env,
+            || {},
+        ) {
+            if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
+                return Some(result);
             }
+        }
+        // Guard failure → fall through to interpreter
+        return None;
+    }
 
-            // ── Stack manipulation ────────────────────────────────────
-            Instruction::PopTop => {
-                frame.pop();
-            }
+    // Fast path: if already tracing, skip counting.
+    if driver.is_tracing() {
+        return None;
+    }
 
-            Instruction::PushNull => {
-                frame.push(PY_NULL);
-            }
+    // Lightweight local counting with a low threshold so that tracing
+    // starts early in a deep recursion (capturing the recursive path).
+    let counts = func_entry_counts();
+    let count = counts.entry(green_key).or_insert(0);
+    *count += 1;
+    if *count != FUNC_ENTRY_THRESHOLD {
+        return None;
+    }
 
-            Instruction::Copy { i } => {
-                let depth = i.get(op_arg) as usize;
-                let val = frame.peek_at(depth - 1);
-                frame.push(val);
-            }
+    // Threshold reached — force-start tracing (bypasses driver's
+    // internal hot counter since we already did our own counting).
+    let env = PyreEnv;
+    let mut jit_state = build_jit_state(frame, info);
+    driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
+    None
+}
 
-            Instruction::Swap { i } => {
-                let depth = i.get(op_arg) as usize;
-                let top_idx = frame.stack_depth - 1;
-                let other_idx = frame.stack_depth - depth;
-                frame.value_stack_w.swap(top_idx, other_idx);
-            }
-
-            // ── Binary operations ─────────────────────────────────────
-            Instruction::BinaryOp { op } => {
-                let op = op.get(op_arg);
-                let b = frame.pop();
-                let a = frame.pop();
-                let result = binary_op(a, b, op)?;
-                frame.push(result);
-            }
-
-            // ── Comparison operations ─────────────────────────────────
-            Instruction::CompareOp { opname } => {
-                let op = opname.get(op_arg);
-                let b = frame.pop();
-                let a = frame.pop();
-                let cmp_op = match op {
-                    ComparisonOperator::Less => CompareOp::Lt,
-                    ComparisonOperator::LessOrEqual => CompareOp::Le,
-                    ComparisonOperator::Greater => CompareOp::Gt,
-                    ComparisonOperator::GreaterOrEqual => CompareOp::Ge,
-                    ComparisonOperator::Equal => CompareOp::Eq,
-                    ComparisonOperator::NotEqual => CompareOp::Ne,
-                };
-                let result = py_compare(a, b, cmp_op)?;
-                frame.push(result);
-            }
-
-            // ── Unary operations ──────────────────────────────────────
-            Instruction::UnaryNegative => {
-                let a = frame.pop();
-                let result = py_negative(a)?;
-                frame.push(result);
-            }
-
-            Instruction::UnaryNot => {
-                let a = frame.pop();
-                frame.push(w_bool_from(!py_is_true(a)));
-            }
-
-            Instruction::UnaryInvert => {
-                let a = frame.pop();
-                if unsafe { is_int(a) } {
-                    frame.push(w_int_new(unsafe { !w_int_get_value(a) }));
-                } else {
-                    return Err(PyError::type_error("bad operand type for unary ~"));
-                }
-            }
-
-            // ── Control flow ──────────────────────────────────────────
-            Instruction::JumpForward { delta } => {
-                let d = delta.get(op_arg).as_usize();
-                let base = skip_caches(&code.instructions, frame.next_instr);
-                frame.next_instr = base + d;
-            }
-
-            Instruction::JumpBackward { delta } => {
-                let d = delta.get(op_arg).as_usize();
-                // Skip cache entries after this instruction to align with CPython's
-                // delta base (deltas are relative to after instruction + its caches)
-                let base = skip_caches(&code.instructions, frame.next_instr);
-                let target_idx = base - d;
-
-                // JIT back-edge detection: backward jumps trigger hot counting
-                let mut jit_state = build_jit_state(frame, &virtualizable_info);
-                if driver.back_edge(target_idx, &mut jit_state, &env, || {}) {
-                    sync_jit_state_to_frame(&jit_state, frame, &virtualizable_info);
-                    continue;
-                }
-
-                frame.next_instr = target_idx;
-            }
-
-            Instruction::PopJumpIfFalse { delta } => {
-                let top = frame.pop();
-                if !py_is_true(top) {
-                    let d = delta.get(op_arg).as_usize();
-                    let base = skip_caches(&code.instructions, frame.next_instr);
-                    frame.next_instr = base + d;
-                }
-            }
-
-            Instruction::PopJumpIfTrue { delta } => {
-                let top = frame.pop();
-                if py_is_true(top) {
-                    let d = delta.get(op_arg).as_usize();
-                    let base = skip_caches(&code.instructions, frame.next_instr);
-                    frame.next_instr = base + d;
-                }
-            }
-
-            // ── Function creation ─────────────────────────────────────
-            Instruction::MakeFunction => {
-                // Stack: code object (TOS)
-                // In CPython 3.14, MakeFunction pops a code object and
-                // pushes a function object. The code object was pushed
-                // via LoadConst of a ConstantData::Code.
-                let code_obj = frame.pop();
-                let code_ptr = unsafe { w_code_get_ptr(code_obj) };
-                // Extract the function name from the CodeObject's qualname
-                let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
-                let name = code.qualname.to_string();
-                let func = w_func_new(code_ptr, name);
-                frame.push(func);
-            }
-
-            // ── Function calls ────────────────────────────────────────
-            Instruction::Call { argc } => {
-                let nargs = argc.get(op_arg) as usize;
-                // Pop arguments (top of stack = last arg)
-                let mut args = Vec::with_capacity(nargs);
-                for _ in 0..nargs {
-                    args.push(frame.pop());
-                }
-                args.reverse();
-                // Stack: [callable, null_or_self] (bottom to top after args popped)
-                let _null_or_self = frame.pop();
-                let callable = frame.pop();
-                if unsafe { is_builtin_func(callable) } {
-                    let func = unsafe { w_builtin_func_get(callable) };
-                    let result = func(&args);
-                    frame.push(result);
-                } else if unsafe { is_func(callable) } {
-                    // User-defined function call
-                    let code_ptr = unsafe { w_func_get_code_ptr(callable) };
-                    let func_code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
-                    let mut func_frame = PyFrame::new_for_call(
-                        func_code.clone(),
-                        &args,
-                        &frame.namespace,
-                        frame.execution_context.clone(),
-                    );
-                    let result = eval_frame(&mut func_frame)?;
-                    frame.push(result);
-                } else {
-                    return Err(PyError::type_error(format!(
-                        "'{}' object is not callable",
-                        unsafe { (*(*callable).ob_type).tp_name }
-                    )));
-                }
-            }
-
-            // ── Return ────────────────────────────────────────────────
-            Instruction::ReturnValue => {
-                let result = frame.pop();
-                return Ok(result);
-            }
-
-            // ── Container construction ───────────────────────────────
-            Instruction::BuildList { count } => {
-                let size = count.get(op_arg) as usize;
-                let mut items = Vec::with_capacity(size);
-                for _ in 0..size {
-                    items.push(frame.pop());
-                }
-                items.reverse();
-                frame.push(w_list_new(items));
-            }
-
-            Instruction::BuildTuple { count } => {
-                let size = count.get(op_arg) as usize;
-                let mut items = Vec::with_capacity(size);
-                for _ in 0..size {
-                    items.push(frame.pop());
-                }
-                items.reverse();
-                frame.push(w_tuple_new(items));
-            }
-
-            Instruction::BuildMap { count } => {
-                let size = count.get(op_arg) as usize;
-                let dict = w_dict_new();
-                // Stack has key-value pairs: key1, val1, key2, val2, ...
-                // We need to pop them in reverse order
-                let mut pairs = Vec::with_capacity(size);
-                for _ in 0..size {
-                    let value = frame.pop();
-                    let key = frame.pop();
-                    pairs.push((key, value));
-                }
-                pairs.reverse();
-                for (key, value) in pairs {
-                    unsafe {
-                        if is_int(key) {
-                            w_dict_setitem(dict, w_int_get_value(key), value);
-                        }
-                    }
-                }
-                frame.push(dict);
-            }
-
-            // ── Subscript operations ─────────────────────────────────
-            Instruction::StoreSubscr => {
-                // Stack: [value, obj, key] (TOS=key, TOS1=obj, TOS2=value)
-                let key = frame.pop();
-                let obj = frame.pop();
-                let value = frame.pop();
-                py_setitem(obj, key, value)?;
-            }
-
-            // ── List operations ──────────────────────────────────────
-            Instruction::ListAppend { i } => {
-                let value = frame.pop();
-                let depth = i.get(op_arg) as usize;
-                let list = frame.peek_at(depth - 1);
-                unsafe { w_list_append(list, value) };
-            }
-
-            // ── Sequence unpacking ───────────────────────────────────
-            Instruction::UnpackSequence { count } => {
-                let size = count.get(op_arg) as usize;
-                let seq = frame.pop();
-                unsafe {
-                    if is_tuple(seq) {
-                        let len = w_tuple_len(seq);
-                        if len != size {
-                            return Err(PyError::type_error(format!(
-                                "not enough values to unpack (expected {size}, got {len})"
-                            )));
-                        }
-                        // Push in reverse order so first element ends up on top
-                        for idx in (0..size).rev() {
-                            frame.push(w_tuple_getitem(seq, idx as i64).unwrap());
-                        }
-                    } else if is_list(seq) {
-                        let len = w_list_len(seq);
-                        if len != size {
-                            return Err(PyError::type_error(format!(
-                                "not enough values to unpack (expected {size}, got {len})"
-                            )));
-                        }
-                        for idx in (0..size).rev() {
-                            frame.push(w_list_getitem(seq, idx as i64).unwrap());
-                        }
-                    } else {
-                        return Err(PyError::type_error(format!(
-                            "cannot unpack non-sequence {}",
-                            (*(*seq).ob_type).tp_name
-                        )));
-                    }
-                }
-            }
-
-            // ── Iteration ────────────────────────────────────────────
-            Instruction::GetIter => {
-                let obj = frame.peek();
-                if unsafe { is_range_iter(obj) } {
-                    // range_iter is its own iterator, leave on stack
-                } else {
-                    return Err(PyError::type_error(format!(
-                        "'{}' object is not iterable",
-                        unsafe { (*(*obj).ob_type).tp_name }
-                    )));
-                }
-            }
-
-            Instruction::ForIter { delta } => {
-                let iter = frame.peek();
-                if unsafe { is_range_iter(iter) } {
-                    match unsafe { w_range_iter_next(iter) } {
-                        Some(value) => {
-                            // Push next value on top of the iterator
-                            frame.push(value);
-                        }
-                        None => {
-                            // Iterator exhausted: leave iterator on stack,
-                            // jump forward by delta (relative to after caches).
-                            let base = skip_caches(&code.instructions, frame.next_instr);
-                            let d = delta.get(op_arg).as_usize();
-                            frame.next_instr = base + d;
-                        }
-                    }
-                } else {
-                    return Err(PyError::type_error("not an iterator"));
-                }
-            }
-
-            Instruction::EndFor => {
-                // End-of-for marker. In 3.14, this is a no-op placeholder;
-                // the actual iterator cleanup is done by PopIter.
-            }
-
-            Instruction::PopIter => {
-                // Pop the iterator from the stack after the for loop ends.
-                frame.pop();
-            }
-
-            // ── Not yet implemented ───────────────────────────────────
-            other => {
-                return Err(PyError::type_error(format!(
-                    "unimplemented instruction: {other:?}"
+/// Handle a `DetailedDriverRunOutcome` from compiled code execution.
+fn handle_jit_outcome(
+    outcome: DetailedDriverRunOutcome,
+    jit_state: &PyreJitState,
+    frame: &mut PyFrame,
+    info: &majit_meta::virtualizable::VirtualizableInfo,
+) -> Option<PyResult> {
+    match outcome {
+        DetailedDriverRunOutcome::Finished { typed_values, .. } => {
+            let [value] = typed_values.as_slice() else {
+                return Some(Err(PyError::type_error(
+                    "compiled finish did not produce a single object return value",
                 )));
-            }
+            };
+            let value = match value {
+                majit_ir::Value::Int(raw) => *raw as PyObjectRef,
+                majit_ir::Value::Ref(value) => value.as_usize() as PyObjectRef,
+                _ => {
+                    return Some(Err(PyError::type_error(
+                        "compiled finish produced a non-object return value",
+                    )));
+                }
+            };
+            Some(Ok(value))
         }
+        DetailedDriverRunOutcome::Jump { .. }
+        | DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
+            sync_jit_state_to_frame(jit_state, frame, info);
+            None // Continue interpretation
+        }
+        DetailedDriverRunOutcome::GuardFailure {
+            restored: false, ..
+        }
+        | DetailedDriverRunOutcome::Abort { .. } => None,
     }
 }
 
-/// Skip past any Cache instructions at `pos`, returning the index of the next
-/// non-Cache instruction. Jump deltas are relative to after instruction + caches.
-fn skip_caches(instructions: &[pyre_bytecode::bytecode::CodeUnit], mut pos: usize) -> usize {
-    while pos < instructions.len() {
-        let mut s = OpArgState::default();
-        let (ins, _) = s.get(instructions[pos]);
-        if matches!(ins, Instruction::Cache) {
-            pos += 1;
-        } else {
-            break;
-        }
+impl SharedOpcodeHandler for PyFrame {
+    type Value = PyObjectRef;
+
+    fn push_value(&mut self, value: Self::Value) -> Result<(), PyError> {
+        PyFrame::push(self, value);
+        Ok(())
     }
-    pos
+
+    fn pop_value(&mut self) -> Result<Self::Value, PyError> {
+        if self.stack_depth == 0 {
+            return Err(stack_underflow_error("interpreter opcode"));
+        }
+        Ok(PyFrame::pop(self))
+    }
+
+    fn peek_at(&mut self, depth: usize) -> Result<Self::Value, PyError> {
+        if self.stack_depth <= depth {
+            return Err(stack_underflow_error("interpreter peek"));
+        }
+        Ok(PyFrame::peek_at(self, depth))
+    }
+
+    fn make_function(&mut self, code_obj: Self::Value) -> Result<Self::Value, PyError> {
+        Ok(make_function_from_code_obj(code_obj, self.namespace))
+    }
+
+    fn call_callable(
+        &mut self,
+        callable: Self::Value,
+        args: &[Self::Value],
+    ) -> Result<Self::Value, PyError> {
+        call_callable(self, callable, args)
+    }
+
+    fn build_list(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        Ok(build_list_from_refs(items))
+    }
+
+    fn build_tuple(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        Ok(build_tuple_from_refs(items))
+    }
+
+    fn build_map(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        Ok(build_map_from_refs(items))
+    }
+
+    fn store_subscr(
+        &mut self,
+        obj: Self::Value,
+        key: Self::Value,
+        value: Self::Value,
+    ) -> Result<(), PyError> {
+        py_setitem(obj, key, value).map(|_| ())
+    }
+
+    fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
+        unsafe { w_list_append(list, value) };
+        Ok(())
+    }
+
+    fn unpack_sequence(
+        &mut self,
+        seq: Self::Value,
+        count: usize,
+    ) -> Result<Vec<Self::Value>, PyError> {
+        unpack_sequence_exact(seq, count)
+    }
 }
 
-/// Dispatch a binary operation based on RustPython's BinaryOperator enum.
-fn binary_op(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> PyResult {
-    match op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => py_add(a, b),
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => py_sub(a, b),
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => py_mul(a, b),
-        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => py_floordiv(a, b),
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => py_mod(a, b),
-        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => py_truediv(a, b),
-        BinaryOperator::Subscr => py_getitem(a, b),
-        _ => Err(PyError::type_error(format!(
-            "binary operation {op:?} not yet implemented"
-        ))),
+impl LocalOpcodeHandler for PyFrame {
+    fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
+        Ok(self.locals_w[idx])
+    }
+
+    fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
+        let value = self.locals_w[idx];
+        if value.is_null() {
+            return Err(PyError {
+                kind: PyErrorKind::NameError,
+                message: format!("local variable '{name}' referenced before assignment"),
+            });
+        }
+        Ok(value)
+    }
+
+    fn store_local_value(&mut self, idx: usize, value: Self::Value) -> Result<(), PyError> {
+        self.locals_w[idx] = value;
+        Ok(())
+    }
+}
+
+impl NamespaceOpcodeHandler for PyFrame {
+    fn load_name_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
+        let ns = unsafe { &*self.namespace };
+        namespace_load(ns, name)
+    }
+
+    fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
+        let ns = unsafe { &mut *self.namespace };
+        namespace_store(ns, name, value);
+        Ok(())
+    }
+
+    fn null_value(&mut self) -> Result<Self::Value, PyError> {
+        Ok(PY_NULL)
+    }
+}
+
+impl StackOpcodeHandler for PyFrame {
+    fn swap_values(&mut self, depth: usize) -> Result<(), PyError> {
+        let top_idx = self.stack_depth - 1;
+        let other_idx = self.stack_depth - depth;
+        self.value_stack_w.swap(top_idx, other_idx);
+        Ok(())
+    }
+}
+
+impl IterOpcodeHandler for PyFrame {
+    fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
+        ensure_range_iter(iter)
+    }
+
+    fn concrete_iter_continues(&mut self, iter: Self::Value) -> Result<bool, PyError> {
+        range_iter_continues(iter)
+    }
+
+    fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
+        range_iter_next_or_null(iter)
+    }
+
+    fn on_iter_exhausted(&mut self, target: usize) -> Result<(), PyError> {
+        self.next_instr = target;
+        Ok(())
+    }
+}
+
+impl TruthOpcodeHandler for PyFrame {
+    type Truth = bool;
+
+    fn truth_value(&mut self, value: Self::Value) -> Result<Self::Truth, PyError> {
+        Ok(truth_value(value))
+    }
+
+    fn bool_value_from_truth(
+        &mut self,
+        truth: Self::Truth,
+        negate: bool,
+    ) -> Result<Self::Value, PyError> {
+        Ok(bool_value_from_truth(if negate { !truth } else { truth }))
+    }
+}
+
+impl ControlFlowOpcodeHandler for PyFrame {
+    fn fallthrough_target(&mut self) -> usize {
+        self.next_instr
+    }
+
+    fn set_next_instr(&mut self, target: usize) -> Result<(), PyError> {
+        self.next_instr = target;
+        Ok(())
+    }
+
+    fn close_loop(&mut self, _target: usize) -> Result<StepResult<Self::Value>, PyError> {
+        // Signal a back-edge to the main eval_loop, which handles
+        // JIT counting and compiled code execution via try_back_edge_jit.
+        Ok(StepResult::CloseLoop(vec![]))
+    }
+}
+
+impl BranchOpcodeHandler for PyFrame {
+    fn concrete_truth_as_bool(&mut self, truth: Self::Truth) -> Result<bool, PyError> {
+        Ok(truth)
+    }
+}
+
+impl ArithmeticOpcodeHandler for PyFrame {
+    fn binary_value(
+        &mut self,
+        a: Self::Value,
+        b: Self::Value,
+        op: BinaryOperator,
+    ) -> Result<Self::Value, PyError> {
+        binary_value(a, b, op)
+    }
+
+    fn compare_value(
+        &mut self,
+        a: Self::Value,
+        b: Self::Value,
+        op: ComparisonOperator,
+    ) -> Result<Self::Value, PyError> {
+        compare_value(a, b, op)
+    }
+
+    fn unary_negative_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
+        unary_negative_value(value)
+    }
+
+    fn unary_invert_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
+        unary_invert_value(value)
+    }
+}
+
+impl ConstantOpcodeHandler for PyFrame {
+    fn int_constant(&mut self, value: i64) -> Result<Self::Value, PyError> {
+        Ok(w_int_new(value))
+    }
+
+    fn bigint_constant(&mut self, value: &pyre_runtime::PyBigInt) -> Result<Self::Value, PyError> {
+        Ok(w_long_new(value.clone()))
+    }
+
+    fn float_constant(&mut self, value: f64) -> Result<Self::Value, PyError> {
+        Ok(w_float_new(value))
+    }
+
+    fn bool_constant(&mut self, value: bool) -> Result<Self::Value, PyError> {
+        Ok(w_bool_from(value))
+    }
+
+    fn str_constant(&mut self, value: &str) -> Result<Self::Value, PyError> {
+        Ok(box_str_constant(value))
+    }
+
+    fn code_constant(
+        &mut self,
+        code: &pyre_bytecode::bytecode::CodeObject,
+    ) -> Result<Self::Value, PyError> {
+        let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
+        Ok(w_code_new(code_ptr))
+    }
+
+    fn none_constant(&mut self) -> Result<Self::Value, PyError> {
+        Ok(w_none())
+    }
+}
+
+impl OpcodeStepExecutor for PyFrame {
+    type Error = PyError;
+
+    fn unsupported(
+        &mut self,
+        instruction: &Instruction,
+    ) -> Result<StepResult<PyObjectRef>, Self::Error> {
+        Err(PyError::type_error(format!(
+            "unimplemented instruction: {instruction:?}"
+        )))
     }
 }
 
@@ -565,29 +604,14 @@ fn build_jit_state(
     frame: &PyFrame,
     virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
 ) -> PyreJitState {
-    let mut ns_keys: Vec<String> = frame.namespace.keys().cloned().collect();
-    ns_keys.sort();
-    let ns_values: Vec<PyObjectRef> = ns_keys
-        .iter()
-        .map(|k| *frame.namespace.get(k).unwrap())
-        .collect();
-
     let mut jit_state = PyreJitState {
         frame: frame as *const PyFrame as usize,
         next_instr: frame.next_instr,
-        local_count: frame.locals_w.len(),
-        locals: Vec::new(),
-        ns_keys,
-        ns_values,
-        stack_capacity: frame.value_stack_w.len(),
-        stack: Vec::new(),
         stack_depth: frame.stack_depth,
     };
 
     if !jit_state.sync_from_virtualizable(virtualizable_info) {
         jit_state.next_instr = frame.next_instr;
-        jit_state.locals = frame.locals_w.to_vec();
-        jit_state.stack = frame.value_stack_w.to_vec();
         jit_state.stack_depth = frame.stack_depth;
     }
 
@@ -602,30 +626,21 @@ fn sync_jit_state_to_frame(
 ) {
     if !jit_state.sync_to_virtualizable(virtualizable_info) {
         frame.next_instr = jit_state.next_instr;
-
-        let local_count = jit_state.locals.len().min(frame.locals_w.len());
-        frame.locals_w.as_mut_slice()[..local_count]
-            .copy_from_slice(&jit_state.locals[..local_count]);
-
-        let stack_count = jit_state.stack.len().min(frame.value_stack_w.len());
-        frame.value_stack_w.as_mut_slice()[..stack_count]
-            .copy_from_slice(&jit_state.stack[..stack_count]);
         frame.stack_depth = jit_state.stack_depth;
     }
 
     frame.next_instr = jit_state.next_instr;
-    frame.namespace.clear();
-    for (k, &v) in jit_state.ns_keys.iter().zip(&jit_state.ns_values) {
-        frame.namespace.insert(k.clone(), v);
-    }
     frame.stack_depth = jit_state.stack_depth;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::Value;
+    use majit_meta::JitState;
+    use majit_meta::blackhole::ExceptionState;
     use pyre_bytecode::*;
-    use pyre_runtime::PyExecutionContext;
+    use pyre_runtime::{PyExecutionContext, w_func_new};
     use std::rc::Rc;
 
     fn run_eval(source: &str) -> PyResult {
@@ -654,6 +669,57 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_function_helper_reuses_interpreter_call_semantics() {
+        install_jit_call_bridge();
+
+        let caller_code = compile_exec("z = 2").expect("compile failed");
+        let caller = PyFrame::new_with_context(caller_code, Rc::new(PyExecutionContext::default()));
+        unsafe { (*caller.namespace).insert("z".to_string(), w_int_new(2)) };
+
+        let code = nested_function_code("z = 2\ndef f(x):\n    return x + z");
+        let code_ptr = Box::into_raw(Box::new(code)) as *const ();
+        let callable = w_func_new(code_ptr, "f".to_string(), caller.namespace);
+
+        let result = crate::jit::helpers::jit_call_callable_1(
+            (&caller as *const PyFrame) as i64,
+            callable as i64,
+            w_int_new(40) as i64,
+        );
+
+        unsafe {
+            assert_eq!(w_int_get_value(result as PyObjectRef), 42);
+        }
+    }
+
+    #[test]
+    fn test_jit_namespace_helpers_read_and_write_frame_namespace() {
+        let code = compile_exec("i = 0").expect("compile failed");
+        let frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        unsafe { (*frame.namespace).insert("i".to_string(), w_int_new(7)) };
+
+        let name = frame.code().names[0].to_string();
+        let namespace_ptr = frame.namespace as i64;
+        let name_ptr = name.as_ptr() as i64;
+        let name_len = name.len() as i64;
+
+        let loaded =
+            crate::jit::helpers::jit_load_name_from_namespace(namespace_ptr, name_ptr, name_len);
+        unsafe {
+            assert_eq!(w_int_get_value(loaded as PyObjectRef), 7);
+        }
+
+        crate::jit::helpers::jit_store_name_to_namespace(
+            namespace_ptr,
+            name_ptr,
+            name_len,
+            w_int_new(11) as i64,
+        );
+        unsafe {
+            assert_eq!(w_int_get_value(*(*frame.namespace).get("i").unwrap()), 11);
+        }
+    }
+
+    #[test]
     fn test_dump_for_bytecode() {
         let source = "s = 0\nfor i in range(10):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
@@ -671,31 +737,26 @@ mod tests {
     fn test_build_jit_state_imports_virtualizable_frame_state() {
         let code = nested_function_code("def f(x):\n    y = x\n    return y");
         let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        frame.fix_array_ptrs();
         frame.next_instr = 7;
         frame.stack_depth = 1;
         frame.locals_w[0] = w_int_new(11);
         frame.locals_w[1] = w_int_new(13);
         frame.value_stack_w[0] = w_int_new(29);
-        frame.namespace.insert("x".to_string(), w_int_new(41));
+        unsafe { (*frame.namespace).insert("x".to_string(), w_int_new(41)) };
 
         let info = build_pyframe_virtualizable_info();
         let jit_state = build_jit_state(&frame, &info);
-        let x_idx = jit_state
-            .ns_keys
-            .iter()
-            .position(|key| key == "x")
-            .expect("x must be present in namespace snapshot");
 
         assert_eq!(jit_state.frame, &frame as *const PyFrame as usize);
         assert_eq!(jit_state.next_instr, 7);
         assert_eq!(jit_state.stack_depth, 1);
-        assert_eq!(jit_state.local_count, frame.locals_w.len());
-        assert_eq!(jit_state.stack_capacity, frame.value_stack_w.len());
+        assert_eq!(jit_state.local_count(), frame.locals_w.len());
+        assert_eq!(jit_state.stack_capacity(), frame.value_stack_w.len());
         unsafe {
-            assert_eq!(w_int_get_value(jit_state.locals[0]), 11);
-            assert_eq!(w_int_get_value(jit_state.locals[1]), 13);
-            assert_eq!(w_int_get_value(jit_state.stack[0]), 29);
-            assert_eq!(w_int_get_value(jit_state.ns_values[x_idx]), 41);
+            assert_eq!(w_int_get_value(jit_state.local_at(0).unwrap()), 11);
+            assert_eq!(w_int_get_value(jit_state.local_at(1).unwrap()), 13);
+            assert_eq!(w_int_get_value(jit_state.stack_at(0).unwrap()), 29);
         }
     }
 
@@ -703,21 +764,16 @@ mod tests {
     fn test_sync_jit_state_to_frame_exports_virtualizable_state() {
         let code = nested_function_code("def f(x):\n    y = x\n    return y");
         let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
-        frame.namespace.insert("x".to_string(), w_int_new(5));
+        frame.fix_array_ptrs();
+        unsafe { (*frame.namespace).insert("x".to_string(), w_int_new(5)) };
 
         let info = build_pyframe_virtualizable_info();
         let mut jit_state = build_jit_state(&frame, &info);
-        let x_idx = jit_state
-            .ns_keys
-            .iter()
-            .position(|key| key == "x")
-            .expect("x must be present in namespace snapshot");
         jit_state.next_instr = 13;
         jit_state.stack_depth = 1;
-        jit_state.locals[0] = w_int_new(17);
-        jit_state.locals[1] = w_int_new(19);
-        jit_state.stack[0] = w_int_new(23);
-        jit_state.ns_values[x_idx] = w_int_new(31);
+        assert!(jit_state.set_local_at(0, w_int_new(17)));
+        assert!(jit_state.set_local_at(1, w_int_new(19)));
+        assert!(jit_state.set_stack_at(0, w_int_new(23)));
 
         sync_jit_state_to_frame(&jit_state, &mut frame, &info);
 
@@ -727,7 +783,151 @@ mod tests {
             assert_eq!(w_int_get_value(frame.locals_w[0]), 17);
             assert_eq!(w_int_get_value(frame.locals_w[1]), 19);
             assert_eq!(w_int_get_value(frame.value_stack_w[0]), 23);
-            assert_eq!(w_int_get_value(*frame.namespace.get("x").unwrap()), 31);
+            assert_eq!(w_int_get_value(*(*frame.namespace).get("x").unwrap()), 5);
+        }
+    }
+
+    #[test]
+    fn test_jit_state_extract_live_uses_frame_only_red_state() {
+        let code = nested_function_code("def f(x):\n    y = x\n    return y");
+        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        frame.fix_array_ptrs();
+        frame.next_instr = 7;
+        frame.stack_depth = 1;
+        frame.locals_w[0] = w_int_new(11);
+        frame.locals_w[1] = w_int_new(13);
+        frame.value_stack_w[0] = w_int_new(29);
+
+        let info = build_pyframe_virtualizable_info();
+        let jit_state = build_jit_state(&frame, &info);
+        let meta = <PyreJitState as JitState>::build_meta(&jit_state, frame.next_instr, &PyreEnv);
+        let live = <PyreJitState as JitState>::extract_live(&jit_state, &meta);
+
+        assert_eq!(live, vec![(&frame as *const PyFrame as usize) as i64]);
+    }
+
+    #[test]
+    fn test_jit_state_restore_values_refreshes_frame_backed_scalars_when_only_frame_is_live() {
+        let code = nested_function_code("def f(x):\n    y = x\n    return y");
+        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        frame.fix_array_ptrs();
+
+        let info = build_pyframe_virtualizable_info();
+        let mut jit_state = build_jit_state(&frame, &info);
+        let meta = <PyreJitState as JitState>::build_meta(&jit_state, frame.next_instr, &PyreEnv);
+
+        frame.next_instr = 19;
+        frame.stack_depth = 1;
+        frame.locals_w[0] = w_int_new(17);
+        frame.locals_w[1] = w_int_new(23);
+        frame.value_stack_w[0] = w_int_new(29);
+
+        <PyreJitState as JitState>::restore_values(
+            &mut jit_state,
+            &meta,
+            &[Value::Int((&frame as *const PyFrame as usize) as i64)],
+        );
+
+        assert_eq!(jit_state.frame, &frame as *const PyFrame as usize);
+        assert_eq!(jit_state.next_instr, 19);
+        assert_eq!(jit_state.stack_depth, 1);
+        unsafe {
+            assert_eq!(w_int_get_value(jit_state.local_at(0).unwrap()), 17);
+            assert_eq!(w_int_get_value(jit_state.local_at(1).unwrap()), 23);
+            assert_eq!(w_int_get_value(jit_state.stack_at(0).unwrap()), 29);
+        }
+    }
+
+    #[test]
+    fn test_jit_state_reconstructed_frame_types_use_frame_only_slot() {
+        let code = nested_function_code("def f(x):\n    y = x\n    return y");
+        let frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        let info = build_pyframe_virtualizable_info();
+        let jit_state = build_jit_state(&frame, &info);
+        let meta = <PyreJitState as JitState>::build_meta(&jit_state, frame.next_instr, &PyreEnv);
+
+        let slot_types =
+            <PyreJitState as JitState>::reconstructed_frame_value_types(&jit_state, &meta, 0, 1, 0)
+                .expect("root frame should expose reconstructed slot types");
+
+        assert_eq!(slot_types, vec![majit_ir::Type::Int]);
+    }
+
+    #[test]
+    fn test_jit_state_virtualizable_lengths_follow_frame_shape() {
+        let code = nested_function_code("def f(x):\n    y = x\n    return y");
+        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        frame.fix_array_ptrs();
+
+        let info = build_pyframe_virtualizable_info();
+        let jit_state = build_jit_state(&frame, &info);
+        let meta = <PyreJitState as JitState>::build_meta(&jit_state, frame.next_instr, &PyreEnv);
+
+        let lengths = <PyreJitState as JitState>::virtualizable_array_lengths(
+            &jit_state, &meta, "frame", &info,
+        )
+        .expect("frame-backed virtualizable lengths");
+
+        assert_eq!(
+            lengths,
+            vec![frame.locals_w.len(), frame.value_stack_w.len()]
+        );
+    }
+
+    #[test]
+    fn test_jit_state_meta_reads_namespace_shape_from_frame() {
+        let code = nested_function_code("def f(x):\n    return x");
+        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        frame.fix_array_ptrs();
+        unsafe {
+            (*frame.namespace).insert("z".to_string(), w_int_new(7));
+            (*frame.namespace).insert("a".to_string(), w_int_new(11));
+        }
+
+        let info = build_pyframe_virtualizable_info();
+        let jit_state = build_jit_state(&frame, &info);
+        let meta = <PyreJitState as JitState>::build_meta(&jit_state, frame.next_instr, &PyreEnv);
+
+        assert!(meta.ns_keys.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(meta.ns_keys.iter().any(|key| key == "a"));
+        assert!(meta.ns_keys.iter().any(|key| key == "z"));
+        assert!(meta.ns_keys.iter().any(|key| key == "abs"));
+    }
+
+    #[test]
+    fn test_jit_state_restore_reconstructed_frame_values_refreshes_from_frame_only_slot() {
+        let code = nested_function_code("def f(x):\n    y = x\n    return y");
+        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        frame.fix_array_ptrs();
+
+        let info = build_pyframe_virtualizable_info();
+        let mut jit_state = build_jit_state(&frame, &info);
+        let meta = <PyreJitState as JitState>::build_meta(&jit_state, frame.next_instr, &PyreEnv);
+
+        frame.next_instr = 23;
+        frame.stack_depth = 1;
+        frame.locals_w[0] = w_int_new(31);
+        frame.locals_w[1] = w_int_new(37);
+        frame.value_stack_w[0] = w_int_new(41);
+
+        let restored = <PyreJitState as JitState>::restore_reconstructed_frame_values(
+            &mut jit_state,
+            &meta,
+            0,
+            1,
+            29,
+            &[Value::Int((&frame as *const PyFrame as usize) as i64)],
+            &ExceptionState::default(),
+        );
+
+        assert!(restored);
+        assert_eq!(jit_state.frame, &frame as *const PyFrame as usize);
+        assert_eq!(jit_state.next_instr, 29);
+        assert_eq!(jit_state.stack_depth, 1);
+        unsafe {
+            assert_eq!(w_int_get_value(jit_state.local_at(0).unwrap()), 31);
+            assert_eq!(w_int_get_value(jit_state.local_at(1).unwrap()), 37);
+            assert_eq!(w_int_get_value(jit_state.stack_at(0).unwrap()), 41);
         }
     }
 
@@ -780,8 +980,8 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let x = *frame.namespace.get("x").unwrap();
-            let y = *frame.namespace.get("y").unwrap();
+            let x = *(*frame.namespace).get("x").unwrap();
+            let y = *(*frame.namespace).get("y").unwrap();
             assert_eq!(w_int_get_value(x), 5);
             assert_eq!(w_int_get_value(y), 25);
         }
@@ -794,7 +994,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let i = *frame.namespace.get("i").unwrap();
+            let i = *(*frame.namespace).get("i").unwrap();
             assert_eq!(w_int_get_value(i), 10);
         }
     }
@@ -923,8 +1123,563 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let s = *frame.namespace.get("s").unwrap();
+            let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 45);
+        }
+    }
+
+    #[test]
+    fn test_hot_range_loop_survives_compiled_trace() {
+        let source = "s = 0\nfor i in range(3000):\n    s = s + i";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let s = *(*frame.namespace).get("s").unwrap();
+            assert_eq!(w_int_get_value(s), 4_498_500);
+        }
+    }
+
+    #[test]
+    fn test_hot_module_branch_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    if i < 1500:
+        acc = acc + 1
+    else:
+        acc = acc + 2
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 4500);
+        }
+    }
+
+    #[test]
+    fn test_hot_tuple_unpack_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    a, b = (i, 1)
+    acc = acc + a + b
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 4_501_500);
+        }
+    }
+
+    #[test]
+    fn test_hot_list_index_store_loop_survives_compiled_trace() {
+        let source = "\
+lst = [0]
+i = 0
+acc = 0
+while i < 3000:
+    lst[0] = i
+    acc = acc + lst[0]
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            let lst = *(*frame.namespace).get("lst").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 4_498_500);
+            assert_eq!(w_int_get_value(w_list_getitem(lst, 0).unwrap()), 2999);
+        }
+    }
+
+    #[test]
+    fn test_hot_bitwise_or_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc | i
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 4095);
+        }
+    }
+
+    #[test]
+    fn test_hot_unary_invert_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + (~i)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), -4_501_500);
+        }
+    }
+
+    #[test]
+    fn test_hot_positive_floordiv_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + (i // 3)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 1_498_500);
+        }
+    }
+
+    #[test]
+    fn test_hot_positive_mod_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + (i % 7)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 8_994);
+        }
+    }
+
+    #[test]
+    fn test_hot_builtin_abs_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + abs(i - 1500)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 2_250_000);
+        }
+    }
+
+    #[test]
+    fn test_hot_list_truth_loop_survives_compiled_trace() {
+        let source = "\
+lst = [1]
+i = 0
+acc = 0
+while i < 3000:
+    if lst:
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_empty_tuple_truth_loop_survives_compiled_trace() {
+        let source = "\
+tpl = ()
+i = 0
+acc = 0
+while i < 3000:
+    if tpl:
+        acc = acc + 100
+    else:
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_none_truth_loop_survives_compiled_trace() {
+        let source = "\
+value = None
+i = 0
+acc = 0
+while i < 3000:
+    if value:
+        acc = acc + 100
+    else:
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_float_truth_loop_survives_compiled_trace() {
+        let source = "\
+value = 0.5
+i = 0
+acc = 0
+while i < 3000:
+    if value:
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_string_truth_loop_survives_compiled_trace() {
+        let source = "\
+value = \"pyre\"
+i = 0
+acc = 0
+while i < 3000:
+    if value:
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_empty_string_truth_loop_survives_compiled_trace() {
+        let source = "\
+value = \"\"
+i = 0
+acc = 0
+while i < 3000:
+    if value:
+        acc = acc + 100
+    else:
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_dict_truth_loop_survives_compiled_trace() {
+        let source = "\
+value = {1: 2}
+i = 0
+acc = 0
+while i < 3000:
+    if value:
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_builtin_len_string_loop_survives_compiled_trace() {
+        let source = "\
+value = \"pyre\"
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + len(value)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 12_000);
+        }
+    }
+
+    #[test]
+    fn test_hot_builtin_len_dict_loop_survives_compiled_trace() {
+        let source = "\
+value = {1: 2, 3: 4}
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + len(value)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 6_000);
+        }
+    }
+
+    #[test]
+    fn test_hot_builtin_isinstance_true_loop_survives_compiled_trace() {
+        let source = "\
+x = 42
+i = 0
+acc = 0
+while i < 3000:
+    if isinstance(x, \"int\"):
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_builtin_isinstance_false_loop_survives_compiled_trace() {
+        let source = "\
+x = []
+i = 0
+acc = 0
+while i < 3000:
+    if isinstance(x, \"int\"):
+        acc = acc + 1
+    else:
+        acc = acc + 2
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 6000);
+        }
+    }
+
+    #[test]
+    fn test_hot_builtin_type_loop_survives_compiled_trace() {
+        let source = "\
+x = []
+i = 0
+acc = 0
+while i < 3000:
+    if type(x) == \"list\":
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_builtin_min_small_int_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + min(i % 7, 3)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 6426);
+        }
+    }
+
+    #[test]
+    fn test_hot_builtin_max_small_int_loop_survives_compiled_trace() {
+        let source = "\
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + max(i % 7, 3)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 11568);
+        }
+    }
+
+    #[test]
+    fn test_hot_empty_dict_truth_loop_survives_compiled_trace() {
+        let source = "\
+value = {}
+i = 0
+acc = 0
+while i < 3000:
+    if value:
+        acc = acc + 100
+    else:
+        acc = acc + 1
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 3000);
+        }
+    }
+
+    #[test]
+    fn test_hot_list_negative_index_store_loop_survives_compiled_trace() {
+        let source = "\
+lst = [0, 1]
+i = 0
+acc = 0
+while i < 3000:
+    lst[-1] = i
+    acc = acc + lst[-1]
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            let lst = *(*frame.namespace).get("lst").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 4_498_500);
+            assert_eq!(w_int_get_value(w_list_getitem(lst, -1).unwrap()), 2999);
+        }
+    }
+
+    #[test]
+    fn test_hot_tuple_negative_index_load_loop_survives_compiled_trace() {
+        let source = "\
+tpl = (3, 5)
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + tpl[-1]
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 15_000);
+        }
+    }
+
+    #[test]
+    fn test_hot_user_function_loop_survives_compiled_trace() {
+        let source = "\
+def inc(x):
+    return x + 1
+i = 0
+acc = 0
+while i < 3000:
+    acc = acc + inc(i)
+    i = i + 1";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame(&mut frame);
+        unsafe {
+            let i = *(*frame.namespace).get("i").unwrap();
+            let acc = *(*frame.namespace).get("acc").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            assert_eq!(w_int_get_value(acc), 4_501_500);
         }
     }
 
@@ -935,7 +1690,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let s = *frame.namespace.get("s").unwrap();
+            let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 35);
         }
     }
@@ -947,7 +1702,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let s = *frame.namespace.get("s").unwrap();
+            let s = *(*frame.namespace).get("s").unwrap();
             // 0 + 2 + 4 + 6 + 8 = 20
             assert_eq!(w_int_get_value(s), 20);
         }
@@ -960,7 +1715,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let s = *frame.namespace.get("s").unwrap();
+            let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 42);
         }
     }
@@ -972,7 +1727,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let s = *frame.namespace.get("s").unwrap();
+            let s = *(*frame.namespace).get("s").unwrap();
             // 0 + 1 + 2 + 3 + 4 = 10
             assert_eq!(w_int_get_value(s), 10);
         }
@@ -987,7 +1742,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let x = *frame.namespace.get("x").unwrap();
+            let x = *(*frame.namespace).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 3);
         }
     }
@@ -999,7 +1754,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let x = *frame.namespace.get("x").unwrap();
+            let x = *(*frame.namespace).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 5);
         }
     }
@@ -1011,8 +1766,8 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame(&mut frame);
         unsafe {
-            let a = *frame.namespace.get("a").unwrap();
-            let b = *frame.namespace.get("b").unwrap();
+            let a = *(*frame.namespace).get("a").unwrap();
+            let b = *(*frame.namespace).get("b").unwrap();
             assert_eq!(w_int_get_value(a), 3);
             assert_eq!(w_int_get_value(b), 7);
         }
@@ -1025,7 +1780,7 @@ mod tests {
         let source = "x = [1, 2, 3]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *frame.namespace.get("x").unwrap();
+            let x = *(*frame.namespace).get("x").unwrap();
             assert!(is_list(x));
             assert_eq!(w_list_len(x), 3);
             assert_eq!(w_int_get_value(w_list_getitem(x, 0).unwrap()), 1);
@@ -1039,8 +1794,8 @@ mod tests {
         let source = "a, b = 1, 2";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let a = *frame.namespace.get("a").unwrap();
-            let b = *frame.namespace.get("b").unwrap();
+            let a = *(*frame.namespace).get("a").unwrap();
+            let b = *(*frame.namespace).get("b").unwrap();
             assert_eq!(w_int_get_value(a), 1);
             assert_eq!(w_int_get_value(b), 2);
         }
@@ -1051,7 +1806,7 @@ mod tests {
         let source = "lst = [10, 20, 30]\nx = lst[1]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *frame.namespace.get("x").unwrap();
+            let x = *(*frame.namespace).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 20);
         }
     }
@@ -1061,7 +1816,7 @@ mod tests {
         let source = "lst = [1, 2, 3]\nlst[0] = 99\nx = lst[0]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *frame.namespace.get("x").unwrap();
+            let x = *(*frame.namespace).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 99);
         }
     }
@@ -1071,7 +1826,7 @@ mod tests {
         let source = "d = {1: 10, 2: 20}\nx = d[1]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *frame.namespace.get("x").unwrap();
+            let x = *(*frame.namespace).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 10);
         }
     }
@@ -1083,7 +1838,7 @@ mod tests {
         let source = "def double(x):\n    return x * 2\nresult = double(21)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *frame.namespace.get("result").unwrap();
+            let result = *(*frame.namespace).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -1098,7 +1853,7 @@ def add_squares(a, b):
 result = add_squares(3, 4)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *frame.namespace.get("result").unwrap();
+            let result = *(*frame.namespace).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 25);
         }
     }
@@ -1113,7 +1868,7 @@ def factorial(n):
 result = factorial(5)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *frame.namespace.get("result").unwrap();
+            let result = *(*frame.namespace).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 120);
         }
     }

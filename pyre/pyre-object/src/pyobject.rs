@@ -16,7 +16,7 @@ pub struct PyType {
 /// Common header for all Python objects.
 ///
 /// The `ob_type` pointer identifies the object's type at runtime.
-/// JIT code reads this field via `GetfieldGcR` and guards on it via `GuardClass`.
+/// JIT code reads this field as a raw machine word and guards on it via `GuardClass`.
 #[repr(C)]
 pub struct PyObject {
     pub ob_type: *const PyType,
@@ -24,7 +24,7 @@ pub struct PyObject {
 
 /// The universal Python object reference — a raw pointer to `PyObject`.
 ///
-/// Maps directly to majit's `Type::Ref` / `GcRef`.
+/// `pyre` currently passes this through the JIT as an integer-sized raw pointer.
 /// Phase 1 uses leaked Box allocations; a proper GC will replace this later.
 // Safety: PyType instances are read-only static data, safe to share across threads.
 unsafe impl Sync for PyType {}

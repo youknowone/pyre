@@ -7,30 +7,16 @@ use pyre_object::*;
 
 /// Install the default builtins into a namespace.
 pub fn install_default_builtins(namespace: &mut PyNamespace) {
-    namespace
-        .entry("print".to_string())
-        .or_insert_with(|| w_builtin_func_new("print", builtin_print));
-    namespace
-        .entry("range".to_string())
-        .or_insert_with(|| w_builtin_func_new("range", builtin_range));
-    namespace
-        .entry("len".to_string())
-        .or_insert_with(|| w_builtin_func_new("len", builtin_len));
-    namespace
-        .entry("abs".to_string())
-        .or_insert_with(|| w_builtin_func_new("abs", builtin_abs));
-    namespace
-        .entry("min".to_string())
-        .or_insert_with(|| w_builtin_func_new("min", builtin_min));
-    namespace
-        .entry("max".to_string())
-        .or_insert_with(|| w_builtin_func_new("max", builtin_max));
-    namespace
-        .entry("type".to_string())
-        .or_insert_with(|| w_builtin_func_new("type", builtin_type));
-    namespace
-        .entry("isinstance".to_string())
-        .or_insert_with(|| w_builtin_func_new("isinstance", builtin_isinstance));
+    namespace.get_or_insert_with("print", || w_builtin_func_new("print", builtin_print));
+    namespace.get_or_insert_with("range", || w_builtin_func_new("range", builtin_range));
+    namespace.get_or_insert_with("len", || w_builtin_func_new("len", builtin_len));
+    namespace.get_or_insert_with("abs", || w_builtin_func_new("abs", builtin_abs));
+    namespace.get_or_insert_with("min", || w_builtin_func_new("min", builtin_min));
+    namespace.get_or_insert_with("max", || w_builtin_func_new("max", builtin_max));
+    namespace.get_or_insert_with("type", || w_builtin_func_new("type", builtin_type));
+    namespace.get_or_insert_with("isinstance", || {
+        w_builtin_func_new("isinstance", builtin_isinstance)
+    });
 }
 
 /// Create a fresh namespace seeded with the default builtins.
@@ -109,7 +95,7 @@ fn builtin_len(args: &[PyObjectRef]) -> PyObjectRef {
             return w_int_new(w_dict_len(obj) as i64);
         }
         if is_str(obj) {
-            return w_int_new(w_str_get_value(obj).len() as i64);
+            return w_int_new(w_str_len(obj) as i64);
         }
     }
     panic!("object has no len()")
@@ -195,7 +181,7 @@ fn builtin_type(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 1, "type() takes exactly one argument");
     let obj = args[0];
     let name = unsafe { (*(*obj).ob_type).tp_name };
-    w_str_new(name)
+    box_str_constant(name)
 }
 
 /// `isinstance(obj, type_name)` — simplified type check using type name string.

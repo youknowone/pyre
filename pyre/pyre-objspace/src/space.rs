@@ -191,6 +191,104 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_float_new(result))
 }
 
+// ── Power ────────────────────────────────────────────────────────────
+
+unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let va = w_int_get_value(a);
+    let vb = w_int_get_value(b);
+    if vb < 0 {
+        // Negative exponent → float result
+        return Ok(w_float_new((va as f64).powf(vb as f64)));
+    }
+    let vb = vb as u32;
+    match va.checked_pow(vb) {
+        Some(r) => Ok(w_int_new(r)),
+        None => Ok(w_long_new(BigInt::from(va).pow(vb))),
+    }
+}
+
+unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let vb = as_bigint(b);
+    if vb < BigInt::from(0) {
+        let fa = as_float(a);
+        let fb = as_float(b);
+        return Ok(w_float_new(fa.powf(fb)));
+    }
+    let exp = vb.to_u32().unwrap_or(u32::MAX);
+    Ok(bigint_result(as_bigint(a).pow(exp)))
+}
+
+// ── Shift operations ─────────────────────────────────────────────────
+
+unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let va = w_int_get_value(a);
+    let vb = w_int_get_value(b);
+    if vb < 0 {
+        return Err(PyError::type_error("negative shift count"));
+    }
+    let vb = vb as u32;
+    if vb < 63 {
+        if let Some(r) = va.checked_shl(vb) {
+            return Ok(w_int_new(r));
+        }
+    }
+    Ok(w_long_new(BigInt::from(va) << vb))
+}
+
+unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let va = w_int_get_value(a);
+    let vb = w_int_get_value(b);
+    if vb < 0 {
+        return Err(PyError::type_error("negative shift count"));
+    }
+    let vb = vb as u32;
+    Ok(w_int_new(va >> vb.min(63)))
+}
+
+unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let vb = as_bigint(b);
+    if vb < BigInt::from(0) {
+        return Err(PyError::type_error("negative shift count"));
+    }
+    let shift = vb.to_u32().unwrap_or(u32::MAX);
+    Ok(bigint_result(as_bigint(a) << shift))
+}
+
+unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let vb = as_bigint(b);
+    if vb < BigInt::from(0) {
+        return Err(PyError::type_error("negative shift count"));
+    }
+    let shift = vb.to_u32().unwrap_or(u32::MAX);
+    Ok(bigint_result(as_bigint(a) >> shift))
+}
+
+// ── Bitwise operations ───────────────────────────────────────────────
+
+unsafe fn int_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_int_new(w_int_get_value(a) & w_int_get_value(b)))
+}
+
+unsafe fn int_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_int_new(w_int_get_value(a) | w_int_get_value(b)))
+}
+
+unsafe fn int_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(w_int_new(w_int_get_value(a) ^ w_int_get_value(b)))
+}
+
+unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bigint_result(as_bigint(a) & as_bigint(b)))
+}
+
+unsafe fn long_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bigint_result(as_bigint(a) | as_bigint(b)))
+}
+
+unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bigint_result(as_bigint(a) ^ as_bigint(b)))
+}
+
 // ── String operations ────────────────────────────────────────────────
 
 /// Concatenate two str objects.
@@ -387,6 +485,111 @@ pub fn py_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
+/// Power operation dispatch (`**` operator).
+pub fn py_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_int(a) && is_int(b) {
+            return int_pow(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_pow(a, b);
+        }
+        if is_float_pair(a, b) {
+            return Ok(w_float_new(as_float(a).powf(as_float(b))));
+        }
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for **: '{}' and '{}'",
+            (*(*a).ob_type).tp_name,
+            (*(*b).ob_type).tp_name,
+        )))
+    }
+}
+
+/// Left shift dispatch (`<<` operator).
+pub fn py_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_int(a) && is_int(b) {
+            return int_lshift(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_lshift(a, b);
+        }
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for <<: '{}' and '{}'",
+            (*(*a).ob_type).tp_name,
+            (*(*b).ob_type).tp_name,
+        )))
+    }
+}
+
+/// Right shift dispatch (`>>` operator).
+pub fn py_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_int(a) && is_int(b) {
+            return int_rshift(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_rshift(a, b);
+        }
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for >>: '{}' and '{}'",
+            (*(*a).ob_type).tp_name,
+            (*(*b).ob_type).tp_name,
+        )))
+    }
+}
+
+/// Bitwise AND dispatch (`&` operator).
+pub fn py_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_int(a) && is_int(b) {
+            return int_bitand(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_bitand(a, b);
+        }
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for &: '{}' and '{}'",
+            (*(*a).ob_type).tp_name,
+            (*(*b).ob_type).tp_name,
+        )))
+    }
+}
+
+/// Bitwise OR dispatch (`|` operator).
+pub fn py_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_int(a) && is_int(b) {
+            return int_bitor(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_bitor(a, b);
+        }
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for |: '{}' and '{}'",
+            (*(*a).ob_type).tp_name,
+            (*(*b).ob_type).tp_name,
+        )))
+    }
+}
+
+/// Bitwise XOR dispatch (`^` operator).
+pub fn py_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_int(a) && is_int(b) {
+            return int_bitxor(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_bitxor(a, b);
+        }
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for ^: '{}' and '{}'",
+            (*(*a).ob_type).tp_name,
+            (*(*b).ob_type).tp_name,
+        )))
+    }
+}
+
 /// Comparison operation dispatch.
 pub fn py_compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     unsafe {
@@ -474,7 +677,7 @@ pub fn py_is_true(obj: PyObjectRef) -> bool {
             return w_float_get_value(obj) != 0.0;
         }
         if is_str(obj) {
-            return !w_str_get_value(obj).is_empty();
+            return w_str_len(obj) != 0;
         }
         if is_list(obj) {
             return w_list_len(obj) > 0;
@@ -510,6 +713,22 @@ pub fn py_negative(a: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary -: '{}'",
+            (*(*a).ob_type).tp_name,
+        )))
+    }
+}
+
+/// Unary bitwise inversion.
+pub fn py_invert(a: PyObjectRef) -> PyResult {
+    unsafe {
+        if is_int(a) {
+            return Ok(w_int_new(!w_int_get_value(a)));
+        }
+        if is_long(a) {
+            return Ok(bigint_result(!w_long_get_value(a).clone()));
+        }
+        Err(PyError::type_error(format!(
+            "bad operand type for unary ~: '{}'",
             (*(*a).ob_type).tp_name,
         )))
     }
@@ -609,7 +828,7 @@ pub fn py_len(obj: PyObjectRef) -> PyResult {
         } else if is_dict(obj) {
             Ok(w_int_new(w_dict_len(obj) as i64))
         } else if is_str(obj) {
-            Ok(w_int_new(w_str_get_value(obj).len() as i64))
+            Ok(w_int_new(w_str_len(obj) as i64))
         } else {
             Err(PyError::type_error(format!(
                 "object of type '{}' has no len()",
@@ -734,6 +953,15 @@ mod tests {
     }
 
     #[test]
+    fn test_invert_int() {
+        let result = py_invert(w_int_new(6)).unwrap();
+        unsafe {
+            assert!(is_int(result));
+            assert_eq!(w_int_get_value(result), !6);
+        }
+    }
+
+    #[test]
     fn test_long_compare() {
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_int_new(i64::MAX);
@@ -747,5 +975,96 @@ mod tests {
             BigInt::from(i64::MAX) + BigInt::from(1)
         )));
         assert!(!py_is_true(w_long_new(BigInt::from(0))));
+    }
+
+    #[test]
+    fn test_int_pow() {
+        let result = py_pow(w_int_new(2), w_int_new(10)).unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 1024) };
+    }
+
+    #[test]
+    fn test_int_pow_overflow() {
+        let result = py_pow(w_int_new(2), w_int_new(63)).unwrap();
+        unsafe {
+            // 2^63 overflows i64, should be long
+            assert!(is_long(result));
+            assert_eq!(*w_long_get_value(result), BigInt::from(2).pow(63));
+        }
+    }
+
+    #[test]
+    fn test_int_pow_negative_exponent() {
+        let result = py_pow(w_int_new(2), w_int_new(-1)).unwrap();
+        unsafe {
+            assert!(is_float(result));
+            assert_eq!(w_float_get_value(result), 0.5);
+        }
+    }
+
+    #[test]
+    fn test_int_lshift() {
+        let result = py_lshift(w_int_new(1), w_int_new(10)).unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 1024) };
+    }
+
+    #[test]
+    fn test_int_lshift_overflow() {
+        let result = py_lshift(w_int_new(1), w_int_new(64)).unwrap();
+        unsafe {
+            assert!(is_long(result));
+            assert_eq!(*w_long_get_value(result), BigInt::from(1) << 64);
+        }
+    }
+
+    #[test]
+    fn test_int_rshift() {
+        let result = py_rshift(w_int_new(1024), w_int_new(3)).unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 128) };
+    }
+
+    #[test]
+    fn test_negative_shift_count() {
+        assert!(py_lshift(w_int_new(1), w_int_new(-1)).is_err());
+        assert!(py_rshift(w_int_new(1), w_int_new(-1)).is_err());
+    }
+
+    #[test]
+    fn test_int_bitand() {
+        let result = py_bitand(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 0x0F) };
+    }
+
+    #[test]
+    fn test_int_bitor() {
+        let result = py_bitor(w_int_new(0xF0), w_int_new(0x0F)).unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 0xFF) };
+    }
+
+    #[test]
+    fn test_int_bitxor() {
+        let result = py_bitxor(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 0xF0) };
+    }
+
+    #[test]
+    fn test_long_bitand() {
+        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
+        let b = w_int_new(0xFF);
+        let result = py_bitand(a, b).unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 0) };
+    }
+
+    #[test]
+    fn test_invert_long() {
+        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
+        let result = py_invert(a).unwrap();
+        unsafe {
+            assert!(is_long(result));
+            assert_eq!(
+                *w_long_get_value(result),
+                !(BigInt::from(i64::MAX) + BigInt::from(1))
+            );
+        }
     }
 }

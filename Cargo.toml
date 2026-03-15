@@ -29,7 +29,6 @@ members = [
     "pyre/pyre-objspace",
     "pyre/pyre-bytecode",
     "pyre/pyre-interp",
-    "pyre/pyre-jit",
     "pyre/pyre-main",
 ]
 
@@ -40,7 +39,6 @@ pyre-runtime = { path = "pyre/pyre-runtime" }
 pyre-objspace = { path = "pyre/pyre-objspace" }
 pyre-bytecode = { path = "pyre/pyre-bytecode" }
 pyre-interp = { path = "pyre/pyre-interp" }
-pyre-jit = { path = "pyre/pyre-jit" }
 
 # RustPython compiler toolchain
 rustpython-compiler = { git = "https://github.com/RustPython/RustPython", branch = "main" }

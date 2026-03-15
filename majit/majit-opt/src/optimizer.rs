@@ -3,6 +3,10 @@ use crate::{OptContext, OptimizationPass, PassResult};
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
 /// Chains multiple optimization passes and drives operations through them.
+use crate::{
+    guard::OptGuard, heap::OptHeap, intbounds::OptIntBounds, pure::OptPure,
+    rewrite::OptRewrite, simplify::OptSimplify, virtualize::OptVirtualize, vstring::OptString,
+};
 use majit_ir::Op;
 
 /// The optimizer: chains passes and runs them over a trace.
@@ -117,14 +121,14 @@ impl Optimizer {
     /// Order: IntBounds -> Rewrite -> Virtualize -> String -> Pure -> Guard -> Simplify -> Heap
     pub fn default_pipeline() -> Self {
         let mut opt = Self::new();
-        opt.add_pass(Box::new(crate::intbounds::OptIntBounds::new()));
-        opt.add_pass(Box::new(crate::rewrite::OptRewrite::new()));
-        opt.add_pass(Box::new(crate::virtualize::OptVirtualize::new()));
-        opt.add_pass(Box::new(crate::vstring::OptString::new()));
-        opt.add_pass(Box::new(crate::pure::OptPure::new()));
-        opt.add_pass(Box::new(crate::guard::OptGuard::new()));
-        opt.add_pass(Box::new(crate::simplify::OptSimplify::new()));
-        opt.add_pass(Box::new(crate::heap::OptHeap::new()));
+        opt.add_pass(Box::new(OptIntBounds::new()));
+        opt.add_pass(Box::new(OptRewrite::new()));
+        opt.add_pass(Box::new(OptVirtualize::new()));
+        opt.add_pass(Box::new(OptString::new()));
+        opt.add_pass(Box::new(OptPure::new()));
+        opt.add_pass(Box::new(OptGuard::new()));
+        opt.add_pass(Box::new(OptSimplify::new()));
+        opt.add_pass(Box::new(OptHeap::new()));
         opt
     }
 
@@ -136,7 +140,7 @@ impl Optimizer {
 
 impl Default for Optimizer {
     fn default() -> Self {
-        Self::new()
+        Self::default_pipeline()
     }
 }
 

@@ -38,6 +38,12 @@ pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
     Box::into_raw(obj) as PyObjectRef
 }
 
+/// Box a cloned compiler code object into a heap Python code wrapper.
+pub fn box_code_constant(code: &pyre_bytecode::CodeObject) -> PyObjectRef {
+    let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
+    w_code_new(code_ptr)
+}
+
 /// Extract the opaque code pointer from a known W_CodeObject.
 ///
 /// # Safety

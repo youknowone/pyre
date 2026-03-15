@@ -50,6 +50,9 @@ pub struct StorageConfig {
     pub untraceable: Vec<Path>,
     /// Function to scan for used storages (e.g., `find_used_storages`).
     pub scan_fn: Ident,
+    /// Optional method on StoragePool to check JIT compatibility of all values.
+    /// When set, `can_trace` additionally calls `pool.method()`.
+    pub can_trace_guard: Option<Ident>,
 }
 
 impl Parse for JitInterpConfig {
@@ -140,6 +143,7 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut selector = None;
     let mut untraceable = Vec::new();
     let mut scan_fn = None;
+    let mut can_trace_guard = None;
 
     while !content.is_empty() {
         let key: Ident = content.parse()?;
@@ -164,6 +168,9 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             }
             "scan" => {
                 scan_fn = Some(content.parse::<Ident>()?);
+            }
+            "can_trace_guard" => {
+                can_trace_guard = Some(content.parse::<Ident>()?);
             }
             other => {
                 return Err(syn::Error::new(
@@ -191,6 +198,7 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         selector,
         untraceable,
         scan_fn,
+        can_trace_guard,
     })
 }
 
@@ -235,11 +243,39 @@ fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>>
             content.parse::<Token![=>]>()?;
             let kind: Ident = content.parse()?;
             match kind.to_string().as_str() {
-                "residual_void" | "residual_int" | "elidable_int" | "inline_int" => {}
+                "residual_void"
+                | "residual_void_wrapped"
+                | "may_force_void"
+                | "may_force_void_wrapped"
+                | "release_gil_void"
+                | "release_gil_void_wrapped"
+                | "loopinvariant_void"
+                | "loopinvariant_void_wrapped"
+                | "residual_int"
+                | "residual_int_wrapped"
+                | "may_force_int"
+                | "may_force_int_wrapped"
+                | "release_gil_int"
+                | "release_gil_int_wrapped"
+                | "loopinvariant_int"
+                | "loopinvariant_int_wrapped"
+                | "elidable_int"
+                | "elidable_int_wrapped"
+                | "residual_ref_wrapped"
+                | "may_force_ref_wrapped"
+                | "release_gil_ref_wrapped"
+                | "loopinvariant_ref_wrapped"
+                | "elidable_ref_wrapped"
+                | "residual_float_wrapped"
+                | "may_force_float_wrapped"
+                | "release_gil_float_wrapped"
+                | "loopinvariant_float_wrapped"
+                | "elidable_float_wrapped"
+                | "inline_int" => {}
                 _ => {
                     return Err(syn::Error::new(
                         kind.span(),
-                        "call policy must be one of residual_void, residual_int, elidable_int, inline_int",
+                        "call policy must be a supported residual/may_force/release_gil/loopinvariant policy or inline_int",
                     ));
                 }
             }

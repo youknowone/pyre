@@ -6,7 +6,7 @@
 ///
 /// ## Redundant Guard Removal
 ///
-/// If the same guard condition (opcode + arguments) has already been
+/// If the same foldable guard condition (opcode + arguments) has already been
 /// verified, the duplicate guard is removed:
 ///
 /// ```text
@@ -43,7 +43,7 @@ use crate::{OptContext, OptimizationPass, PassResult};
 
 /// Key that uniquely identifies a guard condition.
 ///
-/// Two guards are redundant when they have the same opcode and the same
+/// Two foldable guards are redundant when they have the same opcode and the same
 /// arguments (after forwarding resolution).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct GuardKey {
@@ -140,6 +140,10 @@ impl OptGuard {
             }
         }
     }
+
+    fn can_remove_as_duplicate(opcode: OpCode) -> bool {
+        opcode.is_foldable_guard()
+    }
 }
 
 impl Default for OptGuard {
@@ -158,9 +162,13 @@ impl OptimizationPass for OptGuard {
         }
 
         // --- Redundant guard removal (exact match) ---
-        let key = GuardKey::from_op(op);
-        if self.seen.contains(&key) {
-            return PassResult::Remove;
+        if Self::can_remove_as_duplicate(op.opcode) {
+            let key = GuardKey::from_op(op);
+            if self.seen.contains(&key) {
+                return PassResult::Remove;
+            }
+
+            self.seen.insert(key);
         }
 
         // --- Guard strengthening (subsumption) ---
@@ -169,7 +177,6 @@ impl OptimizationPass for OptGuard {
         }
 
         // The guard is not redundant – record it and emit.
-        self.seen.insert(key);
         self.record_implications(op, ctx);
 
         // --- Consecutive guard fusion ---
@@ -499,15 +506,53 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_no_exception_duplicates() {
-        // guard_no_exception has 0 args – duplicates should still be removed.
+    fn test_guard_no_exception_duplicates_preserved() {
+        // guard_no_exception depends on ambient exception state, so distinct
+        // checks cannot be merged just because they have no explicit args.
         let mut ops = vec![
             Op::new(OpCode::GuardNoException, &[]),
-            Op::new(OpCode::GuardNoException, &[]), // duplicate
+            Op::new(OpCode::GuardNoException, &[]),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
 
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_guard_no_overflow_duplicates_preserved() {
+        let mut ops = vec![
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::GuardNoOverflow, &[]),
+        ];
+        assign_positions(&mut ops, 100);
+        let result = run_guard_pass(&ops);
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_overflow_guards_preserved_in_full_pipeline() {
+        let mut ops = vec![
+            Op::new(OpCode::GuardTrue, &[OpRef(1)]),
+            Op::new(OpCode::IntSubOvf, &[OpRef(0), OpRef(2)]),
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::IntMulOvf, &[OpRef(2), OpRef(1)]),
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::Jump, &[OpRef(101), OpRef(101), OpRef(103)]),
+        ];
+        assign_positions(&mut ops, 100);
+
+        let mut opt = Optimizer::default_pipeline();
+        let result = opt.optimize(&ops);
+        let guard_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNoOverflow)
+            .count();
+
+        assert_eq!(
+            guard_count, 2,
+            "distinct overflow guards must survive full-pipeline optimization"
+        );
     }
 }

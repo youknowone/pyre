@@ -24,6 +24,13 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
     let sel_field = extract_field_member(&config.storage.selector);
     let untraceable = &config.storage.untraceable;
     let scan_fn = &config.storage.scan_fn;
+    let can_trace_guard = &config.storage.can_trace_guard;
+
+    let extra_guard = if let Some(method) = can_trace_guard {
+        quote! { && self.#pool_field.#method() }
+    } else {
+        quote! {}
+    };
 
     quote! {
         /// Compiled loop metadata: which storages and how many slots each had.
@@ -39,6 +46,7 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
         struct __JitSym {
             stacks: std::collections::HashMap<usize, majit_meta::SymbolicStack>,
             current_selected: usize,
+            current_selected_value: Option<majit_ir::OpRef>,
             storage_layout: Vec<(usize, usize)>,
             loop_header_pc: usize,
         }
@@ -55,8 +63,17 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
                 self.current_selected
             }
 
+            fn current_selected_value(&self) -> Option<majit_ir::OpRef> {
+                self.current_selected_value
+            }
+
             fn set_current_selected(&mut self, selected: usize) {
                 self.current_selected = selected;
+            }
+
+            fn set_current_selected_value(&mut self, selected: usize, value: majit_ir::OpRef) {
+                self.current_selected = selected;
+                self.current_selected_value = Some(value);
             }
 
             fn stack(&self, selected: usize) -> Option<&majit_meta::SymbolicStack> {
@@ -83,6 +100,23 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
                     self.storage_layout.push((selected, len));
                 }
             }
+
+            fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
+                let mut args = Vec::new();
+                for &(sidx, _) in &self.storage_layout {
+                    args.extend(self.stacks[&sidx].to_jump_args());
+                }
+                Some(args)
+            }
+
+            fn fail_storage_lengths(&self) -> Option<Vec<usize>> {
+                Some(
+                    self.storage_layout
+                        .iter()
+                        .map(|&(sidx, _)| self.stacks[&sidx].len())
+                        .collect(),
+                )
+            }
         }
 
         impl majit_meta::JitState for #state_type {
@@ -92,6 +126,7 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn can_trace(&self) -> bool {
                 #( self.#sel_field != #untraceable )&&*
+                #extra_guard
             }
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
@@ -129,6 +164,7 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
                 __JitSym {
                     stacks,
                     current_selected: meta.initial_selected,
+                    current_selected_value: None,
                     storage_layout: meta.storage_layout.clone(),
                     loop_header_pc: header_pc,
                 }
@@ -136,6 +172,9 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
                 meta.initial_selected == self.#sel_field
+                    && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
+                        self.#pool_field.get(sidx).len() == expected_len
+                    })
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
@@ -151,6 +190,11 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
                     }
                     offset = end;
                 }
+                self.#sel_field = values
+                    .get(offset)
+                    .copied()
+                    .map(|value| value as usize)
+                    .unwrap_or(meta.initial_selected);
             }
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
@@ -162,9 +206,18 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
-                meta.storage_layout
-                    .iter()
-                    .all(|&(sidx, initial_depth)| sym.stacks[&sidx].len() == initial_depth)
+                sym.current_selected == meta.initial_selected
+                    && sym.storage_layout.len() == meta.storage_layout.len()
+                    && sym
+                        .storage_layout
+                        .iter()
+                        .zip(meta.storage_layout.iter())
+                        .all(|(&(sym_idx, _), &(meta_idx, _))| sym_idx == meta_idx)
+                    && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
+                        sym.stacks
+                            .get(&sidx)
+                            .is_some_and(|stack| stack.len() == initial_depth)
+                    })
             }
         }
     }

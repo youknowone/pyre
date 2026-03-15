@@ -10,6 +10,12 @@ use majit_ir::{Op, OpCode, OpRef, Value};
 use crate::intutils::IntBound;
 use crate::{OptContext, OptimizationPass, PassResult};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingOverflowGuard {
+    Present,
+    ProvenSafeRemoved,
+}
+
 /// Integer bounds optimization pass.
 ///
 /// Keeps track of the bounds placed on integers by guards and removes
@@ -23,6 +29,9 @@ pub struct OptIntBounds {
     last_emitted_args: Vec<OpRef>,
     /// The last emitted operation's OpRef result.
     last_emitted_ref: OpRef,
+    /// Tracks whether the next overflow guard still has a live overflow-producing
+    /// source op, or whether that source was optimized away as provably safe.
+    pending_overflow_guard: Option<PendingOverflowGuard>,
 }
 
 impl OptIntBounds {
@@ -32,6 +41,7 @@ impl OptIntBounds {
             last_emitted_opcode: None,
             last_emitted_args: Vec::new(),
             last_emitted_ref: OpRef::NONE,
+            pending_overflow_guard: None,
         }
     }
 
@@ -418,14 +428,16 @@ impl OptIntBounds {
         let b0 = self.get_bound(op.arg(0), ctx);
         let b1 = self.get_bound(op.arg(1), ctx);
         if b0.add_bound_cannot_overflow(&b1) {
-            // Transform to non-overflow INT_ADD. The following GUARD_NO_OVERFLOW
-            // will be removed because last_emitted_opcode will be IntAdd.
+            // Transform to non-overflow INT_ADD and mark the following
+            // GUARD_NO_OVERFLOW as redundant.
+            self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
             let mut new_op = Op::new(OpCode::IntAdd, &op.args);
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
             self.postprocess_int_add(&new_op, ctx);
             PassResult::Emit(new_op)
         } else {
+            self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
             self.postprocess_int_add_ovf(op, ctx);
             PassResult::PassOn
         }
@@ -455,12 +467,14 @@ impl OptIntBounds {
             return PassResult::Remove;
         }
         if b0.sub_bound_cannot_overflow(&b1) {
+            self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
             let mut new_op = Op::new(OpCode::IntSub, &op.args);
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
             self.postprocess_int_sub(&new_op, ctx);
             PassResult::Emit(new_op)
         } else {
+            self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
             self.postprocess_int_sub_ovf(op, ctx);
             PassResult::PassOn
         }
@@ -477,12 +491,14 @@ impl OptIntBounds {
         let b0 = self.get_bound(op.arg(0), ctx);
         let b1 = self.get_bound(op.arg(1), ctx);
         if b0.mul_bound_cannot_overflow(&b1) {
+            self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
             let mut new_op = Op::new(OpCode::IntMul, &op.args);
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
             self.postprocess_int_mul(&new_op, ctx);
             PassResult::Emit(new_op)
         } else {
+            self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
             self.postprocess_int_mul_ovf(op, ctx);
             PassResult::PassOn
         }
@@ -502,15 +518,9 @@ impl OptIntBounds {
     }
 
     fn optimize_guard_no_overflow(&mut self, op: &Op) -> PassResult {
-        // If the INT_xxx_OVF was replaced with INT_xxx, remove the guard.
-        match self.last_emitted_opcode {
-            Some(OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf) => {
-                // The OVF op is still present, keep the guard
-                PassResult::PassOn
-            }
-            _ => {
-                // The OVF was replaced with a non-overflow op or removed.
-                // The guard is redundant.
+        match self.pending_overflow_guard.take() {
+            Some(PendingOverflowGuard::Present) => PassResult::PassOn,
+            Some(PendingOverflowGuard::ProvenSafeRemoved) | None => {
                 let _ = op;
                 PassResult::Remove
             }
@@ -518,19 +528,9 @@ impl OptIntBounds {
     }
 
     fn optimize_guard_overflow(&mut self, op: &Op) -> PassResult {
-        match self.last_emitted_opcode {
-            Some(OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf) => {
-                // The OVF is still present, keep the guard
-                let _ = op;
-                PassResult::PassOn
-            }
-            _ => {
-                // The OVF was proven not to overflow; this GUARD_OVERFLOW
-                // means the loop is invalid. We can't raise here, so just
-                // pass it on.
-                PassResult::PassOn
-            }
-        }
+        self.pending_overflow_guard = None;
+        let _ = op;
+        PassResult::PassOn
     }
 
     // ── Guard optimizations ──
@@ -592,12 +592,20 @@ impl OptIntBounds {
     /// Propagate bounds backward after GUARD_TRUE.
     /// The condition (cond_ref) is known to produce a nonzero value (true).
     fn propagate_bounds_from_guard_true(&mut self, cond_ref: OpRef, ctx: &OptContext) {
-        // Set the condition's bound to 1 (we know it's true)
-        self.set_bound(cond_ref, IntBound::from_constant(1));
-
         if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
-            let producing_op = producing_op.clone();
-            self.propagate_bounds_from_comparison(&producing_op, true, ctx);
+            if producing_op.opcode.returns_bool() {
+                self.set_bound(cond_ref, IntBound::from_constant(1));
+                let producing_op = producing_op.clone();
+                self.propagate_bounds_from_comparison(&producing_op, true, ctx);
+                return;
+            }
+        }
+
+        let b0 = self.get_bound(cond_ref, ctx);
+        if b0.known_nonnegative() {
+            let _ = self.get_bound_mut(cond_ref).make_gt_const(0);
+        } else if b0.known_le_const(0) {
+            let _ = self.get_bound_mut(cond_ref).make_lt_const(0);
         }
     }
 
@@ -607,8 +615,10 @@ impl OptIntBounds {
         self.set_bound(cond_ref, IntBound::from_constant(0));
 
         if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
-            let producing_op = producing_op.clone();
-            self.propagate_bounds_from_comparison(&producing_op, false, ctx);
+            if producing_op.opcode.returns_bool() {
+                let producing_op = producing_op.clone();
+                self.propagate_bounds_from_comparison(&producing_op, false, ctx);
+            }
         }
     }
 
@@ -938,6 +948,19 @@ impl OptIntBounds {
         self.last_emitted_opcode = Some(op.opcode);
         self.last_emitted_args = op.args.to_vec();
         self.last_emitted_ref = op.pos;
+        if !matches!(
+            op.opcode,
+            OpCode::IntAdd
+                | OpCode::IntSub
+                | OpCode::IntMul
+                | OpCode::IntAddOvf
+                | OpCode::IntSubOvf
+                | OpCode::IntMulOvf
+                | OpCode::GuardNoOverflow
+                | OpCode::GuardOverflow
+        ) {
+            self.pending_overflow_guard = None;
+        }
     }
 }
 
@@ -1074,6 +1097,7 @@ impl OptimizationPass for OptIntBounds {
         self.last_emitted_opcode = None;
         self.last_emitted_args.clear();
         self.last_emitted_ref = OpRef::NONE;
+        self.pending_overflow_guard = None;
     }
 
     fn name(&self) -> &'static str {
@@ -1358,6 +1382,34 @@ mod tests {
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntMul),
             "INT_MUL_OVF should be transformed to INT_MUL"
+        );
+    }
+
+    #[test]
+    fn test_second_overflow_guard_survives_after_first_guard() {
+        let initial_bounds = vec![
+            (OpRef(0), IntBound::unbounded()),
+            (OpRef(1), IntBound::unbounded()),
+            (OpRef(2), IntBound::unbounded()),
+        ];
+        let ops = vec![
+            make_op(OpCode::GuardTrue, &[OpRef(1)], 3),
+            make_op(OpCode::IntSubOvf, &[OpRef(0), OpRef(1)], 4),
+            make_op(OpCode::GuardNoOverflow, &[], 5),
+            make_op(OpCode::IntMulOvf, &[OpRef(2), OpRef(1)], 6),
+            make_op(OpCode::GuardNoOverflow, &[], 7),
+            make_op(OpCode::Jump, &[OpRef(4), OpRef(4), OpRef(6)], 8),
+        ];
+
+        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let guard_count = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::GuardNoOverflow)
+            .count();
+        let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
+        assert_eq!(
+            guard_count, 2,
+            "both overflow guards must remain, got {opcodes:?}"
         );
     }
 

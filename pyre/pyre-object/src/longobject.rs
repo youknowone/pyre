@@ -45,6 +45,11 @@ pub fn w_long_from_i64(v: i64) -> PyObjectRef {
     w_long_new(BigInt::from(v))
 }
 
+/// Box a bigint constant into a heap Python int object.
+pub fn box_bigint_constant(value: &BigInt) -> PyObjectRef {
+    w_long_new(value.clone())
+}
+
 /// Extract a reference to the BigInt value from a known W_LongObject pointer.
 ///
 /// # Safety

@@ -745,6 +745,15 @@ impl OpCode {
         }
     }
 
+    pub fn call_release_gil_for_type(tp: Type) -> OpCode {
+        match tp {
+            Type::Int => OpCode::CallReleaseGilI,
+            Type::Ref => OpCode::CallReleaseGilR,
+            Type::Float => OpCode::CallReleaseGilF,
+            Type::Void => OpCode::CallReleaseGilN,
+        }
+    }
+
     pub fn same_as_for_type(tp: Type) -> OpCode {
         match tp {
             Type::Int => OpCode::SameAsI,

@@ -3,6 +3,7 @@ use majit_macros::jit_interp;
 use majit_meta::{
     assert_trace_parity, BackEdgeAction, JitState, MetaInterp, TraceAction, TraceParityCase,
 };
+use std::sync::Mutex;
 
 mod aheui {
     pub const OP_BRPOP1: u8 = 1;
@@ -12,6 +13,7 @@ mod aheui {
 }
 
 const UNTRACEABLE: usize = 99;
+static BRANCH_PARITY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Default)]
 struct Store {
@@ -163,6 +165,9 @@ fn start_trace(
 
 #[test]
 fn jit_interp_branch_group_false_path_records_guard_false() {
+    let _guard = BRANCH_PARITY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let program = Program {
         ops: vec![aheui::OP_BRZ],
         labels: vec![1],
@@ -183,13 +188,16 @@ fn jit_interp_branch_group_false_path_records_guard_false() {
     let case = TraceParityCase {
         name: "jit_interp_branch_group_guard_false",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: generate_guard(rop.GUARD_FALSE)",
-        expected_lines: &["GuardFalse(v0)", "Finish()"],
+        expected_lines: &["GuardFalse(v0) [fail_args=0, 0, 1]", "Finish()"],
     };
     assert_trace_parity(&trace, &constants, &case);
 }
 
 #[test]
 fn jit_interp_branch_group_true_path_records_guard_true() {
+    let _guard = BRANCH_PARITY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let program = Program {
         ops: vec![aheui::OP_BRZ],
         labels: vec![1],
@@ -210,13 +218,16 @@ fn jit_interp_branch_group_true_path_records_guard_true() {
     let case = TraceParityCase {
         name: "jit_interp_branch_group_guard_true",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: generate_guard(rop.GUARD_TRUE)",
-        expected_lines: &["GuardTrue(v0)", "Finish()"],
+        expected_lines: &["GuardTrue(v0) [fail_args=0, 0, 1]", "Finish()"],
     };
     assert_trace_parity(&trace, &constants, &case);
 }
 
 #[test]
 fn jit_interp_branch_group_closes_loop_on_backedge() {
+    let _guard = BRANCH_PARITY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let program = Program {
         ops: vec![aheui::OP_BRZ],
         labels: vec![0],
@@ -236,6 +247,6 @@ fn jit_interp_branch_group_closes_loop_on_backedge() {
     let (trace, constants) = interp.finish_trace_for_parity(&[]).unwrap();
     let normalized = majit_meta::normalize_trace(&trace, &constants);
     assert_eq!(trace.ops[0].opcode, OpCode::GuardFalse);
-    assert_eq!(trace.ops[1].opcode, OpCode::CallN);
+    assert_eq!(trace.ops[1].opcode, OpCode::Finish);
     assert_eq!(normalized.last().unwrap(), "Finish()");
 }
