@@ -7,9 +7,15 @@
 use std::rc::Rc;
 
 use pyre_bytecode::CodeObject;
-use pyre_bytecode::ConstantData;
 use pyre_object::*;
-use pyre_runtime::{PyExecutionContext, PyNamespace, PyObjectArray, w_code_new};
+use pyre_runtime::{PyExecutionContext, PyNamespace, PyObjectArray};
+
+// Ensure *const PyExecutionContext and Rc<PyExecutionContext> have the same
+// size so that PyFrame field offsets are preserved after the switch.
+const _: () = assert!(
+    std::mem::size_of::<*const PyExecutionContext>()
+        == std::mem::size_of::<Rc<PyExecutionContext>>()
+);
 
 /// Execution frame for a single Python code block.
 ///
@@ -22,10 +28,13 @@ use pyre_runtime::{PyExecutionContext, PyNamespace, PyObjectArray, w_code_new};
 /// in registers. A "force" flushes them back to the heap.
 #[repr(C)]
 pub struct PyFrame {
-    /// Shared interpreter-wide execution context.
-    pub execution_context: Rc<PyExecutionContext>,
-    /// The code object being executed (shared via Rc for borrow-safe access).
-    pub code: Rc<CodeObject>,
+    /// Raw pointer to the shared execution context.
+    /// The top-level frame leaks the Rc via `Rc::into_raw`.
+    /// Callee frames just copy the pointer (no atomic refcount ops).
+    pub execution_context: *const PyExecutionContext,
+    /// Raw pointer to the code object (shared, not owned — the CodeObject
+    /// is leaked via `Box::into_raw` at creation time and lives forever).
+    pub code: *const CodeObject,
     /// Local variables (fast locals), indexed by varname slot.
     pub locals_w: PyObjectArray,
     /// Operand stack for bytecode execution.
@@ -34,8 +43,9 @@ pub struct PyFrame {
     pub stack_depth: usize,
     /// Index of the next instruction to execute.
     pub next_instr: usize,
-    /// Name-based local/global namespace (for module-level code).
-    pub namespace: PyNamespace,
+    /// Raw pointer to the shared globals namespace object.
+    /// All frames in the same module share the same globals.
+    pub namespace: *mut PyNamespace,
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
@@ -69,23 +79,31 @@ impl PyFrame {
     }
 
     /// Create a new frame for executing a code object in the given context.
+    ///
+    /// The `Rc` is leaked via `Rc::into_raw` — consistent with pyre's
+    /// memory model where code objects and namespaces are also leaked.
     pub fn new_with_context(code: CodeObject, execution_context: Rc<PyExecutionContext>) -> Self {
-        let namespace = execution_context.fresh_namespace();
-        Self::new_with_namespace(code, execution_context, namespace)
+        let mut namespace = Box::new(execution_context.fresh_namespace());
+        namespace.fix_ptr();
+        let namespace = Box::into_raw(namespace);
+        let code_ptr = Box::into_raw(Box::new(code));
+        let ctx_ptr = Rc::into_raw(execution_context);
+        Self::new_with_namespace(code_ptr, ctx_ptr, namespace)
     }
 
-    /// Create a new frame with an explicitly provided namespace.
+    /// Create a new frame with an explicitly provided namespace pointer.
     pub fn new_with_namespace(
-        code: CodeObject,
-        execution_context: Rc<PyExecutionContext>,
-        namespace: PyNamespace,
+        code: *const CodeObject,
+        execution_context: *const PyExecutionContext,
+        namespace: *mut PyNamespace,
     ) -> Self {
-        let num_locals = code.varnames.len();
-        let max_stack = code.max_stackdepth as usize;
+        let code_ref = unsafe { &*code };
+        let num_locals = code_ref.varnames.len();
+        let max_stack = code_ref.max_stackdepth as usize;
 
         PyFrame {
             execution_context,
-            code: Rc::new(code),
+            code,
             locals_w: PyObjectArray::filled(num_locals, PY_NULL),
             value_stack_w: PyObjectArray::filled(max_stack, PY_NULL),
             stack_depth: 0,
@@ -120,74 +138,54 @@ impl PyFrame {
         self.value_stack_w[self.stack_depth - 1 - depth]
     }
 
-    // ── Constant loading ──────────────────────────────────────────────
-
-    /// Convert a RustPython ConstantData to a PyObjectRef.
-    pub fn load_const(constant: &ConstantData) -> PyObjectRef {
-        match constant {
-            ConstantData::Integer { value } => {
-                use num_traits::ToPrimitive;
-                match value.to_i64() {
-                    Some(v) => w_int_new(v),
-                    None => w_long_new(value.clone()),
-                }
-            }
-            ConstantData::Float { value } => w_float_new(*value),
-            ConstantData::Boolean { value } => w_bool_from(*value),
-            ConstantData::Str { value } => {
-                w_str_new(value.as_str().expect("non-UTF-8 string constant"))
-            }
-            ConstantData::Tuple { elements } => {
-                let items: Vec<PyObjectRef> =
-                    elements.iter().map(|e| Self::load_const(e)).collect();
-                w_tuple_new(items)
-            }
-            ConstantData::Code { code } => {
-                // Clone the CodeObject, leak it, and wrap as W_CodeObject.
-                // The W_CodeObject stores an opaque pointer for MakeFunction.
-                let code_clone = Box::new(code.as_ref().clone());
-                let code_ptr = Box::into_raw(code_clone) as *const ();
-                w_code_new(code_ptr)
-            }
-            ConstantData::None => w_none(),
-            _ => {
-                // Other constant types not yet supported
-                w_none()
-            }
-        }
-    }
-
     /// Create a new frame for a function call.
     ///
-    /// Binds positional arguments to fast locals and copies
-    /// globals from the caller's namespace.
+    /// The `globals` pointer is shared from the function object — no clone.
+    /// The `code` pointer is shared from the function object — no clone.
     pub fn new_for_call(
-        code: CodeObject,
+        code: *const CodeObject,
         args: &[PyObjectRef],
-        caller_namespace: &PyNamespace,
-        execution_context: Rc<PyExecutionContext>,
+        globals: *mut PyNamespace,
+        execution_context: *const PyExecutionContext,
     ) -> Self {
-        let num_locals = code.varnames.len();
-        let max_stack = code.max_stackdepth as usize;
+        let code_ref = unsafe { &*code };
+        let num_locals = code_ref.varnames.len();
+        let max_stack = code_ref.max_stackdepth as usize;
 
-        let namespace = execution_context.inherit_namespace(caller_namespace);
-
-        let mut locals = vec![PY_NULL; num_locals];
-
-        // Bind positional arguments to local variable slots
+        let mut locals_w = PyObjectArray::filled(num_locals, PY_NULL);
+        // Bind positional arguments directly — no intermediate Vec.
         let nargs = args.len().min(num_locals);
-        locals[..nargs].copy_from_slice(&args[..nargs]);
+        for i in 0..nargs {
+            locals_w[i] = args[i];
+        }
 
         PyFrame {
             execution_context,
-            code: Rc::new(code),
-            locals_w: PyObjectArray::from_vec(locals),
+            code,
+            locals_w,
             value_stack_w: PyObjectArray::filled(max_stack, PY_NULL),
             stack_depth: 0,
             next_instr: 0,
-            namespace,
+            namespace: globals,
             vable_token: 0,
         }
+    }
+
+    /// Borrow the shared code object.
+    #[inline]
+    pub fn code(&self) -> &CodeObject {
+        unsafe { &*self.code }
+    }
+
+    /// Repoint internal array pointers after a struct move.
+    ///
+    /// `PyObjectArray` with small-buffer optimization stores an inline
+    /// buffer whose address changes on move. Call this once after the
+    /// frame is at its final stack location.
+    #[inline]
+    pub fn fix_array_ptrs(&mut self) {
+        self.locals_w.fix_ptr();
+        self.value_stack_w.fix_ptr();
     }
 }
 
@@ -197,8 +195,6 @@ use majit_ir::Type;
 use majit_meta::virtualizable::VirtualizableInfo;
 
 /// Build a `VirtualizableInfo` describing PyFrame's layout.
-///
-/// Corresponds to PyPy's `_virtualizable_` declaration on pyframe.py:
 ///
 /// ```text
 ///     _virtualizable_ = ['locals_stack_w[*]', 'valuestackdepth',
@@ -225,8 +221,8 @@ pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
     info.add_field("stack_depth", Type::Int, PYFRAME_STACK_DEPTH_OFFSET);
 
     // Array fields (element-wise virtualization)
-    info.add_array_field("locals_w", Type::Ref, PYFRAME_LOCALS_OFFSET);
-    info.add_array_field("value_stack_w", Type::Ref, PYFRAME_STACK_OFFSET);
+    info.add_array_field("locals_w", Type::Int, PYFRAME_LOCALS_OFFSET);
+    info.add_array_field("value_stack_w", Type::Int, PYFRAME_STACK_OFFSET);
 
     info
 }

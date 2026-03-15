@@ -6,6 +6,9 @@
 /// - #[jit_inline]: Serialize a simple integer helper into a hidden sub-JitCode
 /// - #[elidable]: Mark a function as pure (constant-foldable)
 /// - #[dont_look_inside]: Prevent tracing into a function
+/// - #[jit_may_force]: Mark a helper as a may-force call surface
+/// - #[jit_release_gil]: Mark a helper as a release-GIL call surface
+/// - #[jit_loop_invariant]: Mark a helper as a loop-invariant call surface
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
@@ -35,12 +38,39 @@ impl Parse for JitInlineArgs {
                             content.parse::<Token![=>]>()?;
                             let kind: Ident = content.parse()?;
                             match kind.to_string().as_str() {
-                                "residual_void" | "residual_int" | "elidable_int"
+                                "residual_void"
+                                | "residual_void_wrapped"
+                                | "may_force_void"
+                                | "may_force_void_wrapped"
+                                | "release_gil_void"
+                                | "release_gil_void_wrapped"
+                                | "loopinvariant_void"
+                                | "loopinvariant_void_wrapped"
+                                | "residual_int"
+                                | "residual_int_wrapped"
+                                | "may_force_int"
+                                | "may_force_int_wrapped"
+                                | "release_gil_int"
+                                | "release_gil_int_wrapped"
+                                | "loopinvariant_int"
+                                | "loopinvariant_int_wrapped"
+                                | "elidable_int"
+                                | "elidable_int_wrapped"
+                                | "residual_ref_wrapped"
+                                | "may_force_ref_wrapped"
+                                | "release_gil_ref_wrapped"
+                                | "loopinvariant_ref_wrapped"
+                                | "elidable_ref_wrapped"
+                                | "residual_float_wrapped"
+                                | "may_force_float_wrapped"
+                                | "release_gil_float_wrapped"
+                                | "loopinvariant_float_wrapped"
+                                | "elidable_float_wrapped"
                                 | "inline_int" => {}
                                 _ => {
                                     return Err(syn::Error::new(
                                         kind.span(),
-                                        "#[jit_inline(calls = { ... })] supports only residual_void, residual_int, elidable_int, inline_int",
+                                        "#[jit_inline(calls = { ... })] supports residual/may_force/release_gil/loopinvariant call policies for void/int and wrapped int/ref/float helpers, plus inline_int",
                                     ));
                                 }
                             }
@@ -89,16 +119,68 @@ fn primitive_type_ident(ty: &Type) -> Option<&Ident> {
     Some(&type_path.path.segments.last()?.ident)
 }
 
-fn is_supported_helper_return_type(ty: &Type) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelperCallKind {
+    Void,
+    Int,
+    Ref,
+    Float,
+    Unsupported,
+}
+
+fn is_gc_ref_type(ty: &Type) -> bool {
     matches!(
-        primitive_type_ident(ty)
-            .map(|ident| ident.to_string())
-            .as_deref(),
-        Some("i64" | "isize")
+        ty,
+        Type::Path(type_path)
+            if type_path.qself.is_none()
+                && type_path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident == "GcRef")
+                    .unwrap_or(false)
     )
 }
 
+fn is_raw_pointer_type(ty: &Type) -> bool {
+    matches!(ty, Type::Ptr(_))
+}
+
+fn helper_call_kind_for_type(ty: &Type) -> HelperCallKind {
+    if is_gc_ref_type(ty) || is_raw_pointer_type(ty) {
+        return HelperCallKind::Ref;
+    }
+    match primitive_type_ident(ty)
+        .map(|ident| ident.to_string())
+        .as_deref()
+    {
+        Some(
+            "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+            | "bool",
+        ) => HelperCallKind::Int,
+        Some("f64") => HelperCallKind::Float,
+        _ => HelperCallKind::Unsupported,
+    }
+}
+
+fn helper_call_kind_for_return(output: &ReturnType) -> HelperCallKind {
+    match output {
+        ReturnType::Default => HelperCallKind::Void,
+        ReturnType::Type(_, ty) => helper_call_kind_for_type(ty),
+    }
+}
+
+fn is_supported_helper_return_type(ty: &Type) -> bool {
+    matches!(helper_call_kind_for_type(ty), HelperCallKind::Int)
+}
+
 fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::TokenStream> {
+    if is_gc_ref_type(ty) {
+        return Some(quote! { #ty((#arg_ident) as usize) });
+    }
+    if is_raw_pointer_type(ty) {
+        return Some(quote! { ((#arg_ident) as usize) as #ty });
+    }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
         "i8" | "i16" | "i32" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
@@ -106,6 +188,7 @@ fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::Toke
         }
         "i64" => Some(quote! { #arg_ident }),
         "bool" => Some(quote! { (#arg_ident) != 0 }),
+        "f64" => Some(quote! { f64::from_bits((#arg_ident) as u64) }),
         _ => None,
     }
 }
@@ -114,22 +197,33 @@ fn helper_return_to_i64(
     value: proc_macro2::TokenStream,
     ty: &Type,
 ) -> Option<proc_macro2::TokenStream> {
+    if is_gc_ref_type(ty) {
+        return Some(quote! { (#value).0 as i64 });
+    }
+    if is_raw_pointer_type(ty) {
+        return Some(quote! { (#value) as usize as i64 });
+    }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
+        "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "u64" | "usize" | "bool" => {
+            Some(quote! { (#value) as i64 })
+        }
         "i64" => Some(quote! { #value }),
         "isize" => Some(quote! { (#value) as i64 }),
+        "f64" => Some(quote! { f64::to_bits(#value) as i64 }),
         _ => None,
     }
 }
 
 fn emit_helper_call_target_fn(
     func: &ItemFn,
-) -> syn::Result<Option<(Ident, proc_macro2::TokenStream)>> {
+) -> syn::Result<Option<(Ident, Ident, proc_macro2::TokenStream)>> {
     if !func.sig.generics.params.is_empty() {
         return Ok(None);
     }
 
-    let target_name = helper_call_target_fn_name(&Path::from(func.sig.ident.clone()))?;
+    let trace_target_name = helper_call_target_fn_name(&Path::from(func.sig.ident.clone()))?;
+    let concrete_target_name = format_ident!("{}_concrete", trace_target_name);
     let mut wrapper_params = Vec::new();
     let mut converted_args = Vec::new();
     for (index, arg) in func.sig.inputs.iter().enumerate() {
@@ -145,14 +239,17 @@ fn emit_helper_call_target_fn(
     }
 
     let helper_name = &func.sig.ident;
-    let wrapper = match &func.sig.output {
-        ReturnType::Default => quote! {
+    let wrapper = match helper_call_kind_for_return(&func.sig.output) {
+        HelperCallKind::Void => quote! {
             #[doc(hidden)]
-            pub(crate) extern "C" fn #target_name(#(#wrapper_params),*) {
+            pub(crate) extern "C" fn #trace_target_name(#(#wrapper_params),*) {
                 #helper_name(#(#converted_args),*);
             }
         },
-        ReturnType::Type(_, ty) if is_supported_helper_return_type(ty) => {
+        HelperCallKind::Int | HelperCallKind::Ref => {
+            let ReturnType::Type(_, ty) = &func.sig.output else {
+                return Ok(None);
+            };
             let Some(converted_return) = helper_return_to_i64(
                 quote! {
                     #helper_name(#(#converted_args),*)
@@ -163,41 +260,137 @@ fn emit_helper_call_target_fn(
             };
             quote! {
                 #[doc(hidden)]
-                pub(crate) extern "C" fn #target_name(#(#wrapper_params),*) -> i64 {
+                pub(crate) extern "C" fn #trace_target_name(#(#wrapper_params),*) -> i64 {
                     #converted_return
                 }
             }
         }
-        _ => return Ok(None),
+        HelperCallKind::Float => {
+            let ReturnType::Type(_, ty) = &func.sig.output else {
+                return Ok(None);
+            };
+            let float_wrapper = quote! {
+                #[doc(hidden)]
+                pub(crate) extern "C" fn #trace_target_name(#(#wrapper_params),*) -> f64 {
+                    #helper_name(#(#converted_args),*)
+                }
+            };
+            let Some(concrete_return) = helper_return_to_i64(
+                quote! {
+                    #helper_name(#(#converted_args),*)
+                },
+                ty,
+            ) else {
+                return Ok(None);
+            };
+            let concrete_wrapper = quote! {
+                #[doc(hidden)]
+                pub(crate) extern "C" fn #concrete_target_name(#(#wrapper_params),*) -> i64 {
+                    #concrete_return
+                }
+            };
+            quote! {
+                #float_wrapper
+                #concrete_wrapper
+            }
+        }
+        HelperCallKind::Unsupported => return Ok(None),
     };
 
-    Ok(Some((target_name, wrapper)))
+    let concrete_name = if matches!(
+        helper_call_kind_for_return(&func.sig.output),
+        HelperCallKind::Float
+    ) {
+        concrete_target_name
+    } else {
+        trace_target_name.clone()
+    };
+    Ok(Some((trace_target_name, concrete_name, wrapper)))
 }
 
 fn helper_policy_tokens_for_fn(
     func: &ItemFn,
     attr_name: &str,
-    call_target_name: Option<&Ident>,
+    trace_target_name: Option<&Ident>,
+    concrete_target_name: Option<&Ident>,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let unsupported = quote! { (0u8, std::ptr::null(), std::ptr::null()) };
-    let Some(call_target_name) = call_target_name else {
+    let unsupported = quote! { (0u8, std::ptr::null(), std::ptr::null(), std::ptr::null()) };
+    let (Some(trace_target_name), Some(concrete_target_name)) =
+        (trace_target_name, concrete_target_name)
+    else {
         return Ok(unsupported);
     };
-    match &func.sig.output {
-        ReturnType::Default => Ok(match attr_name {
-            "dont_look_inside" => {
-                quote! { (1u8, std::ptr::null(), #call_target_name as *const ()) }
-            }
+    match helper_call_kind_for_return(&func.sig.output) {
+        HelperCallKind::Void => Ok(match attr_name {
+            "dont_look_inside" => quote! {
+                (1u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_may_force" => quote! {
+                (9u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_release_gil" => quote! {
+                (13u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_loop_invariant" => quote! {
+                (17u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
             _ => unsupported,
         }),
-        ReturnType::Type(_, ty) if is_supported_helper_return_type(ty) => Ok(match attr_name {
-            "elidable" => quote! { (3u8, std::ptr::null(), #call_target_name as *const ()) },
-            "dont_look_inside" => {
-                quote! { (2u8, std::ptr::null(), #call_target_name as *const ()) }
-            }
+        HelperCallKind::Int => Ok(match attr_name {
+            "elidable" => quote! {
+                (3u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "dont_look_inside" => quote! {
+                (2u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_may_force" => quote! {
+                (10u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_release_gil" => quote! {
+                (14u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_loop_invariant" => quote! {
+                (18u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
             _ => unsupported,
         }),
-        _ => Ok(unsupported),
+        HelperCallKind::Ref => Ok(match attr_name {
+            "elidable" => quote! {
+                (6u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "dont_look_inside" => quote! {
+                (5u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_may_force" => quote! {
+                (11u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_release_gil" => quote! {
+                (15u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_loop_invariant" => quote! {
+                (19u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            _ => unsupported,
+        }),
+        HelperCallKind::Float => Ok(match attr_name {
+            "elidable" => quote! {
+                (8u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "dont_look_inside" => quote! {
+                (7u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_may_force" => quote! {
+                (12u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_release_gil" => quote! {
+                (16u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            "jit_loop_invariant" => quote! {
+                (20u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            },
+            _ => unsupported,
+        }),
+        HelperCallKind::Unsupported => Ok(unsupported),
     }
 }
 
@@ -208,7 +401,7 @@ fn emit_helper_policy_fn(
     let helper_name = helper_policy_fn_name(path)?;
     Ok(quote! {
         #[doc(hidden)]
-        pub(crate) fn #helper_name() -> (u8, *const (), *const ()) {
+        pub(crate) fn #helper_name() -> (u8, *const (), *const (), *const ()) {
             #body
         }
     })
@@ -471,14 +664,22 @@ pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
-    let (call_target_name, call_target_fn) = match emit_helper_call_target_fn(&func) {
-        Ok(Some((name, tokens))) => (Some(name), Some(tokens)),
-        Ok(None) => (None, None),
-        Err(err) => return err.to_compile_error().into(),
-    };
+    let (trace_target_name, concrete_target_name, call_target_fn) =
+        match emit_helper_call_target_fn(&func) {
+            Ok(Some((trace_name, concrete_name, tokens))) => {
+                (Some(trace_name), Some(concrete_name), Some(tokens))
+            }
+            Ok(None) => (None, None, None),
+            Err(err) => return err.to_compile_error().into(),
+        };
     let policy_fn = match emit_helper_policy_fn(
         &policy_path,
-        match helper_policy_tokens_for_fn(&func, "elidable", call_target_name.as_ref()) {
+        match helper_policy_tokens_for_fn(
+            &func,
+            "elidable",
+            trace_target_name.as_ref(),
+            concrete_target_name.as_ref(),
+        ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
         },
@@ -519,14 +720,22 @@ pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
-    let (call_target_name, call_target_fn) = match emit_helper_call_target_fn(&func) {
-        Ok(Some((name, tokens))) => (Some(name), Some(tokens)),
-        Ok(None) => (None, None),
-        Err(err) => return err.to_compile_error().into(),
-    };
+    let (trace_target_name, concrete_target_name, call_target_fn) =
+        match emit_helper_call_target_fn(&func) {
+            Ok(Some((trace_name, concrete_name, tokens))) => {
+                (Some(trace_name), Some(concrete_name), Some(tokens))
+            }
+            Ok(None) => (None, None, None),
+            Err(err) => return err.to_compile_error().into(),
+        };
     let policy_fn = match emit_helper_policy_fn(
         &policy_path,
-        match helper_policy_tokens_for_fn(&func, "dont_look_inside", call_target_name.as_ref()) {
+        match helper_policy_tokens_for_fn(
+            &func,
+            "dont_look_inside",
+            trace_target_name.as_ref(),
+            concrete_target_name.as_ref(),
+        ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
         },
@@ -552,6 +761,75 @@ pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+    let marker = format_ident!("{marker_name}");
+    let policy_path = Path::from(sig.ident.clone());
+    let (trace_target_name, concrete_target_name, call_target_fn) =
+        match emit_helper_call_target_fn(&func) {
+            Ok(Some((trace_name, concrete_name, tokens))) => {
+                (Some(trace_name), Some(concrete_name), Some(tokens))
+            }
+            Ok(None) => (None, None, None),
+            Err(err) => return err.to_compile_error().into(),
+        };
+    let policy_fn = match emit_helper_policy_fn(
+        &policy_path,
+        match helper_policy_tokens_for_fn(
+            &func,
+            attr_name,
+            trace_target_name.as_ref(),
+            concrete_target_name.as_ref(),
+        ) {
+            Ok(tokens) => tokens,
+            Err(err) => return err.to_compile_error().into(),
+        },
+    ) {
+        Ok(tokens) => tokens,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
+    let expanded = quote! {
+        #(#attrs)*
+        #[inline(never)]
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const #marker: bool = true;
+            #block
+        }
+
+        #call_target_fn
+        #policy_fn
+    };
+
+    expanded.into()
+}
+
+/// Mark a function as a may-force call surface.
+#[proc_macro_attribute]
+pub fn jit_may_force(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_call_surface_attr("jit_may_force", "_MAJIT_MAY_FORCE", item)
+}
+
+/// Mark a function as a release-GIL call surface.
+#[proc_macro_attribute]
+pub fn jit_release_gil(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_call_surface_attr("jit_release_gil", "_MAJIT_RELEASE_GIL", item)
+}
+
+/// Mark a function as a loop-invariant call surface.
+#[proc_macro_attribute]
+pub fn jit_loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
 }
 
 /// Serialize a simple integer helper into a hidden `JitCode` builder.
@@ -605,8 +883,8 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[doc(hidden)]
-        pub(crate) fn #policy_name() -> (u8, *const (), *const ()) {
-            (4u8, #helper_name as *const (), std::ptr::null())
+        pub(crate) fn #policy_name() -> (u8, *const (), *const (), *const ()) {
+            (4u8, #helper_name as *const (), std::ptr::null(), std::ptr::null())
         }
     };
 

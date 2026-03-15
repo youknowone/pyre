@@ -12,6 +12,9 @@ pub struct W_BoolObject {
     pub boolval: bool,
 }
 
+/// Field offset of `boolval` within `W_BoolObject`, for JIT field access.
+pub const BOOL_BOOLVAL_OFFSET: usize = std::mem::offset_of!(W_BoolObject, boolval);
+
 /// Allocate a new W_BoolObject.
 pub fn w_bool_new(value: bool) -> PyObjectRef {
     let obj = Box::new(W_BoolObject {
@@ -32,12 +35,33 @@ pub unsafe fn w_bool_get_value(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_BoolObject)).boolval }
 }
 
+// ── Bool singletons ──────────────────────────────────────────────────
+
+static TRUE_SINGLETON: W_BoolObject = W_BoolObject {
+    ob_header: PyObject {
+        ob_type: &BOOL_TYPE as *const PyType,
+    },
+    boolval: true,
+};
+
+static FALSE_SINGLETON: W_BoolObject = W_BoolObject {
+    ob_header: PyObject {
+        ob_type: &BOOL_TYPE as *const PyType,
+    },
+    boolval: false,
+};
+
 /// Get a boolean PyObjectRef from a bool value.
 ///
-/// Phase 1: allocates new objects each time. In production, True/False
-/// would be pre-allocated singletons.
+/// Returns a pointer to a pre-allocated static singleton,
+/// avoiding heap allocation on every comparison/branch.
+#[inline]
 pub fn w_bool_from(value: bool) -> PyObjectRef {
-    w_bool_new(value)
+    if value {
+        (&TRUE_SINGLETON as *const W_BoolObject).cast_mut() as PyObjectRef
+    } else {
+        (&FALSE_SINGLETON as *const W_BoolObject).cast_mut() as PyObjectRef
+    }
 }
 
 #[cfg(test)]

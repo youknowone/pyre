@@ -349,7 +349,7 @@ fn jit_interp_internal_if_taken_path_records_guard_true() {
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: bytecode branch on traced bool",
         expected_lines: &[
             "v1 = IntNe(v0, 0)",
-            "GuardTrue(v1)",
+            "GuardTrue(v1) [fail_args=0, 0, 0]",
             "v3 = IntAdd(v0, 10)",
             "Finish(v3)",
         ],
@@ -379,7 +379,11 @@ fn jit_interp_internal_if_fallthrough_records_guard_false() {
     let case = TraceParityCase {
         name: "jit_interp_internal_if_fallthrough",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: bytecode branch on traced bool",
-        expected_lines: &["v1 = IntNe(v0, 0)", "GuardFalse(v1)", "Finish(42)"],
+        expected_lines: &[
+            "v1 = IntNe(v0, 0)",
+            "GuardFalse(v1) [fail_args=0, 0, 0]",
+            "Finish(42)",
+        ],
     };
     assert_trace_parity(&trace, &constants, &case);
 }
@@ -408,7 +412,7 @@ fn jit_interp_if_expr_taken_path_reuses_branch_value() {
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: register-valued branch result",
         expected_lines: &[
             "v1 = IntNe(v0, 0)",
-            "GuardTrue(v1)",
+            "GuardTrue(v1) [fail_args=0, 0, 0]",
             "v3 = IntAdd(v0, 1)",
             "Finish(v3)",
         ],
@@ -440,7 +444,7 @@ fn jit_interp_if_expr_fallthrough_reuses_branch_value() {
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: register-valued branch result",
         expected_lines: &[
             "v1 = IntNe(v0, 0)",
-            "GuardFalse(v1)",
+            "GuardFalse(v1) [fail_args=0, 0, 0]",
             "v3 = IntSub(v0, 1)",
             "Finish(v3)",
         ],

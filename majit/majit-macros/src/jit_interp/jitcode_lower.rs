@@ -4,8 +4,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     BinOp, Block, Expr, ExprAssign, ExprBinary, ExprCall, ExprCast, ExprIf, ExprLit,
-    ExprMethodCall, ExprParen, ExprPath, ExprUnary, FnArg, Ident, ItemFn, Lit, Local, Pat, Path,
-    ReturnType, Stmt, Type, UnOp,
+    ExprMethodCall, ExprParen, ExprPath, ExprReference, ExprUnary, FnArg, Ident, ItemFn, Lit,
+    Local, Pat, Path, ReturnType, Stmt, Type, UnOp,
 };
 
 // ── LowererConfig ────────────────────────────────────────────────────
@@ -101,11 +101,26 @@ fn normalize_expr(expr: &Expr) -> String {
     normalize(&quote!(#expr).to_string())
 }
 
+fn unwrap_ref_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Reference(ExprReference { expr, .. }) => expr,
+        _ => expr,
+    }
+}
+
 // ── Lowerer ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+enum BindingKind {
+    Int,
+    Ref,
+    Float,
+}
 
 #[derive(Clone)]
 struct Binding {
     reg: u16,
+    kind: BindingKind,
     depends_on_stack: bool,
 }
 
@@ -235,6 +250,7 @@ impl<'c> Lowerer<'c> {
                 ident.to_string(),
                 Binding {
                     reg,
+                    kind: BindingKind::Int,
                     depends_on_stack: false,
                 },
             );
@@ -255,9 +271,17 @@ impl<'c> Lowerer<'c> {
         if let Some(push_arg) = push_call_arg(expr) {
             let binding = self.lower_value_expr(push_arg)?;
             let reg = binding.reg;
-            self.statements.push(quote! {
-                __builder.push_i(#reg);
-            });
+            match binding.kind {
+                BindingKind::Int => self.statements.push(quote! {
+                    __builder.push_i(#reg);
+                }),
+                BindingKind::Ref => self.statements.push(quote! {
+                    __builder.push_r(#reg);
+                }),
+                BindingKind::Float => self.statements.push(quote! {
+                    __builder.push_f(#reg);
+                }),
+            }
             return Some(());
         }
 
@@ -308,13 +332,29 @@ impl<'c> Lowerer<'c> {
 
         // Compound binop: pop two, operate, push result
         if let Some(opcode) = config.binops.get(&method_name) {
-            self.statements.push(quote! {
-                {
-                    let mut __sub = majit_meta::JitCodeBuilder::new();
+            let binop_tokens = if opcode.to_string().ends_with("Ovf") {
+                quote! {
+                    __sub.peek_i(0);
+                    __sub.swap_stack();
+                    __sub.peek_i(1);
+                    __sub.swap_stack();
+                    __sub.record_binop_i(2, majit_ir::OpCode::#opcode, 1, 0);
+                    __sub.pop_discard();
+                    __sub.pop_discard();
+                    __sub.push_i(2);
+                }
+            } else {
+                quote! {
                     __sub.pop_i(0);
                     __sub.pop_i(1);
                     __sub.record_binop_i(2, majit_ir::OpCode::#opcode, 1, 0);
                     __sub.push_i(2);
+                }
+            };
+            self.statements.push(quote! {
+                {
+                    let mut __sub = majit_meta::JitCodeBuilder::new();
+                    #binop_tokens
                     let __sub_idx = __builder.add_sub_jitcode(__sub.finish());
                     __builder.inline_call(__sub_idx);
                 }
@@ -344,38 +384,135 @@ impl<'c> Lowerer<'c> {
             return None;
         }
 
-        let mut arg_regs = Vec::with_capacity(call.args.len());
+        let mut arg_bindings = Vec::with_capacity(call.args.len());
         for arg in &call.args {
             let binding = self.lower_value_expr(arg)?;
-            arg_regs.push(binding.reg);
+            arg_bindings.push(binding);
         }
         let func = &call.func;
         match policy {
-            CallPolicySpec::Explicit(kind) => {
-                if kind.to_string() != "residual_void" {
-                    return None;
+            CallPolicySpec::Explicit(kind) => match kind.to_string().as_str() {
+                "residual_void" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
+                    self.statements.push(quote! {
+                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                        __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
+                    });
                 }
-                self.statements.push(quote! {
-                    let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                    __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
-                });
-            }
+                "may_force_void" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
+                    self.statements.push(quote! {
+                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                        __builder.call_may_force_void_args(__fn_idx, &[#(#arg_regs),*]);
+                    });
+                }
+                "release_gil_void" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
+                    self.statements.push(quote! {
+                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                        __builder.call_release_gil_void_args(__fn_idx, &[#(#arg_regs),*]);
+                    });
+                }
+                "loopinvariant_void" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
+                    self.statements.push(quote! {
+                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                        __builder.call_loopinvariant_void_args(__fn_idx, &[#(#arg_regs),*]);
+                    });
+                }
+                "residual_void_wrapped" => {
+                    let policy_path = helper_policy_path(&call.func)?;
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let call_stmt =
+                        quote! { __builder.residual_call_void_typed_args(__fn_idx, #typed_args); };
+                    self.statements.push(quote! {
+                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                        if __trace_target.is_null() && __concrete_target.is_null() {
+                            panic!("wrapped helper policy requires generated call-target wrappers");
+                        }
+                        let __trace_target = if __trace_target.is_null() {
+                            __concrete_target
+                        } else {
+                            __trace_target
+                        };
+                        let __concrete_target = if __concrete_target.is_null() {
+                            __trace_target
+                        } else {
+                            __concrete_target
+                        };
+                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                        #call_stmt
+                    });
+                }
+                "may_force_void_wrapped"
+                | "release_gil_void_wrapped"
+                | "loopinvariant_void_wrapped" => {
+                    let policy_path = helper_policy_path(&call.func)?;
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let call_stmt = match kind.to_string().as_str() {
+                        "may_force_void_wrapped" => {
+                            quote! { __builder.call_may_force_void_typed_args(__fn_idx, #typed_args); }
+                        }
+                        "release_gil_void_wrapped" => {
+                            quote! { __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args); }
+                        }
+                        "loopinvariant_void_wrapped" => {
+                            quote! { __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args); }
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.statements.push(quote! {
+                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                        if __trace_target.is_null() && __concrete_target.is_null() {
+                            panic!("wrapped helper policy requires generated call-target wrappers");
+                        }
+                        let __trace_target = if __trace_target.is_null() {
+                            __concrete_target
+                        } else {
+                            __trace_target
+                        };
+                        let __concrete_target = if __concrete_target.is_null() {
+                            __trace_target
+                        } else {
+                            __concrete_target
+                        };
+                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                        #call_stmt
+                    });
+                }
+                _ => return None,
+            },
             CallPolicySpec::Infer => {
                 let policy_path = helper_policy_path(&call.func)?;
+                let typed_args = typed_call_arg_tokens(&arg_bindings);
                 let unsupported = self.inference_failure_tokens(
                     "inferred helper policy does not support void calls here",
                 );
                 self.statements.push(quote! {
-                    let (__policy, _inline_builder, __call_target) = #policy_path();
-                    let __call_target = if __call_target.is_null() {
+                    let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                    let __trace_target = if __trace_target.is_null() {
                         #func as *const ()
                     } else {
-                        __call_target
+                        __trace_target
                     };
-                    let __fn_idx = __builder.add_fn_ptr(__call_target);
+                    let __concrete_target = if __concrete_target.is_null() {
+                        __trace_target
+                    } else {
+                        __concrete_target
+                    };
+                    let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
                     match __policy {
                         1u8 => {
-                            __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
+                            __builder.residual_call_void_typed_args(__fn_idx, #typed_args);
+                        }
+                        9u8 => {
+                            __builder.call_may_force_void_typed_args(__fn_idx, #typed_args);
+                        }
+                        13u8 => {
+                            __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args);
+                        }
+                        17u8 => {
+                            __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args);
                         }
                         _ => {
                             #unsupported
@@ -397,7 +534,7 @@ impl<'c> Lowerer<'c> {
 
         for (io_path, shim) in &config.io_shims {
             if func_str == *io_path {
-                let arg = call.args.first()?;
+                let arg = unwrap_ref_expr(call.args.first()?);
                 let binding = self.lower_value_expr(arg)?;
                 let reg = binding.reg;
                 self.statements.push(quote! {
@@ -411,7 +548,7 @@ impl<'c> Lowerer<'c> {
         None
     }
 
-    /// Lower selector assignment: state.selected = value → set_selected(const_idx)
+    /// Lower selector changes into jitcode when the RHS is trace-time constant.
     fn lower_selector_assign(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Assign(ExprAssign { left, right, .. }) = expr else {
             return None;
@@ -421,10 +558,13 @@ impl<'c> Lowerer<'c> {
         if lhs_str != config.selector_str {
             return None;
         }
-        let rhs = &**right;
+        if self.expr_touches_storage(right) || self.expr_uses_stack_bindings(right) {
+            return None;
+        }
         self.statements.push(quote! {
-            let __sel_const = __builder.add_const_i((#rhs) as i64);
-            __builder.set_selected(__sel_const);
+            let __selected_value = (#right) as i64;
+            let __selected_const_idx = __builder.add_const_i(__selected_value);
+            __builder.set_selected(__selected_const_idx);
         });
         Some(())
     }
@@ -446,6 +586,9 @@ impl<'c> Lowerer<'c> {
         }
         let arg = &mc.args[0];
         let binding = self.lower_value_expr(arg)?;
+        if !matches!(binding.kind, BindingKind::Int) {
+            return None;
+        }
         let reg = binding.reg;
         self.statements.push(quote! {
             __builder.push_to(#reg, (#target_arg) as u16);
@@ -472,6 +615,55 @@ impl<'c> Lowerer<'c> {
         };
         let s = normalize(&quote!(#expr).to_string());
         s.contains(&config.pool_str)
+    }
+
+    fn expr_uses_stack_bindings(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(ExprPath { path, .. }) => path
+                .get_ident()
+                .and_then(|ident| self.bindings.get(&ident.to_string()))
+                .is_some_and(|binding| binding.depends_on_stack),
+            Expr::Assign(ExprAssign { left, right, .. }) => {
+                self.expr_uses_stack_bindings(left) || self.expr_uses_stack_bindings(right)
+            }
+            Expr::Binary(ExprBinary { left, right, .. }) => {
+                self.expr_uses_stack_bindings(left) || self.expr_uses_stack_bindings(right)
+            }
+            Expr::Call(ExprCall { func, args, .. }) => {
+                self.expr_uses_stack_bindings(func)
+                    || args.iter().any(|arg| self.expr_uses_stack_bindings(arg))
+            }
+            Expr::Cast(ExprCast { expr, .. })
+            | Expr::Paren(ExprParen { expr, .. })
+            | Expr::Unary(ExprUnary { expr, .. }) => self.expr_uses_stack_bindings(expr),
+            Expr::If(ExprIf {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            }) => {
+                self.expr_uses_stack_bindings(cond)
+                    || then_branch
+                        .stmts
+                        .iter()
+                        .any(|stmt| self.stmt_uses_stack_bindings(stmt))
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|(_, expr)| self.expr_uses_stack_bindings(expr))
+            }
+            _ => false,
+        }
+    }
+
+    fn stmt_uses_stack_bindings(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Expr(expr, _) => self.expr_uses_stack_bindings(expr),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| self.expr_uses_stack_bindings(&init.expr)),
+            _ => false,
+        }
     }
 
     // ── Core lowering (unchanged logic) ──────────────────────────────
@@ -522,6 +714,7 @@ impl<'c> Lowerer<'c> {
             });
             return Some(Binding {
                 reg,
+                kind: BindingKind::Int,
                 depends_on_stack: true,
             });
         }
@@ -533,6 +726,7 @@ impl<'c> Lowerer<'c> {
             });
             return Some(Binding {
                 reg,
+                kind: BindingKind::Int,
                 depends_on_stack: true,
             });
         }
@@ -549,6 +743,7 @@ impl<'c> Lowerer<'c> {
                 });
                 Some(Binding {
                     reg,
+                    kind: BindingKind::Int,
                     depends_on_stack: false,
                 })
             }
@@ -557,7 +752,11 @@ impl<'c> Lowerer<'c> {
                 self.bindings.get(&ident.to_string()).cloned()
             }
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_int_cast(ty) => {
-                self.lower_value_expr(expr)
+                let binding = self.lower_value_expr(expr)?;
+                if !matches!(binding.kind, BindingKind::Int) {
+                    return None;
+                }
+                Some(binding)
             }
             Expr::Paren(ExprParen { expr, .. }) => self.lower_value_expr(expr),
             Expr::If(expr_if) => self.lower_if_value(expr_if),
@@ -574,31 +773,150 @@ impl<'c> Lowerer<'c> {
             return None;
         }
 
-        let mut arg_regs = Vec::with_capacity(call.args.len());
+        let mut arg_bindings = Vec::with_capacity(call.args.len());
         let mut depends_on_stack = false;
         for arg in &call.args {
             let binding = self.lower_value_expr(arg)?;
-            arg_regs.push(binding.reg);
+            arg_bindings.push(binding.clone());
             depends_on_stack |= binding.depends_on_stack;
         }
 
         let reg = self.alloc_reg();
         let func = &call.func;
+        let mut result_kind = BindingKind::Int;
         match policy {
             CallPolicySpec::Explicit(kind) => match kind.to_string().as_str() {
                 "residual_int" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
                     self.statements.push(quote! {
                         let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                         __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);
                     });
                 }
+                "may_force_int" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
+                    self.statements.push(quote! {
+                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                        __builder.call_may_force_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                    });
+                }
+                "release_gil_int" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
+                    self.statements.push(quote! {
+                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                        __builder.call_release_gil_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                    });
+                }
+                "loopinvariant_int" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
+                    self.statements.push(quote! {
+                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                        __builder.call_loopinvariant_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                    });
+                }
                 "elidable_int" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
                     self.statements.push(quote! {
                         let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                         __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #reg);
                     });
                 }
+                "residual_int_wrapped"
+                | "may_force_int_wrapped"
+                | "release_gil_int_wrapped"
+                | "loopinvariant_int_wrapped"
+                | "elidable_int_wrapped"
+                | "residual_ref_wrapped"
+                | "may_force_ref_wrapped"
+                | "release_gil_ref_wrapped"
+                | "loopinvariant_ref_wrapped"
+                | "elidable_ref_wrapped"
+                | "residual_float_wrapped"
+                | "may_force_float_wrapped"
+                | "release_gil_float_wrapped"
+                | "loopinvariant_float_wrapped"
+                | "elidable_float_wrapped" => {
+                    let policy_path = helper_policy_path(&call.func)?;
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let call_stmt = match kind.to_string().as_str() {
+                        "residual_int_wrapped" => {
+                            quote! { __builder.call_int_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "may_force_int_wrapped" => {
+                            quote! { __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "release_gil_int_wrapped" => {
+                            quote! { __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "loopinvariant_int_wrapped" => {
+                            quote! { __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "elidable_int_wrapped" => {
+                            quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "residual_ref_wrapped" => {
+                            result_kind = BindingKind::Ref;
+                            quote! { __builder.call_ref_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "may_force_ref_wrapped" => {
+                            result_kind = BindingKind::Ref;
+                            quote! { __builder.call_may_force_ref_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "release_gil_ref_wrapped" => {
+                            result_kind = BindingKind::Ref;
+                            quote! { __builder.call_release_gil_ref_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "loopinvariant_ref_wrapped" => {
+                            result_kind = BindingKind::Ref;
+                            quote! { __builder.call_loopinvariant_ref_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "elidable_ref_wrapped" => {
+                            result_kind = BindingKind::Ref;
+                            quote! { __builder.call_pure_ref_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "residual_float_wrapped" => {
+                            result_kind = BindingKind::Float;
+                            quote! { __builder.call_float_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "may_force_float_wrapped" => {
+                            result_kind = BindingKind::Float;
+                            quote! { __builder.call_may_force_float_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "release_gil_float_wrapped" => {
+                            result_kind = BindingKind::Float;
+                            quote! { __builder.call_release_gil_float_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "loopinvariant_float_wrapped" => {
+                            result_kind = BindingKind::Float;
+                            quote! { __builder.call_loopinvariant_float_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        "elidable_float_wrapped" => {
+                            result_kind = BindingKind::Float;
+                            quote! { __builder.call_pure_float_typed(__fn_idx, #typed_args, #reg); }
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.statements.push(quote! {
+                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                        if __trace_target.is_null() && __concrete_target.is_null() {
+                            panic!("wrapped helper policy requires generated call-target wrappers");
+                        }
+                        let __trace_target = if __trace_target.is_null() {
+                            __concrete_target
+                        } else {
+                            __trace_target
+                        };
+                        let __concrete_target = if __concrete_target.is_null() {
+                            __trace_target
+                        } else {
+                            __concrete_target
+                        };
+                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                        #call_stmt
+                    });
+                }
                 "inline_int" => {
+                    let arg_regs = int_arg_regs(&arg_bindings)?;
                     let builder_path = inline_builder_path(&call.func)?;
                     let callee_arg_map = arg_regs
                         .iter()
@@ -618,49 +936,103 @@ impl<'c> Lowerer<'c> {
             },
             CallPolicySpec::Infer => {
                 let policy_path = helper_policy_path(&call.func)?;
+                let typed_args = typed_call_arg_tokens(&arg_bindings);
+                let int_arg_regs = int_arg_regs(&arg_bindings);
                 let unsupported = self.inference_failure_tokens(
-                    "inferred helper policy does not support integer value calls here",
+                    "inferred helper policy does not support this value call here",
                 );
-                let callee_arg_map = arg_regs
-                    .iter()
-                    .enumerate()
-                    .map(|(index, caller_reg)| quote! { (#caller_reg, #index as u16) });
-                self.statements.push(quote! {
-                    let (__policy, __inline_builder, __call_target) = #policy_path();
-                    let __call_target = if __call_target.is_null() {
-                        #func as *const ()
-                    } else {
-                        __call_target
-                    };
-                    let __fn_idx = __builder.add_fn_ptr(__call_target);
-                    match __policy {
-                        2u8 => {
-                            __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                if let Some(arg_regs) = int_arg_regs {
+                    let callee_arg_map = arg_regs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, caller_reg)| quote! { (#caller_reg, #index as u16) });
+                    self.statements.push(quote! {
+                        let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
+                        let __trace_target = if __trace_target.is_null() {
+                            #func as *const ()
+                        } else {
+                            __trace_target
+                        };
+                        let __concrete_target = if __concrete_target.is_null() {
+                            __trace_target
+                        } else {
+                            __concrete_target
+                        };
+                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                        match __policy {
+                            2u8 => {
+                                __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            3u8 => {
+                                __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            4u8 => {
+                                let __builder_fn: fn() -> (majit_meta::JitCode, u16) =
+                                    unsafe { std::mem::transmute(__inline_builder) };
+                                let (__sub_jitcode, __sub_return_reg) = __builder_fn();
+                                let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                                __builder.inline_call_i(
+                                    __sub_idx,
+                                    &[#(#callee_arg_map),*],
+                                    Some((__sub_return_reg, #reg)),
+                                );
+                            }
+                            10u8 => {
+                                __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            14u8 => {
+                                __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            18u8 => {
+                                __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            _ => {
+                                #unsupported
+                            }
                         }
-                        3u8 => {
-                            __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                    });
+                } else {
+                    self.statements.push(quote! {
+                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                        let __trace_target = if __trace_target.is_null() {
+                            #func as *const ()
+                        } else {
+                            __trace_target
+                        };
+                        let __concrete_target = if __concrete_target.is_null() {
+                            __trace_target
+                        } else {
+                            __concrete_target
+                        };
+                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                        match __policy {
+                            2u8 => {
+                                __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            3u8 => {
+                                __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            10u8 => {
+                                __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            14u8 => {
+                                __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            18u8 => {
+                                __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            _ => {
+                                #unsupported
+                            }
                         }
-                        4u8 => {
-                            let __builder_fn: fn() -> (majit_meta::JitCode, u16) =
-                                unsafe { std::mem::transmute(__inline_builder) };
-                            let (__sub_jitcode, __sub_return_reg) = __builder_fn();
-                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                            __builder.inline_call_i(
-                                __sub_idx,
-                                &[#(#callee_arg_map),*],
-                                Some((__sub_return_reg, #reg)),
-                            );
-                        }
-                        _ => {
-                            #unsupported
-                        }
-                    }
-                });
+                    });
+                }
             }
         }
 
         Some(Binding {
             reg,
+            kind: result_kind,
             depends_on_stack,
         })
     }
@@ -671,6 +1043,9 @@ impl<'c> Lowerer<'c> {
         }
 
         let cond = self.lower_value_expr(&expr_if.cond)?;
+        if !matches!(cond.kind, BindingKind::Int) {
+            return None;
+        }
         let (_, else_expr) = expr_if.else_branch.as_ref()?;
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
@@ -683,6 +1058,11 @@ impl<'c> Lowerer<'c> {
                 block: expr_if.then_branch.clone(),
             }))?;
         let (else_stmts, else_binding) = self.lower_branch_value_expr(else_expr)?;
+        if !matches!(then_binding.kind, BindingKind::Int)
+            || !matches!(else_binding.kind, BindingKind::Int)
+        {
+            return None;
+        }
         let then_reg = then_binding.reg;
         let else_reg = else_binding.reg;
 
@@ -715,6 +1095,7 @@ impl<'c> Lowerer<'c> {
 
         Some(Binding {
             reg: result_reg,
+            kind: BindingKind::Int,
             depends_on_stack: cond.depends_on_stack
                 || then_binding.depends_on_stack
                 || else_binding.depends_on_stack,
@@ -724,6 +1105,9 @@ impl<'c> Lowerer<'c> {
     fn lower_bool_if(&mut self, expr_if: &ExprIf) -> Option<Binding> {
         let (then_value, else_value) = extract_bool_branch_values(expr_if)?;
         let cond = self.lower_value_expr(&expr_if.cond)?;
+        if !matches!(cond.kind, BindingKind::Int) {
+            return None;
+        }
         match (then_value, else_value) {
             (1, 0) => Some(cond),
             (0, 1) => {
@@ -738,6 +1122,7 @@ impl<'c> Lowerer<'c> {
                 });
                 Some(Binding {
                     reg,
+                    kind: BindingKind::Int,
                     depends_on_stack: cond.depends_on_stack,
                 })
             }
@@ -749,6 +1134,9 @@ impl<'c> Lowerer<'c> {
         match op {
             UnOp::Neg(_) => {
                 let inner = self.lower_value_expr(expr)?;
+                if !matches!(inner.kind, BindingKind::Int) {
+                    return None;
+                }
                 let reg = self.alloc_reg();
                 let src_reg = inner.reg;
                 self.statements.push(quote! {
@@ -756,6 +1144,7 @@ impl<'c> Lowerer<'c> {
                 });
                 Some(Binding {
                     reg,
+                    kind: BindingKind::Int,
                     depends_on_stack: inner.depends_on_stack,
                 })
             }
@@ -766,6 +1155,9 @@ impl<'c> Lowerer<'c> {
     fn lower_binary(&mut self, expr: &ExprBinary) -> Option<Binding> {
         let lhs = self.lower_value_expr(&expr.left)?;
         let rhs = self.lower_value_expr(&expr.right)?;
+        if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
         let opcode = opcode_for_binop(&expr.op)?;
         let reg = self.alloc_reg();
         let lhs_reg = lhs.reg;
@@ -775,6 +1167,7 @@ impl<'c> Lowerer<'c> {
         });
         Some(Binding {
             reg,
+            kind: BindingKind::Int,
             depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
         })
     }
@@ -868,11 +1261,37 @@ fn push_call_arg(expr: &Expr) -> Option<&Expr> {
     let Expr::MethodCall(ExprMethodCall { method, args, .. }) = expr else {
         return None;
     };
-    if method == "push" && args.len() == 1 {
+    if matches!(
+        method.to_string().as_str(),
+        "push" | "push_ref" | "push_float"
+    ) && args.len() == 1
+    {
         Some(&args[0])
     } else {
         None
     }
+}
+
+fn int_arg_regs(bindings: &[Binding]) -> Option<Vec<u16>> {
+    bindings
+        .iter()
+        .map(|binding| match binding.kind {
+            BindingKind::Int => Some(binding.reg),
+            BindingKind::Ref | BindingKind::Float => None,
+        })
+        .collect()
+}
+
+fn typed_call_arg_tokens(bindings: &[Binding]) -> TokenStream {
+    let args = bindings.iter().map(|binding| {
+        let reg = binding.reg;
+        match binding.kind {
+            BindingKind::Int => quote! { majit_meta::JitCallArg::int(#reg) },
+            BindingKind::Ref => quote! { majit_meta::JitCallArg::reference(#reg) },
+            BindingKind::Float => quote! { majit_meta::JitCallArg::float(#reg) },
+        }
+    });
+    quote! { &[#(#args),*] }
 }
 
 fn is_pop_call(expr: &Expr) -> bool {
@@ -1081,6 +1500,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
             pat_ident.ident.to_string(),
             Binding {
                 reg: index as u16,
+                kind: BindingKind::Int,
                 depends_on_stack: false,
             },
         );

@@ -107,7 +107,9 @@ pub struct OptPure {
 impl OptPure {
     pub fn new() -> Self {
         OptPure {
-            cache: PureOpCache::new(16),
+            // Aheui traces routinely repeat the same comparisons hundreds of
+            // ops apart; a tiny ring buffer misses most of those CSE wins.
+            cache: PureOpCache::new(4096),
             loopinvariant_cache: HashMap::new(),
         }
     }
@@ -422,8 +424,8 @@ mod tests {
 
     #[test]
     fn test_cache_eviction() {
-        // Insert 17 different pure ops (cache limit is 16),
-        // then re-insert the first one -- it should have been evicted.
+        // Force a tiny cache so eviction behavior is deterministic even if
+        // the production default changes.
         let mut ops = Vec::new();
         for i in 0..17u32 {
             ops.push(Op::new(OpCode::IntAdd, &[OpRef(i), OpRef(i + 100)]));
@@ -433,7 +435,10 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
+        opt.add_pass(Box::new(OptPure {
+            cache: PureOpCache::new(16),
+            loopinvariant_cache: HashMap::new(),
+        }));
         let result = opt.optimize(&ops);
 
         // All 17 unique ops should be emitted, plus the re-inserted one

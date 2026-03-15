@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 
-use crate::resume::{MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData};
+use crate::resume::{
+    MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeLayoutSummary,
+};
 use majit_ir::{Op, OpCode, OpRef};
 
 /// Trait for blackhole memory access: the interpreter supplies
@@ -1041,6 +1043,46 @@ pub fn blackhole_with_virtuals(
     start_index: usize,
     resume_data: Option<&ResumeData>,
 ) -> BlackholeResult {
+    blackhole_with_recovery_layout(
+        ops,
+        constants,
+        initial_values,
+        start_index,
+        resume_data,
+        None,
+    )
+}
+
+/// Blackhole execution with semantic-free resume-layout materialization.
+///
+/// This is the same seam as `blackhole_with_virtuals()`, but it can source
+/// virtual/pending-write reconstruction from `ResumeLayoutSummary` alone when
+/// the original semantic `ResumeData` is no longer available.
+pub fn blackhole_with_resume_layout(
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    initial_values: &HashMap<u32, i64>,
+    start_index: usize,
+    resume_layout: Option<&ResumeLayoutSummary>,
+) -> BlackholeResult {
+    blackhole_with_recovery_layout(
+        ops,
+        constants,
+        initial_values,
+        start_index,
+        None,
+        resume_layout,
+    )
+}
+
+fn blackhole_with_recovery_layout(
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    initial_values: &HashMap<u32, i64>,
+    start_index: usize,
+    resume_data: Option<&ResumeData>,
+    resume_layout: Option<&ResumeLayoutSummary>,
+) -> BlackholeResult {
     let result = blackhole_execute(ops, constants, initial_values, start_index);
 
     // If guard failed and we have resume data with virtuals, materialize them
@@ -1059,6 +1101,15 @@ pub fn blackhole_with_virtuals(
                     fail_values: fail_values.clone(),
                     materialized_virtuals: materialized,
                     pending_field_writes,
+                };
+            }
+        } else if let Some(layout) = resume_layout {
+            if layout.num_virtuals > 0 || layout.pending_field_count > 0 {
+                return BlackholeResult::GuardFailedWithVirtuals {
+                    guard_index,
+                    fail_values: fail_values.clone(),
+                    materialized_virtuals: layout.materialize_virtuals(fail_values),
+                    pending_field_writes: layout.resolve_pending_field_writes(fail_values),
                 };
             }
         }
@@ -1381,6 +1432,68 @@ mod tests {
                         descr_index: 9,
                         target: crate::resume::MaterializedValue::Value(1),
                         value: crate::resume::MaterializedValue::Value(77),
+                        item_index: Some(2),
+                    }]
+                );
+            }
+            _ => panic!("expected GuardFailedWithVirtuals"),
+        }
+    }
+
+    #[test]
+    fn test_blackhole_with_resume_layout_materializes_virtuals_without_resume_data() {
+        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut initial = HashMap::new();
+        initial.insert(0, 0i64);
+
+        let resume_layout = ResumeData {
+            frames: vec![],
+            virtuals: vec![ResumeVirtualInfo::VStruct {
+                type_id: 0,
+                descr_index: 7,
+                fields: vec![(3, VirtualFieldSource::Constant(55))],
+            }],
+            pending_fields: vec![ResumePendingFieldInfo {
+                descr_index: 9,
+                target: VirtualFieldSource::Virtual(0),
+                value: VirtualFieldSource::FailArg(0),
+                item_index: Some(2),
+            }],
+        }
+        .encode()
+        .layout_summary();
+
+        match blackhole_with_resume_layout(&ops, &HashMap::new(), &initial, 0, Some(&resume_layout))
+        {
+            BlackholeResult::GuardFailedWithVirtuals {
+                guard_index,
+                fail_values,
+                materialized_virtuals,
+                pending_field_writes,
+            } => {
+                assert_eq!(guard_index, 1);
+                assert_eq!(fail_values, vec![0]);
+                assert_eq!(
+                    materialized_virtuals,
+                    vec![MaterializedVirtual::Struct {
+                        type_id: 0,
+                        descr_index: 7,
+                        fields: vec![(3, crate::resume::MaterializedValue::Value(55))],
+                    }]
+                );
+                assert_eq!(
+                    pending_field_writes,
+                    vec![crate::resume::ResolvedPendingFieldWrite {
+                        descr_index: 9,
+                        target: crate::resume::MaterializedValue::VirtualRef(0),
+                        value: crate::resume::MaterializedValue::Value(0),
                         item_index: Some(2),
                     }]
                 );

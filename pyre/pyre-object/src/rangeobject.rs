@@ -46,6 +46,10 @@ pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
     Box::into_raw(obj) as PyObjectRef
 }
 
+pub extern "C" fn jit_range_iter_new(start: i64, stop: i64, step: i64) -> i64 {
+    w_range_iter_new(start, stop, step) as i64
+}
+
 /// Advance the range iterator and return the next value, or `None` if exhausted.
 ///
 /// # Safety
@@ -53,21 +57,31 @@ pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
 pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
     let iter = obj as *mut W_RangeIterator;
     unsafe {
+        if !w_range_iter_has_next(obj) {
+            None
+        } else {
+            let current = (*iter).current;
+            let step = (*iter).step;
+            (*iter).current = current + step;
+            Some(crate::intobject::w_int_new(current))
+        }
+    }
+}
+
+/// Check whether a range iterator has another element without advancing it.
+///
+/// # Safety
+/// `obj` must point to a valid `W_RangeIterator`.
+pub unsafe fn w_range_iter_has_next(obj: PyObjectRef) -> bool {
+    let iter = obj as *const W_RangeIterator;
+    unsafe {
         let current = (*iter).current;
         let stop = (*iter).stop;
         let step = (*iter).step;
-
-        let exhausted = if step > 0 {
-            current >= stop
+        if step > 0 {
+            current < stop
         } else {
-            current <= stop
-        };
-
-        if exhausted {
-            None
-        } else {
-            (*iter).current = current + step;
-            Some(crate::intobject::w_int_new(current))
+            current > stop
         }
     }
 }
@@ -144,7 +158,19 @@ mod tests {
     fn test_range_iter_empty() {
         let iter = w_range_iter_new(5, 5, 1);
         unsafe {
+            assert!(!w_range_iter_has_next(iter));
             assert!(w_range_iter_next(iter).is_none());
+        }
+    }
+
+    #[test]
+    fn test_range_iter_has_next_is_pure_probe() {
+        let iter = w_range_iter_new(0, 2, 1);
+        unsafe {
+            assert!(w_range_iter_has_next(iter));
+            assert!(w_range_iter_has_next(iter));
+            let v0 = w_range_iter_next(iter).unwrap();
+            assert_eq!(w_int_get_value(v0), 0);
         }
     }
 

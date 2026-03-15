@@ -8,7 +8,11 @@
 
 use std::collections::HashMap;
 
-use majit_ir::GcRef;
+use majit_codegen::{
+    ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
+    ExitVirtualLayout,
+};
+use majit_ir::{GcRef, Type};
 
 const TAG_MASK: i64 = 0b11;
 const TAG_CONST: i64 = 0;
@@ -77,9 +81,13 @@ pub struct ResumeValueLayoutSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeFrameLayoutSummary {
+    pub trace_id: Option<u64>,
+    pub header_pc: Option<u64>,
+    pub source_guard: Option<(u64, u32)>,
     pub pc: u64,
     pub slot_sources: Vec<ResumeValueKind>,
     pub slot_layouts: Vec<ResumeValueLayoutSummary>,
+    pub slot_types: Option<Vec<Type>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +152,438 @@ pub struct ResumeLayoutSummary {
     pub const_pool_size: usize,
 }
 
+impl ResumeValueLayoutSummary {
+    pub(crate) fn raw_fail_arg_position(&self, fail_arg_positions: &[usize]) -> usize {
+        if let Some(position) = self.raw_fail_arg_position {
+            return position;
+        }
+        let compact_index = self
+            .fail_arg_index
+            .expect("resume layout missing fail-arg index for FailArg source");
+        *fail_arg_positions
+            .get(compact_index)
+            .expect("resume layout compact fail-arg index out of bounds")
+    }
+
+    fn to_resume_source(&self, fail_arg_positions: &[usize]) -> ResumeValueSource {
+        match self.kind {
+            ResumeValueKind::FailArg => {
+                ResumeValueSource::FailArg(self.raw_fail_arg_position(fail_arg_positions))
+            }
+            ResumeValueKind::Constant => {
+                ResumeValueSource::Constant(self.constant.expect("missing constant value"))
+            }
+            ResumeValueKind::Virtual => {
+                ResumeValueSource::Virtual(self.virtual_index.expect("missing virtual index"))
+            }
+            ResumeValueKind::Uninitialized => ResumeValueSource::Uninitialized,
+            ResumeValueKind::Unavailable => ResumeValueSource::Unavailable,
+        }
+    }
+
+    fn to_exit_source(
+        &self,
+        fail_arg_positions: &[usize],
+        virtual_offset: usize,
+    ) -> ExitValueSourceLayout {
+        match self.kind {
+            ResumeValueKind::FailArg => {
+                ExitValueSourceLayout::ExitValue(self.raw_fail_arg_position(fail_arg_positions))
+            }
+            ResumeValueKind::Constant => {
+                ExitValueSourceLayout::Constant(self.constant.expect("missing constant value"))
+            }
+            ResumeValueKind::Virtual => ExitValueSourceLayout::Virtual(
+                self.virtual_index.expect("missing virtual index") + virtual_offset,
+            ),
+            ResumeValueKind::Uninitialized => ExitValueSourceLayout::Uninitialized,
+            ResumeValueKind::Unavailable => ExitValueSourceLayout::Unavailable,
+        }
+    }
+}
+
+impl ResumeFrameLayoutSummary {
+    fn to_frame_info(&self, fail_arg_positions: &[usize]) -> FrameInfo {
+        FrameInfo {
+            pc: self.pc,
+            slot_map: self
+                .slot_layouts
+                .iter()
+                .map(|slot| slot.to_resume_source(fail_arg_positions))
+                .collect(),
+        }
+    }
+
+    fn to_exit_frame_layout(
+        &self,
+        fail_arg_positions: &[usize],
+        virtual_offset: usize,
+    ) -> ExitFrameLayout {
+        ExitFrameLayout {
+            trace_id: self.trace_id,
+            header_pc: self.header_pc,
+            source_guard: self.source_guard,
+            pc: self.pc,
+            slots: self
+                .slot_layouts
+                .iter()
+                .map(|slot| slot.to_exit_source(fail_arg_positions, virtual_offset))
+                .collect(),
+            slot_types: self.slot_types.clone(),
+        }
+    }
+}
+
+impl ResumeVirtualLayoutSummary {
+    fn to_virtual_info(&self, fail_arg_positions: &[usize]) -> VirtualInfo {
+        match self {
+            ResumeVirtualLayoutSummary::Object {
+                type_id,
+                descr_index,
+                fields,
+            } => VirtualInfo::VirtualObj {
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields: fields
+                    .iter()
+                    .map(|(field_descr, source)| {
+                        (*field_descr, source.to_resume_source(fail_arg_positions))
+                    })
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::Struct {
+                type_id,
+                descr_index,
+                fields,
+            } => VirtualInfo::VStruct {
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields: fields
+                    .iter()
+                    .map(|(field_descr, source)| {
+                        (*field_descr, source.to_resume_source(fail_arg_positions))
+                    })
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::Array { descr_index, items } => VirtualInfo::VArray {
+                descr_index: *descr_index,
+                items: items
+                    .iter()
+                    .map(|source| source.to_resume_source(fail_arg_positions))
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::ArrayStruct {
+                descr_index,
+                element_fields,
+            } => VirtualInfo::VArrayStruct {
+                descr_index: *descr_index,
+                element_fields: element_fields
+                    .iter()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|(field_descr, source)| {
+                                (*field_descr, source.to_resume_source(fail_arg_positions))
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::RawBuffer { size, entries } => VirtualInfo::VRawBuffer {
+                size: *size,
+                entries: entries
+                    .iter()
+                    .map(|(offset, size_in_bytes, source)| {
+                        (
+                            *offset,
+                            *size_in_bytes,
+                            source.to_resume_source(fail_arg_positions),
+                        )
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    fn to_exit_virtual_layout(
+        &self,
+        fail_arg_positions: &[usize],
+        virtual_offset: usize,
+    ) -> ExitVirtualLayout {
+        match self {
+            ResumeVirtualLayoutSummary::Object {
+                type_id,
+                descr_index,
+                fields,
+            } => ExitVirtualLayout::Object {
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields: fields
+                    .iter()
+                    .map(|(field_descr, source)| {
+                        (
+                            *field_descr,
+                            source.to_exit_source(fail_arg_positions, virtual_offset),
+                        )
+                    })
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::Struct {
+                type_id,
+                descr_index,
+                fields,
+            } => ExitVirtualLayout::Struct {
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields: fields
+                    .iter()
+                    .map(|(field_descr, source)| {
+                        (
+                            *field_descr,
+                            source.to_exit_source(fail_arg_positions, virtual_offset),
+                        )
+                    })
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::Array { descr_index, items } => ExitVirtualLayout::Array {
+                descr_index: *descr_index,
+                items: items
+                    .iter()
+                    .map(|source| source.to_exit_source(fail_arg_positions, virtual_offset))
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::ArrayStruct {
+                descr_index,
+                element_fields,
+            } => ExitVirtualLayout::ArrayStruct {
+                descr_index: *descr_index,
+                element_fields: element_fields
+                    .iter()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|(field_descr, source)| {
+                                (
+                                    *field_descr,
+                                    source.to_exit_source(fail_arg_positions, virtual_offset),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::RawBuffer { size, entries } => {
+                ExitVirtualLayout::RawBuffer {
+                    size: *size,
+                    entries: entries
+                        .iter()
+                        .map(|(offset, size_in_bytes, source)| {
+                            (
+                                *offset,
+                                *size_in_bytes,
+                                source.to_exit_source(fail_arg_positions, virtual_offset),
+                            )
+                        })
+                        .collect(),
+                }
+            }
+        }
+    }
+}
+
+impl PendingFieldLayoutSummary {
+    fn to_pending_field_info(&self, fail_arg_positions: &[usize]) -> PendingFieldInfo {
+        PendingFieldInfo {
+            descr_index: self.descr_index,
+            target: self.target.to_resume_source(fail_arg_positions),
+            value: self.value.to_resume_source(fail_arg_positions),
+            item_index: self.item_index,
+        }
+    }
+
+    fn to_exit_pending_field_layout(
+        &self,
+        fail_arg_positions: &[usize],
+        virtual_offset: usize,
+    ) -> ExitPendingFieldLayout {
+        ExitPendingFieldLayout {
+            descr_index: self.descr_index,
+            item_index: self.item_index,
+            is_array_item: self.is_array_item,
+            target: self
+                .target
+                .to_exit_source(fail_arg_positions, virtual_offset),
+            value: self
+                .value
+                .to_exit_source(fail_arg_positions, virtual_offset),
+        }
+    }
+}
+
+impl ResumeLayoutSummary {
+    pub fn to_resume_data(&self) -> ResumeData {
+        ResumeData {
+            frames: self
+                .frame_layouts
+                .iter()
+                .map(|frame| frame.to_frame_info(&self.fail_arg_positions))
+                .collect(),
+            virtuals: self
+                .virtual_layouts
+                .iter()
+                .map(|virt| virt.to_virtual_info(&self.fail_arg_positions))
+                .collect(),
+            pending_fields: self
+                .pending_field_layouts
+                .iter()
+                .map(|pending| pending.to_pending_field_info(&self.fail_arg_positions))
+                .collect(),
+        }
+    }
+
+    pub fn to_exit_recovery_layout(&self) -> ExitRecoveryLayout {
+        self.to_exit_recovery_layout_with_caller_prefix(None)
+    }
+
+    pub fn to_exit_recovery_layout_with_caller_prefix(
+        &self,
+        caller_prefix: Option<&ExitRecoveryLayout>,
+    ) -> ExitRecoveryLayout {
+        if self.frame_layouts.is_empty() {
+            return caller_prefix.cloned().unwrap_or(ExitRecoveryLayout {
+                frames: Vec::new(),
+                virtual_layouts: Vec::new(),
+                pending_field_layouts: Vec::new(),
+            });
+        }
+
+        let prefix_frame_count = caller_prefix
+            .map(|layout| layout.frames.len().saturating_sub(self.frame_layouts.len()))
+            .unwrap_or(0);
+        let preserve_prefix = prefix_frame_count > 0;
+
+        let mut frames = caller_prefix
+            .map(|layout| layout.frames[..prefix_frame_count].to_vec())
+            .unwrap_or_default();
+        let mut virtual_layouts = if preserve_prefix {
+            caller_prefix
+                .map(|layout| layout.virtual_layouts.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut pending_field_layouts = if preserve_prefix {
+            caller_prefix
+                .map(|layout| layout.pending_field_layouts.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let virtual_offset = virtual_layouts.len();
+
+        frames.extend(
+            self.frame_layouts
+                .iter()
+                .map(|frame| frame.to_exit_frame_layout(&self.fail_arg_positions, virtual_offset)),
+        );
+        virtual_layouts.extend(
+            self.virtual_layouts
+                .iter()
+                .map(|virt| virt.to_exit_virtual_layout(&self.fail_arg_positions, virtual_offset)),
+        );
+        pending_field_layouts.extend(self.pending_field_layouts.iter().map(|pending| {
+            pending.to_exit_pending_field_layout(&self.fail_arg_positions, virtual_offset)
+        }));
+
+        ExitRecoveryLayout {
+            frames,
+            virtual_layouts,
+            pending_field_layouts,
+        }
+    }
+
+    pub fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState {
+        let resume_data = self.to_resume_data();
+        let virtuals = resume_data.materialize_virtuals(fail_values);
+        let pending_fields =
+            ResumeData::resolve_pending_field_writes(&resume_data.pending_fields, fail_values);
+        let frames = self
+            .frame_layouts
+            .iter()
+            .map(|frame| ReconstructedFrame {
+                trace_id: frame.trace_id,
+                header_pc: frame.header_pc,
+                source_guard: frame.source_guard,
+                pc: frame.pc,
+                slot_types: frame.slot_types.clone(),
+                values: frame
+                    .slot_layouts
+                    .iter()
+                    .map(|slot| {
+                        ResumeData::resolve_frame_slot_source(
+                            &slot.to_resume_source(&self.fail_arg_positions),
+                            fail_values,
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        ReconstructedState {
+            frames,
+            virtuals,
+            pending_fields,
+        }
+    }
+
+    pub fn reconstruct(&self, fail_values: &[i64]) -> Vec<ReconstructedFrame> {
+        self.reconstruct_state(fail_values).frames
+    }
+
+    pub fn reconstruct_frame(
+        &self,
+        frame_index: usize,
+        fail_values: &[i64],
+    ) -> Option<ReconstructedFrame> {
+        let frame = self.frame_layouts.get(frame_index)?;
+        Some(ReconstructedFrame {
+            trace_id: frame.trace_id,
+            header_pc: frame.header_pc,
+            source_guard: frame.source_guard,
+            pc: frame.pc,
+            slot_types: frame.slot_types.clone(),
+            values: frame
+                .slot_layouts
+                .iter()
+                .map(|slot| {
+                    ResumeData::resolve_frame_slot_source(
+                        &slot.to_resume_source(&self.fail_arg_positions),
+                        fail_values,
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    pub fn materialize_virtuals(&self, fail_values: &[i64]) -> Vec<MaterializedVirtual> {
+        self.to_resume_data().materialize_virtuals(fail_values)
+    }
+
+    pub fn resolve_pending_field_writes(
+        &self,
+        fail_values: &[i64],
+    ) -> Vec<ResolvedPendingFieldWrite> {
+        let resume_data = self.to_resume_data();
+        ResumeData::resolve_pending_field_writes(&resume_data.pending_fields, fail_values)
+    }
+
+    pub fn compact_fail_values(&self, raw_fail_values: &[i64]) -> Vec<i64> {
+        self.fail_arg_positions
+            .iter()
+            .map(|&raw_index| raw_fail_values.get(raw_index).copied().unwrap_or(0))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncodedVirtualKind {
     VirtualObj = 0,
@@ -192,11 +632,11 @@ fn decode_len(value: i64) -> usize {
 }
 
 fn encode_u64(value: u64) -> i64 {
-    i64::try_from(value).expect("resume value exceeds i64")
+    value as i64
 }
 
 fn decode_u64(value: i64) -> u64 {
-    u64::try_from(value).expect("negative resume value where unsigned expected")
+    value as u64
 }
 
 /// Describes how to reconstruct a single frame in the interpreter's call stack.
@@ -922,6 +1362,9 @@ impl EncodedResumeData {
                 .frames
                 .iter()
                 .map(|frame| ResumeFrameLayoutSummary {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
                     pc: frame.pc,
                     slot_sources: frame.slot_map.iter().map(ResumeValueSource::kind).collect(),
                     slot_layouts: frame
@@ -929,6 +1372,7 @@ impl EncodedResumeData {
                         .iter()
                         .map(|source| source.layout_summary(&self.fail_arg_positions))
                         .collect(),
+                    slot_types: None,
                 })
                 .collect(),
             num_virtuals: layout.virtuals.len(),
@@ -960,7 +1404,11 @@ impl EncodedResumeData {
             .frames
             .iter()
             .map(|frame| ReconstructedFrame {
+                trace_id: None,
+                header_pc: None,
+                source_guard: None,
                 pc: frame.pc,
+                slot_types: None,
                 values: frame
                     .slot_map
                     .iter()
@@ -1041,7 +1489,11 @@ impl ResumeData {
                     .map(|slot| Self::resolve_frame_slot_source(slot, fail_values))
                     .collect();
                 ReconstructedFrame {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
                     pc: frame.pc,
+                    slot_types: None,
                     values,
                 }
             })
@@ -1157,8 +1609,16 @@ impl ResumeData {
 /// A reconstructed interpreter frame from resume data.
 #[derive(Debug, Clone)]
 pub struct ReconstructedFrame {
+    /// Compiled trace identifier for this frame, when known.
+    pub trace_id: Option<u64>,
+    /// Trace header pc associated with this frame, when known.
+    pub header_pc: Option<u64>,
+    /// Source guard this frame's trace is attached to, when known.
+    pub source_guard: Option<(u64, u32)>,
     /// Program counter for this frame.
     pub pc: u64,
+    /// Typed layout of the reconstructed slots, when known.
+    pub slot_types: Option<Vec<Type>>,
     /// Reconstructed values for each slot.
     pub values: Vec<ReconstructedValue>,
 }
@@ -2615,6 +3075,9 @@ mod tests {
             summary.frame_layouts,
             vec![
                 ResumeFrameLayoutSummary {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
                     pc: 11,
                     slot_sources: vec![
                         ResumeValueKind::FailArg,
@@ -2644,8 +3107,12 @@ mod tests {
                             virtual_index: Some(0),
                         },
                     ],
+                    slot_types: None,
                 },
                 ResumeFrameLayoutSummary {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
                     pc: 22,
                     slot_sources: vec![
                         ResumeValueKind::Unavailable,
@@ -2667,6 +3134,7 @@ mod tests {
                             virtual_index: None,
                         },
                     ],
+                    slot_types: None,
                 },
             ]
         );
@@ -2711,5 +3179,262 @@ mod tests {
         assert_eq!(summary.num_fail_args, 2);
         assert_eq!(summary.fail_arg_positions, vec![3, 1]);
         assert_eq!(summary.pending_field_count, 1);
+    }
+
+    #[test]
+    fn test_layout_summary_roundtrips_into_reconstruction_helpers() {
+        let rd = ResumeData {
+            frames: vec![
+                FrameInfo {
+                    pc: 55,
+                    slot_map: vec![
+                        FrameSlotSource::Virtual(0),
+                        FrameSlotSource::FailArg(4),
+                        FrameSlotSource::Constant(99),
+                    ],
+                },
+                FrameInfo {
+                    pc: 77,
+                    slot_map: vec![FrameSlotSource::Unavailable, FrameSlotSource::Virtual(1)],
+                },
+            ],
+            virtuals: vec![
+                VirtualInfo::VStruct {
+                    type_id: 3,
+                    descr_index: 10,
+                    fields: vec![
+                        (0, VirtualFieldSource::FailArg(2)),
+                        (1, VirtualFieldSource::Constant(123)),
+                    ],
+                },
+                VirtualInfo::VArray {
+                    descr_index: 11,
+                    items: vec![
+                        VirtualFieldSource::Virtual(0),
+                        VirtualFieldSource::FailArg(1),
+                    ],
+                },
+            ],
+            pending_fields: vec![
+                PendingFieldInfo {
+                    descr_index: 44,
+                    target: ResumeValueSource::Virtual(0),
+                    value: ResumeValueSource::FailArg(4),
+                    item_index: None,
+                },
+                PendingFieldInfo {
+                    descr_index: 45,
+                    target: ResumeValueSource::FailArg(0),
+                    value: ResumeValueSource::Virtual(1),
+                    item_index: Some(2),
+                },
+            ],
+        };
+        let encoded = rd.encode();
+        let summary = encoded.layout_summary();
+        let fail_values = vec![101, 202, 303, 404, 505];
+
+        assert_eq!(summary.to_resume_data(), encoded.decode());
+        assert_eq!(
+            summary.compact_fail_values(&fail_values),
+            encoded.compact_fail_values(&fail_values)
+        );
+
+        let expected = encoded.reconstruct_state(&fail_values);
+        let reconstructed = summary.reconstruct_state(&fail_values);
+
+        assert_eq!(reconstructed.frames.len(), expected.frames.len());
+        for (actual, expected) in reconstructed.frames.iter().zip(expected.frames.iter()) {
+            assert_eq!(actual.pc, expected.pc);
+            assert_eq!(actual.values, expected.values);
+        }
+        assert_eq!(reconstructed.virtuals, expected.virtuals);
+        assert_eq!(reconstructed.pending_fields, expected.pending_fields);
+        assert_eq!(
+            summary.materialize_virtuals(&fail_values),
+            expected.virtuals
+        );
+        assert_eq!(
+            summary.resolve_pending_field_writes(&fail_values),
+            expected.pending_fields
+        );
+    }
+
+    #[test]
+    fn test_layout_summary_reconstruction_preserves_frame_metadata() {
+        let rd = ResumeData {
+            frames: vec![
+                FrameInfo {
+                    pc: 55,
+                    slot_map: vec![FrameSlotSource::FailArg(0), FrameSlotSource::Constant(99)],
+                },
+                FrameInfo {
+                    pc: 77,
+                    slot_map: vec![FrameSlotSource::FailArg(1)],
+                },
+            ],
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        };
+        let mut summary = rd.encode().layout_summary();
+        summary.frame_layouts[0].trace_id = Some(1001);
+        summary.frame_layouts[0].header_pc = Some(5001);
+        summary.frame_layouts[0].source_guard = Some((9001, 1));
+        summary.frame_layouts[0].slot_types = Some(vec![Type::Int, Type::Int]);
+        summary.frame_layouts[1].trace_id = Some(1002);
+        summary.frame_layouts[1].header_pc = Some(5002);
+        summary.frame_layouts[1].source_guard = Some((9002, 2));
+        summary.frame_layouts[1].slot_types = Some(vec![Type::Ref]);
+
+        let reconstructed = summary.reconstruct_state(&[11, 22]);
+        assert_eq!(reconstructed.frames.len(), 2);
+        assert_eq!(reconstructed.frames[0].trace_id, Some(1001));
+        assert_eq!(reconstructed.frames[0].header_pc, Some(5001));
+        assert_eq!(reconstructed.frames[0].source_guard, Some((9001, 1)));
+        assert_eq!(
+            reconstructed.frames[0].slot_types,
+            Some(vec![Type::Int, Type::Int])
+        );
+        assert_eq!(reconstructed.frames[1].trace_id, Some(1002));
+        assert_eq!(reconstructed.frames[1].header_pc, Some(5002));
+        assert_eq!(reconstructed.frames[1].source_guard, Some((9002, 2)));
+        assert_eq!(reconstructed.frames[1].slot_types, Some(vec![Type::Ref]));
+
+        let frame = summary
+            .reconstruct_frame(1, &[11, 22])
+            .expect("frame metadata should reconstruct");
+        assert_eq!(frame.trace_id, Some(1002));
+        assert_eq!(frame.header_pc, Some(5002));
+        assert_eq!(frame.source_guard, Some((9002, 2)));
+        assert_eq!(frame.slot_types, Some(vec![Type::Ref]));
+        assert_eq!(frame.lossy_values(), vec![22]);
+    }
+
+    #[test]
+    fn test_layout_summary_to_exit_recovery_layout_preserves_caller_prefix_and_shifts_virtuals() {
+        let summary = ResumeLayoutSummary {
+            num_frames: 1,
+            frame_pcs: vec![77],
+            frame_slot_counts: vec![1],
+            frame_layouts: vec![ResumeFrameLayoutSummary {
+                trace_id: Some(22),
+                header_pc: Some(222),
+                source_guard: Some((21, 5)),
+                pc: 77,
+                slot_sources: vec![ResumeValueKind::Virtual],
+                slot_layouts: vec![ResumeValueLayoutSummary {
+                    kind: ResumeValueKind::Virtual,
+                    fail_arg_index: None,
+                    raw_fail_arg_position: None,
+                    constant: None,
+                    virtual_index: Some(0),
+                }],
+                slot_types: Some(vec![Type::Ref]),
+            }],
+            num_virtuals: 1,
+            virtual_kinds: vec![ResumeVirtualKind::Array],
+            virtual_layouts: vec![ResumeVirtualLayoutSummary::Array {
+                descr_index: 9,
+                items: vec![ResumeValueLayoutSummary {
+                    kind: ResumeValueKind::FailArg,
+                    fail_arg_index: Some(0),
+                    raw_fail_arg_position: Some(1),
+                    constant: None,
+                    virtual_index: None,
+                }],
+            }],
+            num_fail_args: 1,
+            fail_arg_positions: vec![1],
+            pending_field_count: 1,
+            pending_field_layouts: vec![PendingFieldLayoutSummary {
+                descr_index: 11,
+                item_index: Some(2),
+                is_array_item: true,
+                target_kind: ResumeValueKind::Virtual,
+                value_kind: ResumeValueKind::FailArg,
+                target: ResumeValueLayoutSummary {
+                    kind: ResumeValueKind::Virtual,
+                    fail_arg_index: None,
+                    raw_fail_arg_position: None,
+                    constant: None,
+                    virtual_index: Some(0),
+                },
+                value: ResumeValueLayoutSummary {
+                    kind: ResumeValueKind::FailArg,
+                    fail_arg_index: Some(0),
+                    raw_fail_arg_position: Some(1),
+                    constant: None,
+                    virtual_index: None,
+                },
+            }],
+            const_pool_size: 0,
+        };
+        let caller_prefix = ExitRecoveryLayout {
+            frames: vec![
+                ExitFrameLayout {
+                    trace_id: Some(10),
+                    header_pc: Some(100),
+                    source_guard: Some((9, 1)),
+                    pc: 55,
+                    slots: vec![ExitValueSourceLayout::ExitValue(0)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+                ExitFrameLayout {
+                    trace_id: Some(11),
+                    header_pc: Some(110),
+                    source_guard: Some((10, 2)),
+                    pc: 66,
+                    slots: vec![ExitValueSourceLayout::ExitValue(1)],
+                    slot_types: Some(vec![Type::Ref]),
+                },
+            ],
+            virtual_layouts: vec![ExitVirtualLayout::Array {
+                descr_index: 3,
+                items: vec![ExitValueSourceLayout::Constant(9)],
+            }],
+            pending_field_layouts: vec![ExitPendingFieldLayout {
+                descr_index: 4,
+                item_index: None,
+                is_array_item: false,
+                target: ExitValueSourceLayout::ExitValue(0),
+                value: ExitValueSourceLayout::Constant(1),
+            }],
+        };
+
+        let recovery = summary.to_exit_recovery_layout_with_caller_prefix(Some(&caller_prefix));
+        assert_eq!(recovery.frames.len(), 2);
+        assert_eq!(recovery.frames[0], caller_prefix.frames[0]);
+        assert_eq!(recovery.frames[1].trace_id, Some(22));
+        assert_eq!(recovery.frames[1].header_pc, Some(222));
+        assert_eq!(recovery.frames[1].source_guard, Some((21, 5)));
+        assert_eq!(recovery.frames[1].pc, 77);
+        assert_eq!(recovery.frames[1].slot_types, Some(vec![Type::Ref]));
+        assert_eq!(
+            recovery.frames[1].slots,
+            vec![ExitValueSourceLayout::Virtual(1)]
+        );
+        assert_eq!(recovery.virtual_layouts.len(), 2);
+        assert_eq!(
+            recovery.virtual_layouts[0],
+            caller_prefix.virtual_layouts[0]
+        );
+        assert_eq!(
+            recovery.virtual_layouts[1],
+            ExitVirtualLayout::Array {
+                descr_index: 9,
+                items: vec![ExitValueSourceLayout::ExitValue(1)],
+            }
+        );
+        assert_eq!(recovery.pending_field_layouts.len(), 2);
+        assert_eq!(
+            recovery.pending_field_layouts[1],
+            ExitPendingFieldLayout {
+                descr_index: 11,
+                item_index: Some(2),
+                is_array_item: true,
+                target: ExitValueSourceLayout::Virtual(1),
+                value: ExitValueSourceLayout::ExitValue(1),
+            }
+        );
     }
 }

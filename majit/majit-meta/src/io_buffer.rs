@@ -39,6 +39,7 @@ pub fn io_buffer_commit() {
             let stdout = io::stdout();
             let mut out = stdout.lock();
             let _ = out.write_all(&b);
+            let _ = out.flush();
             b.clear();
         }
     });

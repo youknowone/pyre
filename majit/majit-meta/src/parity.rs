@@ -280,7 +280,10 @@ mod tests {
         stack.push(i0);
 
         let action = ctx.trace_branch_guard(&mut stack, true, true, 0, true);
-        assert!(matches!(action, TraceAction::CloseLoop));
+        assert!(matches!(
+            action,
+            TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. }
+        ));
         let (trace, constants) = finish_trace_ctx(ctx, &[]);
 
         let case = TraceParityCase {

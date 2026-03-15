@@ -1,6 +1,9 @@
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
-use crate::meta_interp::{BackEdgeAction, CompiledExitLayout, MetaInterp};
+use crate::meta_interp::{
+    BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision, MetaInterp,
+};
+use crate::resume::ResumeLayoutSummary;
 use crate::trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 use crate::TraceAction;
@@ -54,8 +57,23 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Whether the driver is currently tracing.
+    #[inline]
     pub fn is_tracing(&self) -> bool {
         self.meta.is_tracing()
+    }
+
+    /// The green key of the active trace, if any.
+    pub fn current_trace_green_key(&mut self) -> Option<u64> {
+        self.meta.trace_ctx().map(|ctx| ctx.green_key())
+    }
+
+    /// Abort the active trace and clear driver-owned symbolic state.
+    pub fn abort_current_trace(&mut self, permanent: bool) {
+        if self.meta.is_tracing() {
+            self.meta.abort_trace(permanent);
+            self.sym = None;
+            self.trace_meta = None;
+        }
     }
 
     /// Tracing hook — call at the top of the dispatch loop.
@@ -64,6 +82,7 @@ impl<S: JitState> JitDriver<S> {
     /// and symbolic state, then handles the result automatically:
     ///
     /// - `CloseLoop` → validates depths, collects jump args, compiles
+    /// - `Finish` → compiles a terminal trace ending in `FINISH`
     /// - `Abort` → aborts trace (may retry later)
     /// - `AbortPermanent` → aborts trace permanently
     /// - `Continue` → no action
@@ -75,6 +94,7 @@ impl<S: JitState> JitDriver<S> {
     ///     trace_instruction(ctx, sym, program, pc, &state)
     /// });
     /// ```
+    #[inline]
     pub fn merge_point<F>(&mut self, trace_fn: F)
     where
         F: FnOnce(&mut TraceCtx, &mut S::Sym) -> TraceAction,
@@ -82,11 +102,25 @@ impl<S: JitState> JitDriver<S> {
         if !self.meta.is_tracing() {
             return;
         }
+        if self.sym.is_none() || self.trace_meta.is_none() {
+            self.meta.abort_trace(false);
+            self.sym = None;
+            self.trace_meta = None;
+            return;
+        }
 
         // Phase 1: split-borrow self into meta (for ctx) and sym, run closure
         let action = {
-            let ctx = self.meta.trace_ctx().unwrap();
-            let sym = self.sym.as_mut().unwrap();
+            let Some(ctx) = self.meta.trace_ctx() else {
+                self.sym = None;
+                self.trace_meta = None;
+                return;
+            };
+            let Some(sym) = self.sym.as_mut() else {
+                self.meta.abort_trace(false);
+                self.trace_meta = None;
+                return;
+            };
             trace_fn(ctx, sym)
         }; // ctx and sym references dropped here
 
@@ -94,8 +128,17 @@ impl<S: JitState> JitDriver<S> {
         match action {
             TraceAction::Continue => {}
             TraceAction::CloseLoop => {
-                let trace_meta = self.trace_meta.as_ref().unwrap();
-                let sym = self.sym.as_ref().unwrap();
+                let Some(trace_meta) = self.trace_meta.as_ref() else {
+                    self.meta.abort_trace(false);
+                    self.sym = None;
+                    self.trace_meta = None;
+                    return;
+                };
+                let Some(sym) = self.sym.as_ref() else {
+                    self.meta.abort_trace(false);
+                    self.trace_meta = None;
+                    return;
+                };
                 if S::validate_close(sym, trace_meta) {
                     let jump_args = S::collect_jump_args(sym);
                     let meta = self.trace_meta.take().unwrap();
@@ -104,6 +147,36 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.abort_trace(false);
                     self.trace_meta = None;
                 }
+                self.sym = None;
+            }
+            TraceAction::CloseLoopWithArgs { jump_args } => {
+                let Some(trace_meta) = self.trace_meta.as_ref() else {
+                    self.meta.abort_trace(false);
+                    self.sym = None;
+                    self.trace_meta = None;
+                    return;
+                };
+                let Some(sym) = self.sym.as_ref() else {
+                    self.meta.abort_trace(false);
+                    self.trace_meta = None;
+                    return;
+                };
+                if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
+                    let meta = self.trace_meta.take().unwrap();
+                    self.meta.close_and_compile(&jump_args, meta);
+                } else {
+                    self.meta.abort_trace(false);
+                    self.trace_meta = None;
+                }
+                self.sym = None;
+            }
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+            } => {
+                let meta = self.trace_meta.take().unwrap();
+                self.meta
+                    .finish_and_compile(&finish_args, finish_arg_types, meta);
                 self.sym = None;
             }
             TraceAction::Abort => {
@@ -171,6 +244,34 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_internal(key, Some(green_key), target_pc, state, env, pre_run)
     }
 
+    pub fn back_edge_or_run_compiled(
+        &mut self,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> Option<DetailedDriverRunOutcome> {
+        self.back_edge_or_run_compiled_internal(
+            target_pc as u64,
+            None,
+            target_pc,
+            state,
+            env,
+            pre_run,
+        )
+    }
+
+    pub fn back_edge_or_run_compiled_keyed(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> Option<DetailedDriverRunOutcome> {
+        self.back_edge_or_run_compiled_internal(green_key, None, target_pc, state, env, pre_run)
+    }
+
     pub fn back_edge_declarative<D: DeclarativeJitDriver>(
         &mut self,
         green_values: &[i64],
@@ -197,16 +298,17 @@ impl<S: JitState> JitDriver<S> {
         }
 
         if self.meta.has_compiled_loop(green_key) {
+            let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap();
+            let descriptor = self.driver_descriptor_for(state, compiled_meta);
             let live_values = {
-                let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap();
                 if !state.is_compatible(compiled_meta) {
                     return false;
                 }
-                if !self.sync_before(state, compiled_meta) {
+                if !self.sync_before(state, compiled_meta, descriptor.as_ref()) {
                     return false;
                 }
                 let live_values = state.extract_live_values(compiled_meta);
-                if !self.live_values_match_descriptor(&live_values) {
+                if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
                     return false;
                 }
                 live_values
@@ -219,39 +321,116 @@ impl<S: JitState> JitDriver<S> {
             {
                 let run_meta = run_meta.clone();
                 state.restore_values(&run_meta, &new_values);
-                self.sync_after(state, &run_meta);
+                let run_descriptor = self.driver_descriptor_for(state, &run_meta);
+                self.sync_after(state, &run_meta, run_descriptor.as_ref());
                 return true;
             }
             return false;
         }
 
+        self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
+        false
+    }
+
+    fn back_edge_or_run_compiled_internal(
+        &mut self,
+        green_key: u64,
+        structured_green_key: Option<GreenKey>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> Option<DetailedDriverRunOutcome> {
+        if self.meta.is_tracing() || !state.can_trace() {
+            return None;
+        }
+
+        if self.meta.has_compiled_loop(green_key) {
+            return Some(self.run_compiled_detailed_keyed(green_key, state, pre_run));
+        }
+
+        self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
+        None
+    }
+
+    /// Force-start tracing for a function entry.
+    ///
+    /// Bypasses the WarmState hot counter (the caller already did its own
+    /// counting). Used for function-entry JIT where the threshold is
+    /// controlled externally.
+    pub fn force_start_tracing(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) {
         let meta = state.build_meta(target_pc, env);
-        if !self.sync_before(state, &meta) {
-            return false;
+        let descriptor = self.driver_descriptor_for(state, &meta);
+        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+            return;
         }
         let live_values = state.extract_live_values(&meta);
-        if !self.live_values_match_descriptor(&live_values) {
-            return false;
+        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            return;
+        }
+
+        match self
+            .meta
+            .force_start_tracing(green_key, descriptor, &live_values)
+        {
+            BackEdgeAction::StartedTracing => {
+                self.sym = Some(S::create_sym(&meta, target_pc));
+                self.trace_meta = Some(meta);
+            }
+            _ => {}
+        }
+    }
+
+    fn maybe_start_tracing(
+        &mut self,
+        green_key: u64,
+        structured_green_key: Option<GreenKey>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) {
+        let meta = state.build_meta(target_pc, env);
+        let descriptor = self.driver_descriptor_for(state, &meta);
+        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+            return;
+        }
+        let live_values = state.extract_live_values(&meta);
+        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            return;
         }
 
         match self.meta.on_back_edge_typed(
             green_key,
             structured_green_key,
-            self.descriptor.clone(),
+            descriptor,
             &live_values,
         ) {
-            BackEdgeAction::Interpret => false,
+            BackEdgeAction::Interpret => {}
             BackEdgeAction::StartedTracing => {
                 self.sym = Some(S::create_sym(&meta, target_pc));
                 self.trace_meta = Some(meta);
-                false
             }
-            BackEdgeAction::AlreadyTracing | BackEdgeAction::RunCompiled => false,
+            BackEdgeAction::AlreadyTracing | BackEdgeAction::RunCompiled => {}
         }
     }
 
-    fn live_values_match_descriptor(&self, live_values: &[Value]) -> bool {
-        let Some(descriptor) = self.descriptor.as_ref() else {
+    fn driver_descriptor_for(&self, state: &S, meta: &S::Meta) -> Option<JitDriverDescriptor> {
+        self.descriptor
+            .clone()
+            .or_else(|| state.driver_descriptor(meta))
+    }
+
+    fn live_values_match_descriptor(
+        descriptor: Option<&JitDriverDescriptor>,
+        live_values: &[Value],
+    ) -> bool {
+        let Some(descriptor) = descriptor else {
             return true;
         };
         let reds = descriptor.reds();
@@ -262,8 +441,13 @@ impl<S: JitState> JitDriver<S> {
                 .all(|(var, value)| var.tp == value.get_type())
     }
 
-    fn sync_before(&self, state: &mut S, meta: &S::Meta) -> bool {
-        let Some(descriptor) = self.descriptor.as_ref() else {
+    fn sync_before(
+        &self,
+        state: &mut S,
+        meta: &S::Meta,
+        descriptor: Option<&JitDriverDescriptor>,
+    ) -> bool {
+        let Some(descriptor) = descriptor else {
             return true;
         };
         let Some(virtualizable) = descriptor.virtualizable() else {
@@ -276,8 +460,8 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
-    fn sync_after(&self, state: &mut S, meta: &S::Meta) {
-        let Some(descriptor) = self.descriptor.as_ref() else {
+    fn sync_after(&self, state: &mut S, meta: &S::Meta, descriptor: Option<&JitDriverDescriptor>) {
+        let Some(descriptor) = descriptor else {
             return;
         };
         let Some(virtualizable) = descriptor.virtualizable() else {
@@ -342,17 +526,24 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
-        if !state.is_compatible(&meta) || !self.sync_before(state, &meta) {
+        let descriptor = self.driver_descriptor_for(state, &meta);
+        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
             return crate::meta_interp::DriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         }
-        let live_values = state.extract_live(&meta);
+        let live_values = state.extract_live_values(&meta);
+        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            return crate::meta_interp::DriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        }
         pre_run();
         let Some(result) = self
             .meta
-            .run_with_blackhole_fallback(green_key, &live_values)
+            .run_with_blackhole_fallback_with_values(green_key, &live_values)
         else {
             return crate::meta_interp::DriverRunOutcome::Abort {
                 restored: false,
@@ -373,7 +564,7 @@ impl<S: JitState> JitDriver<S> {
                 } else {
                     state.restore(&meta, &values);
                 }
-                self.sync_after(state, &meta);
+                self.sync_after(state, &meta, descriptor.as_ref());
                 crate::meta_interp::DriverRunOutcome::Finished { via_blackhole }
             }
             crate::meta_interp::BlackholeRunResult::Jump {
@@ -388,12 +579,14 @@ impl<S: JitState> JitDriver<S> {
                     state.restore_values(&meta, values);
                 } else if let Some(layout) = exit_layout.as_ref() {
                     state.restore_values(&meta, &Self::decode_exit_layout_values(&values, layout));
-                } else if let Some(values) = self.decode_descriptor_values(&meta, &values) {
+                } else if let Some(values) =
+                    Self::decode_descriptor_values(descriptor.as_ref(), &values)
+                {
                     state.restore_values(&meta, &values);
                 } else {
                     state.restore(&meta, &values);
                 }
-                self.sync_after(state, &meta);
+                self.sync_after(state, &meta, descriptor.as_ref());
                 crate::meta_interp::DriverRunOutcome::Jump { via_blackhole }
             }
             crate::meta_interp::BlackholeRunResult::GuardFailure {
@@ -405,11 +598,20 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole,
                 ..
             } => {
+                let patched_resume_layout = recovery.as_ref().and_then(|recovery| {
+                    recovery.resume_layout.as_ref().and_then(|layout| {
+                        Self::resume_layout_with_descriptor_slot_types(descriptor.as_ref(), layout)
+                    })
+                });
                 let restored = if let Some(recovery) = recovery.as_ref() {
-                    state.restore_guard_failure(
+                    state.restore_guard_failure_with_resume_layout(
                         &meta,
                         &fail_values,
                         recovery.reconstructed_state.as_ref(),
+                        patched_resume_layout
+                            .as_ref()
+                            .or(recovery.resume_layout.as_ref())
+                            .map(|layout| layout.frame_layouts.as_slice()),
                         &recovery.materialized_virtuals,
                         &recovery.pending_field_writes,
                         &recovery.exception,
@@ -422,12 +624,15 @@ impl<S: JitState> JitDriver<S> {
                         &Self::decode_exit_layout_values(&fail_values, layout),
                         &ExceptionState::default(),
                     )
-                } else if let Some(values) = self.decode_descriptor_values(&meta, &fail_values) {
+                } else if let Some(values) =
+                    Self::decode_descriptor_values(descriptor.as_ref(), &fail_values)
+                {
                     state.restore_guard_failure_values(&meta, &values, &ExceptionState::default())
                 } else {
-                    state.restore_guard_failure(
+                    state.restore_guard_failure_with_resume_layout(
                         &meta,
                         &fail_values,
+                        None,
                         None,
                         &[],
                         &[],
@@ -435,7 +640,7 @@ impl<S: JitState> JitDriver<S> {
                     )
                 };
                 if restored {
-                    self.sync_after(state, &meta);
+                    self.sync_after(state, &meta, descriptor.as_ref());
                 }
                 crate::meta_interp::DriverRunOutcome::GuardFailure {
                     restored,
@@ -461,8 +666,63 @@ impl<S: JitState> JitDriver<S> {
         Ok(self.run_compiled_with_blackhole_fallback_keyed(green_key.hash_u64(), state, pre_run))
     }
 
-    fn decode_descriptor_values(&self, _meta: &S::Meta, raw_values: &[i64]) -> Option<Vec<Value>> {
-        let descriptor = self.descriptor.as_ref()?;
+    pub fn run_compiled_detailed_keyed(
+        &mut self,
+        green_key: u64,
+        state: &mut S,
+        pre_run: impl FnOnce(),
+    ) -> DetailedDriverRunOutcome {
+        let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
+        let descriptor = self.driver_descriptor_for(state, &meta);
+        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        }
+        let live_values = state.extract_live_values(&meta);
+        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        }
+        pre_run();
+        let Some(result) = self
+            .meta
+            .run_compiled_detailed_with_values(green_key, &live_values)
+        else {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
+
+        if result.is_finish {
+            return DetailedDriverRunOutcome::Finished {
+                typed_values: result.typed_values,
+                via_blackhole: false,
+            };
+        }
+
+        let exit_meta = result.meta.clone();
+        state.restore_values(&exit_meta, &result.typed_values);
+        self.sync_after(state, &exit_meta, descriptor.as_ref());
+        DetailedDriverRunOutcome::Jump {
+            via_blackhole: false,
+        }
+    }
+
+    fn decode_descriptor_values(
+        descriptor: Option<&JitDriverDescriptor>,
+        raw_values: &[i64],
+    ) -> Option<Vec<Value>> {
+        let descriptor = descriptor?;
         let reds = descriptor.reds();
         if reds.len() != raw_values.len() {
             return None;
@@ -497,27 +757,105 @@ impl<S: JitState> JitDriver<S> {
             .collect()
     }
 
+    fn resume_layout_with_descriptor_slot_types(
+        descriptor: Option<&JitDriverDescriptor>,
+        resume_layout: &ResumeLayoutSummary,
+    ) -> Option<ResumeLayoutSummary> {
+        let descriptor = descriptor?;
+        let red_types: Vec<Type> = descriptor.reds().iter().map(|var| var.tp).collect();
+        let last = resume_layout.frame_layouts.last()?;
+        if last.slot_types.is_some() || last.slot_layouts.len() != red_types.len() {
+            return None;
+        }
+        let mut patched = resume_layout.clone();
+        if let Some(last) = patched.frame_layouts.last_mut() {
+            last.slot_types = Some(red_types);
+        }
+        Some(patched)
+    }
+
     /// Invalidate a compiled loop, forcing fallback to interpretation.
     pub fn invalidate_loop(&mut self, green_key: u64) {
         self.meta.invalidate_loop(green_key);
     }
 
     /// Check whether a compiled loop exists for a given green key.
+    #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.meta.has_compiled_loop(green_key)
+    }
+
+    /// Get the loop token number for a compiled loop.
+    pub fn get_loop_token_number(&self, green_key: u64) -> Option<u64> {
+        self.meta.get_loop_token(green_key).map(|t| t.number)
+    }
+
+    /// Get the pre-allocated token number for the trace being recorded.
+    ///
+    /// Returns `Some(number)` if `green_key` matches the current trace's
+    /// target, enabling self-recursive call_assembler emission.
+    pub fn get_pending_token_number(&self, green_key: u64) -> Option<u64> {
+        self.meta.get_pending_token_number(green_key)
+    }
+
+    /// Decide how to handle a function call during tracing.
+    ///
+    /// Returns `Inline` if the callee should be traced through,
+    /// `CallAssembler` if it already has compiled code, or
+    /// `ResidualCall` if it should be left as an opaque call.
+    pub fn should_inline(&mut self, callee_key: u64) -> InlineDecision {
+        self.meta.should_inline(callee_key)
+    }
+
+    /// Begin inlining a function call during tracing.
+    ///
+    /// Records EnterPortalFrame and pushes an inline frame.
+    /// Returns `true` if inlining started successfully.
+    pub fn enter_inline_frame(&mut self, callee_key: u64) -> bool {
+        self.meta.enter_inline_frame(callee_key)
+    }
+
+    /// End an inlined function call during tracing.
+    ///
+    /// Records LeavePortalFrame and pops the inline frame.
+    pub fn leave_inline_frame(&mut self) {
+        self.meta.leave_inline_frame()
+    }
+
+    /// Get the current inlining depth.
+    pub fn inline_depth(&self) -> usize {
+        self.meta.inline_depth()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{OpCode, OpRef, Value};
+    use crate::resume::{ReconstructedFrame, ReconstructedState, ReconstructedValue};
+    use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
 
     #[derive(Default)]
     struct TypedRestoreState {
         live_values: Vec<i64>,
         restored_values: Vec<Value>,
         restore_called: bool,
+    }
+
+    #[derive(Default)]
+    struct TypedInputState {
+        raw_live_values: Vec<i64>,
+        typed_live_values: Vec<Value>,
+        restored_values: Vec<Value>,
+        raw_restore_calls: usize,
+        typed_restore_calls: usize,
+    }
+
+    #[derive(Default)]
+    struct FrameMetadataState {
+        seen_trace_id: Option<u64>,
+        seen_header_pc: Option<u64>,
+        seen_source_guard: Option<(u64, u32)>,
+        restored_values: Vec<Value>,
     }
 
     impl JitState for TypedRestoreState {
@@ -543,6 +881,89 @@ mod tests {
 
         fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
             self.restored_values = values.to_vec();
+        }
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
+    impl JitState for TypedInputState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            self.raw_live_values.clone()
+        }
+
+        fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+            self.typed_live_values.clone()
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {
+            self.raw_restore_calls += 1;
+        }
+
+        fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
+            self.typed_restore_calls += 1;
+            self.restored_values = values.to_vec();
+        }
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
+    impl JitState for FrameMetadataState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn restore_reconstructed_frame_values_with_metadata(
+            &mut self,
+            _meta: &Self::Meta,
+            _frame_index: usize,
+            _total_frames: usize,
+            frame: &ReconstructedFrame,
+            values: &[Value],
+            _exception: &ExceptionState,
+        ) -> bool {
+            self.seen_trace_id = frame.trace_id;
+            self.seen_header_pc = frame.header_pc;
+            self.seen_source_guard = frame.source_guard;
+            self.restored_values = values.to_vec();
+            true
         }
 
         fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
@@ -622,5 +1043,167 @@ mod tests {
         }
         assert_eq!(state.restored_values, vec![Value::Int(1)]);
         assert!(!state.restore_called);
+    }
+
+    #[test]
+    fn run_compiled_detailed_keyed_uses_typed_live_inputs() {
+        let mut driver = JitDriver::<TypedInputState>::new(1);
+        let key = 11u64;
+        let typed_live_values = vec![Value::Ref(GcRef(0x1234)), Value::Float(3.5)];
+
+        assert!(matches!(
+            driver
+                .meta
+                .on_back_edge_typed(key, None, None, &typed_live_values),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver
+                .meta
+                .on_back_edge_typed(key, None, None, &typed_live_values),
+            BackEdgeAction::StartedTracing
+        ));
+
+        let cond = {
+            let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
+            let cond = ctx.const_int(1);
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[OpRef(0), OpRef(1)]);
+            cond
+        };
+        driver.meta.close_and_compile(&[OpRef(0), OpRef(1)], ());
+        assert!(driver.has_compiled_loop(key));
+
+        let mut state = TypedInputState {
+            raw_live_values: vec![0, 0],
+            typed_live_values: typed_live_values.clone(),
+            ..Default::default()
+        };
+        match driver.run_compiled_detailed_keyed(key, &mut state, || {}) {
+            DetailedDriverRunOutcome::Jump { via_blackhole } => {
+                assert!(!via_blackhole);
+            }
+            other => panic!("expected Jump outcome, got {other:?}"),
+        }
+        assert_eq!(state.restored_values, typed_live_values);
+        assert_eq!(state.raw_restore_calls, 0);
+        assert_eq!(state.typed_restore_calls, 1);
+        let _ = cond;
+    }
+
+    #[test]
+    fn blackhole_fallback_uses_typed_live_inputs() {
+        let mut driver = JitDriver::<TypedInputState>::new(1);
+        let key = 12u64;
+        let typed_live_values = vec![Value::Ref(GcRef(0x5678)), Value::Float(6.25)];
+
+        assert!(matches!(
+            driver
+                .meta
+                .on_back_edge_typed(key, None, None, &typed_live_values),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver
+                .meta
+                .on_back_edge_typed(key, None, None, &typed_live_values),
+            BackEdgeAction::StartedTracing
+        ));
+
+        let cond = {
+            let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
+            let cond = ctx.const_int(1);
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[OpRef(0), OpRef(1)]);
+            cond
+        };
+        driver.meta.close_and_compile(&[OpRef(0), OpRef(1)], ());
+        assert!(driver.has_compiled_loop(key));
+
+        let mut state = TypedInputState {
+            raw_live_values: vec![0, 0],
+            typed_live_values: typed_live_values.clone(),
+            ..Default::default()
+        };
+        match driver.run_compiled_with_blackhole_fallback_keyed(key, &mut state, || {}) {
+            crate::meta_interp::DriverRunOutcome::Jump { via_blackhole } => {
+                assert!(via_blackhole);
+            }
+            other => panic!("expected Jump outcome, got {other:?}"),
+        }
+        assert_eq!(state.restored_values, typed_live_values);
+        assert_eq!(state.raw_restore_calls, 0);
+        assert_eq!(state.typed_restore_calls, 1);
+        let _ = cond;
+    }
+
+    #[test]
+    fn generic_guard_restore_uses_embedded_reconstructed_frame_slot_types() {
+        let mut state = TypedRestoreState::default();
+        let reconstructed_state = ReconstructedState {
+            frames: vec![ReconstructedFrame {
+                trace_id: Some(77),
+                header_pc: Some(88),
+                source_guard: Some((70, 7)),
+                pc: 99,
+                slot_types: Some(vec![Type::Ref, Type::Float]),
+                values: vec![
+                    ReconstructedValue::Value(0x1234),
+                    ReconstructedValue::Value(6.25f64.to_bits() as i64),
+                ],
+            }],
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        };
+
+        assert!(
+            <TypedRestoreState as JitState>::restore_guard_failure_with_resume_layout(
+                &mut state,
+                &(),
+                &[],
+                Some(&reconstructed_state),
+                None,
+                &[],
+                &[],
+                &ExceptionState::default(),
+            )
+        );
+        assert!(!state.restore_called);
+        assert_eq!(
+            state.restored_values,
+            vec![Value::Ref(GcRef(0x1234)), Value::Float(6.25)]
+        );
+    }
+
+    #[test]
+    fn generic_guard_restore_passes_embedded_reconstructed_frame_metadata() {
+        let mut state = FrameMetadataState::default();
+        let reconstructed_state = ReconstructedState {
+            frames: vec![ReconstructedFrame {
+                trace_id: Some(701),
+                header_pc: Some(1701),
+                source_guard: Some((700, 0)),
+                pc: 99,
+                slot_types: Some(vec![Type::Int]),
+                values: vec![ReconstructedValue::Value(44)],
+            }],
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        };
+
+        assert!(
+            <FrameMetadataState as JitState>::restore_guard_failure_with_resume_layout(
+                &mut state,
+                &(),
+                &[],
+                Some(&reconstructed_state),
+                None,
+                &[],
+                &[],
+                &ExceptionState::default(),
+            )
+        );
+        assert_eq!(state.seen_trace_id, Some(701));
+        assert_eq!(state.seen_header_pc, Some(1701));
+        assert_eq!(state.seen_source_guard, Some((700, 0)));
+        assert_eq!(state.restored_values, vec![Value::Int(44)]);
     }
 }

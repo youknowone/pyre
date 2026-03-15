@@ -3,6 +3,8 @@
 //! Phase 1 uses a fixed i64 representation. BigInt support (like PyPy's
 //! `W_LongObject`) will be added in Phase 4.
 
+use std::sync::LazyLock;
+
 use crate::pyobject::*;
 
 /// Python integer object.
@@ -18,18 +20,45 @@ pub struct W_IntObject {
 /// Field offset of `intval` within `W_IntObject`, for JIT field access.
 pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 
-/// Allocate a new W_IntObject on the heap.
+// ── Small-int cache ──────────────────────────────────────────────────
+//
+// Pre-allocate W_IntObject for values -5..=256 (262 entries, matching
+// CPython's NSMALLPOSINTS/NSMALLNEGINTS). This eliminates heap allocation
+// for the most common integer values — constants, loop counters, and
+// small arithmetic results.
+
+const SMALL_INT_MIN: i64 = -5;
+const SMALL_INT_MAX: i64 = 256;
+
+static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
+    (SMALL_INT_MIN..=SMALL_INT_MAX)
+        .map(|v| W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+            },
+            intval: v,
+        })
+        .collect()
+});
+
+/// Create or retrieve a W_IntObject for the given value.
 ///
-/// Phase 1: uses `Box::leak` for simplicity (objects are never freed).
-/// A proper GC will replace this allocation strategy.
+/// Values in -5..=256 are returned from a pre-allocated cache (no heap
+/// allocation). Values outside this range are heap-allocated via Box::leak.
+#[inline]
 pub fn w_int_new(value: i64) -> PyObjectRef {
-    let obj = Box::new(W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-        },
-        intval: value,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    if value >= SMALL_INT_MIN && value <= SMALL_INT_MAX {
+        let idx = (value - SMALL_INT_MIN) as usize;
+        (&SMALL_INTS[idx] as *const W_IntObject).cast_mut() as PyObjectRef
+    } else {
+        let obj = Box::new(W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+            },
+            intval: value,
+        });
+        Box::into_raw(obj) as PyObjectRef
+    }
 }
 
 /// Extract the i64 value from a known W_IntObject pointer.
@@ -39,6 +68,10 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const W_IntObject)).intval }
+}
+
+pub extern "C" fn jit_w_int_new(value: i64) -> i64 {
+    w_int_new(value) as i64
 }
 
 #[cfg(test)]
@@ -52,8 +85,6 @@ mod tests {
             assert!(is_int(obj));
             assert!(!is_bool(obj));
             assert_eq!(w_int_get_value(obj), 42);
-            // Clean up
-            drop(Box::from_raw(obj as *mut W_IntObject));
         }
     }
 
@@ -62,12 +93,45 @@ mod tests {
         let obj = w_int_new(-7);
         unsafe {
             assert_eq!(w_int_get_value(obj), -7);
-            drop(Box::from_raw(obj as *mut W_IntObject));
         }
     }
 
     #[test]
     fn test_int_field_offset() {
         assert_eq!(INT_INTVAL_OFFSET, 8); // after *const PyType (8 bytes on 64-bit)
+    }
+
+    #[test]
+    fn test_small_int_cache_returns_same_pointer() {
+        let a = w_int_new(42);
+        let b = w_int_new(42);
+        assert_eq!(a, b, "cached ints should return the same pointer");
+    }
+
+    #[test]
+    fn test_small_int_cache_boundary() {
+        // Values at cache boundaries
+        let low = w_int_new(SMALL_INT_MIN);
+        let high = w_int_new(SMALL_INT_MAX);
+        unsafe {
+            assert_eq!(w_int_get_value(low), SMALL_INT_MIN);
+            assert_eq!(w_int_get_value(high), SMALL_INT_MAX);
+        }
+        // Same pointer on second call
+        assert_eq!(low, w_int_new(SMALL_INT_MIN));
+        assert_eq!(high, w_int_new(SMALL_INT_MAX));
+    }
+
+    #[test]
+    fn test_large_int_not_cached() {
+        let a = w_int_new(1000);
+        let b = w_int_new(1000);
+        assert_ne!(a, b, "large ints should be different heap allocations");
+        unsafe {
+            assert_eq!(w_int_get_value(a), 1000);
+            assert_eq!(w_int_get_value(b), 1000);
+            drop(Box::from_raw(a as *mut W_IntObject));
+            drop(Box::from_raw(b as *mut W_IntObject));
+        }
     }
 }

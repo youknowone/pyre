@@ -8,7 +8,7 @@ pyre-object = { workspace = true }
 pyre-runtime = { workspace = true }
 pyre-objspace = { workspace = true }
 pyre-bytecode = { workspace = true }
-pyre-jit = { workspace = true }
 majit-meta = { workspace = true }
 majit-ir = { workspace = true }
+majit-codegen-cranelift = { path = "../../majit/majit-codegen-cranelift" }
 num-traits = "0.2"

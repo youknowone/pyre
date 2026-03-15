@@ -3,7 +3,9 @@ use majit_ir::{GcRef, OpRef, Type, Value};
 use crate::blackhole::ExceptionState;
 use crate::resume::{
     MaterializedValue, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
+    ResumeFrameLayoutSummary,
 };
+use crate::trace_ctx::JitDriverDescriptor;
 use crate::virtualizable::{
     clear_vable_token, read_all_virtualizable_boxes, write_all_virtualizable_boxes,
     VirtualizableInfo,
@@ -52,6 +54,10 @@ pub trait JitState: Sized {
     }
 
     fn create_sym(meta: &Self::Meta, header_pc: usize) -> Self::Sym;
+
+    fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverDescriptor> {
+        None
+    }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool;
 
@@ -189,6 +195,14 @@ pub trait JitState: Sized {
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool;
 
+    fn validate_close_with_jump_args(
+        sym: &Self::Sym,
+        meta: &Self::Meta,
+        _jump_args: &[OpRef],
+    ) -> bool {
+        Self::validate_close(sym, meta)
+    }
+
     fn materialize_virtual_ref(
         &mut self,
         _meta: &Self::Meta,
@@ -233,6 +247,61 @@ pub trait JitState: Sized {
         )
     }
 
+    fn restore_reconstructed_frames_with_resume_layout(
+        &mut self,
+        meta: &Self::Meta,
+        reconstructed_state: &ReconstructedState,
+        frame_layouts: Option<&[ResumeFrameLayoutSummary]>,
+        materialized_virtuals: &[MaterializedVirtual],
+        exception: &ExceptionState,
+    ) -> bool {
+        let total_frames = reconstructed_state.frames.len();
+        let can_use_generic_layout = total_frames == 1
+            || reconstructed_state
+                .frames
+                .iter()
+                .enumerate()
+                .any(|(frame_index, frame)| {
+                    frame.slot_types.as_ref().is_some()
+                        || self
+                            .reconstructed_frame_value_types_with_metadata(
+                                meta,
+                                frame_index,
+                                total_frames,
+                                frame,
+                            )
+                            .is_some()
+                        || frame_layouts
+                            .and_then(|layouts| layouts.get(frame_index))
+                            .filter(|layout| {
+                                layout.pc == frame.pc
+                                    && layout.slot_layouts.len() == frame.values.len()
+                            })
+                            .and_then(|layout| layout.slot_types.as_ref())
+                            .is_some()
+                });
+
+        if can_use_generic_layout {
+            let cache = self.materialize_virtual_refs(meta, materialized_virtuals);
+            if self.try_restore_reconstructed_frames_with_cache_and_layout(
+                meta,
+                reconstructed_state,
+                exception,
+                &cache,
+                frame_layouts,
+            ) {
+                return true;
+            }
+        }
+
+        self.restore_reconstructed_frames(
+            meta,
+            reconstructed_state,
+            materialized_virtuals,
+            exception,
+        )
+    }
+
     fn reconstructed_frame_value_types(
         &self,
         _meta: &Self::Meta,
@@ -241,6 +310,16 @@ pub trait JitState: Sized {
         _frame_pc: u64,
     ) -> Option<Vec<Type>> {
         None
+    }
+
+    fn reconstructed_frame_value_types_with_metadata(
+        &self,
+        meta: &Self::Meta,
+        frame_index: usize,
+        total_frames: usize,
+        frame: &crate::resume::ReconstructedFrame,
+    ) -> Option<Vec<Type>> {
+        self.reconstructed_frame_value_types(meta, frame_index, total_frames, frame.pc)
     }
 
     fn restore_reconstructed_frame_values(
@@ -255,12 +334,48 @@ pub trait JitState: Sized {
         false
     }
 
+    fn restore_reconstructed_frame_values_with_metadata(
+        &mut self,
+        meta: &Self::Meta,
+        frame_index: usize,
+        total_frames: usize,
+        frame: &crate::resume::ReconstructedFrame,
+        values: &[Value],
+        exception: &ExceptionState,
+    ) -> bool {
+        self.restore_reconstructed_frame_values(
+            meta,
+            frame_index,
+            total_frames,
+            frame.pc,
+            values,
+            exception,
+        )
+    }
+
     fn try_restore_reconstructed_frames_with_cache(
         &mut self,
         meta: &Self::Meta,
         reconstructed_state: &ReconstructedState,
         exception: &ExceptionState,
         materialized_refs: &[Option<GcRef>],
+    ) -> bool {
+        self.try_restore_reconstructed_frames_with_cache_and_layout(
+            meta,
+            reconstructed_state,
+            exception,
+            materialized_refs,
+            None,
+        )
+    }
+
+    fn try_restore_reconstructed_frames_with_cache_and_layout(
+        &mut self,
+        meta: &Self::Meta,
+        reconstructed_state: &ReconstructedState,
+        exception: &ExceptionState,
+        materialized_refs: &[Option<GcRef>],
+        frame_layouts: Option<&[ResumeFrameLayoutSummary]>,
     ) -> bool {
         if reconstructed_state.frames.is_empty() {
             return false;
@@ -269,25 +384,44 @@ pub trait JitState: Sized {
         let total_frames = reconstructed_state.frames.len();
         let mut used_generic = false;
         for (frame_index, frame) in reconstructed_state.frames.iter().enumerate() {
-            if let Some(types) =
-                self.reconstructed_frame_value_types(meta, frame_index, total_frames, frame.pc)
+            let layout_types = frame.slot_types.clone().or_else(|| {
+                frame_layouts
+                    .and_then(|layouts| layouts.get(frame_index))
+                    .filter(|layout| {
+                        layout.pc == frame.pc && layout.slot_layouts.len() == frame.values.len()
+                    })
+                    .and_then(|layout| layout.slot_types.clone())
+            });
+            if let Some(types) = self
+                .reconstructed_frame_value_types_with_metadata(
+                    meta,
+                    frame_index,
+                    total_frames,
+                    frame,
+                )
+                .or(layout_types)
             {
                 let Some(values) =
                     frame_values_from_reconstructed(&frame.values, &types, materialized_refs)
                 else {
                     return false;
                 };
-                if !self.restore_reconstructed_frame_values(
+                if self.restore_reconstructed_frame_values_with_metadata(
                     meta,
                     frame_index,
                     total_frames,
-                    frame.pc,
+                    frame,
                     &values,
                     exception,
                 ) {
-                    return false;
+                    used_generic = true;
+                    continue;
                 }
-                used_generic = true;
+                if total_frames == 1 && frame_index + 1 == total_frames {
+                    self.restore_values(meta, &values);
+                    return true;
+                }
+                return false;
             }
         }
 
@@ -296,7 +430,18 @@ pub trait JitState: Sized {
         }
 
         let frame = reconstructed_state.frames.last().expect("non-empty");
-        let types = self.live_value_types(meta);
+        let types = frame
+            .slot_types
+            .clone()
+            .or_else(|| {
+                frame_layouts
+                    .and_then(|layouts| layouts.last())
+                    .filter(|layout| {
+                        layout.pc == frame.pc && layout.slot_layouts.len() == frame.values.len()
+                    })
+                    .and_then(|layout| layout.slot_types.clone())
+            })
+            .unwrap_or_else(|| self.live_value_types(meta));
         if types.len() != frame.values.len() {
             return false;
         }
@@ -318,6 +463,27 @@ pub trait JitState: Sized {
         pending_field_writes: &[ResolvedPendingFieldWrite],
         exception: &ExceptionState,
     ) -> bool {
+        self.restore_guard_failure_with_resume_layout(
+            meta,
+            fail_values,
+            reconstructed_state,
+            None,
+            materialized_virtuals,
+            pending_field_writes,
+            exception,
+        )
+    }
+
+    fn restore_guard_failure_with_resume_layout(
+        &mut self,
+        meta: &Self::Meta,
+        fail_values: &[i64],
+        reconstructed_state: Option<&ReconstructedState>,
+        frame_layouts: Option<&[ResumeFrameLayoutSummary]>,
+        materialized_virtuals: &[MaterializedVirtual],
+        pending_field_writes: &[ResolvedPendingFieldWrite],
+        exception: &ExceptionState,
+    ) -> bool {
         if let Some(reconstructed_state) = reconstructed_state {
             let materialized_refs = self.materialize_virtual_refs(meta, materialized_virtuals);
             let total_frames = reconstructed_state.frames.len();
@@ -327,26 +493,49 @@ pub trait JitState: Sized {
                     .iter()
                     .enumerate()
                     .any(|(frame_index, frame)| {
-                        self.reconstructed_frame_value_types(
-                            meta,
-                            frame_index,
-                            total_frames,
-                            frame.pc,
-                        )
-                        .is_some()
+                        frame.slot_types.as_ref().is_some()
+                            || self
+                                .reconstructed_frame_value_types_with_metadata(
+                                    meta,
+                                    frame_index,
+                                    total_frames,
+                                    frame,
+                                )
+                                .is_some()
+                            || frame_layouts
+                                .and_then(|layouts| layouts.get(frame_index))
+                                .filter(|layout| {
+                                    layout.pc == frame.pc
+                                        && layout.slot_layouts.len() == frame.values.len()
+                                })
+                                .and_then(|layout| layout.slot_types.as_ref())
+                                .is_some()
                     });
 
             let restored = if can_use_generic_cache {
-                self.try_restore_reconstructed_frames_with_cache(
+                let restored = self.try_restore_reconstructed_frames_with_cache_and_layout(
                     meta,
                     reconstructed_state,
                     exception,
                     &materialized_refs,
-                )
+                    frame_layouts,
+                );
+                if restored {
+                    true
+                } else {
+                    self.restore_reconstructed_frames_with_resume_layout(
+                        meta,
+                        reconstructed_state,
+                        frame_layouts,
+                        materialized_virtuals,
+                        exception,
+                    )
+                }
             } else {
-                self.restore_reconstructed_frames(
+                self.restore_reconstructed_frames_with_resume_layout(
                     meta,
                     reconstructed_state,
+                    frame_layouts,
                     materialized_virtuals,
                     exception,
                 )
