@@ -26,6 +26,23 @@ pub struct RawExecResult {
     pub is_finish: bool,
 }
 
+/// Static layout metadata for a backend fail descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailDescrLayout {
+    /// Backend fail-index for this exit.
+    pub fail_index: u32,
+    /// Compiled trace identifier that owns this exit.
+    pub trace_id: u64,
+    /// Typed layout of the exit slots.
+    pub fail_arg_types: Vec<Type>,
+    /// Whether this exit is a FINISH rather than a guard failure.
+    pub is_finish: bool,
+    /// Exit slot indices that hold rooted GC references.
+    pub gc_ref_slots: Vec<usize>,
+    /// Exit slot indices that carry opaque FORCE_TOKEN handles.
+    pub force_token_slots: Vec<usize>,
+}
+
 /// Result of compiling a loop or bridge.
 #[derive(Debug)]
 pub struct AsmInfo {
@@ -170,6 +187,21 @@ pub trait Backend: Send {
     fn execute_token_ints_raw(&self, token: &LoopToken, args: &[i64]) -> RawExecResult {
         let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
         self.execute_token_raw(token, &values)
+    }
+
+    /// Inspect static exit layouts for a compiled loop token.
+    fn compiled_fail_descr_layouts(&self, _token: &LoopToken) -> Option<Vec<FailDescrLayout>> {
+        None
+    }
+
+    /// Inspect static exit layouts for a bridge attached to a source guard.
+    fn compiled_bridge_fail_descr_layouts(
+        &self,
+        _original_token: &LoopToken,
+        _source_trace_id: u64,
+        _source_fail_index: u32,
+    ) -> Option<Vec<FailDescrLayout>> {
+        None
     }
 
     /// Force a frame identified by a `FORCE_TOKEN` result.

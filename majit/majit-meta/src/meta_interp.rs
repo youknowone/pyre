@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use majit_codegen::{Backend, LoopToken};
+use majit_codegen::{Backend, FailDescrLayout, LoopToken};
 use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{OpCode, OpRef, Type, Value};
+use majit_ir::{GcRef, InputArg, OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
 use majit_trace::trace::Trace;
 use majit_trace::warmstate::{HotResult, WarmState};
@@ -11,9 +11,9 @@ use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionS
 use crate::io_buffer;
 use crate::resume::{
     EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
-    ResumeData, ResumeDataBuilder,
+    ResumeData, ResumeDataBuilder, ResumeDataLoopMemo, ResumeLayoutSummary,
 };
-use crate::trace_ctx::TraceCtx;
+use crate::trace_ctx::{JitDriverDescriptor, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 
 /// Result of checking a back-edge.
@@ -31,6 +31,24 @@ pub enum BackEdgeAction {
 /// Detailed result from running compiled code, including guard failure info.
 ///
 /// Mirrors RPython's handle_guard_failure in pyjitpl.py.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledExitLayout {
+    /// Compiled trace identifier for this exit (root loop or bridge).
+    pub trace_id: u64,
+    /// Backend fail-index for this exit.
+    pub fail_index: u32,
+    /// Typed layout of the raw exit slots produced by the backend.
+    pub exit_types: Vec<Type>,
+    /// Whether this exit is a FINISH rather than a guard failure.
+    pub is_finish: bool,
+    /// Exit slot indices that hold rooted GC references.
+    pub gc_ref_slots: Vec<usize>,
+    /// Exit slot indices that carry opaque FORCE_TOKEN handles.
+    pub force_token_slots: Vec<usize>,
+    /// Compact resume/jitframe layout attached to this exit, when available.
+    pub resume_layout: Option<ResumeLayoutSummary>,
+}
+
 pub struct CompileResult<'a, M> {
     /// The live values at the point of guard failure (or loop finish).
     pub values: Vec<i64>,
@@ -44,6 +62,8 @@ pub struct CompileResult<'a, M> {
     pub trace_id: u64,
     /// Whether this exit is a FINISH rather than a guard failure.
     pub is_finish: bool,
+    /// Static layout metadata for this compiled exit.
+    pub exit_layout: CompiledExitLayout,
     /// Pending exception state captured from the backend deadframe.
     pub exception: ExceptionState,
 }
@@ -57,6 +77,8 @@ struct GuardFailureInfo {
 }
 
 struct CompiledTrace {
+    /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
+    inputargs: Vec<InputArg>,
     /// Resume data for each guard, keyed by fail_index.
     resume_data: HashMap<u32, StoredResumeData>,
     /// Optimized ops for blackhole fallback from compiled guard failures.
@@ -65,17 +87,60 @@ struct CompiledTrace {
     constants: HashMap<u32, i64>,
     /// Mapping from backend fail_index to the corresponding guard op index.
     guard_op_indices: HashMap<u32, usize>,
+    /// Static exit metadata for each guard/finish in this trace.
+    exit_layouts: HashMap<u32, StoredExitLayout>,
+    /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
+    terminal_exit_layouts: HashMap<usize, StoredExitLayout>,
 }
 
 struct StoredResumeData {
     semantic: ResumeData,
     encoded: EncodedResumeData,
+    layout: ResumeLayoutSummary,
 }
 
 impl StoredResumeData {
     fn new(semantic: ResumeData) -> Self {
         let encoded = semantic.encode();
-        StoredResumeData { semantic, encoded }
+        let layout = encoded.layout_summary();
+        StoredResumeData {
+            semantic,
+            encoded,
+            layout,
+        }
+    }
+
+    fn with_loop_memo(semantic: ResumeData, memo: &mut ResumeDataLoopMemo) -> Self {
+        let encoded = memo.encode_shared(&semantic);
+        let layout = encoded.layout_summary();
+        StoredResumeData {
+            semantic,
+            encoded,
+            layout,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredExitLayout {
+    exit_types: Vec<Type>,
+    is_finish: bool,
+    gc_ref_slots: Vec<usize>,
+    force_token_slots: Vec<usize>,
+    resume_layout: Option<ResumeLayoutSummary>,
+}
+
+impl StoredExitLayout {
+    fn public(&self, trace_id: u64, fail_index: u32) -> CompiledExitLayout {
+        CompiledExitLayout {
+            trace_id,
+            fail_index,
+            exit_types: self.exit_types.clone(),
+            is_finish: self.is_finish,
+            gc_ref_slots: self.gc_ref_slots.clone(),
+            force_token_slots: self.force_token_slots.clone(),
+            resume_layout: self.resume_layout.clone(),
+        }
     }
 }
 
@@ -161,6 +226,30 @@ impl<M: Clone> MetaInterp<M> {
             .traces
             .get(&trace_id)
             .map(|trace| (trace_id, trace))
+    }
+
+    fn compiled_exit_layout_from_trace(
+        trace: &CompiledTrace,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<CompiledExitLayout> {
+        trace
+            .exit_layouts
+            .get(&fail_index)
+            .map(|layout| layout.public(trace_id, fail_index))
+    }
+
+    fn terminal_exit_layout_from_trace(
+        trace: &CompiledTrace,
+        trace_id: u64,
+        op_index: usize,
+    ) -> Option<CompiledExitLayout> {
+        trace.terminal_exit_layouts.get(&op_index).map(|layout| {
+            layout.public(
+                trace_id,
+                find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
+            )
+        })
     }
 
     /// Create a new MetaInterp with the given compilation threshold.
@@ -252,6 +341,17 @@ impl<M: Clone> MetaInterp<M> {
     /// as an InputArg. The interpreter should then build its symbolic state
     /// from the returned InputArg OpRefs (OpRef(0), OpRef(1), ...).
     pub fn on_back_edge(&mut self, green_key: u64, live_values: &[i64]) -> BackEdgeAction {
+        let typed_values: Vec<Value> = live_values.iter().copied().map(Value::Int).collect();
+        self.on_back_edge_typed(green_key, None, None, &typed_values)
+    }
+
+    pub fn on_back_edge_typed(
+        &mut self,
+        green_key: u64,
+        green_key_values: Option<majit_ir::GreenKey>,
+        driver_descriptor: Option<JitDriverDescriptor>,
+        live_values: &[Value],
+    ) -> BackEdgeAction {
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -259,9 +359,8 @@ impl<M: Clone> MetaInterp<M> {
         match self.warm_state.maybe_compile(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing(mut recorder) => {
-                // Register all live values as InputArgs
-                for _ in live_values {
-                    recorder.record_input_arg(Type::Int);
+                for value in live_values {
+                    recorder.record_input_arg(value.get_type());
                 }
 
                 if crate::majit_log_enabled() {
@@ -272,7 +371,15 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
 
-                self.tracing = Some(TraceCtx::new(recorder, green_key));
+                let mut ctx = if let Some(values) = green_key_values {
+                    TraceCtx::with_green_key(recorder, green_key, values)
+                } else {
+                    TraceCtx::new(recorder, green_key)
+                };
+                if let Some(descriptor) = driver_descriptor {
+                    ctx.set_driver_descriptor(descriptor);
+                }
+                self.tracing = Some(ctx);
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
                 }
@@ -362,17 +469,25 @@ impl<M: Clone> MetaInterp<M> {
                         trace.inputargs.len()
                     );
                 }
-                // Build resume data for all guards in the optimized trace.
-                let (resume_data, guard_op_indices) =
-                    build_guard_metadata(&optimized_ops, green_key);
+                // Build resume data and exit layouts for all guards in the optimized trace.
+                let (resume_data, guard_op_indices, mut exit_layouts) =
+                    build_guard_metadata(&trace.inputargs, &optimized_ops, green_key);
+                let terminal_exit_layouts =
+                    build_terminal_exit_layouts(&trace.inputargs, &optimized_ops);
+                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
+                    merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                }
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
+                        inputargs: trace.inputargs.clone(),
                         resume_data,
                         ops: optimized_ops,
                         constants: compiled_constants,
                         guard_op_indices,
+                        exit_layouts,
+                        terminal_exit_layouts,
                     },
                 );
 
@@ -628,6 +743,23 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types = descr.fail_arg_types();
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
+        let exit_layout = Self::trace_for_exit(compiled, trace_id)
+            .and_then(|(trace_id, trace)| {
+                Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
+            })
+            .unwrap_or_else(|| CompiledExitLayout {
+                trace_id,
+                fail_index,
+                exit_types: exit_types.to_vec(),
+                is_finish,
+                gc_ref_slots: exit_types
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
+                    .collect(),
+                force_token_slots: descr.force_token_slots().to_vec(),
+                resume_layout: None,
+            });
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {
@@ -665,6 +797,7 @@ impl<M: Clone> MetaInterp<M> {
             fail_index,
             trace_id,
             is_finish,
+            exit_layout,
             exception,
         })
     }
@@ -721,6 +854,72 @@ impl<M: Clone> MetaInterp<M> {
             .resume_data
             .get(&fail_index)
             .map(|data| &data.semantic)
+    }
+
+    /// Get a compact resume layout summary for a specific guard failure.
+    pub fn get_resume_layout(
+        &self,
+        green_key: u64,
+        fail_index: u32,
+    ) -> Option<&ResumeLayoutSummary> {
+        let trace_id = self.compiled_loops.get(&green_key)?.root_trace_id;
+        self.get_resume_layout_in_trace(green_key, trace_id, fail_index)
+    }
+
+    /// Get a compact resume layout summary for a specific guard failure in a specific trace.
+    pub fn get_resume_layout_in_trace(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<&ResumeLayoutSummary> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let (_, trace) = Self::trace_for_exit(compiled, trace_id)?;
+        trace.resume_data.get(&fail_index).map(|data| &data.layout)
+    }
+
+    /// Get the full static layout for a compiled exit in the root trace.
+    pub fn get_compiled_exit_layout(
+        &self,
+        green_key: u64,
+        fail_index: u32,
+    ) -> Option<CompiledExitLayout> {
+        let trace_id = self.compiled_loops.get(&green_key)?.root_trace_id;
+        self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
+    }
+
+    /// Get the full static layout for a compiled exit in a specific trace.
+    pub fn get_compiled_exit_layout_in_trace(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<CompiledExitLayout> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
+        Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
+    }
+
+    /// Get the full static layout for a terminal FINISH/JUMP op in the root trace.
+    pub fn get_terminal_exit_layout(
+        &self,
+        green_key: u64,
+        op_index: usize,
+    ) -> Option<CompiledExitLayout> {
+        let trace_id = self.compiled_loops.get(&green_key)?.root_trace_id;
+        self.get_terminal_exit_layout_in_trace(green_key, trace_id, op_index)
+    }
+
+    /// Get the full static layout for a terminal FINISH/JUMP op in a specific trace.
+    pub fn get_terminal_exit_layout_in_trace(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        op_index: usize,
+    ) -> Option<CompiledExitLayout> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
+        Self::terminal_exit_layout_from_trace(trace, trace_id, op_index)
     }
 
     /// Check whether a guard has failed enough times to warrant bridge compilation.
@@ -896,15 +1095,27 @@ impl<M: Clone> MetaInterp<M> {
                             bridge_compiled: false,
                         })
                         .bridge_compiled = true;
-                    let (resume_data, guard_op_indices) =
-                        build_guard_metadata(&optimized_ops, green_key);
+                    let (resume_data, guard_op_indices, mut exit_layouts) =
+                        build_guard_metadata(bridge_inputargs, &optimized_ops, green_key);
+                    let terminal_exit_layouts =
+                        build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
+                    if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
+                        &compiled.token,
+                        source_trace_id,
+                        fail_index,
+                    ) {
+                        merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                    }
                     compiled.traces.insert(
                         bridge_trace_id,
                         CompiledTrace {
+                            inputargs: bridge_inputargs.to_vec(),
                             resume_data,
                             ops: optimized_ops,
                             constants: compiled_constants,
                             guard_op_indices,
+                            exit_layouts,
+                            terminal_exit_layouts,
                         },
                     );
                 }
@@ -1022,6 +1233,29 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
+        let exit_layout = Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
+            .unwrap_or_else(|| CompiledExitLayout {
+                trace_id,
+                fail_index,
+                exit_types: typed_fail_values
+                    .map(|values| values.iter().map(Value::get_type).collect())
+                    .unwrap_or_default(),
+                is_finish: false,
+                gc_ref_slots: typed_fail_values
+                    .map(|values| {
+                        values
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, value)| {
+                                (value.get_type() == Type::Ref).then_some(slot)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                force_token_slots: Vec::new(),
+                resume_layout: None,
+            });
+        let resume_layout = exit_layout.resume_layout.clone();
         let reconstructed = reconstructed_state
             .as_ref()
             .map(|state| state.frames.clone());
@@ -1049,8 +1283,10 @@ impl<M: Clone> MetaInterp<M> {
         Some(GuardRecovery {
             trace_id,
             fail_index,
+            exit_layout,
             fail_values: fail_values.to_vec(),
             typed_fail_values: typed_fail_values.map(|values| values.to_vec()),
+            resume_layout,
             reconstructed_frames: reconstructed,
             reconstructed_state,
             materialized_virtuals,
@@ -1140,6 +1376,7 @@ impl<M: Clone> MetaInterp<M> {
         let is_finish = result.is_finish;
         let values = result.values.clone();
         let typed_values = result.typed_values.clone();
+        let compiled_exit_layout = result.exit_layout.clone();
         let exception = result.exception.clone();
         let meta = result.meta.clone();
 
@@ -1147,6 +1384,7 @@ impl<M: Clone> MetaInterp<M> {
             return Some(BlackholeRunResult::Finished {
                 values,
                 typed_values: Some(typed_values),
+                exit_layout: Some(compiled_exit_layout),
                 meta,
                 via_blackhole: false,
                 exception,
@@ -1174,6 +1412,7 @@ impl<M: Clone> MetaInterp<M> {
                 fail_index,
                 fail_values: values,
                 typed_fail_values: Some(typed_values),
+                exit_layout: Some(compiled_exit_layout),
                 meta,
                 recovery: initial_recovery,
                 materialized_virtuals: Vec::new(),
@@ -1184,19 +1423,42 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         match blackhole_result {
-            BlackholeResult::Finish(values) => Some(BlackholeRunResult::Finished {
-                values,
-                typed_values: None,
-                meta,
-                via_blackhole: true,
-                exception: blackhole_exception,
-            }),
-            BlackholeResult::Jump(values) => Some(BlackholeRunResult::Jump {
-                values,
-                typed_values: None,
-                meta,
-                exception: blackhole_exception,
-            }),
+            BlackholeResult::Finish { op_index, values } => {
+                let exit_layout = {
+                    let compiled = self.compiled_loops.get(&green_key)?;
+                    let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
+                    terminal_exit_layout_for_trace(trace, terminal_trace_id, op_index)
+                };
+                let typed_values = exit_layout
+                    .as_ref()
+                    .map(|layout| decode_values_with_layout(&values, layout));
+                Some(BlackholeRunResult::Finished {
+                    values,
+                    typed_values,
+                    exit_layout,
+                    meta,
+                    via_blackhole: true,
+                    exception: blackhole_exception,
+                })
+            }
+            BlackholeResult::Jump { op_index, values } => {
+                let exit_layout = {
+                    let compiled = self.compiled_loops.get(&green_key)?;
+                    let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
+                    terminal_exit_layout_for_trace(trace, terminal_trace_id, op_index)
+                };
+                let typed_values = exit_layout
+                    .as_ref()
+                    .map(|layout| decode_values_with_layout(&values, layout));
+                Some(BlackholeRunResult::Jump {
+                    values,
+                    typed_values,
+                    exit_layout,
+                    meta,
+                    via_blackhole: true,
+                    exception: blackhole_exception,
+                })
+            }
             BlackholeResult::GuardFailed {
                 guard_index,
                 fail_values,
@@ -1204,6 +1466,8 @@ impl<M: Clone> MetaInterp<M> {
                 let (
                     fallback_trace_id,
                     fallback_fail_index,
+                    exit_layout,
+                    typed_fail_values,
                     materialized_virtuals,
                     pending_field_writes,
                 ) = {
@@ -1228,9 +1492,16 @@ impl<M: Clone> MetaInterp<M> {
                                 .resolve_pending_field_writes(&fail_values)
                         })
                         .unwrap_or_default();
+                    let exit_layout =
+                        Self::compiled_exit_layout_from_trace(trace, trace_id, fallback_fail_index);
+                    let typed_fail_values = exit_layout
+                        .as_ref()
+                        .map(|layout| decode_values_with_layout(&fail_values, layout));
                     (
                         trace_id,
                         fallback_fail_index,
+                        exit_layout,
+                        typed_fail_values,
                         materialized_virtuals,
                         pending_field_writes,
                     )
@@ -1240,14 +1511,15 @@ impl<M: Clone> MetaInterp<M> {
                     fallback_trace_id,
                     fallback_fail_index,
                     &fail_values,
-                    None,
+                    typed_fail_values.as_deref(),
                     blackhole_exception.clone(),
                 );
                 Some(BlackholeRunResult::GuardFailure {
                     trace_id: fallback_trace_id,
                     fail_index: fallback_fail_index,
                     fail_values,
-                    typed_fail_values: None,
+                    typed_fail_values,
+                    exit_layout,
                     meta,
                     recovery,
                     materialized_virtuals,
@@ -1262,7 +1534,7 @@ impl<M: Clone> MetaInterp<M> {
                 materialized_virtuals,
                 pending_field_writes,
             } => {
-                let (fallback_trace_id, fallback_fail_index) = {
+                let (fallback_trace_id, fallback_fail_index, exit_layout, typed_fail_values) = {
                     let compiled = self.compiled_loops.get(&green_key)?;
                     let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
                     let fallback_fail_index = trace
@@ -1270,21 +1542,32 @@ impl<M: Clone> MetaInterp<M> {
                         .iter()
                         .find_map(|(&idx, &op_index)| (op_index == guard_index).then_some(idx))
                         .unwrap_or(fail_index);
-                    (trace_id, fallback_fail_index)
+                    let exit_layout =
+                        Self::compiled_exit_layout_from_trace(trace, trace_id, fallback_fail_index);
+                    let typed_fail_values = exit_layout
+                        .as_ref()
+                        .map(|layout| decode_values_with_layout(&fail_values, layout));
+                    (
+                        trace_id,
+                        fallback_fail_index,
+                        exit_layout,
+                        typed_fail_values,
+                    )
                 };
                 let recovery = self.handle_guard_failure_in_trace(
                     green_key,
                     fallback_trace_id,
                     fallback_fail_index,
                     &fail_values,
-                    None,
+                    typed_fail_values.as_deref(),
                     blackhole_exception.clone(),
                 );
                 Some(BlackholeRunResult::GuardFailure {
                     trace_id: fallback_trace_id,
                     fail_index: fallback_fail_index,
                     fail_values,
-                    typed_fail_values: None,
+                    typed_fail_values,
+                    exit_layout,
                     meta,
                     recovery,
                     materialized_virtuals,
@@ -1298,6 +1581,7 @@ impl<M: Clone> MetaInterp<M> {
                 fail_index,
                 fail_values: values,
                 typed_fail_values: Some(typed_values),
+                exit_layout: Some(compiled_exit_layout),
                 meta,
                 recovery: initial_recovery,
                 message,
@@ -1451,10 +1735,14 @@ pub struct GuardRecovery {
     pub trace_id: u64,
     /// Index of the failed guard.
     pub fail_index: u32,
+    /// Static layout metadata for this compiled exit.
+    pub exit_layout: CompiledExitLayout,
     /// Raw fail_values from the DeadFrame.
     pub fail_values: Vec<i64>,
     /// Typed fail values decoded from the backend deadframe, when available.
     pub typed_fail_values: Option<Vec<Value>>,
+    /// Compact resume/jitframe layout for this exit, when available.
+    pub resume_layout: Option<ResumeLayoutSummary>,
     /// Reconstructed interpreter frames (if resume data was available).
     pub reconstructed_frames: Option<Vec<crate::resume::ReconstructedFrame>>,
     /// Full reconstructed state, including materialized virtuals.
@@ -1502,6 +1790,7 @@ pub enum BlackholeRunResult<M> {
     Finished {
         values: Vec<i64>,
         typed_values: Option<Vec<Value>>,
+        exit_layout: Option<CompiledExitLayout>,
         meta: M,
         via_blackhole: bool,
         exception: ExceptionState,
@@ -1510,7 +1799,9 @@ pub enum BlackholeRunResult<M> {
     Jump {
         values: Vec<i64>,
         typed_values: Option<Vec<Value>>,
+        exit_layout: Option<CompiledExitLayout>,
         meta: M,
+        via_blackhole: bool,
         exception: ExceptionState,
     },
     /// Execution still ended in a guard failure.
@@ -1519,6 +1810,7 @@ pub enum BlackholeRunResult<M> {
         fail_index: u32,
         fail_values: Vec<i64>,
         typed_fail_values: Option<Vec<Value>>,
+        exit_layout: Option<CompiledExitLayout>,
         meta: M,
         recovery: Option<GuardRecovery>,
         materialized_virtuals: Vec<MaterializedVirtual>,
@@ -1532,11 +1824,20 @@ pub enum BlackholeRunResult<M> {
         fail_index: u32,
         fail_values: Vec<i64>,
         typed_fail_values: Option<Vec<Value>>,
+        exit_layout: Option<CompiledExitLayout>,
         meta: M,
         recovery: Option<GuardRecovery>,
         message: String,
         exception: ExceptionState,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverRunOutcome {
+    Finished { via_blackhole: bool },
+    Jump { via_blackhole: bool },
+    GuardFailure { restored: bool, via_blackhole: bool },
+    Abort { restored: bool, via_blackhole: bool },
 }
 
 /// Build guard metadata for a compiled trace.
@@ -1545,14 +1846,27 @@ pub enum BlackholeRunResult<M> {
 /// helper mirrors that numbering and records only the guard entries that need
 /// resume data plus the corresponding op index for blackhole fallback.
 fn build_guard_metadata(
+    inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     pc: u64,
-) -> (HashMap<u32, StoredResumeData>, HashMap<u32, usize>) {
+) -> (
+    HashMap<u32, StoredResumeData>,
+    HashMap<u32, usize>,
+    HashMap<u32, StoredExitLayout>,
+) {
     let mut result = HashMap::new();
     let mut guard_op_indices = HashMap::new();
+    let mut exit_layouts = HashMap::new();
     let mut fail_index = 0u32;
+    let mut resume_memo = ResumeDataLoopMemo::new();
+    let mut value_types: HashMap<u32, Type> =
+        inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
 
     for (op_idx, op) in ops.iter().enumerate() {
+        if !op.pos.is_none() && op.result_type() != Type::Void {
+            value_types.insert(op.pos.0, op.result_type());
+        }
+
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         if !is_guard && !is_finish {
@@ -1562,7 +1876,22 @@ fn build_guard_metadata(
         if is_guard {
             guard_op_indices.insert(fail_index, op_idx);
         }
-        // Guards that have fail_args produce resume data.
+
+        let exit_types: Vec<Type> = if is_finish {
+            op.args
+                .iter()
+                .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                .collect()
+        } else if let Some(ref fail_args) = op.fail_args {
+            fail_args
+                .iter()
+                .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                .collect()
+        } else {
+            inputargs.iter().map(|arg| arg.tp).collect()
+        };
+
+        let mut resume_layout = None;
         if is_guard {
             if let Some(ref fail_args) = op.fail_args {
                 let mut builder = ResumeDataBuilder::new();
@@ -1572,13 +1901,189 @@ fn build_guard_metadata(
                     builder.map_slot(slot_idx, slot_idx);
                 }
 
-                result.insert(fail_index, StoredResumeData::new(builder.build()));
+                let stored = StoredResumeData::with_loop_memo(builder.build(), &mut resume_memo);
+                resume_layout = Some(stored.layout.clone());
+                result.insert(fail_index, stored);
             }
         }
+
+        exit_layouts.insert(
+            fail_index,
+            StoredExitLayout {
+                gc_ref_slots: exit_types
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, tp)| (*tp == Type::Ref).then_some(slot))
+                    .collect(),
+                force_token_slots: Vec::new(),
+                exit_types,
+                is_finish,
+                resume_layout,
+            },
+        );
         fail_index += 1;
     }
 
-    (result, guard_op_indices)
+    (result, guard_op_indices, exit_layouts)
+}
+
+fn merge_backend_exit_layouts(
+    exit_layouts: &mut HashMap<u32, StoredExitLayout>,
+    backend_layouts: &[FailDescrLayout],
+) {
+    for layout in backend_layouts {
+        let entry = exit_layouts
+            .entry(layout.fail_index)
+            .or_insert_with(|| StoredExitLayout {
+                exit_types: layout.fail_arg_types.clone(),
+                is_finish: layout.is_finish,
+                gc_ref_slots: layout.gc_ref_slots.clone(),
+                force_token_slots: layout.force_token_slots.clone(),
+                resume_layout: None,
+            });
+        entry.exit_types = layout.fail_arg_types.clone();
+        entry.is_finish = layout.is_finish;
+        entry.gc_ref_slots = layout.gc_ref_slots.clone();
+        entry.force_token_slots = layout.force_token_slots.clone();
+    }
+}
+
+fn build_trace_value_maps(
+    inputargs: &[InputArg],
+    ops: &[majit_ir::Op],
+) -> (HashMap<u32, Type>, HashMap<u32, OpCode>) {
+    let mut value_types: HashMap<u32, Type> =
+        inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
+    let mut producers = HashMap::new();
+    for op in ops {
+        if !op.pos.is_none() && op.result_type() != Type::Void {
+            value_types.insert(op.pos.0, op.result_type());
+            producers.insert(op.pos.0, op.opcode);
+        }
+    }
+    (value_types, producers)
+}
+
+fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize) -> Option<u32> {
+    let mut fail_index = 0u32;
+    for (idx, op) in ops.iter().enumerate() {
+        if op.opcode.is_guard() || op.opcode == OpCode::Finish {
+            if idx == op_index {
+                return Some(fail_index);
+            }
+            fail_index += 1;
+        }
+    }
+    None
+}
+
+fn infer_terminal_exit_layout(
+    inputargs: &[InputArg],
+    ops: &[majit_ir::Op],
+    trace_id: u64,
+    op_index: usize,
+) -> Option<CompiledExitLayout> {
+    let op = ops.get(op_index)?;
+    let is_finish = op.opcode == OpCode::Finish;
+    if !is_finish && op.opcode != OpCode::Jump {
+        return None;
+    }
+    let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
+    let (value_types, producers) = build_trace_value_maps(inputargs, ops);
+    let exit_types: Vec<Type> = op
+        .args
+        .iter()
+        .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+        .collect();
+    let force_token_slots: Vec<usize> = op
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, opref)| {
+            producers
+                .get(&opref.0)
+                .copied()
+                .filter(|opcode| *opcode == OpCode::ForceToken)
+                .map(|_| slot)
+        })
+        .collect();
+    let gc_ref_slots: Vec<usize> = exit_types
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, tp)| {
+            (*tp == Type::Ref && !force_token_slots.contains(&slot)).then_some(slot)
+        })
+        .collect();
+    Some(CompiledExitLayout {
+        trace_id,
+        fail_index,
+        exit_types,
+        is_finish,
+        gc_ref_slots,
+        force_token_slots,
+        resume_layout: None,
+    })
+}
+
+fn build_terminal_exit_layouts(
+    inputargs: &[InputArg],
+    ops: &[majit_ir::Op],
+) -> HashMap<usize, StoredExitLayout> {
+    let mut layouts = HashMap::new();
+    for (op_index, op) in ops.iter().enumerate() {
+        if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
+            continue;
+        }
+        if let Some(layout) = infer_terminal_exit_layout(inputargs, ops, 0, op_index) {
+            layouts.insert(
+                op_index,
+                StoredExitLayout {
+                    exit_types: layout.exit_types,
+                    is_finish: layout.is_finish,
+                    gc_ref_slots: layout.gc_ref_slots,
+                    force_token_slots: layout.force_token_slots,
+                    resume_layout: None,
+                },
+            );
+        }
+    }
+    layouts
+}
+
+fn terminal_exit_layout_for_trace(
+    trace: &CompiledTrace,
+    trace_id: u64,
+    op_index: usize,
+) -> Option<CompiledExitLayout> {
+    if let Some(layout) = trace.terminal_exit_layouts.get(&op_index) {
+        return Some(layout.public(
+            trace_id,
+            find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
+        ));
+    }
+    if let Some(fail_index) = find_fail_index_for_exit_op(&trace.ops, op_index) {
+        if let Some(layout) = trace.exit_layouts.get(&fail_index) {
+            return Some(layout.public(trace_id, fail_index));
+        }
+    }
+    infer_terminal_exit_layout(&trace.inputargs, &trace.ops, trace_id, op_index)
+}
+
+fn decode_values_with_layout(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
+    layout
+        .exit_types
+        .iter()
+        .enumerate()
+        .map(|(index, tp)| {
+            let raw = raw_values.get(index).copied().unwrap_or(0);
+            match tp {
+                Type::Int => Value::Int(raw),
+                Type::Ref => Value::Ref(GcRef(raw as usize)),
+                Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                Type::Void => Value::Void,
+            }
+        })
+        .collect()
 }
 
 /// Decision about how to handle a function call during tracing.
@@ -1621,15 +2126,23 @@ mod tests {
         meta.backend
             .compile_loop(inputargs, &ops, &mut token)
             .expect("loop should compile");
-        let (resume_data, guard_op_indices) = build_guard_metadata(&ops, green_key);
+        let (resume_data, guard_op_indices, mut exit_layouts) =
+            build_guard_metadata(inputargs, &ops, green_key);
+        let terminal_exit_layouts = build_terminal_exit_layouts(inputargs, &ops);
+        if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
+            merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+        }
         let mut traces = HashMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
+                inputargs: inputargs.to_vec(),
                 resume_data,
                 ops,
                 constants,
                 guard_op_indices,
+                exit_layouts,
+                terminal_exit_layouts,
             },
         );
 
@@ -1658,10 +2171,13 @@ mod tests {
         traces.insert(
             trace_id,
             CompiledTrace {
+                inputargs: Vec::new(),
                 resume_data,
                 ops: Vec::new(),
                 constants: HashMap::new(),
                 guard_op_indices: HashMap::new(),
+                exit_layouts: HashMap::new(),
+                terminal_exit_layouts: HashMap::new(),
             },
         );
 
@@ -1709,6 +2225,119 @@ mod tests {
     }
 
     #[test]
+    fn test_get_compiled_exit_layout_in_trace_reports_exit_and_resume_shape() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 70;
+        let fail_index = 3;
+        let trace_id = meta.alloc_trace_id();
+        let stored = StoredResumeData::new(ResumeData {
+            frames: vec![crate::resume::FrameInfo {
+                pc: 111,
+                slot_map: vec![
+                    FrameSlotSource::FailArg(4),
+                    crate::resume::FrameSlotSource::Constant(55),
+                ],
+            }],
+            virtuals: vec![crate::resume::VirtualInfo::VStruct {
+                type_id: 0,
+                descr_index: 9,
+                fields: vec![(0, crate::resume::VirtualFieldSource::FailArg(4))],
+            }],
+            pending_fields: vec![crate::resume::PendingFieldInfo {
+                descr_index: 12,
+                target: crate::resume::ResumeValueSource::FailArg(1),
+                value: crate::resume::ResumeValueSource::Constant(77),
+                item_index: Some(3),
+            }],
+        });
+        let expected_layout = stored.layout.clone();
+        let mut resume_data = HashMap::new();
+        resume_data.insert(fail_index, stored);
+        let mut exit_layouts = HashMap::new();
+        exit_layouts.insert(
+            fail_index,
+            StoredExitLayout {
+                exit_types: vec![Type::Ref, Type::Int],
+                is_finish: false,
+                gc_ref_slots: vec![0],
+                force_token_slots: Vec::new(),
+                resume_layout: Some(expected_layout.clone()),
+            },
+        );
+        let mut traces = HashMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                inputargs: Vec::new(),
+                resume_data,
+                ops: Vec::new(),
+                constants: HashMap::new(),
+                guard_op_indices: HashMap::new(),
+                exit_layouts,
+                terminal_exit_layouts: HashMap::new(),
+            },
+        );
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: LoopToken::new(100),
+                num_inputs: 2,
+                meta: (),
+                root_trace_id: trace_id,
+                guard_failures: HashMap::new(),
+                traces,
+            },
+        );
+
+        let layout = meta
+            .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
+            .expect("compiled exit layout should exist");
+        assert_eq!(layout.trace_id, trace_id);
+        assert_eq!(layout.fail_index, fail_index);
+        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Int]);
+        assert!(!layout.is_finish);
+        assert_eq!(layout.gc_ref_slots, vec![0]);
+        assert!(layout.force_token_slots.is_empty());
+        assert_eq!(layout.resume_layout, Some(expected_layout.clone()));
+
+        let resume_layout = meta
+            .get_resume_layout_in_trace(green_key, trace_id, fail_index)
+            .expect("resume layout should exist");
+        assert_eq!(resume_layout, &expected_layout);
+    }
+
+    #[test]
+    fn test_merge_backend_exit_layouts_overrides_gc_and_force_token_slots() {
+        let mut exit_layouts = HashMap::new();
+        exit_layouts.insert(
+            0,
+            StoredExitLayout {
+                exit_types: vec![Type::Ref],
+                is_finish: false,
+                gc_ref_slots: vec![0],
+                force_token_slots: Vec::new(),
+                resume_layout: None,
+            },
+        );
+
+        merge_backend_exit_layouts(
+            &mut exit_layouts,
+            &[FailDescrLayout {
+                fail_index: 0,
+                trace_id: 99,
+                fail_arg_types: vec![Type::Ref],
+                is_finish: false,
+                gc_ref_slots: Vec::new(),
+                force_token_slots: vec![0],
+            }],
+        );
+
+        let layout = exit_layouts.get(&0).expect("layout should exist");
+        assert!(layout.gc_ref_slots.is_empty());
+        assert_eq!(layout.force_token_slots, vec![0]);
+    }
+
+    #[test]
     fn test_handle_guard_failure_reconstructs_pending_field_writes() {
         let mut meta = MetaInterp::<()>::new(10);
         let green_key = 17;
@@ -1735,10 +2364,13 @@ mod tests {
         traces.insert(
             trace_id,
             CompiledTrace {
+                inputargs: Vec::new(),
                 resume_data,
                 ops: Vec::new(),
                 constants: HashMap::new(),
                 guard_op_indices: HashMap::new(),
+                exit_layouts: HashMap::new(),
+                terminal_exit_layouts: HashMap::new(),
             },
         );
         meta.compiled_loops.insert(
@@ -1761,8 +2393,8 @@ mod tests {
             recovery.pending_field_writes,
             vec![ResolvedPendingFieldWrite {
                 descr_index: 12,
-                target: 123,
-                value: 99,
+                target: crate::resume::MaterializedValue::Value(123),
+                value: crate::resume::MaterializedValue::Value(99),
                 item_index: Some(4),
             }]
         );
@@ -1831,6 +2463,41 @@ mod tests {
     }
 
     #[test]
+    fn test_run_with_blackhole_fallback_infers_typed_finish_values_from_trace_layout() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 19;
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                guard
+            },
+            mk_op(OpCode::CastIntToFloat, &[OpRef(0)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+
+        match meta.run_with_blackhole_fallback(green_key, &[1]) {
+            Some(BlackholeRunResult::Finished {
+                typed_values,
+                exit_layout,
+                via_blackhole,
+                ..
+            }) => {
+                assert!(via_blackhole);
+                assert_eq!(typed_values, Some(vec![Value::Float(1.0)]));
+                let exit_layout = exit_layout.expect("finish exit layout should be inferred");
+                assert_eq!(exit_layout.exit_types, vec![Type::Float]);
+                assert!(exit_layout.gc_ref_slots.is_empty());
+            }
+            other => panic!("expected typed blackhole Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_run_with_blackhole_fallback_materializes_virtuals_on_nested_guard_failure() {
         let mut meta = MetaInterp::<()>::new(10);
         let green_key = 13;
@@ -1892,7 +2559,10 @@ mod tests {
                         ..
                     } => {
                         assert_eq!(*descr_index, 7);
-                        assert_eq!(fields, &vec![(3, 55)]);
+                        assert_eq!(
+                            fields,
+                            &vec![(3, crate::resume::MaterializedValue::Value(55))]
+                        );
                     }
                     other => panic!("unexpected virtual: {other:?}"),
                 }
@@ -1968,8 +2638,8 @@ mod tests {
                     pending_field_writes,
                     vec![ResolvedPendingFieldWrite {
                         descr_index: 12,
-                        target: 1,
-                        value: 99,
+                        target: crate::resume::MaterializedValue::Value(1),
+                        value: crate::resume::MaterializedValue::Value(99),
                         item_index: Some(4),
                     }]
                 );
@@ -2216,6 +2886,34 @@ mod tests {
             .run_compiled_with_values(green_key, &[Value::Float(3.5)])
             .expect("compiled loop should finish");
         assert_eq!(values, vec![Value::Float(3.5)]);
+    }
+
+    #[test]
+    fn test_get_terminal_exit_layout_in_trace_reports_jump_shape() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 22;
+        let inputargs = vec![InputArg::new_float(0), InputArg::new_ref(1)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Jump, &[OpRef(1), OpRef(0)], OpRef::NONE.0),
+        ];
+
+        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        let trace_id = meta
+            .compiled_loops
+            .get(&green_key)
+            .expect("compiled entry")
+            .root_trace_id;
+
+        let layout = meta
+            .get_terminal_exit_layout_in_trace(green_key, trace_id, 1)
+            .expect("terminal jump layout should exist");
+        assert_eq!(layout.trace_id, trace_id);
+        assert_eq!(layout.fail_index, u32::MAX);
+        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Float]);
+        assert!(!layout.is_finish);
+        assert_eq!(layout.gc_ref_slots, vec![0]);
+        assert!(layout.force_token_slots.is_empty());
     }
 
     #[test]

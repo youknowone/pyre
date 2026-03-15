@@ -1,9 +1,10 @@
+use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
-use crate::meta_interp::{BackEdgeAction, MetaInterp};
-use crate::trace_ctx::TraceCtx;
+use crate::meta_interp::{BackEdgeAction, CompiledExitLayout, MetaInterp};
+use crate::trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 use crate::TraceAction;
-use majit_ir::Value;
+use majit_ir::{GreenKey, Type, Value};
 
 /// High-level JIT driver that automates the tracing lifecycle.
 ///
@@ -23,6 +24,7 @@ pub struct JitDriver<S: JitState> {
     meta: MetaInterp<S::Meta>,
     sym: Option<S::Sym>,
     trace_meta: Option<S::Meta>,
+    descriptor: Option<JitDriverDescriptor>,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -32,7 +34,23 @@ impl<S: JitState> JitDriver<S> {
             meta: MetaInterp::new(threshold),
             sym: None,
             trace_meta: None,
+            descriptor: None,
         }
+    }
+
+    pub fn with_descriptor(threshold: u32, descriptor: JitDriverDescriptor) -> Self {
+        let mut driver = Self::new(threshold);
+        driver.descriptor = Some(descriptor);
+        driver
+    }
+
+    pub fn with_declarative<D: DeclarativeJitDriver>(
+        threshold: u32,
+        green_types: &[Type],
+        red_types: &[Type],
+    ) -> Result<Self, &'static str> {
+        let descriptor = D::descriptor(green_types, red_types)?;
+        Ok(Self::with_descriptor(threshold, descriptor))
     }
 
     /// Whether the driver is currently tracing.
@@ -127,49 +145,101 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> bool {
+        self.back_edge_internal(target_pc as u64, None, target_pc, state, env, pre_run)
+    }
+
+    pub fn back_edge_keyed(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> bool {
+        self.back_edge_internal(green_key, None, target_pc, state, env, pre_run)
+    }
+
+    pub fn back_edge_structured(
+        &mut self,
+        green_key: GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> bool {
+        let key = green_key.hash_u64();
+        self.back_edge_internal(key, Some(green_key), target_pc, state, env, pre_run)
+    }
+
+    pub fn back_edge_declarative<D: DeclarativeJitDriver>(
+        &mut self,
+        green_values: &[i64],
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> Result<bool, &'static str> {
+        let green_key = D::green_key(green_values)?;
+        Ok(self.back_edge_structured(green_key, target_pc, state, env, pre_run))
+    }
+
+    fn back_edge_internal(
+        &mut self,
+        green_key: u64,
+        structured_green_key: Option<GreenKey>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> bool {
         if self.meta.is_tracing() || !state.can_trace() {
             return false;
         }
 
-        let key = target_pc as u64;
-
-        // Fast path: compiled code exists — use cached meta, skip build_meta()
-        if self.meta.has_compiled_loop(key) {
+        if self.meta.has_compiled_loop(green_key) {
             let live_values = {
-                let compiled_meta = self.meta.get_compiled_meta(key).unwrap();
+                let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap();
                 if !state.is_compatible(compiled_meta) {
                     return false;
                 }
-                state.extract_live_values(compiled_meta)
+                if !self.sync_before(state, compiled_meta) {
+                    return false;
+                }
+                let live_values = state.extract_live_values(compiled_meta);
+                if !self.live_values_match_descriptor(&live_values) {
+                    return false;
+                }
+                live_values
             };
 
             pre_run();
 
-            let result = if let Some(ints) = live_values
-                .iter()
-                .map(|value| match value {
-                    Value::Int(v) => Some(*v),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()
+            if let Some((new_values, run_meta)) =
+                self.meta.run_compiled_with_values(green_key, &live_values)
             {
-                self.meta.run_compiled_values(key, &ints)
-            } else {
-                self.meta.run_compiled_with_values(key, &live_values)
-            };
-
-            if let Some((new_values, run_meta)) = result {
-                state.restore_values(run_meta, &new_values);
+                let run_meta = run_meta.clone();
+                state.restore_values(&run_meta, &new_values);
+                self.sync_after(state, &run_meta);
                 return true;
             }
             return false;
         }
 
-        // Slow path: no compiled code yet — need build_meta for tracing
         let meta = state.build_meta(target_pc, env);
-        let live = state.extract_live(&meta);
+        if !self.sync_before(state, &meta) {
+            return false;
+        }
+        let live_values = state.extract_live_values(&meta);
+        if !self.live_values_match_descriptor(&live_values) {
+            return false;
+        }
 
-        match self.meta.on_back_edge(key, &live) {
+        match self.meta.on_back_edge_typed(
+            green_key,
+            structured_green_key,
+            self.descriptor.clone(),
+            &live_values,
+        ) {
             BackEdgeAction::Interpret => false,
             BackEdgeAction::StartedTracing => {
                 self.sym = Some(S::create_sym(&meta, target_pc));
@@ -178,6 +248,46 @@ impl<S: JitState> JitDriver<S> {
             }
             BackEdgeAction::AlreadyTracing | BackEdgeAction::RunCompiled => false,
         }
+    }
+
+    fn live_values_match_descriptor(&self, live_values: &[Value]) -> bool {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return true;
+        };
+        let reds = descriptor.reds();
+        reds.len() == live_values.len()
+            && reds
+                .iter()
+                .zip(live_values.iter())
+                .all(|(var, value)| var.tp == value.get_type())
+    }
+
+    fn sync_before(&self, state: &mut S, meta: &S::Meta) -> bool {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return true;
+        };
+        let Some(virtualizable) = descriptor.virtualizable() else {
+            return true;
+        };
+        state.sync_named_virtualizable_before_jit(
+            meta,
+            &virtualizable.name,
+            self.meta.virtualizable_info(),
+        )
+    }
+
+    fn sync_after(&self, state: &mut S, meta: &S::Meta) {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return;
+        };
+        let Some(virtualizable) = descriptor.virtualizable() else {
+            return;
+        };
+        state.sync_named_virtualizable_after_jit(
+            meta,
+            &virtualizable.name,
+            self.meta.virtualizable_info(),
+        );
     }
 
     /// Set virtualizable info for frame virtualization.
@@ -220,6 +330,173 @@ impl<S: JitState> JitDriver<S> {
         &mut self.meta
     }
 
+    pub fn run_compiled_with_blackhole_fallback_keyed(
+        &mut self,
+        green_key: u64,
+        state: &mut S,
+        pre_run: impl FnOnce(),
+    ) -> crate::meta_interp::DriverRunOutcome {
+        let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+            return crate::meta_interp::DriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
+        if !state.is_compatible(&meta) || !self.sync_before(state, &meta) {
+            return crate::meta_interp::DriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        }
+        let live_values = state.extract_live(&meta);
+        pre_run();
+        let Some(result) = self
+            .meta
+            .run_with_blackhole_fallback(green_key, &live_values)
+        else {
+            return crate::meta_interp::DriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
+
+        match result {
+            crate::meta_interp::BlackholeRunResult::Finished {
+                values,
+                typed_values,
+                meta,
+                via_blackhole,
+                ..
+            } => {
+                if let Some(values) = typed_values.as_ref() {
+                    state.restore_values(&meta, values);
+                } else {
+                    state.restore(&meta, &values);
+                }
+                self.sync_after(state, &meta);
+                crate::meta_interp::DriverRunOutcome::Finished { via_blackhole }
+            }
+            crate::meta_interp::BlackholeRunResult::Jump {
+                values,
+                typed_values,
+                exit_layout,
+                meta,
+                via_blackhole,
+                ..
+            } => {
+                if let Some(values) = typed_values.as_ref() {
+                    state.restore_values(&meta, values);
+                } else if let Some(layout) = exit_layout.as_ref() {
+                    state.restore_values(&meta, &Self::decode_exit_layout_values(&values, layout));
+                } else if let Some(values) = self.decode_descriptor_values(&meta, &values) {
+                    state.restore_values(&meta, &values);
+                } else {
+                    state.restore(&meta, &values);
+                }
+                self.sync_after(state, &meta);
+                crate::meta_interp::DriverRunOutcome::Jump { via_blackhole }
+            }
+            crate::meta_interp::BlackholeRunResult::GuardFailure {
+                fail_values,
+                typed_fail_values,
+                exit_layout,
+                meta,
+                recovery,
+                via_blackhole,
+                ..
+            } => {
+                let restored = if let Some(recovery) = recovery.as_ref() {
+                    state.restore_guard_failure(
+                        &meta,
+                        &fail_values,
+                        recovery.reconstructed_state.as_ref(),
+                        &recovery.materialized_virtuals,
+                        &recovery.pending_field_writes,
+                        &recovery.exception,
+                    )
+                } else if let Some(values) = typed_fail_values.as_ref() {
+                    state.restore_guard_failure_values(&meta, values, &ExceptionState::default())
+                } else if let Some(layout) = exit_layout.as_ref() {
+                    state.restore_guard_failure_values(
+                        &meta,
+                        &Self::decode_exit_layout_values(&fail_values, layout),
+                        &ExceptionState::default(),
+                    )
+                } else if let Some(values) = self.decode_descriptor_values(&meta, &fail_values) {
+                    state.restore_guard_failure_values(&meta, &values, &ExceptionState::default())
+                } else {
+                    state.restore_guard_failure(
+                        &meta,
+                        &fail_values,
+                        None,
+                        &[],
+                        &[],
+                        &ExceptionState::default(),
+                    )
+                };
+                if restored {
+                    self.sync_after(state, &meta);
+                }
+                crate::meta_interp::DriverRunOutcome::GuardFailure {
+                    restored,
+                    via_blackhole,
+                }
+            }
+            crate::meta_interp::BlackholeRunResult::Abort { .. } => {
+                crate::meta_interp::DriverRunOutcome::Abort {
+                    restored: false,
+                    via_blackhole: true,
+                }
+            }
+        }
+    }
+
+    pub fn run_compiled_with_blackhole_fallback_declarative<D: DeclarativeJitDriver>(
+        &mut self,
+        green_values: &[i64],
+        state: &mut S,
+        pre_run: impl FnOnce(),
+    ) -> Result<crate::meta_interp::DriverRunOutcome, &'static str> {
+        let green_key = D::green_key(green_values)?;
+        Ok(self.run_compiled_with_blackhole_fallback_keyed(green_key.hash_u64(), state, pre_run))
+    }
+
+    fn decode_descriptor_values(&self, _meta: &S::Meta, raw_values: &[i64]) -> Option<Vec<Value>> {
+        let descriptor = self.descriptor.as_ref()?;
+        let reds = descriptor.reds();
+        if reds.len() != raw_values.len() {
+            return None;
+        }
+        Some(
+            reds.iter()
+                .zip(raw_values.iter().copied())
+                .map(|(var, raw)| match var.tp {
+                    Type::Int => Value::Int(raw),
+                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
+                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                    Type::Void => Value::Void,
+                })
+                .collect(),
+        )
+    }
+
+    fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
+        layout
+            .exit_types
+            .iter()
+            .enumerate()
+            .map(|(index, tp)| {
+                let raw = raw_values.get(index).copied().unwrap_or(0);
+                match tp {
+                    Type::Int => Value::Int(raw),
+                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
+                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                    Type::Void => Value::Void,
+                }
+            })
+            .collect()
+    }
+
     /// Invalidate a compiled loop, forcing fallback to interpretation.
     pub fn invalidate_loop(&mut self, green_key: u64) {
         self.meta.invalidate_loop(green_key);
@@ -238,6 +515,7 @@ mod tests {
 
     #[derive(Default)]
     struct TypedRestoreState {
+        live_values: Vec<i64>,
         restored_values: Vec<Value>,
         restore_called: bool,
     }
@@ -250,7 +528,7 @@ mod tests {
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
         fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
-            Vec::new()
+            self.live_values.clone()
         }
 
         fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
@@ -300,9 +578,49 @@ mod tests {
         driver.meta.close_and_compile(&[], ());
         assert!(driver.has_compiled_loop(key));
 
-        let mut state = TypedRestoreState::default();
+        let mut state = TypedRestoreState {
+            live_values: vec![1],
+            ..Default::default()
+        };
         assert!(driver.back_edge(key as usize, &mut state, &(), || {}));
         assert!(!state.restore_called);
         assert_eq!(state.restored_values, vec![Value::Float(7.0)]);
+    }
+
+    #[test]
+    fn blackhole_jump_reports_via_blackhole_even_with_typed_restore_values() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        let key = 9u64;
+
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[1]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[1]),
+            BackEdgeAction::StartedTracing
+        ));
+
+        let cond = {
+            let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
+            let cond = ctx.const_int(1);
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[cond]);
+            cond
+        };
+        driver.meta.close_and_compile(&[cond], ());
+        assert!(driver.has_compiled_loop(key));
+
+        let mut state = TypedRestoreState {
+            live_values: vec![1],
+            ..Default::default()
+        };
+        match driver.run_compiled_with_blackhole_fallback_keyed(key, &mut state, || {}) {
+            crate::meta_interp::DriverRunOutcome::Jump { via_blackhole } => {
+                assert!(via_blackhole);
+            }
+            other => panic!("expected Jump outcome, got {other:?}"),
+        }
+        assert_eq!(state.restored_values, vec![Value::Int(1)]);
+        assert!(!state.restore_called);
     }
 }

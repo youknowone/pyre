@@ -4,9 +4,9 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::ItemFn;
 
-use super::classify::{classify_arms, ArmPattern};
-use super::jitcode_lower::{self, LowererConfig};
 use super::JitInterpConfig;
+use super::classify::{ArmPattern, classify_arms};
+use super::jitcode_lower::{self, LowererConfig};
 
 pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let fn_name = &func.sig.ident;

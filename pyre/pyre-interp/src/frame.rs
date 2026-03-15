@@ -9,7 +9,7 @@ use std::rc::Rc;
 use pyre_bytecode::CodeObject;
 use pyre_bytecode::ConstantData;
 use pyre_object::*;
-use pyre_runtime::{PyExecutionContext, PyNamespace, w_code_new};
+use pyre_runtime::{PyExecutionContext, PyNamespace, PyObjectArray, w_code_new};
 
 /// Execution frame for a single Python code block.
 ///
@@ -20,15 +20,16 @@ use pyre_runtime::{PyExecutionContext, PyNamespace, w_code_new};
 /// The `vable_token` field coordinates ownership: when JIT code is
 /// running, the token is nonzero and the canonical field values live
 /// in registers. A "force" flushes them back to the heap.
+#[repr(C)]
 pub struct PyFrame {
     /// Shared interpreter-wide execution context.
     pub execution_context: Rc<PyExecutionContext>,
     /// The code object being executed (shared via Rc for borrow-safe access).
     pub code: Rc<CodeObject>,
     /// Local variables (fast locals), indexed by varname slot.
-    pub locals_w: Vec<PyObjectRef>,
+    pub locals_w: PyObjectArray,
     /// Operand stack for bytecode execution.
-    pub value_stack_w: Vec<PyObjectRef>,
+    pub value_stack_w: PyObjectArray,
     /// Current stack depth (number of live values on value_stack_w).
     pub stack_depth: usize,
     /// Index of the next instruction to execute.
@@ -85,8 +86,8 @@ impl PyFrame {
         PyFrame {
             execution_context,
             code: Rc::new(code),
-            locals_w: vec![PY_NULL; num_locals],
-            value_stack_w: vec![PY_NULL; max_stack],
+            locals_w: PyObjectArray::filled(num_locals, PY_NULL),
+            value_stack_w: PyObjectArray::filled(max_stack, PY_NULL),
             stack_depth: 0,
             next_instr: 0,
             namespace,
@@ -180,8 +181,8 @@ impl PyFrame {
         PyFrame {
             execution_context,
             code: Rc::new(code),
-            locals_w: locals,
-            value_stack_w: vec![PY_NULL; max_stack],
+            locals_w: PyObjectArray::from_vec(locals),
+            value_stack_w: PyObjectArray::filled(max_stack, PY_NULL),
             stack_depth: 0,
             next_instr: 0,
             namespace,

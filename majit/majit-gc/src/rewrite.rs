@@ -11,9 +11,9 @@
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
 use std::collections::{HashMap, HashSet};
 
+use majit_ir::Type;
 use majit_ir::descr::{DescrRef, FieldDescr};
 use majit_ir::op::{Op, OpCode, OpRef};
-use majit_ir::Type;
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
@@ -682,9 +682,11 @@ mod tests {
         let result = rw.rewrite_for_gc(&ops);
 
         // Expect: CallMallocNurseryVarsize
-        assert!(result
-            .iter()
-            .any(|o| o.opcode == OpCode::CallMallocNurseryVarsize));
+        assert!(
+            result
+                .iter()
+                .any(|o| o.opcode == OpCode::CallMallocNurseryVarsize)
+        );
         let varsize = result
             .iter()
             .find(|o| o.opcode == OpCode::CallMallocNurseryVarsize)
@@ -770,9 +772,11 @@ mod tests {
         // And the original CallMallocNursery should have been updated
         // to the combined size.
         assert!(result.iter().any(|o| o.opcode == OpCode::CallMallocNursery));
-        assert!(result
-            .iter()
-            .any(|o| o.opcode == OpCode::NurseryPtrIncrement));
+        assert!(
+            result
+                .iter()
+                .any(|o| o.opcode == OpCode::NurseryPtrIncrement)
+        );
 
         let malloc = result
             .iter()
@@ -982,10 +986,12 @@ mod tests {
         assert_eq!(second_alloc.pos, OpRef(3));
         assert_eq!(finish.opcode, OpCode::Finish);
         assert_eq!(finish.args[0], OpRef(3));
-        assert!(result
-            .iter()
-            .filter(|op| op.opcode == OpCode::GcStore)
-            .all(|op| op.pos.is_none()));
+        assert!(
+            result
+                .iter()
+                .filter(|op| op.opcode == OpCode::GcStore)
+                .all(|op| op.pos.is_none())
+        );
     }
 
     #[test]

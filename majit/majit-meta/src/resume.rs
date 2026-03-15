@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use majit_ir::GcRef;
+
 const TAG_MASK: i64 = 0b11;
 const TAG_CONST: i64 = 0;
 const TAG_INT: i64 = 1;
@@ -53,6 +55,93 @@ struct DecodedResumeLayout {
     frames: Vec<FrameInfo>,
     virtuals: Vec<VirtualInfo>,
     pending_fields: Vec<PendingFieldInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeValueKind {
+    FailArg,
+    Constant,
+    Virtual,
+    Uninitialized,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeValueLayoutSummary {
+    pub kind: ResumeValueKind,
+    pub fail_arg_index: Option<usize>,
+    pub raw_fail_arg_position: Option<usize>,
+    pub constant: Option<i64>,
+    pub virtual_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeFrameLayoutSummary {
+    pub pc: u64,
+    pub slot_sources: Vec<ResumeValueKind>,
+    pub slot_layouts: Vec<ResumeValueLayoutSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeVirtualKind {
+    Object,
+    Struct,
+    Array,
+    ArrayStruct,
+    RawBuffer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeVirtualLayoutSummary {
+    Object {
+        type_id: u32,
+        descr_index: u32,
+        fields: Vec<(u32, ResumeValueLayoutSummary)>,
+    },
+    Struct {
+        type_id: u32,
+        descr_index: u32,
+        fields: Vec<(u32, ResumeValueLayoutSummary)>,
+    },
+    Array {
+        descr_index: u32,
+        items: Vec<ResumeValueLayoutSummary>,
+    },
+    ArrayStruct {
+        descr_index: u32,
+        element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
+    },
+    RawBuffer {
+        size: usize,
+        entries: Vec<(usize, usize, ResumeValueLayoutSummary)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFieldLayoutSummary {
+    pub descr_index: u32,
+    pub item_index: Option<usize>,
+    pub is_array_item: bool,
+    pub target_kind: ResumeValueKind,
+    pub value_kind: ResumeValueKind,
+    pub target: ResumeValueLayoutSummary,
+    pub value: ResumeValueLayoutSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeLayoutSummary {
+    pub num_frames: usize,
+    pub frame_pcs: Vec<u64>,
+    pub frame_slot_counts: Vec<usize>,
+    pub frame_layouts: Vec<ResumeFrameLayoutSummary>,
+    pub num_virtuals: usize,
+    pub virtual_kinds: Vec<ResumeVirtualKind>,
+    pub virtual_layouts: Vec<ResumeVirtualLayoutSummary>,
+    pub num_fail_args: usize,
+    pub fail_arg_positions: Vec<usize>,
+    pub pending_field_count: usize,
+    pub pending_field_layouts: Vec<PendingFieldLayoutSummary>,
+    pub const_pool_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +251,58 @@ pub enum ResumeValueSource {
     Unavailable,
 }
 
+impl ResumeValueSource {
+    pub fn kind(&self) -> ResumeValueKind {
+        match self {
+            ResumeValueSource::FailArg(_) => ResumeValueKind::FailArg,
+            ResumeValueSource::Constant(_) => ResumeValueKind::Constant,
+            ResumeValueSource::Virtual(_) => ResumeValueKind::Virtual,
+            ResumeValueSource::Uninitialized => ResumeValueKind::Uninitialized,
+            ResumeValueSource::Unavailable => ResumeValueKind::Unavailable,
+        }
+    }
+
+    pub fn layout_summary(&self, fail_arg_positions: &[usize]) -> ResumeValueLayoutSummary {
+        match self {
+            ResumeValueSource::FailArg(index) => ResumeValueLayoutSummary {
+                kind: ResumeValueKind::FailArg,
+                fail_arg_index: fail_arg_positions.iter().position(|pos| pos == index),
+                raw_fail_arg_position: Some(*index),
+                constant: None,
+                virtual_index: None,
+            },
+            ResumeValueSource::Constant(value) => ResumeValueLayoutSummary {
+                kind: ResumeValueKind::Constant,
+                fail_arg_index: None,
+                raw_fail_arg_position: None,
+                constant: Some(*value),
+                virtual_index: None,
+            },
+            ResumeValueSource::Virtual(index) => ResumeValueLayoutSummary {
+                kind: ResumeValueKind::Virtual,
+                fail_arg_index: None,
+                raw_fail_arg_position: None,
+                constant: None,
+                virtual_index: Some(*index),
+            },
+            ResumeValueSource::Uninitialized => ResumeValueLayoutSummary {
+                kind: ResumeValueKind::Uninitialized,
+                fail_arg_index: None,
+                raw_fail_arg_position: None,
+                constant: None,
+                virtual_index: None,
+            },
+            ResumeValueSource::Unavailable => ResumeValueLayoutSummary {
+                kind: ResumeValueKind::Unavailable,
+                fail_arg_index: None,
+                raw_fail_arg_position: None,
+                constant: None,
+                virtual_index: None,
+            },
+        }
+    }
+}
+
 /// Source for a resumed frame slot.
 pub type FrameSlotSource = ResumeValueSource;
 
@@ -222,6 +363,88 @@ pub enum VirtualInfo {
     },
 }
 
+impl VirtualInfo {
+    pub fn kind(&self) -> ResumeVirtualKind {
+        match self {
+            VirtualInfo::VirtualObj { .. } => ResumeVirtualKind::Object,
+            VirtualInfo::VStruct { .. } => ResumeVirtualKind::Struct,
+            VirtualInfo::VArray { .. } => ResumeVirtualKind::Array,
+            VirtualInfo::VArrayStruct { .. } => ResumeVirtualKind::ArrayStruct,
+            VirtualInfo::VRawBuffer { .. } => ResumeVirtualKind::RawBuffer,
+        }
+    }
+
+    pub fn layout_summary(&self, fail_arg_positions: &[usize]) -> ResumeVirtualLayoutSummary {
+        match self {
+            VirtualInfo::VirtualObj {
+                type_id,
+                descr_index,
+                fields,
+            } => ResumeVirtualLayoutSummary::Object {
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields: fields
+                    .iter()
+                    .map(|(field_descr, source)| {
+                        (*field_descr, source.layout_summary(fail_arg_positions))
+                    })
+                    .collect(),
+            },
+            VirtualInfo::VStruct {
+                type_id,
+                descr_index,
+                fields,
+            } => ResumeVirtualLayoutSummary::Struct {
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields: fields
+                    .iter()
+                    .map(|(field_descr, source)| {
+                        (*field_descr, source.layout_summary(fail_arg_positions))
+                    })
+                    .collect(),
+            },
+            VirtualInfo::VArray { descr_index, items } => ResumeVirtualLayoutSummary::Array {
+                descr_index: *descr_index,
+                items: items
+                    .iter()
+                    .map(|source| source.layout_summary(fail_arg_positions))
+                    .collect(),
+            },
+            VirtualInfo::VArrayStruct {
+                descr_index,
+                element_fields,
+            } => ResumeVirtualLayoutSummary::ArrayStruct {
+                descr_index: *descr_index,
+                element_fields: element_fields
+                    .iter()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|(field_descr, source)| {
+                                (*field_descr, source.layout_summary(fail_arg_positions))
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            },
+            VirtualInfo::VRawBuffer { size, entries } => ResumeVirtualLayoutSummary::RawBuffer {
+                size: *size,
+                entries: entries
+                    .iter()
+                    .map(|(offset, size_in_bytes, source)| {
+                        (
+                            *offset,
+                            *size_in_bytes,
+                            source.layout_summary(fail_arg_positions),
+                        )
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
 /// Source of a virtual object's field value.
 pub type VirtualFieldSource = ResumeValueSource;
 
@@ -238,15 +461,29 @@ pub struct PendingFieldInfo {
     pub item_index: Option<usize>,
 }
 
+impl PendingFieldInfo {
+    pub fn layout_summary(&self, fail_arg_positions: &[usize]) -> PendingFieldLayoutSummary {
+        PendingFieldLayoutSummary {
+            descr_index: self.descr_index,
+            item_index: self.item_index,
+            is_array_item: self.item_index.is_some(),
+            target_kind: self.target.kind(),
+            value_kind: self.value.kind(),
+            target: self.target.layout_summary(fail_arg_positions),
+            value: self.value.layout_summary(fail_arg_positions),
+        }
+    }
+}
+
 /// Concrete pending heap write reconstructed from resume data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPendingFieldWrite {
     /// Descriptor index identifying the field or array descriptor.
     pub descr_index: u32,
     /// Concrete object/array pointer.
-    pub target: i64,
+    pub target: MaterializedValue,
     /// Concrete value to write.
-    pub value: i64,
+    pub value: MaterializedValue,
     /// Array item index. `None` means a plain field write.
     pub item_index: Option<usize>,
 }
@@ -670,6 +907,49 @@ impl EncodedResumeData {
         }
     }
 
+    /// Return a compact summary of this snapshot's frame/jitframe layout.
+    pub fn layout_summary(&self) -> ResumeLayoutSummary {
+        let layout = self.decode_layout();
+        ResumeLayoutSummary {
+            num_frames: layout.frames.len(),
+            frame_pcs: layout.frames.iter().map(|frame| frame.pc).collect(),
+            frame_slot_counts: layout
+                .frames
+                .iter()
+                .map(|frame| frame.slot_map.len())
+                .collect(),
+            frame_layouts: layout
+                .frames
+                .iter()
+                .map(|frame| ResumeFrameLayoutSummary {
+                    pc: frame.pc,
+                    slot_sources: frame.slot_map.iter().map(ResumeValueSource::kind).collect(),
+                    slot_layouts: frame
+                        .slot_map
+                        .iter()
+                        .map(|source| source.layout_summary(&self.fail_arg_positions))
+                        .collect(),
+                })
+                .collect(),
+            num_virtuals: layout.virtuals.len(),
+            virtual_kinds: layout.virtuals.iter().map(VirtualInfo::kind).collect(),
+            virtual_layouts: layout
+                .virtuals
+                .iter()
+                .map(|virt| virt.layout_summary(&self.fail_arg_positions))
+                .collect(),
+            num_fail_args: self.num_fail_args,
+            fail_arg_positions: self.fail_arg_positions.clone(),
+            pending_field_count: layout.pending_fields.len(),
+            pending_field_layouts: layout
+                .pending_fields
+                .iter()
+                .map(|pending| pending.layout_summary(&self.fail_arg_positions))
+                .collect(),
+            const_pool_size: self.consts.len(),
+        }
+    }
+
     /// Reconstruct the full interpreter state directly from the encoded snapshot.
     pub fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState {
         let layout = self.decode_layout();
@@ -822,8 +1102,8 @@ impl ResumeData {
             .iter()
             .map(|pending| ResolvedPendingFieldWrite {
                 descr_index: pending.descr_index,
-                target: Self::resolve_field_source(&pending.target, fail_values),
-                value: Self::resolve_field_source(&pending.value, fail_values),
+                target: Self::resolve_materialized_source(&pending.target, fail_values),
+                value: Self::resolve_materialized_source(&pending.value, fail_values),
                 item_index: pending.item_index,
             })
             .collect()
@@ -835,15 +1115,25 @@ impl ResumeData {
     /// the actual object address is only known after allocation by the
     /// interpreter's allocator.
     pub fn resolve_field_source(source: &VirtualFieldSource, fail_values: &[i64]) -> i64 {
+        match Self::resolve_materialized_source(source, fail_values) {
+            MaterializedValue::Value(value) => value,
+            MaterializedValue::VirtualRef(_) => 0,
+        }
+    }
+
+    pub fn resolve_materialized_source(
+        source: &VirtualFieldSource,
+        fail_values: &[i64],
+    ) -> MaterializedValue {
         match source {
-            ResumeValueSource::FailArg(idx) => fail_values.get(*idx).copied().unwrap_or(0),
-            ResumeValueSource::Constant(val) => *val,
-            ResumeValueSource::Virtual(_idx) => {
-                // Nested virtual — returns placeholder; actual pointer filled
-                // after allocation by the interpreter.
-                0
+            ResumeValueSource::FailArg(idx) => {
+                MaterializedValue::Value(fail_values.get(*idx).copied().unwrap_or(0))
             }
-            ResumeValueSource::Uninitialized | ResumeValueSource::Unavailable => 0,
+            ResumeValueSource::Constant(val) => MaterializedValue::Value(*val),
+            ResumeValueSource::Virtual(idx) => MaterializedValue::VirtualRef(*idx),
+            ResumeValueSource::Uninitialized | ResumeValueSource::Unavailable => {
+                MaterializedValue::Value(0)
+            }
         }
     }
 
@@ -927,33 +1217,55 @@ impl ReconstructedValue {
 ///
 /// Mirrors RPython's `_materialize_virtual()` in resume.py.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializedValue {
+    Value(i64),
+    VirtualRef(usize),
+}
+
+impl MaterializedValue {
+    pub fn resolve_with_refs(&self, materialized_refs: &[Option<GcRef>]) -> Option<i64> {
+        match self {
+            MaterializedValue::Value(value) => Some(*value),
+            MaterializedValue::VirtualRef(index) => materialized_refs
+                .get(*index)
+                .copied()
+                .flatten()
+                .map(|gc_ref| gc_ref.as_usize() as i64),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaterializedVirtual {
     /// Object with vtable.
     Obj {
         type_id: u32,
         descr_index: u32,
         /// (field_descr_index, concrete_value).
-        fields: Vec<(u32, i64)>,
+        fields: Vec<(u32, MaterializedValue)>,
     },
     /// Plain struct.
     Struct {
         type_id: u32,
         descr_index: u32,
-        fields: Vec<(u32, i64)>,
+        fields: Vec<(u32, MaterializedValue)>,
     },
     /// Array.
-    Array { descr_index: u32, items: Vec<i64> },
+    Array {
+        descr_index: u32,
+        items: Vec<MaterializedValue>,
+    },
     /// Array of structs.
     ArrayStruct {
         descr_index: u32,
         /// Per-element: Vec<(field_index, value)>.
-        elements: Vec<Vec<(u32, i64)>>,
+        elements: Vec<Vec<(u32, MaterializedValue)>>,
     },
     /// Raw buffer.
     RawBuffer {
         size: usize,
         /// (offset, size_in_bytes, value).
-        entries: Vec<(usize, usize, i64)>,
+        entries: Vec<(usize, usize, MaterializedValue)>,
     },
 }
 
@@ -981,7 +1293,7 @@ impl MaterializedVirtual {
             },
             VirtualInfo::VArray { descr_index, items } => MaterializedVirtual::Array {
                 descr_index: *descr_index,
-                items: vec![0; items.len()],
+                items: vec![MaterializedValue::Value(0); items.len()],
             },
             VirtualInfo::VArrayStruct {
                 descr_index,
@@ -1014,7 +1326,12 @@ impl MaterializedVirtual {
             ) => {
                 *fields = src_fields
                     .iter()
-                    .map(|(idx, src)| (*idx, ResumeData::resolve_field_source(src, fail_values)))
+                    .map(|(idx, src)| {
+                        (
+                            *idx,
+                            ResumeData::resolve_materialized_source(src, fail_values),
+                        )
+                    })
                     .collect();
             }
             (
@@ -1025,7 +1342,7 @@ impl MaterializedVirtual {
             ) => {
                 *items = src_items
                     .iter()
-                    .map(|src| ResumeData::resolve_field_source(src, fail_values))
+                    .map(|src| ResumeData::resolve_materialized_source(src, fail_values))
                     .collect();
             }
             (
@@ -1041,7 +1358,10 @@ impl MaterializedVirtual {
                         elem_fields
                             .iter()
                             .map(|(idx, src)| {
-                                (*idx, ResumeData::resolve_field_source(src, fail_values))
+                                (
+                                    *idx,
+                                    ResumeData::resolve_materialized_source(src, fail_values),
+                                )
                             })
                             .collect()
                     })
@@ -1060,12 +1380,104 @@ impl MaterializedVirtual {
                         (
                             *off,
                             *sz,
-                            ResumeData::resolve_field_source(src, fail_values),
+                            ResumeData::resolve_materialized_source(src, fail_values),
                         )
                     })
                     .collect();
             }
             _ => {} // type mismatch — should not happen
+        }
+    }
+
+    pub fn resolve_with_refs(
+        &self,
+        materialized_refs: &[Option<GcRef>],
+    ) -> Option<MaterializedVirtual> {
+        match self {
+            MaterializedVirtual::Obj {
+                type_id,
+                descr_index,
+                fields,
+            } => Some(MaterializedVirtual::Obj {
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields: fields
+                    .iter()
+                    .map(|(idx, value)| {
+                        Some((
+                            *idx,
+                            MaterializedValue::Value(value.resolve_with_refs(materialized_refs)?),
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+            MaterializedVirtual::Struct {
+                type_id,
+                descr_index,
+                fields,
+            } => Some(MaterializedVirtual::Struct {
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields: fields
+                    .iter()
+                    .map(|(idx, value)| {
+                        Some((
+                            *idx,
+                            MaterializedValue::Value(value.resolve_with_refs(materialized_refs)?),
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+            MaterializedVirtual::Array { descr_index, items } => Some(MaterializedVirtual::Array {
+                descr_index: *descr_index,
+                items: items
+                    .iter()
+                    .map(|value| {
+                        Some(MaterializedValue::Value(
+                            value.resolve_with_refs(materialized_refs)?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+            MaterializedVirtual::ArrayStruct {
+                descr_index,
+                elements,
+            } => Some(MaterializedVirtual::ArrayStruct {
+                descr_index: *descr_index,
+                elements: elements
+                    .iter()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|(idx, value)| {
+                                Some((
+                                    *idx,
+                                    MaterializedValue::Value(
+                                        value.resolve_with_refs(materialized_refs)?,
+                                    ),
+                                ))
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+            MaterializedVirtual::RawBuffer { size, entries } => {
+                Some(MaterializedVirtual::RawBuffer {
+                    size: *size,
+                    entries: entries
+                        .iter()
+                        .map(|(offset, size_in_bytes, value)| {
+                            Some((
+                                *offset,
+                                *size_in_bytes,
+                                MaterializedValue::Value(
+                                    value.resolve_with_refs(materialized_refs)?,
+                                ),
+                            ))
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                })
+            }
         }
     }
 }
@@ -1593,7 +2005,7 @@ mod tests {
         assert_eq!(state.virtuals.len(), 1);
         match &state.virtuals[0] {
             MaterializedVirtual::Struct { fields, .. } => {
-                assert_eq!(fields, &vec![(0, 99)]);
+                assert_eq!(fields, &vec![(0, MaterializedValue::Value(99))]);
             }
             other => panic!("expected Struct, got {other:?}"),
         }
@@ -1635,14 +2047,14 @@ mod tests {
             vec![
                 ResolvedPendingFieldWrite {
                     descr_index: 7,
-                    target: 101,
-                    value: 55,
+                    target: MaterializedValue::Value(101),
+                    value: MaterializedValue::Value(55),
                     item_index: None,
                 },
                 ResolvedPendingFieldWrite {
                     descr_index: 8,
-                    target: 202,
-                    value: 303,
+                    target: MaterializedValue::Value(202),
+                    value: MaterializedValue::Value(303),
                     item_index: Some(3),
                 },
             ]
@@ -1675,8 +2087,8 @@ mod tests {
             } => {
                 assert_eq!(*type_id, 42);
                 assert_eq!(fields.len(), 2);
-                assert_eq!(fields[0], (0, 10)); // from FailArg(0)
-                assert_eq!(fields[1], (1, 99)); // constant
+                assert_eq!(fields[0], (0, MaterializedValue::Value(10))); // from FailArg(0)
+                assert_eq!(fields[1], (1, MaterializedValue::Value(99))); // constant
             }
             _ => panic!("expected Obj"),
         }
@@ -1705,7 +2117,14 @@ mod tests {
         match &materialized[0] {
             MaterializedVirtual::Array { items, descr_index } => {
                 assert_eq!(*descr_index, 5);
-                assert_eq!(*items, vec![100, 200, 42]);
+                assert_eq!(
+                    *items,
+                    vec![
+                        MaterializedValue::Value(100),
+                        MaterializedValue::Value(200),
+                        MaterializedValue::Value(42),
+                    ]
+                );
             }
             _ => panic!("expected Array"),
         }
@@ -1747,7 +2166,7 @@ mod tests {
                 type_id, fields, ..
             } => {
                 assert_eq!(*type_id, 1);
-                assert_eq!(fields[0], (0, 10));
+                assert_eq!(fields[0], (0, MaterializedValue::Value(10)));
             }
             _ => panic!("expected Struct"),
         }
@@ -1758,8 +2177,8 @@ mod tests {
                 type_id, fields, ..
             } => {
                 assert_eq!(*type_id, 2);
-                assert_eq!(fields[0], (0, 0)); // Virtual(0) → placeholder
-                assert_eq!(fields[1], (1, 20));
+                assert_eq!(fields[0], (0, MaterializedValue::VirtualRef(0)));
+                assert_eq!(fields[1], (1, MaterializedValue::Value(20)));
             }
             _ => panic!("expected Obj"),
         }
@@ -1792,8 +2211,20 @@ mod tests {
         match &materialized[0] {
             MaterializedVirtual::ArrayStruct { elements, .. } => {
                 assert_eq!(elements.len(), 2);
-                assert_eq!(elements[0], vec![(0, 10), (1, 20)]);
-                assert_eq!(elements[1], vec![(0, 99), (1, 30)]);
+                assert_eq!(
+                    elements[0],
+                    vec![
+                        (0, MaterializedValue::Value(10)),
+                        (1, MaterializedValue::Value(20)),
+                    ]
+                );
+                assert_eq!(
+                    elements[1],
+                    vec![
+                        (0, MaterializedValue::Value(99)),
+                        (1, MaterializedValue::Value(30)),
+                    ]
+                );
             }
             _ => panic!("expected ArrayStruct"),
         }
@@ -1821,8 +2252,8 @@ mod tests {
             MaterializedVirtual::RawBuffer { size, entries } => {
                 assert_eq!(*size, 32);
                 assert_eq!(entries.len(), 2);
-                assert_eq!(entries[0], (0, 8, 0xCAFE));
-                assert_eq!(entries[1], (8, 4, 0xFF));
+                assert_eq!(entries[0], (0, 8, MaterializedValue::Value(0xCAFE)));
+                assert_eq!(entries[1], (8, 4, MaterializedValue::Value(0xFF)));
             }
             _ => panic!("expected RawBuffer"),
         }
@@ -1963,8 +2394,8 @@ mod tests {
             reconstructed.pending_fields,
             vec![ResolvedPendingFieldWrite {
                 descr_index: 12,
-                target: 102,
-                value: 107,
+                target: MaterializedValue::Value(102),
+                value: MaterializedValue::Value(107),
                 item_index: Some(4),
             }]
         );
@@ -2145,5 +2576,140 @@ mod tests {
         let dec2 = enc2.decode();
         assert_eq!(dec1, rd1);
         assert_eq!(dec2, rd2);
+    }
+
+    #[test]
+    fn test_layout_summary_reports_slot_virtual_and_pending_write_kinds() {
+        let rd = ResumeData {
+            frames: vec![
+                FrameInfo {
+                    pc: 11,
+                    slot_map: vec![
+                        FrameSlotSource::FailArg(3),
+                        FrameSlotSource::Constant(77),
+                        FrameSlotSource::Virtual(0),
+                    ],
+                },
+                FrameInfo {
+                    pc: 22,
+                    slot_map: vec![FrameSlotSource::Unavailable, FrameSlotSource::Uninitialized],
+                },
+            ],
+            virtuals: vec![VirtualInfo::VArray {
+                descr_index: 7,
+                items: vec![VirtualFieldSource::FailArg(3)],
+            }],
+            pending_fields: vec![PendingFieldInfo {
+                descr_index: 9,
+                target: ResumeValueSource::FailArg(1),
+                value: ResumeValueSource::Constant(88),
+                item_index: Some(2),
+            }],
+        };
+
+        let summary = rd.encode().layout_summary();
+        assert_eq!(summary.num_frames, 2);
+        assert_eq!(summary.frame_pcs, vec![11, 22]);
+        assert_eq!(summary.frame_slot_counts, vec![3, 2]);
+        assert_eq!(
+            summary.frame_layouts,
+            vec![
+                ResumeFrameLayoutSummary {
+                    pc: 11,
+                    slot_sources: vec![
+                        ResumeValueKind::FailArg,
+                        ResumeValueKind::Constant,
+                        ResumeValueKind::Virtual,
+                    ],
+                    slot_layouts: vec![
+                        ResumeValueLayoutSummary {
+                            kind: ResumeValueKind::FailArg,
+                            fail_arg_index: Some(0),
+                            raw_fail_arg_position: Some(3),
+                            constant: None,
+                            virtual_index: None,
+                        },
+                        ResumeValueLayoutSummary {
+                            kind: ResumeValueKind::Constant,
+                            fail_arg_index: None,
+                            raw_fail_arg_position: None,
+                            constant: Some(77),
+                            virtual_index: None,
+                        },
+                        ResumeValueLayoutSummary {
+                            kind: ResumeValueKind::Virtual,
+                            fail_arg_index: None,
+                            raw_fail_arg_position: None,
+                            constant: None,
+                            virtual_index: Some(0),
+                        },
+                    ],
+                },
+                ResumeFrameLayoutSummary {
+                    pc: 22,
+                    slot_sources: vec![
+                        ResumeValueKind::Unavailable,
+                        ResumeValueKind::Uninitialized,
+                    ],
+                    slot_layouts: vec![
+                        ResumeValueLayoutSummary {
+                            kind: ResumeValueKind::Unavailable,
+                            fail_arg_index: None,
+                            raw_fail_arg_position: None,
+                            constant: None,
+                            virtual_index: None,
+                        },
+                        ResumeValueLayoutSummary {
+                            kind: ResumeValueKind::Uninitialized,
+                            fail_arg_index: None,
+                            raw_fail_arg_position: None,
+                            constant: None,
+                            virtual_index: None,
+                        },
+                    ],
+                },
+            ]
+        );
+        assert_eq!(summary.virtual_kinds, vec![ResumeVirtualKind::Array]);
+        assert_eq!(
+            summary.virtual_layouts,
+            vec![ResumeVirtualLayoutSummary::Array {
+                descr_index: 7,
+                items: vec![ResumeValueLayoutSummary {
+                    kind: ResumeValueKind::FailArg,
+                    fail_arg_index: Some(0),
+                    raw_fail_arg_position: Some(3),
+                    constant: None,
+                    virtual_index: None,
+                }],
+            }]
+        );
+        assert_eq!(
+            summary.pending_field_layouts,
+            vec![PendingFieldLayoutSummary {
+                descr_index: 9,
+                item_index: Some(2),
+                is_array_item: true,
+                target_kind: ResumeValueKind::FailArg,
+                value_kind: ResumeValueKind::Constant,
+                target: ResumeValueLayoutSummary {
+                    kind: ResumeValueKind::FailArg,
+                    fail_arg_index: Some(1),
+                    raw_fail_arg_position: Some(1),
+                    constant: None,
+                    virtual_index: None,
+                },
+                value: ResumeValueLayoutSummary {
+                    kind: ResumeValueKind::Constant,
+                    fail_arg_index: None,
+                    raw_fail_arg_position: None,
+                    constant: Some(88),
+                    virtual_index: None,
+                },
+            }]
+        );
+        assert_eq!(summary.num_fail_args, 2);
+        assert_eq!(summary.fail_arg_positions, vec![3, 1]);
+        assert_eq!(summary.pending_field_count, 1);
     }
 }

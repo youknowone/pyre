@@ -366,8 +366,13 @@ impl<'c> Lowerer<'c> {
                     "inferred helper policy does not support void calls here",
                 );
                 self.statements.push(quote! {
-                    let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                    let (__policy, _inline_builder) = #policy_path();
+                    let (__policy, _inline_builder, __call_target) = #policy_path();
+                    let __call_target = if __call_target.is_null() {
+                        #func as *const ()
+                    } else {
+                        __call_target
+                    };
+                    let __fn_idx = __builder.add_fn_ptr(__call_target);
                     match __policy {
                         1u8 => {
                             __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
@@ -621,8 +626,13 @@ impl<'c> Lowerer<'c> {
                     .enumerate()
                     .map(|(index, caller_reg)| quote! { (#caller_reg, #index as u16) });
                 self.statements.push(quote! {
-                    let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                    let (__policy, __inline_builder) = #policy_path();
+                    let (__policy, __inline_builder, __call_target) = #policy_path();
+                    let __call_target = if __call_target.is_null() {
+                        #func as *const ()
+                    } else {
+                        __call_target
+                    };
+                    let __fn_idx = __builder.add_fn_ptr(__call_target);
                     match __policy {
                         2u8 => {
                             __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);

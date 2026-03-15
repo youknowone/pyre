@@ -76,6 +76,19 @@ pub trait FailDescr: Descr {
     fn trace_id(&self) -> u64 {
         0
     }
+
+    /// Whether the given exit slot should be treated as a real GC root.
+    ///
+    /// Backends may override this to distinguish rooted refs from opaque
+    /// handles that reuse `Type::Ref`, such as FORCE_TOKEN values.
+    fn is_gc_ref_slot(&self, slot: usize) -> bool {
+        matches!(self.fail_arg_types().get(slot), Some(Type::Ref))
+    }
+
+    /// Exit slot indices that carry opaque force-token handles.
+    fn force_token_slots(&self) -> &[usize] {
+        &[]
+    }
 }
 
 /// Descriptor for a fixed-size struct/object allocation.

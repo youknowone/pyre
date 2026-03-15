@@ -4996,6 +4996,47 @@ impl majit_codegen::Backend for CraneliftBackend {
         }
     }
 
+    fn compiled_fail_descr_layouts(
+        &self,
+        token: &LoopToken,
+    ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        Some(
+            compiled
+                .fail_descrs
+                .iter()
+                .map(|descr| descr.layout())
+                .collect(),
+        )
+    }
+
+    fn compiled_bridge_fail_descr_layouts(
+        &self,
+        original_token: &LoopToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
+        let original_compiled = original_token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
+            descr.fail_index == source_fail_index && descr.trace_id == source_trace_id
+        })?;
+        let bridge = source_descr.bridge.lock().unwrap();
+        let bridge = bridge.as_ref()?;
+        Some(
+            bridge
+                .fail_descrs
+                .iter()
+                .map(|descr| descr.layout())
+                .collect(),
+        )
+    }
+
     fn force(&self, force_token: GcRef) -> DeadFrame {
         force_token_to_dead_frame(force_token)
     }

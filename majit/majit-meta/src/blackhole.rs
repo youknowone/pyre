@@ -126,9 +126,9 @@ impl ExceptionState {
 /// Result of blackhole execution.
 pub enum BlackholeResult {
     /// Reached a Finish operation with output values.
-    Finish(Vec<i64>),
+    Finish { op_index: usize, values: Vec<i64> },
     /// Reached a Jump — loop back to header with these values.
-    Jump(Vec<i64>),
+    Jump { op_index: usize, values: Vec<i64> },
     /// A guard failed during blackhole execution.
     GuardFailed {
         guard_index: usize,
@@ -213,11 +213,23 @@ fn blackhole_execute_full(
             OpResult::Void => {}
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
-                return (BlackholeResult::Finish(vals), exc_state);
+                return (
+                    BlackholeResult::Finish {
+                        op_index: op_idx,
+                        values: vals,
+                    },
+                    exc_state,
+                );
             }
             OpResult::Jump(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
-                return (BlackholeResult::Jump(vals), exc_state);
+                return (
+                    BlackholeResult::Jump {
+                        op_index: op_idx,
+                        values: vals,
+                    },
+                    exc_state,
+                );
             }
             OpResult::GuardFailed => {
                 let fail_values = if let Some(ref fail_args) = op.fail_args {
@@ -369,11 +381,23 @@ pub(crate) fn blackhole_execute_with_state(
             OpResult::Void => {}
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
-                return (BlackholeResult::Finish(vals), exc_state);
+                return (
+                    BlackholeResult::Finish {
+                        op_index: op_idx,
+                        values: vals,
+                    },
+                    exc_state,
+                );
             }
             OpResult::Jump(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
-                return (BlackholeResult::Jump(vals), exc_state);
+                return (
+                    BlackholeResult::Jump {
+                        op_index: op_idx,
+                        values: vals,
+                    },
+                    exc_state,
+                );
             }
             OpResult::GuardFailed => {
                 let fail_values = if let Some(ref fail_args) = op.fail_args {
@@ -1070,7 +1094,7 @@ mod tests {
         initial.insert(1, 20i64);
 
         match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
-            BlackholeResult::Finish(vals) => assert_eq!(vals, vec![30]),
+            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![30]),
             other => panic!(
                 "expected Finish, got {:?}",
                 match other {
@@ -1092,7 +1116,7 @@ mod tests {
         initial.insert(0, 1i64);
 
         match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
-            BlackholeResult::Finish(vals) => assert_eq!(vals, vec![1]),
+            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![1]),
             _ => panic!("expected Finish"),
         }
     }
@@ -1108,7 +1132,7 @@ mod tests {
         initial.insert(0, 42i64);
 
         match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
-            BlackholeResult::Finish(vals) => assert_eq!(vals, vec![42]),
+            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![42]),
             _ => panic!("expected Finish when no exception is pending"),
         }
     }
@@ -1161,7 +1185,7 @@ mod tests {
                 exc_value: 200,
             },
         ) {
-            BlackholeResult::Finish(vals) => assert_eq!(vals, vec![200]),
+            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![200]),
             _ => panic!("expected Finish when initial exception class matches"),
         }
     }
@@ -1185,7 +1209,7 @@ mod tests {
         initial.insert(1, 200i64); // exc_value
 
         match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
-            BlackholeResult::Finish(vals) => assert_eq!(vals, vec![100, 200]),
+            BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![100, 200]),
             _ => panic!("expected Finish"),
         }
     }
@@ -1235,7 +1259,7 @@ mod tests {
         initial.insert(1, 200i64); // exc_value
 
         match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
-            BlackholeResult::Finish(vals) => {
+            BlackholeResult::Finish { values: vals, .. } => {
                 // GuardException should return the exc_value
                 assert_eq!(vals, vec![200]);
             }
@@ -1306,7 +1330,10 @@ mod tests {
                     } => {
                         assert_eq!(*type_id, 0);
                         assert_eq!(*descr_index, 7);
-                        assert_eq!(fields, &vec![(3, 55)]);
+                        assert_eq!(
+                            fields,
+                            &vec![(3, crate::resume::MaterializedValue::Value(55))]
+                        );
                     }
                     other => panic!("unexpected materialized virtual: {other:?}"),
                 }
@@ -1352,8 +1379,8 @@ mod tests {
                     pending_field_writes,
                     vec![crate::resume::ResolvedPendingFieldWrite {
                         descr_index: 9,
-                        target: 1,
-                        value: 77,
+                        target: crate::resume::MaterializedValue::Value(1),
+                        value: crate::resume::MaterializedValue::Value(77),
                         item_index: Some(2),
                     }]
                 );

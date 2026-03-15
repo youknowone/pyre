@@ -35,15 +35,17 @@ pub use fail_descr::make_fail_descr;
 pub use io_buffer::{
     emit_commit_io, io_buffer_commit, io_buffer_discard, io_buffer_write, io_buffer_write_fmt,
 };
-pub use jit_state::JitState;
+pub use jit_state::{JitState, PendingFieldWriteLayout};
 pub use jitcode::{
     trace_jitcode, ClosureRuntime, JitCode, JitCodeBuilder, JitCodeMachine, JitCodeRuntime,
     JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
 };
-pub use meta_interp::{BackEdgeAction, BlackholeRunResult, JitHooks, MetaInterp};
+pub use meta_interp::{
+    BackEdgeAction, BlackholeRunResult, CompiledExitLayout, DriverRunOutcome, JitHooks, MetaInterp,
+};
 pub use parity::{assert_trace_parity, normalize_ops, normalize_trace, TraceParityCase};
 pub use symbolic_stack::SymbolicStack;
-pub use trace_ctx::{JitDriverDescriptor, TraceCtx};
+pub use trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx};
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 pub fn majit_log_enabled() -> bool {
