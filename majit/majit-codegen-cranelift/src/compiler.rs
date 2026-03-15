@@ -1262,24 +1262,31 @@ fn take_call_assembler_deadframe(handle: u64) -> Option<DeadFrame> {
         .remove(&handle)
 }
 
-fn finish_result_from_deadframe(frame: &mut DeadFrame) -> i64 {
-    let descr = get_latest_descr_from_deadframe(frame);
-    assert!(descr.is_finish(), "expected finish deadframe");
-    match descr.fail_arg_types() {
-        [] => 0,
+fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendError> {
+    let fail_arg_types = {
+        let descr = get_latest_descr_from_deadframe(frame)?;
+        assert!(descr.is_finish(), "expected finish deadframe");
+        descr.fail_arg_types().to_vec()
+    };
+    match fail_arg_types.as_slice() {
+        [] => Ok(0),
         [Type::Int] => get_int_from_deadframe(frame, 0),
         [Type::Ref] => {
             if let Some(frame_data) = frame.data.downcast_mut::<FrameData>() {
-                return frame_data.take_ref_for_call_result(0).as_usize() as i64;
+                return Ok(frame_data.take_ref_for_call_result(0).as_usize() as i64);
             }
             if let Some(preview) = frame.data.downcast_mut::<PreviewFrameData>() {
-                return preview.frame.get_ref(0).as_usize() as i64;
+                return Ok(preview.frame.get_ref(0).as_usize() as i64);
             }
-            panic!("unsupported dead frame type")
+            Err(BackendError::Unsupported(
+                "unsupported dead frame type for Ref finish result".to_string(),
+            ))
         }
-        [Type::Float] => get_float_from_deadframe(frame, 0).to_bits() as i64,
-        [Type::Void] => 0,
-        other => panic!("unsupported call_assembler finish result layout: {other:?}"),
+        [Type::Float] => Ok(get_float_from_deadframe(frame, 0)?.to_bits() as i64),
+        [Type::Void] => Ok(0),
+        other => Err(BackendError::Unsupported(format!(
+            "unsupported call_assembler finish result layout: {other:?}"
+        ))),
     }
 }
 
@@ -1469,87 +1476,104 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     }
 }
 
-pub fn set_savedata_ref_on_deadframe(frame: &mut DeadFrame, data: GcRef) {
+pub fn set_savedata_ref_on_deadframe(
+    frame: &mut DeadFrame,
+    data: GcRef,
+) -> Result<(), BackendError> {
     if let Some(frame_data) = frame.data.downcast_mut::<FrameData>() {
         frame_data.set_savedata_ref(data);
-        return;
+        return Ok(());
     }
     if let Some(preview) = frame.data.downcast_mut::<PreviewFrameData>() {
         preview.frame.set_savedata_ref(data);
         set_force_frame_saved_data(&preview.active_force_frame, data);
-        return;
+        return Ok(());
     }
     if let Some(overlay) = frame.data.downcast_mut::<OverlayFrameData>() {
-        set_savedata_ref_on_deadframe(&mut overlay.inner, data);
-        return;
+        set_savedata_ref_on_deadframe(&mut overlay.inner, data)?;
+        return Ok(());
     }
-    panic!("unsupported dead frame type for saved-data");
+    Err(BackendError::Unsupported(
+        "unsupported dead frame type for saved-data".to_string(),
+    ))
 }
 
-pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> &dyn FailDescr {
+pub fn get_latest_descr_from_deadframe(
+    frame: &DeadFrame,
+) -> Result<&dyn FailDescr, BackendError> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return frame_data.fail_descr.as_ref();
+        return Ok(frame_data.fail_descr.as_ref());
     }
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return preview.frame.fail_descr.as_ref();
+        return Ok(preview.frame.fail_descr.as_ref());
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return overlay.fail_descr.as_ref();
+        return Ok(overlay.fail_descr.as_ref());
     }
-    panic!("unsupported dead frame type");
+    Err(BackendError::Unsupported(
+        "unsupported dead frame type for get_latest_descr".to_string(),
+    ))
 }
 
-pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> i64 {
+pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, BackendError> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return frame_data.get_int(index);
+        return Ok(frame_data.get_int(index));
     }
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return preview.frame.get_int(index);
+        return Ok(preview.frame.get_int(index));
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return get_int_from_deadframe(&overlay.inner, index);
     }
-    panic!("unsupported dead frame type");
+    Err(BackendError::Unsupported(
+        "unsupported dead frame type for get_int".to_string(),
+    ))
 }
 
-pub fn get_float_from_deadframe(frame: &DeadFrame, index: usize) -> f64 {
+pub fn get_float_from_deadframe(frame: &DeadFrame, index: usize) -> Result<f64, BackendError> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return frame_data.get_float(index);
+        return Ok(frame_data.get_float(index));
     }
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return preview.frame.get_float(index);
+        return Ok(preview.frame.get_float(index));
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return get_float_from_deadframe(&overlay.inner, index);
     }
-    panic!("unsupported dead frame type");
+    Err(BackendError::Unsupported(
+        "unsupported dead frame type for get_float".to_string(),
+    ))
 }
 
-pub fn get_ref_from_deadframe(frame: &DeadFrame, index: usize) -> GcRef {
+pub fn get_ref_from_deadframe(frame: &DeadFrame, index: usize) -> Result<GcRef, BackendError> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return frame_data.get_ref(index);
+        return Ok(frame_data.get_ref(index));
     }
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return preview.frame.get_ref(index);
+        return Ok(preview.frame.get_ref(index));
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return get_ref_from_deadframe(&overlay.inner, index);
     }
-    panic!("unsupported dead frame type");
+    Err(BackendError::Unsupported(
+        "unsupported dead frame type for get_ref".to_string(),
+    ))
 }
 
-pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> GcRef {
+pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return frame_data.get_savedata_ref();
+        return Ok(frame_data.get_savedata_ref());
     }
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return get_force_frame_saved_data(&preview.active_force_frame)
-            .unwrap_or_else(|| preview.frame.get_savedata_ref());
+        return Ok(get_force_frame_saved_data(&preview.active_force_frame)
+            .unwrap_or_else(|| preview.frame.get_savedata_ref()));
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return get_savedata_ref_from_deadframe(&overlay.inner);
     }
-    panic!("unsupported dead frame type for saved-data");
+    Err(BackendError::Unsupported(
+        "unsupported dead frame type for get_savedata_ref".to_string(),
+    ))
 }
 
 pub fn grab_savedata_ref_from_deadframe(frame: &DeadFrame) -> Option<GcRef> {
@@ -1566,30 +1590,34 @@ pub fn grab_savedata_ref_from_deadframe(frame: &DeadFrame) -> Option<GcRef> {
     None
 }
 
-pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> GcRef {
+pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return frame_data.get_exception_ref();
+        return Ok(frame_data.get_exception_ref());
     }
     if frame.data.downcast_ref::<PreviewFrameData>().is_some() {
-        return GcRef::NULL;
+        return Ok(GcRef::NULL);
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return grab_exc_value_from_deadframe(&overlay.inner);
     }
-    panic!("unsupported dead frame type for exception value");
+    Err(BackendError::Unsupported(
+        "unsupported dead frame type for exception value".to_string(),
+    ))
 }
 
-pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> i64 {
+pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendError> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return frame_data.get_exception_class();
+        return Ok(frame_data.get_exception_class());
     }
     if frame.data.downcast_ref::<PreviewFrameData>().is_some() {
-        return 0;
+        return Ok(0);
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return grab_exc_class_from_deadframe(&overlay.inner);
     }
-    panic!("unsupported dead frame type for exception class");
+    Err(BackendError::Unsupported(
+        "unsupported dead frame type for exception class".to_string(),
+    ))
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
@@ -1720,7 +1748,8 @@ fn call_assembler_fast_path(
                     fail_descr,
                     target.gc_runtime_id,
                 );
-                finish_result_from_deadframe(&mut frame) as u64
+                finish_result_from_deadframe(&mut frame)
+                    .expect("finish_result_from_deadframe failed") as u64
             }
         };
     }
@@ -1784,7 +1813,8 @@ fn call_assembler_fast_path_heap(
                     fail_descr,
                     target.gc_runtime_id,
                 );
-                finish_result_from_deadframe(&mut frame) as u64
+                finish_result_from_deadframe(&mut frame)
+                    .expect("finish_result_from_deadframe failed") as u64
             }
         };
     }
@@ -1851,13 +1881,15 @@ extern "C" fn call_assembler_shim(
 
     // Slow path: full DeadFrame construction
     let mut frame = execute_registered_loop_target(target, input_slice);
-    let descr = get_latest_descr_from_deadframe(&frame);
+    let descr = get_latest_descr_from_deadframe(&frame)
+        .expect("get_latest_descr_from_deadframe failed");
     if descr.is_finish() {
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
             *outcome.add(1) = 0;
         }
-        return finish_result_from_deadframe(&mut frame) as u64;
+        return finish_result_from_deadframe(&mut frame)
+            .expect("finish_result_from_deadframe failed") as u64;
     }
 
     let handle = store_call_assembler_deadframe(frame);
@@ -6945,26 +6977,32 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         get_latest_descr_from_deadframe(frame)
+            .expect("get_latest_descr_from_deadframe failed")
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
         get_int_from_deadframe(frame, index)
+            .expect("get_int_from_deadframe failed")
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
         get_float_from_deadframe(frame, index)
+            .expect("get_float_from_deadframe failed")
     }
 
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> GcRef {
         get_ref_from_deadframe(frame, index)
+            .expect("get_ref_from_deadframe failed")
     }
 
     fn set_savedata_ref(&self, frame: &mut DeadFrame, data: GcRef) {
-        set_savedata_ref_on_deadframe(frame, data);
+        set_savedata_ref_on_deadframe(frame, data)
+            .expect("set_savedata_ref_on_deadframe failed");
     }
 
     fn get_savedata_ref(&self, frame: &DeadFrame) -> GcRef {
         get_savedata_ref_from_deadframe(frame)
+            .expect("get_savedata_ref_from_deadframe failed")
     }
 
     fn grab_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
@@ -6973,17 +7011,21 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn grab_exception_state(&self, frame: &DeadFrame) -> (i64, GcRef) {
         (
-            grab_exc_class_from_deadframe(frame),
-            grab_exc_value_from_deadframe(frame),
+            grab_exc_class_from_deadframe(frame)
+                .expect("grab_exc_class_from_deadframe failed"),
+            grab_exc_value_from_deadframe(frame)
+                .expect("grab_exc_value_from_deadframe failed"),
         )
     }
 
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
         grab_exc_value_from_deadframe(frame)
+            .expect("grab_exc_value_from_deadframe failed")
     }
 
     fn grab_exc_class(&self, frame: &DeadFrame) -> i64 {
         grab_exc_class_from_deadframe(frame)
+            .expect("grab_exc_class_from_deadframe failed")
     }
 
     fn invalidate_loop(&self, token: &LoopToken) {
@@ -7142,11 +7184,11 @@ mod tests {
         if flag != 0 {
             let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
             let mut values = may_force_void_values().lock().unwrap();
-            values.push(get_latest_descr_from_deadframe(&deadframe).fail_index() as i64);
-            values.push(get_int_from_deadframe(&deadframe, 0));
-            values.push(get_int_from_deadframe(&deadframe, 1));
+            values.push(get_latest_descr_from_deadframe(&deadframe).unwrap().fail_index() as i64);
+            values.push(get_int_from_deadframe(&deadframe, 0).unwrap());
+            values.push(get_int_from_deadframe(&deadframe, 1).unwrap());
             drop(values);
-            set_savedata_ref_on_deadframe(&mut deadframe, GcRef(0xDADA));
+            set_savedata_ref_on_deadframe(&mut deadframe, GcRef(0xDADA)).unwrap();
         }
     }
 
@@ -7154,10 +7196,10 @@ mod tests {
         if flag != 0 {
             let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
             let mut values = may_force_int_values().lock().unwrap();
-            values.push(get_int_from_deadframe(&deadframe, 0));
-            values.push(get_int_from_deadframe(&deadframe, 2));
+            values.push(get_int_from_deadframe(&deadframe, 0).unwrap());
+            values.push(get_int_from_deadframe(&deadframe, 2).unwrap());
             drop(values);
-            set_savedata_ref_on_deadframe(&mut deadframe, GcRef(0xBABA));
+            set_savedata_ref_on_deadframe(&mut deadframe, GcRef(0xBABA)).unwrap();
         }
         42
     }
@@ -7166,9 +7208,9 @@ mod tests {
         if flag != 0 {
             let deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
             let mut values = may_force_float_values().lock().unwrap();
-            values.push(get_int_from_deadframe(&deadframe, 0) as u64);
-            values.push(get_float_from_deadframe(&deadframe, 1).to_bits());
-            values.push(get_int_from_deadframe(&deadframe, 2) as u64);
+            values.push(get_int_from_deadframe(&deadframe, 0).unwrap() as u64);
+            values.push(get_float_from_deadframe(&deadframe, 1).unwrap().to_bits());
+            values.push(get_int_from_deadframe(&deadframe, 2).unwrap() as u64);
         }
         12.5
     }
@@ -7181,17 +7223,17 @@ mod tests {
     ) -> i64 {
         if flag != 0 {
             let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
-            let preview_live = get_ref_from_deadframe(&deadframe, 2);
-            set_savedata_ref_on_deadframe(&mut deadframe, preview_live);
+            let preview_live = get_ref_from_deadframe(&deadframe, 2).unwrap();
+            set_savedata_ref_on_deadframe(&mut deadframe, preview_live).unwrap();
             with_gc_runtime(runtime_id as u64, |gc| gc.collect_nursery());
-            let preview_result = get_ref_from_deadframe(&deadframe, 1);
-            let preview_live = get_ref_from_deadframe(&deadframe, 2);
-            let preview_return = get_ref_from_deadframe(&deadframe, 3);
+            let preview_result = get_ref_from_deadframe(&deadframe, 1).unwrap();
+            let preview_live = get_ref_from_deadframe(&deadframe, 2).unwrap();
+            let preview_return = get_ref_from_deadframe(&deadframe, 3).unwrap();
             let mut values = may_force_ref_values().lock().unwrap();
             values.push(preview_result.0);
             values.push(preview_live.0);
             values.push(preview_return.0);
-            return get_ref_from_deadframe(&deadframe, 3).0 as i64;
+            return get_ref_from_deadframe(&deadframe, 3).unwrap().0 as i64;
         }
         return_ref
     }
