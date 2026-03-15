@@ -29,6 +29,7 @@ pub mod quasi_immut;
 pub mod resume;
 mod symbolic_stack;
 mod trace_ctx;
+pub mod virtual_ref;
 pub mod virtualizable;
 
 pub use call_descr::{make_call_assembler_descr, make_call_descr};

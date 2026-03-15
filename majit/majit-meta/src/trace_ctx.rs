@@ -1,9 +1,11 @@
 use majit_ir::{DescrRef, GreenKey, JitDriverVar, OpCode, OpRef, Type, VarKind};
 use majit_trace::recorder::TraceRecorder;
 
-use crate::call_descr::make_call_descr;
+use majit_codegen::LoopToken;
+
+use crate::call_descr::{make_call_assembler_descr, make_call_descr};
 use crate::constant_pool::ConstantPool;
-use crate::fail_descr::make_fail_descr;
+use crate::fail_descr::{make_fail_descr, make_fail_descr_typed};
 use crate::symbolic_stack::SymbolicStack;
 use crate::TraceAction;
 
@@ -212,32 +214,35 @@ impl TraceCtx {
             .record_guard_with_fail_args(opcode, args, descr, fail_args)
     }
 
+    /// Record a guard with explicit typed fail_args.
+    pub fn record_guard_typed_with_fail_args(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        fail_arg_types: Vec<Type>,
+        fail_args: &[OpRef],
+    ) -> OpRef {
+        let descr = make_fail_descr_typed(fail_arg_types);
+        self.recorder
+            .record_guard_with_fail_args(opcode, args, descr, fail_args)
+    }
+
     /// Record a void-returning function call (CallN).
     ///
     /// Automatically registers the function pointer as a constant and
     /// creates a CallDescr. The interpreter doesn't need to manage
     /// function pointer constants or CallDescr implementations.
     pub fn call_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Void);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallN, &call_args, descr);
+        self.call_void_typed(func_ptr, args, &arg_types);
     }
 
     /// Record an integer-returning function call (CallI).
     ///
     /// Same convenience as `call_void` but returns an OpRef for the result.
     pub fn call_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Int);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallI, &call_args, descr)
+        self.call_int_typed(func_ptr, args, &arg_types)
     }
 
     /// Whether the trace has exceeded the maximum allowed length.
@@ -300,13 +305,8 @@ impl TraceCtx {
     /// This records a CALL_PURE_I (or CALL_PURE_R/CALL_PURE_N) which the
     /// optimizer's pure pass can eliminate.
     pub fn call_elidable_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Int);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallPureI, &call_args, descr)
+        self.call_elidable_int_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a void-returning call to a may-force function (e.g., one that
@@ -315,13 +315,8 @@ impl TraceCtx {
     /// In RPython this is `call_may_force` — a call that may force virtualizable
     /// frames or raise exceptions. Must be followed by `GUARD_NOT_FORCED`.
     pub fn call_may_force_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Int);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallMayForceI, &call_args, descr)
+        self.call_may_force_int_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a virtualizable field read (GETFIELD_GC_I/R/F).
@@ -334,16 +329,31 @@ impl TraceCtx {
         self.record_op(OpCode::GetfieldGcI, &[vable_opref, offset_ref])
     }
 
+    /// Record a virtualizable field read with an explicit field descriptor.
+    pub fn vable_getfield_int_descr(&mut self, vable_opref: OpRef, descr: DescrRef) -> OpRef {
+        self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], descr)
+    }
+
     /// Record a virtualizable field write (SETFIELD_GC).
     pub fn vable_setfield(&mut self, vable_opref: OpRef, field_offset: usize, value: OpRef) {
         let offset_ref = self.const_int(field_offset as i64);
         self.record_op(OpCode::SetfieldGc, &[vable_opref, offset_ref, value]);
     }
 
+    /// Record a virtualizable field write with an explicit field descriptor.
+    pub fn vable_setfield_descr(&mut self, vable_opref: OpRef, value: OpRef, descr: DescrRef) {
+        self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], descr);
+    }
+
     /// Record a virtualizable ref field read (GETFIELD_GC_R).
     pub fn vable_getfield_ref(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
         let offset_ref = self.const_int(field_offset as i64);
         self.record_op(OpCode::GetfieldGcR, &[vable_opref, offset_ref])
+    }
+
+    /// Record a virtualizable ref field read with an explicit field descriptor.
+    pub fn vable_getfield_ref_descr(&mut self, vable_opref: OpRef, descr: DescrRef) -> OpRef {
+        self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], descr)
     }
 
     /// Record a virtualizable float field read (GETFIELD_GC_F).
@@ -358,10 +368,30 @@ impl TraceCtx {
         self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
     }
 
+    /// Record a virtualizable array item read with an explicit array descriptor.
+    pub fn vable_getarrayitem_int_descr(
+        &mut self,
+        array_opref: OpRef,
+        index: OpRef,
+        descr: DescrRef,
+    ) -> OpRef {
+        self.record_op_with_descr(OpCode::GetarrayitemGcI, &[array_opref, index], descr)
+    }
+
     /// Record a virtualizable array item read (GETARRAYITEM_GC_R).
     pub fn vable_getarrayitem_ref(&mut self, array_opref: OpRef, index: OpRef) -> OpRef {
         let zero = self.const_int(0); // descr placeholder
         self.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero])
+    }
+
+    /// Record a virtualizable array item read with an explicit array descriptor.
+    pub fn vable_getarrayitem_ref_descr(
+        &mut self,
+        array_opref: OpRef,
+        index: OpRef,
+        descr: DescrRef,
+    ) -> OpRef {
+        self.record_op_with_descr(OpCode::GetarrayitemGcR, &[array_opref, index], descr)
     }
 
     /// Record a virtualizable array item read (GETARRAYITEM_GC_F).
@@ -376,26 +406,27 @@ impl TraceCtx {
         self.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
     }
 
+    /// Record a virtualizable array item write with an explicit array descriptor.
+    pub fn vable_setarrayitem_descr(
+        &mut self,
+        array_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        descr: DescrRef,
+    ) {
+        self.record_op_with_descr(OpCode::SetarrayitemGc, &[array_opref, index, value], descr);
+    }
+
     /// Record a ref-returning call to a may-force function.
     pub fn call_may_force_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Ref);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallMayForceR, &call_args, descr)
+        self.call_may_force_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a void-returning call to a may-force function.
     pub fn call_may_force_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Void);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallMayForceN, &call_args, descr);
+        self.call_may_force_void_typed(func_ptr, args, &arg_types);
     }
 
     /// Record a call with GIL release (for C extensions / external libs).
@@ -403,13 +434,8 @@ impl TraceCtx {
     /// In RPython this is `call_release_gil`. The GIL is released before the
     /// call and reacquired after. Used for long-running C functions.
     pub fn call_release_gil_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Int);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallReleaseGilI, &call_args, descr)
+        self.call_release_gil_int_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a call to a loop-invariant function.
@@ -417,13 +443,8 @@ impl TraceCtx {
     /// The result is cached for the duration of one loop iteration.
     /// In RPython, `@jit.loop_invariant` marks such functions.
     pub fn call_loopinvariant_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Int);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallLoopinvariantI, &call_args, descr)
+        self.call_loopinvariant_int_typed(func_ptr, args, &arg_types)
     }
 
     /// Record GUARD_NOT_FORCED (must follow a call_may_force).
@@ -463,116 +484,416 @@ impl TraceCtx {
             .record_op_with_descr(opcode, &call_args, descr)
     }
 
+    pub fn call_void_typed(&mut self, func_ptr: *const (), args: &[OpRef], arg_types: &[Type]) {
+        let _ = self.call_typed(OpCode::CallN, func_ptr, args, arg_types, Type::Void);
+    }
+
+    pub fn call_int_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_typed(OpCode::CallI, func_ptr, args, arg_types, Type::Int)
+    }
+
+    pub fn call_elidable_int_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_typed(OpCode::CallPureI, func_ptr, args, arg_types, Type::Int)
+    }
+
     // ── Ref/Float call variants ─────────────────────────────────────
 
     /// Record a ref-returning function call (CallR).
     pub fn call_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Ref);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallR, &call_args, descr)
+        self.call_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a float-returning function call (CallF).
     pub fn call_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Float);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallF, &call_args, descr)
+        self.call_float_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a ref-returning elidable (pure) call (CallPureR).
     pub fn call_elidable_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Ref);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallPureR, &call_args, descr)
+        self.call_elidable_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a float-returning elidable (pure) call (CallPureF).
     pub fn call_elidable_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Float);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallPureF, &call_args, descr)
+        self.call_elidable_float_typed(func_ptr, args, &arg_types)
+    }
+
+    pub fn call_ref_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_typed(OpCode::CallR, func_ptr, args, arg_types, Type::Ref)
+    }
+
+    pub fn call_float_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_typed(OpCode::CallF, func_ptr, args, arg_types, Type::Float)
+    }
+
+    pub fn call_elidable_ref_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_typed(OpCode::CallPureR, func_ptr, args, arg_types, Type::Ref)
+    }
+
+    pub fn call_elidable_float_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_typed(OpCode::CallPureF, func_ptr, args, arg_types, Type::Float)
+    }
+
+    fn call_family_typed(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+    ) -> OpRef {
+        self.call_typed(opcode, func_ptr, args, arg_types, ret_type)
+    }
+
+    pub fn call_may_force_void_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) {
+        let _ = self.call_family_typed(
+            OpCode::call_may_force_for_type(Type::Void),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Void,
+        );
+    }
+
+    pub fn call_may_force_int_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_may_force_for_type(Type::Int),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Int,
+        )
+    }
+
+    pub fn call_may_force_ref_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_may_force_for_type(Type::Ref),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Ref,
+        )
     }
 
     /// Record a float-returning may-force call (CallMayForceF).
     pub fn call_may_force_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Float);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallMayForceF, &call_args, descr)
+        self.call_may_force_float_typed(func_ptr, args, &arg_types)
+    }
+
+    pub fn call_may_force_float_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_may_force_for_type(Type::Float),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Float,
+        )
     }
 
     /// Record a void-returning GIL-release call (CallReleaseGilN).
     pub fn call_release_gil_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Void);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallReleaseGilN, &call_args, descr);
+        self.call_release_gil_void_typed(func_ptr, args, &arg_types);
     }
 
     /// Record a ref-returning GIL-release call (CallReleaseGilR).
     pub fn call_release_gil_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Ref);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallReleaseGilR, &call_args, descr)
+        self.call_release_gil_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a float-returning GIL-release call (CallReleaseGilF).
     pub fn call_release_gil_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Float);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallReleaseGilF, &call_args, descr)
+        self.call_release_gil_float_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a ref-returning loop-invariant call (CallLoopinvariantR).
     pub fn call_loopinvariant_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Ref);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallLoopinvariantR, &call_args, descr)
+        self.call_loopinvariant_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a float-returning loop-invariant call (CallLoopinvariantF).
     pub fn call_loopinvariant_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_descr(&arg_types, Type::Float);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(OpCode::CallLoopinvariantF, &call_args, descr)
+        self.call_loopinvariant_float_typed(func_ptr, args, &arg_types)
+    }
+
+    pub fn call_release_gil_void_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) {
+        let _ = self.call_family_typed(
+            OpCode::call_release_gil_for_type(Type::Void),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Void,
+        );
+    }
+
+    pub fn call_release_gil_int_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_release_gil_for_type(Type::Int),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Int,
+        )
+    }
+
+    pub fn call_release_gil_ref_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_release_gil_for_type(Type::Ref),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Ref,
+        )
+    }
+
+    pub fn call_release_gil_float_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_release_gil_for_type(Type::Float),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Float,
+        )
+    }
+
+    pub fn call_loopinvariant_void_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) {
+        let _ = self.call_family_typed(
+            OpCode::call_loopinvariant_for_type(Type::Void),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Void,
+        );
+    }
+
+    pub fn call_loopinvariant_int_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_loopinvariant_for_type(Type::Int),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Int,
+        )
+    }
+
+    pub fn call_loopinvariant_ref_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_loopinvariant_for_type(Type::Ref),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Ref,
+        )
+    }
+
+    pub fn call_loopinvariant_float_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_family_typed(
+            OpCode::call_loopinvariant_for_type(Type::Float),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Float,
+        )
+    }
+
+    // ── CALL_ASSEMBLER ────────────────────────────────────────────
+
+    fn call_assembler_typed(
+        &mut self,
+        opcode: OpCode,
+        target: &LoopToken,
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+    ) -> OpRef {
+        let descr = make_call_assembler_descr(target.number, arg_types, ret_type);
+        self.record_op_with_descr(opcode, args, descr)
+    }
+
+    /// Emit CALL_ASSEMBLER_I by token number, without needing a &LoopToken.
+    pub fn call_assembler_int_by_number(&mut self, target_number: u64, args: &[OpRef]) -> OpRef {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let descr = make_call_assembler_descr(target_number, &arg_types, Type::Int);
+        self.record_op_with_descr(OpCode::CallAssemblerI, args, descr)
+    }
+
+    pub fn call_assembler_void(&mut self, target: &LoopToken, args: &[OpRef]) {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        self.call_assembler_void_typed(target, args, &arg_types);
+    }
+
+    pub fn call_assembler_int(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        self.call_assembler_int_typed(target, args, &arg_types)
+    }
+
+    pub fn call_assembler_ref(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        self.call_assembler_ref_typed(target, args, &arg_types)
+    }
+
+    pub fn call_assembler_float(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        self.call_assembler_float_typed(target, args, &arg_types)
+    }
+
+    pub fn call_assembler_void_typed(
+        &mut self,
+        target: &LoopToken,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) {
+        let _ = self.call_assembler_typed(
+            OpCode::call_assembler_for_type(Type::Void),
+            target,
+            args,
+            arg_types,
+            Type::Void,
+        );
+    }
+
+    pub fn call_assembler_int_typed(
+        &mut self,
+        target: &LoopToken,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_assembler_typed(
+            OpCode::call_assembler_for_type(Type::Int),
+            target,
+            args,
+            arg_types,
+            Type::Int,
+        )
+    }
+
+    pub fn call_assembler_ref_typed(
+        &mut self,
+        target: &LoopToken,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_assembler_typed(
+            OpCode::call_assembler_for_type(Type::Ref),
+            target,
+            args,
+            arg_types,
+            Type::Ref,
+        )
+    }
+
+    pub fn call_assembler_float_typed(
+        &mut self,
+        target: &LoopToken,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_assembler_typed(
+            OpCode::call_assembler_for_type(Type::Float),
+            target,
+            args,
+            arg_types,
+            Type::Float,
+        )
     }
 
     // ── Exception handling ──────────────────────────────────────────
@@ -619,6 +940,37 @@ impl TraceCtx {
     /// Record NEW_ARRAY_CLEAR: allocate a zero-initialized array.
     pub fn record_new_array_clear(&mut self, length: OpRef, descr: DescrRef) -> OpRef {
         self.record_op_with_descr(OpCode::NewArrayClear, &[length], descr)
+    }
+
+    // ── Virtual references ────────────────────────────────────────
+
+    /// Record VIRTUAL_REF_R: create a virtual reference (ref-typed result).
+    ///
+    /// `virtual_obj` is the real object being wrapped.
+    /// `force_token` is the force token for the current JIT frame.
+    ///
+    /// The optimizer replaces this with a virtual struct, so if the vref
+    /// never escapes, no allocation happens.
+    pub fn virtual_ref_r(&mut self, virtual_obj: OpRef, force_token: OpRef) -> OpRef {
+        self.record_op(OpCode::VirtualRefR, &[virtual_obj, force_token])
+    }
+
+    /// Record VIRTUAL_REF_I: create a virtual reference (int-typed result).
+    pub fn virtual_ref_i(&mut self, virtual_obj: OpRef, force_token: OpRef) -> OpRef {
+        self.record_op(OpCode::VirtualRefI, &[virtual_obj, force_token])
+    }
+
+    /// Record VIRTUAL_REF_FINISH: finalize a virtual reference.
+    ///
+    /// `vref` is the virtual reference to finalize.
+    /// `virtual_obj` is the real object (or NULL/0 if the frame is being left normally).
+    pub fn virtual_ref_finish(&mut self, vref: OpRef, virtual_obj: OpRef) {
+        self.record_op(OpCode::VirtualRefFinish, &[vref, virtual_obj]);
+    }
+
+    /// Record FORCE_TOKEN: capture the current JIT frame address.
+    pub fn force_token(&mut self) -> OpRef {
+        self.record_op(OpCode::ForceToken, &[])
     }
 
     // ── Overflow-checked arithmetic ────────────────────────────────
@@ -742,5 +1094,100 @@ impl TraceCtx {
         } else {
             TraceAction::Continue
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_codegen::LoopToken;
+    use majit_ir::Type;
+
+    extern "C" fn dummy_call_target() {}
+
+    fn make_ctx_with_mixed_inputs() -> (TraceCtx, [OpRef; 3]) {
+        let mut recorder = TraceRecorder::new();
+        let r = recorder.record_input_arg(Type::Ref);
+        let f = recorder.record_input_arg(Type::Float);
+        let i = recorder.record_input_arg(Type::Int);
+        (TraceCtx::new(recorder, 0), [r, f, i])
+    }
+
+    fn take_single_call_descr(ctx: TraceCtx, jump_args: &[OpRef]) -> (Vec<Type>, OpCode) {
+        let mut recorder = ctx.recorder;
+        recorder.close_loop(jump_args);
+        let trace = recorder.get_trace();
+        let call_op = &trace.ops[0];
+        let arg_types = call_op
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .expect("call op should carry CallDescr")
+            .arg_types()
+            .to_vec();
+        (arg_types, call_op.opcode)
+    }
+
+    fn take_single_call_op(ctx: TraceCtx, jump_args: &[OpRef]) -> majit_ir::Op {
+        let mut recorder = ctx.recorder;
+        recorder.close_loop(jump_args);
+        let mut trace = recorder.get_trace();
+        trace.ops.remove(0)
+    }
+
+    #[test]
+    fn call_may_force_typed_preserves_mixed_arg_types() {
+        let (mut ctx, args) = make_ctx_with_mixed_inputs();
+        let _ = ctx.call_may_force_ref_typed(
+            dummy_call_target as *const (),
+            &args,
+            &[Type::Ref, Type::Float, Type::Int],
+        );
+        let (arg_types, opcode) = take_single_call_descr(ctx, &args);
+        assert_eq!(opcode, OpCode::CallMayForceR);
+        assert_eq!(arg_types, &[Type::Ref, Type::Float, Type::Int]);
+    }
+
+    #[test]
+    fn call_release_gil_typed_preserves_mixed_arg_types() {
+        let (mut ctx, args) = make_ctx_with_mixed_inputs();
+        let _ = ctx.call_release_gil_float_typed(
+            dummy_call_target as *const (),
+            &args,
+            &[Type::Ref, Type::Float, Type::Int],
+        );
+        let (arg_types, opcode) = take_single_call_descr(ctx, &args);
+        assert_eq!(opcode, OpCode::CallReleaseGilF);
+        assert_eq!(arg_types, &[Type::Ref, Type::Float, Type::Int]);
+    }
+
+    #[test]
+    fn call_loopinvariant_typed_preserves_mixed_arg_types() {
+        let (mut ctx, args) = make_ctx_with_mixed_inputs();
+        let _ = ctx.call_loopinvariant_int_typed(
+            dummy_call_target as *const (),
+            &args,
+            &[Type::Ref, Type::Float, Type::Int],
+        );
+        let (arg_types, opcode) = take_single_call_descr(ctx, &args);
+        assert_eq!(opcode, OpCode::CallLoopinvariantI);
+        assert_eq!(arg_types, &[Type::Ref, Type::Float, Type::Int]);
+    }
+
+    #[test]
+    fn call_assembler_typed_preserves_mixed_arg_types_and_target_token() {
+        let (mut ctx, args) = make_ctx_with_mixed_inputs();
+        let token = LoopToken::new(777);
+        let _ = ctx.call_assembler_ref_typed(&token, &args, &[Type::Ref, Type::Float, Type::Int]);
+        let op = take_single_call_op(ctx, &args);
+        assert_eq!(op.opcode, OpCode::CallAssemblerR);
+        assert_eq!(op.args.as_slice(), &args);
+        let call_descr = op
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .expect("call op should carry CallDescr");
+        assert_eq!(call_descr.arg_types(), &[Type::Ref, Type::Float, Type::Int]);
+        assert_eq!(call_descr.call_target_token(), Some(777));
     }
 }
