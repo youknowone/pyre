@@ -1768,8 +1768,53 @@ fn call_assembler_fast_path(
         };
     }
 
-    // Guard failure — force callee frame through interpreter
+    // Guard failure — check for bridge, then fall back to force
     fail_descr.increment_fail_count();
+
+    // If a bridge is attached, execute it instead of calling force_fn.
+    let bridge_guard = fail_descr.bridge.lock().unwrap();
+    if let Some(ref bridge) = *bridge_guard {
+        release_force_token(handle);
+        let outputs_slice = &outputs[..actual_outputs];
+        let mut frame = CraneliftBackend::execute_bridge(
+            bridge,
+            outputs_slice,
+            &fail_descr.fail_arg_types,
+        );
+        let bridge_descr = get_latest_descr_from_deadframe(&frame)
+            .expect("bridge deadframe must have a descriptor");
+        if bridge_descr.is_finish() {
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return finish_result_from_deadframe(&mut frame)
+                .expect("finish_result_from_deadframe failed") as u64;
+        }
+        // Bridge didn't finish — store as deadframe for caller
+        let df_handle = store_call_assembler_deadframe(frame);
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
+            *outcome.add(1) = df_handle as i64;
+        }
+        return 0;
+    }
+    drop(bridge_guard);
+
+    // Trigger bridge compilation when threshold is reached
+    if fail_descr.get_fail_count() >= DEFAULT_BRIDGE_THRESHOLD {
+        if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
+            let callee_frame_ptr = outputs[0];
+            let trace_info = fail_descr.trace_info.lock().unwrap();
+            if let Some(ref info) = *trace_info {
+                let green_key = info.header_pc;
+                let trace_id = info.trace_id;
+                drop(trace_info);
+                bridge_fn(callee_frame_ptr, fail_index, trace_id, green_key);
+            }
+        }
+    }
+
     release_force_token(handle);
 
     let callee_frame_ptr = outputs[0];
@@ -1833,8 +1878,49 @@ fn call_assembler_fast_path_heap(
         };
     }
 
-    // Guard failure — force callee frame through interpreter
+    // Guard failure — check for bridge, then fall back to force
     fail_descr.increment_fail_count();
+
+    let bridge_guard = fail_descr.bridge.lock().unwrap();
+    if let Some(ref bridge) = *bridge_guard {
+        release_force_token(handle);
+        let mut frame = CraneliftBackend::execute_bridge(
+            bridge,
+            &outputs,
+            &fail_descr.fail_arg_types,
+        );
+        let bridge_descr = get_latest_descr_from_deadframe(&frame)
+            .expect("bridge deadframe must have a descriptor");
+        if bridge_descr.is_finish() {
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return finish_result_from_deadframe(&mut frame)
+                .expect("finish_result_from_deadframe failed") as u64;
+        }
+        let df_handle = store_call_assembler_deadframe(frame);
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
+            *outcome.add(1) = df_handle as i64;
+        }
+        return 0;
+    }
+    drop(bridge_guard);
+
+    if fail_descr.get_fail_count() >= DEFAULT_BRIDGE_THRESHOLD {
+        if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
+            let callee_frame_ptr = outputs[0];
+            let trace_info = fail_descr.trace_info.lock().unwrap();
+            if let Some(ref info) = *trace_info {
+                let green_key = info.header_pc;
+                let trace_id = info.trace_id;
+                drop(trace_info);
+                bridge_fn(callee_frame_ptr, fail_index, trace_id, green_key);
+            }
+        }
+    }
+
     release_force_token(handle);
 
     let callee_frame_ptr = outputs[0];
@@ -1887,6 +1973,22 @@ extern "C" fn call_assembler_shim(
     // construction. Runs compiled code directly and handles the result
     // inline — avoids Box alloc, mutex lock, and Arc clone per call.
     if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
+        // Tagged pointer short-circuit: create_callee_frame returns
+        // (result << 1) | 1 on FORCE_CACHE hit. If input_slice[0] (the
+        // frame pointer) has bit 0 set, the result is already cached —
+        // skip compiled code execution entirely.
+        // This only applies when a force callback is registered, because
+        // the tagged encoding is produced by the meta-interp layer that
+        // also registers the force callback.
+        if !input_slice.is_empty() && (input_slice[0] & 1) != 0 {
+            let result = (input_slice[0] >> 1) as u64;
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return result;
+        }
+
         return call_assembler_fast_path(
             target,
             input_slice,
