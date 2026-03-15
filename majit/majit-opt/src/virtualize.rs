@@ -12,7 +12,7 @@ use majit_ir::{Descr, DescrRef, FieldDescr, Op, OpCode, OpRef, Value};
 
 use crate::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
-    VirtualStructInfo,
+    VirtualStructInfo, VirtualizableFieldState,
 };
 use crate::{OptContext, OptimizationPass, PassResult};
 
@@ -89,8 +89,52 @@ impl OptVirtualize {
                 self.force_virtual_array_struct(resolved, vinfo, ctx)
             }
             PtrInfo::VirtualRawBuffer(vinfo) => self.force_virtual_raw_buffer(resolved, vinfo, ctx),
+            PtrInfo::Virtualizable(vinfo) => {
+                self.force_virtualizable(resolved, vinfo, ctx)
+            }
             _ => resolved,
         }
+    }
+
+    /// Force a virtualizable: emit SETFIELD_RAW ops to write tracked
+    /// field values back to the heap object. Unlike virtual objects,
+    /// no allocation is emitted — the object already exists.
+    fn force_virtualizable(
+        &mut self,
+        opref: OpRef,
+        vinfo: VirtualizableFieldState,
+        ctx: &mut OptContext,
+    ) -> OpRef {
+        // Mark as no longer virtual (prevents infinite recursion)
+        self.set_info(opref, PtrInfo::NonNull);
+
+        // Emit SETFIELD_RAW for each tracked field
+        for (field_idx, value_ref) in vinfo.fields {
+            let value_ref = self.force_virtual(value_ref, ctx);
+            let value_ref = ctx.get_replacement(value_ref);
+            let mut set_op = Op::new(OpCode::SetfieldRaw, &[opref, value_ref]);
+            set_op.descr = Some(make_field_index_descr(field_idx));
+            ctx.emit(set_op);
+        }
+
+        // Emit SETARRAYITEM_RAW for each tracked array element
+        for (array_idx, elements) in vinfo.arrays {
+            // Get the array pointer from the frame
+            let mut get_array_op = Op::new(OpCode::GetfieldRawI, &[opref]);
+            get_array_op.descr = Some(make_field_index_descr(array_idx));
+            let array_ref = ctx.emit(get_array_op);
+
+            for (i, elem_ref) in elements.into_iter().enumerate() {
+                let elem_ref = self.force_virtual(elem_ref, ctx);
+                let elem_ref = ctx.get_replacement(elem_ref);
+                let idx_ref = self.emit_constant_int(ctx, i as i64);
+                let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[array_ref, idx_ref, elem_ref]);
+                set_op.descr = Some(make_field_index_descr(array_idx));
+                ctx.emit(set_op);
+            }
+        }
+
+        opref
     }
 
     fn force_virtual_instance(
@@ -250,7 +294,7 @@ impl OptVirtualize {
         }
 
         // Emit RAW_STORE for each tracked entry
-        for (offset, value_ref) in &vinfo.entries {
+        for (offset, _length, value_ref) in &vinfo.entries {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
             let offset_ref = self.emit_constant_int(ctx, *offset as i64);
@@ -479,7 +523,9 @@ impl OptVirtualize {
         if let Some(offset) = ctx.get_constant_int(offset_ref) {
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = self.get_info(buf_ref) {
                 let offset = offset as usize;
-                if let Some((_, val_ref)) = vinfo.entries.iter().find(|(off, _)| *off == offset) {
+                if let Some((_, _, val_ref)) =
+                    vinfo.entries.iter().find(|(off, _, _)| *off == offset)
+                {
                     ctx.replace_op(op.pos, *val_ref);
                     return PassResult::Remove;
                 }
@@ -497,11 +543,15 @@ impl OptVirtualize {
             if let Some(info) = self.get_info_mut(buf_ref) {
                 if let PtrInfo::VirtualRawBuffer(vinfo) = info {
                     let offset = offset as usize;
-                    // Update or insert entry
-                    if let Some(entry) = vinfo.entries.iter_mut().find(|(off, _)| *off == offset) {
-                        entry.1 = value_ref;
+                    // Update or insert entry (use default word size 8 for untyped stores)
+                    if let Some(entry) =
+                        vinfo.entries.iter_mut().find(|(off, _, _)| *off == offset)
+                    {
+                        entry.2 = value_ref;
                     } else {
-                        vinfo.entries.push((offset, value_ref));
+                        // Use write_value for sorted insertion with overlap check.
+                        // Default length of 8 bytes (word-sized store).
+                        let _ = vinfo.write_value(offset, 8, value_ref);
                     }
                     return PassResult::Remove;
                 }
@@ -730,16 +780,24 @@ impl OptimizationPass for OptVirtualize {
             OpCode::NewArray | OpCode::NewArrayClear => self.optimize_new_array(op, ctx),
 
             // Field access on potentially-virtual objects
-            OpCode::SetfieldGc => self.optimize_setfield_gc(op, ctx),
-            OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
-                self.optimize_getfield_gc(op, ctx)
-            }
+            OpCode::SetfieldGc | OpCode::SetfieldRaw => self.optimize_setfield_gc(op, ctx),
+            OpCode::GetfieldGcI
+            | OpCode::GetfieldGcR
+            | OpCode::GetfieldGcF
+            | OpCode::GetfieldRawI
+            | OpCode::GetfieldRawR
+            | OpCode::GetfieldRawF => self.optimize_getfield_gc(op, ctx),
 
             // Array access on potentially-virtual arrays
-            OpCode::SetarrayitemGc => self.optimize_setarrayitem_gc(op, ctx),
-            OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => {
-                self.optimize_getarrayitem_gc(op, ctx)
+            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+                self.optimize_setarrayitem_gc(op, ctx)
             }
+            OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcR
+            | OpCode::GetarrayitemGcF
+            | OpCode::GetarrayitemRawI
+            | OpCode::GetarrayitemRawR
+            | OpCode::GetarrayitemRawF => self.optimize_getarrayitem_gc(op, ctx),
 
             // Array length
             OpCode::ArraylenGc => self.optimize_arraylen_gc(op, ctx),
@@ -838,6 +896,7 @@ impl PtrInfo {
                 | PtrInfo::VirtualStruct(_)
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_)
+                | PtrInfo::Virtualizable(_)
         )
     }
 
@@ -849,7 +908,8 @@ impl PtrInfo {
             | PtrInfo::VirtualArray(_)
             | PtrInfo::VirtualStruct(_)
             | PtrInfo::VirtualArrayStruct(_)
-            | PtrInfo::VirtualRawBuffer(_) => true,
+            | PtrInfo::VirtualRawBuffer(_)
+            | PtrInfo::Virtualizable(_) => true,
             PtrInfo::Constant(gcref) => !gcref.is_null(),
         }
     }
