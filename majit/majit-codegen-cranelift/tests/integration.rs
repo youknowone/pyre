@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use majit_codegen::{Backend, LoopToken};
 use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{Descr, DescrRef, FailDescr, OpCode, OpRef, Type, Value};
+use majit_ir::{Descr, DescrRef, FailDescr, Op, OpCode, OpRef, Type, Value};
 use majit_opt::intdiv::magic_numbers;
 use majit_opt::optimizer::Optimizer;
 use majit_opt::pure::OptPure;
@@ -1101,4 +1101,830 @@ fn test_vec_chained_add_mul_simd() {
     );
     assert_eq!(backend.get_int_value(&frame, 0), 60);
     assert_eq!(backend.get_int_value(&frame, 1), 160);
+}
+
+// ===========================================================================
+// Stress tests: multi-pass optimizer pipeline integration
+// ===========================================================================
+
+/// Helper: create a full 8-pass default optimizer pipeline.
+fn default_optimizer() -> Optimizer {
+    Optimizer::default_pipeline()
+}
+
+/// Minimal field descriptor for optimizer-level tests.
+#[derive(Debug)]
+struct TestFieldDescr {
+    idx: u32,
+    immutable: bool,
+}
+
+impl Descr for TestFieldDescr {
+    fn index(&self) -> u32 {
+        self.idx
+    }
+    fn is_always_pure(&self) -> bool {
+        self.immutable
+    }
+}
+
+/// Minimal call descriptor for optimizer-level tests.
+#[derive(Debug)]
+struct TestCallDescr {
+    idx: u32,
+    effect: majit_ir::EffectInfo,
+    arg_types: Vec<Type>,
+    result_type: Type,
+}
+
+impl Descr for TestCallDescr {
+    fn index(&self) -> u32 {
+        self.idx
+    }
+    fn as_call_descr(&self) -> Option<&dyn majit_ir::CallDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::CallDescr for TestCallDescr {
+    fn arg_types(&self) -> &[Type] {
+        &self.arg_types
+    }
+    fn result_type(&self) -> Type {
+        self.result_type
+    }
+    fn result_size(&self) -> usize {
+        8
+    }
+    fn effect_info(&self) -> &majit_ir::EffectInfo {
+        &self.effect
+    }
+}
+
+fn field_descr(idx: u32) -> DescrRef {
+    Arc::new(TestFieldDescr {
+        idx,
+        immutable: false,
+    })
+}
+
+fn immutable_field_descr(idx: u32) -> DescrRef {
+    Arc::new(TestFieldDescr {
+        idx,
+        immutable: true,
+    })
+}
+
+fn call_descr_can_raise(idx: u32) -> DescrRef {
+    Arc::new(TestCallDescr {
+        idx,
+        effect: majit_ir::EffectInfo {
+            extra_effect: majit_ir::ExtraEffect::CanRaise,
+            oopspec_index: majit_ir::OopSpecIndex::None,
+        },
+        arg_types: vec![Type::Int],
+        result_type: Type::Void,
+    })
+}
+
+/// Assign sequential positions to ops starting at `base`.
+fn assign_positions(ops: &mut [Op], base: u32) {
+    for (i, op) in ops.iter_mut().enumerate() {
+        op.pos = OpRef(base + i as u32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stress Test 1: Virtual Object + Guard Elimination + Constant Folding
+//
+// Trace (optimizer-level):
+//   p0 = new_with_vtable(descr=size0)
+//   setfield_gc(p0, CONST_42, descr=field0)
+//   i1 = getfield_gc_i(p0, descr=field0)
+//   i2 = int_add(i1, CONST_8)
+//   i3 = int_gt(i2, CONST_0)
+//   guard_true(i3)
+//   finish(i2)
+//
+// Expected after full pipeline:
+//   - new_with_vtable eliminated (virtualized by OptVirtualize)
+//   - setfield_gc eliminated (virtual, no escape)
+//   - getfield_gc_i folded to CONST_42 (virtual field read)
+//   - int_add(42, 8) = 50 (constant folded by OptPure/OptRewrite)
+//   - int_gt(50, 0) = true (constant folded by IntBounds)
+//   - guard_true(true) eliminated (guard on known-true condition)
+//   - finish(50)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_virtual_guard_constfold() {
+    // Build trace ops manually with positions.
+    // Constants: 1000=42, 1001=8, 1002=0
+    let size_descr = field_descr(10); // reuse as size descr
+    let fd = field_descr(0);
+
+    let mut ops = vec![
+        Op::with_descr(OpCode::NewWithVtable, &[], size_descr.clone()),
+        Op::with_descr(
+            OpCode::SetfieldGc,
+            &[OpRef(100), OpRef(1000)],
+            fd.clone(),
+        ),
+        Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], fd.clone()),
+        Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(1001)]),
+        Op::new(OpCode::IntGt, &[OpRef(103), OpRef(1002)]),
+        Op::with_descr(OpCode::GuardTrue, &[OpRef(104)], make_descr(0)),
+        Op::with_descr(OpCode::Finish, &[OpRef(103)], make_descr(1)),
+    ];
+    assign_positions(&mut ops, 100);
+
+    let mut constants = HashMap::new();
+    constants.insert(1000, 42i64);
+    constants.insert(1001, 8i64);
+    constants.insert(1002, 0i64);
+
+    let mut opt = default_optimizer();
+    let optimized = opt.optimize_with_constants(&mut ops, &mut constants);
+
+    // The virtual object should be eliminated: no NewWithVtable, SetfieldGc, or GetfieldGcI.
+    let has_new = optimized
+        .iter()
+        .any(|o| o.opcode == OpCode::NewWithVtable);
+    let has_setfield = optimized
+        .iter()
+        .any(|o| o.opcode == OpCode::SetfieldGc);
+    let has_getfield = optimized
+        .iter()
+        .any(|o| o.opcode == OpCode::GetfieldGcI);
+    assert!(
+        !has_new,
+        "NewWithVtable should be virtualized and eliminated"
+    );
+    assert!(
+        !has_setfield,
+        "SetfieldGc should be eliminated (virtual, no escape)"
+    );
+    assert!(
+        !has_getfield,
+        "GetfieldGcI should be folded (virtual field read)"
+    );
+
+    // The guard on a known-true condition should be eliminated.
+    let guard_count = optimized
+        .iter()
+        .filter(|o| o.opcode == OpCode::GuardTrue)
+        .count();
+    assert_eq!(
+        guard_count, 0,
+        "guard_true on constant true should be eliminated"
+    );
+
+    // The trace should reduce to just Finish (possibly with constant ops).
+    assert!(
+        optimized.len() <= 3,
+        "heavily optimized trace should be very short, got {} ops",
+        optimized.len()
+    );
+
+    // Verify constant folding: 42 + 8 = 50 should be discoverable.
+    // The finish arg should resolve to a constant 50 in the constants map.
+    let finish_op = optimized.iter().find(|o| o.opcode == OpCode::Finish);
+    assert!(finish_op.is_some(), "trace must end with Finish");
+    let finish_arg = finish_op.unwrap().arg(0);
+    let folded_val = constants.get(&finish_arg.0);
+    assert_eq!(
+        folded_val,
+        Some(&50i64),
+        "int_add(42, 8) should fold to 50, constants={constants:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stress Test 2: IntDiv magic numbers + IntBounds guard elimination
+//
+// Part A: Optimizer level - verify redundant guard removal.
+// Part B: Execution level - verify magic number division correctness
+//         (separate trace without redundant guards to avoid fail_index conflicts).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_intdiv_intbounds_interaction() {
+    // === Part A: Optimizer-level verification ===
+    // Build a trace with a redundant guard to verify IntBounds eliminates it.
+    let mut ops_a = vec![
+        // cmp0 = int_ge(x, CONST_0)
+        Op::new(OpCode::IntGe, &[OpRef(0), OpRef(1000)]),
+        // guard_true(cmp0)  -> x >= 0
+        Op::with_descr(OpCode::GuardTrue, &[OpRef(100)], make_descr(0)),
+        // cmp1 = int_lt(x, CONST_100)
+        Op::new(OpCode::IntLt, &[OpRef(0), OpRef(1001)]),
+        // guard_true(cmp1)  -> x < 100
+        Op::with_descr(OpCode::GuardTrue, &[OpRef(102)], make_descr(1)),
+        // cmp2 = int_ge(x, CONST_0)  -- REDUNDANT
+        Op::new(OpCode::IntGe, &[OpRef(0), OpRef(1000)]),
+        // guard_true(cmp2)  -- should be eliminated
+        Op::with_descr(OpCode::GuardTrue, &[OpRef(104)], make_descr(2)),
+        // some computation
+        Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
+        Op::with_descr(OpCode::Finish, &[OpRef(106)], make_descr(3)),
+    ];
+    assign_positions(&mut ops_a, 100);
+
+    let mut constants_a = HashMap::new();
+    constants_a.insert(1000, 0i64);
+    constants_a.insert(1001, 100i64);
+
+    let mut opt_a = default_optimizer();
+    let optimized_a = opt_a.optimize_with_constants(&ops_a, &mut constants_a);
+
+    let original_guard_count = 3;
+    let opt_guard_count = optimized_a
+        .iter()
+        .filter(|o| o.opcode == OpCode::GuardTrue)
+        .count();
+    assert!(
+        opt_guard_count < original_guard_count,
+        "IntBounds should eliminate redundant guard: {opt_guard_count} < {original_guard_count}"
+    );
+
+    // === Part B: E2E magic number division with guards ===
+    let (k, i_shift) = magic_numbers(7);
+
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_k = OpRef(1002);
+    let const_i = OpRef(1003);
+    let const_63 = OpRef(1004);
+
+    // Guard x > 0
+    let cmp = rec.record_op(OpCode::IntGt, &[x, const_0]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp], make_descr(0));
+
+    // Division by 7 via magic numbers
+    let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
+    let nt = rec.record_op(OpCode::IntXor, &[x, t]);
+    let mul = rec.record_op(OpCode::UintMulHigh, &[nt, const_k]);
+    let sh = rec.record_op(OpCode::UintRshift, &[mul, const_i]);
+    let result = rec.record_op(OpCode::IntXor, &[sh, t]);
+    rec.finish(&[result], make_descr(1));
+    let trace = rec.get_trace();
+
+    // Optimize
+    let mut opt_b = default_optimizer();
+    let mut constants_b = HashMap::new();
+    constants_b.insert(1000, 0i64);
+    constants_b.insert(1002, k as i64);
+    constants_b.insert(1003, i_shift as i64);
+    constants_b.insert(1004, 63i64);
+    let optimized_b = opt_b.optimize_with_constants(&trace.ops, &mut constants_b);
+
+    // Compile
+    let mut backend = CraneliftBackend::new();
+    backend.set_constants(constants_b);
+
+    let mut token = LoopToken::new(400);
+    backend
+        .compile_loop(&trace.inputargs, &optimized_b, &mut token)
+        .expect("compilation should succeed");
+
+    // Test with positive values
+    for input in [1, 6, 7, 14, 42, 99, 1000] {
+        let expected = floor_div(input, 7);
+        let frame = backend.execute_token(&token, &[Value::Int(input)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert_eq!(
+            descr.fail_index(),
+            1,
+            "input={input}: Finish should be reached (fail_index=1)"
+        );
+        let actual = backend.get_int_value(&frame, 0);
+        assert_eq!(
+            actual, expected,
+            "input={input}: {input} // 7 = expected {expected}, got {actual}"
+        );
+    }
+
+    // Negative input should fail the guard (x > 0)
+    let frame = backend.execute_token(&token, &[Value::Int(-5)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(
+        descr.fail_index(),
+        0,
+        "negative input should fail the guard"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stress Test 3: Loop with CSE + Guard Deduplication
+//
+// Loop trace:
+//   label(i, acc)
+//   sq = int_mul(i, i)        -- (first computation)
+//   acc2 = int_add(acc, sq)
+//   i2   = int_sub(i, CONST_1)
+//   cmp1 = int_gt(i2, CONST_0)
+//   guard_true(cmp1)
+//   cmp2 = int_gt(i2, CONST_0)   -- CSE of cmp1
+//   guard_true(cmp2)              -- duplicate guard, should be removed
+//   sq2  = int_mul(i, i)         -- CSE of sq
+//   result = int_add(acc2, sq2)   -- after CSE: acc2 + sq
+//   jump(i2, result)
+//
+// Expected after optimization:
+//   - cmp2 eliminated by CSE (OptPure)
+//   - second guard_true eliminated (duplicate by OptGuard)
+//   - sq2 eliminated by CSE (OptPure), forwarded to sq
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_loop_multi_pass() {
+    let mut rec = TraceRecorder::new();
+    let i = rec.record_input_arg(Type::Int);
+    let acc = rec.record_input_arg(Type::Int);
+
+    let const_1 = OpRef(1000);
+    let const_0 = OpRef(1001);
+
+    let sq = rec.record_op(OpCode::IntMul, &[i, i]);
+    let acc2 = rec.record_op(OpCode::IntAdd, &[acc, sq]);
+    let i2 = rec.record_op(OpCode::IntSub, &[i, const_1]);
+    let cmp1 = rec.record_op(OpCode::IntGt, &[i2, const_0]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp1], make_descr(0));
+
+    // Redundant comparison and guard
+    let _cmp2 = rec.record_op(OpCode::IntGt, &[i2, const_0]);
+    rec.record_guard(OpCode::GuardTrue, &[_cmp2], make_descr(1));
+
+    // Redundant multiplication (CSE candidate for sq)
+    let sq2 = rec.record_op(OpCode::IntMul, &[i, i]);
+    let result = rec.record_op(OpCode::IntAdd, &[acc2, sq2]);
+    rec.close_loop(&[i2, result]);
+    let trace = rec.get_trace();
+
+    let original_len = trace.ops.len();
+
+    // Optimize
+    let mut opt = default_optimizer();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 1i64);
+    constants.insert(1001, 0i64);
+    let optimized = opt.optimize_with_constants(&trace.ops, &mut constants);
+
+    // Verify optimization reduced ops.
+    assert!(
+        optimized.len() < original_len,
+        "optimizer should reduce op count: {} < {}",
+        optimized.len(),
+        original_len
+    );
+
+    // CSE should eliminate duplicate IntGt.
+    let int_gt_count = optimized
+        .iter()
+        .filter(|o| o.opcode == OpCode::IntGt)
+        .count();
+    assert_eq!(
+        int_gt_count, 1,
+        "CSE should eliminate duplicate IntGt, got {int_gt_count}"
+    );
+
+    // Duplicate guard_true should be removed.
+    let guard_count = optimized
+        .iter()
+        .filter(|o| o.opcode == OpCode::GuardTrue)
+        .count();
+    assert_eq!(
+        guard_count, 1,
+        "duplicate guard should be removed, got {guard_count}"
+    );
+
+    // CSE should eliminate duplicate IntMul(i, i).
+    let int_mul_count = optimized
+        .iter()
+        .filter(|o| o.opcode == OpCode::IntMul)
+        .count();
+    assert_eq!(
+        int_mul_count, 1,
+        "CSE should eliminate duplicate IntMul, got {int_mul_count}"
+    );
+
+    // Compile and execute.
+    let mut backend = CraneliftBackend::new();
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(401);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("compilation should succeed");
+
+    // Execute: i=4, acc=0
+    // After CSE, sq2 -> sq, so result = acc2 + sq = (acc + sq) + sq = acc + 2*i^2.
+    //   Iter 1: i=4, acc=0  -> sq=16, acc2=16, i2=3, result=16+16=32 -> jump(3, 32)
+    //   Iter 2: i=3, acc=32 -> sq=9,  acc2=41, i2=2, result=41+9=50  -> jump(2, 50)
+    //   Iter 3: i=2, acc=50 -> sq=4,  acc2=54, i2=1, result=54+4=58  -> jump(1, 58)
+    //   Iter 4: i=1, acc=58 -> sq=1,  acc2=59, i2=0, cmp=false -> guard fails
+    // Guard saves input args: i=1, acc=58.
+    let frame = backend.execute_token(&token, &[Value::Int(4), Value::Int(0)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(descr.fail_index(), 0, "guard should fail at i2=0");
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        1,
+        "i at guard failure should be 1"
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 1),
+        58,
+        "acc at guard failure should be 58"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stress Test 4: Heap Cache + Green Field (Immutable) Optimization
+//
+// Trace (optimizer-level):
+//   i0 = getfield_gc_i(p_input, descr=immutable_d0)
+//   call_n(some_func, i0, descr=call_d)
+//   i1 = getfield_gc_i(p_input, descr=immutable_d0)  -- should be cached
+//   i2 = getfield_gc_i(p_input, descr=mutable_d1)
+//   call_n(some_func, i2, descr=call_d)
+//   i3 = getfield_gc_i(p_input, descr=mutable_d1)    -- re-emitted (invalidated)
+//   i4 = int_add(i0, i1)     -- after CSE: i1 -> i0, so i4 = i0 + i0
+//   i5 = int_add(i4, i3)
+//   finish(i5)
+//
+// Expected after full pipeline:
+//   - Second immutable getfield (i1) eliminated by OptHeap green field cache
+//   - Second mutable getfield (i3) re-emitted (cache invalidated by call)
+//   - i1 forwarded to i0, so i4 becomes int_add(i0, i0)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_heap_cache_greenfield() {
+    let immut_fd = immutable_field_descr(0);
+    let mut_fd = field_descr(1);
+    let cd = call_descr_can_raise(50);
+
+    let p_input = OpRef(500); // external pointer (not allocated in trace)
+
+    let mut ops = vec![
+        // i0 = getfield_gc_i(p_input, immutable)
+        Op::with_descr(OpCode::GetfieldGcI, &[p_input], immut_fd.clone()),
+        // call_n(func, i0)
+        Op::with_descr(OpCode::CallN, &[OpRef(600), OpRef(100)], cd.clone()),
+        // i1 = getfield_gc_i(p_input, immutable) -- should be cached
+        Op::with_descr(OpCode::GetfieldGcI, &[p_input], immut_fd.clone()),
+        // i2 = getfield_gc_i(p_input, mutable)
+        Op::with_descr(OpCode::GetfieldGcI, &[p_input], mut_fd.clone()),
+        // call_n(func, i2)
+        Op::with_descr(OpCode::CallN, &[OpRef(600), OpRef(103)], cd.clone()),
+        // i3 = getfield_gc_i(p_input, mutable) -- invalidated by call, re-emitted
+        Op::with_descr(OpCode::GetfieldGcI, &[p_input], mut_fd.clone()),
+        // i4 = int_add(i0, i1)
+        Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(102)]),
+        // i5 = int_add(i4, i3)
+        Op::new(OpCode::IntAdd, &[OpRef(106), OpRef(105)]),
+        // finish(i5)
+        Op::with_descr(OpCode::Finish, &[OpRef(107)], make_descr(0)),
+    ];
+    assign_positions(&mut ops, 100);
+
+    let mut opt = default_optimizer();
+    let optimized = opt.optimize(&ops);
+
+    // Count getfield_gc_i ops in optimized trace.
+    let getfield_count = optimized
+        .iter()
+        .filter(|o| o.opcode == OpCode::GetfieldGcI)
+        .count();
+
+    // We expect:
+    //   - 1 immutable getfield (first read; second is cached and eliminated)
+    //   - 1 mutable getfield (first read, cached until call invalidates)
+    //   - 1 mutable getfield (after second call, cache invalidated)
+    //   = 3 total
+    assert_eq!(
+        getfield_count, 3,
+        "expected 3 getfield ops (1 immutable + 2 mutable), got {getfield_count}"
+    );
+
+    // Verify the immutable field's second read was eliminated:
+    // The optimized trace should have exactly 1 immutable getfield.
+    // Since we can't easily distinguish which descr is which from the optimized ops,
+    // we verify that the total count is strictly less than the original 4.
+    let original_getfield_count = ops
+        .iter()
+        .filter(|o| o.opcode == OpCode::GetfieldGcI)
+        .count();
+    assert!(
+        getfield_count < original_getfield_count,
+        "optimizer should eliminate at least one getfield: {getfield_count} < {original_getfield_count}"
+    );
+
+    // Verify Finish is present.
+    assert!(
+        optimized.iter().any(|o| o.opcode == OpCode::Finish),
+        "trace must end with Finish"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stress Test 5: String Virtualization
+//
+// Trace (optimizer-level):
+//   s0 = newstr(CONST_3)
+//   strsetitem(s0, CONST_0, CONST_65)   -- 'A'
+//   strsetitem(s0, CONST_1, CONST_66)   -- 'B'
+//   strsetitem(s0, CONST_2, CONST_67)   -- 'C'
+//   i0 = strgetitem(s0, CONST_1)        -- should resolve to CONST_66
+//   i1 = strlen(s0)                     -- should resolve to CONST_3
+//   i2 = int_add(i0, i1)               -- 66 + 3 = 69
+//   finish(i2)
+//
+// Expected after full pipeline:
+//   - newstr eliminated (virtualized by OptString)
+//   - all strsetitem eliminated (writing to virtual)
+//   - strgetitem folded to constant 66
+//   - strlen folded to constant 3
+//   - int_add(66, 3) folded to 69
+//   - Trace reduces to Finish(69)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_string_virtualization() {
+    // Constants: 1000=3 (length), 1001=0, 1002=1, 1003=2,
+    //            1004=65('A'), 1005=66('B'), 1006=67('C')
+    let mut ops = vec![
+        Op::new(OpCode::Newstr, &[OpRef(1000)]),
+        Op::new(OpCode::Strsetitem, &[OpRef(100), OpRef(1001), OpRef(1004)]),
+        Op::new(OpCode::Strsetitem, &[OpRef(100), OpRef(1002), OpRef(1005)]),
+        Op::new(OpCode::Strsetitem, &[OpRef(100), OpRef(1003), OpRef(1006)]),
+        Op::new(OpCode::Strgetitem, &[OpRef(100), OpRef(1002)]),
+        Op::new(OpCode::Strlen, &[OpRef(100)]),
+        Op::new(OpCode::IntAdd, &[OpRef(104), OpRef(105)]),
+        Op::with_descr(OpCode::Finish, &[OpRef(106)], make_descr(0)),
+    ];
+    assign_positions(&mut ops, 100);
+
+    let mut constants = HashMap::new();
+    constants.insert(1000, 3i64);
+    constants.insert(1001, 0i64);
+    constants.insert(1002, 1i64);
+    constants.insert(1003, 2i64);
+    constants.insert(1004, 65i64);
+    constants.insert(1005, 66i64);
+    constants.insert(1006, 67i64);
+
+    let mut opt = default_optimizer();
+    let optimized = opt.optimize_with_constants(&ops, &mut constants);
+
+    // Newstr should be virtualized and eliminated.
+    let has_newstr = optimized.iter().any(|o| o.opcode == OpCode::Newstr);
+    assert!(!has_newstr, "Newstr should be eliminated by string virtualization");
+
+    // All strsetitem should be eliminated.
+    let has_setitem = optimized.iter().any(|o| o.opcode == OpCode::Strsetitem);
+    assert!(
+        !has_setitem,
+        "Strsetitem should be eliminated (virtual string)"
+    );
+
+    // Strgetitem should be folded (resolved from virtual string).
+    let has_getitem = optimized.iter().any(|o| o.opcode == OpCode::Strgetitem);
+    assert!(
+        !has_getitem,
+        "Strgetitem should be folded from virtual string"
+    );
+
+    // Strlen should be folded.
+    let has_strlen = optimized.iter().any(|o| o.opcode == OpCode::Strlen);
+    assert!(!has_strlen, "Strlen should be folded to constant");
+
+    // The trace should be very short: just Finish (possibly with SameAsI constants).
+    assert!(
+        optimized.len() <= 4,
+        "fully folded trace should be very short, got {} ops: {:?}",
+        optimized.len(),
+        optimized.iter().map(|o| o.opcode).collect::<Vec<_>>()
+    );
+
+    // Verify constant folding: 66 + 3 = 69
+    let finish_op = optimized.iter().find(|o| o.opcode == OpCode::Finish);
+    assert!(finish_op.is_some(), "trace must end with Finish");
+    let finish_arg = finish_op.unwrap().arg(0);
+    let folded_val = constants.get(&finish_arg.0);
+    assert_eq!(
+        folded_val,
+        Some(&69i64),
+        "int_add(66, 3) should fold to 69, constants={constants:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stress Test 6: Combined loop with guard dedup, CSE, and IntBounds
+//
+// This test verifies that the full pipeline handles a realistic loop trace
+// with interleaved optimizations: IntBounds narrows ranges, Pure deduplicates,
+// Guard removes redundant guards, and the result compiles and runs correctly.
+//
+// Loop trace:
+//   input(x, acc)
+//   // Guard x > 0 (provides IntBounds: x >= 1)
+//   cmp0 = int_gt(x, CONST_0)
+//   guard_true(cmp0)
+//   // Computation: acc += x * x
+//   sq = int_mul(x, x)
+//   acc2 = int_add(acc, sq)
+//   // Decrement
+//   x2 = int_sub(x, CONST_1)
+//   // Guard x2 >= 0 (IntBounds knows x >= 1, so x2 >= 0 is known)
+//   cmp1 = int_ge(x2, CONST_0)
+//   guard_true(cmp1)           -- should be eliminated by IntBounds
+//   // Guard x > 0 again (redundant)
+//   cmp2 = int_gt(x, CONST_0)
+//   guard_true(cmp2)           -- CSE + guard dedup should eliminate
+//   // Continue check
+//   cmp3 = int_gt(x2, CONST_0)
+//   guard_true(cmp3)
+//   jump(x2, acc2)
+//
+// Expected:
+//   - cmp1/guard eliminated (IntBounds: x>=1 implies x-1>=0)
+//   - cmp2/guard eliminated (CSE of cmp0 + guard dedup)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_loop_intbounds_guard_cse() {
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+    let acc = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_1 = OpRef(1001);
+
+    // Guard x > 0
+    let cmp0 = rec.record_op(OpCode::IntGt, &[x, const_0]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp0], make_descr(0));
+
+    // acc += x * x
+    let sq = rec.record_op(OpCode::IntMul, &[x, x]);
+    let acc2 = rec.record_op(OpCode::IntAdd, &[acc, sq]);
+
+    // x2 = x - 1
+    let x2 = rec.record_op(OpCode::IntSub, &[x, const_1]);
+
+    // Guard x2 >= 0 (redundant: IntBounds knows x >= 1)
+    let cmp1 = rec.record_op(OpCode::IntGe, &[x2, const_0]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp1], make_descr(1));
+
+    // Guard x > 0 again (CSE + guard dedup)
+    let cmp2 = rec.record_op(OpCode::IntGt, &[x, const_0]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp2], make_descr(2));
+
+    // Continue check
+    let cmp3 = rec.record_op(OpCode::IntGt, &[x2, const_0]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp3], make_descr(3));
+
+    rec.close_loop(&[x2, acc2]);
+    let trace = rec.get_trace();
+
+    let original_guard_count = trace
+        .ops
+        .iter()
+        .filter(|o| o.opcode == OpCode::GuardTrue)
+        .count();
+    assert_eq!(original_guard_count, 4);
+
+    // Optimize
+    let mut opt = default_optimizer();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 1i64);
+    let optimized = opt.optimize_with_constants(&trace.ops, &mut constants);
+
+    // At least 2 guards should be eliminated (cmp1 by IntBounds, cmp2 by CSE+guard dedup).
+    let opt_guard_count = optimized
+        .iter()
+        .filter(|o| o.opcode == OpCode::GuardTrue)
+        .count();
+    assert!(
+        opt_guard_count <= 2,
+        "at least 2 guards should be eliminated: {opt_guard_count} <= 2 (was {original_guard_count})"
+    );
+
+    // Total op count should be reduced.
+    assert!(
+        optimized.len() < trace.ops.len(),
+        "optimizer should reduce op count: {} < {}",
+        optimized.len(),
+        trace.ops.len()
+    );
+
+    // Compile and execute.
+    let mut backend = CraneliftBackend::new();
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(402);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("compilation should succeed");
+
+    // Execute: x=3, acc=0
+    // Computes sum of squares: 3*3 + 2*2 + 1*1 = 9 + 4 + 1 = 14
+    // But guard_true(x2 > 0) fails when x2=0, so:
+    //   Iter 1: x=3, acc=0 -> sq=9, acc2=9, x2=2 -> cmp3=true -> jump(2, 9)
+    //   Iter 2: x=2, acc=9 -> sq=4, acc2=13, x2=1 -> cmp3=true -> jump(1, 13)
+    //   Iter 3: x=1, acc=13 -> sq=1, acc2=14, x2=0 -> cmp3=false -> guard fails
+    // Guard saves: x=1, acc=13
+    let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
+    let final_x = backend.get_int_value(&frame, 0);
+    let final_acc = backend.get_int_value(&frame, 1);
+    assert_eq!(final_x, 1, "x at guard failure");
+    assert_eq!(final_acc, 13, "acc at guard failure");
+    // Sum of squares 1..3 = 14. At failure: acc=13 + x^2 = 13 + 1 = 14.
+    assert_eq!(final_acc + final_x * final_x, 14, "total sum of squares 1+4+9=14");
+}
+
+// ---------------------------------------------------------------------------
+// Stress Test 7: Full pipeline with arithmetic chains and multiple CSE
+//
+// This test builds a longer arithmetic chain with several CSE opportunities,
+// compiles, and verifies execution through the Cranelift backend.
+//
+// Trace:
+//   input(a, b)
+//   c = a + b
+//   d = a * b
+//   e = a + b           -- CSE -> c
+//   f = c + d
+//   g = a * b           -- CSE -> d
+//   h = f + g           -- after CSE: f + d
+//   i_val = c + d       -- CSE -> f
+//   result = h + i_val  -- after CSE: h + f
+//   finish(result)
+//
+// After CSE: e->c, g->d, i_val->f
+//   c = a + b
+//   d = a * b
+//   f = c + d
+//   h = f + d
+//   result = h + f
+//   finish(result)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_cse_chain() {
+    let mut rec = TraceRecorder::new();
+    let a = rec.record_input_arg(Type::Int);
+    let b = rec.record_input_arg(Type::Int);
+
+    let c = rec.record_op(OpCode::IntAdd, &[a, b]);
+    let d = rec.record_op(OpCode::IntMul, &[a, b]);
+    let _e = rec.record_op(OpCode::IntAdd, &[a, b]); // CSE -> c
+    let f = rec.record_op(OpCode::IntAdd, &[c, d]);
+    let g = rec.record_op(OpCode::IntMul, &[a, b]); // CSE -> d
+    let h = rec.record_op(OpCode::IntAdd, &[f, g]);
+    let i_val = rec.record_op(OpCode::IntAdd, &[c, d]); // CSE -> f
+    let result = rec.record_op(OpCode::IntAdd, &[h, i_val]);
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    let original_len = trace.ops.len();
+
+    // Optimize
+    let mut opt = default_optimizer();
+    let optimized = opt.optimize(&trace.ops);
+
+    // 3 operations should be eliminated by CSE (e, g, i_val).
+    assert!(
+        optimized.len() <= original_len - 3,
+        "CSE should eliminate 3 ops: {} <= {} - 3 = {}",
+        optimized.len(),
+        original_len,
+        original_len - 3
+    );
+
+    // Compile and execute.
+    let mut backend = CraneliftBackend::new();
+    let mut token = LoopToken::new(403);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("compilation should succeed");
+
+    // a=3, b=4:
+    //   c = 7, d = 12, f = 19, h = 19+12 = 31, result = 31+19 = 50
+    let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(4)]);
+    assert_eq!(backend.get_int_value(&frame, 0), 50);
+
+    // a=0, b=5:
+    //   c = 5, d = 0, f = 5, h = 5+0 = 5, result = 5+5 = 10
+    let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(5)]);
+    assert_eq!(backend.get_int_value(&frame, 0), 10);
+
+    // a=-2, b=3:
+    //   c = 1, d = -6, f = -5, h = -5+(-6) = -11, result = -11+(-5) = -16
+    let frame = backend.execute_token(&token, &[Value::Int(-2), Value::Int(3)]);
+    assert_eq!(backend.get_int_value(&frame, 0), -16);
 }
