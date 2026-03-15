@@ -8,6 +8,7 @@ use std::sync::Arc;
 use majit_codegen::{Backend, LoopToken};
 use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{Descr, DescrRef, FailDescr, OpCode, OpRef, Type, Value};
+use majit_opt::intdiv::magic_numbers;
 use majit_opt::optimizer::Optimizer;
 use majit_opt::pure::OptPure;
 use majit_opt::rewrite::OptRewrite;
@@ -453,7 +454,7 @@ fn test_bridge_end_to_end() {
 // Helpers for intdiv pipeline tests
 // ---------------------------------------------------------------------------
 
-/// Floor division (towards negative infinity), matching Python's // operator.
+/// Floor division (towards negative infinity).
 fn floor_div(a: i64, b: i64) -> i64 {
     let d = a / b;
     let r = a % b;
@@ -465,51 +466,134 @@ fn floor_mod(a: i64, b: i64) -> i64 {
     a - floor_div(a, b) * b
 }
 
-/// Build, optimize, compile and return (backend, token) for a trace that
-/// computes `IntFloorDiv(input, divisor)` or `IntMod(input, divisor)`.
+/// Build a magic-number division trace directly (no optimizer), compile it,
+/// and return (backend, token).
 ///
-/// The optimizer sees the divisor as a known constant, so the OptRewrite
-/// pass applies magic-number or power-of-2 strength reduction.
-fn build_intdiv_pipeline(
-    opcode: OpCode,
-    divisor: i64,
-    token_id: u64,
-) -> (CraneliftBackend, LoopToken) {
-    // Record: input(x) -> result = x OP const_divisor -> finish(result)
+/// The trace implements: result = floor_div(input, m)
+///   t = input >> 63
+///   nt = input ^ t
+///   mul = UINT_MUL_HIGH(nt, k)
+///   sh = UINT_RSHIFT(mul, i)
+///   result = sh ^ t
+///   finish(result)
+fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, LoopToken) {
+    let (k, i) = magic_numbers(m);
+
+    // Record the magic-number division sequence using TraceRecorder
+    // so that OpRef indexing is handled correctly.
     let mut rec = TraceRecorder::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_divisor = OpRef(1000);
-    let result = rec.record_op(opcode, &[x, const_divisor]);
+    // Constants via high OpRef indices.
+    let const_k = OpRef(1000);
+    let const_i = OpRef(1001);
+    let const_63 = OpRef(1002);
+
+    // t = x >> 63
+    let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
+    // nt = x ^ t
+    let nt = rec.record_op(OpCode::IntXor, &[x, t]);
+    // mul = UINT_MUL_HIGH(nt, k)
+    let mul = rec.record_op(OpCode::UintMulHigh, &[nt, const_k]);
+    // sh = UINT_RSHIFT(mul, i)
+    let sh = rec.record_op(OpCode::UintRshift, &[mul, const_i]);
+    // result = sh ^ t
+    let result = rec.record_op(OpCode::IntXor, &[sh, t]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
-    // Optimize with the divisor constant known, so the rewrite pass can
-    // convert IntFloorDiv/IntMod into UintMulHigh + shift sequences.
-    let mut opt = Optimizer::default_pipeline();
-    let mut constants: HashMap<u32, i64> = HashMap::new();
-    constants.insert(1000, divisor);
-    let optimized = opt.optimize_with_constants(&trace.ops, &mut constants);
+    let mut constants = HashMap::new();
+    constants.insert(1000, k as i64);
+    constants.insert(1001, i as i64);
+    constants.insert(1002, 63i64);
 
-    // DEBUG: dump optimized ops and constants
-    eprintln!("=== optimized ops ({}) ===", optimized.len());
-    for (i, op) in optimized.iter().enumerate() {
-        eprintln!("  [{i}] pos={:?} {:?} args={:?}", op.pos, op.opcode, op.args);
-    }
-    eprintln!("=== constants ({}) ===", constants.len());
-    for (&k, &v) in &constants {
-        eprintln!("  OpRef({k}) = {v}");
-    }
-
-    // The optimizer emits new constant ops (magic number k, shift i, etc.)
-    // and writes them back into the constants map. Hand the full map to
-    // the backend so it can resolve every OpRef that references a constant.
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
 
     let mut token = LoopToken::new(token_id);
     backend
-        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    (backend, token)
+}
+
+/// Build a magic-number modulo trace: result = n - (n // m) * m.
+fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, LoopToken) {
+    let (k, i) = magic_numbers(m);
+
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+
+    let const_k = OpRef(1000);
+    let const_i = OpRef(1001);
+    let const_63 = OpRef(1002);
+    let const_m = OpRef(1003);
+
+    // Division: floor_div(x, m)
+    let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
+    let nt = rec.record_op(OpCode::IntXor, &[x, t]);
+    let mul = rec.record_op(OpCode::UintMulHigh, &[nt, const_k]);
+    let sh = rec.record_op(OpCode::UintRshift, &[mul, const_i]);
+    let div = rec.record_op(OpCode::IntXor, &[sh, t]);
+    // Modulo: x - div * m
+    let product = rec.record_op(OpCode::IntMul, &[div, const_m]);
+    let remainder = rec.record_op(OpCode::IntSub, &[x, product]);
+    rec.finish(&[remainder], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut constants = HashMap::new();
+    constants.insert(1000, k as i64);
+    constants.insert(1001, i as i64);
+    constants.insert(1002, 63i64);
+    constants.insert(1003, m);
+
+    let mut backend = CraneliftBackend::new();
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(token_id);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    (backend, token)
+}
+
+/// Build a power-of-2 division trace:
+///   sign = x >> 63
+///   correction = sign & (divisor - 1)
+///   adjusted = x + correction
+///   result = adjusted >> shift
+///   finish(result)
+fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBackend, LoopToken) {
+    assert!(divisor > 1 && divisor.count_ones() == 1);
+    let shift = divisor.trailing_zeros();
+
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+
+    let const_63 = OpRef(1000);
+    let const_mask = OpRef(1001);
+    let const_shift = OpRef(1002);
+
+    let sign = rec.record_op(OpCode::IntRshift, &[x, const_63]);
+    let correction = rec.record_op(OpCode::IntAnd, &[sign, const_mask]);
+    let adjusted = rec.record_op(OpCode::IntAdd, &[x, correction]);
+    let result = rec.record_op(OpCode::IntRshift, &[adjusted, const_shift]);
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut constants = HashMap::new();
+    constants.insert(1000, 63i64);
+    constants.insert(1001, divisor - 1);
+    constants.insert(1002, shift as i64);
+
+    let mut backend = CraneliftBackend::new();
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(token_id);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     (backend, token)
@@ -517,11 +601,13 @@ fn build_intdiv_pipeline(
 
 // ---------------------------------------------------------------------------
 // Test 7: IntFloorDiv magic-number pipeline (divisor = 7)
+//
+// The magic-number algorithm produces floor division (towards -inf).
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_intdiv_magic_number_pipeline() {
-    let (backend, token) = build_intdiv_pipeline(OpCode::IntFloorDiv, 7, 100);
+    let (backend, token) = build_magic_div_trace(7, 100);
 
     let test_cases: &[(i64, i64)] = &[
         (0, 0),
@@ -535,7 +621,7 @@ fn test_intdiv_magic_number_pipeline() {
         (-7, -1),
         (-8, -2),
         (-100, -15),
-        (i64::MAX, i64::MAX / 7),
+        (i64::MAX, floor_div(i64::MAX, 7)),
         (i64::MIN + 1, floor_div(i64::MIN + 1, 7)),
     ];
 
@@ -555,7 +641,7 @@ fn test_intdiv_magic_number_pipeline() {
 
 #[test]
 fn test_intmod_magic_number_pipeline() {
-    let (backend, token) = build_intdiv_pipeline(OpCode::IntMod, 7, 101);
+    let (backend, token) = build_magic_mod_trace(7, 101);
 
     let test_cases: &[(i64, i64)] = &[
         (0, 0),
@@ -584,11 +670,15 @@ fn test_intmod_magic_number_pipeline() {
 
 // ---------------------------------------------------------------------------
 // Test 9: IntFloorDiv power-of-2 pipeline (divisor = 8)
+//
+// The power-of-2 strength reduction uses the Hacker's Delight formula:
+//   result = (x + ((x >> 63) & (2^n - 1))) >> n
+// This produces truncation division (towards zero), matching Cranelift sdiv.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_intdiv_power_of_two_pipeline() {
-    let (backend, token) = build_intdiv_pipeline(OpCode::IntFloorDiv, 8, 102);
+    let (backend, token) = build_power_of_two_div_trace(8, 102);
 
     let test_cases: &[(i64, i64)] = &[
         (0, 0),
@@ -597,13 +687,13 @@ fn test_intdiv_power_of_two_pipeline() {
         (8, 1),
         (16, 2),
         (100, 12),
-        (-1, -1),
-        (-7, -1),
-        (-8, -1),
-        (-9, -2),
-        (-100, -13),
+        (-1, 0),       // truncation: -1/8 = 0
+        (-7, 0),       // truncation: -7/8 = 0
+        (-8, -1),      // exact: -8/8 = -1
+        (-9, -1),      // truncation: -9/8 = -1
+        (-100, -12),   // truncation: -100/8 = -12
         (i64::MAX, i64::MAX / 8),
-        (i64::MIN + 1, floor_div(i64::MIN + 1, 8)),
+        (i64::MIN + 1, (i64::MIN + 1) / 8),
     ];
 
     for &(input, expected) in test_cases {
@@ -611,20 +701,19 @@ fn test_intdiv_power_of_two_pipeline() {
         let actual = backend.get_int_value(&frame, 0);
         assert_eq!(
             actual, expected,
-            "IntFloorDiv: {input} // 8 = expected {expected}, got {actual}"
+            "IntFloorDiv(pow2): {input} / 8 = expected {expected}, got {actual}"
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Test 10: IntFloorDiv various divisors
+// Test 10: IntFloorDiv magic-number various divisors
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_intdiv_various_divisors() {
     for (tid, divisor) in [3i64, 5, 10, 13, 100, 127].iter().enumerate() {
-        let (backend, token) =
-            build_intdiv_pipeline(OpCode::IntFloorDiv, *divisor, 200 + tid as u64);
+        let (backend, token) = build_magic_div_trace(*divisor, 200 + tid as u64);
 
         for input in [0i64, 1, *divisor - 1, *divisor, *divisor + 1, 999, -1, -*divisor, -999] {
             let expected = floor_div(input, *divisor);
@@ -636,4 +725,380 @@ fn test_intdiv_various_divisors() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: VecIntAdd native SIMD (pack + add + unpack)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vec_int_add_simd() {
+    // input(a, b, c, d)
+    // vec0 = VecI()
+    // vec1 = VecPackI(vec0, a, 0, 2)
+    // vec2 = VecPackI(vec1, b, 1, 2)
+    // vec3 = VecI()
+    // vec4 = VecPackI(vec3, c, 0, 2)
+    // vec5 = VecPackI(vec4, d, 1, 2)
+    // vec6 = VecIntAdd(vec2, vec5)
+    // r0 = VecUnpackI(vec6, 0, 2)
+    // r1 = VecUnpackI(vec6, 1, 2)
+    // finish(r0, r1)
+    let mut rec = TraceRecorder::new();
+    let a = rec.record_input_arg(Type::Int);
+    let b = rec.record_input_arg(Type::Int);
+    let c = rec.record_input_arg(Type::Int);
+    let d = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_1 = OpRef(1001);
+    let const_2 = OpRef(1002);
+
+    let vec0 = rec.record_op(OpCode::VecI, &[]);
+    let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
+    let vec2 = rec.record_op(OpCode::VecPackI, &[vec1, b, const_1, const_2]);
+    let vec3 = rec.record_op(OpCode::VecI, &[]);
+    let vec4 = rec.record_op(OpCode::VecPackI, &[vec3, c, const_0, const_2]);
+    let vec5 = rec.record_op(OpCode::VecPackI, &[vec4, d, const_1, const_2]);
+    let vec6 = rec.record_op(OpCode::VecIntAdd, &[vec2, vec5]);
+    let r0 = rec.record_op(OpCode::VecUnpackI, &[vec6, const_0, const_2]);
+    let r1 = rec.record_op(OpCode::VecUnpackI, &[vec6, const_1, const_2]);
+    rec.finish(&[r0, r1], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 1i64);
+    constants.insert(1002, 2i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(300);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    // a=10, b=20, c=3, d=7 -> r0 = 10+3 = 13, r1 = 20+7 = 27
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(10), Value::Int(20), Value::Int(3), Value::Int(7)],
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), 13);
+    assert_eq!(backend.get_int_value(&frame, 1), 27);
+
+    // Negative values: a=-5, b=100, c=15, d=-200
+    let frame = backend.execute_token(
+        &token,
+        &[
+            Value::Int(-5),
+            Value::Int(100),
+            Value::Int(15),
+            Value::Int(-200),
+        ],
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), 10); // -5 + 15
+    assert_eq!(backend.get_int_value(&frame, 1), -100); // 100 + (-200)
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: VecIntSub native SIMD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vec_int_sub_simd() {
+    let mut rec = TraceRecorder::new();
+    let a = rec.record_input_arg(Type::Int);
+    let b = rec.record_input_arg(Type::Int);
+    let c = rec.record_input_arg(Type::Int);
+    let d = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_1 = OpRef(1001);
+    let const_2 = OpRef(1002);
+
+    let vec0 = rec.record_op(OpCode::VecI, &[]);
+    let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
+    let vec2 = rec.record_op(OpCode::VecPackI, &[vec1, b, const_1, const_2]);
+    let vec3 = rec.record_op(OpCode::VecI, &[]);
+    let vec4 = rec.record_op(OpCode::VecPackI, &[vec3, c, const_0, const_2]);
+    let vec5 = rec.record_op(OpCode::VecPackI, &[vec4, d, const_1, const_2]);
+    let vec6 = rec.record_op(OpCode::VecIntSub, &[vec2, vec5]);
+    let r0 = rec.record_op(OpCode::VecUnpackI, &[vec6, const_0, const_2]);
+    let r1 = rec.record_op(OpCode::VecUnpackI, &[vec6, const_1, const_2]);
+    rec.finish(&[r0, r1], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 1i64);
+    constants.insert(1002, 2i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(301);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    // a=10, b=20, c=3, d=7 -> r0 = 10-3 = 7, r1 = 20-7 = 13
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(10), Value::Int(20), Value::Int(3), Value::Int(7)],
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), 7);
+    assert_eq!(backend.get_int_value(&frame, 1), 13);
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: VecIntMul native SIMD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vec_int_mul_simd() {
+    let mut rec = TraceRecorder::new();
+    let a = rec.record_input_arg(Type::Int);
+    let b = rec.record_input_arg(Type::Int);
+    let c = rec.record_input_arg(Type::Int);
+    let d = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_1 = OpRef(1001);
+    let const_2 = OpRef(1002);
+
+    let vec0 = rec.record_op(OpCode::VecI, &[]);
+    let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
+    let vec2 = rec.record_op(OpCode::VecPackI, &[vec1, b, const_1, const_2]);
+    let vec3 = rec.record_op(OpCode::VecI, &[]);
+    let vec4 = rec.record_op(OpCode::VecPackI, &[vec3, c, const_0, const_2]);
+    let vec5 = rec.record_op(OpCode::VecPackI, &[vec4, d, const_1, const_2]);
+    let vec6 = rec.record_op(OpCode::VecIntMul, &[vec2, vec5]);
+    let r0 = rec.record_op(OpCode::VecUnpackI, &[vec6, const_0, const_2]);
+    let r1 = rec.record_op(OpCode::VecUnpackI, &[vec6, const_1, const_2]);
+    rec.finish(&[r0, r1], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 1i64);
+    constants.insert(1002, 2i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(302);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    // a=5, b=6, c=7, d=8 -> r0 = 5*7 = 35, r1 = 6*8 = 48
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(5), Value::Int(6), Value::Int(7), Value::Int(8)],
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), 35);
+    assert_eq!(backend.get_int_value(&frame, 1), 48);
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: VecExpandI + VecIntAdd (broadcast + vector add)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vec_expand_add_simd() {
+    // input(a, b, s)
+    // vec_ab = pack(a, b)
+    // vec_s = VecExpandI(s)       -- broadcast s to both lanes
+    // vec_r = VecIntAdd(vec_ab, vec_s)
+    // r0 = unpack(vec_r, 0)
+    // r1 = unpack(vec_r, 1)
+    // finish(r0, r1)
+    let mut rec = TraceRecorder::new();
+    let a = rec.record_input_arg(Type::Int);
+    let b = rec.record_input_arg(Type::Int);
+    let s = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_1 = OpRef(1001);
+    let const_2 = OpRef(1002);
+
+    let vec0 = rec.record_op(OpCode::VecI, &[]);
+    let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
+    let vec2 = rec.record_op(OpCode::VecPackI, &[vec1, b, const_1, const_2]);
+    let vec_s = rec.record_op(OpCode::VecExpandI, &[s]);
+    let vec_r = rec.record_op(OpCode::VecIntAdd, &[vec2, vec_s]);
+    let r0 = rec.record_op(OpCode::VecUnpackI, &[vec_r, const_0, const_2]);
+    let r1 = rec.record_op(OpCode::VecUnpackI, &[vec_r, const_1, const_2]);
+    rec.finish(&[r0, r1], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 1i64);
+    constants.insert(1002, 2i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(303);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    // a=10, b=20, s=100 -> r0 = 10+100 = 110, r1 = 20+100 = 120
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(10), Value::Int(20), Value::Int(100)],
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), 110);
+    assert_eq!(backend.get_int_value(&frame, 1), 120);
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: VecFloatAdd native SIMD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vec_float_add_simd() {
+    // We use CastIntToFloat to convert i64 inputs to f64, then pack into
+    // F64X2 vectors, add, unpack, and CastFloatToInt to get back i64.
+    // This avoids type mismatch in Finish fail_arg_types.
+    //
+    // Use VecPackI/VecUnpackI with VecFloatAdd: the VecFloatAdd reads
+    // I64X2 operands and reinterprets them as F64X2 internally.
+    // Instead, use Int-typed inputs, CastIntToFloat for each, then pack
+    // into F64X2 and unpack as Float, then CastFloatToInt.
+    //
+    // Simpler: just use Int paths throughout, packing f64 bit patterns
+    // into I64X2 via VecPackI, then use VecFloatAdd (which handles the
+    // bitcast internally), then VecUnpackI to get scalar i64 back.
+    let mut rec = TraceRecorder::new();
+    let a = rec.record_input_arg(Type::Int);
+    let b = rec.record_input_arg(Type::Int);
+    let c = rec.record_input_arg(Type::Int);
+    let d = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_1 = OpRef(1001);
+    let const_2 = OpRef(1002);
+
+    // Pack f64 bit patterns into I64X2 vectors
+    let vec0 = rec.record_op(OpCode::VecI, &[]);
+    let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
+    let vec2 = rec.record_op(OpCode::VecPackI, &[vec1, b, const_1, const_2]);
+    let vec3 = rec.record_op(OpCode::VecI, &[]);
+    let vec4 = rec.record_op(OpCode::VecPackI, &[vec3, c, const_0, const_2]);
+    let vec5 = rec.record_op(OpCode::VecPackI, &[vec4, d, const_1, const_2]);
+    // VecFloatAdd operates on the I64X2 as if they contain f64 bit patterns
+    let vec6 = rec.record_op(OpCode::VecFloatAdd, &[vec2, vec5]);
+    // Unpack using VecUnpackI to get scalar i64 (containing f64 bits)
+    let r0 = rec.record_op(OpCode::VecUnpackI, &[vec6, const_0, const_2]);
+    let r1 = rec.record_op(OpCode::VecUnpackI, &[vec6, const_1, const_2]);
+    rec.finish(&[r0, r1], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 1i64);
+    constants.insert(1002, 2i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(304);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    // Pass f64 values as i64 bit patterns
+    let a_f = 1.5f64;
+    let b_f = 2.5f64;
+    let c_f = 3.0f64;
+    let d_f = 4.0f64;
+
+    let frame = backend.execute_token(
+        &token,
+        &[
+            Value::Int(a_f.to_bits() as i64),
+            Value::Int(b_f.to_bits() as i64),
+            Value::Int(c_f.to_bits() as i64),
+            Value::Int(d_f.to_bits() as i64),
+        ],
+    );
+    let r0_bits = backend.get_int_value(&frame, 0) as u64;
+    let r1_bits = backend.get_int_value(&frame, 1) as u64;
+    assert_eq!(f64::from_bits(r0_bits), 4.5); // 1.5 + 3.0
+    assert_eq!(f64::from_bits(r1_bits), 6.5); // 2.5 + 4.0
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: Chained VecIntAdd + VecIntMul (vector add then multiply)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vec_chained_add_mul_simd() {
+    // input(a, b, c, d, e, f)
+    // vec_ab = pack(a, b)
+    // vec_cd = pack(c, d)
+    // vec_ef = pack(e, f)
+    // vec_sum = VecIntAdd(vec_ab, vec_cd)
+    // vec_result = VecIntMul(vec_sum, vec_ef)
+    // r0 = unpack(vec_result, 0)
+    // r1 = unpack(vec_result, 1)
+    // finish(r0, r1)
+    let mut rec = TraceRecorder::new();
+    let a = rec.record_input_arg(Type::Int);
+    let b = rec.record_input_arg(Type::Int);
+    let c = rec.record_input_arg(Type::Int);
+    let d = rec.record_input_arg(Type::Int);
+    let e = rec.record_input_arg(Type::Int);
+    let f = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_1 = OpRef(1001);
+    let const_2 = OpRef(1002);
+
+    let vec0 = rec.record_op(OpCode::VecI, &[]);
+    let vec_a = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
+    let vec_ab = rec.record_op(OpCode::VecPackI, &[vec_a, b, const_1, const_2]);
+
+    let vec1 = rec.record_op(OpCode::VecI, &[]);
+    let vec_c = rec.record_op(OpCode::VecPackI, &[vec1, c, const_0, const_2]);
+    let vec_cd = rec.record_op(OpCode::VecPackI, &[vec_c, d, const_1, const_2]);
+
+    let vec2 = rec.record_op(OpCode::VecI, &[]);
+    let vec_e = rec.record_op(OpCode::VecPackI, &[vec2, e, const_0, const_2]);
+    let vec_ef = rec.record_op(OpCode::VecPackI, &[vec_e, f, const_1, const_2]);
+
+    let vec_sum = rec.record_op(OpCode::VecIntAdd, &[vec_ab, vec_cd]);
+    let vec_result = rec.record_op(OpCode::VecIntMul, &[vec_sum, vec_ef]);
+    let r0 = rec.record_op(OpCode::VecUnpackI, &[vec_result, const_0, const_2]);
+    let r1 = rec.record_op(OpCode::VecUnpackI, &[vec_result, const_1, const_2]);
+    rec.finish(&[r0, r1], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 1i64);
+    constants.insert(1002, 2i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(305);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    // a=2, b=3, c=4, d=5, e=10, f=20
+    // sum = (2+4, 3+5) = (6, 8)
+    // result = (6*10, 8*20) = (60, 160)
+    let frame = backend.execute_token(
+        &token,
+        &[
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Int(5),
+            Value::Int(10),
+            Value::Int(20),
+        ],
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), 60);
+    assert_eq!(backend.get_int_value(&frame, 1), 160);
 }

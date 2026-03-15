@@ -20,7 +20,10 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use cranelift_codegen::ir::Value as CValue;
 
-use majit_codegen::{AsmInfo, BackendError, DeadFrame, LoopToken};
+use majit_codegen::{
+    AsmInfo, BackendError, CompiledTraceInfo, DeadFrame, ExitFrameLayout, ExitRecoveryLayout,
+    ExitValueSourceLayout, FailDescrLayout, LoopToken, TerminalExitLayout,
+};
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr, flags as gc_flags};
@@ -156,6 +159,10 @@ impl majit_ir::CallDescr for CallAssemblerDescr {
 
 #[derive(Clone)]
 struct RegisteredLoopTarget {
+    trace_id: u64,
+    header_pc: u64,
+    source_guard: Option<(u64, u32)>,
+    caller_prefix_layout: Option<ExitRecoveryLayout>,
     code_ptr: *const u8,
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
     gc_runtime_id: Option<u64>,
@@ -192,6 +199,11 @@ struct PendingMayForceFrame {
 struct PreviewFrameData {
     frame: FrameData,
     active_force_frame: Arc<ActiveForceFrame>,
+}
+
+struct OverlayFrameData {
+    inner: DeadFrame,
+    fail_descr: Arc<CraneliftFailDescr>,
 }
 
 impl PendingForceFrame {
@@ -249,6 +261,123 @@ impl PreviewFrameData {
             frame: FrameData::new_preview(raw_values, fail_descr, gc_runtime_id),
             active_force_frame,
         }
+    }
+}
+
+fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
+    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
+        return Some(frame_data.fail_descr.layout());
+    }
+    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
+        return Some(preview.frame.fail_descr.layout());
+    }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return Some(overlay.fail_descr.layout());
+    }
+    None
+}
+
+fn overlay_deadframe_fail_descr(
+    base_layout: &FailDescrLayout,
+    recovery_layout: ExitRecoveryLayout,
+) -> Arc<CraneliftFailDescr> {
+    let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+        base_layout.fail_index,
+        base_layout.trace_id,
+        base_layout.fail_arg_types.clone(),
+        base_layout.is_finish,
+        base_layout.force_token_slots.clone(),
+        Some(recovery_layout),
+    );
+    if let Some(source_op_index) = base_layout.source_op_index {
+        descr.set_source_op_index(source_op_index);
+    }
+    if let Some(trace_info) = base_layout.trace_info.clone() {
+        descr.set_trace_info(trace_info);
+    }
+    Arc::new(descr)
+}
+
+fn deadframe_recovery_layout_for_call_assembler(
+    layout: &FailDescrLayout,
+) -> Option<ExitRecoveryLayout> {
+    layout.recovery_layout.clone().or_else(|| {
+        layout.trace_info.as_ref().map(|trace_info| {
+            identity_recovery_layout(
+                layout.trace_id,
+                trace_info.header_pc,
+                trace_info.source_guard,
+                &layout.fail_arg_types,
+                None,
+            )
+        })
+    })
+}
+
+fn caller_prefix_recovery_layout(
+    trace_id: u64,
+    header_pc: u64,
+    source_guard: Option<(u64, u32)>,
+    slot_types: &[Type],
+    inputs: &[i64],
+    caller_prefix_layout: Option<&ExitRecoveryLayout>,
+) -> ExitRecoveryLayout {
+    ExitRecoveryLayout {
+        frames: vec![ExitFrameLayout {
+            trace_id: Some(trace_id),
+            header_pc: Some(header_pc),
+            source_guard,
+            pc: header_pc,
+            slots: slot_types
+                .iter()
+                .enumerate()
+                .map(|(slot, _)| {
+                    inputs
+                        .get(slot)
+                        .copied()
+                        .map(ExitValueSourceLayout::Constant)
+                        .unwrap_or(ExitValueSourceLayout::Unavailable)
+                })
+                .collect(),
+            slot_types: Some(slot_types.to_vec()),
+        }],
+        virtual_layouts: Vec::new(),
+        pending_field_layouts: Vec::new(),
+    }
+    .prefixed_by(caller_prefix_layout)
+}
+
+fn wrap_call_assembler_deadframe_with_caller_prefix(
+    frame: DeadFrame,
+    trace_id: u64,
+    header_pc: u64,
+    source_guard: Option<(u64, u32)>,
+    input_types: &[Type],
+    inputs: &[i64],
+    caller_prefix_layout: Option<&ExitRecoveryLayout>,
+) -> DeadFrame {
+    let Some(layout) = deadframe_layout(&frame) else {
+        return frame;
+    };
+    let Some(inner_recovery_layout) = deadframe_recovery_layout_for_call_assembler(&layout) else {
+        return frame;
+    };
+
+    let caller_layout = caller_prefix_recovery_layout(
+        trace_id,
+        header_pc,
+        source_guard,
+        input_types,
+        inputs,
+        caller_prefix_layout,
+    );
+    let recovery_layout = inner_recovery_layout.prefixed_by(Some(&caller_layout));
+
+    DeadFrame {
+        data: Box::new(OverlayFrameData {
+            inner: frame,
+            fail_descr: overlay_deadframe_fail_descr(&layout, recovery_layout),
+        }),
     }
 }
 
@@ -424,6 +553,153 @@ const BUILTIN_STRING_BASE_SIZE: usize = BUILTIN_STRING_LEN_OFFSET + std::mem::si
 
 fn var(idx: u32) -> Variable {
     Variable::from_u32(idx)
+}
+
+/// Whether to use native SIMD (I64X2/F64X2) for Vec* codegen.
+/// When false, falls back to scalar emulation.
+const USE_NATIVE_SIMD: bool = true;
+
+/// Returns true if `opcode` is a Vec* opcode that produces a vector-typed value
+/// (I64X2 or F64X2). VecUnpack* opcodes produce scalars, so they return false.
+/// Guard/void opcodes also return false.
+fn is_vec_producing_opcode(opcode: OpCode) -> bool {
+    matches!(
+        opcode,
+        OpCode::VecIntAdd
+            | OpCode::VecIntSub
+            | OpCode::VecIntMul
+            | OpCode::VecIntAnd
+            | OpCode::VecIntOr
+            | OpCode::VecIntXor
+            | OpCode::VecFloatAdd
+            | OpCode::VecFloatSub
+            | OpCode::VecFloatMul
+            | OpCode::VecFloatTrueDiv
+            | OpCode::VecFloatNeg
+            | OpCode::VecFloatAbs
+            | OpCode::VecFloatXor
+            | OpCode::VecI
+            | OpCode::VecF
+            | OpCode::VecPackI
+            | OpCode::VecPackF
+            | OpCode::VecExpandI
+            | OpCode::VecExpandF
+            | OpCode::VecLoadI
+            | OpCode::VecLoadF
+    )
+}
+
+/// Returns true if `opcode` is a Vec* float opcode producing F64X2.
+fn is_vec_float_producing(opcode: OpCode) -> bool {
+    matches!(
+        opcode,
+        OpCode::VecFloatAdd
+            | OpCode::VecFloatSub
+            | OpCode::VecFloatMul
+            | OpCode::VecFloatTrueDiv
+            | OpCode::VecFloatNeg
+            | OpCode::VecFloatAbs
+            | OpCode::VecFloatXor
+            | OpCode::VecF
+            | OpCode::VecPackF
+            | OpCode::VecExpandF
+            | OpCode::VecLoadF
+    )
+}
+
+/// Pre-scan ops to find positions that produce vector values.
+fn build_vec_oprefs(ops: &[Op], num_inputs: usize) -> HashSet<u32> {
+    if !USE_NATIVE_SIMD {
+        return HashSet::new();
+    }
+    let mut set = HashSet::new();
+    for (op_idx, op) in ops.iter().enumerate() {
+        if is_vec_producing_opcode(op.opcode) {
+            let vi = op_var_index(op, op_idx, num_inputs) as u32;
+            set.insert(vi);
+        }
+    }
+    set
+}
+
+/// Pre-scan to find which vector-producing positions have float type (F64X2).
+fn build_vec_float_oprefs(ops: &[Op], num_inputs: usize) -> HashSet<u32> {
+    if !USE_NATIVE_SIMD {
+        return HashSet::new();
+    }
+    let mut set = HashSet::new();
+    for (op_idx, op) in ops.iter().enumerate() {
+        if is_vec_float_producing(op.opcode) {
+            let vi = op_var_index(op, op_idx, num_inputs) as u32;
+            set.insert(vi);
+        }
+    }
+    set
+}
+
+/// Resolve an OpRef as a vector value (I64X2). If the OpRef refers to a
+/// vector-producing op, uses the variable directly (bitcasting F64X2 to
+/// I64X2 if needed). If it's a constant, splats it to fill all lanes.
+fn resolve_opref_vec_int(
+    builder: &mut FunctionBuilder,
+    constants: &HashMap<u32, i64>,
+    vec_oprefs: &HashSet<u32>,
+    vec_float_oprefs: &HashSet<u32>,
+    opref: OpRef,
+) -> CValue {
+    if let Some(&c) = constants.get(&opref.0) {
+        let scalar = builder.ins().iconst(cl_types::I64, c);
+        return builder.ins().splat(cl_types::I64X2, scalar);
+    }
+    if vec_oprefs.contains(&opref.0) {
+        let v = builder.use_var(var(opref.0));
+        if vec_float_oprefs.contains(&opref.0) {
+            // Variable is F64X2, bitcast to I64X2
+            return builder
+                .ins()
+                .bitcast(cl_types::I64X2, MemFlags::new(), v);
+        }
+        return v;
+    }
+    // Scalar variable referenced in a vector context: splat it
+    let scalar = builder.use_var(var(opref.0));
+    builder.ins().splat(cl_types::I64X2, scalar)
+}
+
+/// Resolve an OpRef as a vector float value (F64X2). If it's a constant,
+/// reinterpret the i64 bits as f64 and splat. If it's a vector var,
+/// bitcast to F64X2 if needed. If scalar, bitcast to f64 then splat.
+fn resolve_opref_vec_float(
+    builder: &mut FunctionBuilder,
+    constants: &HashMap<u32, i64>,
+    vec_oprefs: &HashSet<u32>,
+    vec_float_oprefs: &HashSet<u32>,
+    opref: OpRef,
+) -> CValue {
+    if let Some(&c) = constants.get(&opref.0) {
+        let scalar_i = builder.ins().iconst(cl_types::I64, c);
+        let scalar_f = builder
+            .ins()
+            .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
+        return builder.ins().splat(cl_types::F64X2, scalar_f);
+    }
+    if vec_oprefs.contains(&opref.0) {
+        let v = builder.use_var(var(opref.0));
+        if vec_float_oprefs.contains(&opref.0) {
+            // Already F64X2
+            return v;
+        }
+        // I64X2 -> F64X2 bitcast
+        return builder
+            .ins()
+            .bitcast(cl_types::F64X2, MemFlags::new(), v);
+    }
+    // Scalar variable: bitcast i64 -> f64 then splat
+    let scalar = builder.use_var(var(opref.0));
+    let scalar_f = builder
+        .ins()
+        .bitcast(cl_types::F64, MemFlags::new(), scalar);
+    builder.ins().splat(cl_types::F64X2, scalar_f)
 }
 
 /// Map a majit Type to the corresponding Cranelift IR type for call signatures.
@@ -614,32 +890,331 @@ fn with_active_force_frame<R>(handle: u64, f: impl FnOnce() -> R) -> R {
 
 static CALL_ASSEMBLER_TARGETS: OnceLock<Mutex<HashMap<u64, RegisteredLoopTarget>>> =
     OnceLock::new();
+static CALL_ASSEMBLER_EXPECTATIONS: OnceLock<
+    Mutex<HashMap<u64, HashMap<CallAssemblerCallerId, u64>>>,
+> = OnceLock::new();
+static CALL_ASSEMBLER_DEADFRAMES: OnceLock<Mutex<HashMap<u64, DeadFrame>>> = OnceLock::new();
+static NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+const CALL_ASSEMBLER_OUTCOME_FINISH: i64 = 0;
+const CALL_ASSEMBLER_OUTCOME_DEADFRAME: i64 = 1;
+
+/// Callback to "force" a callee frame through the interpreter when
+/// call_assembler hits a guard failure.  The callback takes the
+/// callee frame pointer (from fail_args[0]) and runs the interpreter
+/// to completion, returning the result as an i64.
+static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::new();
+
+thread_local! {
+    /// Thread-local cache for call_assembler target lookups.
+    /// The HashMap holds Arc ownership; CA_FAST_PTR caches a raw pointer
+    /// for the hot path to avoid atomic refcount ops on every call.
+    static CA_TARGET_CACHE: RefCell<HashMap<u64, Arc<RegisteredLoopTarget>>> =
+        RefCell::new(HashMap::new());
+
+    /// Single-entry raw pointer cache: (token_number, ptr_as_usize).
+    /// Valid because the Arc in CA_TARGET_CACHE keeps the data alive.
+    static CA_FAST_PTR: Cell<(u64, usize)> = const { Cell::new((0, 0)) };
+}
+
+/// Look up a call_assembler target without atomic refcount operations.
+///
+/// # Safety
+/// The returned pointer is valid for the duration of the current call
+/// (the Arc in CA_TARGET_CACHE keeps the data alive, and invalidation
+/// clears CA_FAST_PTR before removing from CA_TARGET_CACHE).
+unsafe fn fast_lookup_ca_target(token_number: u64) -> *const RegisteredLoopTarget {
+    // Hot path: single Cell read, no borrow, no atomic ops
+    if let Ok((t, p)) = CA_FAST_PTR.try_with(|c| c.get()) {
+        if t == token_number && p != 0 {
+            return p as *const RegisteredLoopTarget;
+        }
+    }
+    // Warm path: HashMap lookup, extract pointer without Arc clone
+    if let Ok(Some(ptr)) = CA_TARGET_CACHE.try_with(|c| {
+        c.borrow()
+            .get(&token_number)
+            .map(|arc| Arc::as_ptr(arc) as usize)
+    }) {
+        let _ = CA_FAST_PTR.try_with(|c| c.set((token_number, ptr)));
+        return ptr as *const RegisteredLoopTarget;
+    }
+    // Cold path: global registry (mutex lock), then cache
+    let target = call_assembler_registry()
+        .lock()
+        .unwrap()
+        .get(&token_number)
+        .cloned()
+        .map(Arc::new)
+        .unwrap_or_else(|| panic!("missing call_assembler target token {token_number}"));
+    let ptr = Arc::as_ptr(&target) as usize;
+    let _ = CA_TARGET_CACHE.try_with(|c| c.borrow_mut().insert(token_number, target));
+    let _ = CA_FAST_PTR.try_with(|c| c.set((token_number, ptr)));
+    ptr as *const RegisteredLoopTarget
+}
+
+fn invalidate_ca_thread_cache(token_number: u64) {
+    // Clear fast pointer cache first (before removing Arc ownership)
+    let _ = CA_FAST_PTR.try_with(|c| {
+        let (t, _) = c.get();
+        if t == token_number {
+            c.set((0, 0));
+        }
+    });
+    let _ = CA_TARGET_CACHE.try_with(|c| c.borrow_mut().remove(&token_number));
+}
+
+/// Register a force callback for call_assembler guard failures.
+pub fn register_call_assembler_force(f: extern "C" fn(i64) -> i64) {
+    let _ = CALL_ASSEMBLER_FORCE_FN.set(f);
+}
+
+const CALL_ASSEMBLER_DEADFRAME_SENTINEL: u32 = u32::MAX - 1;
+const CALL_ASSEMBLER_RESULT_VOID: u64 = 0;
+const CALL_ASSEMBLER_RESULT_INT: u64 = 1;
+const CALL_ASSEMBLER_RESULT_FLOAT: u64 = 2;
+const CALL_ASSEMBLER_RESULT_REF: u64 = 3;
+const CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF: u64 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CallAssemblerCallerId {
+    RootLoop(u64),
+    BridgeTrace(u64),
+}
 
 fn call_assembler_registry() -> &'static Mutex<HashMap<u64, RegisteredLoopTarget>> {
     CALL_ASSEMBLER_TARGETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn register_call_assembler_target(token: &LoopToken, compiled: &CompiledLoop) {
-    call_assembler_registry().lock().unwrap().insert(
-        token.number,
-        RegisteredLoopTarget {
-            code_ptr: compiled.code_ptr,
-            fail_descrs: compiled.fail_descrs.clone(),
-            gc_runtime_id: compiled.gc_runtime_id,
-            num_inputs: compiled.num_inputs,
-            num_ref_roots: compiled.num_ref_roots,
-            max_output_slots: compiled.max_output_slots,
-            inputarg_types: token.inputarg_types.clone(),
-            needs_force_frame: compiled.needs_force_frame,
-        },
-    );
+fn call_assembler_expectation_registry()
+-> &'static Mutex<HashMap<u64, HashMap<CallAssemblerCallerId, u64>>> {
+    CALL_ASSEMBLER_EXPECTATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn unregister_call_assembler_target(token_number: u64) {
+fn call_assembler_deadframe_registry() -> &'static Mutex<HashMap<u64, DeadFrame>> {
+    CALL_ASSEMBLER_DEADFRAMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn call_assembler_result_kind_name(kind: u64) -> &'static str {
+    match kind {
+        CALL_ASSEMBLER_RESULT_VOID => "void",
+        CALL_ASSEMBLER_RESULT_INT => "int",
+        CALL_ASSEMBLER_RESULT_FLOAT => "float",
+        CALL_ASSEMBLER_RESULT_REF => "ref",
+        CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF => "force-token-ref",
+        _ => "unknown",
+    }
+}
+
+fn actual_call_assembler_target_result_kind(
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+) -> Result<u64, BackendError> {
+    let finish_descr = fail_descrs
+        .iter()
+        .find(|descr| descr.is_finish())
+        .ok_or_else(|| {
+            unsupported_semantics(
+                OpCode::CallAssemblerN,
+                "call-assembler target must expose at least one finish exit",
+            )
+        })?;
+    actual_call_assembler_result_kind(finish_descr.as_ref())
+}
+
+fn validate_call_assembler_target_result_kind(
+    target_token: u64,
+    expected_result_kind: u64,
+    actual_result_kind: u64,
+    context: &str,
+) -> Result<(), BackendError> {
+    if expected_result_kind == actual_result_kind {
+        return Ok(());
+    }
+    Err(BackendError::Unsupported(format!(
+        "call-assembler target {target_token} has incompatible {context}: expected {}, got {}",
+        call_assembler_result_kind_name(expected_result_kind),
+        call_assembler_result_kind_name(actual_result_kind),
+    )))
+}
+
+fn validate_registered_target_against_call_assembler_expectations(
+    target_token: u64,
+    target: &RegisteredLoopTarget,
+) -> Result<(), BackendError> {
+    let expectations = call_assembler_expectation_registry().lock().unwrap();
+    let Some(target_expectations) = expectations.get(&target_token) else {
+        return Ok(());
+    };
+    let expected_result_kinds: Vec<u64> = target_expectations.values().copied().collect();
+    drop(expectations);
+
+    let actual_result_kind = actual_call_assembler_target_result_kind(&target.fail_descrs)?;
+    for expected_result_kind in expected_result_kinds {
+        validate_call_assembler_target_result_kind(
+            target_token,
+            expected_result_kind,
+            actual_result_kind,
+            "callee finish result kind",
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_call_assembler_expectations_locked(
+    expectations: &mut HashMap<u64, HashMap<CallAssemblerCallerId, u64>>,
+    caller_id: CallAssemblerCallerId,
+) {
+    expectations.retain(|_, callers| {
+        callers.remove(&caller_id);
+        !callers.is_empty()
+    });
+}
+
+fn unregister_call_assembler_expectations(caller_id: CallAssemblerCallerId) {
+    let mut expectations = call_assembler_expectation_registry().lock().unwrap();
+    remove_call_assembler_expectations_locked(&mut expectations, caller_id);
+}
+
+fn unregister_bridge_call_assembler_expectations(bridge: &BridgeData) {
+    unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(bridge.trace_id));
+    for descr in &bridge.fail_descrs {
+        let attached = descr.bridge.lock().unwrap();
+        if let Some(ref child_bridge) = *attached {
+            unregister_bridge_call_assembler_expectations(child_bridge);
+        }
+    }
+}
+
+fn unregister_call_assembler_bridge_tree(fail_descrs: &[Arc<CraneliftFailDescr>]) {
+    for descr in fail_descrs {
+        let attached = descr.bridge.lock().unwrap();
+        if let Some(ref bridge) = *attached {
+            unregister_bridge_call_assembler_expectations(bridge);
+        }
+    }
+}
+
+fn collect_call_assembler_expectations(ops: &[Op]) -> Result<HashMap<u64, u64>, BackendError> {
+    let mut expectations = HashMap::new();
+    for op in ops {
+        let opcode = op.opcode;
+        if !matches!(
+            opcode,
+            OpCode::CallAssemblerI
+                | OpCode::CallAssemblerR
+                | OpCode::CallAssemblerF
+                | OpCode::CallAssemblerN
+        ) {
+            continue;
+        }
+        let descr = op.descr.as_ref().ok_or_else(|| {
+            unsupported_semantics(opcode, "call-assembler op must have a descriptor")
+        })?;
+        let call_descr = descr.as_call_descr().ok_or_else(|| {
+            unsupported_semantics(opcode, "call-assembler descriptor must be a CallDescr")
+        })?;
+        let target_token = call_descr.call_target_token().ok_or_else(|| {
+            unsupported_semantics(
+                opcode,
+                "call-assembler descriptor must provide a compiled target token",
+            )
+        })?;
+        let resolved_target = resolve_call_assembler_target(opcode, call_descr)?;
+        let expected_result_kind =
+            expected_call_assembler_result_kind(call_descr, resolved_target.as_ref())?;
+        if let Some(previous) = expectations.insert(target_token, expected_result_kind) {
+            validate_call_assembler_target_result_kind(
+                target_token,
+                previous,
+                expected_result_kind,
+                "caller result expectation",
+            )?;
+        }
+    }
+    Ok(expectations)
+}
+
+fn install_call_assembler_expectations(
+    caller_id: CallAssemblerCallerId,
+    ops: &[Op],
+) -> Result<(), BackendError> {
+    let expectations = collect_call_assembler_expectations(ops)?;
+
+    for (&target_token, &expected_result_kind) in &expectations {
+        if let Some(target) = lookup_call_assembler_target(target_token) {
+            let actual_result_kind = actual_call_assembler_target_result_kind(&target.fail_descrs)?;
+            validate_call_assembler_target_result_kind(
+                target_token,
+                expected_result_kind,
+                actual_result_kind,
+                "callee finish result kind",
+            )?;
+        }
+    }
+
+    let mut registry = call_assembler_expectation_registry().lock().unwrap();
+    for (&target_token, &expected_result_kind) in &expectations {
+        if let Some(callers) = registry.get(&target_token) {
+            for (&other_caller, &other_expected_kind) in callers {
+                if other_caller != caller_id {
+                    validate_call_assembler_target_result_kind(
+                        target_token,
+                        expected_result_kind,
+                        other_expected_kind,
+                        "caller result expectation",
+                    )?;
+                }
+            }
+        }
+    }
+
+    remove_call_assembler_expectations_locked(&mut registry, caller_id);
+    for (&target_token, &expected_result_kind) in &expectations {
+        registry
+            .entry(target_token)
+            .or_default()
+            .insert(caller_id, expected_result_kind);
+    }
+    Ok(())
+}
+
+fn register_call_assembler_target(
+    token: &LoopToken,
+    compiled: &CompiledLoop,
+) -> Result<(), BackendError> {
+    invalidate_ca_thread_cache(token.number);
+    let target = RegisteredLoopTarget {
+        trace_id: compiled.trace_id,
+        header_pc: compiled.header_pc,
+        source_guard: None,
+        caller_prefix_layout: compiled.caller_prefix_layout.clone(),
+        code_ptr: compiled.code_ptr,
+        fail_descrs: compiled.fail_descrs.clone(),
+        gc_runtime_id: compiled.gc_runtime_id,
+        num_inputs: compiled.num_inputs,
+        num_ref_roots: compiled.num_ref_roots,
+        max_output_slots: compiled.max_output_slots,
+        inputarg_types: token.inputarg_types.clone(),
+        needs_force_frame: compiled.needs_force_frame,
+    };
+    validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
     call_assembler_registry()
         .lock()
         .unwrap()
+        .insert(token.number, target);
+    Ok(())
+}
+
+fn unregister_call_assembler_target(token_number: u64) {
+    invalidate_ca_thread_cache(token_number);
+    unregister_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token_number));
+    let removed = call_assembler_registry()
+        .lock()
+        .unwrap()
         .remove(&token_number);
+    if let Some(target) = removed {
+        unregister_call_assembler_bridge_tree(&target.fail_descrs);
+    }
 }
 
 fn lookup_call_assembler_target(token_number: u64) -> Option<RegisteredLoopTarget> {
@@ -650,14 +1225,104 @@ fn lookup_call_assembler_target(token_number: u64) -> Option<RegisteredLoopTarge
         .cloned()
 }
 
-fn redirect_call_assembler_target(old_number: u64, new_number: u64) {
+fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<(), BackendError> {
+    invalidate_ca_thread_cache(old_number);
     let Some(new_target) = lookup_call_assembler_target(new_number) else {
-        return;
+        return Ok(());
     };
+    if let Some(old_target) = lookup_call_assembler_target(old_number) {
+        if old_target.inputarg_types != new_target.inputarg_types {
+            return Err(BackendError::Unsupported(format!(
+                "call-assembler redirect from token {old_number} to {new_number} changed input types"
+            )));
+        }
+    }
+    validate_registered_target_against_call_assembler_expectations(old_number, &new_target)?;
     call_assembler_registry()
         .lock()
         .unwrap()
         .insert(old_number, new_target);
+    Ok(())
+}
+
+fn store_call_assembler_deadframe(frame: DeadFrame) -> u64 {
+    let handle = NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.fetch_add(1, Ordering::Relaxed);
+    assert!(handle != 0, "call_assembler deadframe handle overflowed");
+    call_assembler_deadframe_registry()
+        .lock()
+        .unwrap()
+        .insert(handle, frame);
+    handle
+}
+
+fn take_call_assembler_deadframe(handle: u64) -> Option<DeadFrame> {
+    call_assembler_deadframe_registry()
+        .lock()
+        .unwrap()
+        .remove(&handle)
+}
+
+fn finish_result_from_deadframe(frame: &mut DeadFrame) -> i64 {
+    let descr = get_latest_descr_from_deadframe(frame);
+    assert!(descr.is_finish(), "expected finish deadframe");
+    match descr.fail_arg_types() {
+        [] => 0,
+        [Type::Int] => get_int_from_deadframe(frame, 0),
+        [Type::Ref] => {
+            if let Some(frame_data) = frame.data.downcast_mut::<FrameData>() {
+                return frame_data.take_ref_for_call_result(0).as_usize() as i64;
+            }
+            if let Some(preview) = frame.data.downcast_mut::<PreviewFrameData>() {
+                return preview.frame.get_ref(0).as_usize() as i64;
+            }
+            panic!("unsupported dead frame type")
+        }
+        [Type::Float] => get_float_from_deadframe(frame, 0).to_bits() as i64,
+        [Type::Void] => 0,
+        other => panic!("unsupported call_assembler finish result layout: {other:?}"),
+    }
+}
+
+fn take_call_assembler_deadframe_from_outputs(outputs: &[i64]) -> DeadFrame {
+    let handle = outputs
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("missing call_assembler deadframe handle slot"))
+        as u64;
+    assert!(handle != 0, "missing call_assembler deadframe handle");
+    take_call_assembler_deadframe(handle)
+        .unwrap_or_else(|| panic!("unknown call_assembler deadframe handle {handle}"))
+}
+
+fn maybe_take_call_assembler_deadframe(
+    fail_index: u32,
+    outputs: &[i64],
+    handle: u64,
+    force_frame: Option<&Arc<ActiveForceFrame>>,
+) -> Option<DeadFrame> {
+    if fail_index != CALL_ASSEMBLER_DEADFRAME_SENTINEL {
+        return None;
+    }
+    if let Some(force_frame) = force_frame {
+        take_force_frame_saved_data(force_frame);
+    }
+    release_force_token(handle);
+    Some(take_call_assembler_deadframe_from_outputs(outputs))
+}
+
+fn actual_call_assembler_result_kind(descr: &dyn FailDescr) -> Result<u64, BackendError> {
+    match descr.fail_arg_types() {
+        [] | [Type::Void] => Ok(CALL_ASSEMBLER_RESULT_VOID),
+        [Type::Int] => Ok(CALL_ASSEMBLER_RESULT_INT),
+        [Type::Float] => Ok(CALL_ASSEMBLER_RESULT_FLOAT),
+        [Type::Ref] if descr.force_token_slots() == [0] => {
+            Ok(CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF)
+        }
+        [Type::Ref] => Ok(CALL_ASSEMBLER_RESULT_REF),
+        other => Err(BackendError::Unsupported(format!(
+            "call-assembler target exposes unsupported finish result layout: {other:?}"
+        ))),
+    }
 }
 
 extern "C" fn current_force_token_shim() -> u64 {
@@ -814,6 +1479,10 @@ pub fn set_savedata_ref_on_deadframe(frame: &mut DeadFrame, data: GcRef) {
         set_force_frame_saved_data(&preview.active_force_frame, data);
         return;
     }
+    if let Some(overlay) = frame.data.downcast_mut::<OverlayFrameData>() {
+        set_savedata_ref_on_deadframe(&mut overlay.inner, data);
+        return;
+    }
     panic!("unsupported dead frame type for saved-data");
 }
 
@@ -823,6 +1492,9 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> &dyn FailDescr {
     }
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
         return preview.frame.fail_descr.as_ref();
+    }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return overlay.fail_descr.as_ref();
     }
     panic!("unsupported dead frame type");
 }
@@ -834,6 +1506,9 @@ pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> i64 {
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
         return preview.frame.get_int(index);
     }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return get_int_from_deadframe(&overlay.inner, index);
+    }
     panic!("unsupported dead frame type");
 }
 
@@ -844,6 +1519,9 @@ pub fn get_float_from_deadframe(frame: &DeadFrame, index: usize) -> f64 {
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
         return preview.frame.get_float(index);
     }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return get_float_from_deadframe(&overlay.inner, index);
+    }
     panic!("unsupported dead frame type");
 }
 
@@ -853,6 +1531,9 @@ pub fn get_ref_from_deadframe(frame: &DeadFrame, index: usize) -> GcRef {
     }
     if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
         return preview.frame.get_ref(index);
+    }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return get_ref_from_deadframe(&overlay.inner, index);
     }
     panic!("unsupported dead frame type");
 }
@@ -865,7 +1546,24 @@ pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> GcRef {
         return get_force_frame_saved_data(&preview.active_force_frame)
             .unwrap_or_else(|| preview.frame.get_savedata_ref());
     }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return get_savedata_ref_from_deadframe(&overlay.inner);
+    }
     panic!("unsupported dead frame type for saved-data");
+}
+
+pub fn grab_savedata_ref_from_deadframe(frame: &DeadFrame) -> Option<GcRef> {
+    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
+        return frame_data.try_get_savedata_ref();
+    }
+    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
+        return get_force_frame_saved_data(&preview.active_force_frame)
+            .or_else(|| preview.frame.try_get_savedata_ref());
+    }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return grab_savedata_ref_from_deadframe(&overlay.inner);
+    }
+    None
 }
 
 pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> GcRef {
@@ -874,6 +1572,9 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> GcRef {
     }
     if frame.data.downcast_ref::<PreviewFrameData>().is_some() {
         return GcRef::NULL;
+    }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return grab_exc_value_from_deadframe(&overlay.inner);
     }
     panic!("unsupported dead frame type for exception value");
 }
@@ -885,42 +1586,309 @@ pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> i64 {
     if frame.data.downcast_ref::<PreviewFrameData>().is_some() {
         return 0;
     }
+    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
+        return grab_exc_class_from_deadframe(&overlay.inner);
+    }
     panic!("unsupported dead frame type for exception class");
 }
 
-extern "C" fn call_assembler_shim(target_token: u64, args_ptr: u64) -> u64 {
-    let target = lookup_call_assembler_target(target_token)
-        .unwrap_or_else(|| panic!("missing call_assembler target token {target_token}"));
-    assert_eq!(
-        target.fail_descrs.len(),
-        1,
-        "call_assembler shim only supports finish-only callees"
-    );
-    assert!(
-        target.fail_descrs[0].is_finish(),
-        "call_assembler shim only supports finish-only callees"
-    );
-
-    let input_slice =
-        unsafe { std::slice::from_raw_parts(args_ptr as usize as *const i64, target.num_inputs) };
-    let (fail_index, outputs, handle, _) = run_compiled_code(
+fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
+    let (fail_index, outputs, handle, force_frame) = run_compiled_code(
         target.code_ptr,
         &target.fail_descrs,
         target.gc_runtime_id,
         target.num_ref_roots,
         target.max_output_slots,
-        input_slice,
+        inputs,
         target.needs_force_frame,
     );
-    assert_eq!(
-        fail_index as usize, 0,
-        "call_assembler shim received a non-finish exit from the callee"
-    );
-    if target.fail_descrs[0].force_token_slots.is_empty() {
+
+    if let Some(frame) =
+        maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
+    {
+        return wrap_call_assembler_deadframe_with_caller_prefix(
+            frame,
+            target.trace_id,
+            target.header_pc,
+            target.source_guard,
+            &target.inputarg_types,
+            inputs,
+            target.caller_prefix_layout.as_ref(),
+        );
+    }
+
+    let fail_descr = &target.fail_descrs[fail_index as usize];
+    fail_descr.increment_fail_count();
+
+    let bridge_guard = fail_descr.bridge.lock().unwrap();
+    if let Some(ref bridge) = *bridge_guard {
+        release_force_token(handle);
+        return CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+    }
+    drop(bridge_guard);
+
+    let saved_data = if let Some(ref ff) = force_frame {
+        take_force_frame_saved_data(ff)
+    } else {
+        None
+    };
+    let (exception_class, exception) = take_pending_jit_exception_state();
+    if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
         release_force_token(handle);
     }
 
-    outputs[0] as u64
+    DeadFrame {
+        data: Box::new(FrameData::new_with_savedata_and_exception(
+            outputs,
+            fail_descr.clone(),
+            target.gc_runtime_id,
+            saved_data,
+            exception_class,
+            (!exception.is_null()).then_some(exception),
+        )),
+    }
+}
+
+/// Stack-allocated output buffer size for the fast path.
+/// Traces with more output slots fall back to the normal path.
+const FAST_PATH_MAX_OUTPUTS: usize = 16;
+
+/// Fast path for call_assembler when a force callback is available.
+/// Runs compiled code with stack-allocated buffers, avoiding all heap
+/// allocation per call (no Vec, no DeadFrame, no Box).
+fn call_assembler_fast_path(
+    target: &RegisteredLoopTarget,
+    inputs: &[i64],
+    outcome: *mut i64,
+    force_fn: extern "C" fn(i64) -> i64,
+) -> u64 {
+    // Tagged cached result: an odd inputs[0] encodes a pre-computed
+    // result from the frame-creation helper (bit 0 = tag, bits 1.. = result).
+    // This skips frame creation, compiled code execution, and force callback.
+    if inputs[0] & 1 != 0 {
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+            *outcome.add(1) = 0;
+        }
+        return (inputs[0] >> 1) as u64;
+    }
+
+    let actual_outputs = target.max_output_slots.max(1);
+    if actual_outputs > FAST_PATH_MAX_OUTPUTS {
+        // Rare: too many outputs for stack buffer. Fall back to heap path.
+        return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
+    }
+
+    let func: unsafe extern "C" fn(*const i64, *mut i64, *mut i64) -> i64 =
+        unsafe { std::mem::transmute(target.code_ptr) };
+
+    let _jitted_guard = majit_codegen::JittedGuard::enter();
+
+    // Skip force_frame registration — the force callback handles all
+    // guard failures directly, making force_frame redundant.
+    let handle = 0u64;
+
+    // Stack-allocated buffers — no heap allocation per call
+    let mut outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
+    let mut roots = [GcRef::NULL; 8];
+
+    let fail_index = unsafe {
+        func(
+            inputs.as_ptr(),
+            outputs.as_mut_ptr(),
+            roots.as_mut_ptr() as *mut i64,
+        )
+    } as u32;
+    drop(_jitted_guard);
+
+    // Handle nested call_assembler DEADFRAME propagation
+    if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
+        let frame = take_call_assembler_deadframe_from_outputs(&outputs);
+        release_force_token(handle);
+        let handle = store_call_assembler_deadframe(frame);
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
+            *outcome.add(1) = handle as i64;
+        }
+        return 0;
+    }
+
+    let fail_descr = &target.fail_descrs[fail_index as usize];
+
+    if fail_descr.is_finish() {
+        release_force_token(handle);
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+            *outcome.add(1) = 0;
+        }
+        return match fail_descr.fail_arg_types() {
+            [] | [Type::Void] => 0,
+            [Type::Int] | [Type::Float] => outputs[0] as u64,
+            _ => {
+                let outputs_vec = outputs[..actual_outputs].to_vec();
+                let mut frame = build_deadframe_from_outputs(
+                    outputs_vec,
+                    fail_descr,
+                    target.gc_runtime_id,
+                );
+                finish_result_from_deadframe(&mut frame) as u64
+            }
+        };
+    }
+
+    // Guard failure — use force callback directly
+    fail_descr.increment_fail_count();
+    release_force_token(handle);
+
+    let callee_frame_ptr = outputs[0];
+    let result = force_fn(callee_frame_ptr);
+    unsafe {
+        *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+        *outcome.add(1) = 0;
+    }
+    result as u64
+}
+
+/// Heap-allocated fallback for call_assembler_fast_path when outputs
+/// exceed the stack buffer size.
+fn call_assembler_fast_path_heap(
+    target: &RegisteredLoopTarget,
+    inputs: &[i64],
+    outcome: *mut i64,
+    force_fn: extern "C" fn(i64) -> i64,
+) -> u64 {
+    let (fail_index, outputs, handle, _force_frame) = run_compiled_code(
+        target.code_ptr,
+        &target.fail_descrs,
+        target.gc_runtime_id,
+        target.num_ref_roots,
+        target.max_output_slots,
+        inputs,
+        target.needs_force_frame,
+    );
+
+    if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
+        let frame = take_call_assembler_deadframe_from_outputs(&outputs);
+        release_force_token(handle);
+        let handle = store_call_assembler_deadframe(frame);
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
+            *outcome.add(1) = handle as i64;
+        }
+        return 0;
+    }
+
+    let fail_descr = &target.fail_descrs[fail_index as usize];
+
+    if fail_descr.is_finish() {
+        release_force_token(handle);
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+            *outcome.add(1) = 0;
+        }
+        return match fail_descr.fail_arg_types() {
+            [] | [Type::Void] => 0,
+            [Type::Int] | [Type::Float] => outputs[0] as u64,
+            _ => {
+                let mut frame = build_deadframe_from_outputs(
+                    outputs,
+                    fail_descr,
+                    target.gc_runtime_id,
+                );
+                finish_result_from_deadframe(&mut frame) as u64
+            }
+        };
+    }
+
+    fail_descr.increment_fail_count();
+    release_force_token(handle);
+    let callee_frame_ptr = outputs[0];
+    let result = force_fn(callee_frame_ptr);
+    unsafe {
+        *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+        *outcome.add(1) = 0;
+    }
+    result as u64
+}
+
+/// Build a DeadFrame from raw outputs for cases where the fast path
+/// can't extract the result directly (e.g. Ref-typed results).
+fn build_deadframe_from_outputs(
+    outputs: Vec<i64>,
+    fail_descr: &Arc<CraneliftFailDescr>,
+    gc_runtime_id: Option<u64>,
+) -> DeadFrame {
+    let (exception_class, exception) = take_pending_jit_exception_state();
+    DeadFrame {
+        data: Box::new(FrameData::new_with_savedata_and_exception(
+            outputs,
+            fail_descr.clone(),
+            gc_runtime_id,
+            None,
+            exception_class,
+            (!exception.is_null()).then_some(exception),
+        )),
+    }
+}
+
+extern "C" fn call_assembler_shim(
+    target_token: u64,
+    args_ptr: u64,
+    outcome_ptr: u64,
+    _expected_result_kind: u64,
+) -> u64 {
+    let outcome = outcome_ptr as usize as *mut i64;
+
+    // Tagged cached result: if the frame creator encoded a cached value
+    // (odd pointer), return it immediately — no target lookup, no compiled
+    // code execution, no force callback.
+    let input0 = unsafe { *(args_ptr as *const i64) };
+    if input0 & 1 != 0 {
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+            *outcome.add(1) = 0;
+        }
+        return (input0 >> 1) as u64;
+    }
+
+    let target = unsafe { &*fast_lookup_ca_target(target_token) };
+
+    let input_slice =
+        unsafe { std::slice::from_raw_parts(args_ptr as usize as *const i64, target.num_inputs) };
+    assert!(
+        !outcome.is_null(),
+        "call_assembler shim outcome buffer must be non-null"
+    );
+
+    // Fast path: when a force callback is registered, bypass DeadFrame
+    // construction. Runs compiled code directly and handles the result
+    // inline — avoids Box alloc, mutex lock, and Arc clone per call.
+    if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
+        return call_assembler_fast_path(
+            target,
+            input_slice,
+            outcome,
+            *force_fn,
+        );
+    }
+
+    // Slow path: full DeadFrame construction
+    let mut frame = execute_registered_loop_target(target, input_slice);
+    let descr = get_latest_descr_from_deadframe(&frame);
+    if descr.is_finish() {
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+            *outcome.add(1) = 0;
+        }
+        return finish_result_from_deadframe(&mut frame) as u64;
+    }
+
+    let handle = store_call_assembler_deadframe(frame);
+    unsafe {
+        *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
+        *outcome.add(1) = handle as i64;
+    }
+    0
 }
 
 extern "C" fn gc_alloc_nursery_shim(
@@ -1116,19 +2084,16 @@ fn missing_gc_runtime(opcode: OpCode) -> BackendError {
 fn resolve_call_assembler_target(
     opcode: OpCode,
     call_descr: &dyn CallDescr,
-) -> Result<RegisteredLoopTarget, BackendError> {
+) -> Result<Option<RegisteredLoopTarget>, BackendError> {
     let target_token = call_descr.call_target_token().ok_or_else(|| {
         unsupported_semantics(
             opcode,
             "call-assembler descriptor must provide a compiled target token",
         )
     })?;
-    let target = lookup_call_assembler_target(target_token).ok_or_else(|| {
-        unsupported_semantics(
-            opcode,
-            "call-assembler target token is not compiled or not registered",
-        )
-    })?;
+    let Some(target) = lookup_call_assembler_target(target_token) else {
+        return Ok(None);
+    };
 
     if target.inputarg_types != call_descr.arg_types() {
         return Err(unsupported_semantics(
@@ -1136,20 +2101,28 @@ fn resolve_call_assembler_target(
             "call-assembler target input types do not match the descriptor",
         ));
     }
-    if target.fail_descrs.len() != 1 || !target.fail_descrs[0].is_finish() {
+    let finish_descr = target
+        .fail_descrs
+        .iter()
+        .find(|descr| descr.is_finish())
+        .ok_or_else(|| {
+            unsupported_semantics(
+                opcode,
+                "call-assembler target must expose at least one finish exit",
+            )
+        })?;
+    let finish_types = finish_descr.fail_arg_types();
+    if !finish_descr.force_token_slots.is_empty()
+        && !(call_descr.result_type() == Type::Ref
+            && finish_types == [Type::Ref]
+            && finish_descr.force_token_slots == [0])
+    {
         return Err(unsupported_semantics(
             opcode,
-            "call-assembler currently supports only finish-only callee loops",
-        ));
-    }
-    if !target.fail_descrs[0].force_token_slots.is_empty() {
-        return Err(unsupported_semantics(
-            opcode,
-            "call-assembler does not yet support callee finish values containing force tokens",
+            "call-assembler does not yet support this callee finish force-token shape",
         ));
     }
 
-    let finish_types = target.fail_descrs[0].fail_arg_types();
     match call_descr.result_type() {
         Type::Void => {
             if !finish_types.is_empty() {
@@ -1169,7 +2142,42 @@ fn resolve_call_assembler_target(
         }
     }
 
-    Ok(target)
+    Ok(Some(target))
+}
+
+fn expected_call_assembler_result_kind(
+    call_descr: &dyn CallDescr,
+    target: Option<&RegisteredLoopTarget>,
+) -> Result<u64, BackendError> {
+    match call_descr.result_type() {
+        Type::Void => Ok(CALL_ASSEMBLER_RESULT_VOID),
+        Type::Int => Ok(CALL_ASSEMBLER_RESULT_INT),
+        Type::Float => Ok(CALL_ASSEMBLER_RESULT_FLOAT),
+        Type::Ref => {
+            let Some(target) = target else {
+                return Ok(CALL_ASSEMBLER_RESULT_REF);
+            };
+            let finish_descr = target
+                .fail_descrs
+                .iter()
+                .find(|descr| descr.is_finish())
+                .ok_or_else(|| {
+                    unsupported_semantics(
+                        OpCode::CallAssemblerR,
+                        "call-assembler target must expose at least one finish exit",
+                    )
+                })?;
+            Ok(
+                if finish_descr.fail_arg_types() == [Type::Ref]
+                    && finish_descr.force_token_slots == [0]
+                {
+                    CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF
+                } else {
+                    CALL_ASSEMBLER_RESULT_REF
+                },
+            )
+        }
+    }
 }
 
 fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
@@ -1185,14 +2193,38 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
     known
 }
 
-fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
+fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u32>, BackendError> {
     let mut force_tokens = HashSet::new();
     for (op_idx, op) in ops.iter().enumerate() {
-        if op.opcode == OpCode::ForceToken && !op.pos.is_none() {
-            force_tokens.insert(op_var_index(op, op_idx, inputargs.len()) as u32);
+        if op.pos.is_none() {
+            continue;
+        }
+        let result_var = op_var_index(op, op_idx, inputargs.len()) as u32;
+        if op.opcode == OpCode::ForceToken {
+            force_tokens.insert(result_var);
+            continue;
+        }
+        if op.opcode == OpCode::CallAssemblerR {
+            let descr = op.descr.as_ref().ok_or_else(|| {
+                unsupported_semantics(op.opcode, "call-assembler op must have a descriptor")
+            })?;
+            let call_descr = descr.as_call_descr().ok_or_else(|| {
+                unsupported_semantics(op.opcode, "call-assembler descriptor must be a CallDescr")
+            })?;
+            if let Some(target) = resolve_call_assembler_target(op.opcode, call_descr)? {
+                if let Some(finish_descr) =
+                    target.fail_descrs.iter().find(|descr| descr.is_finish())
+                {
+                    if finish_descr.fail_arg_types() == [Type::Ref]
+                        && finish_descr.force_token_slots == [0]
+                    {
+                        force_tokens.insert(result_var);
+                    }
+                }
+            }
         }
     }
-    force_tokens
+    Ok(force_tokens)
 }
 
 fn build_value_type_map(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, Type> {
@@ -1215,12 +2247,17 @@ fn build_value_type_map(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, Type
     value_types
 }
 
-fn build_ref_root_slots(inputargs: &[InputArg], ops: &[Op]) -> Vec<(u32, usize)> {
+fn build_ref_root_slots(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    force_tokens: &HashSet<u32>,
+) -> Vec<(u32, usize)> {
     let mut seen = HashSet::new();
     let mut slots = Vec::new();
 
     for input in inputargs {
-        if input.tp == Type::Ref && seen.insert(input.index) {
+        if input.tp == Type::Ref && !force_tokens.contains(&input.index) && seen.insert(input.index)
+        {
             slots.push((input.index, slots.len()));
         }
     }
@@ -1228,7 +2265,7 @@ fn build_ref_root_slots(inputargs: &[InputArg], ops: &[Op]) -> Vec<(u32, usize)>
     for (op_idx, op) in ops.iter().enumerate() {
         if op.result_type() == Type::Ref {
             let vi = op_var_index(op, op_idx, inputargs.len()) as u32;
-            if seen.insert(vi) {
+            if !force_tokens.contains(&vi) && seen.insert(vi) {
                 slots.push((vi, slots.len()));
             }
         }
@@ -1523,6 +2560,19 @@ fn ptr_arg_as_i64(
     }
 }
 
+fn output_transfers_current_force_token(
+    fail_descr: &CraneliftFailDescr,
+    outputs: &[i64],
+    handle: u64,
+) -> bool {
+    handle != 0
+        && fail_descr
+            .force_token_slots
+            .iter()
+            .copied()
+            .any(|slot| outputs.get(slot).copied() == Some(handle as i64))
+}
+
 extern "C" fn zero_memory_shim(base: u64, offset: u64, size: u64) {
     if size == 0 {
         return;
@@ -1737,10 +2787,15 @@ fn emit_guard_exit(
 // ---------------------------------------------------------------------------
 
 struct CompiledLoop {
+    trace_id: u64,
+    input_types: Vec<Type>,
+    header_pc: u64,
+    caller_prefix_layout: Option<ExitRecoveryLayout>,
     _func_id: FuncId,
     code_ptr: *const u8,
     code_size: usize,
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
+    terminal_exit_layouts: Mutex<Vec<TerminalExitLayout>>,
     gc_runtime_id: Option<u64>,
     num_inputs: usize,
     num_ref_roots: usize,
@@ -1751,6 +2806,96 @@ struct CompiledLoop {
 }
 
 unsafe impl Send for CompiledLoop {}
+
+fn find_trace_fail_descr_layouts_in_fail_descrs(
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+    trace_id: u64,
+) -> Option<Vec<majit_codegen::FailDescrLayout>> {
+    for descr in fail_descrs {
+        let bridge_guard = descr.bridge.lock().unwrap();
+        if let Some(bridge) = bridge_guard.as_ref() {
+            if bridge.trace_id == trace_id {
+                return Some(
+                    bridge
+                        .fail_descrs
+                        .iter()
+                        .map(|descr| descr.layout())
+                        .collect(),
+                );
+            }
+            if let Some(layouts) =
+                find_trace_fail_descr_layouts_in_fail_descrs(&bridge.fail_descrs, trace_id)
+            {
+                return Some(layouts);
+            }
+        }
+    }
+    None
+}
+
+fn find_trace_terminal_exit_layouts_in_fail_descrs(
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+    trace_id: u64,
+) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
+    for descr in fail_descrs {
+        let bridge_guard = descr.bridge.lock().unwrap();
+        if let Some(bridge) = bridge_guard.as_ref() {
+            if bridge.trace_id == trace_id {
+                return Some(bridge.terminal_exit_layouts.lock().unwrap().clone());
+            }
+            if let Some(layouts) =
+                find_trace_terminal_exit_layouts_in_fail_descrs(&bridge.fail_descrs, trace_id)
+            {
+                return Some(layouts);
+            }
+        }
+    }
+    None
+}
+
+fn find_trace_info_in_fail_descrs(
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+    trace_id: u64,
+) -> Option<CompiledTraceInfo> {
+    for descr in fail_descrs {
+        let bridge_guard = descr.bridge.lock().unwrap();
+        if let Some(bridge) = bridge_guard.as_ref() {
+            if bridge.trace_id == trace_id {
+                return Some(CompiledTraceInfo {
+                    trace_id: bridge.trace_id,
+                    input_types: bridge.input_types.clone(),
+                    header_pc: bridge.header_pc,
+                    source_guard: Some(bridge.source_guard),
+                });
+            }
+            if let Some(info) = find_trace_info_in_fail_descrs(&bridge.fail_descrs, trace_id) {
+                return Some(info);
+            }
+        }
+    }
+    None
+}
+
+fn find_fail_descr_in_fail_descrs(
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+    trace_id: u64,
+    fail_index: u32,
+) -> Option<Arc<CraneliftFailDescr>> {
+    for descr in fail_descrs {
+        if descr.trace_id == trace_id && descr.fail_index == fail_index {
+            return Some(descr.clone());
+        }
+        let bridge_guard = descr.bridge.lock().unwrap();
+        if let Some(bridge) = bridge_guard.as_ref() {
+            if let Some(found) =
+                find_fail_descr_in_fail_descrs(&bridge.fail_descrs, trace_id, fail_index)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
 
 fn run_compiled_code(
     code_ptr: *const u8,
@@ -1791,6 +2936,113 @@ struct GuardInfo {
     fail_arg_refs: Vec<OpRef>,
 }
 
+fn identity_recovery_layout(
+    trace_id: u64,
+    header_pc: u64,
+    source_guard: Option<(u64, u32)>,
+    slot_types: &[Type],
+    caller_layout: Option<&ExitRecoveryLayout>,
+) -> ExitRecoveryLayout {
+    let mut frames = caller_layout
+        .map(|layout| layout.frames.clone())
+        .unwrap_or_default();
+    frames.push(ExitFrameLayout {
+        trace_id: Some(trace_id),
+        header_pc: Some(header_pc),
+        source_guard,
+        pc: header_pc,
+        slots: (0..slot_types.len())
+            .map(ExitValueSourceLayout::ExitValue)
+            .collect(),
+        slot_types: Some(slot_types.to_vec()),
+    });
+    ExitRecoveryLayout {
+        frames,
+        virtual_layouts: caller_layout
+            .map(|layout| layout.virtual_layouts.clone())
+            .unwrap_or_default(),
+        pending_field_layouts: caller_layout
+            .map(|layout| layout.pending_field_layouts.clone())
+            .unwrap_or_default(),
+    }
+}
+
+fn patch_fail_descr_recovery_layout(
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+    trace_id: u64,
+    fail_index: u32,
+    recovery_layout: &ExitRecoveryLayout,
+) -> bool {
+    for descr in fail_descrs {
+        if descr.trace_id == trace_id && descr.fail_index == fail_index {
+            descr.set_recovery_layout(recovery_layout.clone());
+            return true;
+        }
+        let bridge_guard = descr.bridge.lock().unwrap();
+        if let Some(bridge) = bridge_guard.as_ref() {
+            if patch_fail_descr_recovery_layout(
+                &bridge.fail_descrs,
+                trace_id,
+                fail_index,
+                recovery_layout,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn patch_terminal_exit_recovery_layout_in_vec(
+    terminal_exit_layouts: &Mutex<Vec<TerminalExitLayout>>,
+    trace_id: u64,
+    op_index: usize,
+    recovery_layout: &ExitRecoveryLayout,
+) -> bool {
+    let mut terminal_exit_layouts = terminal_exit_layouts.lock().unwrap();
+    if let Some(layout) = terminal_exit_layouts
+        .iter_mut()
+        .find(|layout| layout.trace_id == trace_id && layout.op_index == op_index)
+    {
+        layout.recovery_layout = Some(recovery_layout.clone());
+        return true;
+    }
+    false
+}
+
+fn patch_terminal_exit_recovery_layout(
+    root_terminal_exit_layouts: &Mutex<Vec<TerminalExitLayout>>,
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+    trace_id: u64,
+    op_index: usize,
+    recovery_layout: &ExitRecoveryLayout,
+) -> bool {
+    if patch_terminal_exit_recovery_layout_in_vec(
+        root_terminal_exit_layouts,
+        trace_id,
+        op_index,
+        recovery_layout,
+    ) {
+        return true;
+    }
+
+    for descr in fail_descrs {
+        let bridge_guard = descr.bridge.lock().unwrap();
+        if let Some(bridge) = bridge_guard.as_ref() {
+            if patch_terminal_exit_recovery_layout(
+                &bridge.terminal_exit_layouts,
+                &bridge.fail_descrs,
+                trace_id,
+                op_index,
+                recovery_layout,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn infer_fail_arg_types(
     fail_arg_refs: &[OpRef],
     value_types: &HashMap<u32, Type>,
@@ -1822,6 +3074,9 @@ pub struct CraneliftBackend {
     gc_runtime_id: Option<u64>,
     trace_counter: u64,
     next_trace_id: Option<u64>,
+    next_header_pc: Option<u64>,
+    registered_call_assembler_tokens: HashSet<u64>,
+    registered_call_assembler_bridge_traces: HashSet<u64>,
 }
 
 impl CraneliftBackend {
@@ -1846,6 +3101,9 @@ impl CraneliftBackend {
             gc_runtime_id: None,
             trace_counter: 1,
             next_trace_id: None,
+            next_header_pc: None,
+            registered_call_assembler_tokens: HashSet::new(),
+            registered_call_assembler_bridge_traces: HashSet::new(),
         }
     }
 
@@ -1871,6 +3129,12 @@ impl CraneliftBackend {
     /// Force the next compile call to assign a specific trace id to all exits.
     pub fn set_next_trace_id(&mut self, trace_id: u64) {
         self.next_trace_id = Some(trace_id);
+    }
+
+    /// Force the next compile call to attach a specific header PC to
+    /// synthesized exit recovery layouts.
+    pub fn set_next_header_pc(&mut self, header_pc: u64) {
+        self.next_header_pc = Some(header_pc);
     }
 
     fn gc_rewriter(&self) -> Option<GcRewriterImpl> {
@@ -1919,6 +3183,20 @@ impl CraneliftBackend {
             compiled.needs_force_frame,
         );
 
+        if let Some(frame) =
+            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
+        {
+            return wrap_call_assembler_deadframe_with_caller_prefix(
+                frame,
+                compiled.trace_id,
+                compiled.header_pc,
+                None,
+                &compiled.input_types,
+                inputs,
+                compiled.caller_prefix_layout.as_ref(),
+            );
+        }
+
         let fail_descr = &compiled.fail_descrs[fail_index as usize];
 
         // Increment guard failure count.
@@ -1938,7 +3216,7 @@ impl CraneliftBackend {
             None
         };
         let (exception_class, exception) = take_pending_jit_exception_state();
-        if fail_descr.force_token_slots.is_empty() {
+        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
             release_force_token(handle);
         }
 
@@ -1976,6 +3254,20 @@ impl CraneliftBackend {
             bridge.needs_force_frame,
         );
 
+        if let Some(frame) =
+            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
+        {
+            return wrap_call_assembler_deadframe_with_caller_prefix(
+                frame,
+                bridge.trace_id,
+                bridge.header_pc,
+                Some(bridge.source_guard),
+                &bridge.input_types,
+                bridge_inputs,
+                bridge.caller_prefix_layout.as_ref(),
+            );
+        }
+
         let fail_descr = &bridge.fail_descrs[fail_index as usize];
         fail_descr.increment_fail_count();
 
@@ -1993,7 +3285,7 @@ impl CraneliftBackend {
             None
         };
         let (exception_class, exception) = take_pending_jit_exception_state();
-        if fail_descr.force_token_slots.is_empty() {
+        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
             release_force_token(handle);
         }
 
@@ -2014,6 +3306,8 @@ impl CraneliftBackend {
         inputargs: &[InputArg],
         ops: &[Op],
         invalidation_flag_ptr: Option<usize>,
+        source_guard: Option<(u64, u32)>,
+        caller_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<CompiledLoop, BackendError> {
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let ops = prepared_ops.as_slice();
@@ -2022,6 +3316,7 @@ impl CraneliftBackend {
             self.trace_counter += 1;
             trace_id
         });
+        let header_pc = self.next_header_pc.take().unwrap_or(0);
         let ptr_type = self.module.target_config().pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
 
@@ -2045,28 +3340,46 @@ impl CraneliftBackend {
         );
 
         // Pre-scan
+        let force_tokens = build_force_token_set(inputargs, ops)?;
         let mut fail_descrs: Vec<Arc<CraneliftFailDescr>> = Vec::new();
         let mut guard_infos: Vec<GuardInfo> = Vec::new();
         let mut max_output_slots: usize = 0;
         collect_guards(
             ops,
             inputargs,
+            &force_tokens,
             &mut fail_descrs,
             &mut guard_infos,
             &mut max_output_slots,
             trace_id,
+            header_pc,
+            source_guard,
+            caller_layout,
+        )?;
+        let terminal_exit_layouts = collect_terminal_exit_layouts(
+            ops,
+            inputargs,
+            &force_tokens,
+            trace_id,
+            header_pc,
+            source_guard,
+            caller_layout,
         )?;
 
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
         let value_types = build_value_type_map(inputargs, ops);
-        let ref_root_slots = build_ref_root_slots(inputargs, ops);
+        let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens);
         let gc_runtime_id = self.gc_runtime_id;
         let mut defined_ref_vars: HashSet<u32> = inputargs
             .iter()
-            .filter(|input| input.tp == Type::Ref)
+            .filter(|input| input.tp == Type::Ref && !force_tokens.contains(&input.index))
             .map(|input| input.index)
             .collect();
+
+        // Pre-scan for vector-producing ops (SIMD variable types)
+        let vec_oprefs = build_vec_oprefs(ops, num_inputs);
+        let vec_float_oprefs = build_vec_float_oprefs(ops, num_inputs);
 
         // Take constants out of self to avoid borrow conflicts with func_ctx
         let constants = std::mem::take(&mut self.constants);
@@ -2090,7 +3403,16 @@ impl CraneliftBackend {
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
                 let vi = op_var_index(op, op_idx, num_inputs);
-                builder.declare_var(var(vi as u32), cl_types::I64);
+                let cl_type = if vec_oprefs.contains(&(vi as u32)) {
+                    if is_vec_float_producing(op.opcode) {
+                        cl_types::F64X2
+                    } else {
+                        cl_types::I64X2
+                    }
+                } else {
+                    cl_types::I64
+                };
+                builder.declare_var(var(vi as u32), cl_type);
             }
         }
 
@@ -2909,7 +4231,7 @@ impl CraneliftBackend {
                             "call-assembler descriptor must be a CallDescr",
                         )
                     })?;
-                    let target = resolve_call_assembler_target(op.opcode, call_descr)?;
+                    let resolved_target = resolve_call_assembler_target(op.opcode, call_descr)?;
                     if op.args.len() != call_descr.arg_types().len() {
                         return Err(unsupported_semantics(
                             op.opcode,
@@ -2917,7 +4239,7 @@ impl CraneliftBackend {
                         ));
                     }
 
-                    let arg_bytes = (target.num_inputs.max(1) * 8) as u32;
+                    let arg_bytes = (call_descr.arg_types().len().max(1) * 8) as u32;
                     let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         arg_bytes,
@@ -2935,6 +4257,18 @@ impl CraneliftBackend {
                         call_descr.call_target_token().unwrap() as i64,
                     );
                     let args_ptr_i64 = ptr_arg_as_i64(&mut builder, args_ptr, ptr_type);
+                    let outcome_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        16,
+                        3,
+                    ));
+                    let outcome_ptr = builder.ins().stack_addr(ptr_type, outcome_slot, 0);
+                    let outcome_ptr_i64 = ptr_arg_as_i64(&mut builder, outcome_ptr, ptr_type);
+                    let expected_result_kind = builder.ins().iconst(
+                        cl_types::I64,
+                        expected_call_assembler_result_kind(call_descr, resolved_target.as_ref())?
+                            as i64,
+                    );
 
                     if call_descr.effect_info().can_raise() {
                         let _ = emit_host_call(
@@ -2962,7 +4296,12 @@ impl CraneliftBackend {
                         ptr_type,
                         call_conv,
                         call_assembler_shim as *const () as usize,
-                        &[target_token, args_ptr_i64],
+                        &[
+                            target_token,
+                            args_ptr_i64,
+                            outcome_ptr_i64,
+                            expected_result_kind,
+                        ],
                         Some(cl_types::I64),
                     );
                     emit_gc_root_registration(
@@ -2975,6 +4314,31 @@ impl CraneliftBackend {
                         false,
                     );
                     reload_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
+
+                    let outcome_kind = builder.ins().stack_load(cl_types::I64, outcome_slot, 0);
+                    let finish_kind = builder
+                        .ins()
+                        .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
+                    let is_finish = builder.ins().icmp(IntCC::Equal, outcome_kind, finish_kind);
+                    let cont_block = builder.create_block();
+                    let exit_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(is_finish, cont_block, &[], exit_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    let deadframe_handle = builder.ins().stack_load(cl_types::I64, outcome_slot, 8);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), deadframe_handle, outputs_ptr, 0);
+                    let sentinel = builder
+                        .ins()
+                        .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
+                    builder.ins().return_(&[sentinel]);
+
+                    builder.switch_to_block(cont_block);
+                    builder.seal_block(cont_block);
 
                     if op.result_type() != Type::Void {
                         let result = result.expect("call_assembler shim must return a value");
@@ -4262,30 +5626,45 @@ impl CraneliftBackend {
                 }
 
                 // ── Vector integer arithmetic ──
-                // Vectors are represented as pairs of i64 values stored
-                // in two consecutive Cranelift variables.
-                // We implement vector ops via scalar emulation for portability.
-                // A future SIMD pass can lower these to native vector instructions.
+                // Native SIMD path: I64X2 (128-bit, 2x i64) / F64X2 (128-bit, 2x f64).
+                // Scalar emulation fallback for portability.
                 OpCode::VecIntAdd
                 | OpCode::VecIntSub
                 | OpCode::VecIntMul
                 | OpCode::VecIntAnd
                 | OpCode::VecIntOr
                 | OpCode::VecIntXor => {
-                    // Binary vector integer ops: emulated as scalar ops on the
-                    // packed representation (pairs of i64).
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
-                    let result = match op.opcode {
-                        OpCode::VecIntAdd => builder.ins().iadd(a, b),
-                        OpCode::VecIntSub => builder.ins().isub(a, b),
-                        OpCode::VecIntMul => builder.ins().imul(a, b),
-                        OpCode::VecIntAnd => builder.ins().band(a, b),
-                        OpCode::VecIntOr => builder.ins().bor(a, b),
-                        OpCode::VecIntXor => builder.ins().bxor(a, b),
-                        _ => unreachable!(),
-                    };
-                    builder.def_var(var(vi), result);
+                    if USE_NATIVE_SIMD {
+                        let a = resolve_opref_vec_int(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let b = resolve_opref_vec_int(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[1],
+                        );
+                        let result = match op.opcode {
+                            OpCode::VecIntAdd => builder.ins().iadd(a, b),
+                            OpCode::VecIntSub => builder.ins().isub(a, b),
+                            OpCode::VecIntMul => builder.ins().imul(a, b),
+                            OpCode::VecIntAnd => builder.ins().band(a, b),
+                            OpCode::VecIntOr => builder.ins().bor(a, b),
+                            OpCode::VecIntXor => builder.ins().bxor(a, b),
+                            _ => unreachable!(),
+                        };
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let result = match op.opcode {
+                            OpCode::VecIntAdd => builder.ins().iadd(a, b),
+                            OpCode::VecIntSub => builder.ins().isub(a, b),
+                            OpCode::VecIntMul => builder.ins().imul(a, b),
+                            OpCode::VecIntAnd => builder.ins().band(a, b),
+                            OpCode::VecIntOr => builder.ins().bor(a, b),
+                            OpCode::VecIntXor => builder.ins().bxor(a, b),
+                            _ => unreachable!(),
+                        };
+                        builder.def_var(var(vi), result);
+                    }
                 }
 
                 // ── Vector float arithmetic ──
@@ -4293,52 +5672,101 @@ impl CraneliftBackend {
                 | OpCode::VecFloatSub
                 | OpCode::VecFloatMul
                 | OpCode::VecFloatTrueDiv => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
-                    let fresult = match op.opcode {
-                        OpCode::VecFloatAdd => builder.ins().fadd(fa, fb),
-                        OpCode::VecFloatSub => builder.ins().fsub(fa, fb),
-                        OpCode::VecFloatMul => builder.ins().fmul(fa, fb),
-                        OpCode::VecFloatTrueDiv => builder.ins().fdiv(fa, fb),
-                        _ => unreachable!(),
-                    };
-                    let result = builder
-                        .ins()
-                        .bitcast(cl_types::I64, MemFlags::new(), fresult);
-                    builder.def_var(var(vi), result);
+                    if USE_NATIVE_SIMD {
+                        let a = resolve_opref_vec_float(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let b = resolve_opref_vec_float(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[1],
+                        );
+                        let result = match op.opcode {
+                            OpCode::VecFloatAdd => builder.ins().fadd(a, b),
+                            OpCode::VecFloatSub => builder.ins().fsub(a, b),
+                            OpCode::VecFloatMul => builder.ins().fmul(a, b),
+                            OpCode::VecFloatTrueDiv => builder.ins().fdiv(a, b),
+                            _ => unreachable!(),
+                        };
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                        let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                        let fresult = match op.opcode {
+                            OpCode::VecFloatAdd => builder.ins().fadd(fa, fb),
+                            OpCode::VecFloatSub => builder.ins().fsub(fa, fb),
+                            OpCode::VecFloatMul => builder.ins().fmul(fa, fb),
+                            OpCode::VecFloatTrueDiv => builder.ins().fdiv(fa, fb),
+                            _ => unreachable!(),
+                        };
+                        let result = builder
+                            .ins()
+                            .bitcast(cl_types::I64, MemFlags::new(), fresult);
+                        builder.def_var(var(vi), result);
+                    }
                 }
 
                 OpCode::VecFloatNeg => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                    let fresult = builder.ins().fneg(fa);
-                    let result = builder
-                        .ins()
-                        .bitcast(cl_types::I64, MemFlags::new(), fresult);
-                    builder.def_var(var(vi), result);
+                    if USE_NATIVE_SIMD {
+                        let a = resolve_opref_vec_float(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let result = builder.ins().fneg(a);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                        let fresult = builder.ins().fneg(fa);
+                        let result = builder
+                            .ins()
+                            .bitcast(cl_types::I64, MemFlags::new(), fresult);
+                        builder.def_var(var(vi), result);
+                    }
                 }
 
                 OpCode::VecFloatAbs => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                    let fresult = builder.ins().fabs(fa);
-                    let result = builder
-                        .ins()
-                        .bitcast(cl_types::I64, MemFlags::new(), fresult);
-                    builder.def_var(var(vi), result);
+                    if USE_NATIVE_SIMD {
+                        let a = resolve_opref_vec_float(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let result = builder.ins().fabs(a);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                        let fresult = builder.ins().fabs(fa);
+                        let result = builder
+                            .ins()
+                            .bitcast(cl_types::I64, MemFlags::new(), fresult);
+                        builder.def_var(var(vi), result);
+                    }
                 }
 
                 OpCode::VecFloatXor => {
-                    // XOR on the raw bits of float values
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
-                    let result = builder.ins().bxor(a, b);
-                    builder.def_var(var(vi), result);
+                    if USE_NATIVE_SIMD {
+                        // XOR on the raw bits: operate on I64X2 representation
+                        let a = resolve_opref_vec_int(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let b = resolve_opref_vec_int(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[1],
+                        );
+                        let xored = builder.ins().bxor(a, b);
+                        // Result is declared as F64X2, bitcast from I64X2
+                        let result = builder
+                            .ins()
+                            .bitcast(cl_types::F64X2, MemFlags::new(), xored);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let result = builder.ins().bxor(a, b);
+                        builder.def_var(var(vi), result);
+                    }
                 }
 
                 // ── Vector comparison/test operations ──
+                // These always produce scalar results (I64), not vectors.
                 OpCode::VecFloatEq => {
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
                     let b = resolve_opref(&mut builder, &constants, op.args[1]);
@@ -4390,6 +5818,7 @@ impl CraneliftBackend {
                 }
 
                 // ── Vector cast operations ──
+                // These operate on scalar elements, not full vectors.
                 OpCode::VecCastFloatToInt => {
                     let a = resolve_opref(&mut builder, &constants, op.args[0]);
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
@@ -4431,59 +5860,188 @@ impl CraneliftBackend {
                 }
 
                 // ── Vector pack/unpack/expand ──
-                // These operate on scalar values, packing/unpacking from vector positions.
-                // In the scalar emulation model, vec == the scalar value itself.
                 OpCode::VecI | OpCode::VecF => {
-                    // Create an "uninitialized" vector → just zero
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    builder.def_var(var(vi), zero);
+                    if USE_NATIVE_SIMD {
+                        // Zero-initialized vector
+                        if op.opcode == OpCode::VecF {
+                            let zero_i = builder.ins().iconst(cl_types::I64, 0);
+                            let zero_f = builder
+                                .ins()
+                                .bitcast(cl_types::F64, MemFlags::new(), zero_i);
+                            let result = builder.ins().splat(cl_types::F64X2, zero_f);
+                            builder.def_var(var(vi), result);
+                        } else {
+                            let zero = builder.ins().iconst(cl_types::I64, 0);
+                            let result = builder.ins().splat(cl_types::I64X2, zero);
+                            builder.def_var(var(vi), result);
+                        }
+                    } else {
+                        let zero = builder.ins().iconst(cl_types::I64, 0);
+                        builder.def_var(var(vi), zero);
+                    }
                 }
 
-                OpCode::VecPackI | OpCode::VecPackF => {
-                    // vec_pack(vec, scalar, index, count) → just use the scalar
-                    let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
-                    builder.def_var(var(vi), scalar);
+                OpCode::VecPackI => {
+                    if USE_NATIVE_SIMD {
+                        // vec_pack(vec, scalar, lane_const, count_const)
+                        // insertlane(vec, scalar, lane_idx)
+                        let vec_val = resolve_opref_vec_int(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let lane = constants.get(&op.args[2].0).copied().unwrap_or(0) as u8;
+                        let result = builder.ins().insertlane(vec_val, scalar, lane);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
+                        builder.def_var(var(vi), scalar);
+                    }
                 }
 
-                OpCode::VecUnpackI | OpCode::VecUnpackF => {
-                    // vec_unpack(vec, index, count) → extract the scalar
-                    let vec_val = resolve_opref(&mut builder, &constants, op.args[0]);
-                    builder.def_var(var(vi), vec_val);
+                OpCode::VecPackF => {
+                    if USE_NATIVE_SIMD {
+                        // vec_pack(vec, scalar, lane_const, count_const)
+                        // insertlane(vec, scalar, lane_idx)
+                        let vec_val = resolve_opref_vec_float(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let scalar_i = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let scalar_f = builder
+                            .ins()
+                            .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
+                        let lane = constants.get(&op.args[2].0).copied().unwrap_or(0) as u8;
+                        let result = builder.ins().insertlane(vec_val, scalar_f, lane);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
+                        builder.def_var(var(vi), scalar);
+                    }
                 }
 
-                OpCode::VecExpandI | OpCode::VecExpandF => {
-                    // vec_expand(scalar) → replicate scalar across all lanes
-                    let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
-                    builder.def_var(var(vi), scalar);
+                OpCode::VecUnpackI => {
+                    if USE_NATIVE_SIMD {
+                        // vec_unpack(vec, lane_const, count_const) → scalar i64
+                        let vec_val = resolve_opref_vec_int(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let lane = constants.get(&op.args[1].0).copied().unwrap_or(0) as u8;
+                        let result = builder.ins().extractlane(vec_val, lane);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let vec_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        builder.def_var(var(vi), vec_val);
+                    }
+                }
+
+                OpCode::VecUnpackF => {
+                    if USE_NATIVE_SIMD {
+                        // vec_unpack(vec, lane_const, count_const) → scalar f64 as i64
+                        let vec_val = resolve_opref_vec_float(
+                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                        );
+                        let lane = constants.get(&op.args[1].0).copied().unwrap_or(0) as u8;
+                        let scalar_f = builder.ins().extractlane(vec_val, lane);
+                        let result = builder
+                            .ins()
+                            .bitcast(cl_types::I64, MemFlags::new(), scalar_f);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let vec_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        builder.def_var(var(vi), vec_val);
+                    }
+                }
+
+                OpCode::VecExpandI => {
+                    if USE_NATIVE_SIMD {
+                        // Broadcast scalar to all lanes
+                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let result = builder.ins().splat(cl_types::I64X2, scalar);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        builder.def_var(var(vi), scalar);
+                    }
+                }
+
+                OpCode::VecExpandF => {
+                    if USE_NATIVE_SIMD {
+                        // Broadcast scalar f64 to all lanes
+                        let scalar_i = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar_f = builder
+                            .ins()
+                            .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
+                        let result = builder.ins().splat(cl_types::F64X2, scalar_f);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        builder.def_var(var(vi), scalar);
+                    }
                 }
 
                 // ── Vector load/store ──
                 OpCode::VecLoadI | OpCode::VecLoadF => {
-                    // Load from memory (like raw_load but for vector data)
-                    let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let offset_val = if op.args.len() > 1 {
-                        resolve_opref(&mut builder, &constants, op.args[1])
+                    if USE_NATIVE_SIMD {
+                        // Load 128 bits (2x i64 or 2x f64) from memory
+                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let offset_val = if op.args.len() > 1 {
+                            resolve_opref(&mut builder, &constants, op.args[1])
+                        } else {
+                            builder.ins().iconst(cl_types::I64, 0)
+                        };
+                        let addr = builder.ins().iadd(base, offset_val);
+                        let load_type = if op.opcode == OpCode::VecLoadF {
+                            cl_types::F64X2
+                        } else {
+                            cl_types::I64X2
+                        };
+                        let result = builder
+                            .ins()
+                            .load(load_type, MemFlags::trusted(), addr, 0);
+                        builder.def_var(var(vi), result);
                     } else {
-                        builder.ins().iconst(cl_types::I64, 0)
-                    };
-                    let addr = builder.ins().iadd(base, offset_val);
-                    let result = builder
-                        .ins()
-                        .load(cl_types::I64, MemFlags::trusted(), addr, 0);
-                    builder.def_var(var(vi), result);
+                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let offset_val = if op.args.len() > 1 {
+                            resolve_opref(&mut builder, &constants, op.args[1])
+                        } else {
+                            builder.ins().iconst(cl_types::I64, 0)
+                        };
+                        let addr = builder.ins().iadd(base, offset_val);
+                        let result = builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), addr, 0);
+                        builder.def_var(var(vi), result);
+                    }
                 }
 
                 OpCode::VecStore => {
-                    // Store to memory
-                    let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let offset_val = if op.args.len() > 2 {
-                        resolve_opref(&mut builder, &constants, op.args[1])
+                    if USE_NATIVE_SIMD {
+                        // Store 128 bits to memory
+                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let offset_val = if op.args.len() > 2 {
+                            resolve_opref(&mut builder, &constants, op.args[1])
+                        } else {
+                            builder.ins().iconst(cl_types::I64, 0)
+                        };
+                        let value_ref = op.args[op.args.len() - 1];
+                        let value = if vec_oprefs.contains(&value_ref.0) {
+                            builder.use_var(var(value_ref.0))
+                        } else {
+                            resolve_opref(&mut builder, &constants, value_ref)
+                        };
+                        let addr = builder.ins().iadd(base, offset_val);
+                        builder.ins().store(MemFlags::trusted(), value, addr, 0);
                     } else {
-                        builder.ins().iconst(cl_types::I64, 0)
-                    };
-                    let value = resolve_opref(&mut builder, &constants, op.args[op.args.len() - 1]);
-                    let addr = builder.ins().iadd(base, offset_val);
-                    builder.ins().store(MemFlags::trusted(), value, addr, 0);
+                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let offset_val = if op.args.len() > 2 {
+                            resolve_opref(&mut builder, &constants, op.args[1])
+                        } else {
+                            builder.ins().iconst(cl_types::I64, 0)
+                        };
+                        let value =
+                            resolve_opref(&mut builder, &constants, op.args[op.args.len() - 1]);
+                        let addr = builder.ins().iadd(base, offset_val);
+                        builder.ins().store(MemFlags::trusted(), value, addr, 0);
+                    }
                 }
 
                 // ── Allocation opcodes ──
@@ -4675,7 +6233,7 @@ impl CraneliftBackend {
                 }
             }
 
-            if op.result_type() == Type::Ref {
+            if op.result_type() == Type::Ref && !force_tokens.contains(&vi) {
                 defined_ref_vars.insert(vi);
             }
         }
@@ -4707,11 +6265,25 @@ impl CraneliftBackend {
                     | OpCode::CallAssemblerN
             )
         });
+        let trace_info = CompiledTraceInfo {
+            trace_id,
+            input_types: inputargs.iter().map(|arg| arg.tp).collect(),
+            header_pc,
+            source_guard: None,
+        };
+        for descr in &fail_descrs {
+            descr.set_trace_info(trace_info.clone());
+        }
         Ok(CompiledLoop {
+            trace_id,
+            input_types: trace_info.input_types.clone(),
+            header_pc,
+            caller_prefix_layout: caller_layout.cloned(),
             _func_id: func_id,
             code_ptr,
             code_size: 0,
             fail_descrs,
+            terminal_exit_layouts: Mutex::new(terminal_exit_layouts),
             gc_runtime_id,
             num_inputs: inputargs.len(),
             num_ref_roots: ref_root_slots.len(),
@@ -4723,6 +6295,14 @@ impl CraneliftBackend {
 
 impl Drop for CraneliftBackend {
     fn drop(&mut self) {
+        for token_number in std::mem::take(&mut self.registered_call_assembler_tokens) {
+            unregister_call_assembler_target(token_number);
+        }
+        for trace_id in std::mem::take(&mut self.registered_call_assembler_bridge_traces) {
+            unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(trace_id));
+        }
+        call_assembler_deadframe_registry().lock().unwrap().clear();
+        NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.store(1, Ordering::Relaxed);
         if let Some(runtime_id) = self.gc_runtime_id.take() {
             unregister_gc_runtime(runtime_id);
         }
@@ -4732,16 +6312,19 @@ impl Drop for CraneliftBackend {
 fn collect_guards(
     ops: &[Op],
     inputargs: &[InputArg],
+    force_tokens: &HashSet<u32>,
     fail_descrs: &mut Vec<Arc<CraneliftFailDescr>>,
     guard_infos: &mut Vec<GuardInfo>,
     max_output_slots: &mut usize,
     trace_id: u64,
+    header_pc: u64,
+    source_guard: Option<(u64, u32)>,
+    caller_layout: Option<&ExitRecoveryLayout>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     let value_types = build_value_type_map(inputargs, ops);
-    let force_tokens = build_force_token_set(inputargs, ops);
 
-    for op in ops {
+    for (op_idx, op) in ops.iter().enumerate() {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
 
@@ -4776,15 +6359,23 @@ fn collect_guards(
             .filter_map(|(slot, opref)| force_tokens.contains(&opref.0).then_some(slot))
             .collect();
 
-        let descr = Arc::new(
-            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-                fail_index,
-                trace_id,
-                fail_arg_types,
-                is_finish,
-                force_token_slots,
-            ),
+        let recovery_layout = Some(identity_recovery_layout(
+            trace_id,
+            header_pc,
+            source_guard,
+            &fail_arg_types,
+            caller_layout,
+        ));
+        let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            fail_index,
+            trace_id,
+            fail_arg_types,
+            is_finish,
+            force_token_slots,
+            recovery_layout,
         );
+        descr.set_source_op_index(op_idx);
+        let descr = Arc::new(descr);
         fail_descrs.push(descr);
         guard_infos.push(GuardInfo {
             fail_index,
@@ -4793,6 +6384,74 @@ fn collect_guards(
     }
 
     Ok(())
+}
+
+fn collect_terminal_exit_layouts(
+    ops: &[Op],
+    inputargs: &[InputArg],
+    force_tokens: &HashSet<u32>,
+    trace_id: u64,
+    header_pc: u64,
+    source_guard: Option<(u64, u32)>,
+    caller_layout: Option<&ExitRecoveryLayout>,
+) -> Result<Vec<TerminalExitLayout>, BackendError> {
+    let value_types = build_value_type_map(inputargs, ops);
+    let mut layouts = Vec::new();
+    let mut fail_index = 0u32;
+
+    for (op_index, op) in ops.iter().enumerate() {
+        let is_guard = op.opcode.is_guard();
+        let is_finish = op.opcode == OpCode::Finish;
+        let is_jump = op.opcode == OpCode::Jump;
+
+        if is_finish || is_jump {
+            let exit_types = infer_fail_arg_types(op.args.as_slice(), &value_types)?;
+            let force_token_slots: Vec<usize> = op
+                .args
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, opref)| force_tokens.contains(&opref.0).then_some(slot))
+                .collect();
+            let gc_ref_slots = exit_types
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, tp)| {
+                    (*tp == Type::Ref && !force_token_slots.contains(&slot)).then_some(slot)
+                })
+                .collect();
+            let recovery_layout = (is_jump || is_finish).then(|| {
+                identity_recovery_layout(
+                    trace_id,
+                    header_pc,
+                    source_guard,
+                    &exit_types,
+                    caller_layout,
+                )
+            });
+            layouts.push(TerminalExitLayout {
+                op_index,
+                trace_id,
+                trace_info: Some(CompiledTraceInfo {
+                    trace_id,
+                    input_types: inputargs.iter().map(|arg| arg.tp).collect(),
+                    header_pc,
+                    source_guard: None,
+                }),
+                fail_index: if is_finish { fail_index } else { u32::MAX },
+                exit_types,
+                is_finish,
+                gc_ref_slots,
+                force_token_slots,
+                recovery_layout,
+            });
+        }
+
+        if is_guard || is_finish {
+            fail_index += 1;
+        }
+    }
+
+    Ok(layouts)
 }
 
 // ---------------------------------------------------------------------------
@@ -4810,12 +6469,19 @@ impl majit_codegen::Backend for CraneliftBackend {
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
-        let compiled = self.do_compile(inputargs, ops, Some(flag_ptr))?;
+        let compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None)?;
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
             code_size: compiled.code_size,
         };
-        register_call_assembler_target(token, &compiled);
+        register_call_assembler_target(token, &compiled)?;
+        if let Err(err) =
+            install_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token.number), ops)
+        {
+            unregister_call_assembler_target(token.number);
+            return Err(err);
+        }
+        self.registered_call_assembler_tokens.insert(token.number);
         token.compiled = Some(Box::new(compiled));
         Ok(info)
     }
@@ -4831,14 +6497,6 @@ impl majit_codegen::Backend for CraneliftBackend {
         // code generation path as compile_loop.
         // Bridges share the parent loop's invalidation flag.
         let flag_ptr = Arc::as_ptr(&original_token.invalidated) as *const AtomicBool as usize;
-        let compiled = self.do_compile(inputargs, ops, Some(flag_ptr))?;
-        let info = AsmInfo {
-            code_addr: compiled.code_ptr as usize,
-            code_size: compiled.code_size,
-        };
-
-        // Attach the bridge to the original guard's fail descriptor so that
-        // execute_token can dispatch to it on subsequent guard failures.
         let original_compiled = original_token
             .compiled
             .as_ref()
@@ -4846,20 +6504,89 @@ impl majit_codegen::Backend for CraneliftBackend {
             .ok_or_else(|| {
                 BackendError::CompilationFailed("original token has no compiled loop".to_string())
             })?;
+        let source_trace_id = if fail_descr.trace_id() == 0 {
+            original_compiled.trace_id
+        } else {
+            fail_descr.trace_id()
+        };
+        let source_descr = find_fail_descr_in_fail_descrs(
+            &original_compiled.fail_descrs,
+            source_trace_id,
+            fail_descr.fail_index(),
+        )
+        .ok_or_else(|| {
+            BackendError::CompilationFailed(format!(
+                "source fail descr not found for trace {} fail {}",
+                source_trace_id,
+                fail_descr.fail_index()
+            ))
+        })?;
+        let caller_layout =
+            source_descr
+                .recovery_layout
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|mut layout| {
+                    layout.frames.pop();
+                    layout
+                });
+        let compiled = self.do_compile(
+            inputargs,
+            ops,
+            Some(flag_ptr),
+            Some((source_trace_id, fail_descr.fail_index())),
+            caller_layout.as_ref(),
+        )?;
+        let info = AsmInfo {
+            code_addr: compiled.code_ptr as usize,
+            code_size: compiled.code_size,
+        };
+        install_call_assembler_expectations(
+            CallAssemblerCallerId::BridgeTrace(compiled.trace_id),
+            ops,
+        )?;
+        self.registered_call_assembler_bridge_traces
+            .insert(compiled.trace_id);
 
-        let fi = fail_descr.fail_index() as usize;
-        if fi < original_compiled.fail_descrs.len() {
-            let target_descr = &original_compiled.fail_descrs[fi];
-            target_descr.attach_bridge(BridgeData {
-                code_ptr: compiled.code_ptr,
-                fail_descrs: compiled.fail_descrs,
-                gc_runtime_id: compiled.gc_runtime_id,
-                num_inputs: compiled.num_inputs,
-                num_ref_roots: compiled.num_ref_roots,
-                max_output_slots: compiled.max_output_slots,
-                needs_force_frame: compiled.needs_force_frame,
-            });
+        // Attach the bridge to the original guard's fail descriptor so that
+        // execute_token can dispatch to it on subsequent guard failures.
+        let bridge_trace_info = CompiledTraceInfo {
+            trace_id: compiled.trace_id,
+            input_types: compiled.input_types.clone(),
+            header_pc: compiled.header_pc,
+            source_guard: Some((source_trace_id, fail_descr.fail_index())),
+        };
+        for descr in &compiled.fail_descrs {
+            descr.set_trace_info(bridge_trace_info.clone());
         }
+        {
+            let mut terminal_exit_layouts = compiled.terminal_exit_layouts.lock().unwrap();
+            for layout in terminal_exit_layouts.iter_mut() {
+                layout.trace_info = Some(bridge_trace_info.clone());
+            }
+        }
+        {
+            let existing_bridge = source_descr.bridge.lock().unwrap();
+            if let Some(ref bridge) = *existing_bridge {
+                unregister_bridge_call_assembler_expectations(bridge);
+            }
+        }
+        source_descr.attach_bridge(BridgeData {
+            trace_id: compiled.trace_id,
+            input_types: compiled.input_types.clone(),
+            header_pc: compiled.header_pc,
+            source_guard: (source_trace_id, fail_descr.fail_index()),
+            caller_prefix_layout: compiled.caller_prefix_layout.clone(),
+            code_ptr: compiled.code_ptr,
+            fail_descrs: compiled.fail_descrs,
+            terminal_exit_layouts: compiled.terminal_exit_layouts,
+            gc_runtime_id: compiled.gc_runtime_id,
+            num_inputs: compiled.num_inputs,
+            num_ref_roots: compiled.num_ref_roots,
+            max_output_slots: compiled.max_output_slots,
+            needs_force_frame: compiled.needs_force_frame,
+        });
 
         Ok(info)
     }
@@ -4918,6 +6645,62 @@ impl majit_codegen::Backend for CraneliftBackend {
             compiled.needs_force_frame,
         );
 
+        if let Some(frame) =
+            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
+        {
+            let frame = wrap_call_assembler_deadframe_with_caller_prefix(
+                frame,
+                compiled.trace_id,
+                compiled.header_pc,
+                None,
+                &compiled.input_types,
+                args,
+                compiled.caller_prefix_layout.as_ref(),
+            );
+            let descr = self.get_latest_descr(&frame);
+            let exit_layout = self.describe_deadframe(&frame);
+            let savedata = self.grab_savedata_ref(&frame);
+            let (exception_class, exception_value) = self.grab_exception_state(&frame);
+            let exit_arity = descr.fail_arg_types().len();
+            let mut result = Vec::with_capacity(exit_arity);
+            let mut typed_result = Vec::with_capacity(exit_arity);
+            for (i, &tp) in descr.fail_arg_types().iter().enumerate() {
+                match tp {
+                    Type::Int => {
+                        let value = self.get_int_value(&frame, i);
+                        result.push(value);
+                        typed_result.push(Value::Int(value));
+                    }
+                    Type::Ref => {
+                        let value = self.get_ref_value(&frame, i);
+                        result.push(value.as_usize() as i64);
+                        typed_result.push(Value::Ref(value));
+                    }
+                    Type::Float => {
+                        let value = self.get_float_value(&frame, i);
+                        result.push(value.to_bits() as i64);
+                        typed_result.push(Value::Float(value));
+                    }
+                    Type::Void => {
+                        result.push(0);
+                        typed_result.push(Value::Void);
+                    }
+                }
+            }
+            return majit_codegen::RawExecResult {
+                outputs: result,
+                typed_outputs: typed_result,
+                exit_layout,
+                force_token_slots: descr.force_token_slots().to_vec(),
+                savedata,
+                exception_class,
+                exception_value,
+                fail_index: descr.fail_index(),
+                trace_id: descr.trace_id(),
+                is_finish: descr.is_finish(),
+            };
+        }
+
         let fail_descr = &compiled.fail_descrs[fail_index as usize];
         fail_descr.increment_fail_count();
 
@@ -4959,6 +6742,11 @@ impl majit_codegen::Backend for CraneliftBackend {
             return majit_codegen::RawExecResult {
                 outputs: result,
                 typed_outputs: typed_result,
+                exit_layout: Some(descr.fail_descr.layout()),
+                force_token_slots: descr.fail_descr.force_token_slots().to_vec(),
+                savedata: descr.try_get_savedata_ref(),
+                exception_class: descr.get_exception_class(),
+                exception_value: descr.get_exception_ref(),
                 fail_index: descr.fail_descr.fail_index(),
                 trace_id: descr.fail_descr.trace_id(),
                 is_finish: descr.fail_descr.is_finish(),
@@ -4967,11 +6755,13 @@ impl majit_codegen::Backend for CraneliftBackend {
         drop(bridge_guard);
 
         // No bridge — skip DeadFrame, return outputs directly.
-        if let Some(ref ff) = force_frame {
-            take_force_frame_saved_data(ff);
-        }
-        take_pending_jit_exception_state();
-        if fail_descr.force_token_slots.is_empty() {
+        let savedata = if let Some(ref ff) = force_frame {
+            take_force_frame_saved_data(ff)
+        } else {
+            None
+        };
+        let (exception_class, exception) = take_pending_jit_exception_state();
+        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
             release_force_token(handle);
         }
 
@@ -4990,6 +6780,11 @@ impl majit_codegen::Backend for CraneliftBackend {
         majit_codegen::RawExecResult {
             outputs,
             typed_outputs,
+            exit_layout: Some(fail_descr.layout()),
+            force_token_slots: fail_descr.force_token_slots().to_vec(),
+            savedata,
+            exception_class,
+            exception_value: exception,
             fail_index,
             trace_id: fail_descr.trace_id(),
             is_finish: fail_descr.is_finish(),
@@ -5037,48 +6832,154 @@ impl majit_codegen::Backend for CraneliftBackend {
         )
     }
 
+    fn compiled_trace_fail_descr_layouts(
+        &self,
+        token: &LoopToken,
+        trace_id: u64,
+    ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        if compiled.trace_id == trace_id {
+            return Some(
+                compiled
+                    .fail_descrs
+                    .iter()
+                    .map(|descr| descr.layout())
+                    .collect(),
+            );
+        }
+        find_trace_fail_descr_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
+    }
+
+    fn compiled_terminal_exit_layouts(
+        &self,
+        token: &LoopToken,
+    ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        Some(compiled.terminal_exit_layouts.lock().unwrap().clone())
+    }
+
+    fn compiled_bridge_terminal_exit_layouts(
+        &self,
+        original_token: &LoopToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
+        let original_compiled = original_token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
+            descr.fail_index == source_fail_index && descr.trace_id == source_trace_id
+        })?;
+        let bridge = source_descr.bridge.lock().unwrap();
+        let bridge = bridge.as_ref()?;
+        Some(bridge.terminal_exit_layouts.lock().unwrap().clone())
+    }
+
+    fn compiled_trace_terminal_exit_layouts(
+        &self,
+        token: &LoopToken,
+        trace_id: u64,
+    ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        if compiled.trace_id == trace_id {
+            return Some(compiled.terminal_exit_layouts.lock().unwrap().clone());
+        }
+        find_trace_terminal_exit_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
+    }
+
+    fn compiled_trace_info(&self, token: &LoopToken, trace_id: u64) -> Option<CompiledTraceInfo> {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        if compiled.trace_id == trace_id {
+            return Some(CompiledTraceInfo {
+                trace_id: compiled.trace_id,
+                input_types: compiled.input_types.clone(),
+                header_pc: compiled.header_pc,
+                source_guard: None,
+            });
+        }
+        find_trace_info_in_fail_descrs(&compiled.fail_descrs, trace_id)
+    }
+
+    fn describe_deadframe(&self, frame: &DeadFrame) -> Option<majit_codegen::FailDescrLayout> {
+        deadframe_layout(frame)
+    }
+
+    fn update_fail_descr_recovery_layout(
+        &mut self,
+        token: &LoopToken,
+        trace_id: u64,
+        fail_index: u32,
+        recovery_layout: ExitRecoveryLayout,
+    ) -> bool {
+        let Some(compiled) = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+        else {
+            return false;
+        };
+        patch_fail_descr_recovery_layout(
+            &compiled.fail_descrs,
+            trace_id,
+            fail_index,
+            &recovery_layout,
+        )
+    }
+
+    fn update_terminal_exit_recovery_layout(
+        &mut self,
+        token: &LoopToken,
+        trace_id: u64,
+        op_index: usize,
+        recovery_layout: ExitRecoveryLayout,
+    ) -> bool {
+        let Some(compiled) = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+        else {
+            return false;
+        };
+        patch_terminal_exit_recovery_layout(
+            &compiled.terminal_exit_layouts,
+            &compiled.fail_descrs,
+            trace_id,
+            op_index,
+            &recovery_layout,
+        )
+    }
+
     fn force(&self, force_token: GcRef) -> DeadFrame {
         force_token_to_dead_frame(force_token)
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
-        if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-            return frame_data.fail_descr.as_ref();
-        }
-        if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-            return preview.frame.fail_descr.as_ref();
-        }
-        panic!("unsupported dead frame type")
+        get_latest_descr_from_deadframe(frame)
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
-        if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-            return frame_data.get_int(index);
-        }
-        if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-            return preview.frame.get_int(index);
-        }
-        panic!("unsupported dead frame type")
+        get_int_from_deadframe(frame, index)
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
-        if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-            return frame_data.get_float(index);
-        }
-        if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-            return preview.frame.get_float(index);
-        }
-        panic!("unsupported dead frame type")
+        get_float_from_deadframe(frame, index)
     }
 
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> GcRef {
-        if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-            return frame_data.get_ref(index);
-        }
-        if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-            return preview.frame.get_ref(index);
-        }
-        panic!("unsupported dead frame type")
+        get_ref_from_deadframe(frame, index)
     }
 
     fn set_savedata_ref(&self, frame: &mut DeadFrame, data: GcRef) {
@@ -5087,6 +6988,17 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn get_savedata_ref(&self, frame: &DeadFrame) -> GcRef {
         get_savedata_ref_from_deadframe(frame)
+    }
+
+    fn grab_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
+        grab_savedata_ref_from_deadframe(frame)
+    }
+
+    fn grab_exception_state(&self, frame: &DeadFrame) -> (i64, GcRef) {
+        (
+            grab_exc_class_from_deadframe(frame),
+            grab_exc_value_from_deadframe(frame),
+        )
     }
 
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
@@ -5101,12 +7013,17 @@ impl majit_codegen::Backend for CraneliftBackend {
         token.invalidate();
     }
 
-    fn redirect_call_assembler(&self, old: &LoopToken, new: &LoopToken) {
-        redirect_call_assembler_target(old.number, new.number);
+    fn redirect_call_assembler(
+        &self,
+        old: &LoopToken,
+        new: &LoopToken,
+    ) -> Result<(), BackendError> {
+        redirect_call_assembler_target(old.number, new.number)
     }
 
     fn free_loop(&mut self, token: &LoopToken) {
         unregister_call_assembler_target(token.number);
+        self.registered_call_assembler_tokens.remove(&token.number);
     }
 }
 
@@ -5673,6 +7590,651 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_fail_descr_layouts_include_backend_recovery_layout() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1), OpRef(0)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(76);
+        backend.set_next_header_pc(1234);
+        let mut token = LoopToken::new(8008);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let layouts = backend
+            .compiled_fail_descr_layouts(&token)
+            .expect("compiled layouts should exist");
+        let layout = &layouts[0];
+        assert_eq!(layout.source_op_index, Some(1));
+        let recovery = layout
+            .recovery_layout
+            .as_ref()
+            .expect("guard layout should include backend recovery layout");
+        assert_eq!(recovery.frames.len(), 1);
+        assert_eq!(recovery.frames[0].trace_id, Some(76));
+        assert_eq!(recovery.frames[0].header_pc, Some(1234));
+        assert_eq!(recovery.frames[0].pc, 1234);
+        assert_eq!(
+            recovery.frames[0].slots,
+            vec![
+                majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                majit_codegen::ExitValueSourceLayout::ExitValue(1),
+            ]
+        );
+        assert_eq!(
+            recovery.frames[0].slot_types,
+            Some(vec![Type::Ref, Type::Int])
+        );
+    }
+
+    #[test]
+    fn test_compiled_terminal_exit_layouts_include_backend_jump_recovery_layout() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_float(0), InputArg::new_ref(1)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Jump, &[OpRef(1), OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(77);
+        backend.set_next_header_pc(1234);
+        let mut token = LoopToken::new(8009);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let layouts = backend
+            .compiled_terminal_exit_layouts(&token)
+            .expect("compiled terminal layouts should exist");
+        assert_eq!(layouts.len(), 1);
+        let layout = &layouts[0];
+        assert_eq!(layout.op_index, 1);
+        assert_eq!(layout.trace_id, 77);
+        assert_eq!(layout.fail_index, u32::MAX);
+        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Float]);
+        assert!(!layout.is_finish);
+        assert_eq!(layout.gc_ref_slots, vec![0]);
+        assert!(layout.force_token_slots.is_empty());
+        let recovery = layout
+            .recovery_layout
+            .as_ref()
+            .expect("jump layout should include backend recovery layout");
+        assert_eq!(recovery.frames.len(), 1);
+        assert_eq!(recovery.frames[0].trace_id, Some(77));
+        assert_eq!(recovery.frames[0].header_pc, Some(1234));
+        assert_eq!(recovery.frames[0].pc, 1234);
+        assert_eq!(
+            recovery.frames[0].slots,
+            vec![
+                majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                majit_codegen::ExitValueSourceLayout::ExitValue(1),
+            ]
+        );
+        assert_eq!(
+            recovery.frames[0].slot_types,
+            Some(vec![Type::Ref, Type::Float])
+        );
+    }
+
+    #[test]
+    fn test_compiled_terminal_exit_layouts_include_backend_finish_recovery_layout() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_float(0), InputArg::new_ref(1)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(1), OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(79);
+        backend.set_next_header_pc(5678);
+        let mut token = LoopToken::new(8011);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let layouts = backend
+            .compiled_terminal_exit_layouts(&token)
+            .expect("compiled terminal layouts should exist");
+        assert_eq!(layouts.len(), 1);
+        let layout = &layouts[0];
+        assert_eq!(layout.op_index, 1);
+        assert_eq!(layout.trace_id, 79);
+        assert_eq!(layout.fail_index, 0);
+        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Float]);
+        assert!(layout.is_finish);
+        assert_eq!(layout.gc_ref_slots, vec![0]);
+        assert!(layout.force_token_slots.is_empty());
+        let recovery = layout
+            .recovery_layout
+            .as_ref()
+            .expect("finish layout should include backend recovery layout");
+        assert_eq!(recovery.frames.len(), 1);
+        assert_eq!(recovery.frames[0].trace_id, Some(79));
+        assert_eq!(recovery.frames[0].header_pc, Some(5678));
+        assert_eq!(recovery.frames[0].pc, 5678);
+        assert_eq!(
+            recovery.frames[0].slots,
+            vec![
+                majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                majit_codegen::ExitValueSourceLayout::ExitValue(1),
+            ]
+        );
+        assert_eq!(
+            recovery.frames[0].slot_types,
+            Some(vec![Type::Ref, Type::Float])
+        );
+    }
+
+    #[test]
+    fn test_update_terminal_exit_recovery_layout_patches_compiled_terminal_layout() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Jump, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(78);
+        backend.set_next_header_pc(1000);
+        let mut token = LoopToken::new(8010);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let patched = majit_codegen::ExitRecoveryLayout {
+            frames: vec![majit_codegen::ExitFrameLayout {
+                trace_id: None,
+                header_pc: None,
+                source_guard: None,
+                pc: 4242,
+                slots: vec![majit_codegen::ExitValueSourceLayout::Constant(99)],
+                slot_types: Some(vec![Type::Int]),
+            }],
+            virtual_layouts: Vec::new(),
+            pending_field_layouts: Vec::new(),
+        };
+        assert!(backend.update_terminal_exit_recovery_layout(&token, 78, 1, patched.clone()));
+
+        let layouts = backend
+            .compiled_terminal_exit_layouts(&token)
+            .expect("compiled terminal layouts should exist");
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].recovery_layout, Some(patched));
+    }
+
+    #[test]
+    fn test_compiled_trace_layout_queries_find_attached_bridge_by_trace_id() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let root_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(90);
+        backend.set_next_header_pc(1000);
+        let mut token = LoopToken::new(8012);
+        backend
+            .compile_loop(&inputargs, &root_ops, &mut token)
+            .unwrap();
+
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            0,
+            90,
+            vec![Type::Int],
+            false,
+            Vec::new(),
+            None,
+        );
+
+        backend.set_next_trace_id(91);
+        backend.set_next_header_pc(2000);
+        backend
+            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token)
+            .unwrap();
+
+        let root_layouts = backend
+            .compiled_trace_fail_descr_layouts(&token, 90)
+            .expect("root trace layouts should exist");
+        assert!(root_layouts.iter().all(|layout| layout.trace_id == 90));
+        let root_info = backend
+            .compiled_trace_info(&token, 90)
+            .expect("root trace info should exist");
+        assert_eq!(root_info.trace_id, 90);
+        assert_eq!(root_info.input_types, vec![Type::Int]);
+        assert_eq!(root_info.header_pc, 1000);
+        assert_eq!(root_info.source_guard, None);
+
+        let bridge_layouts = backend
+            .compiled_trace_fail_descr_layouts(&token, 91)
+            .expect("bridge trace layouts should exist");
+        assert_eq!(bridge_layouts.len(), 1);
+        assert_eq!(bridge_layouts[0].trace_id, 91);
+        assert!(bridge_layouts[0].is_finish);
+        let bridge_info = backend
+            .compiled_trace_info(&token, 91)
+            .expect("bridge trace info should exist");
+        assert_eq!(bridge_info.trace_id, 91);
+        assert_eq!(bridge_info.input_types, vec![Type::Int]);
+        assert_eq!(bridge_info.header_pc, 2000);
+        assert_eq!(bridge_info.source_guard, Some((90, 0)));
+
+        let bridge_terminal_layouts = backend
+            .compiled_trace_terminal_exit_layouts(&token, 91)
+            .expect("bridge terminal layouts should exist");
+        assert_eq!(bridge_terminal_layouts.len(), 1);
+        assert_eq!(bridge_terminal_layouts[0].trace_id, 91);
+        assert_eq!(
+            bridge_terminal_layouts[0]
+                .recovery_layout
+                .as_ref()
+                .expect("bridge terminal layout should have recovery")
+                .frames[0]
+                .pc,
+            2000
+        );
+    }
+
+    #[test]
+    fn test_compiled_bridge_recovery_layouts_inherit_source_guard_caller_frames() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let root_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(190);
+        backend.set_next_header_pc(1000);
+        let mut token = LoopToken::new(8013);
+        backend
+            .compile_loop(&inputargs, &root_ops, &mut token)
+            .unwrap();
+
+        let source_layout = majit_codegen::ExitRecoveryLayout {
+            frames: vec![
+                majit_codegen::ExitFrameLayout {
+                    trace_id: Some(10),
+                    header_pc: Some(900),
+                    source_guard: Some((9, 0)),
+                    pc: 900,
+                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+                majit_codegen::ExitFrameLayout {
+                    trace_id: Some(190),
+                    header_pc: Some(1000),
+                    source_guard: None,
+                    pc: 1000,
+                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+            ],
+            virtual_layouts: vec![majit_codegen::ExitVirtualLayout::Array {
+                descr_index: 17,
+                items: vec![
+                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                    majit_codegen::ExitValueSourceLayout::Constant(44),
+                ],
+            }],
+            pending_field_layouts: vec![majit_codegen::ExitPendingFieldLayout {
+                descr_index: 33,
+                item_index: Some(1),
+                is_array_item: true,
+                target: majit_codegen::ExitValueSourceLayout::Virtual(0),
+                value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+            }],
+        };
+        assert!(backend.update_fail_descr_recovery_layout(&token, 190, 0, source_layout.clone()));
+
+        let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            0,
+            190,
+            vec![Type::Int],
+            false,
+            Vec::new(),
+            None,
+        );
+        let mut bridge_guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+        bridge_guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            bridge_guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(191);
+        backend.set_next_header_pc(2000);
+        backend
+            .compile_bridge(&bridge_fail_descr, &inputargs, &bridge_ops, &token)
+            .unwrap();
+
+        let bridge_layouts = backend
+            .compiled_trace_fail_descr_layouts(&token, 191)
+            .expect("bridge trace layouts should exist");
+        let guard_layout = bridge_layouts
+            .iter()
+            .find(|layout| !layout.is_finish)
+            .expect("bridge guard layout should exist");
+        let guard_recovery = guard_layout
+            .recovery_layout
+            .as_ref()
+            .expect("bridge guard should carry backend recovery");
+        assert_eq!(guard_recovery.frames.len(), 2);
+        assert_eq!(guard_recovery.frames[0].trace_id, Some(10));
+        assert_eq!(guard_recovery.frames[0].header_pc, Some(900));
+        assert_eq!(guard_recovery.frames[0].source_guard, Some((9, 0)));
+        assert_eq!(guard_recovery.frames[1].trace_id, Some(191));
+        assert_eq!(guard_recovery.frames[1].header_pc, Some(2000));
+        assert_eq!(guard_recovery.frames[1].source_guard, Some((190, 0)));
+        assert_eq!(guard_recovery.frames[0].pc, 900);
+        assert_eq!(guard_recovery.frames[1].pc, 2000);
+        assert_eq!(guard_recovery.frames[0].slot_types, Some(vec![Type::Int]));
+        assert_eq!(guard_recovery.frames[1].slot_types, Some(vec![Type::Int]));
+        assert_eq!(
+            guard_recovery.virtual_layouts,
+            source_layout.virtual_layouts
+        );
+        assert_eq!(
+            guard_recovery.pending_field_layouts,
+            source_layout.pending_field_layouts
+        );
+
+        let bridge_terminal_layouts = backend
+            .compiled_trace_terminal_exit_layouts(&token, 191)
+            .expect("bridge terminal layouts should exist");
+        let finish_recovery = bridge_terminal_layouts[0]
+            .recovery_layout
+            .as_ref()
+            .expect("bridge finish should carry backend recovery");
+        assert_eq!(finish_recovery.frames.len(), 2);
+        assert_eq!(finish_recovery.frames[0].pc, 900);
+        assert_eq!(finish_recovery.frames[1].pc, 2000);
+        assert_eq!(
+            finish_recovery.virtual_layouts,
+            source_layout.virtual_layouts
+        );
+        assert_eq!(
+            finish_recovery.pending_field_layouts,
+            source_layout.pending_field_layouts
+        );
+    }
+
+    #[test]
+    fn test_compile_bridge_normalizes_legacy_root_source_guard_trace_id() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut root_guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+        root_guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let root_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            root_guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(300);
+        backend.set_next_header_pc(1000);
+        let mut token = LoopToken::new(8015);
+        backend
+            .compile_loop(&inputargs, &root_ops, &mut token)
+            .unwrap();
+
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let legacy_fail_descr = CraneliftFailDescr::new(0, vec![Type::Int]);
+        backend.set_next_trace_id(301);
+        backend.set_next_header_pc(2000);
+        backend
+            .compile_bridge(&legacy_fail_descr, &inputargs, &bridge_ops, &token)
+            .unwrap();
+
+        let bridge_info = backend
+            .compiled_trace_info(&token, 301)
+            .expect("bridge trace info should exist");
+        assert_eq!(bridge_info.source_guard, Some((300, 0)));
+        let bridge_layouts = backend
+            .compiled_trace_fail_descr_layouts(&token, 301)
+            .expect("bridge trace layouts should exist");
+        assert!(
+            bridge_layouts
+                .iter()
+                .all(|layout| layout.trace_info.as_ref().unwrap().source_guard == Some((300, 0)))
+        );
+    }
+
+    #[test]
+    fn test_nested_bridge_compilation_uses_source_trace_fail_descr_tree() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut root_guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+        root_guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let root_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            root_guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(290);
+        backend.set_next_header_pc(1000);
+        let mut token = LoopToken::new(8014);
+        backend
+            .compile_loop(&inputargs, &root_ops, &mut token)
+            .unwrap();
+
+        let root_layout = majit_codegen::ExitRecoveryLayout {
+            frames: vec![
+                majit_codegen::ExitFrameLayout {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
+                    pc: 900,
+                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+                majit_codegen::ExitFrameLayout {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
+                    pc: 1000,
+                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+            ],
+            virtual_layouts: vec![majit_codegen::ExitVirtualLayout::Array {
+                descr_index: 17,
+                items: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+            }],
+            pending_field_layouts: vec![majit_codegen::ExitPendingFieldLayout {
+                descr_index: 33,
+                item_index: Some(0),
+                is_array_item: true,
+                target: majit_codegen::ExitValueSourceLayout::Virtual(0),
+                value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+            }],
+        };
+        assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout));
+
+        let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            0,
+            290,
+            vec![Type::Int],
+            false,
+            Vec::new(),
+            None,
+        );
+        let mut bridge_guard = mk_op(OpCode::GuardFalse, &[OpRef(0)], OpRef::NONE.0);
+        bridge_guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            bridge_guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(291);
+        backend.set_next_header_pc(2000);
+        backend
+            .compile_bridge(&bridge_fail_descr, &inputargs, &bridge_ops, &token)
+            .unwrap();
+        assert!(
+            backend
+                .compiled_trace_fail_descr_layouts(&token, 291)
+                .is_some()
+        );
+        assert_eq!(
+            backend
+                .compiled_trace_info(&token, 291)
+                .expect("first bridge trace info")
+                .source_guard,
+            Some((290, 0))
+        );
+
+        let bridge_source_layout = majit_codegen::ExitRecoveryLayout {
+            frames: vec![
+                majit_codegen::ExitFrameLayout {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
+                    pc: 444,
+                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+                majit_codegen::ExitFrameLayout {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: Some((290, 0)),
+                    pc: 2000,
+                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+            ],
+            virtual_layouts: vec![majit_codegen::ExitVirtualLayout::Array {
+                descr_index: 99,
+                items: vec![
+                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                    majit_codegen::ExitValueSourceLayout::Constant(55),
+                ],
+            }],
+            pending_field_layouts: vec![majit_codegen::ExitPendingFieldLayout {
+                descr_index: 77,
+                item_index: Some(1),
+                is_array_item: true,
+                target: majit_codegen::ExitValueSourceLayout::Virtual(0),
+                value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+            }],
+        };
+        assert!(backend.update_fail_descr_recovery_layout(
+            &token,
+            291,
+            0,
+            bridge_source_layout.clone()
+        ));
+
+        let nested_bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            0,
+            291,
+            vec![Type::Int],
+            false,
+            Vec::new(),
+            None,
+        );
+        backend.set_next_trace_id(292);
+        backend.set_next_header_pc(3000);
+        backend
+            .compile_bridge(&nested_bridge_fail_descr, &inputargs, &bridge_ops, &token)
+            .unwrap();
+
+        assert!(
+            backend
+                .compiled_trace_fail_descr_layouts(&token, 291)
+                .is_some()
+        );
+        let nested_info = backend
+            .compiled_trace_info(&token, 292)
+            .expect("nested bridge trace info should exist");
+        assert_eq!(nested_info.source_guard, Some((291, 0)));
+
+        let nested_layouts = backend
+            .compiled_trace_fail_descr_layouts(&token, 292)
+            .expect("nested bridge layouts should exist");
+        let nested_guard_layout = nested_layouts
+            .iter()
+            .find(|layout| !layout.is_finish)
+            .expect("nested bridge guard layout should exist");
+        let nested_guard_recovery = nested_guard_layout
+            .recovery_layout
+            .as_ref()
+            .expect("nested bridge guard should carry backend recovery");
+        assert_eq!(
+            nested_guard_recovery
+                .frames
+                .iter()
+                .map(|frame| frame.pc)
+                .collect::<Vec<_>>(),
+            vec![444, 3000]
+        );
+        assert_eq!(
+            nested_guard_recovery
+                .frames
+                .iter()
+                .map(|frame| frame.source_guard)
+                .collect::<Vec<_>>(),
+            vec![None, Some((291, 0))]
+        );
+        assert_eq!(
+            nested_guard_recovery.virtual_layouts,
+            bridge_source_layout.virtual_layouts
+        );
+        assert_eq!(
+            nested_guard_recovery.pending_field_layouts,
+            bridge_source_layout.pending_field_layouts
+        );
+
+        let nested_terminal_layouts = backend
+            .compiled_trace_terminal_exit_layouts(&token, 292)
+            .expect("nested bridge terminal layouts should exist");
+        let nested_finish_recovery = nested_terminal_layouts[0]
+            .recovery_layout
+            .as_ref()
+            .expect("nested bridge finish should carry backend recovery");
+        assert_eq!(
+            nested_finish_recovery
+                .frames
+                .iter()
+                .map(|frame| frame.pc)
+                .collect::<Vec<_>>(),
+            vec![444, 3000]
+        );
+        assert_eq!(
+            nested_finish_recovery.virtual_layouts,
+            bridge_source_layout.virtual_layouts
+        );
+        assert_eq!(
+            nested_finish_recovery.pending_field_layouts,
+            bridge_source_layout.pending_field_layouts
+        );
+    }
+
+    #[test]
     fn test_sum_loop() {
         let mut backend = CraneliftBackend::new();
 
@@ -5881,6 +8443,77 @@ mod tests {
     }
 
     #[test]
+    fn test_call_n_order_preserved_in_loop() {
+        use std::sync::{Mutex, OnceLock};
+
+        static EVENTS: OnceLock<Mutex<Vec<i64>>> = OnceLock::new();
+
+        extern "C" fn log_char(v: i64) {
+            EVENTS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push(1000 + v);
+        }
+
+        extern "C" fn log_num(v: i64) {
+            EVENTS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push(v);
+        }
+
+        EVENTS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .clear();
+
+        let mut backend = CraneliftBackend::new();
+        let call_void = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallN,
+                &[OpRef(100), OpRef(101)],
+                OpRef::NONE.0,
+                call_void.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::CallN,
+                &[OpRef(102), OpRef(0)],
+                OpRef::NONE.0,
+                call_void,
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(103)], 1),
+            mk_op(OpCode::IntLt, &[OpRef(1), OpRef(104)], 2),
+            mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0),
+            mk_op(OpCode::Jump, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, log_char as *const () as i64);
+        constants.insert(101, 32);
+        constants.insert(102, log_num as *const () as i64);
+        constants.insert(103, 1);
+        constants.insert(104, 3);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(24_001);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 2);
+        assert_eq!(
+            *EVENTS.get().unwrap().lock().unwrap(),
+            vec![1032, 0, 1032, 1, 1032, 2]
+        );
+    }
+
+    #[test]
     fn test_guard_exception_exact_match_returns_value_and_clears_deadframe_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
@@ -5998,6 +8631,51 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 0);
         assert_eq!(backend.grab_exc_class(&frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert!(!jit_exc_is_pending());
+    }
+
+    #[test]
+    fn test_execute_token_ints_raw_preserves_exception_and_layout_metadata() {
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(0xCAFEusize as i64, 0x1111);
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(103)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, maybe_raise_test_exception as *const () as i64);
+        constants.insert(102, 1);
+        constants.insert(103, 0);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(27_001);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let raw = backend.execute_token_ints_raw(&token, &[1]);
+        assert!(!raw.is_finish);
+        assert_eq!(raw.fail_index, 0);
+        assert_eq!(raw.outputs, vec![1]);
+        assert_eq!(raw.typed_outputs, vec![Value::Int(1)]);
+        assert_eq!(raw.savedata, None);
+        assert_eq!(raw.exception_class, 0x1111);
+        assert_eq!(raw.exception_value, GcRef(0xCAFEusize));
+        let layout = raw
+            .exit_layout
+            .expect("raw exit should expose backend layout");
+        assert_eq!(layout.fail_index, 0);
+        assert_eq!(layout.source_op_index, Some(2));
+        assert!(layout.recovery_layout.is_some());
         assert!(!jit_exc_is_pending());
     }
 
@@ -8046,6 +10724,55 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_token_ints_raw_preserves_savedata_and_layout_for_call_may_force() {
+        may_force_void_values().lock().unwrap().clear();
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1), OpRef(0)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::ForceToken, &[], 2),
+            mk_op_with_descr(
+                OpCode::CallMayForceN,
+                &[OpRef(100), OpRef(2), OpRef(1)],
+                OpRef::NONE.0,
+                descr,
+            ),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(
+            100,
+            maybe_force_and_return_void as *const () as usize as i64,
+        );
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(1500_404);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let raw = backend.execute_token_ints_raw(&token, &[10, 1]);
+        assert!(!raw.is_finish);
+        assert_eq!(raw.fail_index, 0);
+        assert_eq!(raw.outputs, vec![1, 10]);
+        assert_eq!(raw.typed_outputs, vec![Value::Int(1), Value::Int(10)]);
+        assert_eq!(raw.savedata, Some(GcRef(0xDADA)));
+        assert_eq!(raw.exception_class, 0);
+        assert_eq!(raw.exception_value, GcRef::NULL);
+        let layout = raw
+            .exit_layout
+            .expect("raw exit should expose backend layout");
+        assert_eq!(layout.fail_index, 0);
+        assert_eq!(layout.source_op_index, Some(3));
+        assert!(layout.recovery_layout.is_some());
+        assert_eq!(*may_force_void_values().lock().unwrap(), vec![0, 1, 10]);
+    }
+
+    #[test]
     fn test_call_may_force_i_guard_not_forced_uses_real_call_result() {
         may_force_int_values().lock().unwrap().clear();
 
@@ -8394,16 +11121,17 @@ mod tests {
         let frame = backend.execute_token(&caller, &[Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 6);
 
-        backend.redirect_call_assembler(&callee1, &callee2);
+        backend.redirect_call_assembler(&callee1, &callee2).unwrap();
 
         let frame = backend.execute_token(&caller, &[Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 105);
     }
 
     #[test]
-    fn test_call_assembler_rejects_guarded_callee_target() {
+    fn test_call_assembler_propagates_guarded_callee_deadframe() {
         let mut backend = CraneliftBackend::new();
 
+        backend.set_next_trace_id(1500_220);
         let callee_inputargs = vec![InputArg::new_int(0)];
         let callee_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
@@ -8415,6 +11143,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
 
+        backend.set_next_trace_id(1500_221);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
@@ -8428,13 +11157,901 @@ mod tests {
         ];
 
         let mut caller = LoopToken::new(1500_221);
-        let err = backend
+        backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(!descr.is_finish());
+        assert_eq!(descr.trace_id(), 1500_220);
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+
+        let raw = backend.execute_token_ints_raw(&caller, &[0]);
+        assert!(!raw.is_finish);
+        assert_eq!(raw.trace_id, 1500_220);
+        assert_eq!(raw.fail_index, 0);
+        assert_eq!(raw.outputs, vec![0]);
+        assert_eq!(raw.typed_outputs, vec![Value::Int(0)]);
+        assert_eq!(raw.savedata, None);
+        assert_eq!(raw.exception_class, 0);
+        assert_eq!(raw.exception_value, GcRef::NULL);
+        let layout = raw
+            .exit_layout
+            .expect("call_assembler raw exit should expose layout");
+        assert_eq!(layout.trace_id, 1500_220);
+        assert_eq!(layout.fail_index, 0);
+        assert_eq!(layout.source_op_index, Some(1));
+        assert!(layout.recovery_layout.is_some());
+    }
+
+    #[test]
+    fn test_call_assembler_propagates_nested_callee_deadframe_through_registered_target() {
+        let mut backend = CraneliftBackend::new();
+
+        backend.set_next_trace_id(1500_280);
+        let grandchild_inputargs = vec![InputArg::new_int(0)];
+        let grandchild_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut grandchild = LoopToken::new(1500_280);
+        backend
+            .compile_loop(&grandchild_inputargs, &grandchild_ops, &mut grandchild)
+            .unwrap();
+
+        backend.set_next_trace_id(1500_281);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        backend.set_constants(HashMap::from([(100, 5)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntSub, &[OpRef(0), OpRef(100)], 1),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(1)],
+                2,
+                make_call_assembler_descr(&grandchild, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut callee = LoopToken::new(1500_281);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+        backend.set_constants(HashMap::new());
+
+        backend.set_next_trace_id(1500_282);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_282);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller, &[Value::Int(5)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(!descr.is_finish());
+        assert_eq!(descr.trace_id(), 1500_280);
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+
+        let raw = backend.execute_token_ints_raw(&caller, &[5]);
+        assert!(!raw.is_finish);
+        assert_eq!(raw.trace_id, 1500_280);
+        assert_eq!(raw.fail_index, 0);
+        assert_eq!(raw.outputs, vec![0]);
+        assert_eq!(raw.typed_outputs, vec![Value::Int(0)]);
+        let layout = raw
+            .exit_layout
+            .expect("nested call_assembler raw exit should expose layout");
+        assert_eq!(layout.trace_id, 1500_280);
+        assert_eq!(layout.fail_index, 0);
+        assert_eq!(layout.source_op_index, Some(1));
+        let recovery = layout
+            .recovery_layout
+            .expect("nested call_assembler raw exit should expose recovery layout");
+        assert_eq!(recovery.frames.len(), 3);
+        assert_eq!(
+            recovery
+                .frames
+                .iter()
+                .map(|frame| frame.trace_id)
+                .collect::<Vec<_>>(),
+            vec![Some(1500_282), Some(1500_281), Some(1500_280)]
+        );
+        assert_eq!(
+            recovery.frames[0].slots,
+            vec![ExitValueSourceLayout::Constant(5)]
+        );
+        assert_eq!(
+            recovery.frames[1].slots,
+            vec![ExitValueSourceLayout::Constant(5)]
+        );
+        assert_eq!(
+            recovery.frames[2].slots,
+            vec![ExitValueSourceLayout::ExitValue(0)]
+        );
+    }
+
+    #[test]
+    fn test_call_assembler_guarded_target_uses_attached_bridge_finish() {
+        let mut backend = CraneliftBackend::new();
+
+        backend.set_next_trace_id(1500_230);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut callee = LoopToken::new(1500_230);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        let failed = backend.execute_token(&callee, &[Value::Int(0)]);
+        let guard_descr = failed
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("callee guard should produce FrameData")
+            .fail_descr
+            .clone();
+
+        backend.set_next_trace_id(1500_231);
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 100);
+        backend.set_constants(constants);
+        backend
+            .compile_bridge(
+                guard_descr.as_ref(),
+                &bridge_inputargs,
+                &bridge_ops,
+                &callee,
+            )
+            .unwrap();
+
+        backend.set_constants(HashMap::new());
+        backend.set_next_trace_id(1500_232);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_232);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(descr.trace_id(), 1500_232);
+        assert_eq!(backend.get_int_value(&frame, 0), 100);
+    }
+
+    #[test]
+    fn test_call_assembler_propagates_nested_callee_deadframe_through_bridge() {
+        let mut backend = CraneliftBackend::new();
+
+        backend.set_next_trace_id(1500_290);
+        let grandchild_inputargs = vec![InputArg::new_int(0)];
+        let grandchild_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut grandchild = LoopToken::new(1500_290);
+        backend
+            .compile_loop(&grandchild_inputargs, &grandchild_ops, &mut grandchild)
+            .unwrap();
+        let grandchild_layout = ExitRecoveryLayout {
+            frames: vec![ExitFrameLayout {
+                trace_id: Some(1500_290),
+                header_pc: Some(2900),
+                source_guard: None,
+                pc: 2900,
+                slots: vec![ExitValueSourceLayout::ExitValue(0)],
+                slot_types: Some(vec![Type::Int]),
+            }],
+            virtual_layouts: vec![majit_codegen::ExitVirtualLayout::Array {
+                descr_index: 2900,
+                items: vec![ExitValueSourceLayout::Constant(11)],
+            }],
+            pending_field_layouts: vec![majit_codegen::ExitPendingFieldLayout {
+                descr_index: 2901,
+                item_index: Some(0),
+                is_array_item: true,
+                target: ExitValueSourceLayout::Virtual(0),
+                value: ExitValueSourceLayout::Constant(22),
+            }],
+        };
+        assert!(backend.update_fail_descr_recovery_layout(
+            &grandchild,
+            1500_290,
+            0,
+            grandchild_layout.clone()
+        ));
+
+        backend.set_next_trace_id(1500_291);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        backend.set_constants(HashMap::from([(102, 5)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntSub, &[OpRef(0), OpRef(102)], 1),
+            mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut callee = LoopToken::new(1500_291);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+        backend.set_constants(HashMap::new());
+
+        let failed = backend.execute_token(&callee, &[Value::Int(5)]);
+        let guard_descr = failed
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("callee guard should produce FrameData")
+            .fail_descr
+            .clone();
+        let bridge_source_layout = ExitRecoveryLayout {
+            frames: vec![
+                ExitFrameLayout {
+                    trace_id: Some(1500_289),
+                    header_pc: Some(444),
+                    source_guard: None,
+                    pc: 444,
+                    slots: vec![ExitValueSourceLayout::Constant(55)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+                ExitFrameLayout {
+                    trace_id: Some(1500_291),
+                    header_pc: Some(2910),
+                    source_guard: None,
+                    pc: 2910,
+                    slots: vec![ExitValueSourceLayout::ExitValue(0)],
+                    slot_types: Some(vec![Type::Int]),
+                },
+            ],
+            virtual_layouts: vec![majit_codegen::ExitVirtualLayout::Array {
+                descr_index: 2910,
+                items: vec![ExitValueSourceLayout::Constant(33)],
+            }],
+            pending_field_layouts: vec![majit_codegen::ExitPendingFieldLayout {
+                descr_index: 2911,
+                item_index: Some(1),
+                is_array_item: true,
+                target: ExitValueSourceLayout::Virtual(0),
+                value: ExitValueSourceLayout::Constant(44),
+            }],
+        };
+        assert!(backend.update_fail_descr_recovery_layout(
+            &callee,
+            1500_291,
+            0,
+            bridge_source_layout.clone()
+        ));
+
+        backend.set_next_trace_id(1500_292);
+        backend.set_constants(HashMap::from([(101, 5)]));
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntSub, &[OpRef(0), OpRef(101)], 1),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(1)],
+                2,
+                make_call_assembler_descr(&grandchild, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(
+                guard_descr.as_ref(),
+                &callee_inputargs,
+                &bridge_ops,
+                &callee,
+            )
+            .unwrap();
+        backend.set_constants(HashMap::new());
+
+        let frame = {
+            let bridge_guard = guard_descr.bridge.lock().unwrap();
+            let bridge = bridge_guard
+                .as_ref()
+                .expect("callee guard should have an attached bridge");
+            CraneliftBackend::execute_bridge(bridge, &[5], &[Type::Int])
+        };
+        let descr = backend.get_latest_descr(&frame);
+        assert!(!descr.is_finish());
+        assert_eq!(descr.trace_id(), 1500_290);
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+
+        let layout = backend
+            .describe_deadframe(&frame)
+            .expect("bridge nested call_assembler exit should expose layout");
+        assert_eq!(layout.trace_id, 1500_290);
+        assert_eq!(layout.fail_index, 0);
+        assert_eq!(layout.source_op_index, Some(1));
+        let recovery = layout
+            .recovery_layout
+            .expect("bridge nested call_assembler exit should expose recovery layout");
+        assert_eq!(recovery.frames.len(), 3);
+        assert_eq!(
+            recovery
+                .frames
+                .iter()
+                .map(|frame| frame.trace_id)
+                .collect::<Vec<_>>(),
+            vec![Some(1500_289), Some(1500_292), Some(1500_290)]
+        );
+        assert_eq!(recovery.frames[0].source_guard, None);
+        assert_eq!(recovery.frames[1].source_guard, Some((1500_291, 0)));
+        assert_eq!(
+            recovery.frames[0].slots,
+            vec![ExitValueSourceLayout::Constant(55)]
+        );
+        assert_eq!(
+            recovery.frames[1].slots,
+            vec![ExitValueSourceLayout::Constant(5)]
+        );
+        assert_eq!(
+            recovery.frames[2].slots,
+            vec![ExitValueSourceLayout::ExitValue(0)]
+        );
+        assert_eq!(recovery.virtual_layouts.len(), 2);
+        assert_eq!(
+            recovery.virtual_layouts[0],
+            bridge_source_layout.virtual_layouts[0]
+        );
+        assert_eq!(
+            recovery.virtual_layouts[1],
+            grandchild_layout.virtual_layouts[0]
+        );
+        assert_eq!(recovery.pending_field_layouts.len(), 2);
+        assert_eq!(
+            recovery.pending_field_layouts[0],
+            bridge_source_layout.pending_field_layouts[0]
+        );
+        assert_eq!(
+            recovery.pending_field_layouts[1],
+            majit_codegen::ExitPendingFieldLayout {
+                descr_index: 2901,
+                item_index: Some(0),
+                is_array_item: true,
+                target: ExitValueSourceLayout::Virtual(1),
+                value: ExitValueSourceLayout::Constant(22),
+            }
+        );
+    }
+
+    #[test]
+    fn test_call_assembler_compiles_before_target_is_registered() {
+        let mut backend = CraneliftBackend::new();
+
+        let mut deferred_target = LoopToken::new(1500_240);
+        backend.set_next_trace_id(1500_241);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&deferred_target, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_241);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        backend.set_next_trace_id(1500_240);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 7);
+        backend.set_constants(constants);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
+            .unwrap();
+
+        backend.set_constants(HashMap::new());
+        let frame = backend.execute_token(&caller, &[Value::Int(5)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 12);
+    }
+
+    #[test]
+    fn test_call_assembler_float_finish_and_raw_path() {
+        let mut backend = CraneliftBackend::new();
+
+        backend.set_next_trace_id(1500_242);
+        let callee_inputargs = vec![InputArg::new_float(0)];
+        backend.set_constants(HashMap::from([(100, 2.25f64.to_bits() as i64)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::FloatAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut callee = LoopToken::new(1500_242);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        backend.set_constants(HashMap::new());
+        backend.set_next_trace_id(1500_243);
+        let caller_inputargs = vec![InputArg::new_float(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerF,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Float], Type::Float),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_243);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller, &[Value::Float(3.5)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(descr.trace_id(), 1500_243);
+        assert!((backend.get_float_value(&frame, 0) - 5.75).abs() < 1e-10);
+
+        let raw = backend.execute_token_ints_raw(&caller, &[3.5f64.to_bits() as i64]);
+        assert!(raw.is_finish);
+        assert_eq!(raw.trace_id, 1500_243);
+        assert_eq!(raw.outputs, vec![5.75f64.to_bits() as i64]);
+        assert_eq!(raw.typed_outputs, vec![Value::Float(5.75)]);
+        let layout = raw
+            .exit_layout
+            .expect("call_assembler float raw exit should expose layout");
+        assert_eq!(layout.trace_id, 1500_243);
+        assert_eq!(layout.fail_arg_types, vec![Type::Float]);
+    }
+
+    #[test]
+    fn test_call_assembler_void_finish_and_raw_path() {
+        let mut backend = CraneliftBackend::new();
+
+        backend.set_next_trace_id(1500_244);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[], OpRef::NONE.0),
+        ];
+        let mut callee = LoopToken::new(1500_244);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        backend.set_next_trace_id(1500_2441);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerN,
+                &[OpRef(0)],
+                OpRef::NONE.0,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Void),
+            ),
+            mk_op(OpCode::Finish, &[], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_2441);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller, &[Value::Int(99)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(descr.trace_id(), 1500_2441);
+        assert!(descr.fail_arg_types().is_empty());
+
+        let raw = backend.execute_token_ints_raw(&caller, &[99]);
+        assert!(raw.is_finish);
+        assert_eq!(raw.trace_id, 1500_2441);
+        assert!(raw.outputs.is_empty());
+        assert!(raw.typed_outputs.is_empty());
+        let layout = raw
+            .exit_layout
+            .expect("call_assembler void raw exit should expose layout");
+        assert_eq!(layout.trace_id, 1500_2441);
+        assert!(layout.fail_arg_types.is_empty());
+    }
+
+    #[test]
+    fn test_call_assembler_late_bound_ref_result_supports_plain_ref_finish() {
+        let mut backend = CraneliftBackend::new();
+
+        let mut deferred_target = LoopToken::new(1500_245);
+        let caller_inputargs = vec![InputArg::new_ref(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerR,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&deferred_target, vec![Type::Ref], Type::Ref),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_246);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        backend.set_next_trace_id(1500_245);
+        let callee_inputargs = vec![InputArg::new_ref(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        backend.set_constants(HashMap::new());
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
+            .unwrap();
+
+        let root = GcRef(0xCAFE);
+        let frame = backend.execute_token(&caller, &[Value::Ref(root)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert!(descr.force_token_slots().is_empty());
+        assert_eq!(backend.get_ref_value(&frame, 0), root);
+    }
+
+    #[test]
+    fn test_call_assembler_late_bound_ref_result_rejects_force_token_finish_shape() {
+        let mut backend = CraneliftBackend::new();
+
+        let mut deferred_target = LoopToken::new(1500_247);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerR,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&deferred_target, vec![Type::Int], Type::Ref),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_248);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        backend.set_next_trace_id(1500_247);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::ForceToken, &[], 2),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 10);
+        backend.set_constants(constants);
+        let err = backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
             .unwrap_err();
-        match err {
-            BackendError::Unsupported(msg) => assert!(msg.contains("finish-only callee loops")),
-            other => panic!("expected unsupported error, got {other:?}"),
-        }
+        assert!(
+            err.to_string()
+                .contains("incompatible callee finish result kind"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_call_assembler_redirect_rejects_incompatible_force_token_result_shape() {
+        let mut backend = CraneliftBackend::new();
+
+        let ref_inputargs = vec![InputArg::new_ref(0)];
+        let plain_ref_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut plain_ref_target = LoopToken::new(1500_349);
+        backend
+            .compile_loop(&ref_inputargs, &plain_ref_ops, &mut plain_ref_target)
+            .unwrap();
+
+        let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1)]));
+        let force_token_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::ForceToken, &[], 1),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut force_token_target = LoopToken::new(1500_350);
+        backend
+            .compile_loop(&ref_inputargs, &force_token_ops, &mut force_token_target)
+            .unwrap();
+
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerR,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&plain_ref_target, vec![Type::Ref], Type::Ref),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_351);
+        backend
+            .compile_loop(&ref_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let err = backend
+            .redirect_call_assembler(&plain_ref_target, &force_token_target)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("incompatible callee finish result kind"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_call_assembler_supports_direct_self_recursive_dispatch() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 0);
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(1500_250);
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntGt, &[OpRef(0), OpRef(101)], 1),
+            mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::IntSub, &[OpRef(0), OpRef(100)], 2),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(2)],
+                3,
+                make_call_assembler_descr(&token, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(100)], 4),
+            mk_op(OpCode::Finish, &[OpRef(4)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Int(0)]);
+        let guard_descr = failed
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("base-case guard should produce FrameData")
+            .fail_descr
+            .clone();
+
+        backend.set_constants(HashMap::new());
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(guard_descr.as_ref(), &inputargs, &bridge_ops, &token)
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(4)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 4);
+
+        let raw = backend.execute_token_ints_raw(&token, &[4]);
+        assert!(raw.is_finish);
+        assert_eq!(raw.outputs, vec![4]);
+        assert_eq!(raw.typed_outputs, vec![Value::Int(4)]);
+    }
+
+    #[test]
+    fn test_call_assembler_preserves_callee_force_token_finish_result() {
+        let mut backend = CraneliftBackend::new();
+
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::ForceToken, &[], 2),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 10);
+        backend.set_constants(constants);
+
+        let mut callee = LoopToken::new(1500_260);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerR,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Ref),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend.set_constants(HashMap::new());
+
+        let mut caller = LoopToken::new(1500_261);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller, &[Value::Int(20)]);
+        let frame_data = frame
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("caller finish should produce FrameData");
+        assert!(frame_data.fail_descr.is_force_token_slot(0));
+        let force_token = backend.get_ref_value(&frame, 0);
+        assert_ne!(force_token, GcRef::NULL);
+
+        let forced = backend.force(force_token);
+        let descr = backend.get_latest_descr(&forced);
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&forced, 0), 30);
+    }
+
+    #[test]
+    fn test_call_assembler_force_token_finish_result_is_owned_by_caller_deadframe() {
+        let mut backend = CraneliftBackend::new();
+
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::ForceToken, &[], 2),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 10);
+        backend.set_constants(constants);
+
+        let mut callee = LoopToken::new(1500_262);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerR,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Ref),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend.set_constants(HashMap::new());
+
+        let mut caller = LoopToken::new(1500_263);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller, &[Value::Int(20)]);
+        let frame_data = frame
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("caller finish should produce FrameData");
+        assert!(frame_data.fail_descr.is_force_token_slot(0));
+        let force_token = backend.get_ref_value(&frame, 0);
+        drop(frame);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.force(force_token);
+        }));
+        assert!(
+            result.is_err(),
+            "caller deadframe should release returned force token on drop"
+        );
+    }
+
+    #[test]
+    fn test_call_assembler_force_token_finish_result_marks_raw_force_token_slots() {
+        let mut backend = CraneliftBackend::new();
+
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::ForceToken, &[], 2),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 10);
+        backend.set_constants(constants);
+
+        let mut callee = LoopToken::new(1500_264);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerR,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Ref),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend.set_constants(HashMap::new());
+
+        let mut caller = LoopToken::new(1500_265);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let raw = backend.execute_token_ints_raw(&caller, &[20]);
+        assert_eq!(raw.force_token_slots, vec![0]);
+        let force_token = match raw.typed_outputs.as_slice() {
+            [Value::Ref(value)] => *value,
+            other => panic!("expected single force-token ref output, got {other:?}"),
+        };
+
+        let forced = backend.force(force_token);
+        let descr = backend.get_latest_descr(&forced);
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&forced, 0), 30);
     }
 
     #[test]
