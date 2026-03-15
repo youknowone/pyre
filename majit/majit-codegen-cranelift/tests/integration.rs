@@ -448,3 +448,192 @@ fn test_bridge_end_to_end() {
     let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
     assert_eq!(backend.get_int_value(&frame, 0), 10);
 }
+
+// ---------------------------------------------------------------------------
+// Helpers for intdiv pipeline tests
+// ---------------------------------------------------------------------------
+
+/// Floor division (towards negative infinity), matching Python's // operator.
+fn floor_div(a: i64, b: i64) -> i64 {
+    let d = a / b;
+    let r = a % b;
+    if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d }
+}
+
+/// Floor modulo: a - floor_div(a, b) * b.
+fn floor_mod(a: i64, b: i64) -> i64 {
+    a - floor_div(a, b) * b
+}
+
+/// Build, optimize, compile and return (backend, token) for a trace that
+/// computes `IntFloorDiv(input, divisor)` or `IntMod(input, divisor)`.
+///
+/// The optimizer sees the divisor as a known constant, so the OptRewrite
+/// pass applies magic-number or power-of-2 strength reduction.
+fn build_intdiv_pipeline(
+    opcode: OpCode,
+    divisor: i64,
+    token_id: u64,
+) -> (CraneliftBackend, LoopToken) {
+    // Record: input(x) -> result = x OP const_divisor -> finish(result)
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+
+    let const_divisor = OpRef(1000);
+    let result = rec.record_op(opcode, &[x, const_divisor]);
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    // Optimize with the divisor constant known, so the rewrite pass can
+    // convert IntFloorDiv/IntMod into UintMulHigh + shift sequences.
+    let mut opt = Optimizer::default_pipeline();
+    let mut constants: HashMap<u32, i64> = HashMap::new();
+    constants.insert(1000, divisor);
+    let optimized = opt.optimize_with_constants(&trace.ops, &mut constants);
+
+    // DEBUG: dump optimized ops and constants
+    eprintln!("=== optimized ops ({}) ===", optimized.len());
+    for (i, op) in optimized.iter().enumerate() {
+        eprintln!("  [{i}] pos={:?} {:?} args={:?}", op.pos, op.opcode, op.args);
+    }
+    eprintln!("=== constants ({}) ===", constants.len());
+    for (&k, &v) in &constants {
+        eprintln!("  OpRef({k}) = {v}");
+    }
+
+    // The optimizer emits new constant ops (magic number k, shift i, etc.)
+    // and writes them back into the constants map. Hand the full map to
+    // the backend so it can resolve every OpRef that references a constant.
+    let mut backend = CraneliftBackend::new();
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(token_id);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("compilation should succeed");
+
+    (backend, token)
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: IntFloorDiv magic-number pipeline (divisor = 7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_intdiv_magic_number_pipeline() {
+    let (backend, token) = build_intdiv_pipeline(OpCode::IntFloorDiv, 7, 100);
+
+    let test_cases: &[(i64, i64)] = &[
+        (0, 0),
+        (1, 0),
+        (6, 0),
+        (7, 1),
+        (14, 2),
+        (100, 14),
+        (-1, -1),
+        (-6, -1),
+        (-7, -1),
+        (-8, -2),
+        (-100, -15),
+        (i64::MAX, i64::MAX / 7),
+        (i64::MIN + 1, floor_div(i64::MIN + 1, 7)),
+    ];
+
+    for &(input, expected) in test_cases {
+        let frame = backend.execute_token(&token, &[Value::Int(input)]);
+        let actual = backend.get_int_value(&frame, 0);
+        assert_eq!(
+            actual, expected,
+            "IntFloorDiv: {input} // 7 = expected {expected}, got {actual}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: IntMod magic-number pipeline (divisor = 7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_intmod_magic_number_pipeline() {
+    let (backend, token) = build_intdiv_pipeline(OpCode::IntMod, 7, 101);
+
+    let test_cases: &[(i64, i64)] = &[
+        (0, 0),
+        (1, 1),
+        (6, 6),
+        (7, 0),
+        (14, 0),
+        (100, floor_mod(100, 7)),
+        (-1, floor_mod(-1, 7)),
+        (-7, 0),
+        (-8, floor_mod(-8, 7)),
+        (-100, floor_mod(-100, 7)),
+        (i64::MAX, floor_mod(i64::MAX, 7)),
+        (i64::MIN + 1, floor_mod(i64::MIN + 1, 7)),
+    ];
+
+    for &(input, expected) in test_cases {
+        let frame = backend.execute_token(&token, &[Value::Int(input)]);
+        let actual = backend.get_int_value(&frame, 0);
+        assert_eq!(
+            actual, expected,
+            "IntMod: {input} % 7 = expected {expected}, got {actual}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: IntFloorDiv power-of-2 pipeline (divisor = 8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_intdiv_power_of_two_pipeline() {
+    let (backend, token) = build_intdiv_pipeline(OpCode::IntFloorDiv, 8, 102);
+
+    let test_cases: &[(i64, i64)] = &[
+        (0, 0),
+        (1, 0),
+        (7, 0),
+        (8, 1),
+        (16, 2),
+        (100, 12),
+        (-1, -1),
+        (-7, -1),
+        (-8, -1),
+        (-9, -2),
+        (-100, -13),
+        (i64::MAX, i64::MAX / 8),
+        (i64::MIN + 1, floor_div(i64::MIN + 1, 8)),
+    ];
+
+    for &(input, expected) in test_cases {
+        let frame = backend.execute_token(&token, &[Value::Int(input)]);
+        let actual = backend.get_int_value(&frame, 0);
+        assert_eq!(
+            actual, expected,
+            "IntFloorDiv: {input} // 8 = expected {expected}, got {actual}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: IntFloorDiv various divisors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_intdiv_various_divisors() {
+    for (tid, divisor) in [3i64, 5, 10, 13, 100, 127].iter().enumerate() {
+        let (backend, token) =
+            build_intdiv_pipeline(OpCode::IntFloorDiv, *divisor, 200 + tid as u64);
+
+        for input in [0i64, 1, *divisor - 1, *divisor, *divisor + 1, 999, -1, -*divisor, -999] {
+            let expected = floor_div(input, *divisor);
+            let frame = backend.execute_token(&token, &[Value::Int(input)]);
+            let actual = backend.get_int_value(&frame, 0);
+            assert_eq!(
+                actual, expected,
+                "IntFloorDiv: {input} // {divisor} = expected {expected}, got {actual}"
+            );
+        }
+    }
+}

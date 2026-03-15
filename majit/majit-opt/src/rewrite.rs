@@ -254,18 +254,12 @@ impl OptRewrite {
         // Strength reduction for constant divisor >= 2
         if let Some(divisor) = ctx.get_constant_int(arg1) {
             if divisor > 1 && divisor.count_ones() == 1 {
-                // Power-of-2: x // (2^n) = (x + ((x >> 63) & (2^n - 1))) >> n
+                // Power-of-2 floor division: x // (2^n) = x >> n
+                // Arithmetic right shift IS floor division for positive divisors.
                 let shift = divisor.trailing_zeros();
-                let shift63_ref = self.emit_constant_int(ctx, 63);
-                let sign_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, shift63_ref]));
-                let mask_ref = self.emit_constant_int(ctx, divisor - 1);
-                let correction_ref =
-                    ctx.emit(Op::new(OpCode::IntAnd, &[sign_ref, mask_ref]));
-                let adjusted_ref =
-                    ctx.emit(Op::new(OpCode::IntAdd, &[arg0, correction_ref]));
                 let shift_ref = self.emit_constant_int(ctx, shift as i64);
                 let result_ref =
-                    ctx.emit(Op::new(OpCode::IntRshift, &[adjusted_ref, shift_ref]));
+                    ctx.emit(Op::new(OpCode::IntRshift, &[arg0, shift_ref]));
                 ctx.replace_op(op.pos, result_ref);
                 return PassResult::Remove;
             }
