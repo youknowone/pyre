@@ -26,6 +26,10 @@ type ArrayItemKey = (OpRef, u32, i64);
 ///
 /// Caches field and array item values to eliminate redundant loads, and delays
 /// store emission (lazy sets) to enable write-after-write elimination.
+///
+/// Green field optimization: immutable field caches survive cache invalidation
+/// by calls and side-effecting operations. When an immutable field is read from
+/// a constant object, the result is also a constant (green field folding).
 pub struct OptHeap {
     /// Cached field values: field_key -> value OpRef.
     cached_fields: HashMap<FieldKey, OpRef>,
@@ -37,6 +41,9 @@ pub struct OptHeap {
     lazy_setarrayitems: HashMap<ArrayItemKey, Op>,
     /// Whether we've already emitted a GUARD_NOT_INVALIDATED.
     seen_guard_not_invalidated: bool,
+    /// Descriptor indices known to be immutable (green fields).
+    /// Cached values for these descriptors survive invalidation.
+    immutable_field_descrs: std::collections::HashSet<u32>,
 }
 
 impl OptHeap {
@@ -47,6 +54,7 @@ impl OptHeap {
             cached_arrayitems: HashMap::new(),
             lazy_setarrayitems: HashMap::new(),
             seen_guard_not_invalidated: false,
+            immutable_field_descrs: std::collections::HashSet::new(),
         }
     }
 
@@ -101,9 +109,17 @@ impl OptHeap {
         self.force_all_lazy_setarrayitems(ctx);
     }
 
-    /// Invalidate all caches (field and array). Called on side-effecting operations.
+    /// Invalidate caches for mutable fields/arrays. Called on side-effecting operations.
+    ///
+    /// Immutable (green) field caches survive invalidation: their values never
+    /// change, so calls and stores cannot affect them.
     fn invalidate_caches(&mut self) {
-        self.cached_fields.clear();
+        if self.immutable_field_descrs.is_empty() {
+            self.cached_fields.clear();
+        } else {
+            self.cached_fields
+                .retain(|(_obj, descr_idx), _| self.immutable_field_descrs.contains(descr_idx));
+        }
         self.cached_arrayitems.clear();
     }
 
@@ -114,6 +130,14 @@ impl OptHeap {
             Some(k) => k,
             None => return PassResult::Emit(op.clone()),
         };
+
+        // Register immutable field descriptors so their cache entries survive
+        // invalidation by calls and side-effecting operations.
+        if let Some(descr) = &op.descr {
+            if descr.is_always_pure() {
+                self.immutable_field_descrs.insert(key.1);
+            }
+        }
 
         // Check lazy set first: if there is a pending SETFIELD for this key,
         // the value is the second arg of that pending op.
@@ -325,6 +349,7 @@ impl OptimizationPass for OptHeap {
         self.cached_arrayitems.clear();
         self.lazy_setarrayitems.clear();
         self.seen_guard_not_invalidated = false;
+        self.immutable_field_descrs.clear();
     }
 
     fn flush(&mut self) {
@@ -338,6 +363,7 @@ impl OptimizationPass for OptHeap {
         self.lazy_setfields.clear();
         self.cached_arrayitems.clear();
         self.lazy_setarrayitems.clear();
+        self.immutable_field_descrs.clear();
     }
 
     fn name(&self) -> &'static str {
@@ -366,8 +392,26 @@ mod tests {
         }
     }
 
+    /// Descriptor for immutable (green) fields. `is_always_pure()` returns true.
+    #[derive(Debug)]
+    struct ImmutableDescr(u32);
+
+    impl Descr for ImmutableDescr {
+        fn index(&self) -> u32 {
+            self.0
+        }
+
+        fn is_always_pure(&self) -> bool {
+            true
+        }
+    }
+
     fn descr(idx: u32) -> DescrRef {
         Arc::new(TestDescr(idx))
+    }
+
+    fn immutable_descr(idx: u32) -> DescrRef {
+        Arc::new(ImmutableDescr(idx))
     }
 
     /// Helper: assign sequential positions to ops.
@@ -812,5 +856,186 @@ mod tests {
             .count();
         assert_eq!(set_count, 2);
         assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    // ── Green field optimization tests ──
+
+    // ── Test 17: Immutable field cache survives call invalidation ──
+
+    #[test]
+    fn test_immutable_field_survives_call() {
+        // i1 = getfield_gc_i(p0, descr=immutable_d0)
+        // call_n(...)                              <- invalidates mutable caches
+        // i2 = getfield_gc_i(p0, descr=immutable_d0) <- still cached (immutable)
+        let d = immutable_descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // GETFIELD + CALL + Jump. Second GETFIELD eliminated (immutable survives call).
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[1].opcode, OpCode::CallN);
+        assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    // ── Test 18: Mutable field cache is still invalidated by call ──
+
+    #[test]
+    fn test_mutable_field_invalidated_by_call() {
+        // i1 = getfield_gc_i(p0, descr=mutable_d0)
+        // call_n(...)
+        // i2 = getfield_gc_i(p0, descr=mutable_d0) <- re-emitted (mutable, invalidated)
+        let d = descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // GETFIELD + CALL + GETFIELD (re-emitted) + Jump.
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[1].opcode, OpCode::CallN);
+        assert_eq!(result[2].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[3].opcode, OpCode::Jump);
+    }
+
+    // ── Test 19: Mixed immutable and mutable fields: only mutable invalidated ──
+
+    #[test]
+    fn test_mixed_immutable_mutable_fields() {
+        // i1 = getfield_gc_i(p0, descr=immut_d0)
+        // i2 = getfield_gc_i(p0, descr=mut_d1)
+        // call_n(...)
+        // i3 = getfield_gc_i(p0, descr=immut_d0)  <- cached (immutable survives)
+        // i4 = getfield_gc_i(p0, descr=mut_d1)    <- re-emitted (mutable invalidated)
+        let d_immut = immutable_descr(0);
+        let d_mut = descr(1);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d_immut.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d_mut.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d_immut.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d_mut.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // GETFIELD(immut) + GETFIELD(mut) + CALL + GETFIELD(mut, re-emitted) + Jump.
+        // GETFIELD(immut) after call is eliminated.
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI); // immutable, first read
+        assert_eq!(result[1].opcode, OpCode::GetfieldGcI); // mutable, first read
+        assert_eq!(result[2].opcode, OpCode::CallN);
+        assert_eq!(result[3].opcode, OpCode::GetfieldGcI); // mutable, re-emitted
+        assert_eq!(result[4].opcode, OpCode::Jump);
+    }
+
+    // ── Test 20: Immutable field from non-constant object still gets read-cache ──
+
+    #[test]
+    fn test_immutable_field_read_cache_no_constant() {
+        // Even without a constant source object, immutable fields benefit from
+        // read-after-read caching that survives side effects.
+        let d = immutable_descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // Only first GETFIELD + Jump.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[1].opcode, OpCode::Jump);
+    }
+
+    // ── Test 21: Immutable Ref and Float field variants survive call ──
+
+    #[test]
+    fn test_immutable_field_ref_survives_call() {
+        let d = immutable_descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(result[1].opcode, OpCode::CallN);
+        assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_immutable_field_float_survives_call() {
+        let d = immutable_descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcF, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::GetfieldGcF, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcF);
+        assert_eq!(result[1].opcode, OpCode::CallN);
+        assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    // ── Test 22: Immutable field survives multiple calls ──
+
+    #[test]
+    fn test_immutable_field_survives_multiple_calls() {
+        let d = immutable_descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::new(OpCode::CallN, &[OpRef(201)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // GETFIELD + CALL + CALL + Jump. Second GETFIELD eliminated.
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[1].opcode, OpCode::CallN);
+        assert_eq!(result[2].opcode, OpCode::CallN);
+        assert_eq!(result[3].opcode, OpCode::Jump);
+    }
+
+    // ── Test 23: Different objects with same immutable descr are independent ──
+
+    #[test]
+    fn test_immutable_field_different_objects() {
+        let d = immutable_descr(0);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(200)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef(300)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()), // cached
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(200)], d.clone()), // cached
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        // Both initial GETFIELDs + CALL + Jump. Both post-call GETFIELDs eliminated.
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[1].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[2].opcode, OpCode::CallN);
+        assert_eq!(result[3].opcode, OpCode::Jump);
     }
 }
