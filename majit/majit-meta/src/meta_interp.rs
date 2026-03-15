@@ -259,6 +259,8 @@ pub struct JitHooks {
     pub on_trace_start: Option<Box<dyn Fn(u64) + Send>>,
     /// Called when tracing is aborted. Args: (green_key, permanent).
     pub on_trace_abort: Option<Box<dyn Fn(u64, bool) + Send>>,
+    /// Called when compilation (loop or bridge) fails. Args: (green_key, error_message).
+    pub on_compile_error: Option<Box<dyn Fn(u64, &str) + Send>>,
 }
 
 impl<M: Clone> MetaInterp<M> {
@@ -633,6 +635,11 @@ impl<M: Clone> MetaInterp<M> {
         self.hooks.on_trace_abort = Some(Box::new(f));
     }
 
+    /// Set a callback for compilation error events (loop or bridge).
+    pub fn set_on_compile_error(&mut self, f: impl Fn(u64, &str) + Send + 'static) {
+        self.hooks.on_compile_error = Some(Box::new(f));
+    }
+
     /// Check a back-edge: is this location hot enough to trace or run?
     ///
     /// `green_key` identifies the loop header (e.g., PC).
@@ -898,7 +905,13 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             Err(e) => {
-                eprintln!("JIT compilation failed: {e}");
+                let msg = format!("JIT compilation failed: {e}");
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit] {msg}");
+                }
+                if let Some(ref cb) = self.hooks.on_compile_error {
+                    cb(green_key, &msg);
+                }
                 self.warm_state.abort_tracing(green_key, true);
             }
         }
@@ -933,7 +946,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn finish_and_compile(
         &mut self,
         finish_args: &[OpRef],
-        _finish_arg_types: Vec<Type>,
+        finish_arg_types: Vec<Type>,
         meta: M,
     ) {
         let ctx = self.tracing.take().unwrap();
@@ -942,7 +955,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut recorder = ctx.recorder;
         recorder.finish(
             finish_args,
-            crate::make_fail_descr_typed(finish_args.iter().map(|_| Type::Int).collect::<Vec<_>>()),
+            crate::make_fail_descr_typed(finish_arg_types),
         );
         let trace = recorder.get_trace();
 
@@ -1060,11 +1073,12 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             Err(e) => {
+                let msg = format!("finish_and_compile: compile_loop FAILED key={green_key}: {e:?}");
                 if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] finish_and_compile: compile_loop FAILED key={}: {:?}",
-                        green_key, e
-                    );
+                    eprintln!("[jit] {msg}");
+                }
+                if let Some(ref cb) = self.hooks.on_compile_error {
+                    cb(green_key, &msg);
                 }
                 self.warm_state.abort_tracing(green_key, false);
                 self.warm_state.reset_function_counts();
@@ -2127,7 +2141,13 @@ impl<M: Clone> MetaInterp<M> {
                 true
             }
             Err(e) => {
-                eprintln!("Bridge compilation failed: {e}");
+                let msg = format!("Bridge compilation failed: {e}");
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit] {msg}");
+                }
+                if let Some(ref cb) = self.hooks.on_compile_error {
+                    cb(green_key, &msg);
+                }
                 false
             }
         }
