@@ -20,7 +20,7 @@
 /// - Only operates on loop bodies (Label..Jump)
 /// - Requires array load/store patterns for memory access vectorization
 /// - Guards in the loop body prevent full vectorization (conservative)
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use majit_ir::{Op, OpCode, OpRef};
 
@@ -182,6 +182,64 @@ impl DependencyGraph {
     }
 }
 
+// ── Instruction Scheduling ──────────────────────────────────────────────
+
+/// Reorder operations to maximize instruction-level parallelism.
+///
+/// Uses a topological sort with priority scheduling: among all operations
+/// whose dependencies are satisfied, choose the one with the highest
+/// "height" (longest path to a leaf in the dependency graph).
+///
+/// This mirrors RPython's `schedule.py`, which reorders the loop body to
+/// improve ILP before packing decisions are made.
+pub fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
+    let n = graph.nodes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Compute heights in reverse topological order.
+    // Height = 1 + max height among users (successors in the DAG).
+    let mut heights = vec![0usize; n];
+    for i in (0..n).rev() {
+        let max_user_height = graph.nodes[i]
+            .users
+            .iter()
+            .map(|&u| heights[u])
+            .max()
+            .unwrap_or(0);
+        heights[i] = 1 + max_user_height;
+    }
+
+    // Compute in-degrees from deps.
+    let mut in_degree = vec![0usize; n];
+    for node in &graph.nodes {
+        in_degree[node.idx] = node.deps.len();
+    }
+
+    // Seed the priority queue with all zero-in-degree nodes.
+    // BinaryHeap is a max-heap: (height, index) — higher height = higher priority.
+    let mut ready: BinaryHeap<(usize, usize)> = BinaryHeap::new();
+    for i in 0..n {
+        if in_degree[i] == 0 {
+            ready.push((heights[i], i));
+        }
+    }
+
+    let mut schedule = Vec::with_capacity(n);
+    while let Some((_, idx)) = ready.pop() {
+        schedule.push(idx);
+        for &user in &graph.nodes[idx].users {
+            in_degree[user] -= 1;
+            if in_degree[user] == 0 {
+                ready.push((heights[user], user));
+            }
+        }
+    }
+
+    schedule
+}
+
 /// A group of independent, isomorphic operations that can be packed.
 #[derive(Clone, Debug)]
 pub struct PackGroup {
@@ -277,11 +335,23 @@ impl OptVectorize {
     }
 
     /// Attempt to vectorize the buffered loop body.
-    fn try_vectorize(&self, ctx: &mut OptContext) -> Option<Vec<Op>> {
+    ///
+    /// Before packing, operations are scheduled for maximum ILP.
+    /// The reordering may expose additional packing opportunities.
+    fn try_vectorize(&mut self, ctx: &mut OptContext) -> Option<Vec<Op>> {
         if self.body_ops.len() < 4 {
             return None; // Too small to benefit
         }
 
+        // Phase 1: Schedule operations for ILP before packing.
+        let dep_graph = DependencyGraph::build(&self.body_ops);
+        let schedule = schedule_operations(&dep_graph);
+        if schedule.len() == self.body_ops.len() {
+            let scheduled: Vec<Op> = schedule.iter().map(|&i| self.body_ops[i].clone()).collect();
+            self.body_ops = scheduled;
+        }
+
+        // Phase 2: Rebuild dependency graph on reordered ops and find packs.
         let dep_graph = DependencyGraph::build(&self.body_ops);
         let groups = dep_graph.find_packable_groups();
 
@@ -635,5 +705,109 @@ mod tests {
         // Should still have Label and Jump
         assert!(result.iter().any(|op| op.opcode == OpCode::Label));
         assert!(result.iter().any(|op| op.opcode == OpCode::Jump));
+    }
+
+    // ── Scheduler tests ──
+
+    #[test]
+    fn test_schedule_respects_dependencies() {
+        // A → B → C: linear chain must stay in order
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // A
+            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(101)]),   // B depends on A
+            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(101)]),   // C depends on B
+        ];
+        assign_positions(&mut ops, 0);
+
+        let graph = DependencyGraph::build(&ops);
+        let sched = schedule_operations(&graph);
+
+        assert_eq!(sched.len(), 3);
+        // A before B before C
+        let pos_a = sched.iter().position(|&x| x == 0).unwrap();
+        let pos_b = sched.iter().position(|&x| x == 1).unwrap();
+        let pos_c = sched.iter().position(|&x| x == 2).unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+    }
+
+    #[test]
+    fn test_schedule_maximizes_parallelism() {
+        // A and B are independent — both should appear early (before any
+        // dependent op). With no dependents, both have height 1 and both
+        // should be in the first two schedule slots.
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // A
+            Op::new(OpCode::IntSub, &[OpRef(102), OpRef(103)]), // B (independent)
+        ];
+        assign_positions(&mut ops, 0);
+
+        let graph = DependencyGraph::build(&ops);
+        let sched = schedule_operations(&graph);
+
+        assert_eq!(sched.len(), 2);
+        // Both scheduled (order doesn't matter, but both must be present)
+        assert!(sched.contains(&0));
+        assert!(sched.contains(&1));
+    }
+
+    #[test]
+    fn test_schedule_prioritizes_critical_path() {
+        // Critical path: A → B → C (heights: A=3, B=2, C=1)
+        // Independent: D (height=1)
+        // A should be scheduled before D because A has higher height.
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // A (idx 0)
+            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(101)]),   // B (idx 1, depends on A)
+            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(101)]),   // C (idx 2, depends on B)
+            Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(103)]), // D (idx 3, independent)
+        ];
+        assign_positions(&mut ops, 0);
+
+        let graph = DependencyGraph::build(&ops);
+        let sched = schedule_operations(&graph);
+
+        assert_eq!(sched.len(), 4);
+        let pos_a = sched.iter().position(|&x| x == 0).unwrap();
+        let pos_d = sched.iter().position(|&x| x == 3).unwrap();
+        // A (height 3) should be scheduled before D (height 1)
+        assert!(pos_a < pos_d, "A (height 3) should precede D (height 1)");
+    }
+
+    #[test]
+    fn test_schedule_diamond() {
+        // Diamond: A → B, A → C, B → D, C → D
+        // Valid orders: [A, B, C, D] or [A, C, B, D]
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // A (idx 0)
+            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(101)]),   // B (idx 1, depends on A)
+            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(102)]),   // C (idx 2, depends on A)
+            Op::new(OpCode::IntAdd, &[OpRef(1), OpRef(2)]),     // D (idx 3, depends on B and C)
+        ];
+        assign_positions(&mut ops, 0);
+
+        let graph = DependencyGraph::build(&ops);
+        let sched = schedule_operations(&graph);
+
+        assert_eq!(sched.len(), 4);
+
+        let pos_a = sched.iter().position(|&x| x == 0).unwrap();
+        let pos_b = sched.iter().position(|&x| x == 1).unwrap();
+        let pos_c = sched.iter().position(|&x| x == 2).unwrap();
+        let pos_d = sched.iter().position(|&x| x == 3).unwrap();
+
+        // A must come before B and C
+        assert!(pos_a < pos_b);
+        assert!(pos_a < pos_c);
+        // B and C must come before D
+        assert!(pos_b < pos_d);
+        assert!(pos_c < pos_d);
+    }
+
+    #[test]
+    fn test_schedule_empty_graph() {
+        let graph = DependencyGraph { nodes: Vec::new() };
+        let sched = schedule_operations(&graph);
+        assert!(sched.is_empty());
     }
 }
