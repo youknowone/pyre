@@ -40,16 +40,22 @@ pub trait JitState: Sized {
     fn extract_live(&self, meta: &Self::Meta) -> Vec<i64>;
 
     fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
-        self.extract_live(meta)
-            .into_iter()
-            .map(Value::Int)
+        let raw = self.extract_live(meta);
+        let types = self.live_value_types(meta);
+        raw.into_iter()
+            .zip(types)
+            .map(|(v, t)| match t {
+                Type::Float => Value::Float(f64::from_bits(v as u64)),
+                Type::Ref => Value::Ref(GcRef(v as usize)),
+                _ => Value::Int(v),
+            })
             .collect()
     }
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        self.extract_live_values(meta)
+        self.extract_live(meta)
             .iter()
-            .map(Value::get_type)
+            .map(|_| Type::Int)
             .collect()
     }
 
