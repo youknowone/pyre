@@ -13,6 +13,8 @@
 
 extern crate self as majit_meta;
 
+use majit_ir::{OpRef, Type};
+
 pub mod blackhole;
 mod call_descr;
 mod constant_pool;
@@ -23,27 +25,32 @@ mod jit_state;
 mod jitcode;
 mod meta_interp;
 pub mod parity;
+pub mod quasi_immut;
 pub mod resume;
 mod symbolic_stack;
 mod trace_ctx;
 pub mod virtualizable;
 
-pub use call_descr::make_call_descr;
+pub use call_descr::{make_call_assembler_descr, make_call_descr};
 pub use constant_pool::ConstantPool;
 pub use driver::JitDriver;
-pub use fail_descr::make_fail_descr;
+pub use fail_descr::{make_fail_descr, make_fail_descr_typed};
 pub use io_buffer::{
     emit_commit_io, io_buffer_commit, io_buffer_discard, io_buffer_write, io_buffer_write_fmt,
 };
 pub use jit_state::{JitState, PendingFieldWriteLayout};
 pub use jitcode::{
-    trace_jitcode, ClosureRuntime, JitCode, JitCodeBuilder, JitCodeMachine, JitCodeRuntime,
-    JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
+    trace_jitcode, ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
+    JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
 };
+pub use majit_codegen::CompiledTraceInfo;
 pub use meta_interp::{
-    BackEdgeAction, BlackholeRunResult, CompiledExitLayout, DriverRunOutcome, JitHooks, MetaInterp,
+    BackEdgeAction, BlackholeRunResult, CompiledExitLayout, CompiledTerminalExitLayout,
+    CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, DriverRunOutcome,
+    GuardRecoveryAction, JitHooks, MetaInterp, RawCompileResult,
 };
 pub use parity::{assert_trace_parity, normalize_ops, normalize_trace, TraceParityCase};
+pub use quasi_immut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;
 pub use trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx};
 
@@ -64,6 +71,13 @@ pub enum TraceAction {
     Continue,
     /// Close the loop (back-edge to header detected).
     CloseLoop,
+    /// Close the loop with explicit jump arguments supplied by the tracer.
+    CloseLoopWithArgs { jump_args: Vec<OpRef> },
+    /// Finish the trace with terminal output values.
+    Finish {
+        finish_args: Vec<OpRef>,
+        finish_arg_types: Vec<Type>,
+    },
     /// Abort the current trace (recoverable — may retry later).
     Abort,
     /// Abort the current trace permanently (never trace this location again).
