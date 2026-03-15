@@ -791,7 +791,11 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let num_ops_before = trace.ops.len();
-        let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
+        let optimized_ops = optimizer.optimize_with_constants_and_inputs(
+            &trace.ops,
+            &mut constants,
+            trace.inputargs.len(),
+        );
         let num_ops_after = optimized_ops.len();
 
         if crate::majit_log_enabled() {
@@ -946,7 +950,11 @@ impl<M: Clone> MetaInterp<M> {
         let mut constants = ctx.constants.into_inner();
 
         let num_ops_before = trace.ops.len();
-        let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
+        let optimized_ops = optimizer.optimize_with_constants_and_inputs(
+            &trace.ops,
+            &mut constants,
+            trace.inputargs.len(),
+        );
         let num_ops_after = optimized_ops.len();
 
         if crate::majit_log_enabled() {
@@ -2004,7 +2012,11 @@ impl<M: Clone> MetaInterp<M> {
         // Optimize the bridge trace
         let mut optimizer = Optimizer::default_pipeline();
         let mut constants = constants;
-        let optimized_ops = optimizer.optimize_with_constants(bridge_ops, &mut constants);
+        let optimized_ops = optimizer.optimize_with_constants_and_inputs(
+            bridge_ops,
+            &mut constants,
+            bridge_inputargs.len(),
+        );
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
         let bridge_trace_id = self.alloc_trace_id();

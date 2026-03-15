@@ -104,8 +104,10 @@ pub struct VirtualArrayInfo {
 pub struct VirtualStructInfo {
     /// The size descriptor.
     pub descr: DescrRef,
-    /// Field values.
+    /// Field values: (field_index, value, optional original field descriptor).
     pub fields: Vec<(u32, OpRef)>,
+    /// Original field descriptors keyed by field_index, used for force.
+    pub field_descrs: Vec<(u32, DescrRef)>,
 }
 
 /// A virtual array of structs (interior field access pattern).

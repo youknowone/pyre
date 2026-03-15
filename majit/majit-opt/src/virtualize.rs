@@ -227,11 +227,13 @@ impl OptVirtualize {
         }
 
         // Emit SETFIELD_GC for each tracked field
-        for (field_idx, value_ref) in vinfo.fields {
-            let value_ref = self.force_virtual(value_ref, ctx);
+        for (field_idx, value_ref) in &vinfo.fields {
+            let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
+            let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
+                .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-            set_op.descr = Some(make_field_index_descr(field_idx));
+            set_op.descr = Some(descr);
             ctx.emit(set_op);
         }
 
@@ -306,6 +308,13 @@ impl OptVirtualize {
     }
 
     /// Force all arguments that are virtual.
+    fn has_any_virtual_arg(&self, op: &Op, ctx: &OptContext) -> bool {
+        op.args.iter().any(|arg| {
+            let resolved = ctx.get_replacement(*arg);
+            self.is_virtual(resolved, ctx)
+        })
+    }
+
     fn force_all_args(&mut self, op: &Op, ctx: &mut OptContext) -> Op {
         let mut new_op = op.clone();
         for arg in &mut new_op.args {
@@ -349,6 +358,7 @@ impl OptVirtualize {
         let vinfo = VirtualStructInfo {
             descr,
             fields: Vec::new(),
+            field_descrs: Vec::new(),
         };
         self.set_info(op.pos, PtrInfo::VirtualStruct(vinfo));
         PassResult::Remove
@@ -386,6 +396,9 @@ impl OptVirtualize {
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
                         set_field(&mut vinfo.fields, field_idx, value_ref);
+                        if let Some(descr) = &op.descr {
+                            set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
+                        }
                         return PassResult::Remove;
                     }
                     _ => {}
@@ -430,6 +443,10 @@ impl OptVirtualize {
                     }
                 }
             }
+        }
+        // Force any virtual args before emitting the setarrayitem
+        if self.has_any_virtual_arg(op, ctx) {
+            return PassResult::Replace(self.force_all_args(op, ctx));
         }
         PassResult::PassOn
     }
@@ -689,6 +706,7 @@ impl OptVirtualize {
         let vinfo = VirtualStructInfo {
             descr: vref_descr,
             fields,
+            field_descrs: Vec::new(),
         };
         self.set_info(op.pos, PtrInfo::VirtualStruct(vinfo));
 
@@ -927,6 +945,23 @@ fn set_field(fields: &mut Vec<(u32, OpRef)>, field_idx: u32, value_ref: OpRef) {
     fields.push((field_idx, value_ref));
 }
 
+fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
+    for entry in field_descrs.iter_mut() {
+        if entry.0 == field_idx {
+            entry.1 = descr;
+            return;
+        }
+    }
+    field_descrs.push((field_idx, descr));
+}
+
+fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<DescrRef> {
+    field_descrs
+        .iter()
+        .find(|(idx, _)| *idx == field_idx)
+        .map(|(_, descr)| descr.clone())
+}
+
 fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
     fields
         .iter()
@@ -947,6 +982,9 @@ struct FieldIndexDescr(u32);
 impl Descr for FieldIndexDescr {
     fn index(&self) -> u32 {
         self.0
+    }
+    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+        Some(self)
     }
 }
 
