@@ -135,6 +135,7 @@ mod tests {
                     descr: descr_ref(),
                     known_class: None,
                     fields: vec![(0, OpRef(10))],
+                    field_descrs: Vec::new(),
                 }),
             ),
             (
@@ -149,6 +150,7 @@ mod tests {
                 PtrInfo::VirtualStruct(VirtualStructInfo {
                     descr: descr_ref(),
                     fields: vec![(0, OpRef(30))],
+                    field_descrs: Vec::new(),
                 }),
             ),
             (
@@ -206,6 +208,7 @@ mod tests {
                     descr: descr_ref(),
                     known_class: None,
                     fields: vec![(0, OpRef(10)), (1, OpRef(11))],
+                    field_descrs: Vec::new(),
                 }),
             ),
             (
