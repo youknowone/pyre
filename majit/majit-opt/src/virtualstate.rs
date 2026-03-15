@@ -56,7 +56,7 @@ pub enum VirtualStateInfo {
     /// Value is a virtual raw buffer.
     VirtualRawBuffer {
         size: usize,
-        entries: Vec<(usize, Box<VirtualStateInfo>)>,
+        entries: Vec<(usize, usize, Box<VirtualStateInfo>)>,
     },
     /// Value has a known class (non-null).
     KnownClass { class_ptr: GcRef },
@@ -210,9 +210,11 @@ impl VirtualStateInfo {
                 if s1 != s2 || e1.len() != e2.len() {
                     return false;
                 }
-                e1.iter()
-                    .zip(e2.iter())
-                    .all(|((off1, v1), (off2, v2))| off1 == off2 && v1.is_compatible(v2))
+                e1.iter().zip(e2.iter()).all(
+                    |((off1, len1, v1), (off2, len2, v2))| {
+                        off1 == off2 && len1 == len2 && v1.is_compatible(v2)
+                    },
+                )
             }
 
             // KnownClass: other must have the same class (or be virtual with matching class)
@@ -479,9 +481,9 @@ fn export_single_value(
                 let entries = vinfo
                     .entries
                     .iter()
-                    .map(|(offset, value_ref)| {
+                    .map(|(offset, length, value_ref)| {
                         let val_state = export_single_value(*value_ref, ctx, ptr_info, visited);
-                        (*offset, Box::new(val_state))
+                        (*offset, *length, Box::new(val_state))
                     })
                     .collect();
                 return VirtualStateInfo::VirtualRawBuffer {
@@ -502,6 +504,10 @@ fn export_single_value(
             }
             PtrInfo::Constant(gcref) => {
                 return VirtualStateInfo::Constant(Value::Ref(*gcref));
+            }
+            PtrInfo::Virtualizable(_) => {
+                // Virtualizable objects are treated as non-null in virtual state
+                return VirtualStateInfo::NonNull;
             }
         }
     }
@@ -609,11 +615,11 @@ fn import_single_value(
         }
         VirtualStateInfo::VirtualRawBuffer { size, entries } => {
             let mut imported_entries = Vec::new();
-            for (offset, entry_info) in entries {
+            for (offset, length, entry_info) in entries {
                 let entry_opref =
                     ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
                 import_single_value(entry_info, entry_opref, ctx, ptr_info);
-                imported_entries.push((*offset, entry_opref));
+                imported_entries.push((*offset, *length, entry_opref));
             }
             ptr_info[idx] = Some(PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
                 size: *size,

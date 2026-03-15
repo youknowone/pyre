@@ -23,6 +23,7 @@ pub mod vector;
 pub mod virtualize;
 pub mod virtualstate;
 pub mod vstring;
+pub mod walkvirtual;
 
 use majit_ir::{Op, OpRef, Value};
 
