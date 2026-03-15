@@ -1923,6 +1923,59 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     // ── Bridge Compilation ──────────────────────────────────────
+}
+
+/// Proxy FailDescr used when compiling bridges from guard failure points.
+/// Carries enough information for the backend to locate the original guard.
+#[derive(Debug)]
+struct BridgeFailDescrProxy {
+    fail_index: u32,
+    trace_id: u64,
+    fail_arg_types: Vec<Type>,
+}
+
+impl majit_ir::Descr for BridgeFailDescrProxy {
+    fn index(&self) -> u32 {
+        self.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::FailDescr for BridgeFailDescrProxy {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.fail_arg_types
+    }
+    fn trace_id(&self) -> u64 {
+        self.trace_id
+    }
+}
+
+impl<M: Clone> MetaInterp<M> {
+
+    /// Obtain a FailDescr proxy for a guard identified by green_key,
+    /// trace_id, and fail_index. Used by call_assembler bridge callbacks
+    /// that need to pass a FailDescr to compile_bridge.
+    pub fn get_fail_descr_for_bridge(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Box<dyn majit_ir::FailDescr>> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        // Verify the guard exists
+        let _trace = compiled.traces.get(&trace_id)?;
+        Some(Box::new(BridgeFailDescrProxy {
+            fail_index,
+            trace_id,
+            fail_arg_types: vec![Type::Int], // call_assembler guard fail_args = [frame_ptr]
+        }))
+    }
 
     /// Compile a bridge from a guard failure point.
     ///
