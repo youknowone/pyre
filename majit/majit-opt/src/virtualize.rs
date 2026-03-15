@@ -167,7 +167,10 @@ impl OptVirtualize {
             let value_ref = self.force_virtual(value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-            set_op.descr = Some(make_field_index_descr(field_idx));
+            set_op.descr = Some(
+                get_field_descr(&vinfo.field_descrs, field_idx)
+                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
+            );
             ctx.emit(set_op);
         }
 
@@ -348,6 +351,7 @@ impl OptVirtualize {
             descr,
             known_class: None,
             fields: Vec::new(),
+            field_descrs: Vec::new(),
         };
         self.set_info(op.pos, PtrInfo::Virtual(vinfo));
         PassResult::Remove
@@ -392,6 +396,9 @@ impl OptVirtualize {
                 match info {
                     PtrInfo::Virtual(vinfo) => {
                         set_field(&mut vinfo.fields, field_idx, value_ref);
+                        if let Some(descr) = &op.descr {
+                            set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
+                        }
                         return PassResult::Remove;
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
@@ -842,6 +849,12 @@ impl OptimizationPass for OptVirtualize {
             // VirtualRefFinish: finalize the virtual ref
             OpCode::VirtualRefFinish => self.optimize_virtual_ref_finish(op, ctx),
 
+            // GUARD_NOT_FORCED checks if the JIT frame was forced during a call.
+            // If the force_token from the preceding CALL_MAY_FORCE is virtual
+            // (never escaped), the guard always succeeds. Otherwise, pass through.
+            // Must not hit the is_call() or default branch which would force all virtuals.
+            OpCode::GuardNotForced | OpCode::GuardNotForced2 => PassResult::PassOn,
+
             // Calls / escaping operations — force all virtual args
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
 
@@ -893,8 +906,14 @@ impl OptimizationPass for OptVirtualize {
             // Consumed by pure pass (CSE) — just remove here.
             OpCode::RecordKnownResult => PassResult::Remove,
 
-            // Everything else passes through
-            _ => PassResult::PassOn,
+            // Everything else passes through, but force any virtual args first
+            _ => {
+                for i in 0..op.num_args() {
+                    let arg = ctx.get_replacement(op.arg(i));
+                    self.force_virtual(arg, ctx);
+                }
+                PassResult::PassOn
+            }
         }
     }
 
