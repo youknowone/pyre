@@ -1662,17 +1662,6 @@ fn call_assembler_fast_path(
     outcome: *mut i64,
     force_fn: extern "C" fn(i64) -> i64,
 ) -> u64 {
-    // Tagged cached result: an odd inputs[0] encodes a pre-computed
-    // result from the frame-creation helper (bit 0 = tag, bits 1.. = result).
-    // This skips frame creation, compiled code execution, and force callback.
-    if inputs[0] & 1 != 0 {
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-            *outcome.add(1) = 0;
-        }
-        return (inputs[0] >> 1) as u64;
-    }
-
     let actual_outputs = target.max_output_slots.max(1);
     if actual_outputs > FAST_PATH_MAX_OUTPUTS {
         // Rare: too many outputs for stack buffer. Fall back to heap path.
@@ -1838,18 +1827,6 @@ extern "C" fn call_assembler_shim(
     _expected_result_kind: u64,
 ) -> u64 {
     let outcome = outcome_ptr as usize as *mut i64;
-
-    // Tagged cached result: if the frame creator encoded a cached value
-    // (odd pointer), return it immediately — no target lookup, no compiled
-    // code execution, no force callback.
-    let input0 = unsafe { *(args_ptr as *const i64) };
-    if input0 & 1 != 0 {
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-            *outcome.add(1) = 0;
-        }
-        return (input0 >> 1) as u64;
-    }
 
     let target = unsafe { &*fast_lookup_ca_target(target_token) };
 
