@@ -16,6 +16,13 @@ use crate::info::{
 };
 use crate::{OptContext, OptimizationPass, PassResult};
 
+/// Field descriptor index for the `virtual_token` field of JitVirtualRef.
+const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 0x7F00;
+/// Field descriptor index for the `forced` field of JitVirtualRef.
+const VREF_FORCED_FIELD_INDEX: u32 = 0x7F01;
+/// Size descriptor index for the JitVirtualRef struct.
+const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
+
 /// The virtualize optimization pass.
 pub struct OptVirtualize {
     /// Per-operation PtrInfo, indexed by OpRef.0.
@@ -595,10 +602,116 @@ impl OptVirtualize {
         PassResult::PassOn
     }
 
+    /// Handle VirtualRefR / VirtualRefI.
+    ///
+    /// Replace the VIRTUAL_REF operation with a virtual struct of type
+    /// JitVirtualRef. The struct has two fields:
+    /// - virtual_token (field index VREF_VIRTUAL_TOKEN): set to a ForceToken op
+    /// - forced (field index VREF_FORCED): set to NULL (constant 0)
+    ///
+    /// This way the vref itself becomes virtual. If it never escapes, the
+    /// allocation is eliminated entirely. If it does escape, the forcing
+    /// mechanism emits the struct allocation + field writes.
+    fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let vref_descr = make_field_index_descr(VREF_SIZE_DESCR_INDEX);
+
+        // Emit a FORCE_TOKEN to capture the JIT frame address.
+        let token_op = Op::new(OpCode::ForceToken, &[]);
+        let token_ref = ctx.emit(token_op);
+
+        // The emitted ForceToken may reuse an OpRef index that previously
+        // had PtrInfo::Virtual attached (from an earlier NEW_WITH_VTABLE
+        // that was virtualized). Clear that to prevent accidental forcing
+        // of unrelated virtuals when the vref struct is forced.
+        self.set_info(token_ref, PtrInfo::NonNull);
+
+        // Use a sentinel OpRef for the NULL constant in the `forced` field.
+        // We don't emit it now; when the virtual struct is forced, the
+        // constant 0 is emitted lazily. Using OpRef::NONE here is safe
+        // because force_virtual checks whether a field value is virtual
+        // before forcing it, and OpRef::NONE is never virtual.
+        let null_ref = OpRef::NONE;
+
+        let fields = vec![
+            (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
+            (VREF_FORCED_FIELD_INDEX, null_ref),
+        ];
+        let vinfo = VirtualStructInfo {
+            descr: vref_descr,
+            fields,
+        };
+        self.set_info(op.pos, PtrInfo::VirtualStruct(vinfo));
+
+        PassResult::Remove
+    }
+
+    /// Handle VirtualRefFinish(vref, virtual_obj).
+    ///
+    /// Two cases:
+    /// 1. Normal case: virtual_obj is NULL (constant 0) -- the frame is being
+    ///    left normally. Just clear the virtual_token field.
+    /// 2. Forced case: virtual_obj is non-NULL -- the vref was forced during
+    ///    tracing. Store the real object into the `forced` field.
+    ///
+    /// If the vref is still virtual, these writes are absorbed into the
+    /// virtual struct's field tracking and nothing is emitted.
+    /// If the vref was already forced (escaped), we emit SETFIELD_GC ops.
+    fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        let vref_ref = ctx.get_replacement(op.arg(0));
+        let obj_ref = ctx.get_replacement(op.arg(1));
+
+        // Check if the virtual object arg is non-null (forced case)
+        let obj_is_null = ctx
+            .get_constant_int(obj_ref)
+            .is_some_and(|v| v == 0);
+
+        // If vref is still virtual, update the virtual struct fields directly
+        if let Some(info) = self.get_info_mut(vref_ref) {
+            if info.is_virtual() {
+                if let PtrInfo::VirtualStruct(vinfo) = info {
+                    // Set forced field to the object (or keep NULL)
+                    if !obj_is_null {
+                        set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_ref);
+                    }
+                    // Set virtual_token to NULL (TOKEN_NONE)
+                    let null_ref = self.emit_constant_int(ctx, 0);
+                    // Re-borrow: get_info_mut again after emit_constant_int
+                    if let Some(PtrInfo::VirtualStruct(vinfo)) =
+                        self.get_info_mut(vref_ref)
+                    {
+                        set_field(
+                            &mut vinfo.fields,
+                            VREF_VIRTUAL_TOKEN_FIELD_INDEX,
+                            null_ref,
+                        );
+                    }
+                    return PassResult::Remove;
+                }
+            }
+        }
+
+        // vref is not virtual (was forced/escaped): emit SETFIELD_GC ops
+
+        // Set 'forced' field if the object is non-null
+        if !obj_is_null {
+            let mut set_forced = Op::new(OpCode::SetfieldGc, &[vref_ref, obj_ref]);
+            set_forced.descr = Some(make_field_index_descr(VREF_FORCED_FIELD_INDEX));
+            ctx.emit(set_forced);
+        }
+
+        // Set 'virtual_token' to NULL
+        let null_ref = self.emit_constant_int(ctx, 0);
+        let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
+        set_token.descr = Some(make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
+        ctx.emit(set_token);
+
+        PassResult::Remove
+    }
+
     /// Handle operations that may cause virtuals to escape.
     fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         let forced = self.force_all_args(op, ctx);
-        PassResult::Emit(forced)
+        PassResult::Replace(forced)
     }
 }
 
@@ -647,6 +760,11 @@ impl OptimizationPass for OptVirtualize {
             OpCode::GuardNonnull => self.optimize_guard_nonnull(op, ctx),
             OpCode::GuardNonnullClass => self.optimize_guard_nonnull_class(op, ctx),
             OpCode::GuardValue => self.optimize_guard_value(op, ctx),
+
+            // VirtualRef: replace with a virtual struct tracking token + forced fields
+            OpCode::VirtualRefR | OpCode::VirtualRefI => self.optimize_virtual_ref(op, ctx),
+            // VirtualRefFinish: finalize the virtual ref
+            OpCode::VirtualRefFinish => self.optimize_virtual_ref_finish(op, ctx),
 
             // Calls / escaping operations — force all virtual args
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
@@ -1333,5 +1451,201 @@ mod tests {
         );
         assert_eq!(result[0].opcode, OpCode::NewWithVtable);
         assert_eq!(result.last().unwrap().opcode, OpCode::EscapeR);
+    }
+
+    // ── VirtualRef tests ──
+
+    #[test]
+    fn test_virtual_ref_non_escaping() {
+        // vref = virtual_ref_r(obj, token)   <- becomes virtual struct
+        // virtual_ref_finish(vref, NULL)      <- absorbed into virtual, removed
+        //
+        // Expected output: only ForceToken (emitted by optimizer) + SameAsI for the null constant
+        let mut ops = vec![
+            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
+            Op::new(OpCode::VirtualRefFinish, &[OpRef(0), OpRef(102)]), // pos=1
+        ];
+        assign_positions(&mut ops);
+
+        // OpRef(102) = constant 0 (NULL)
+        let constants = vec![(OpRef(102), Value::Int(0))];
+        let result = run_pass_with_constants(&ops, &constants);
+
+        // VirtualRefR should be removed (virtual), VirtualRefFinish should be removed.
+        // Only the ForceToken and null constant ops remain.
+        let has_virtual_ref = result
+            .iter()
+            .any(|o| matches!(o.opcode, OpCode::VirtualRefR | OpCode::VirtualRefI));
+        assert!(
+            !has_virtual_ref,
+            "VirtualRef should not appear in output; got: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+
+        let has_finish = result
+            .iter()
+            .any(|o| o.opcode == OpCode::VirtualRefFinish);
+        assert!(
+            !has_finish,
+            "VirtualRefFinish should not appear in output; got: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_virtual_ref_escapes_at_call() {
+        // vref = virtual_ref_r(obj, token)   <- becomes virtual struct
+        // call_n(vref)                        <- vref escapes, force it
+        //
+        // Expected: NEW (forced struct) + SETFIELD_GC (fields) + CALL_N
+        let mut ops = vec![
+            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
+            Op::new(OpCode::CallN, &[OpRef(0)]),                     // pos=1
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        // The virtual ref should be forced (New or NewWithVtable emitted)
+        let has_alloc = result
+            .iter()
+            .any(|o| matches!(o.opcode, OpCode::New | OpCode::NewWithVtable));
+        assert!(
+            has_alloc,
+            "forced vref should emit allocation; got: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            result.last().unwrap().opcode,
+            OpCode::CallN,
+            "last op should be CALL_N"
+        );
+    }
+
+    #[test]
+    fn test_virtual_ref_finish_with_forced_obj() {
+        // vref = virtual_ref_r(obj, token)
+        // virtual_ref_finish(vref, real_obj)   <- real_obj is non-null
+        //
+        // When the vref is still virtual and finish has a non-null obj,
+        // the forced field is updated in the virtual struct.
+        // No ops should be emitted for the VirtualRefFinish itself.
+        let mut ops = vec![
+            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
+            Op::new(OpCode::VirtualRefFinish, &[OpRef(0), OpRef(200)]), // pos=1, non-null
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        let has_finish = result
+            .iter()
+            .any(|o| o.opcode == OpCode::VirtualRefFinish);
+        assert!(
+            !has_finish,
+            "VirtualRefFinish should be removed; got: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_virtual_ref_does_not_force_underlying_obj() {
+        // p0 = new_with_vtable(descr=size1)   <- virtual
+        // vref = virtual_ref_r(p0, token)     <- virtual struct
+        // call_n(vref)                         <- forces vref, NOT p0
+        //
+        // The key property: forcing the vref should NOT force the wrapped
+        // object p0. The vref struct's `forced` field is set to NULL (0)
+        // by optimize_virtual_ref, so p0 is not referenced in the vref fields.
+        // p0 only appears in the original VirtualRefR args, which are discarded.
+        let sd = size_descr(1);
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
+            Op::new(OpCode::VirtualRefR, &[OpRef(0), OpRef(101)]),  // pos=1
+            Op::new(OpCode::CallN, &[OpRef(1)]),                     // pos=2
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        // The vref struct is a VirtualStruct forced as New.
+        // p0 (NewWithVtable) should NOT appear because the vref's forced field
+        // is NULL, not p0.
+        let new_vtable_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::NewWithVtable)
+            .count();
+        assert_eq!(
+            new_vtable_count, 0,
+            "the wrapped object p0 should NOT be forced; got ops: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+
+        // The vref struct itself is forced as New
+        let new_count = result.iter().filter(|o| o.opcode == OpCode::New).count();
+        assert_eq!(
+            new_count, 1,
+            "only the vref struct should be allocated; got ops: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_virtual_ref_finish_on_escaped_vref() {
+        // vref = virtual_ref_r(obj, token)
+        // call_n(vref)                         <- forces vref
+        // virtual_ref_finish(vref, real_obj)   <- vref is now non-virtual
+        //
+        // VirtualRefFinish on a non-virtual vref should emit SETFIELD_GC ops.
+        let mut ops = vec![
+            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
+            Op::new(OpCode::CallN, &[OpRef(0)]),                     // pos=1
+            Op::new(OpCode::VirtualRefFinish, &[OpRef(0), OpRef(200)]), // pos=2
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        // After the call, vref is forced. VirtualRefFinish should emit
+        // SETFIELD_GC for `forced` and `virtual_token` fields.
+        let setfield_after_call = result
+            .iter()
+            .skip_while(|o| o.opcode != OpCode::CallN)
+            .filter(|o| o.opcode == OpCode::SetfieldGc)
+            .count();
+        assert!(
+            setfield_after_call >= 2,
+            "VirtualRefFinish on escaped vref should emit SETFIELD_GCs; got ops: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_virtual_ref_getfield_on_virtual_vref() {
+        // vref = virtual_ref_r(obj, token)
+        // i0 = getfield_gc_i(vref, descr=vref_forced_field)
+        //
+        // The vref is virtual, so getfield should return the virtual field value.
+        let forced_descr = field_descr(super::VREF_FORCED_FIELD_INDEX);
+
+        let mut ops = vec![
+            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], forced_descr), // pos=1
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        // The getfield should be removed (the forced field is a known constant 0)
+        let has_getfield = result
+            .iter()
+            .any(|o| o.opcode == OpCode::GetfieldGcI);
+        assert!(
+            !has_getfield,
+            "getfield on virtual vref should be removed; got: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
     }
 }
