@@ -3547,11 +3547,11 @@ mod tests {
             let mut values = may_force_void_values()
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
-            values.push(get_latest_descr_from_deadframe(&deadframe).fail_index() as i64);
-            values.push(get_int_from_deadframe(&deadframe, 0));
-            values.push(get_int_from_deadframe(&deadframe, 1));
+            values.push(get_latest_descr_from_deadframe(&deadframe).unwrap().fail_index() as i64);
+            values.push(get_int_from_deadframe(&deadframe, 0).unwrap());
+            values.push(get_int_from_deadframe(&deadframe, 1).unwrap());
             drop(values);
-            set_savedata_ref_on_deadframe(&mut deadframe, GcRef(0xDADA));
+            set_savedata_ref_on_deadframe(&mut deadframe, GcRef(0xDADA)).unwrap();
         });
     }
 
