@@ -106,6 +106,21 @@ pub trait DeclarativeJitDriver {
     fn green_key(values: &[i64]) -> Result<GreenKey, &'static str>;
 }
 
+/// A single virtualizable field to synchronize before/after a residual call.
+///
+/// `field_descr_idx` identifies the field descriptor, `value` is the current
+/// symbolic value (OpRef) that should be written to the heap before the call.
+/// `field_type` determines which GETFIELD_GC variant to use when re-reading.
+#[derive(Debug, Clone, Copy)]
+pub struct VableSyncField {
+    /// Descriptor index identifying the virtualizable field.
+    pub field_descr_idx: u32,
+    /// Current symbolic value to write to heap before the call.
+    pub value: OpRef,
+    /// Type of the field (Int, Ref, Float).
+    pub field_type: Type,
+}
+
 /// Tracing context: wraps TraceRecorder + ConstantPool with convenience API.
 ///
 /// The interpreter uses this during trace recording to:
@@ -450,6 +465,218 @@ impl TraceCtx {
     /// Record GUARD_NOT_FORCED (must follow a call_may_force).
     pub fn guard_not_forced(&mut self, num_live: usize) -> OpRef {
         self.record_guard(OpCode::GuardNotForced, &[], num_live)
+    }
+
+    // ── CALL_MAY_FORCE with virtualizable synchronization ─────────
+
+    /// Emit SETFIELD_GC ops to flush virtualizable fields to heap,
+    /// then a CALL_MAY_FORCE, then GETFIELD_GC ops to re-read them.
+    ///
+    /// This is the RPython `vable_and_vrefs_before_residual_call` /
+    /// `vable_after_residual_call` pattern: virtualizable state is
+    /// written to the heap before the callee can observe it, and
+    /// re-read afterwards because the callee may have modified it.
+    ///
+    /// Returns `(call_result, updated_fields)` where `updated_fields`
+    /// contains the new OpRefs for each virtualizable field after the
+    /// call. The caller must use these new OpRefs for subsequent
+    /// operations instead of the stale pre-call values.
+    pub fn call_may_force_with_vable_sync_int(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+        num_live: usize,
+    ) -> (OpRef, Vec<(u32, OpRef)>) {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        self.call_may_force_with_vable_sync_int_typed(
+            func_ptr,
+            args,
+            &arg_types,
+            vable_ref,
+            sync_fields,
+            num_live,
+        )
+    }
+
+    /// Typed variant of [`call_may_force_with_vable_sync_int`].
+    pub fn call_may_force_with_vable_sync_int_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+        num_live: usize,
+    ) -> (OpRef, Vec<(u32, OpRef)>) {
+        self.emit_vable_sync_before(vable_ref, sync_fields);
+        let result = self.call_may_force_int_typed(func_ptr, args, arg_types);
+        let updated = self.emit_vable_sync_after(vable_ref, sync_fields);
+        self.guard_not_forced(num_live);
+        (result, updated)
+    }
+
+    /// Ref-returning variant of call_may_force with virtualizable sync.
+    pub fn call_may_force_with_vable_sync_ref(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+        num_live: usize,
+    ) -> (OpRef, Vec<(u32, OpRef)>) {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        self.call_may_force_with_vable_sync_ref_typed(
+            func_ptr,
+            args,
+            &arg_types,
+            vable_ref,
+            sync_fields,
+            num_live,
+        )
+    }
+
+    /// Typed ref-returning variant.
+    pub fn call_may_force_with_vable_sync_ref_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+        num_live: usize,
+    ) -> (OpRef, Vec<(u32, OpRef)>) {
+        self.emit_vable_sync_before(vable_ref, sync_fields);
+        let result = self.call_may_force_ref_typed(func_ptr, args, arg_types);
+        let updated = self.emit_vable_sync_after(vable_ref, sync_fields);
+        self.guard_not_forced(num_live);
+        (result, updated)
+    }
+
+    /// Void-returning variant of call_may_force with virtualizable sync.
+    pub fn call_may_force_with_vable_sync_void(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+        num_live: usize,
+    ) -> Vec<(u32, OpRef)> {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        self.call_may_force_with_vable_sync_void_typed(
+            func_ptr,
+            args,
+            &arg_types,
+            vable_ref,
+            sync_fields,
+            num_live,
+        )
+    }
+
+    /// Typed void-returning variant.
+    pub fn call_may_force_with_vable_sync_void_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+        num_live: usize,
+    ) -> Vec<(u32, OpRef)> {
+        self.emit_vable_sync_before(vable_ref, sync_fields);
+        self.call_may_force_void_typed(func_ptr, args, arg_types);
+        let updated = self.emit_vable_sync_after(vable_ref, sync_fields);
+        self.guard_not_forced(num_live);
+        updated
+    }
+
+    /// Float-returning variant of call_may_force with virtualizable sync.
+    pub fn call_may_force_with_vable_sync_float(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+        num_live: usize,
+    ) -> (OpRef, Vec<(u32, OpRef)>) {
+        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        self.call_may_force_with_vable_sync_float_typed(
+            func_ptr,
+            args,
+            &arg_types,
+            vable_ref,
+            sync_fields,
+            num_live,
+        )
+    }
+
+    /// Typed float-returning variant.
+    pub fn call_may_force_with_vable_sync_float_typed(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+        num_live: usize,
+    ) -> (OpRef, Vec<(u32, OpRef)>) {
+        self.emit_vable_sync_before(vable_ref, sync_fields);
+        let result = self.call_may_force_float_typed(func_ptr, args, arg_types);
+        let updated = self.emit_vable_sync_after(vable_ref, sync_fields);
+        self.guard_not_forced(num_live);
+        (result, updated)
+    }
+
+    /// Emit SETFIELD_GC for each virtualizable field before a residual call.
+    fn emit_vable_sync_before(&mut self, vable_ref: OpRef, sync_fields: &[VableSyncField]) {
+        for field in sync_fields {
+            let descr = crate::fail_descr::make_fail_descr(field.field_descr_idx as usize);
+            self.record_op_with_descr(OpCode::SetfieldGc, &[vable_ref, field.value], descr);
+        }
+    }
+
+    /// Emit GETFIELD_GC for each virtualizable field after a residual call.
+    ///
+    /// Returns updated (field_descr_idx, new_opref) pairs.
+    fn emit_vable_sync_after(
+        &mut self,
+        vable_ref: OpRef,
+        sync_fields: &[VableSyncField],
+    ) -> Vec<(u32, OpRef)> {
+        sync_fields
+            .iter()
+            .map(|field| {
+                let opcode = OpCode::getfield_for_type(field.field_type);
+                let descr = crate::fail_descr::make_fail_descr(field.field_descr_idx as usize);
+                let new_ref = self.record_op_with_descr(opcode, &[vable_ref], descr);
+                (field.field_descr_idx, new_ref)
+            })
+            .collect()
+    }
+
+    /// Callback-based virtualizable sync for CALL_MAY_FORCE.
+    ///
+    /// Uses JitState's `sync_virtualizable_before/after_residual_call`
+    /// methods to emit the appropriate SETFIELD/GETFIELD ops. This is
+    /// the preferred API for interpreters that implement the JitState
+    /// virtualizable sync hooks.
+    ///
+    /// Returns `(call_result, after_fields)` where `after_fields` are
+    /// the (field_index, new_opref) pairs from the after-sync callback.
+    pub fn call_may_force_with_jitstate_sync_int<S: crate::jit_state::JitState>(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        state: &S,
+        num_live: usize,
+    ) -> (OpRef, Vec<(u32, OpRef)>) {
+        state.sync_virtualizable_before_residual_call(self);
+        let result = self.call_may_force_int_typed(func_ptr, args, arg_types);
+        let updated = state.sync_virtualizable_after_residual_call(self);
+        self.guard_not_forced(num_live);
+        (result, updated)
     }
 
     /// Record GUARD_NO_EXCEPTION (check no pending exception).
@@ -1189,5 +1416,302 @@ mod tests {
             .expect("call op should carry CallDescr");
         assert_eq!(call_descr.arg_types(), &[Type::Ref, Type::Float, Type::Int]);
         assert_eq!(call_descr.call_target_token(), Some(777));
+    }
+
+    fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {
+        let mut recorder = ctx.recorder;
+        let num_inputs = recorder.num_inputargs();
+        let jump_args: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+        recorder.close_loop(&jump_args);
+        let trace = recorder.get_trace();
+        // Return only non-JUMP ops
+        trace
+            .ops
+            .iter()
+            .filter(|op| op.opcode != OpCode::Jump)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn call_may_force_with_vable_sync_emits_setfield_before_and_getfield_after() {
+        let mut recorder = TraceRecorder::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let field_val = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(recorder, 0);
+
+        let sync_fields = [VableSyncField {
+            field_descr_idx: 42,
+            value: field_val,
+            field_type: Type::Int,
+        }];
+
+        let (result, updated) = ctx.call_may_force_with_vable_sync_int(
+            dummy_call_target as *const (),
+            &[field_val],
+            vable,
+            &sync_fields,
+            2,
+        );
+
+        // result should be a valid OpRef
+        assert!(result.0 > 0);
+
+        // updated should contain one field with the new OpRef
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].0, 42);
+        // the new OpRef should differ from the original field_val
+        assert_ne!(updated[0].1, field_val);
+
+        let ops = take_all_ops(ctx);
+        // Expected sequence:
+        //   SetfieldGc (before)
+        //   CallMayForceI
+        //   GetfieldGcI (after)
+        //   GuardNotForced
+        assert!(ops.len() >= 4);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::CallMayForceI);
+        assert_eq!(ops[2].opcode, OpCode::GetfieldGcI);
+        assert_eq!(ops[3].opcode, OpCode::GuardNotForced);
+    }
+
+    #[test]
+    fn call_may_force_with_vable_sync_void_emits_correct_sequence() {
+        let mut recorder = TraceRecorder::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let field_val = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(recorder, 0);
+
+        let sync_fields = [VableSyncField {
+            field_descr_idx: 10,
+            value: field_val,
+            field_type: Type::Int,
+        }];
+
+        let updated = ctx.call_may_force_with_vable_sync_void(
+            dummy_call_target as *const (),
+            &[field_val],
+            vable,
+            &sync_fields,
+            2,
+        );
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].0, 10);
+
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::CallMayForceN);
+        assert_eq!(ops[2].opcode, OpCode::GetfieldGcI);
+        assert_eq!(ops[3].opcode, OpCode::GuardNotForced);
+    }
+
+    #[test]
+    fn call_may_force_with_vable_sync_multiple_fields() {
+        let mut recorder = TraceRecorder::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let int_val = recorder.record_input_arg(Type::Int);
+        let ref_val = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(recorder, 0);
+
+        let sync_fields = [
+            VableSyncField {
+                field_descr_idx: 0,
+                value: int_val,
+                field_type: Type::Int,
+            },
+            VableSyncField {
+                field_descr_idx: 1,
+                value: ref_val,
+                field_type: Type::Ref,
+            },
+        ];
+
+        let (_, updated) = ctx.call_may_force_with_vable_sync_ref(
+            dummy_call_target as *const (),
+            &[int_val],
+            vable,
+            &sync_fields,
+            3,
+        );
+
+        assert_eq!(updated.len(), 2);
+        assert_eq!(updated[0].0, 0);
+        assert_eq!(updated[1].0, 1);
+
+        let ops = take_all_ops(ctx);
+        // 2x SetfieldGc + CallMayForceR + 2x GetfieldGc + GuardNotForced
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[2].opcode, OpCode::CallMayForceR);
+        assert_eq!(ops[3].opcode, OpCode::GetfieldGcI);
+        assert_eq!(ops[4].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[5].opcode, OpCode::GuardNotForced);
+    }
+
+    #[test]
+    fn call_may_force_with_empty_vable_sync_behaves_like_plain_call() {
+        let mut recorder = TraceRecorder::new();
+        let val = recorder.record_input_arg(Type::Int);
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(recorder, 0);
+
+        let (result, updated) = ctx.call_may_force_with_vable_sync_int(
+            dummy_call_target as *const (),
+            &[val],
+            vable,
+            &[],
+            1,
+        );
+
+        // No sync fields => no extra ops
+        assert!(result.0 > 0);
+        assert!(updated.is_empty());
+
+        let ops = take_all_ops(ctx);
+        // Just CallMayForceI + GuardNotForced
+        assert_eq!(ops[0].opcode, OpCode::CallMayForceI);
+        assert_eq!(ops[1].opcode, OpCode::GuardNotForced);
+    }
+
+    #[test]
+    fn call_may_force_with_vable_sync_float_field() {
+        let mut recorder = TraceRecorder::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let float_val = recorder.record_input_arg(Type::Float);
+        let mut ctx = TraceCtx::new(recorder, 0);
+
+        let sync_fields = [VableSyncField {
+            field_descr_idx: 5,
+            value: float_val,
+            field_type: Type::Float,
+        }];
+
+        let (_, updated) = ctx.call_may_force_with_vable_sync_float(
+            dummy_call_target as *const (),
+            &[float_val],
+            vable,
+            &sync_fields,
+            2,
+        );
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].0, 5);
+
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::CallMayForceF);
+        assert_eq!(ops[2].opcode, OpCode::GetfieldGcF);
+        assert_eq!(ops[3].opcode, OpCode::GuardNotForced);
+    }
+
+    #[test]
+    fn call_may_force_with_jitstate_sync_default_noop() {
+        use crate::jit_state::JitState;
+
+        #[derive(Default)]
+        struct NoVableState;
+
+        impl JitState for NoVableState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+
+            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn extract_live(&self, _: &()) -> Vec<i64> { Vec::new() }
+            fn create_sym(_: &(), _: usize) -> () {}
+            fn is_compatible(&self, _: &()) -> bool { true }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> { Vec::new() }
+            fn validate_close(_: &(), _: &()) -> bool { true }
+        }
+
+        let mut recorder = TraceRecorder::new();
+        let val = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(recorder, 0);
+        let state = NoVableState;
+
+        let (result, updated) = ctx.call_may_force_with_jitstate_sync_int(
+            dummy_call_target as *const (),
+            &[val],
+            &[Type::Int],
+            &state,
+            1,
+        );
+
+        // Default JitState does no sync => no extra ops
+        assert!(result.0 > 0);
+        assert!(updated.is_empty());
+
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops[0].opcode, OpCode::CallMayForceI);
+        assert_eq!(ops[1].opcode, OpCode::GuardNotForced);
+    }
+
+    #[test]
+    fn call_may_force_with_jitstate_sync_custom_impl() {
+        use crate::jit_state::JitState;
+
+        struct VableState {
+            vable_ref: OpRef,
+            field_val: OpRef,
+        }
+
+        impl JitState for VableState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+
+            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn extract_live(&self, _: &()) -> Vec<i64> { Vec::new() }
+            fn create_sym(_: &(), _: usize) -> () {}
+            fn is_compatible(&self, _: &()) -> bool { true }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> { Vec::new() }
+            fn validate_close(_: &(), _: &()) -> bool { true }
+
+            fn sync_virtualizable_before_residual_call(
+                &self,
+                ctx: &mut TraceCtx,
+            ) {
+                // Write field 0 to heap
+                ctx.vable_setfield(self.vable_ref, 0, self.field_val);
+            }
+
+            fn sync_virtualizable_after_residual_call(
+                &self,
+                ctx: &mut TraceCtx,
+            ) -> Vec<(u32, OpRef)> {
+                // Re-read field 0 from heap
+                let new_ref = ctx.vable_getfield_int(self.vable_ref, 0);
+                vec![(0, new_ref)]
+            }
+        }
+
+        let mut recorder = TraceRecorder::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let field_val = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(recorder, 0);
+        let state = VableState { vable_ref: vable, field_val };
+
+        let (result, updated) = ctx.call_may_force_with_jitstate_sync_int(
+            dummy_call_target as *const (),
+            &[field_val],
+            &[Type::Int],
+            &state,
+            2,
+        );
+
+        assert!(result.0 > 0);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].0, 0);
+
+        let ops = take_all_ops(ctx);
+        // SetfieldGc(before) + CallMayForceI + GetfieldGcI(after) + GuardNotForced
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::CallMayForceI);
+        assert_eq!(ops[2].opcode, OpCode::GetfieldGcI);
+        assert_eq!(ops[3].opcode, OpCode::GuardNotForced);
     }
 }
