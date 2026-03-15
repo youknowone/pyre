@@ -1036,28 +1036,50 @@ impl TraceCtx {
         self.record_op_with_descr(opcode, args, descr)
     }
 
-    /// Emit CALL_ASSEMBLER_I by token number, without needing a &LoopToken.
+    /// Emit CALL_ASSEMBLER_I by token number, without needing a `&LoopToken`.
+    ///
+    /// Assumes all args are `Type::Int`. For mixed-type args, use
+    /// `call_assembler_int_by_number_typed` instead.
     pub fn call_assembler_int_by_number(&mut self, target_number: u64, args: &[OpRef]) -> OpRef {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         let descr = make_call_assembler_descr(target_number, &arg_types, Type::Int);
         self.record_op_with_descr(OpCode::CallAssemblerI, args, descr)
     }
 
+    /// Emit CALL_ASSEMBLER_I by token number with explicit arg types.
+    pub fn call_assembler_int_by_number_typed(
+        &mut self,
+        target_number: u64,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        let descr = make_call_assembler_descr(target_number, arg_types, Type::Int);
+        self.record_op_with_descr(OpCode::CallAssemblerI, args, descr)
+    }
+
+    /// Emit CALL_ASSEMBLER_N (void). Assumes all args are `Type::Int`.
+    /// For mixed-type args, use `call_assembler_void_typed`.
     pub fn call_assembler_void(&mut self, target: &LoopToken, args: &[OpRef]) {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         self.call_assembler_void_typed(target, args, &arg_types);
     }
 
+    /// Emit CALL_ASSEMBLER_I. Assumes all args are `Type::Int`.
+    /// For mixed-type args, use `call_assembler_int_typed`.
     pub fn call_assembler_int(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         self.call_assembler_int_typed(target, args, &arg_types)
     }
 
+    /// Emit CALL_ASSEMBLER_R. Assumes all args are `Type::Int`.
+    /// For mixed-type args, use `call_assembler_ref_typed`.
     pub fn call_assembler_ref(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         self.call_assembler_ref_typed(target, args, &arg_types)
     }
 
+    /// Emit CALL_ASSEMBLER_F. Assumes all args are `Type::Int`.
+    /// For mixed-type args, use `call_assembler_float_typed`.
     pub fn call_assembler_float(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         self.call_assembler_float_typed(target, args, &arg_types)
