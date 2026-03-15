@@ -147,6 +147,15 @@ pub trait FieldDescr: Descr {
     fn is_field_signed(&self) -> bool {
         true
     }
+
+    /// Whether this field is immutable (never written after object creation).
+    ///
+    /// Immutable field reads from a constant object can be folded to constants,
+    /// and their cached values survive cache invalidation by calls/side effects.
+    /// Delegates to `Descr::is_always_pure()` by default.
+    fn is_immutable(&self) -> bool {
+        self.is_always_pure()
+    }
 }
 
 /// Descriptor for an array type.
