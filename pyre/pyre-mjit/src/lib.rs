@@ -45,9 +45,7 @@ mod tests {
             .any(|(_, p)| p.contains("UnboxIntBinop"));
         assert!(has_binary, "missing UnboxIntBinop pattern");
 
-        let has_local_read = TRACE_PATTERNS
-            .iter()
-            .any(|(_, p)| p.contains("LocalRead"));
+        let has_local_read = TRACE_PATTERNS.iter().any(|(_, p)| p.contains("LocalRead"));
         assert!(has_local_read, "missing LocalRead pattern");
 
         let has_call = TRACE_PATTERNS

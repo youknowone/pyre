@@ -6,8 +6,8 @@
 //! Each recognized TracePattern produces a tracing function that emits
 //! the equivalent IR ops. Unrecognized patterns fall back to residual calls.
 
-use crate::patterns::TracePattern;
 use crate::AnalysisResult;
+use crate::patterns::TracePattern;
 
 /// Generate tracing Rust source code from analysis results.
 pub fn generate(result: &AnalysisResult) -> String {
@@ -16,8 +16,18 @@ pub fn generate(result: &AnalysisResult) -> String {
     out.push_str(&format!(
         "// Analysis: {} opcodes, {} classified\n\n",
         result.opcodes.len(),
-        result.opcodes.iter().filter(|a| a.trace_pattern.is_some()).count(),
+        result
+            .opcodes
+            .iter()
+            .filter(|a| a.trace_pattern.is_some())
+            .count(),
     ));
+
+    // Type layout constants (field offsets discovered from source)
+    generate_type_layouts(&mut out, result);
+
+    // Helper function classifications
+    generate_helper_summary(&mut out, result);
 
     // Dispatch table
     generate_dispatch_table(&mut out, result);
@@ -26,13 +36,75 @@ pub fn generate(result: &AnalysisResult) -> String {
     generate_trace_functions(&mut out);
 
     // Summary
-    let classified = result.opcodes.iter().filter(|a| a.trace_pattern.is_some()).count();
+    let classified = result
+        .opcodes
+        .iter()
+        .filter(|a| a.trace_pattern.is_some())
+        .count();
     out.push_str(&format!(
         "// Analysis summary: {}/{} opcodes classified, {} helpers, {} trait impls\n",
-        classified, result.opcodes.len(), result.helpers.len(), result.trait_impls.len(),
+        classified,
+        result.opcodes.len(),
+        result.helpers.len(),
+        result.trait_impls.len(),
     ));
 
     out
+}
+
+fn generate_type_layouts(out: &mut String, result: &AnalysisResult) {
+    out.push_str("// ── Discovered type layouts ──\n");
+    out.push_str(&format!("// {} types found\n", result.type_layouts.len()));
+    for layout in &result.type_layouts {
+        out.push_str(&format!("// struct {} {{\n", layout.name));
+        for (i, field) in layout.fields.iter().enumerate() {
+            out.push_str(&format!(
+                "//   [{}] {}: {}\n",
+                i, field.name, field.ty
+            ));
+        }
+        out.push_str("// }\n");
+    }
+    out.push('\n');
+}
+
+fn generate_helper_summary(out: &mut String, result: &AnalysisResult) {
+    use crate::classify::HelperClassification;
+
+    let mut field_reads = Vec::new();
+    let mut constructors = Vec::new();
+    let mut type_checks = Vec::new();
+
+    for helper in &result.helpers {
+        match &helper.classification {
+            HelperClassification::FieldRead { struct_name, field_name } => {
+                field_reads.push(format!(
+                    "// FieldRead: {} → {}.{}", helper.name, struct_name, field_name
+                ));
+            }
+            HelperClassification::Constructor { struct_name } => {
+                constructors.push(format!(
+                    "// Constructor: {} → New({})", helper.name, struct_name
+                ));
+            }
+            HelperClassification::TypeCheck { type_name } => {
+                type_checks.push(format!(
+                    "// TypeCheck: {} → is_{}", helper.name, type_name
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    out.push_str("// ── Helper function classifications ──\n");
+    out.push_str(&format!(
+        "// {} field reads, {} constructors, {} type checks\n",
+        field_reads.len(), constructors.len(), type_checks.len()
+    ));
+    for s in &field_reads { out.push_str(s); out.push('\n'); }
+    for s in &constructors { out.push_str(s); out.push('\n'); }
+    for s in &type_checks { out.push_str(s); out.push('\n'); }
+    out.push('\n');
 }
 
 fn generate_dispatch_table(out: &mut String, result: &AnalysisResult) {

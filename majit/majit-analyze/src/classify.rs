@@ -19,9 +19,15 @@ pub enum HelperClassification {
     /// Opaque call — emit residual CALL during tracing.
     Residual,
     /// Direct field read — maps to GetfieldRawI.
-    FieldRead { struct_name: String, field_name: String },
+    FieldRead {
+        struct_name: String,
+        field_name: String,
+    },
     /// Direct field write — maps to SetfieldRaw.
-    FieldWrite { struct_name: String, field_name: String },
+    FieldWrite {
+        struct_name: String,
+        field_name: String,
+    },
     /// Object constructor — maps to New + SetfieldRaw sequence.
     Constructor { struct_name: String },
     /// Type check — maps to GetfieldRawI(ob_type) + GuardClass.
@@ -174,14 +180,16 @@ fn extract_struct_from_cast(body: &str) -> String {
     // Look for "as *const W_Something" or "as * const W_Something"
     if let Some(pos) = body.find("as *const ") {
         let after = &body[pos + 10..];
-        let end = after.find(|c: char| !c.is_alphanumeric() && c != '_')
+        let end = after
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
             .unwrap_or(after.len());
         return after[..end].trim().to_string();
     }
     if let Some(pos) = body.find("as * const") {
         let after = &body[pos + 10..];
         let trimmed = after.trim_start();
-        let end = trimmed.find(|c: char| !c.is_alphanumeric() && c != '_')
+        let end = trimmed
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
             .unwrap_or(trimmed.len());
         return trimmed[..end].to_string();
     }
@@ -193,7 +201,8 @@ fn extract_field_from_access(body: &str) -> String {
     // Look for ").field_name" pattern
     if let Some(pos) = body.rfind(").") {
         let after = &body[pos + 2..];
-        let end = after.find(|c: char| !c.is_alphanumeric() && c != '_')
+        let end = after
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
             .unwrap_or(after.len());
         if end > 0 {
             return after[..end].to_string();
