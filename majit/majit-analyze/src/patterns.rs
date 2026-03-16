@@ -107,7 +107,9 @@ pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePatt
                 return Some(TracePattern::TruthCheck);
             }
             // Local variable access
-            "load_fast" | "load_fast_checked" | "load_fast_load_fast"
+            "load_fast"
+            | "load_fast_checked"
+            | "load_fast_load_fast"
             | "load_fast_pair_checked" => return Some(TracePattern::LocalRead),
             "store_fast" | "store_fast_checked" | "store_fast_store_fast" => {
                 return Some(TracePattern::LocalWrite);
@@ -220,9 +222,7 @@ pub fn classify_method_body(body_summary: &str) -> Option<TracePattern> {
         return Some(TracePattern::Jump);
     }
 
-    if body_summary.contains("set_next_instr")
-        && body_summary.contains("record_branch_guard")
-    {
+    if body_summary.contains("set_next_instr") && body_summary.contains("record_branch_guard") {
         return Some(TracePattern::ConditionalJump);
     }
 
@@ -276,9 +276,7 @@ pub fn classify_from_pattern(pattern: &str) -> Option<TracePattern> {
     }
 
     // Local variable access (superword instructions)
-    if pattern.contains("LoadFastBorrowLoadFastBorrow")
-        || pattern.contains("LoadFastLoadFast")
-    {
+    if pattern.contains("LoadFastBorrowLoadFastBorrow") || pattern.contains("LoadFastLoadFast") {
         return Some(TracePattern::LocalRead);
     }
     if pattern.contains("StoreFastStoreFast") {
@@ -309,8 +307,10 @@ pub fn classify_from_pattern(pattern: &str) -> Option<TracePattern> {
     }
 
     // Stack
-    if pattern.contains("PopTop") || pattern.contains("PushNull")
-        || pattern.contains("Copy") || pattern.contains("Swap")
+    if pattern.contains("PopTop")
+        || pattern.contains("PushNull")
+        || pattern.contains("Copy")
+        || pattern.contains("Swap")
     {
         return Some(TracePattern::StackManip);
     }

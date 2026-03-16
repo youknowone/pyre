@@ -50,7 +50,11 @@ fn main() {
     eprintln!(
         "[pyre-mjit build.rs] analyzed {} opcodes ({} classified), {} helpers, {} types, {} trait impls, generated {} bytes",
         result.opcodes.len(),
-        result.opcodes.iter().filter(|a| a.trace_pattern.is_some()).count(),
+        result
+            .opcodes
+            .iter()
+            .filter(|a| a.trace_pattern.is_some())
+            .count(),
         result.helpers.len(),
         result.type_layouts.len(),
         result.trait_impls.len(),
