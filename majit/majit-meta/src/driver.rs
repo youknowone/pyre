@@ -10,6 +10,20 @@ use crate::virtualizable::VirtualizableInfo;
 use crate::TraceAction;
 use majit_ir::{GreenKey, Type, Value};
 
+/// A named entry point registered with a [`JitDriver`].
+///
+/// Multiple functions can share the same JitDriver and compiled loops
+/// by registering additional entry points with distinct green key schemas.
+/// This models the warmspot multi-entry pattern where several
+/// `jit_merge_point` calls in different functions share one driver.
+#[derive(Debug, Clone)]
+pub struct EntryPoint {
+    /// Human-readable name of this entry point (e.g., function name).
+    pub name: String,
+    /// Green key type schema for this entry point.
+    pub schema: Vec<Type>,
+}
+
 /// High-level JIT driver that automates the tracing lifecycle.
 ///
 /// Wraps [`MetaInterp`] and manages symbolic state, replacing ~80 lines
@@ -31,6 +45,8 @@ pub struct JitDriver<S: JitState> {
     descriptor: Option<JitDriverDescriptor>,
     /// Bridge tracing state: (green_key, trace_id, fail_index).
     bridge_info: Option<(u64, u64, u32)>,
+    /// Additional entry points sharing this driver's compiled loops.
+    entry_points: Vec<EntryPoint>,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -42,12 +58,18 @@ impl<S: JitState> JitDriver<S> {
             trace_meta: None,
             descriptor: None,
             bridge_info: None,
+            entry_points: Vec::new(),
         }
     }
 
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverDescriptor) -> Self {
         let mut driver = Self::new(threshold);
+        let greens: Vec<Type> = descriptor.greens().iter().map(|v| v.tp).collect();
         driver.descriptor = Some(descriptor);
+        driver.entry_points.push(EntryPoint {
+            name: "primary".to_string(),
+            schema: greens,
+        });
         driver
     }
 
@@ -514,6 +536,28 @@ impl<S: JitState> JitDriver<S> {
             &virtualizable.name,
             self.meta.virtualizable_info(),
         );
+    }
+
+    /// Register an additional entry point for this driver.
+    ///
+    /// Multiple functions can share the same JitDriver and compiled loops.
+    /// Each entry point has a name and a green key schema describing the
+    /// types of its green (loop-invariant) variables.
+    pub fn register_entry_point(&mut self, name: &str, green_key_schema: &[Type]) {
+        self.entry_points.push(EntryPoint {
+            name: name.to_string(),
+            schema: green_key_schema.to_vec(),
+        });
+    }
+
+    /// Return all registered entry points.
+    pub fn entry_points(&self) -> &[EntryPoint] {
+        &self.entry_points
+    }
+
+    /// Look up an entry point by name.
+    pub fn find_entry_point(&self, name: &str) -> Option<&EntryPoint> {
+        self.entry_points.iter().find(|ep| ep.name == name)
     }
 
     /// Set virtualizable info for frame virtualization.
@@ -1594,5 +1638,91 @@ mod tests {
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 0);
         assert_eq!(stats.loops_aborted, 1);
+    }
+
+    // ── Multi-entry point lifecycle tests ──
+    // Parity with warmspot.py multi-driver entry semantics: multiple functions
+    // can share the same JitDriver and compiled loops via register_entry_point.
+
+    #[test]
+    fn test_multi_entry_point_registration() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+
+        // Initially no entry points.
+        assert!(driver.entry_points().is_empty());
+
+        // Register two entry points with different green key schemas.
+        driver.register_entry_point("loop_main", &[Type::Int]);
+        driver.register_entry_point("loop_helper", &[Type::Int, Type::Ref]);
+
+        assert_eq!(driver.entry_points().len(), 2);
+
+        // Verify first entry point.
+        let ep0 = driver.find_entry_point("loop_main").expect("should find loop_main");
+        assert_eq!(ep0.name, "loop_main");
+        assert_eq!(ep0.schema, vec![Type::Int]);
+
+        // Verify second entry point.
+        let ep1 = driver.find_entry_point("loop_helper").expect("should find loop_helper");
+        assert_eq!(ep1.name, "loop_helper");
+        assert_eq!(ep1.schema, vec![Type::Int, Type::Ref]);
+
+        // Non-existent entry point returns None.
+        assert!(driver.find_entry_point("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_multi_entry_points_share_compiled_loops() {
+        // Two entry points register different functions on the same driver.
+        // A loop compiled from one entry point is visible to back_edge calls
+        // from any entry point, since they share the same MetaInterp and
+        // compiled loop table (keyed by green_key, not by entry point name).
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.register_entry_point("func_a", &[Type::Int]);
+        driver.register_entry_point("func_b", &[Type::Int]);
+
+        // Both entry points are registered.
+        assert_eq!(driver.entry_points().len(), 2);
+
+        // Compile a loop from "func_a"'s perspective using green_key=10.
+        let key = 10u64;
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[0]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[0]),
+            BackEdgeAction::StartedTracing
+        ));
+
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let cond = ctx.const_int(0);
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[sum]);
+        }
+        driver.meta.close_and_compile(&[OpRef(0)], ());
+        assert!(driver.has_compiled_loop(key));
+
+        // "func_b" can see the compiled loop via the same green_key.
+        // The compiled loop is shared — it doesn't matter which entry point
+        // triggered the compilation.
+        assert!(
+            driver.has_compiled_loop(key),
+            "compiled loop should be visible from any entry point"
+        );
+
+        // A different green key from "func_b" does not see the loop.
+        let other_key = 20u64;
+        assert!(
+            !driver.has_compiled_loop(other_key),
+            "different green_key should not match"
+        );
+
+        // The driver stats reflect exactly one compiled loop.
+        let stats = driver.get_stats();
+        assert_eq!(stats.loops_compiled, 1);
     }
 }

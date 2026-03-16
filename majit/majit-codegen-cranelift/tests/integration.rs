@@ -3274,3 +3274,125 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     assert_eq!(innermost.trace_id, Some(930));
     assert_eq!(innermost.header_pc, Some(5000));
 }
+
+// ---------------------------------------------------------------------------
+// Test: FFI exchange buffer pattern
+//
+// Parity with rpython/jit/metainterp/test/test_fficall.py lines 240-290.
+// Simulates the libffi exchange buffer protocol:
+//   1. RawStore arguments to buffer at known offsets (exchange_args)
+//   2. CallReleaseGilI (the FFI callee reads from buffer, writes result)
+//   3. RawLoadI result from buffer at exchange_result offset
+//
+// The buffer layout follows RPython's CIF description convention:
+//   offset 16 = first argument slot
+//   offset 32 = result slot
+// ---------------------------------------------------------------------------
+
+/// FFI function that reads from an exchange buffer and writes back.
+/// Simulates `fake_call_impl_any` from test_fficall.py:
+///   reads arg at offset 16, computes arg * 2, writes result at offset 32.
+extern "C" fn ffi_exchange_buffer_fn(buf_ptr: i64) -> i64 {
+    let buf = buf_ptr as *mut u8;
+    unsafe {
+        let arg = *(buf.add(16) as *const i64);
+        let result = arg * 2;
+        *(buf.add(32) as *mut i64) = result;
+    }
+    0 // return value unused; result is in the buffer
+}
+
+#[test]
+fn test_ffi_exchange_buffer_pattern() {
+    // Simulate FFI exchange buffer:
+    // 1. RawStore arguments to buffer at known offsets
+    // 2. CallReleaseGilI (the FFI call reads from buffer)
+    // 3. RawLoadI result from buffer
+    // This is the pattern RPython uses for libffi calls.
+
+    let ad = raw_descr_int(8);
+    let cd = call_descr_release_gil_i(80, vec![Type::Ref]);
+
+    // Constants: offset_16 = 16 (exchange_args[0]), offset_32 = 32 (exchange_result)
+    let off_arg = OpRef(1000);   // offset 16
+    let off_result = OpRef(1001); // offset 32
+    let fn_ptr = OpRef(1002);     // ffi_exchange_buffer_fn
+
+    let mut rec = TraceRecorder::new();
+    // Inputs: r0 = exchange buffer pointer, i0 = argument value
+    let r0 = rec.record_input_arg(Type::Ref);
+    let i0 = rec.record_input_arg(Type::Int);
+
+    // Step 1: Store argument into buffer at offset 16 (exchange_args[0])
+    rec.record_op_with_descr(OpCode::RawStore, &[r0, off_arg, i0], ad.clone());
+
+    // Step 2: Call the FFI function with buffer pointer
+    let _call_result = rec.record_op_with_descr(
+        OpCode::CallReleaseGilI,
+        &[fn_ptr, r0],
+        cd,
+    );
+
+    // Step 3: Load result from buffer at offset 32 (exchange_result)
+    let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, off_result], ad);
+
+    rec.finish(&[loaded], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 16i64);
+    constants.insert(1001, 32i64);
+    constants.insert(1002, ffi_exchange_buffer_fn as *const () as usize as i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(950);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("FFI exchange buffer pattern should compile");
+
+    // Allocate a 48-byte exchange buffer (matching RPython's exbuf allocation)
+    let mut exbuf = vec![0u8; 48];
+    let ptr = exbuf.as_mut_ptr() as usize;
+
+    // Execute with arg=25: store 25 at offset 16, FFI computes 25*2=50, load from offset 32
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Ref(GcRef(ptr)), Value::Int(25)],
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        50,
+        "exchange buffer: arg=25 -> result=50 (25*2)"
+    );
+
+    // Verify the buffer contents directly
+    let result_in_buf = unsafe { *(exbuf.as_ptr().add(32) as *const i64) };
+    assert_eq!(result_in_buf, 50, "buffer at offset 32 should contain 50");
+
+    // Execute with another value: arg=0
+    exbuf.fill(0);
+    let ptr = exbuf.as_mut_ptr() as usize;
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Ref(GcRef(ptr)), Value::Int(0)],
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        0,
+        "exchange buffer: arg=0 -> result=0"
+    );
+
+    // Execute with negative value: arg=-10
+    exbuf.fill(0);
+    let ptr = exbuf.as_mut_ptr() as usize;
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Ref(GcRef(ptr)), Value::Int(-10)],
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        -20,
+        "exchange buffer: arg=-10 -> result=-20"
+    );
+}
