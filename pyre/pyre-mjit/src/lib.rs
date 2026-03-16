@@ -7,6 +7,21 @@
 //! The interpreter (`pyre-interp`) has zero JIT dependencies.
 //! All JIT logic lives here, generated from static analysis of
 //! the interpreter's source code.
+//!
+//! Architecture:
+//! ```text
+//! pyre-interp (pure interpreter)
+//!       ↓ (source analysis at build time)
+//! majit-analyze (RPython translator)
+//!       ↓ (code generation)
+//! pyre-mjit (this crate)
+//!   ├── jit_trace_gen.rs (auto-generated trace functions)
+//!   ├── driver.rs (JIT driver integration)
+//!   └── lib.rs (public API)
+//! ```
+
+pub mod driver;
+pub mod eval;
 
 // Include auto-generated trace dispatch table and helpers
 include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));

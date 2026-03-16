@@ -8,3 +8,4 @@ pyre-object = { workspace = true }
 pyre-runtime = { workspace = true }
 pyre-bytecode = { workspace = true }
 pyre-interp = { workspace = true }
+pyre-mjit = { path = "../pyre-mjit" }
