@@ -289,8 +289,8 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let code_ptr = unsafe { w_func_get_code_ptr(callable) };
 
     // Check force cache before allocating a frame.
-    // On hit, return a tagged pointer (bit 0 = 1, bits 1.. = result)
-    // that the call_assembler shim recognizes as a pre-computed result.
+    // On hit, return a tagged pointer (bit 0 = 1, bits 1.. = result).
+    // The CALL_ASSEMBLER IR code checks bit 0 before any dereference.
     let code_key = code_ptr as usize;
     let arg_key = if !args.is_empty() {
         force_cache_arg_key(args[0])
@@ -306,7 +306,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
         }
     }
 
-    // Cache miss: create frame normally
+    // Cache miss: create frame
     let frame = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { w_func_get_globals(callable) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;

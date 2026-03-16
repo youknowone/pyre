@@ -1498,31 +1498,11 @@ impl TraceFrameState {
                             let mut helper_args = vec![this.frame(), callable];
                             helper_args.extend_from_slice(args);
                             let callee_frame = ctx.call_int(frame_helper, &helper_args);
-                            let callee_ni = frame_get_next_instr(ctx, callee_frame);
-                            let callee_sd = frame_get_stack_depth(ctx, callee_frame);
-                            let mut ca_args = vec![callee_frame, callee_ni, callee_sd];
-                            let callee_locals_ptr = frame_locals_array(ctx, callee_frame);
-                            for i in 0..callee_nlocals {
-                                let idx = ctx.const_int(i as i64);
-                                let val = ctx.record_op_with_descr(
-                                    OpCode::GetarrayitemRawI,
-                                    &[callee_locals_ptr, idx],
-                                    pyobject_array_descr(),
-                                );
-                                ca_args.push(val);
-                            }
-                            let callee_stack_ptr = frame_stack_array(ctx, callee_frame);
-                            for i in 0..callee_sdepth {
-                                let idx = ctx.const_int(i as i64);
-                                let val = ctx.record_op_with_descr(
-                                    OpCode::GetarrayitemRawI,
-                                    &[callee_stack_ptr, idx],
-                                    pyobject_array_descr(),
-                                );
-                                ca_args.push(val);
-                            }
+                            // Pass only [callee_frame] — no GETFIELD here because
+                            // callee_frame may be a tagged pointer (force_cache hit).
+                            // The target's preamble reads fields from the frame.
                             let result = ctx.call_assembler_int_by_number(
-                                token_number, &ca_args,
+                                token_number, &[callee_frame],
                             );
                             ctx.call_void(
                                 crate::call::jit_drop_callee_frame as *const (),
