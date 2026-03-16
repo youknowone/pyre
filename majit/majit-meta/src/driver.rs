@@ -1,7 +1,8 @@
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::meta_interp::{
-    BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision, MetaInterp,
+    BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision, JitStats,
+    MetaInterp,
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx};
@@ -538,6 +539,30 @@ impl<S: JitState> JitDriver<S> {
     /// Set a callback for guard failure events.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
         self.meta.set_on_guard_failure(f);
+    }
+
+    /// Set a JIT parameter by name at runtime.
+    ///
+    /// Supported parameters:
+    /// - `"threshold"` — compilation hot-count threshold
+    /// - `"trace_eagerness"` — guard failure count before bridge tracing
+    /// - `"bridge_threshold"` — guard failure count before bridge compilation
+    /// - `"function_threshold"` — function call count before inlining
+    ///
+    /// Unknown parameter names are silently ignored.
+    pub fn set_param(&mut self, name: &str, value: i64) {
+        match name {
+            "threshold" => self.meta.set_threshold(value as u32),
+            "trace_eagerness" => self.meta.set_trace_eagerness(value as u32),
+            "bridge_threshold" => self.meta.set_bridge_threshold(value as u32),
+            "function_threshold" => self.meta.set_function_threshold(value as u32),
+            _ => {} // unknown params silently ignored
+        }
+    }
+
+    /// Return a snapshot of the cumulative JIT compilation statistics.
+    pub fn get_stats(&self) -> JitStats {
+        self.meta.get_stats()
     }
 
     /// Get direct access to the underlying MetaInterp.
@@ -1275,5 +1300,79 @@ mod tests {
         assert_eq!(state.seen_header_pc, Some(1701));
         assert_eq!(state.seen_source_guard, Some((700, 0)));
         assert_eq!(state.restored_values, vec![Value::Int(44)]);
+    }
+
+    #[test]
+    fn test_set_param_threshold() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(10);
+        // Initially threshold is 10 — not hot after 2 ticks.
+        let key = 100u64;
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[]),
+            BackEdgeAction::Interpret
+        ));
+
+        // Lower threshold to 1 via set_param — next tick should start tracing.
+        driver.set_param("threshold", 1);
+        let key2 = 200u64;
+        assert!(matches!(
+            driver.meta.on_back_edge(key2, &[]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key2, &[]),
+            BackEdgeAction::StartedTracing
+        ));
+    }
+
+    #[test]
+    fn test_get_stats_after_compile() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        let key = 300u64;
+
+        // Stats should be zero initially.
+        let stats = driver.get_stats();
+        assert_eq!(stats.loops_compiled, 0);
+        assert_eq!(stats.loops_aborted, 0);
+
+        // Warm up and start tracing.
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[]),
+            BackEdgeAction::StartedTracing
+        ));
+
+        // Record minimal trace and compile.
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let _val = ctx.const_int(42);
+        }
+        driver.meta.close_and_compile(&[], ());
+        assert!(driver.has_compiled_loop(key));
+
+        let stats = driver.get_stats();
+        assert_eq!(stats.loops_compiled, 1);
+        assert_eq!(stats.loops_aborted, 0);
+        assert_eq!(stats.bridges_compiled, 0);
+    }
+
+    #[test]
+    fn test_set_param_unknown_ignored() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(5);
+        // Unknown params should not panic or cause any side effects.
+        driver.set_param("nonexistent_param", 999);
+        driver.set_param("", 0);
+        driver.set_param("enable_opts", 1);
+
+        // Driver should still work normally after unknown params.
+        let stats = driver.get_stats();
+        assert_eq!(stats.loops_compiled, 0);
     }
 }

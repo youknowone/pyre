@@ -48,7 +48,7 @@ pub use majit_codegen::CompiledTraceInfo;
 pub use meta_interp::{
     BackEdgeAction, BlackholeRunResult, CompiledExitLayout, CompiledTerminalExitLayout,
     CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, DriverRunOutcome,
-    GuardRecoveryAction, InlineDecision, JitHooks, MetaInterp, RawCompileResult,
+    GuardRecoveryAction, InlineDecision, JitHooks, JitStats, MetaInterp, RawCompileResult,
 };
 pub use parity::{assert_trace_parity, normalize_ops, normalize_trace, TraceParityCase};
 pub use quasi_immut::QuasiImmut;

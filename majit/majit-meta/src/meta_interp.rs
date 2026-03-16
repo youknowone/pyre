@@ -5,8 +5,11 @@ use majit_codegen::{
     TerminalExitLayout,
 };
 use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{GcRef, InputArg, OpCode, OpRef, Type, Value};
+use majit_ir::{
+    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
+};
 use majit_opt::optimizer::Optimizer;
+use std::sync::Arc;
 use majit_trace::trace::Trace;
 use majit_trace::warmstate::{HotResult, WarmState};
 
@@ -19,6 +22,242 @@ use crate::resume::{
 };
 use crate::trace_ctx::{JitDriverDescriptor, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
+
+// ── Preamble descriptors for virtualizable field loads ────────────────
+
+/// Lightweight field descriptor for virtualizable preamble ops.
+#[derive(Debug)]
+struct VableFieldDescr {
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+}
+
+impl Descr for VableFieldDescr {
+    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+        Some(self)
+    }
+}
+
+impl FieldDescr for VableFieldDescr {
+    fn offset(&self) -> usize {
+        self.offset
+    }
+    fn field_size(&self) -> usize {
+        self.field_size
+    }
+    fn field_type(&self) -> Type {
+        self.field_type
+    }
+    fn is_field_signed(&self) -> bool {
+        self.signed
+    }
+}
+
+/// Lightweight array descriptor for virtualizable preamble ops.
+#[derive(Debug)]
+struct VableArrayDescr {
+    base_size: usize,
+    item_size: usize,
+    item_type: Type,
+}
+
+impl Descr for VableArrayDescr {
+    fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
+        Some(self)
+    }
+}
+
+impl ArrayDescr for VableArrayDescr {
+    fn base_size(&self) -> usize {
+        self.base_size
+    }
+    fn item_size(&self) -> usize {
+        self.item_size
+    }
+    fn type_id(&self) -> u32 {
+        0
+    }
+    fn item_type(&self) -> Type {
+        self.item_type
+    }
+}
+
+fn make_vable_field_descr(offset: usize, signed: bool) -> DescrRef {
+    Arc::new(VableFieldDescr {
+        offset,
+        field_size: 8,
+        field_type: Type::Int,
+        signed,
+    })
+}
+
+fn make_vable_array_descr() -> DescrRef {
+    Arc::new(VableArrayDescr {
+        base_size: 0,
+        item_size: 8,
+        item_type: Type::Int,
+    })
+}
+
+/// Patch optimized ops by prepending a virtualizable preamble.
+///
+/// The preamble executes once at loop entry (in the Cranelift entry block),
+/// reading frame fields from memory. The Label defines the loop header's
+/// block parameters. The JUMP at the end of the loop body targets the
+/// Label, carrying the loop-updated values.
+///
+/// `inputargs` is modified in place to contain only `[frame]`.
+/// `constants` is extended with array index constants used by the preamble.
+/// Returns the patched ops (preamble + Label + optimized body).
+fn patch_new_loop_to_load_virtualizable_fields(
+    info: &VirtualizableInfo,
+    original_inputargs: &[InputArg],
+    optimized_ops: Vec<Op>,
+    constants: &mut HashMap<u32, i64>,
+) -> (Vec<InputArg>, Vec<Op>) {
+    // Compute array lengths from inputargs layout.
+    // Layout: [frame, s0, s1, ..., sN, a0_e0, a0_e1, ..., a1_e0, ...]
+    // where s0..sN are static fields and aI_eJ are array elements.
+    let num_static = info.num_static_fields;
+    let total_array_elements = original_inputargs.len().saturating_sub(1 + num_static);
+
+    // Distribute array elements across arrays.
+    // For pyre: locals come first, stack comes second.
+    // Without explicit lengths, we can't split perfectly. However, we
+    // store array_lengths in PyreMeta. At this level, we use a simple
+    // approach: the arrays are split by the tracer in order.
+    //
+    // Actually, we can infer from the concrete_frame at trace time.
+    // For the meta_interp level, we accept array_lengths as a parameter.
+    // Let's use a default split: all remaining go to the first array
+    // if there's only one, otherwise we need help.
+    let num_arrays = info.array_fields.len();
+    if num_arrays == 0 || total_array_elements == 0 {
+        // No array fields or no array elements: static fields are already
+        // passed as inputargs, no preamble needed.
+        return (original_inputargs.to_vec(), optimized_ops);
+    }
+    let array_lengths = if num_arrays == 1 {
+        vec![total_array_elements]
+    } else {
+        // Can't determine split without external info; skip patching.
+        // For pyre, the caller will provide lengths through PyreMeta.
+        return (original_inputargs.to_vec(), optimized_ops);
+    };
+
+    patch_with_array_lengths(info, original_inputargs, optimized_ops, constants, &array_lengths)
+}
+
+/// Core preamble patching with explicit array lengths.
+fn patch_with_array_lengths(
+    info: &VirtualizableInfo,
+    original_inputargs: &[InputArg],
+    optimized_ops: Vec<Op>,
+    constants: &mut HashMap<u32, i64>,
+    array_lengths: &[usize],
+) -> (Vec<InputArg>, Vec<Op>) {
+    let frame_ref = OpRef(0);
+    let array_descr = make_vable_array_descr();
+    let mut preamble = Vec::new();
+    let mut label_args: Vec<OpRef> = vec![frame_ref];
+
+    // Static fields
+    for (i, field) in info.static_fields.iter().enumerate() {
+        let pos = OpRef((1 + i) as u32);
+        let descr = make_vable_field_descr(field.offset, true);
+        let mut op = Op::with_descr(OpCode::GetfieldRawI, &[frame_ref], descr);
+        op.pos = pos;
+        preamble.push(op);
+        label_args.push(pos);
+    }
+
+    // Array fields - use temporary positions for array pointers
+    let mut arg_idx = (1 + info.num_static_fields) as u32;
+    // Use constant range that won't conflict with existing constants.
+    // Pick a base above 10_000 but separate from user constants.
+    let mut next_const_key = 20_000u32;
+    // Find a safe constant key base that doesn't conflict
+    while constants.contains_key(&next_const_key) {
+        next_const_key += 1000;
+    }
+
+    // Temporary positions for array pointers - must not conflict with any
+    // existing op position in the optimized trace.
+    let max_existing_pos = optimized_ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.result_type() != Type::Void)
+        .map(|(idx, op)| {
+            if op.pos.is_none() {
+                (original_inputargs.len() + idx) as u32
+            } else {
+                op.pos.0
+            }
+        })
+        .max()
+        .unwrap_or(original_inputargs.len() as u32);
+    let mut tmp_pos = max_existing_pos + 1;
+
+    for (ai, array_field) in info.array_fields.iter().enumerate() {
+        let count = array_lengths.get(ai).copied().unwrap_or(0);
+
+        // Load array pointer from frame
+        let array_ptr_descr = make_vable_field_descr(array_field.field_offset, false);
+        let array_ptr_pos = OpRef(tmp_pos);
+        tmp_pos += 1;
+        let mut ptr_op = Op::with_descr(OpCode::GetfieldRawI, &[frame_ref], array_ptr_descr);
+        ptr_op.pos = array_ptr_pos;
+        preamble.push(ptr_op);
+
+        // Load each element
+        for ei in 0..count {
+            let elem_pos = OpRef(arg_idx);
+            arg_idx += 1;
+
+            let idx_const_key = next_const_key;
+            next_const_key += 1;
+            constants.insert(idx_const_key, ei as i64);
+            let idx_ref = OpRef(idx_const_key);
+
+            let mut elem_op = Op::with_descr(
+                OpCode::GetarrayitemRawI,
+                &[array_ptr_pos, idx_ref],
+                array_descr.clone(),
+            );
+            elem_op.pos = elem_pos;
+            preamble.push(elem_op);
+            label_args.push(elem_pos);
+        }
+    }
+
+    // Label op defining loop header
+    let mut label = Op::new(OpCode::Label, &label_args);
+    label.pos = OpRef::NONE;
+    preamble.push(label);
+
+    // Combine: preamble + optimized body (skip any existing Label in optimized_ops)
+    let mut result_ops = preamble;
+    for op in optimized_ops {
+        if op.opcode == OpCode::Label {
+            continue; // our Label replaces any existing one
+        }
+        result_ops.push(op);
+    }
+
+    // New inputargs: just [frame], preserving its original type
+    let frame_type = original_inputargs
+        .first()
+        .map(|ia| ia.tp)
+        .unwrap_or(Type::Int);
+    let new_inputargs = vec![InputArg {
+        tp: frame_type,
+        index: 0,
+    }];
+
+    (new_inputargs, result_ops)
+}
 
 /// Result of checking a back-edge.
 pub enum BackEdgeAction {
@@ -243,6 +482,26 @@ pub struct MetaInterp<M: Clone> {
     /// Set when tracing starts so that self-recursive calls can emit
     /// call_assembler targeting this token before the trace is compiled.
     pending_token: Option<(u64, u64)>,
+    /// Cumulative statistics counters.
+    stats: JitStatsCounters,
+}
+
+/// Internal mutable counters for JIT compilation statistics.
+#[derive(Default, Clone, Debug)]
+struct JitStatsCounters {
+    loops_compiled: usize,
+    loops_aborted: usize,
+    bridges_compiled: usize,
+    guard_failures: usize,
+}
+
+/// Snapshot of cumulative JIT compilation statistics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JitStats {
+    pub loops_compiled: usize,
+    pub loops_aborted: usize,
+    pub bridges_compiled: usize,
+    pub guard_failures: usize,
 }
 
 /// Callback hooks for JIT events (compilation, guard failures, etc.).
@@ -568,6 +827,7 @@ impl<M: Clone> MetaInterp<M> {
             virtualizable_info: None,
             hooks: JitHooks::default(),
             pending_token: None,
+            stats: JitStatsCounters::default(),
         }
     }
 
@@ -652,6 +912,16 @@ impl<M: Clone> MetaInterp<M> {
     /// Set a callback for compilation error events (loop or bridge).
     pub fn set_on_compile_error(&mut self, f: impl Fn(u64, &str) + Send + 'static) {
         self.hooks.on_compile_error = Some(Box::new(f));
+    }
+
+    /// Return a snapshot of the cumulative JIT compilation statistics.
+    pub fn get_stats(&self) -> JitStats {
+        JitStats {
+            loops_compiled: self.stats.loops_compiled,
+            loops_aborted: self.stats.loops_aborted,
+            bridges_compiled: self.stats.bridges_compiled,
+            guard_failures: self.stats.guard_failures,
+        }
     }
 
     /// Check a back-edge: is this location hot enough to trace or run?
@@ -829,6 +1099,21 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
 
+        // Patch: prepend virtualizable field loads as a preamble before the
+        // loop body. Entry block reads fields from frame; Label defines the
+        // loop header block params; JUMP targets them on the back-edge.
+        let (inputargs, optimized_ops) = if let Some(ref info) = self.virtualizable_info {
+            let (new_ia, new_ops) = patch_new_loop_to_load_virtualizable_fields(
+                info,
+                &inputargs,
+                optimized_ops,
+                &mut constants,
+            );
+            (new_ia, new_ops)
+        } else {
+            (inputargs, optimized_ops)
+        };
+
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
@@ -928,11 +1213,14 @@ impl<M: Clone> MetaInterp<M> {
                 let install_token = LoopToken::new(install_num);
                 self.warm_state.install_compiled(green_key, install_token);
 
+                self.stats.loops_compiled += 1;
+
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
                 }
             }
             Err(e) => {
+                self.stats.loops_aborted += 1;
                 let msg = format!("JIT compilation failed: {e}");
                 if crate::majit_log_enabled() {
                     eprintln!("[jit] {msg}");
@@ -952,6 +1240,7 @@ impl<M: Clone> MetaInterp<M> {
     /// If `permanent` is true, this location will never be traced again.
     pub fn abort_trace(&mut self, permanent: bool) {
         if let Some(ctx) = self.tracing.take() {
+            self.stats.loops_aborted += 1;
             let green_key = ctx.green_key;
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -1006,9 +1295,6 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        let compiled_constants = constants.clone();
-        self.backend.set_constants(constants);
-
         // Use pre-allocated token number if available (for self-recursion
         // support), otherwise allocate a fresh one.
         let token_num = if let Some((pk, pn)) = self.pending_token.take() {
@@ -1033,6 +1319,24 @@ impl<M: Clone> MetaInterp<M> {
                 index: inputargs.len() as u32,
             });
         }
+
+        // Patch: prepend virtualizable field loads as a preamble (same as
+        // close_and_compile). For finish traces the preamble still reads
+        // frame fields in the entry block; FINISH exits from the loop body.
+        let (inputargs, optimized_ops) = if let Some(ref info) = self.virtualizable_info {
+            let (new_ia, new_ops) = patch_new_loop_to_load_virtualizable_fields(
+                info,
+                &inputargs,
+                optimized_ops,
+                &mut constants,
+            );
+            (new_ia, new_ops)
+        } else {
+            (inputargs, optimized_ops)
+        };
+
+        let compiled_constants = constants.clone();
+        self.backend.set_constants(constants);
 
         match self
             .backend
@@ -1101,6 +1405,7 @@ impl<M: Clone> MetaInterp<M> {
                 let install_token = LoopToken::new(install_num);
                 self.warm_state.install_compiled(green_key, install_token);
                 self.warm_state.reset_function_counts();
+                self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] finish_and_compile: compiled trace key={}, trace_id={}",
@@ -1112,6 +1417,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             Err(e) => {
+                self.stats.loops_aborted += 1;
                 let msg = format!("finish_and_compile: compile_loop FAILED key={green_key}: {e:?}");
                 if crate::majit_log_enabled() {
                     eprintln!("[jit] {msg}");
@@ -1175,6 +1481,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
 
+            self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
@@ -1225,6 +1532,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
 
+            self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
@@ -1271,6 +1579,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
 
+            self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
@@ -1321,6 +1630,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
 
+            self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
@@ -1428,6 +1738,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
 
+            self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
@@ -1536,6 +1847,7 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_compiled: false,
                 });
             info.fail_count += 1;
+            self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
@@ -1636,6 +1948,7 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_compiled: false,
                 });
             info.fail_count += 1;
+            self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
@@ -2268,6 +2581,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.warm_state.log_bridge_compile(fail_index);
+                self.stats.bridges_compiled += 1;
 
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
                     hook(green_key, fail_index, num_optimized_ops);
