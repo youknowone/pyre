@@ -44,23 +44,53 @@ pub fn extract_type_layouts(parsed: &ParsedInterpreter) -> Vec<TypeLayout> {
     layouts
 }
 
-/// Extract trait implementations from the parsed source.
+/// Extract trait implementations AND trait default methods from the parsed source.
 pub fn extract_trait_impls(parsed: &ParsedInterpreter) -> Vec<TraitImplInfo> {
     let mut impls = Vec::new();
+
     for item in &parsed.file.items {
-        if let Item::Impl(impl_block) = item {
-            if let Some((_, trait_path, _)) = &impl_block.trait_ {
-                let trait_name = quote::quote!(#trait_path).to_string();
-                let self_ty = &impl_block.self_ty;
-                let for_type = quote::quote!(#self_ty).to_string();
-                let methods: Vec<MethodInfo> = impl_block
+        match item {
+            // Concrete trait impls (impl Trait for Type)
+            Item::Impl(impl_block) => {
+                if let Some((_, trait_path, _)) = &impl_block.trait_ {
+                    let trait_name = quote::quote!(#trait_path).to_string();
+                    let self_ty = &impl_block.self_ty;
+                    let for_type = quote::quote!(#self_ty).to_string();
+                    let methods: Vec<MethodInfo> = impl_block
+                        .items
+                        .iter()
+                        .filter_map(|item| {
+                            if let syn::ImplItem::Fn(method) = item {
+                                Some(MethodInfo {
+                                    name: method.sig.ident.to_string(),
+                                    body_summary: summarize_block(&method.block),
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !methods.is_empty() {
+                        impls.push(TraitImplInfo {
+                            trait_name,
+                            for_type,
+                            methods,
+                        });
+                    }
+                }
+            }
+            // Trait definitions with default methods
+            Item::Trait(trait_def) => {
+                let trait_name = trait_def.ident.to_string();
+                let methods: Vec<MethodInfo> = trait_def
                     .items
                     .iter()
                     .filter_map(|item| {
-                        if let syn::ImplItem::Fn(method) = item {
-                            Some(MethodInfo {
+                        if let syn::TraitItem::Fn(method) = item {
+                            // Only include methods with a default body
+                            method.default.as_ref().map(|block| MethodInfo {
                                 name: method.sig.ident.to_string(),
-                                body_summary: summarize_block(&method.block),
+                                body_summary: summarize_block(block),
                             })
                         } else {
                             None
@@ -69,12 +99,13 @@ pub fn extract_trait_impls(parsed: &ParsedInterpreter) -> Vec<TraitImplInfo> {
                     .collect();
                 if !methods.is_empty() {
                     impls.push(TraitImplInfo {
-                        trait_name,
-                        for_type,
+                        trait_name: trait_name.clone(),
+                        for_type: format!("<default methods of {}>", trait_name),
                         methods,
                     });
                 }
             }
+            _ => {}
         }
     }
     impls
@@ -116,6 +147,35 @@ pub fn extract_opcode_dispatch(
     arms
 }
 
+/// Collect all function definitions into a name → body_summary map.
+pub fn collect_functions(
+    parsed: &ParsedInterpreter,
+    functions: &mut std::collections::HashMap<String, String>,
+) {
+    for item in &parsed.file.items {
+        match item {
+            Item::Fn(func) => {
+                let name = func.sig.ident.to_string();
+                let body = summarize_block(&func.block);
+                functions.insert(name, body);
+            }
+            Item::Impl(impl_block) => {
+                // Also collect methods from inherent impls (no trait)
+                if impl_block.trait_.is_none() {
+                    for item in &impl_block.items {
+                        if let syn::ImplItem::Fn(method) = item {
+                            let name = method.sig.ident.to_string();
+                            let body = summarize_block(&method.block);
+                            functions.insert(name, body);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Extract match arms from a function containing a match on instruction.
 fn extract_match_arms(func: &ItemFn) -> Vec<OpcodeArm> {
     let mut collector = MatchArmCollector { arms: Vec::new() };
@@ -136,6 +196,7 @@ impl<'ast> Visit<'ast> for MatchArmCollector {
             self.arms.push(OpcodeArm {
                 pattern,
                 handler_calls,
+                resolved_calls: Vec::new(),
                 trace_pattern: None,
             });
         }
@@ -170,12 +231,12 @@ impl<'ast, 'a> Visit<'ast> for CallCollector<'a> {
     }
 }
 
-/// Create a brief summary of a block's content.
+/// Create a summary of a block's content.
 fn summarize_block(block: &syn::Block) -> String {
     let tokens = quote::quote!(#block);
     let s = tokens.to_string();
-    if s.len() > 200 {
-        format!("{}...", &s[..200])
+    if s.len() > 500 {
+        format!("{}...", &s[..500])
     } else {
         s
     }

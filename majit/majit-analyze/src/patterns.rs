@@ -57,6 +57,56 @@ pub enum TracePattern {
     Unknown,
 }
 
+/// Classify an opcode from its resolved call chain.
+pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePattern> {
+    for call in calls {
+        // Check the handler method name and its body
+        let name = &call.name;
+        let body = &call.body_summary;
+
+        match name.as_str() {
+            "binary_op" => {
+                // ArithmeticOpcodeHandler::binary_op → dispatches to w_binary_op etc.
+                return Some(TracePattern::UnboxIntBinop {
+                    op_name: "dispatch".into(),
+                    has_overflow_guard: true,
+                });
+            }
+            "compare_op" => {
+                return Some(TracePattern::UnboxIntCompare {
+                    op_name: "dispatch".into(),
+                });
+            }
+            "unary_negative" | "unary_invert" => {
+                return Some(TracePattern::UnboxIntUnary {
+                    op_name: name.clone(),
+                });
+            }
+            "unary_not" => {
+                return Some(TracePattern::TruthCheck);
+            }
+            "load_fast" | "load_fast_checked" => return Some(TracePattern::LocalRead),
+            "store_fast" | "store_fast_checked" => return Some(TracePattern::LocalWrite),
+            "load_const" => return Some(TracePattern::ConstLoad),
+            "call" => return Some(TracePattern::FunctionCall),
+            "for_iter" => return Some(TracePattern::RangeIterNext),
+            "get_iter" | "build_list" | "build_tuple" | "build_map"
+            | "unpack_sequence" | "store_subscr" | "list_append" => {
+                return Some(TracePattern::Residual {
+                    helper_name: name.clone(),
+                });
+            }
+            _ => {
+                // Try body heuristics
+                if let Some(p) = classify_method_body(body) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Classify a method body summary into a trace pattern.
 pub fn classify_method_body(body_summary: &str) -> Option<TracePattern> {
     // Heuristic pattern matching on the body text
