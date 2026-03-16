@@ -116,38 +116,27 @@ fn patch_new_loop_to_load_virtualizable_fields(
     original_inputargs: &[InputArg],
     optimized_ops: Vec<Op>,
     constants: &mut HashMap<u32, i64>,
+    array_lengths: &[usize],
 ) -> (Vec<InputArg>, Vec<Op>) {
-    // Compute array lengths from inputargs layout.
-    // Layout: [frame, s0, s1, ..., sN, a0_e0, a0_e1, ..., a1_e0, ...]
-    // where s0..sN are static fields and aI_eJ are array elements.
     let num_static = info.num_static_fields;
     let total_array_elements = original_inputargs.len().saturating_sub(1 + num_static);
 
-    // Distribute array elements across arrays.
-    // For pyre: locals come first, stack comes second.
-    // Without explicit lengths, we can't split perfectly. However, we
-    // store array_lengths in PyreMeta. At this level, we use a simple
-    // approach: the arrays are split by the tracer in order.
-    //
-    // Actually, we can infer from the concrete_frame at trace time.
-    // For the meta_interp level, we accept array_lengths as a parameter.
-    // Let's use a default split: all remaining go to the first array
-    // if there's only one, otherwise we need help.
-    let num_arrays = info.array_fields.len();
-    if num_arrays == 0 || total_array_elements == 0 {
-        // No array fields or no array elements: static fields are already
-        // passed as inputargs, no preamble needed.
+    if total_array_elements == 0 && num_static == 0 {
         return (original_inputargs.to_vec(), optimized_ops);
     }
-    let array_lengths = if num_arrays == 1 {
-        vec![total_array_elements]
+
+    let effective_lengths = if array_lengths.is_empty() {
+        let num_arrays = info.array_fields.len();
+        if num_arrays == 1 {
+            vec![total_array_elements]
+        } else {
+            return (original_inputargs.to_vec(), optimized_ops);
+        }
     } else {
-        // Can't determine split without external info; skip patching.
-        // For pyre, the caller will provide lengths through PyreMeta.
-        return (original_inputargs.to_vec(), optimized_ops);
+        array_lengths.to_vec()
     };
 
-    patch_with_array_lengths(info, original_inputargs, optimized_ops, constants, &array_lengths)
+    patch_with_array_lengths(info, original_inputargs, optimized_ops, constants, &effective_lengths)
 }
 
 /// Core preamble patching with explicit array lengths.
@@ -484,6 +473,10 @@ pub struct MetaInterp<M: Clone> {
     pending_token: Option<(u64, u64)>,
     /// Cumulative statistics counters.
     stats: JitStatsCounters,
+    /// Array field lengths for the current trace's virtualizable layout.
+    /// Set by the driver/tracer before compilation; used by preamble patching
+    /// to correctly split [locals..., stack...] in the inputargs.
+    vable_array_lengths: Vec<usize>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -828,7 +821,13 @@ impl<M: Clone> MetaInterp<M> {
             hooks: JitHooks::default(),
             pending_token: None,
             stats: JitStatsCounters::default(),
+            vable_array_lengths: Vec::new(),
         }
+    }
+
+    /// Set virtualizable array lengths for preamble patching.
+    pub fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
+        self.vable_array_lengths = lengths;
     }
 
     /// Set the trace eagerness (guard failure threshold for bridge tracing).
@@ -1108,6 +1107,7 @@ impl<M: Clone> MetaInterp<M> {
                 &inputargs,
                 optimized_ops,
                 &mut constants,
+                &self.vable_array_lengths,
             );
             (new_ia, new_ops)
         } else {
@@ -1320,20 +1320,8 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
 
-        // Patch: prepend virtualizable field loads as a preamble (same as
-        // close_and_compile). For finish traces the preamble still reads
-        // frame fields in the entry block; FINISH exits from the loop body.
-        let (inputargs, optimized_ops) = if let Some(ref info) = self.virtualizable_info {
-            let (new_ia, new_ops) = patch_new_loop_to_load_virtualizable_fields(
-                info,
-                &inputargs,
-                optimized_ops,
-                &mut constants,
-            );
-            (new_ia, new_ops)
-        } else {
-            (inputargs, optimized_ops)
-        };
+        // No preamble patching for FINISH traces — they are linear (no JUMP
+        // back-edge), so all inputargs are passed directly by CALL_ASSEMBLER.
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
