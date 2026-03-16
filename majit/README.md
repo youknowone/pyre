@@ -112,4 +112,4 @@ majit/                          # facade crate (re-exports all below)
 
 ## License
 
-MIT
+MIT — same as [PyPy/RPython](https://github.com/pypy/pypy/blob/main/LICENSE).
