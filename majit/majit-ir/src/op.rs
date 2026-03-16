@@ -79,7 +79,18 @@ impl std::fmt::Display for Op {
                 }
                 write!(f, "v{}", arg.0)?;
             }
-            write!(f, ")")
+            write!(f, ")")?;
+            if let Some(ref fa) = self.fail_args {
+                write!(f, " [")?;
+                for (i, arg) in fa.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "v{}", arg.0)?;
+                }
+                write!(f, "]")?;
+            }
+            Ok(())
         } else if self.opcode.result_type() != Type::Void {
             write!(f, "v{} = {:?}(", self.pos.0, self.opcode)?;
             for (i, arg) in self.args.iter().enumerate() {
@@ -126,7 +137,22 @@ pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>)
                 write!(out, "v{}", arg.0).unwrap();
             }
         }
-        writeln!(out, ")").unwrap();
+        write!(out, ")").unwrap();
+        if let Some(ref fa) = op.fail_args {
+            write!(out, " [").unwrap();
+            for (i, arg) in fa.iter().enumerate() {
+                if i > 0 {
+                    write!(out, ", ").unwrap();
+                }
+                if let Some(&val) = constants.get(&arg.0) {
+                    write!(out, "{val}").unwrap();
+                } else {
+                    write!(out, "v{}", arg.0).unwrap();
+                }
+            }
+            write!(out, "]").unwrap();
+        }
+        writeln!(out).unwrap();
     }
     out
 }
@@ -1801,6 +1827,459 @@ static OPNAME: [&str; OPCODE_COUNT] = {
 mod tests {
     use super::*;
 
+    /// Iterate over all defined OpCode variants.
+    fn all_opcodes() -> impl Iterator<Item = OpCode> {
+        (0..OPCODE_COUNT as u16).map(|i| unsafe { std::mem::transmute::<u16, OpCode>(i) })
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Resoperation parity tests
+    // Ported from rpython/jit/metainterp/test/test_resoperation.py
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── Metadata table coverage ──
+
+    #[test]
+    fn test_every_opcode_has_name() {
+        for op in all_opcodes() {
+            let name = op.name();
+            assert!(
+                !name.is_empty(),
+                "OpCode {:?} (u16={}) has empty name",
+                op,
+                op.as_u16()
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_opcode_has_result_type() {
+        for op in all_opcodes() {
+            let _tp = op.result_type();
+        }
+    }
+
+    #[test]
+    fn test_every_opcode_has_arity_entry() {
+        for op in all_opcodes() {
+            let _arity = op.arity();
+        }
+    }
+
+    #[test]
+    fn test_every_opcode_has_descr_entry() {
+        for op in all_opcodes() {
+            let _has_descr = op.has_descr();
+        }
+    }
+
+    #[test]
+    fn test_every_opcode_has_bool_entry() {
+        for op in all_opcodes() {
+            let _returns_bool = op.returns_bool();
+        }
+    }
+
+    // ── Arity: nullary / unary / binary / variadic ──
+
+    #[test]
+    fn test_arity_nullary() {
+        let nullary_ops = [
+            OpCode::New,
+            OpCode::NewWithVtable,
+            OpCode::ForceToken,
+            OpCode::GuardNoException,
+            OpCode::GuardNoOverflow,
+            OpCode::GuardOverflow,
+            OpCode::GuardNotForced,
+            OpCode::GuardNotForced2,
+            OpCode::GuardNotInvalidated,
+            OpCode::GuardFutureCondition,
+            OpCode::GuardAlwaysFails,
+            OpCode::VecI,
+            OpCode::VecF,
+            OpCode::ThreadlocalrefGet,
+            OpCode::SaveException,
+            OpCode::SaveExcClass,
+        ];
+        for op in &nullary_ops {
+            assert_eq!(op.arity(), Some(0), "{:?} should have arity 0", op);
+        }
+    }
+
+    #[test]
+    fn test_arity_unary() {
+        let unary_ops = [
+            OpCode::GuardTrue,
+            OpCode::GuardFalse,
+            OpCode::GuardNonnull,
+            OpCode::GuardIsnull,
+            OpCode::GuardIsObject,
+            OpCode::GuardException,
+            OpCode::FloatNeg,
+            OpCode::FloatAbs,
+            OpCode::CastFloatToInt,
+            OpCode::CastIntToFloat,
+            OpCode::IntIsZero,
+            OpCode::IntIsTrue,
+            OpCode::IntNeg,
+            OpCode::IntInvert,
+            OpCode::IntForceGeZero,
+            OpCode::SameAsI,
+            OpCode::SameAsR,
+            OpCode::SameAsF,
+            OpCode::CastPtrToInt,
+            OpCode::CastIntToPtr,
+            OpCode::CastOpaquePtr,
+            OpCode::ArraylenGc,
+            OpCode::Strlen,
+            OpCode::Unicodelen,
+            OpCode::GetfieldGcI,
+            OpCode::GetfieldGcR,
+            OpCode::GetfieldGcF,
+            OpCode::GetfieldRawI,
+            OpCode::GetfieldRawR,
+            OpCode::GetfieldRawF,
+            OpCode::GetfieldGcPureI,
+            OpCode::GetfieldGcPureR,
+            OpCode::GetfieldGcPureF,
+            OpCode::NewArray,
+            OpCode::NewArrayClear,
+            OpCode::Newstr,
+            OpCode::Newunicode,
+            OpCode::Strhash,
+            OpCode::Unicodehash,
+            OpCode::CheckMemoryError,
+            OpCode::ForceSpill,
+            OpCode::QuasiimmutField,
+            OpCode::AssertNotNone,
+            OpCode::Keepalive,
+            OpCode::CondCallGcWb,
+            OpCode::LoadFromGcTable,
+            OpCode::IncrementDebugCounter,
+            OpCode::LeavePortalFrame,
+            OpCode::CallMallocNursery,
+            OpCode::CallMallocNurseryVarsizeFrame,
+        ];
+        for op in &unary_ops {
+            assert_eq!(op.arity(), Some(1), "{:?} should have arity 1", op);
+        }
+    }
+
+    #[test]
+    fn test_arity_binary() {
+        let binary_ops = [
+            OpCode::IntAdd,
+            OpCode::IntSub,
+            OpCode::IntMul,
+            OpCode::UintMulHigh,
+            OpCode::IntFloorDiv,
+            OpCode::IntMod,
+            OpCode::IntAnd,
+            OpCode::IntOr,
+            OpCode::IntXor,
+            OpCode::IntRshift,
+            OpCode::IntLshift,
+            OpCode::UintRshift,
+            OpCode::IntSignext,
+            OpCode::FloatAdd,
+            OpCode::FloatSub,
+            OpCode::FloatMul,
+            OpCode::FloatTrueDiv,
+            OpCode::FloatFloorDiv,
+            OpCode::FloatMod,
+            OpCode::IntLt,
+            OpCode::IntLe,
+            OpCode::IntEq,
+            OpCode::IntNe,
+            OpCode::IntGt,
+            OpCode::IntGe,
+            OpCode::UintLt,
+            OpCode::UintLe,
+            OpCode::UintGt,
+            OpCode::UintGe,
+            OpCode::FloatLt,
+            OpCode::FloatLe,
+            OpCode::FloatEq,
+            OpCode::FloatNe,
+            OpCode::FloatGt,
+            OpCode::FloatGe,
+            OpCode::PtrEq,
+            OpCode::PtrNe,
+            OpCode::InstancePtrEq,
+            OpCode::InstancePtrNe,
+            OpCode::NurseryPtrIncrement,
+            OpCode::Strgetitem,
+            OpCode::Unicodegetitem,
+            OpCode::GuardValue,
+            OpCode::GuardClass,
+            OpCode::GuardNonnullClass,
+            OpCode::GuardGcType,
+            OpCode::GuardSubclass,
+            OpCode::GuardCompatible,
+            OpCode::SetfieldGc,
+            OpCode::SetfieldRaw,
+            OpCode::CondCallGcWbArray,
+            OpCode::VirtualRefI,
+            OpCode::VirtualRefR,
+            OpCode::VirtualRefFinish,
+            OpCode::RecordExactClass,
+            OpCode::RecordExactValueR,
+            OpCode::RecordExactValueI,
+            OpCode::EnterPortalFrame,
+            OpCode::RestoreException,
+            OpCode::RawLoadI,
+            OpCode::RawLoadF,
+            OpCode::GetarrayitemGcI,
+            OpCode::GetarrayitemGcR,
+            OpCode::GetarrayitemGcF,
+            OpCode::GetarrayitemGcPureI,
+            OpCode::GetarrayitemGcPureR,
+            OpCode::GetarrayitemGcPureF,
+            OpCode::GetarrayitemRawI,
+            OpCode::GetarrayitemRawR,
+            OpCode::GetarrayitemRawF,
+            OpCode::GetinteriorfieldGcI,
+            OpCode::GetinteriorfieldGcR,
+            OpCode::GetinteriorfieldGcF,
+            OpCode::IntAddOvf,
+            OpCode::IntSubOvf,
+            OpCode::IntMulOvf,
+        ];
+        for op in &binary_ops {
+            assert_eq!(op.arity(), Some(2), "{:?} should have arity 2", op);
+        }
+    }
+
+    #[test]
+    fn test_arity_variadic() {
+        let variadic_ops = [
+            OpCode::Jump,
+            OpCode::Finish,
+            OpCode::Label,
+            OpCode::DebugMergePoint,
+            OpCode::JitDebug,
+            OpCode::CallI,
+            OpCode::CallR,
+            OpCode::CallF,
+            OpCode::CallN,
+            OpCode::CondCallN,
+            OpCode::CondCallValueI,
+            OpCode::CondCallValueR,
+            OpCode::CallAssemblerI,
+            OpCode::CallAssemblerR,
+            OpCode::CallAssemblerF,
+            OpCode::CallAssemblerN,
+            OpCode::CallMayForceI,
+            OpCode::CallMayForceR,
+            OpCode::CallMayForceF,
+            OpCode::CallMayForceN,
+            OpCode::CallLoopinvariantI,
+            OpCode::CallLoopinvariantR,
+            OpCode::CallLoopinvariantF,
+            OpCode::CallLoopinvariantN,
+            OpCode::CallReleaseGilI,
+            OpCode::CallReleaseGilR,
+            OpCode::CallReleaseGilF,
+            OpCode::CallReleaseGilN,
+            OpCode::CallPureI,
+            OpCode::CallPureR,
+            OpCode::CallPureF,
+            OpCode::CallPureN,
+            OpCode::CallMallocNurseryVarsize,
+            OpCode::RecordKnownResult,
+            OpCode::EscapeI,
+            OpCode::EscapeR,
+            OpCode::EscapeF,
+            OpCode::EscapeN,
+        ];
+        for op in &variadic_ops {
+            assert_eq!(op.arity(), None, "{:?} should be variadic (arity=None)", op);
+        }
+    }
+
+    // ── Result type exhaustive checks ──
+
+    #[test]
+    fn test_int_result_types() {
+        let int_ops = [
+            OpCode::IntAdd,
+            OpCode::IntSub,
+            OpCode::IntMul,
+            OpCode::IntFloorDiv,
+            OpCode::IntMod,
+            OpCode::IntAnd,
+            OpCode::IntOr,
+            OpCode::IntXor,
+            OpCode::IntRshift,
+            OpCode::IntLshift,
+            OpCode::UintRshift,
+            OpCode::IntSignext,
+            OpCode::CastFloatToInt,
+            OpCode::IntLt,
+            OpCode::IntLe,
+            OpCode::IntEq,
+            OpCode::IntNe,
+            OpCode::IntGt,
+            OpCode::IntGe,
+            OpCode::IntIsZero,
+            OpCode::IntIsTrue,
+            OpCode::IntNeg,
+            OpCode::IntInvert,
+            OpCode::IntForceGeZero,
+            OpCode::SameAsI,
+            OpCode::CastPtrToInt,
+            OpCode::PtrEq,
+            OpCode::PtrNe,
+            OpCode::IntAddOvf,
+            OpCode::IntSubOvf,
+            OpCode::IntMulOvf,
+            OpCode::GetfieldGcI,
+            OpCode::GetfieldRawI,
+            OpCode::GetfieldGcPureI,
+            OpCode::GetarrayitemGcI,
+            OpCode::GetarrayitemRawI,
+            OpCode::GetarrayitemGcPureI,
+            OpCode::CallI,
+            OpCode::CallPureI,
+            OpCode::CallMayForceI,
+            OpCode::CallAssemblerI,
+            OpCode::CallLoopinvariantI,
+            OpCode::CallReleaseGilI,
+            OpCode::EscapeI,
+            OpCode::SaveExcClass,
+        ];
+        for op in &int_ops {
+            assert_eq!(op.result_type(), Type::Int, "{:?} should return Int", op);
+        }
+    }
+
+    #[test]
+    fn test_float_result_types() {
+        let float_ops = [
+            OpCode::FloatAdd,
+            OpCode::FloatSub,
+            OpCode::FloatMul,
+            OpCode::FloatTrueDiv,
+            OpCode::FloatFloorDiv,
+            OpCode::FloatMod,
+            OpCode::FloatNeg,
+            OpCode::FloatAbs,
+            OpCode::CastIntToFloat,
+            OpCode::CastSinglefloatToFloat,
+            OpCode::SameAsF,
+            OpCode::GetfieldGcF,
+            OpCode::GetfieldRawF,
+            OpCode::GetfieldGcPureF,
+            OpCode::GetarrayitemGcF,
+            OpCode::GetarrayitemRawF,
+            OpCode::GetarrayitemGcPureF,
+            OpCode::CallF,
+            OpCode::CallPureF,
+            OpCode::CallMayForceF,
+            OpCode::CallAssemblerF,
+            OpCode::CallLoopinvariantF,
+            OpCode::CallReleaseGilF,
+            OpCode::EscapeF,
+        ];
+        for op in &float_ops {
+            assert_eq!(op.result_type(), Type::Float, "{:?} should return Float", op);
+        }
+    }
+
+    #[test]
+    fn test_ref_result_types() {
+        let ref_ops = [
+            OpCode::CastIntToPtr,
+            OpCode::CastOpaquePtr,
+            OpCode::SameAsR,
+            OpCode::NurseryPtrIncrement,
+            OpCode::LoadFromGcTable,
+            OpCode::New,
+            OpCode::NewWithVtable,
+            OpCode::NewArray,
+            OpCode::NewArrayClear,
+            OpCode::Newstr,
+            OpCode::Newunicode,
+            OpCode::ForceToken,
+            OpCode::VirtualRefR,
+            OpCode::GuardException,
+            OpCode::GetfieldGcR,
+            OpCode::GetfieldRawR,
+            OpCode::GetfieldGcPureR,
+            OpCode::GetarrayitemGcR,
+            OpCode::GetarrayitemRawR,
+            OpCode::GetarrayitemGcPureR,
+            OpCode::CallR,
+            OpCode::CallPureR,
+            OpCode::CallMayForceR,
+            OpCode::CallAssemblerR,
+            OpCode::CallLoopinvariantR,
+            OpCode::CallReleaseGilR,
+            OpCode::CondCallValueR,
+            OpCode::ThreadlocalrefGet,
+            OpCode::CallMallocNursery,
+            OpCode::CallMallocNurseryVarsize,
+            OpCode::CallMallocNurseryVarsizeFrame,
+            OpCode::SaveException,
+            OpCode::EscapeR,
+        ];
+        for op in &ref_ops {
+            assert_eq!(op.result_type(), Type::Ref, "{:?} should return Ref", op);
+        }
+    }
+
+    #[test]
+    fn test_void_result_types() {
+        let void_ops = [
+            OpCode::Jump,
+            OpCode::Finish,
+            OpCode::Label,
+            OpCode::SetfieldGc,
+            OpCode::SetfieldRaw,
+            OpCode::SetarrayitemGc,
+            OpCode::SetarrayitemRaw,
+            OpCode::SetinteriorfieldGc,
+            OpCode::SetinteriorfieldRaw,
+            OpCode::RawStore,
+            OpCode::GcStore,
+            OpCode::GcStoreIndexed,
+            OpCode::Strsetitem,
+            OpCode::Unicodesetitem,
+            OpCode::CondCallGcWb,
+            OpCode::CondCallGcWbArray,
+            OpCode::DebugMergePoint,
+            OpCode::EnterPortalFrame,
+            OpCode::LeavePortalFrame,
+            OpCode::JitDebug,
+            OpCode::CallN,
+            OpCode::CondCallN,
+            OpCode::CallAssemblerN,
+            OpCode::CallMayForceN,
+            OpCode::CallLoopinvariantN,
+            OpCode::CallReleaseGilN,
+            OpCode::CallPureN,
+            OpCode::EscapeN,
+            OpCode::ForceSpill,
+            OpCode::VirtualRefFinish,
+            OpCode::Copystrcontent,
+            OpCode::Copyunicodecontent,
+            OpCode::QuasiimmutField,
+            OpCode::AssertNotNone,
+            OpCode::RecordExactClass,
+            OpCode::Keepalive,
+            OpCode::RestoreException,
+            OpCode::ZeroArray,
+            OpCode::VecStore,
+            OpCode::IncrementDebugCounter,
+        ];
+        for op in &void_ops {
+            assert_eq!(op.result_type(), Type::Void, "{:?} should return Void", op);
+        }
+    }
+
+    // ── Classification methods ──
+
     #[test]
     fn test_category_classification() {
         assert!(OpCode::Jump.is_final());
@@ -1824,38 +2303,370 @@ mod tests {
     }
 
     #[test]
+    fn test_guard_classification_exhaustive() {
+        let all_guards: Vec<OpCode> = all_opcodes().filter(|op| op.is_guard()).collect();
+        assert!(
+            all_guards.len() >= 20,
+            "expected at least 20 guard ops, got {}",
+            all_guards.len()
+        );
+        let expected_guards = [
+            OpCode::GuardTrue,
+            OpCode::GuardFalse,
+            OpCode::VecGuardTrue,
+            OpCode::VecGuardFalse,
+            OpCode::GuardValue,
+            OpCode::GuardClass,
+            OpCode::GuardNonnull,
+            OpCode::GuardIsnull,
+            OpCode::GuardNonnullClass,
+            OpCode::GuardGcType,
+            OpCode::GuardIsObject,
+            OpCode::GuardSubclass,
+            OpCode::GuardCompatible,
+            OpCode::GuardNoException,
+            OpCode::GuardException,
+            OpCode::GuardNoOverflow,
+            OpCode::GuardOverflow,
+            OpCode::GuardNotForced,
+            OpCode::GuardNotForced2,
+            OpCode::GuardNotInvalidated,
+            OpCode::GuardFutureCondition,
+            OpCode::GuardAlwaysFails,
+        ];
+        for op in &expected_guards {
+            assert!(op.is_guard(), "{:?} should be a guard", op);
+        }
+    }
+
+    #[test]
+    fn test_foldable_guard_subset() {
+        let foldable_guards = [
+            OpCode::GuardTrue,
+            OpCode::GuardFalse,
+            OpCode::VecGuardTrue,
+            OpCode::VecGuardFalse,
+            OpCode::GuardValue,
+            OpCode::GuardClass,
+            OpCode::GuardNonnull,
+            OpCode::GuardIsnull,
+            OpCode::GuardNonnullClass,
+            OpCode::GuardGcType,
+            OpCode::GuardIsObject,
+            OpCode::GuardSubclass,
+            OpCode::GuardCompatible,
+        ];
+        for op in &foldable_guards {
+            assert!(op.is_foldable_guard(), "{:?} should be foldable", op);
+            assert!(op.is_guard(), "foldable guard {:?} must also be a guard", op);
+        }
+        let non_foldable = [
+            OpCode::GuardNoException,
+            OpCode::GuardNotForced,
+            OpCode::GuardNotInvalidated,
+            OpCode::GuardAlwaysFails,
+        ];
+        for op in &non_foldable {
+            assert!(!op.is_foldable_guard(), "{:?} should NOT be foldable", op);
+            assert!(op.is_guard(), "{:?} should still be a guard", op);
+        }
+    }
+
+    #[test]
+    fn test_pure_ops_no_side_effect() {
+        for op in all_opcodes() {
+            if op.is_always_pure() {
+                assert!(
+                    op.has_no_side_effect(),
+                    "{:?} is pure but does not claim no_side_effect",
+                    op
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_side_effect_superset_of_pure() {
+        let extra_nosideeffect = [
+            OpCode::GcLoadI,
+            OpCode::GcLoadR,
+            OpCode::GcLoadF,
+            OpCode::GetarrayitemGcI,
+            OpCode::GetarrayitemGcR,
+            OpCode::GetarrayitemGcF,
+            OpCode::GetfieldGcI,
+            OpCode::GetfieldGcR,
+            OpCode::GetfieldGcF,
+            OpCode::New,
+            OpCode::NewWithVtable,
+            OpCode::NewArray,
+            OpCode::ForceToken,
+            OpCode::Strhash,
+            OpCode::Unicodehash,
+        ];
+        for op in &extra_nosideeffect {
+            assert!(op.has_no_side_effect(), "{:?} should have no_side_effect", op);
+        }
+    }
+
+    #[test]
+    fn test_can_malloc() {
+        assert!(OpCode::New.can_malloc());
+        assert!(OpCode::NewWithVtable.can_malloc());
+        assert!(OpCode::NewArray.can_malloc());
+        assert!(OpCode::CallN.can_malloc());
+        assert!(OpCode::CallI.can_malloc());
+        assert!(OpCode::CallMayForceI.can_malloc());
+        assert!(!OpCode::IntAdd.can_malloc());
+        assert!(!OpCode::GuardTrue.can_malloc());
+    }
+
+    #[test]
+    fn test_is_comparison() {
+        let comparisons = [
+            OpCode::IntLt,
+            OpCode::IntLe,
+            OpCode::IntEq,
+            OpCode::IntNe,
+            OpCode::IntGt,
+            OpCode::IntGe,
+            OpCode::UintLt,
+            OpCode::UintLe,
+            OpCode::UintGt,
+            OpCode::UintGe,
+            OpCode::FloatLt,
+            OpCode::FloatLe,
+            OpCode::FloatEq,
+            OpCode::FloatNe,
+            OpCode::FloatGt,
+            OpCode::FloatGe,
+            OpCode::PtrEq,
+            OpCode::PtrNe,
+            OpCode::InstancePtrEq,
+            OpCode::InstancePtrNe,
+            OpCode::IntIsZero,
+            OpCode::IntIsTrue,
+            OpCode::IntBetween,
+        ];
+        for op in &comparisons {
+            assert!(op.is_comparison(), "{:?} should be a comparison", op);
+            assert!(op.is_always_pure(), "comparison {:?} must be pure", op);
+            assert!(op.returns_bool(), "comparison {:?} must return bool", op);
+        }
+        assert!(!OpCode::IntAdd.is_comparison());
+        assert!(!OpCode::FloatAdd.is_comparison());
+    }
+
+    #[test]
+    fn test_guard_exception_classification() {
+        assert!(OpCode::GuardException.is_guard_exception());
+        assert!(OpCode::GuardNoException.is_guard_exception());
+        assert!(!OpCode::GuardTrue.is_guard_exception());
+    }
+
+    #[test]
+    fn test_guard_overflow_classification() {
+        assert!(OpCode::GuardOverflow.is_guard_overflow());
+        assert!(OpCode::GuardNoOverflow.is_guard_overflow());
+        assert!(!OpCode::GuardTrue.is_guard_overflow());
+    }
+
+    #[test]
+    fn test_call_subcategories() {
+        for op in all_opcodes() {
+            if op.is_plain_call()
+                || op.is_call_assembler()
+                || op.is_call_may_force()
+                || op.is_call_pure()
+                || op.is_call_release_gil()
+                || op.is_call_loopinvariant()
+                || op.is_cond_call_value()
+            {
+                assert!(op.is_call(), "{:?} is a call subcategory but not is_call()", op);
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_same_as() {
+        assert!(OpCode::SameAsI.is_same_as());
+        assert!(OpCode::SameAsR.is_same_as());
+        assert!(OpCode::SameAsF.is_same_as());
+        assert!(!OpCode::IntAdd.is_same_as());
+    }
+
+    // ── Typed dispatch ──
+
+    #[test]
+    fn test_call_for_type() {
+        assert_eq!(OpCode::call_for_type(Type::Int), OpCode::CallI);
+        assert_eq!(OpCode::call_for_type(Type::Ref), OpCode::CallR);
+        assert_eq!(OpCode::call_for_type(Type::Float), OpCode::CallF);
+        assert_eq!(OpCode::call_for_type(Type::Void), OpCode::CallN);
+    }
+
+    #[test]
+    fn test_call_pure_for_type() {
+        assert_eq!(OpCode::call_pure_for_type(Type::Int), OpCode::CallPureI);
+        assert_eq!(OpCode::call_pure_for_type(Type::Float), OpCode::CallPureF);
+    }
+
+    #[test]
+    fn test_same_as_for_type() {
+        assert_eq!(OpCode::same_as_for_type(Type::Int), OpCode::SameAsI);
+        assert_eq!(OpCode::same_as_for_type(Type::Ref), OpCode::SameAsR);
+        assert_eq!(OpCode::same_as_for_type(Type::Float), OpCode::SameAsF);
+    }
+
+    #[test]
+    fn test_getfield_for_type() {
+        assert_eq!(OpCode::getfield_for_type(Type::Int), OpCode::GetfieldGcI);
+        assert_eq!(OpCode::getfield_for_type(Type::Ref), OpCode::GetfieldGcR);
+        assert_eq!(OpCode::getfield_for_type(Type::Float), OpCode::GetfieldGcF);
+    }
+
+    // ── bool_inverse / bool_reflex ──
+
+    #[test]
     fn test_bool_inverse() {
         assert_eq!(OpCode::IntEq.bool_inverse(), Some(OpCode::IntNe));
+        assert_eq!(OpCode::IntNe.bool_inverse(), Some(OpCode::IntEq));
         assert_eq!(OpCode::IntLt.bool_inverse(), Some(OpCode::IntGe));
+        assert_eq!(OpCode::IntGe.bool_inverse(), Some(OpCode::IntLt));
+        assert_eq!(OpCode::IntGt.bool_inverse(), Some(OpCode::IntLe));
+        assert_eq!(OpCode::IntLe.bool_inverse(), Some(OpCode::IntGt));
+        assert_eq!(OpCode::FloatEq.bool_inverse(), Some(OpCode::FloatNe));
+        assert_eq!(OpCode::FloatLt.bool_inverse(), Some(OpCode::FloatGe));
+        assert_eq!(OpCode::UintLt.bool_inverse(), Some(OpCode::UintGe));
+        assert_eq!(OpCode::PtrEq.bool_inverse(), Some(OpCode::PtrNe));
         assert_eq!(OpCode::IntAdd.bool_inverse(), None);
+    }
+
+    #[test]
+    fn test_bool_inverse_is_involution() {
+        for op in all_opcodes() {
+            if let Some(inv) = op.bool_inverse() {
+                assert_eq!(
+                    inv.bool_inverse(),
+                    Some(op),
+                    "bool_inverse should be an involution for {:?}",
+                    op
+                );
+            }
+        }
     }
 
     #[test]
     fn test_bool_reflex() {
         assert_eq!(OpCode::IntLt.bool_reflex(), Some(OpCode::IntGt));
+        assert_eq!(OpCode::IntGt.bool_reflex(), Some(OpCode::IntLt));
         assert_eq!(OpCode::IntEq.bool_reflex(), Some(OpCode::IntEq));
+        assert_eq!(OpCode::IntNe.bool_reflex(), Some(OpCode::IntNe));
+        assert_eq!(OpCode::FloatLt.bool_reflex(), Some(OpCode::FloatGt));
+        assert_eq!(OpCode::PtrEq.bool_reflex(), Some(OpCode::PtrEq));
+        assert_eq!(OpCode::IntAdd.bool_reflex(), None);
     }
 
     #[test]
-    fn test_result_types() {
-        assert_eq!(OpCode::IntAdd.result_type(), Type::Int);
-        assert_eq!(OpCode::FloatAdd.result_type(), Type::Float);
-        assert_eq!(OpCode::New.result_type(), Type::Ref);
-        assert_eq!(OpCode::SetfieldGc.result_type(), Type::Void);
+    fn test_bool_reflex_is_involution() {
+        for op in all_opcodes() {
+            if let Some(refl) = op.bool_reflex() {
+                assert_eq!(
+                    refl.bool_reflex(),
+                    Some(op),
+                    "bool_reflex should be an involution for {:?}",
+                    op
+                );
+            }
+        }
+    }
+
+    // ── without_overflow / to_vector ──
+
+    #[test]
+    fn test_without_overflow() {
+        assert_eq!(OpCode::IntAddOvf.without_overflow(), Some(OpCode::IntAdd));
+        assert_eq!(OpCode::IntSubOvf.without_overflow(), Some(OpCode::IntSub));
+        assert_eq!(OpCode::IntMulOvf.without_overflow(), Some(OpCode::IntMul));
+        assert_eq!(OpCode::IntAdd.without_overflow(), None);
     }
 
     #[test]
-    fn test_arity() {
-        assert_eq!(OpCode::IntAdd.arity(), Some(2));
-        assert_eq!(OpCode::FloatNeg.arity(), Some(1));
-        assert_eq!(OpCode::New.arity(), Some(0));
-        assert_eq!(OpCode::CallI.arity(), None); // variadic
+    fn test_to_vector() {
+        assert_eq!(OpCode::IntAdd.to_vector(), Some(OpCode::VecIntAdd));
+        assert_eq!(OpCode::FloatAdd.to_vector(), Some(OpCode::VecFloatAdd));
+        assert_eq!(OpCode::GuardTrue.to_vector(), Some(OpCode::VecGuardTrue));
+        assert_eq!(OpCode::SetfieldGc.to_vector(), None);
     }
+
+    // ── Name table ──
+
+    #[test]
+    fn test_opname_matches_debug_name() {
+        for op in all_opcodes() {
+            let name = op.name();
+            let debug = format!("{:?}", op);
+            assert_eq!(name, debug, "name() and Debug should match for {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_specific_opnames() {
+        assert_eq!(OpCode::IntAdd.name(), "IntAdd");
+        assert_eq!(OpCode::GuardTrue.name(), "GuardTrue");
+        assert_eq!(OpCode::CallI.name(), "CallI");
+        assert_eq!(OpCode::Jump.name(), "Jump");
+        assert_eq!(OpCode::Finish.name(), "Finish");
+        assert_eq!(OpCode::New.name(), "New");
+        assert_eq!(OpCode::SetfieldGc.name(), "SetfieldGc");
+    }
+
+    // ── Op construction ──
+
+    #[test]
+    fn test_op_new() {
+        let op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        assert_eq!(op.opcode, OpCode::IntAdd);
+        assert_eq!(op.args.len(), 2);
+        assert_eq!(op.args[0], OpRef(0));
+        assert_eq!(op.args[1], OpRef(1));
+        assert!(op.descr.is_none());
+        assert!(op.fail_args.is_none());
+        assert_eq!(op.result_type(), Type::Int);
+        assert_eq!(op.num_args(), 2);
+    }
+
+    #[test]
+    fn test_op_getarg() {
+        let op = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef(20)]);
+        assert_eq!(op.getarg(0), OpRef(10));
+        assert_eq!(op.getarg(1), OpRef(20));
+    }
+
+    // ── Descriptor requirements ──
+
+    #[test]
+    fn test_guards_have_descr() {
+        for op in all_opcodes() {
+            if op.is_guard() {
+                assert!(op.has_descr(), "guard {:?} should have has_descr=true", op);
+            }
+        }
+    }
+
+    #[test]
+    fn test_calls_have_descr() {
+        for op in all_opcodes() {
+            if op.is_call() {
+                assert!(op.has_descr(), "call {:?} should have has_descr=true", op);
+            }
+        }
+    }
+
+    // ── ovf alignment ──
 
     #[test]
     fn test_ovf_to_non_ovf_alignment() {
-        // Mirrors the assertion in resoperation.py setup():
-        // INT_ADD_OVF - _OVF_FIRST == INT_ADD - _ALWAYS_PURE_FIRST
         let add_ovf_offset = OpCode::IntAddOvf as u16 - OVF_FIRST;
         let add_offset = OpCode::IntAdd as u16 - ALWAYS_PURE_FIRST;
         assert_eq!(add_ovf_offset, add_offset);
@@ -1867,5 +2678,302 @@ mod tests {
         let mul_ovf_offset = OpCode::IntMulOvf as u16 - OVF_FIRST;
         let mul_offset = OpCode::IntMul as u16 - ALWAYS_PURE_FIRST;
         assert_eq!(mul_ovf_offset, mul_offset);
+    }
+
+    // ── is_getfield / is_getarrayitem / is_memory_access ──
+
+    #[test]
+    fn test_is_getfield() {
+        assert!(OpCode::GetfieldGcI.is_getfield());
+        assert!(OpCode::GetfieldGcR.is_getfield());
+        assert!(OpCode::GetfieldGcF.is_getfield());
+        assert!(!OpCode::GetfieldRawI.is_getfield());
+        assert!(!OpCode::GetfieldGcPureI.is_getfield());
+        assert!(!OpCode::IntAdd.is_getfield());
+    }
+
+    #[test]
+    fn test_is_getarrayitem() {
+        assert!(OpCode::GetarrayitemGcI.is_getarrayitem());
+        assert!(OpCode::GetarrayitemGcPureI.is_getarrayitem());
+        assert!(!OpCode::IntAdd.is_getarrayitem());
+    }
+
+    #[test]
+    fn test_memory_access_includes_fields_and_arrays() {
+        let memory_ops = [
+            OpCode::GetfieldGcI,
+            OpCode::SetfieldGc,
+            OpCode::GetarrayitemGcI,
+            OpCode::SetarrayitemGc,
+            OpCode::RawLoadI,
+            OpCode::RawStore,
+            OpCode::GcLoadI,
+            OpCode::GcStore,
+        ];
+        for op in &memory_ops {
+            assert!(op.is_memory_access(), "{:?} should be memory access", op);
+        }
+        assert!(!OpCode::IntAdd.is_memory_access());
+        assert!(!OpCode::CallI.is_memory_access());
+    }
+
+    // ── can_raise ──
+
+    #[test]
+    fn test_can_raise() {
+        assert!(OpCode::CallI.can_raise());
+        assert!(OpCode::CallMayForceN.can_raise());
+        assert!(OpCode::IntAddOvf.can_raise());
+        assert!(OpCode::IntSubOvf.can_raise());
+        assert!(OpCode::IntMulOvf.can_raise());
+        assert!(!OpCode::IntAdd.can_raise());
+        assert!(!OpCode::GuardTrue.can_raise());
+        assert!(!OpCode::New.can_raise());
+    }
+
+    // ── is_label / is_jit_debug / is_malloc / is_vector_arithmetic ──
+
+    #[test]
+    fn test_is_label() {
+        assert!(OpCode::Label.is_label());
+        assert!(!OpCode::Jump.is_label());
+    }
+
+    #[test]
+    fn test_is_jit_debug() {
+        assert!(OpCode::DebugMergePoint.is_jit_debug());
+        assert!(OpCode::EnterPortalFrame.is_jit_debug());
+        assert!(OpCode::LeavePortalFrame.is_jit_debug());
+        assert!(OpCode::JitDebug.is_jit_debug());
+        assert!(!OpCode::IntAdd.is_jit_debug());
+    }
+
+    #[test]
+    fn test_is_malloc() {
+        let malloc_ops = [
+            OpCode::New,
+            OpCode::NewWithVtable,
+            OpCode::NewArray,
+            OpCode::NewArrayClear,
+            OpCode::Newstr,
+            OpCode::Newunicode,
+        ];
+        for op in &malloc_ops {
+            assert!(op.is_malloc(), "{:?} should be malloc", op);
+        }
+        assert!(!OpCode::IntAdd.is_malloc());
+        assert!(!OpCode::CallI.is_malloc());
+    }
+
+    #[test]
+    fn test_is_vector_arithmetic() {
+        let vec_arith = [
+            OpCode::VecIntAdd,
+            OpCode::VecIntSub,
+            OpCode::VecIntMul,
+            OpCode::VecFloatAdd,
+            OpCode::VecFloatMul,
+            OpCode::VecFloatNeg,
+            OpCode::VecFloatAbs,
+        ];
+        for op in &vec_arith {
+            assert!(op.is_vector_arithmetic(), "{:?} should be vec arithmetic", op);
+        }
+        assert!(!OpCode::IntAdd.is_vector_arithmetic());
+    }
+
+    // ── Consistency invariants ──
+
+    #[test]
+    fn test_guard_and_call_disjoint() {
+        for op in all_opcodes() {
+            assert!(
+                !(op.is_guard() && op.is_call()),
+                "{:?} is both guard and call",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_final_and_guard_disjoint() {
+        for op in all_opcodes() {
+            assert!(
+                !(op.is_final() && op.is_guard()),
+                "{:?} is both final and guard",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_guards_not_pure() {
+        for op in all_opcodes() {
+            if op.is_guard() {
+                assert!(
+                    !op.is_always_pure(),
+                    "{:?} is a guard and should not be always_pure",
+                    op
+                );
+            }
+        }
+    }
+
+    // ── Logger parity tests (rpython/jit/metainterp/test/test_logger.py) ──
+
+    #[test]
+    fn test_format_trace_readable_output() {
+        let ops = vec![
+            Op {
+                opcode: OpCode::IntAdd,
+                args: smallvec::smallvec![OpRef(1), OpRef(2)],
+                descr: None,
+                pos: OpRef(3),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::IntAdd,
+                args: smallvec::smallvec![OpRef(3), OpRef(10_000)],
+                descr: None,
+                pos: OpRef(4),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::Jump,
+                args: smallvec::smallvec![OpRef(0), OpRef(4), OpRef(3)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: None,
+            },
+        ];
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 3);
+        let output = format_trace(&ops, &constants);
+        assert!(output.contains("v3 = IntAdd(v1, v2)"));
+        assert!(output.contains("v4 = IntAdd(v3, 3)"));
+        assert!(output.contains("Jump(v0, v4, v3)"));
+    }
+
+    #[test]
+    fn test_op_display_int_result() {
+        let op = Op {
+            opcode: OpCode::IntAdd,
+            args: smallvec::smallvec![OpRef(1), OpRef(2)],
+            descr: None,
+            pos: OpRef(6),
+            fail_args: None,
+        };
+        let s = format!("{op}");
+        assert_eq!(s, "v6 = IntAdd(v1, v2)");
+    }
+
+    #[test]
+    fn test_op_display_void() {
+        let op = Op {
+            opcode: OpCode::SetfieldGc,
+            args: smallvec::smallvec![OpRef(0), OpRef(1)],
+            descr: None,
+            pos: OpRef::NONE,
+            fail_args: None,
+        };
+        let s = format!("{op}");
+        assert_eq!(s, "SetfieldGc(v0, v1)");
+    }
+
+    #[test]
+    fn test_op_display_guard_with_fail_args() {
+        let op = Op {
+            opcode: OpCode::GuardTrue,
+            args: smallvec::smallvec![OpRef(0)],
+            descr: None,
+            pos: OpRef::NONE,
+            fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+        };
+        let s = format!("{op}");
+        assert_eq!(s, "GuardTrue(v0) [v0, v1]");
+    }
+
+    #[test]
+    fn test_op_display_guard_without_fail_args() {
+        let op = Op {
+            opcode: OpCode::GuardTrue,
+            args: smallvec::smallvec![OpRef(0)],
+            descr: None,
+            pos: OpRef::NONE,
+            fail_args: None,
+        };
+        let s = format!("{op}");
+        assert_eq!(s, "GuardTrue(v0)");
+    }
+
+    #[test]
+    fn test_format_trace_constants_rendered_with_values() {
+        let ops = vec![Op {
+            opcode: OpCode::IntAdd,
+            args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
+            descr: None,
+            pos: OpRef(1),
+            fail_args: None,
+        }];
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 42);
+        let output = format_trace(&ops, &constants);
+        assert!(output.contains("v1 = IntAdd(v0, 42)"));
+        assert!(!output.contains("v10000"));
+    }
+
+    #[test]
+    fn test_format_trace_guards_show_fail_args() {
+        let ops = vec![
+            Op {
+                opcode: OpCode::IntAdd,
+                args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
+                descr: None,
+                pos: OpRef(1),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::GuardTrue,
+                args: smallvec::smallvec![OpRef(0)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+            },
+            Op {
+                opcode: OpCode::Finish,
+                args: smallvec::smallvec![OpRef(1)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: None,
+            },
+        ];
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 1);
+        let output = format_trace(&ops, &constants);
+        assert!(output.contains("GuardTrue(v0) [v0, v1]"));
+    }
+
+    #[test]
+    fn test_format_trace_constants_in_fail_args() {
+        let ops = vec![Op {
+            opcode: OpCode::GuardTrue,
+            args: smallvec::smallvec![OpRef(0)],
+            descr: None,
+            pos: OpRef::NONE,
+            fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(10_000)]),
+        }];
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 99);
+        let output = format_trace(&ops, &constants);
+        assert!(output.contains("GuardTrue(v0) [v0, 99]"));
+    }
+
+    #[test]
+    fn test_format_trace_empty() {
+        let ops: Vec<Op> = vec![];
+        let constants = std::collections::HashMap::new();
+        let output = format_trace(&ops, &constants);
+        assert!(output.is_empty());
     }
 }

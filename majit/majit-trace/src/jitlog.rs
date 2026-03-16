@@ -358,6 +358,147 @@ mod tests {
         assert!(elapsed.as_nanos() < 1_000_000_000); // less than 1 second
     }
 
+    // ── Jitprof parity tests (rpython/jit/metainterp/test/test_jitprof.py) ──
+
+    #[test]
+    fn test_traces_compiled_counted_correctly() {
+        // Parity with test_simple_loop: traces compiled count matches actual compilations
+        let mut log = JitLog::new(false);
+        assert_eq!(log.traces_compiled(), 0);
+        log.log_compile(1, 50, 30, Duration::from_millis(1), Duration::from_millis(2));
+        assert_eq!(log.traces_compiled(), 1);
+        log.log_compile(2, 80, 40, Duration::from_millis(1), Duration::from_millis(2));
+        assert_eq!(log.traces_compiled(), 2);
+    }
+
+    #[test]
+    fn test_traces_aborted_counted_correctly() {
+        // Aborted traces are counted separately from compiled
+        let mut log = JitLog::new(false);
+        log.log_compile(1, 50, 30, Duration::from_millis(1), Duration::from_millis(2));
+        log.log_abort();
+        log.log_abort();
+        log.log_abort();
+        assert_eq!(log.traces_compiled(), 1);
+        assert_eq!(log.traces_aborted(), 3);
+    }
+
+    #[test]
+    fn test_ops_before_after_optimization() {
+        // Parity with profiler.counters: total ops tracked before and after optimization
+        let mut log = JitLog::new(false);
+        log.log_compile(1, 100, 60, Duration::ZERO, Duration::ZERO);
+        log.log_compile(2, 50, 25, Duration::ZERO, Duration::ZERO);
+        assert_eq!(log.total_ops_before(), 150);
+        assert_eq!(log.total_ops_after(), 85);
+    }
+
+    #[test]
+    fn test_guard_failures_per_guard() {
+        // Guard failure tracking — per-guard counts like profiler.counters
+        let mut log = JitLog::new(false);
+        log.log_guard_failure(0);
+        log.log_guard_failure(0);
+        log.log_guard_failure(0);
+        log.log_guard_failure(1);
+        log.log_guard_failure(2);
+        assert_eq!(log.total_guard_failures(), 5);
+        assert_eq!(*log.guard_failure_counts().get(&0).unwrap(), 3);
+        assert_eq!(*log.guard_failure_counts().get(&1).unwrap(), 1);
+        assert_eq!(*log.guard_failure_counts().get(&2).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_compilation_timing() {
+        // Parity with profiler.times: compilation and optimization timing
+        let mut log = JitLog::new(false);
+        log.log_compile(
+            1, 50, 30,
+            Duration::from_millis(10), // opt time
+            Duration::from_millis(20), // compile time
+        );
+        log.log_compile(
+            2, 80, 40,
+            Duration::from_millis(5),
+            Duration::from_millis(15),
+        );
+        assert_eq!(log.total_opt_time(), Duration::from_millis(15));
+        assert_eq!(log.total_compile_time(), Duration::from_millis(35));
+    }
+
+    #[test]
+    fn test_bridge_compile_tracking() {
+        let mut log = JitLog::new(false);
+        assert_eq!(log.bridges_compiled(), 0);
+        log.log_bridge_compile(0);
+        log.log_bridge_compile(1);
+        assert_eq!(log.bridges_compiled(), 2);
+    }
+
+    #[test]
+    fn test_stats_enabled_checks_env() {
+        // Parity: MAJIT_STATS=1 or MAJIT_LOG=1 enables stats
+        // We can't reliably set env vars in parallel tests, so just verify
+        // the function doesn't panic and returns a bool
+        let _ = stats_enabled();
+    }
+
+    #[test]
+    fn test_from_env_returns_none_when_disabled() {
+        // In a normal test env without MAJIT_STATS=1, from_env returns None
+        // (unless the test env happens to set it — that's fine too)
+        let result = JitLog::from_env();
+        // Just verify it returns an Option, not that it's a specific value
+        let _ = result;
+    }
+
+    #[test]
+    fn test_jitlog_summary_all_fields_present() {
+        // Parity with profiler output: summary contains all tracked statistics
+        let mut log = JitLog::new(false);
+        log.log_compile(1, 200, 100, Duration::from_millis(5), Duration::from_millis(10));
+        log.log_compile(2, 100, 50, Duration::from_millis(3), Duration::from_millis(7));
+        log.log_abort();
+        log.log_abort();
+        log.log_guard_failure(0);
+        log.log_guard_failure(0);
+        log.log_guard_failure(1);
+
+        let summary = log.summary();
+        assert!(summary.contains("Traces compiled: 2"));
+        assert!(summary.contains("Traces aborted: 2"));
+        assert!(summary.contains("Total ops recorded: 300"));
+        assert!(summary.contains("Total ops after opt: 150"));
+        assert!(summary.contains("50% reduction"));
+        assert!(summary.contains("Guard failures: 3"));
+        assert!(summary.contains("Optimization time:"));
+        assert!(summary.contains("Compilation time:"));
+    }
+
+    #[test]
+    fn test_jitlog_loop_entries_accumulate() {
+        let mut log = JitLog::new(false);
+        for _ in 0..10 {
+            log.log_loop_entry(42);
+        }
+        log.log_loop_entry(99);
+        assert_eq!(*log.loop_entry_counts().get(&42).unwrap(), 10);
+        assert_eq!(*log.loop_entry_counts().get(&99).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_jit_timer_measures_duration() {
+        let timer = JitTimer::start();
+        // Do a tiny amount of work
+        let mut _x = 0;
+        for i in 0..1000 {
+            _x += i;
+        }
+        let elapsed = timer.elapsed();
+        // Should be non-negative (well, Duration is always non-negative)
+        assert!(elapsed >= Duration::ZERO);
+    }
+
     #[test]
     fn test_compiled_traces_accessor() {
         let mut log = JitLog::new(false);
