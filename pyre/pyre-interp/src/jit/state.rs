@@ -504,6 +504,15 @@ impl TraceFrameState {
         args
     }
 
+    /// Build the current fail_args for guards: [frame, ni, sd, locals..., stack...]
+    pub(crate) fn current_fail_args(&self, ctx: &mut TraceCtx) -> Vec<OpRef> {
+        let s = self.sym();
+        let mut fa = vec![s.frame, s.vable_next_instr, s.vable_stack_depth];
+        fa.extend_from_slice(&s.symbolic_locals);
+        fa.extend_from_slice(&s.symbolic_stack[..s.stack_depth.min(s.symbolic_stack.len())]);
+        fa
+    }
+
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         self.flush_to_frame(ctx);
         let s = self.sym();
@@ -930,17 +939,39 @@ impl TraceFrameState {
             _ => unreachable!("unexpected direct int binary op"),
         };
 
+        let has_overflow = matches!(
+            op_code,
+            OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
+        );
         self.with_ctx(|this, ctx| {
-            let lhs = this.trace_guarded_int_payload(ctx, a);
-            let rhs = this.trace_guarded_int_payload(ctx, b);
-            let result = ctx.record_op(op_code, &[lhs, rhs]);
-            if matches!(
-                op_code,
-                OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
-            ) {
-                this.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
-            }
-            Ok(this.trace_boxed_int_value(ctx, result, concrete_result))
+            let fail_args = this.current_fail_args(ctx);
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let result = if has_overflow {
+                crate::jit::generated::trace_int_binop_ovf(
+                    ctx,
+                    a,
+                    b,
+                    op_code,
+                    int_type_addr,
+                    crate::jit::descr::ob_type_descr(),
+                    crate::jit::descr::int_intval_descr(),
+                    crate::jit::descr::w_int_size_descr(),
+                    &fail_args,
+                )
+            } else {
+                crate::jit::generated::trace_int_binop(
+                    ctx,
+                    a,
+                    b,
+                    op_code,
+                    int_type_addr,
+                    crate::jit::descr::ob_type_descr(),
+                    crate::jit::descr::int_intval_descr(),
+                    crate::jit::descr::w_int_size_descr(),
+                    &fail_args,
+                )
+            };
+            Ok(result)
         })
     }
 
