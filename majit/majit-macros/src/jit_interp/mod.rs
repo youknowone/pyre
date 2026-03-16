@@ -19,6 +19,31 @@ use syn::{
 };
 
 /// Parsed configuration from `#[jit_interp(...)]` attributes.
+///
+/// ## Helper discovery
+///
+/// Helpers (functions called from traced match arms) can be declared in
+/// three ways, from most explicit to most concise:
+///
+/// 1. **`calls = { helper_a, helper_b => residual_int, ... }`**
+///    Brace-delimited list with optional per-helper policy overrides.
+///
+/// 2. **`helpers = [helper_a, helper_b, helper_c]`**
+///    Bracket-delimited shorthand — all helpers use auto-inferred policy.
+///    Equivalent to listing each in `calls = { ... }` without a `=>` override.
+///    Can be combined with `calls` for helpers that need explicit policies.
+///
+/// 3. **`auto_calls = true`**
+///    Infer helper policies from sidecar `#[elidable]` / `#[dont_look_inside]`
+///    / `#[jit_inline]` attributes on every call site in the traced arms.
+///
+/// ### Module-level discovery limitation
+///
+/// Unlike RPython's codewriter, which can scan an entire module for
+/// JIT-relevant functions, Rust proc macros operate on a single item.
+/// Full module scanning would require a `#[jit_module]` attribute macro
+/// on the enclosing `mod`, which is not yet implemented.  Use `helpers`
+/// or `calls` to explicitly list the functions that need JIT integration.
 pub struct JitInterpConfig {
     /// The interpreter state type (e.g., `AheuiState`).
     pub state_type: Ident,
@@ -31,6 +56,7 @@ pub struct JitInterpConfig {
     /// Interpreter I/O function → JIT shim function mapping.
     pub io_shims: Vec<(Path, Ident)>,
     /// Interpreter function call policies for helper calls.
+    /// Populated from both `calls = { ... }` and `helpers = [...]`.
     pub calls: Vec<(Path, Option<Ident>)>,
     /// Whether direct helper calls should be auto-inferred from sidecar metadata.
     pub auto_calls: bool,
@@ -62,7 +88,7 @@ impl Parse for JitInterpConfig {
         let mut storage = None;
         let mut binops = None;
         let mut io_shims = None;
-        let mut calls = None;
+        let mut calls: Vec<(Path, Option<Ident>)> = Vec::new();
         let mut auto_calls = None;
         let mut greens = None;
 
@@ -87,7 +113,10 @@ impl Parse for JitInterpConfig {
                     io_shims = Some(parse_io_shim_map(input)?);
                 }
                 "calls" => {
-                    calls = Some(parse_call_map(input)?);
+                    calls.extend(parse_call_map(input)?);
+                }
+                "helpers" => {
+                    calls.extend(parse_helpers_list(input)?);
                 }
                 "auto_calls" => {
                     auto_calls = Some(input.parse::<LitBool>()?.value);
@@ -119,7 +148,7 @@ impl Parse for JitInterpConfig {
             storage,
             binops: binops.unwrap_or_default(),
             io_shims: io_shims.unwrap_or_default(),
-            calls: calls.unwrap_or_default(),
+            calls,
             auto_calls: auto_calls.unwrap_or(false),
             greens: greens.unwrap_or_default(),
         })
@@ -287,6 +316,15 @@ fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>>
         let _ = content.parse::<Token![,]>();
     }
     Ok(map)
+}
+
+/// Parse `[func_a, func_b, func_c]` — shorthand helper list with auto-inferred policies.
+fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>> {
+    let content;
+    bracketed!(content in input);
+    let paths: Punctuated<Path, Token![,]> =
+        content.parse_terminated(Path::parse, Token![,])?;
+    Ok(paths.into_iter().map(|p| (p, None)).collect())
 }
 
 /// Main entry point: transform the function with JIT support.
@@ -582,4 +620,69 @@ fn rewrite_body(
 
     let stmts = &cloned_block.stmts;
     quote! { #(#stmts)* }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn parse_helpers_list_basic() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            [helper_add, helper_sub, helper_mul]
+        };
+        let result: Vec<(Path, Option<Ident>)> =
+            syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            result[0].0.segments.last().unwrap().ident.to_string(),
+            "helper_add"
+        );
+        assert!(result[0].1.is_none());
+        assert_eq!(
+            result[1].0.segments.last().unwrap().ident.to_string(),
+            "helper_sub"
+        );
+        assert_eq!(
+            result[2].0.segments.last().unwrap().ident.to_string(),
+            "helper_mul"
+        );
+    }
+
+    #[test]
+    fn parse_helpers_list_empty() {
+        let tokens: proc_macro2::TokenStream = parse_quote! { [] };
+        let result: Vec<(Path, Option<Ident>)> =
+            syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_helpers_list_with_path() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            [module::helper_a, helper_b]
+        };
+        let result: Vec<(Path, Option<Ident>)> =
+            syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
+        assert_eq!(result.len(), 2);
+        // First has two path segments
+        assert_eq!(result[0].0.segments.len(), 2);
+        assert_eq!(
+            result[0].0.segments[0].ident.to_string(),
+            "module"
+        );
+        assert_eq!(
+            result[0].0.segments[1].ident.to_string(),
+            "helper_a"
+        );
+    }
+
+    /// Wrapper to make `parse_helpers_list` testable via `syn::parse2`.
+    struct HelpersListWrapper(Vec<(Path, Option<Ident>)>);
+    impl Parse for HelpersListWrapper {
+        fn parse(input: ParseStream) -> syn::Result<Self> {
+            Ok(Self(parse_helpers_list(input)?))
+        }
+    }
 }

@@ -126,6 +126,12 @@ fn generate_jitcode_arm(
         ArmPattern::Nop => quote! {
             Some(majit_meta::JitCodeBuilder::new().finish())
         },
+        ArmPattern::Unsupported(reason) => {
+            let msg = format!(
+                "unsupported CFG pattern in match arm: {reason}"
+            );
+            quote! { compile_error!(#msg) }
+        }
     };
 
     quote! { #pat => { #build }, }

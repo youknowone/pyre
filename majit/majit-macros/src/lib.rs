@@ -82,6 +82,13 @@ impl Parse for JitInlineArgs {
                         let _ = content.parse::<Token![,]>();
                     }
                 }
+                "helpers" => {
+                    let content;
+                    syn::bracketed!(content in input);
+                    let paths: syn::punctuated::Punctuated<Path, Token![,]> =
+                        content.parse_terminated(Path::parse, Token![,])?;
+                    calls.extend(paths.into_iter().map(|p| (p, None)));
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
