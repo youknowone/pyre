@@ -101,6 +101,9 @@ pub struct PyreSym {
     /// Base OpRef index for virtualizable local variables.
     /// When set, symbolic_locals[i] = OpRef(vable_locals_base + i).
     pub(crate) vable_locals_base: Option<u32>,
+    /// Base OpRef index for virtualizable stack slots.
+    /// When set, symbolic_stack[i] = OpRef(vable_stack_base + i).
+    pub(crate) vable_stack_base: Option<u32>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -254,11 +257,13 @@ pub(crate) fn record_current_state_guard(
     next_instr: OpRef,
     stack_depth: OpRef,
     locals: &[OpRef],
+    stack: &[OpRef],
     opcode: OpCode,
     args: &[OpRef],
 ) {
     let mut fail_args = vec![frame, next_instr, stack_depth];
     fail_args.extend_from_slice(locals);
+    fail_args.extend_from_slice(stack);
     let fail_arg_types = vec![Type::Int; fail_args.len()];
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
@@ -280,6 +285,7 @@ impl PyreSym {
             vable_next_instr: OpRef::NONE,
             vable_stack_depth: OpRef::NONE,
             vable_locals_base: None,
+            vable_stack_base: None,
         }
     }
 
@@ -298,7 +304,11 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; nlocals]
         };
-        self.symbolic_stack = vec![OpRef::NONE; stack_depth];
+        self.symbolic_stack = if let Some(base) = self.vable_stack_base {
+            (0..stack_depth).map(|i| OpRef(base + i as u32)).collect()
+        } else {
+            vec![OpRef::NONE; stack_depth]
+        };
         self.dirty_locals = vec![false; nlocals];
         self.dirty_stack = vec![false; stack_depth];
         self.dirty_stack_depth = false;
@@ -515,17 +525,9 @@ impl TraceFrameState {
         for i in 0..s.dirty_locals.len() {
             s.dirty_locals[i] = false;
         }
+        // Stack is also virtualized — carried through JUMP args.
         for i in 0..s.stack_depth.min(s.dirty_stack.len()) {
-            if s.dirty_stack[i] {
-                let idx = ctx.const_int(i as i64);
-                trace_vable_array_setitem_value(
-                    ctx,
-                    s.stack_array_ref,
-                    idx,
-                    s.symbolic_stack[i],
-                );
-                s.dirty_stack[i] = false;
-            }
+            s.dirty_stack[i] = false;
         }
         if s.dirty_stack_depth {
             let depth = ctx.const_int(s.stack_depth as i64);
@@ -543,15 +545,17 @@ impl TraceFrameState {
         let s = self.sym();
         let mut args = vec![s.frame, s.vable_next_instr, s.vable_stack_depth];
         args.extend_from_slice(&s.symbolic_locals);
+        args.extend_from_slice(&s.symbolic_stack[..s.stack_depth.min(s.symbolic_stack.len())]);
         args
     }
 
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         self.flush_to_frame(ctx);
         let s = self.sym();
+        let stack_slice = &s.symbolic_stack[..s.stack_depth.min(s.symbolic_stack.len())];
         record_current_state_guard(
             ctx, s.frame, s.vable_next_instr, s.vable_stack_depth,
-            &s.symbolic_locals, opcode, args,
+            &s.symbolic_locals, stack_slice, opcode, args,
         );
     }
 
@@ -2304,7 +2308,7 @@ impl PyreJitState {
     }
 
     /// Restore from virtualizable fail_args format:
-    ///   [frame, next_instr, stack_depth, l0, l1, ..., lN-1]
+    ///   [frame, next_instr, stack_depth, l0..lN-1, s0..sM-1]
     fn restore_virtualizable_i64(&mut self, values: &[i64]) {
         let mut idx = 1;
 
@@ -2318,10 +2322,18 @@ impl PyreJitState {
             idx += 1;
         }
 
-        // Locals follow directly (no length prefix -- count from local_count)
+        // Locals follow directly
         for i in 0..self.local_count() {
             if idx < values.len() {
                 let _ = self.set_local_at(i, values[idx] as PyObjectRef);
+                idx += 1;
+            }
+        }
+
+        // Stack values follow locals
+        for i in 0..self.stack_depth {
+            if idx < values.len() {
+                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
                 idx += 1;
             }
         }
@@ -2443,15 +2455,19 @@ impl JitState for PyreJitState {
         for i in 0..self.local_count() {
             vals.push(self.local_at(i).unwrap_or(0 as PyObjectRef) as i64);
         }
+        for i in 0..self.stack_depth {
+            vals.push(self.stack_at(i).unwrap_or(0 as PyObjectRef) as i64);
+        }
         vals
     }
 
     fn create_sym(meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        let _ = meta;
         let mut sym = PyreSym::new_uninit(OpRef(0));
         sym.vable_next_instr = OpRef(1);
         sym.vable_stack_depth = OpRef(2);
         sym.vable_locals_base = Some(3); // locals start after frame(0), ni(1), sd(2)
+        // stack starts after locals: 3 + num_locals
+        sym.vable_stack_base = Some(3 + meta.num_locals as u32);
         sym
     }
 
