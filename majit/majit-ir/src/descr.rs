@@ -447,3 +447,313 @@ impl EffectInfo {
         self.extra_effect >= ExtraEffect::ElidableCanRaise
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── FFI call surface parity tests (rpython/jit/metainterp/test/test_fficall.py) ──
+
+    /// Concrete CallDescr for testing.
+    #[derive(Debug)]
+    struct TestCallDescr {
+        arg_types: Vec<Type>,
+        result_type: Type,
+        result_size: usize,
+        result_signed: bool,
+        effect: EffectInfo,
+    }
+
+    impl Descr for TestCallDescr {
+        fn as_call_descr(&self) -> Option<&dyn CallDescr> {
+            Some(self)
+        }
+    }
+
+    impl CallDescr for TestCallDescr {
+        fn arg_types(&self) -> &[Type] {
+            &self.arg_types
+        }
+        fn result_type(&self) -> Type {
+            self.result_type
+        }
+        fn result_size(&self) -> usize {
+            self.result_size
+        }
+        fn is_result_signed(&self) -> bool {
+            self.result_signed
+        }
+        fn effect_info(&self) -> &EffectInfo {
+            &self.effect
+        }
+    }
+
+    #[test]
+    fn test_call_descr_stores_arg_types_and_result() {
+        // Parity with test_simple_call_int: CallDescr correctly stores arg types and result type
+        let descr = TestCallDescr {
+            arg_types: vec![Type::Int, Type::Int],
+            result_type: Type::Int,
+            result_size: 8,
+            result_signed: true,
+            effect: EffectInfo::default(),
+        };
+        assert_eq!(descr.arg_types(), &[Type::Int, Type::Int]);
+        assert_eq!(descr.result_type(), Type::Int);
+        assert_eq!(descr.result_size(), 8);
+        assert!(descr.is_result_signed());
+    }
+
+    #[test]
+    fn test_call_descr_float_args() {
+        // Parity with test_simple_call_float
+        let descr = TestCallDescr {
+            arg_types: vec![Type::Float, Type::Float],
+            result_type: Type::Float,
+            result_size: 8,
+            result_signed: false,
+            effect: EffectInfo::default(),
+        };
+        assert_eq!(descr.arg_types(), &[Type::Float, Type::Float]);
+        assert_eq!(descr.result_type(), Type::Float);
+    }
+
+    #[test]
+    fn test_call_descr_void_result() {
+        // Parity with test_returns_none
+        let descr = TestCallDescr {
+            arg_types: vec![Type::Int, Type::Int],
+            result_type: Type::Void,
+            result_size: 0,
+            result_signed: false,
+            effect: EffectInfo::default(),
+        };
+        assert_eq!(descr.result_type(), Type::Void);
+        assert_eq!(descr.result_size(), 0);
+    }
+
+    #[test]
+    fn test_call_descr_many_arguments() {
+        // Parity with test_many_arguments: various argument counts
+        for count in [0, 6, 20] {
+            let arg_types = vec![Type::Int; count];
+            let descr = TestCallDescr {
+                arg_types,
+                result_type: Type::Int,
+                result_size: 8,
+                result_signed: true,
+                effect: EffectInfo::default(),
+            };
+            assert_eq!(descr.arg_types().len(), count);
+        }
+    }
+
+    #[test]
+    fn test_call_descr_ref_result() {
+        let descr = TestCallDescr {
+            arg_types: vec![Type::Ref],
+            result_type: Type::Ref,
+            result_size: 8,
+            result_signed: false,
+            effect: EffectInfo::default(),
+        };
+        assert_eq!(descr.arg_types(), &[Type::Ref]);
+        assert_eq!(descr.result_type(), Type::Ref);
+    }
+
+    #[test]
+    fn test_call_descr_downcasts_via_trait() {
+        let descr: Arc<dyn Descr> = Arc::new(TestCallDescr {
+            arg_types: vec![Type::Int],
+            result_type: Type::Int,
+            result_size: 8,
+            result_signed: true,
+            effect: EffectInfo::default(),
+        });
+        let cd = descr.as_call_descr().expect("should downcast to CallDescr");
+        assert_eq!(cd.arg_types(), &[Type::Int]);
+        assert_eq!(cd.result_type(), Type::Int);
+    }
+
+    #[test]
+    fn test_call_target_token_default_none() {
+        let descr = TestCallDescr {
+            arg_types: vec![],
+            result_type: Type::Void,
+            result_size: 0,
+            result_signed: false,
+            effect: EffectInfo::default(),
+        };
+        assert_eq!(descr.call_target_token(), None);
+    }
+
+    #[test]
+    fn test_effect_info_default_can_raise() {
+        let ei = EffectInfo::default();
+        assert_eq!(ei.extra_effect, ExtraEffect::CanRaise);
+        assert_eq!(ei.oopspec_index, OopSpecIndex::None);
+        assert!(ei.can_raise());
+        assert!(!ei.is_elidable());
+        assert!(!ei.is_loopinvariant());
+    }
+
+    #[test]
+    fn test_effect_info_elidable_variants() {
+        let elidable_effects = [
+            ExtraEffect::ElidableCannotRaise,
+            ExtraEffect::ElidableOrMemoryError,
+            ExtraEffect::ElidableCanRaise,
+        ];
+        for effect in elidable_effects {
+            let ei = EffectInfo {
+                extra_effect: effect,
+                oopspec_index: OopSpecIndex::None,
+            };
+            assert!(ei.is_elidable(), "expected elidable for {effect:?}");
+        }
+
+        let non_elidable = [
+            ExtraEffect::CannotRaise,
+            ExtraEffect::CanRaise,
+            ExtraEffect::LoopInvariant,
+            ExtraEffect::ForcesVirtualOrVirtualizable,
+            ExtraEffect::RandomEffects,
+        ];
+        for effect in non_elidable {
+            let ei = EffectInfo {
+                extra_effect: effect,
+                oopspec_index: OopSpecIndex::None,
+            };
+            assert!(!ei.is_elidable(), "expected non-elidable for {effect:?}");
+        }
+    }
+
+    #[test]
+    fn test_effect_info_can_raise_ordering() {
+        // ExtraEffect ordering: effects >= ElidableCanRaise can raise
+        let cannot_raise = [
+            ExtraEffect::ElidableCannotRaise,
+            ExtraEffect::LoopInvariant,
+            ExtraEffect::CannotRaise,
+            ExtraEffect::ElidableOrMemoryError,
+        ];
+        for effect in cannot_raise {
+            let ei = EffectInfo {
+                extra_effect: effect,
+                oopspec_index: OopSpecIndex::None,
+            };
+            assert!(!ei.can_raise(), "expected cannot raise for {effect:?}");
+        }
+
+        let can_raise = [
+            ExtraEffect::ElidableCanRaise,
+            ExtraEffect::CanRaise,
+            ExtraEffect::ForcesVirtualOrVirtualizable,
+            ExtraEffect::RandomEffects,
+        ];
+        for effect in can_raise {
+            let ei = EffectInfo {
+                extra_effect: effect,
+                oopspec_index: OopSpecIndex::None,
+            };
+            assert!(ei.can_raise(), "expected can raise for {effect:?}");
+        }
+    }
+
+    #[test]
+    fn test_effect_info_loop_invariant() {
+        let ei = EffectInfo {
+            extra_effect: ExtraEffect::LoopInvariant,
+            oopspec_index: OopSpecIndex::None,
+        };
+        assert!(ei.is_loopinvariant());
+        assert!(!ei.is_elidable());
+        assert!(!ei.can_raise());
+    }
+
+    #[test]
+    fn test_effect_info_libffi_call_oopspec() {
+        // FFI calls use LibffiCall oopspec index
+        let ei = EffectInfo {
+            extra_effect: ExtraEffect::CanRaise,
+            oopspec_index: OopSpecIndex::LibffiCall,
+        };
+        assert_eq!(ei.oopspec_index, OopSpecIndex::LibffiCall);
+        assert!(ei.can_raise());
+    }
+
+    #[test]
+    fn test_effect_info_forces_virtual() {
+        // Parity: calls that force virtualizable objects
+        let ei = EffectInfo {
+            extra_effect: ExtraEffect::ForcesVirtualOrVirtualizable,
+            oopspec_index: OopSpecIndex::JitForceVirtualizable,
+        };
+        assert!(ei.can_raise());
+        assert!(!ei.is_elidable());
+        assert_eq!(ei.oopspec_index, OopSpecIndex::JitForceVirtualizable);
+    }
+
+    #[test]
+    fn test_call_release_gil_opcodes_exist() {
+        use crate::op::OpCode;
+        // Parity with test_fficall.py: CallReleaseGil opcodes for all return types
+        let int_op = OpCode::call_release_gil_for_type(Type::Int);
+        assert_eq!(int_op, OpCode::CallReleaseGilI);
+
+        let float_op = OpCode::call_release_gil_for_type(Type::Float);
+        assert_eq!(float_op, OpCode::CallReleaseGilF);
+
+        let ref_op = OpCode::call_release_gil_for_type(Type::Ref);
+        assert_eq!(ref_op, OpCode::CallReleaseGilR);
+
+        let void_op = OpCode::call_release_gil_for_type(Type::Void);
+        assert_eq!(void_op, OpCode::CallReleaseGilN);
+    }
+
+    #[test]
+    fn test_fail_descr_trait() {
+        #[derive(Debug)]
+        struct TestFailDescr {
+            index: u32,
+            arg_types: Vec<Type>,
+        }
+        impl Descr for TestFailDescr {
+            fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+                Some(self)
+            }
+        }
+        impl FailDescr for TestFailDescr {
+            fn fail_index(&self) -> u32 {
+                self.index
+            }
+            fn fail_arg_types(&self) -> &[Type] {
+                &self.arg_types
+            }
+        }
+
+        let fd = TestFailDescr {
+            index: 7,
+            arg_types: vec![Type::Int, Type::Ref],
+        };
+        assert_eq!(fd.fail_index(), 7);
+        assert_eq!(fd.fail_arg_types(), &[Type::Int, Type::Ref]);
+        assert!(!fd.is_finish());
+        assert_eq!(fd.trace_id(), 0);
+        // Ref slot is a GC ref
+        assert!(fd.is_gc_ref_slot(1));
+        // Int slot is not
+        assert!(!fd.is_gc_ref_slot(0));
+    }
+
+    #[test]
+    fn test_debug_merge_point_descr_repr() {
+        let info = DebugMergePointInfo::new("testjit", "bytecode LOAD at 12", 12, 0);
+        let descr = DebugMergePointDescr::new(info);
+        let repr = descr.repr();
+        assert!(repr.contains("testjit"));
+        assert!(repr.contains("bytecode LOAD at 12"));
+        assert!(repr.contains("pc=12"));
+        assert!(repr.contains("depth=0"));
+    }
+}
