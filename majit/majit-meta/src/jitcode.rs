@@ -604,36 +604,58 @@ where
                 self.frames.current_mut().code_cursor = target;
             }
             BC_INLINE_CALL => {
-                let (sub_idx, arg_pairs, return_i) = {
+                let (sub_idx, arg_triples, return_i, return_r, return_f) = {
                     let frame = self.frames.current_mut();
                     let sub_idx = frame.next_u16() as usize;
                     let num_args = frame.next_u16() as usize;
-                    let mut arg_pairs = Vec::with_capacity(num_args);
+                    let mut arg_triples = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
-                        arg_pairs.push((frame.next_u16() as usize, frame.next_u16() as usize));
+                        let kind = JitArgKind::decode(frame.next_u8());
+                        let caller_src = frame.next_u16() as usize;
+                        let callee_dst = frame.next_u16() as usize;
+                        arg_triples.push((kind, caller_src, callee_dst));
                     }
-                    let return_src = frame.next_u16() as usize;
-                    let return_dst = frame.next_u16() as usize;
-                    let return_i =
-                        if return_src == u16::MAX as usize && return_dst == u16::MAX as usize {
+                    let decode_return_slot = |f: &mut MIFrame| {
+                        let src = f.next_u16() as usize;
+                        let dst = f.next_u16() as usize;
+                        if src == u16::MAX as usize && dst == u16::MAX as usize {
                             None
                         } else {
-                            Some((return_src, return_dst))
-                        };
-                    (sub_idx, arg_pairs, return_i)
+                            Some((src, dst))
+                        }
+                    };
+                    let return_i = decode_return_slot(frame);
+                    let return_r = decode_return_slot(frame);
+                    let return_f = decode_return_slot(frame);
+                    (sub_idx, arg_triples, return_i, return_r, return_f)
                 };
                 let pc = self.frames.current_mut().pc;
                 let sub_jitcode = &self.frames.current_mut().jitcode.sub_jitcodes[sub_idx];
-                let sub_frame = MIFrame::new(sub_jitcode, pc);
-                let mut sub_frame = sub_frame;
+                let mut sub_frame = MIFrame::new(sub_jitcode, pc);
                 ctx.push_inline_frame(((pc as u64) << 32) | sub_idx as u64, u32::MAX);
                 sub_frame.inline_frame = true;
-                for (caller_src, callee_dst) in arg_pairs {
-                    let (value, concrete) = self.read_int_reg(caller_src);
-                    sub_frame.int_regs[callee_dst] = Some(value);
-                    sub_frame.int_values[callee_dst] = Some(concrete);
+                for (kind, caller_src, callee_dst) in arg_triples {
+                    match kind {
+                        JitArgKind::Int => {
+                            let (value, concrete) = self.read_int_reg(caller_src);
+                            sub_frame.int_regs[callee_dst] = Some(value);
+                            sub_frame.int_values[callee_dst] = Some(concrete);
+                        }
+                        JitArgKind::Ref => {
+                            let (value, concrete) = self.read_ref_reg(caller_src);
+                            sub_frame.ref_regs[callee_dst] = Some(value);
+                            sub_frame.ref_values[callee_dst] = Some(concrete);
+                        }
+                        JitArgKind::Float => {
+                            let (value, concrete) = self.read_float_reg(caller_src);
+                            sub_frame.float_regs[callee_dst] = Some(value);
+                            sub_frame.float_values[callee_dst] = Some(concrete);
+                        }
+                    }
                 }
                 sub_frame.return_i = return_i;
+                sub_frame.return_r = return_r;
+                sub_frame.return_f = return_f;
                 self.frames.push(sub_frame);
             }
             BC_RESIDUAL_CALL_VOID
@@ -1292,20 +1314,102 @@ impl JitCodeBuilder {
         args: &[(u16, u16)],
         return_i: Option<(u16, u16)>,
     ) {
-        for &(caller_src, _) in args {
-            self.touch_reg(caller_src);
+        self.inline_call_full(sub_jitcode_idx, args, return_i, None, None);
+    }
+
+    pub fn inline_call_r(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args: &[(u16, u16)],
+        return_r: Option<(u16, u16)>,
+    ) {
+        self.inline_call_full(sub_jitcode_idx, args, None, return_r, None);
+    }
+
+    pub fn inline_call_f(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args: &[(u16, u16)],
+        return_f: Option<(u16, u16)>,
+    ) {
+        self.inline_call_full(sub_jitcode_idx, args, None, None, return_f);
+    }
+
+    /// Inline call with typed arguments and a typed return slot.
+    ///
+    /// `args` maps each typed caller register to a callee register,
+    /// `return_kind` selects which register file the return is routed through:
+    /// 0 = Int, 1 = Ref, 2 = Float.
+    pub fn inline_call_with_typed_args(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args: &[(JitArgKind, u16, u16)],
+        return_slot: Option<(u16, u16)>,
+        return_kind: u8,
+    ) {
+        let (return_i, return_r, return_f) = match return_kind {
+            1 => (None, return_slot, None),
+            2 => (None, None, return_slot),
+            _ => (return_slot, None, None),
+        };
+        self.inline_call_typed(sub_jitcode_idx, args, return_i, return_r, return_f);
+    }
+
+    fn inline_call_full(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args: &[(u16, u16)],
+        return_i: Option<(u16, u16)>,
+        return_r: Option<(u16, u16)>,
+        return_f: Option<(u16, u16)>,
+    ) {
+        // Default: all args are int-typed when using (u16, u16) pairs
+        let typed_args: Vec<_> = args
+            .iter()
+            .map(|&(src, dst)| (JitArgKind::Int, src, dst))
+            .collect();
+        self.inline_call_typed(sub_jitcode_idx, &typed_args, return_i, return_r, return_f);
+    }
+
+    fn inline_call_typed(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args: &[(JitArgKind, u16, u16)],
+        return_i: Option<(u16, u16)>,
+        return_r: Option<(u16, u16)>,
+        return_f: Option<(u16, u16)>,
+    ) {
+        for &(kind, caller_src, _) in args {
+            match kind {
+                JitArgKind::Int => self.touch_reg(caller_src),
+                JitArgKind::Ref => self.touch_ref_reg(caller_src),
+                JitArgKind::Float => self.touch_float_reg(caller_src),
+            }
         }
         if let Some((_, caller_dst)) = return_i {
             self.touch_reg(caller_dst);
         }
+        if let Some((_, caller_dst)) = return_r {
+            self.touch_ref_reg(caller_dst);
+        }
+        if let Some((_, caller_dst)) = return_f {
+            self.touch_float_reg(caller_dst);
+        }
         self.push_u8(BC_INLINE_CALL);
         self.push_u16(sub_jitcode_idx);
         self.push_u16(args.len() as u16);
-        for &(caller_src, callee_dst) in args {
+        for &(kind, caller_src, callee_dst) in args {
+            self.push_u8(kind.encode());
             self.push_u16(caller_src);
             self.push_u16(callee_dst);
         }
-        match return_i {
+        self.push_return_slot(return_i);
+        self.push_return_slot(return_r);
+        self.push_return_slot(return_f);
+    }
+
+    fn push_return_slot(&mut self, ret: Option<(u16, u16)>) {
+        match ret {
             Some((callee_src, caller_dst)) => {
                 self.push_u16(callee_src);
                 self.push_u16(caller_dst);

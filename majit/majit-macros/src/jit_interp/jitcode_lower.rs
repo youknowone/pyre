@@ -35,8 +35,15 @@ const MAX_HELPER_CALL_ARITY: usize = 16;
 
 pub(crate) struct InlineHelperJitCode {
     pub body: TokenStream,
-    pub param_count: u16,
     pub return_reg: u16,
+    pub return_kind: InlineReturnKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InlineReturnKind {
+    Int,
+    Ref,
+    Float,
 }
 
 #[derive(Clone)]
@@ -979,19 +986,16 @@ impl<'c> Lowerer<'c> {
                     });
                 }
                 "inline_int" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
                     let builder_path = inline_builder_path(&call.func)?;
-                    let callee_arg_map = arg_regs
-                        .iter()
-                        .enumerate()
-                        .map(|(index, caller_reg)| quote! { (#caller_reg, #index as u16) });
+                    let inline_args = typed_inline_arg_tokens(&arg_bindings);
                     self.statements.push(quote! {
-                        let (__sub_jitcode, __sub_return_reg) = #builder_path();
+                        let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = #builder_path();
                         let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                        __builder.inline_call_i(
+                        __builder.inline_call_with_typed_args(
                             __sub_idx,
-                            &[#(#callee_arg_map),*],
+                            #inline_args,
                             Some((__sub_return_reg, #reg)),
+                            __sub_return_kind,
                         );
                     });
                 }
@@ -1000,15 +1004,12 @@ impl<'c> Lowerer<'c> {
             CallPolicySpec::Infer => {
                 let policy_path = helper_policy_path(&call.func)?;
                 let typed_args = typed_call_arg_tokens(&arg_bindings);
+                let inline_args = typed_inline_arg_tokens(&arg_bindings);
                 let int_arg_regs = int_arg_regs(&arg_bindings);
                 let unsupported = self.inference_failure_tokens(
                     "inferred helper policy does not support this value call here",
                 );
-                if let Some(arg_regs) = int_arg_regs {
-                    let callee_arg_map = arg_regs
-                        .iter()
-                        .enumerate()
-                        .map(|(index, caller_reg)| quote! { (#caller_reg, #index as u16) });
+                if let Some(_arg_regs) = int_arg_regs {
                     self.statements.push(quote! {
                         let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
                         let __trace_target = if __trace_target.is_null() {
@@ -1030,14 +1031,15 @@ impl<'c> Lowerer<'c> {
                                 __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
                             }
                             4u8 => {
-                                let __builder_fn: fn() -> (majit_meta::JitCode, u16) =
+                                let __builder_fn: fn() -> (majit_meta::JitCode, u16, u8) =
                                     unsafe { std::mem::transmute(__inline_builder) };
-                                let (__sub_jitcode, __sub_return_reg) = __builder_fn();
+                                let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = __builder_fn();
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                                __builder.inline_call_i(
+                                __builder.inline_call_with_typed_args(
                                     __sub_idx,
-                                    &[#(#callee_arg_map),*],
+                                    #inline_args,
                                     Some((__sub_return_reg, #reg)),
+                                    __sub_return_kind,
                                 );
                             }
                             10u8 => {
@@ -1056,7 +1058,7 @@ impl<'c> Lowerer<'c> {
                     });
                 } else {
                     self.statements.push(quote! {
-                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                        let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
                         let __trace_target = if __trace_target.is_null() {
                             #func as *const ()
                         } else {
@@ -1074,6 +1076,18 @@ impl<'c> Lowerer<'c> {
                             }
                             3u8 => {
                                 __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                            }
+                            4u8 => {
+                                let __builder_fn: fn() -> (majit_meta::JitCode, u16, u8) =
+                                    unsafe { std::mem::transmute(__inline_builder) };
+                                let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = __builder_fn();
+                                let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                                __builder.inline_call_with_typed_args(
+                                    __sub_idx,
+                                    #inline_args,
+                                    Some((__sub_return_reg, #reg)),
+                                    __sub_return_kind,
+                                );
                             }
                             10u8 => {
                                 __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
@@ -1345,6 +1359,25 @@ fn int_arg_regs(bindings: &[Binding]) -> Option<Vec<u16>> {
         .collect()
 }
 
+fn typed_inline_arg_tokens(bindings: &[Binding]) -> TokenStream {
+    let args = bindings.iter().enumerate().map(|(index, binding)| {
+        let reg = binding.reg;
+        let idx = index as u16;
+        match binding.kind {
+            BindingKind::Int => {
+                quote! { (majit_meta::JitArgKind::Int, #reg, #idx) }
+            }
+            BindingKind::Ref => {
+                quote! { (majit_meta::JitArgKind::Ref, #reg, #idx) }
+            }
+            BindingKind::Float => {
+                quote! { (majit_meta::JitArgKind::Float, #reg, #idx) }
+            }
+        }
+    });
+    quote! { &[#(#args),*] }
+}
+
 fn typed_call_arg_tokens(bindings: &[Binding]) -> TokenStream {
     let args = bindings.iter().map(|binding| {
         let reg = binding.reg;
@@ -1419,6 +1452,33 @@ fn is_supported_int_cast(ty: &Type) -> bool {
     match ty {
         Type::Path(type_path) => type_path.path.is_ident("i64") || type_path.path.is_ident("isize"),
         _ => false,
+    }
+}
+
+fn is_supported_ref_type(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => type_path.path.is_ident("usize"),
+        Type::Ptr(_) => true,
+        _ => false,
+    }
+}
+
+fn is_supported_float_type(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => type_path.path.is_ident("f64"),
+        _ => false,
+    }
+}
+
+pub(crate) fn classify_param_type(ty: &Type) -> Option<InlineReturnKind> {
+    if is_supported_int_cast(ty) {
+        Some(InlineReturnKind::Int)
+    } else if is_supported_ref_type(ty) {
+        Some(InlineReturnKind::Ref)
+    } else if is_supported_float_type(ty) {
+        Some(InlineReturnKind::Float)
+    } else {
+        None
     }
 }
 
@@ -1518,15 +1578,15 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     let ReturnType::Type(_, return_ty) = &func.sig.output else {
         return Err(syn::Error::new_spanned(
             &func.sig.output,
-            "#[jit_inline] requires an integer return type",
+            "#[jit_inline] requires a return type",
         ));
     };
-    if !is_supported_int_cast(return_ty) {
-        return Err(syn::Error::new_spanned(
+    let return_kind = classify_param_type(return_ty).ok_or_else(|| {
+        syn::Error::new_spanned(
             return_ty,
-            "#[jit_inline] currently supports only i64/isize return types",
-        ));
-    }
+            "#[jit_inline] supports i64/isize (Int), usize/pointer (Ref), or f64 (Float) return types",
+        )
+    })?;
 
     let call_policies = calls
         .iter()
@@ -1547,23 +1607,28 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
                 "#[jit_inline] does not support methods or self receivers",
             ));
         };
-        if !is_supported_int_cast(&pat_type.ty) {
-            return Err(syn::Error::new_spanned(
+        let param_kind = classify_param_type(&pat_type.ty).ok_or_else(|| {
+            syn::Error::new_spanned(
                 &pat_type.ty,
-                "#[jit_inline] parameters must use i64/isize",
-            ));
-        }
+                "#[jit_inline] parameters must use i64/isize (Int), usize/pointer (Ref), or f64 (Float)",
+            )
+        })?;
         let Pat::Ident(pat_ident) = &*pat_type.pat else {
             return Err(syn::Error::new_spanned(
                 &pat_type.pat,
                 "#[jit_inline] parameters must be simple identifiers",
             ));
         };
+        let binding_kind = match param_kind {
+            InlineReturnKind::Int => BindingKind::Int,
+            InlineReturnKind::Ref => BindingKind::Ref,
+            InlineReturnKind::Float => BindingKind::Float,
+        };
         lowerer.bindings.insert(
             pat_ident.ident.to_string(),
             Binding {
                 reg: index as u16,
-                kind: BindingKind::Int,
+                kind: binding_kind,
                 depends_on_stack: false,
             },
         );
@@ -1579,8 +1644,8 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         body: quote! {
             #(#statements)*
         },
-        param_count: func.sig.inputs.len() as u16,
         return_reg: binding.reg,
+        return_kind,
     }))
 }
 
