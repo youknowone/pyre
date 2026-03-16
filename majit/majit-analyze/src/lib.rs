@@ -40,8 +40,20 @@ pub struct OpcodeArm {
     pub pattern: String,
     /// Handler method calls found in the arm body
     pub handler_calls: Vec<String>,
+    /// Resolved call chain (trait impl → concrete method → helpers)
+    #[serde(default)]
+    pub resolved_calls: Vec<ResolvedCall>,
     /// Trace pattern classification
     pub trace_pattern: Option<TracePattern>,
+}
+
+/// A resolved method/function call with source context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedCall {
+    pub name: String,
+    pub impl_type: Option<String>,
+    pub trait_name: Option<String>,
+    pub body_summary: String,
 }
 
 /// Struct field layout information
@@ -72,21 +84,97 @@ pub struct MethodInfo {
     pub body_summary: String,
 }
 
-/// Analyze a bundled interpreter source file.
+/// Analyze a single source file.
+pub fn analyze(source: &str) -> AnalysisResult {
+    analyze_multiple(&[source])
+}
+
+/// Analyze multiple source files as a unified program.
 ///
 /// This is the main entry point — equivalent to RPython's annotation + rtyping.
-pub fn analyze(source: &str) -> AnalysisResult {
-    let parsed = parse::parse_source(source);
-    let helpers = classify::classify_functions(&parsed);
-    let type_layouts = parse::extract_type_layouts(&parsed);
-    let trait_impls = parse::extract_trait_impls(&parsed);
-    let opcodes = parse::extract_opcode_dispatch(&parsed, &trait_impls);
+/// Pass all relevant source files (opcode_step.rs, eval.rs, object types, etc.)
+/// and the analyzer builds a cross-file view of the interpreter.
+pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
+    let mut all_helpers = Vec::new();
+    let mut all_types = Vec::new();
+    let mut all_trait_impls = Vec::new();
+    let mut all_functions = std::collections::HashMap::new();
+
+    // Phase 1: Parse all files and collect items
+    let parsed_files: Vec<_> = sources
+        .iter()
+        .map(|s| parse::parse_source(s))
+        .collect();
+
+    for parsed in &parsed_files {
+        all_helpers.extend(classify::classify_functions(parsed));
+        all_types.extend(parse::extract_type_layouts(parsed));
+        all_trait_impls.extend(parse::extract_trait_impls(parsed));
+        parse::collect_functions(parsed, &mut all_functions);
+    }
+
+    // Phase 2: Extract opcode dispatch (needs cross-file trait resolution)
+    let mut opcodes = Vec::new();
+    for parsed in &parsed_files {
+        let file_opcodes = parse::extract_opcode_dispatch(parsed, &all_trait_impls);
+        if !file_opcodes.is_empty() {
+            opcodes = file_opcodes;
+            break; // Only one file has execute_opcode_step
+        }
+    }
+
+    // Phase 3: Resolve call chains across files
+    for arm in &mut opcodes {
+        resolve_call_chain(arm, &all_trait_impls, &all_functions);
+    }
 
     AnalysisResult {
         opcodes,
-        helpers,
-        type_layouts,
-        trait_impls,
+        helpers: all_helpers,
+        type_layouts: all_types,
+        trait_impls: all_trait_impls,
+    }
+}
+
+/// Resolve handler method calls through trait impls and function definitions.
+fn resolve_call_chain(
+    arm: &mut OpcodeArm,
+    trait_impls: &[TraitImplInfo],
+    functions: &std::collections::HashMap<String, String>,
+) {
+    let mut resolved_calls = Vec::new();
+
+    for call_name in &arm.handler_calls {
+        // Check trait impls first
+        for impl_info in trait_impls {
+            for method in &impl_info.methods {
+                if &method.name == call_name {
+                    resolved_calls.push(ResolvedCall {
+                        name: call_name.clone(),
+                        impl_type: Some(impl_info.for_type.clone()),
+                        trait_name: Some(impl_info.trait_name.clone()),
+                        body_summary: method.body_summary.clone(),
+                    });
+                }
+            }
+        }
+
+        // Check free functions
+        if let Some(body) = functions.get(call_name) {
+            resolved_calls.push(ResolvedCall {
+                name: call_name.clone(),
+                impl_type: None,
+                trait_name: None,
+                body_summary: body.clone(),
+            });
+        }
+    }
+
+    arm.resolved_calls = resolved_calls;
+
+    // Try to classify the trace pattern from resolved calls
+    if arm.trace_pattern.is_none() {
+        arm.trace_pattern = patterns::classify_from_resolved(&arm.resolved_calls);
     }
 }
 
@@ -101,29 +189,71 @@ pub fn generate_trace_code(result: &AnalysisResult) -> String {
 mod tests {
     use super::*;
 
+    fn read_pyre_file(name: &str) -> String {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pyre/");
+        std::fs::read_to_string(format!("{base}{name}"))
+            .unwrap_or_else(|_| panic!("failed to read {name}"))
+    }
+
     #[test]
     fn test_analyze_opcode_step() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../pyre/pyre-runtime/src/opcode_step.rs"),
-        )
-        .expect("failed to read opcode_step.rs");
+        let source = read_pyre_file("pyre-runtime/src/opcode_step.rs");
         let result = analyze(&source);
 
-        // Should find the execute_opcode_step match arms
         assert!(
             result.opcodes.len() > 20,
             "expected >20 opcode arms, got {}",
             result.opcodes.len()
         );
 
-        // Print summary for manual inspection
-        eprintln!("=== Analysis Results ===");
+        eprintln!("=== Single-file Analysis ===");
+        eprintln!("Opcodes: {}", result.opcodes.len());
+        for (i, arm) in result.opcodes.iter().enumerate() {
+            eprintln!("  [{i}] {} → {:?}", arm.pattern, arm.handler_calls);
+        }
+    }
+
+    #[test]
+    fn test_multi_file_analysis() {
+        let opcode_step = read_pyre_file("pyre-runtime/src/opcode_step.rs");
+        let eval = read_pyre_file("pyre-interp/src/eval.rs");
+
+        let result = analyze_multiple(&[&opcode_step, &eval]);
+
+        eprintln!("=== Multi-file Analysis ===");
         eprintln!("Opcodes: {}", result.opcodes.len());
         eprintln!("Helpers: {}", result.helpers.len());
         eprintln!("Types: {}", result.type_layouts.len());
         eprintln!("Trait impls: {}", result.trait_impls.len());
-        for (i, arm) in result.opcodes.iter().enumerate() {
-            eprintln!("  [{i}] {} → {:?}", arm.pattern, arm.handler_calls);
+
+        // Should have trait impls from eval.rs (PyFrame impls)
+        let pyframe_impls: Vec<_> = result.trait_impls.iter()
+            .filter(|i| i.for_type.contains("PyFrame"))
+            .collect();
+        eprintln!("\nPyFrame trait impls: {}", pyframe_impls.len());
+        for impl_info in &pyframe_impls {
+            eprintln!("  impl {} for PyFrame — {} methods",
+                impl_info.trait_name, impl_info.methods.len());
+            for m in &impl_info.methods {
+                eprintln!("    {}", m.name);
+            }
         }
+
+        // Should have resolved opcode patterns
+        eprintln!("\nOpcode patterns:");
+        for arm in &result.opcodes {
+            if let Some(ref pattern) = arm.trace_pattern {
+                eprintln!("  {} → {:?}", arm.pattern, pattern);
+            }
+        }
+
+        // Verify key patterns are detected
+        let binary_op = result.opcodes.iter()
+            .find(|a| a.pattern.contains("BinaryOp"));
+        assert!(binary_op.is_some(), "BinaryOp arm not found");
+        assert!(
+            binary_op.unwrap().trace_pattern.is_some(),
+            "BinaryOp should have a trace pattern"
+        );
     }
 }
