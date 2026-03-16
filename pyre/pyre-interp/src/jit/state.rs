@@ -4,8 +4,6 @@
 //! infrastructure. It extracts live values from the frame, restores them
 //! after compiled code runs, and provides the meta/sym types for tracing.
 
-use std::sync::OnceLock;
-
 use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
 use majit_meta::virtualizable::{
     VirtualizableInfo, clear_vable_token, read_all_virtualizable_boxes,
@@ -100,6 +98,9 @@ pub struct PyreSym {
     pub(crate) symbolic_initialized: bool,
     pub(crate) vable_next_instr: OpRef,
     pub(crate) vable_stack_depth: OpRef,
+    /// Base OpRef index for virtualizable local variables.
+    /// When set, symbolic_locals[i] = OpRef(vable_locals_base + i).
+    pub(crate) vable_locals_base: Option<u32>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -119,19 +120,6 @@ pub(crate) struct TraceFrameState {
 
 /// Environment context — currently unused.
 pub struct PyreEnv;
-
-fn pyre_driver_descriptor() -> JitDriverDescriptor {
-    static DESCRIPTOR: OnceLock<JitDriverDescriptor> = OnceLock::new();
-    DESCRIPTOR
-        .get_or_init(|| {
-            JitDriverDescriptor::with_virtualizable(
-                Vec::new(),
-                vec![("frame", Type::Int), ("next_instr", Type::Int), ("stack_depth", Type::Int)],
-                Some("frame"),
-            )
-        })
-        .clone()
-}
 
 fn pyobject_array_descr() -> DescrRef {
     make_array_descr(0, 8, Type::Int, false)
@@ -265,11 +253,13 @@ pub(crate) fn record_current_state_guard(
     frame: OpRef,
     next_instr: OpRef,
     stack_depth: OpRef,
+    locals: &[OpRef],
     opcode: OpCode,
     args: &[OpRef],
 ) {
-    let fail_args = vec![frame, next_instr, stack_depth];
-    let fail_arg_types = vec![Type::Int, Type::Int, Type::Int];
+    let mut fail_args = vec![frame, next_instr, stack_depth];
+    fail_args.extend_from_slice(locals);
+    let fail_arg_types = vec![Type::Int; fail_args.len()];
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
 
@@ -289,6 +279,7 @@ impl PyreSym {
             symbolic_initialized: false,
             vable_next_instr: OpRef::NONE,
             vable_stack_depth: OpRef::NONE,
+            vable_locals_base: None,
         }
     }
 
@@ -302,7 +293,11 @@ impl PyreSym {
         let stack_depth = concrete_stack_depth(concrete_frame).unwrap_or(0);
         self.locals_array_ref = frame_locals_array(ctx, self.frame);
         self.stack_array_ref = frame_stack_array(ctx, self.frame);
-        self.symbolic_locals = vec![OpRef::NONE; nlocals];
+        self.symbolic_locals = if let Some(base) = self.vable_locals_base {
+            (0..nlocals).map(|i| OpRef(base + i as u32)).collect()
+        } else {
+            vec![OpRef::NONE; nlocals]
+        };
         self.symbolic_stack = vec![OpRef::NONE; stack_depth];
         self.dirty_locals = vec![false; nlocals];
         self.dirty_stack = vec![false; stack_depth];
@@ -516,17 +511,9 @@ impl TraceFrameState {
     /// Called before guards and at loop close to ensure frame consistency.
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let s = self.sym_mut();
+        // Locals are virtualized — carried through JUMP args, not written to heap.
         for i in 0..s.dirty_locals.len() {
-            if s.dirty_locals[i] {
-                let idx = ctx.const_int(i as i64);
-                trace_vable_array_setitem_value(
-                    ctx,
-                    s.locals_array_ref,
-                    idx,
-                    s.symbolic_locals[i],
-                );
-                s.dirty_locals[i] = false;
-            }
+            s.dirty_locals[i] = false;
         }
         for i in 0..s.stack_depth.min(s.dirty_stack.len()) {
             if s.dirty_stack[i] {
@@ -554,13 +541,18 @@ impl TraceFrameState {
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame(ctx);
         let s = self.sym();
-        vec![s.frame, s.vable_next_instr, s.vable_stack_depth]
+        let mut args = vec![s.frame, s.vable_next_instr, s.vable_stack_depth];
+        args.extend_from_slice(&s.symbolic_locals);
+        args
     }
 
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         self.flush_to_frame(ctx);
         let s = self.sym();
-        record_current_state_guard(ctx, s.frame, s.vable_next_instr, s.vable_stack_depth, opcode, args);
+        record_current_state_guard(
+            ctx, s.frame, s.vable_next_instr, s.vable_stack_depth,
+            &s.symbolic_locals, opcode, args,
+        );
     }
 
     pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
@@ -2312,7 +2304,7 @@ impl PyreJitState {
     }
 
     /// Restore from virtualizable fail_args format:
-    ///   [frame, next_instr, stack_depth, locals_len, l0..lN, stack_len, s0..sM]
+    ///   [frame, next_instr, stack_depth, l0, l1, ..., lN-1]
     fn restore_virtualizable_i64(&mut self, values: &[i64]) {
         let mut idx = 1;
 
@@ -2326,27 +2318,11 @@ impl PyreJitState {
             idx += 1;
         }
 
-        // Locals array
-        if idx < values.len() {
-            let locals_len = values[idx] as usize;
-            idx += 1;
-            for i in 0..locals_len {
-                if idx < values.len() {
-                    let _ = self.set_local_at(i, values[idx] as PyObjectRef);
-                    idx += 1;
-                }
-            }
-        }
-
-        // Stack array
-        if idx < values.len() {
-            let stack_len = values[idx] as usize;
-            idx += 1;
-            for i in 0..stack_len {
-                if idx < values.len() {
-                    let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
-                    idx += 1;
-                }
+        // Locals follow directly (no length prefix -- count from local_count)
+        for i in 0..self.local_count() {
+            if idx < values.len() {
+                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
+                idx += 1;
             }
         }
     }
@@ -2459,7 +2435,15 @@ impl JitState for PyreJitState {
     }
 
     fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
-        vec![self.frame as i64, self.next_instr as i64, self.stack_depth as i64]
+        let mut vals = vec![
+            self.frame as i64,
+            self.next_instr as i64,
+            self.stack_depth as i64,
+        ];
+        for i in 0..self.local_count() {
+            vals.push(self.local_at(i).unwrap_or(0 as PyObjectRef) as i64);
+        }
+        vals
     }
 
     fn create_sym(meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
@@ -2467,12 +2451,12 @@ impl JitState for PyreJitState {
         let mut sym = PyreSym::new_uninit(OpRef(0));
         sym.vable_next_instr = OpRef(1);
         sym.vable_stack_depth = OpRef(2);
+        sym.vable_locals_base = Some(3); // locals start after frame(0), ni(1), sd(2)
         sym
     }
 
-    fn driver_descriptor(&self, meta: &Self::Meta) -> Option<JitDriverDescriptor> {
-        let _ = meta;
-        Some(pyre_driver_descriptor())
+    fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverDescriptor> {
+        None
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {

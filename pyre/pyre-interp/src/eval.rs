@@ -804,7 +804,9 @@ mod tests {
         let live = <PyreJitState as JitState>::extract_live(&jit_state, &meta);
 
         let frame_ptr = (&frame as *const PyFrame as usize) as i64;
-        assert_eq!(live, vec![frame_ptr, 7, 1]); // frame, next_instr, stack_depth
+        let l0 = frame.locals_w[0] as i64;
+        let l1 = frame.locals_w[1] as i64;
+        assert_eq!(live, vec![frame_ptr, 7, 1, l0, l1]);
     }
 
     #[test]
