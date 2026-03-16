@@ -92,6 +92,39 @@ impl Default for RootSet {
 /// Default card page shift: each card covers 2^7 = 128 array elements.
 pub const DEFAULT_CARD_PAGE_SHIFT: u32 = 7;
 
+/// State for incremental major collection.
+///
+/// Instead of doing a full mark-sweep in one pause, the marking work
+/// is spread across multiple minor collections. Each minor collection
+/// piggybacks an incremental marking step that processes a bounded
+/// number of objects from the gray stack.
+struct IncrementalMarkState {
+    /// Objects still to be scanned (gray set).
+    gray_stack: Vec<usize>,
+    /// Whether an incremental cycle is in progress.
+    marking_in_progress: bool,
+    /// Number of objects marked so far in this cycle.
+    objects_marked: usize,
+    /// Target number of objects to mark per increment.
+    mark_budget_per_step: usize,
+}
+
+impl IncrementalMarkState {
+    fn new() -> Self {
+        IncrementalMarkState {
+            gray_stack: Vec::new(),
+            marking_in_progress: false,
+            objects_marked: 0,
+            mark_budget_per_step: 64,
+        }
+    }
+}
+
+/// Default ratio of old-gen growth that triggers an incremental cycle.
+/// When old-gen bytes exceed `last_major_bytes * MAJOR_COLLECT_RATIO`,
+/// a new incremental cycle starts.
+const MAJOR_COLLECT_RATIO: f64 = 1.82;
+
 /// The MiniMark generational GC.
 pub struct MiniMarkGC {
     /// The nursery (young generation).
@@ -117,6 +150,11 @@ pub struct MiniMarkGC {
     pub minor_collections: usize,
     /// Count of major collections performed.
     pub major_collections: usize,
+    /// State for incremental major collection.
+    incr_state: IncrementalMarkState,
+    /// Old-gen bytes at the end of the last completed major collection.
+    /// Used to decide when to start the next incremental cycle.
+    last_major_bytes: usize,
 }
 
 impl MiniMarkGC {
@@ -137,6 +175,8 @@ impl MiniMarkGC {
             config,
             minor_collections: 0,
             major_collections: 0,
+            incr_state: IncrementalMarkState::new(),
+            last_major_bytes: 0,
         }
     }
 
@@ -279,6 +319,20 @@ impl MiniMarkGC {
 
         // Reset nursery for new allocations.
         self.nursery.reset();
+
+        // Incremental marking piggyback: if an incremental cycle is in
+        // progress, perform one bounded marking step.
+        if self.incr_state.marking_in_progress {
+            let done = self.incremental_mark_step();
+            if done {
+                self.finish_incremental_cycle();
+            }
+        }
+
+        // Check if we should start a new incremental cycle.
+        if !self.incr_state.marking_in_progress && self.should_start_major_cycle() {
+            self.start_incremental_cycle();
+        }
     }
 
     /// Copy a single nursery object to old gen.
@@ -377,21 +431,28 @@ impl MiniMarkGC {
         }
     }
 
-    /// Perform a full (major) mark-sweep collection.
+    // ── Incremental marking ──
+
+    /// Check whether old-gen growth warrants starting a new incremental
+    /// major collection cycle.
+    fn should_start_major_cycle(&self) -> bool {
+        if self.last_major_bytes == 0 {
+            // Never done a major collection. Use a minimum threshold so we
+            // don't start an incremental cycle with a nearly empty old gen.
+            return self.oldgen.total_bytes() > self.config.nursery_size;
+        }
+        self.oldgen.total_bytes() as f64 > self.last_major_bytes as f64 * MAJOR_COLLECT_RATIO
+    }
+
+    /// Begin a new incremental marking cycle.
     ///
-    /// 1. First do a minor collection to promote all live nursery objects.
-    /// 2. Mark phase: trace all roots and transitively mark reachable objects.
-    /// 3. Sweep phase: free all unmarked old-gen objects.
-    pub fn do_collect_full(&mut self) {
-        // Minor collection first to empty the nursery.
-        self.do_collect_nursery();
+    /// Seeds the gray stack with all root-reachable old-gen objects.
+    pub fn start_incremental_cycle(&mut self) {
+        self.incr_state.marking_in_progress = true;
+        self.incr_state.gray_stack.clear();
+        self.incr_state.objects_marked = 0;
 
-        self.major_collections += 1;
-
-        // Mark phase: BFS from roots.
-        let mut worklist: Vec<usize> = Vec::new();
-
-        // Start from roots.
+        // Seed gray stack from roots.
         let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
         for root_ptr in roots {
             let gcref = unsafe { *root_ptr };
@@ -399,52 +460,138 @@ impl MiniMarkGC {
                 let hdr = unsafe { header_of(gcref.0) };
                 if !hdr.has_flag(flags::VISITED) {
                     hdr.set_flag(flags::VISITED);
-                    worklist.push(gcref.0);
+                    self.incr_state.gray_stack.push(gcref.0);
+                }
+            }
+        }
+    }
+
+    /// Perform one incremental marking step.
+    ///
+    /// Processes up to `mark_budget_per_step` objects from the gray stack.
+    /// Returns `true` if marking is complete (gray stack exhausted).
+    pub fn incremental_mark_step(&mut self) -> bool {
+        let mut budget = self.incr_state.mark_budget_per_step;
+        while budget > 0 {
+            let Some(obj_addr) = self.incr_state.gray_stack.pop() else {
+                self.incr_state.marking_in_progress = false;
+                return true; // marking complete
+            };
+            self.mark_object(obj_addr);
+            self.incr_state.objects_marked += 1;
+            budget -= 1;
+        }
+        false // more work to do
+    }
+
+    /// Mark a single object: trace its GC pointer fields and push
+    /// unmarked children onto the gray stack.
+    fn mark_object(&mut self, obj_addr: usize) {
+        let type_id = unsafe { header_of(obj_addr).type_id() };
+        let type_info = self.types.get(type_id);
+        let gc_ptr_offsets = type_info.gc_ptr_offsets.clone();
+        let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
+        let item_size = type_info.item_size;
+        let length_offset = type_info.length_offset;
+        let base_size = type_info.size;
+
+        // Trace fixed-part fields.
+        for &offset in &gc_ptr_offsets {
+            let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
+            if !field_ref.is_null() {
+                let hdr = unsafe { header_of(field_ref.0) };
+                if !hdr.has_flag(flags::VISITED) {
+                    hdr.set_flag(flags::VISITED);
+                    self.incr_state.gray_stack.push(field_ref.0);
                 }
             }
         }
 
-        // Process worklist: mark and trace transitively.
-        while let Some(obj_addr) = worklist.pop() {
-            let type_id = unsafe { header_of(obj_addr).type_id() };
-            let type_info = self.types.get(type_id);
-            let gc_ptr_offsets = type_info.gc_ptr_offsets.clone();
-            let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
-            let item_size = type_info.item_size;
-            let length_offset = type_info.length_offset;
-            let base_size = type_info.size;
-
-            // Trace fixed-part fields.
-            for &offset in &gc_ptr_offsets {
-                let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
+        // Trace variable-part items.
+        if items_have_gc_ptrs && item_size > 0 {
+            let length = unsafe { *((obj_addr + length_offset) as *const usize) };
+            let items_start = obj_addr + base_size;
+            for i in 0..length {
+                let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
                 if !field_ref.is_null() {
                     let hdr = unsafe { header_of(field_ref.0) };
                     if !hdr.has_flag(flags::VISITED) {
                         hdr.set_flag(flags::VISITED);
-                        worklist.push(field_ref.0);
-                    }
-                }
-            }
-
-            // Trace variable-part items.
-            if items_have_gc_ptrs && item_size > 0 {
-                let length = unsafe { *((obj_addr + length_offset) as *const usize) };
-                let items_start = obj_addr + base_size;
-                for i in 0..length {
-                    let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
-                    if !field_ref.is_null() {
-                        let hdr = unsafe { header_of(field_ref.0) };
-                        if !hdr.has_flag(flags::VISITED) {
-                            hdr.set_flag(flags::VISITED);
-                            worklist.push(field_ref.0);
-                        }
+                        self.incr_state.gray_stack.push(field_ref.0);
                     }
                 }
             }
         }
+    }
 
-        // Sweep phase: free unmarked objects.
+    /// Complete the sweep phase after incremental marking finishes.
+    fn finish_incremental_cycle(&mut self) {
+        self.major_collections += 1;
         self.oldgen.sweep();
+        self.last_major_bytes = self.oldgen.total_bytes();
+    }
+
+    /// Whether an incremental marking cycle is currently in progress.
+    pub fn is_incremental_marking(&self) -> bool {
+        self.incr_state.marking_in_progress
+    }
+
+    /// Number of objects marked so far in the current incremental cycle.
+    pub fn incremental_objects_marked(&self) -> usize {
+        self.incr_state.objects_marked
+    }
+
+    /// Set the per-step marking budget (number of objects per step).
+    pub fn set_mark_budget(&mut self, budget: usize) {
+        self.incr_state.mark_budget_per_step = budget;
+    }
+
+    /// Perform a full (major) mark-sweep collection.
+    ///
+    /// 1. First do a minor collection to promote all live nursery objects.
+    /// 2. Mark phase: trace all roots and transitively mark reachable objects.
+    /// 3. Sweep phase: free all unmarked old-gen objects.
+    pub fn do_collect_full(&mut self) {
+        // Minor collection first to empty the nursery.
+        // Note: do_collect_nursery may itself start/advance an incremental
+        // cycle, but we need a complete mark-sweep here regardless.
+        self.do_collect_nursery();
+
+        if self.incr_state.marking_in_progress {
+            // An incremental cycle is in progress. Finish it by draining
+            // the gray stack without budget limits.
+            while !self.incr_state.gray_stack.is_empty() {
+                let obj_addr = self.incr_state.gray_stack.pop().unwrap();
+                self.mark_object(obj_addr);
+                self.incr_state.objects_marked += 1;
+            }
+            self.incr_state.marking_in_progress = false;
+            self.finish_incremental_cycle();
+        } else {
+            // No incremental cycle in progress. Do a full stop-the-world
+            // mark-sweep using the same mark_object infrastructure.
+            self.incr_state.gray_stack.clear();
+
+            // Seed from roots.
+            let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
+            for root_ptr in roots {
+                let gcref = unsafe { *root_ptr };
+                if !gcref.is_null() {
+                    let hdr = unsafe { header_of(gcref.0) };
+                    if !hdr.has_flag(flags::VISITED) {
+                        hdr.set_flag(flags::VISITED);
+                        self.incr_state.gray_stack.push(gcref.0);
+                    }
+                }
+            }
+
+            // Drain gray stack completely.
+            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+                self.mark_object(obj_addr);
+            }
+
+            self.finish_incremental_cycle();
+        }
     }
 
     /// Write barrier: call before storing a GC reference into an old-gen object.
@@ -1695,5 +1842,191 @@ mod tests {
             assert_eq!(*(roots[0] as *const usize), 111);
             assert_eq!(*(roots[1] as *const usize), 333);
         }
+    }
+
+    // ── Incremental marking tests ──
+
+    #[test]
+    fn test_incremental_marking_basic() {
+        // Start an incremental cycle, run steps, and verify completion.
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        // Promote some objects to old gen via minor collection.
+        let obj1 = gc.alloc_with_type(tid, 16);
+        let obj2 = gc.alloc_with_type(tid, 16);
+        let mut root1 = obj1;
+        let mut root2 = obj2;
+        unsafe {
+            gc.roots.add(&mut root1);
+            gc.roots.add(&mut root2);
+        }
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(root1.0));
+        assert!(!gc.is_in_nursery(root2.0));
+
+        // Manually start an incremental cycle.
+        gc.start_incremental_cycle();
+        assert!(gc.is_incremental_marking());
+
+        // Run marking steps until complete.
+        let mut steps = 0;
+        while gc.is_incremental_marking() {
+            gc.incremental_mark_step();
+            steps += 1;
+            if steps > 100 {
+                panic!("incremental marking did not complete");
+            }
+        }
+
+        // Marking should have processed the 2 root objects.
+        assert!(gc.incremental_objects_marked() >= 2);
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_incremental_marking_piggyback() {
+        // Verify that incremental marking progresses during nursery collections.
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        // Promote several objects to old gen by rooting each and collecting.
+        let mut roots_storage = vec![GcRef::NULL; 10];
+        for r in roots_storage.iter_mut() {
+            unsafe {
+                gc.roots.add(r);
+            }
+        }
+        for r in roots_storage.iter_mut() {
+            let obj = gc.alloc_with_type(tid, 16);
+            *r = obj;
+        }
+        gc.do_collect_nursery();
+        for r in &roots_storage {
+            assert!(!gc.is_in_nursery(r.0));
+        }
+
+        // Start an incremental cycle with a tiny budget so it takes
+        // multiple steps.
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        assert!(gc.is_incremental_marking());
+
+        // Each nursery collection should advance the marking.
+        let marked_before = gc.incremental_objects_marked();
+        gc.do_collect_nursery();
+        // After one nursery collection with budget=1, we should have
+        // marked at least one more object (if any remained).
+        assert!(
+            gc.incremental_objects_marked() > marked_before,
+            "marking should advance during nursery collection"
+        );
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_incremental_marking_budget() {
+        // Each step should process at most `mark_budget_per_step` objects.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        // Create a chain of 10 objects so marking has plenty of work.
+        let mut prev = GcRef::NULL;
+        let mut roots = Vec::new();
+        for _ in 0..10 {
+            let obj = gc.alloc_with_type(tid, ptr_size);
+            unsafe {
+                *(obj.0 as *mut GcRef) = prev;
+            }
+            prev = obj;
+            roots.push(prev);
+        }
+
+        // Root the head of the chain.
+        let mut head = prev;
+        unsafe {
+            gc.roots.add(&mut head);
+        }
+
+        // Promote all to old gen.
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(head.0));
+
+        // Start incremental cycle with budget of 2.
+        gc.set_mark_budget(2);
+        gc.start_incremental_cycle();
+        assert!(gc.is_incremental_marking());
+
+        // First step: marks at most 2 objects.
+        let done = gc.incremental_mark_step();
+        assert!(!done, "should not be done after marking only 2 out of 10");
+        assert_eq!(gc.incremental_objects_marked(), 2);
+
+        // Second step: marks 2 more.
+        let done = gc.incremental_mark_step();
+        assert!(!done, "should not be done after 4 total");
+        assert_eq!(gc.incremental_objects_marked(), 4);
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_incremental_marking_completes() {
+        // A full incremental cycle (start -> repeated steps -> sweep)
+        // produces the same result as a stop-the-world full collection:
+        // unreachable old-gen objects are freed.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        // Create reachable and unreachable old-gen objects.
+        let reachable = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(reachable.0 as *mut GcRef) = GcRef::NULL;
+        }
+        let unreachable = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(unreachable.0 as *mut GcRef) = GcRef::NULL;
+        }
+
+        let mut root = reachable;
+        let mut root2 = unreachable;
+        unsafe {
+            gc.roots.add(&mut root);
+            gc.roots.add(&mut root2);
+        }
+
+        // Promote both to old gen.
+        gc.do_collect_nursery();
+        assert_eq!(gc.oldgen.object_count(), 2);
+
+        // Unroot the unreachable one.
+        gc.roots.remove(&mut root2);
+
+        // Run incremental cycle with budget=1 to force multiple steps.
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+
+        // Drive the cycle to completion.
+        let mut iterations = 0;
+        while gc.is_incremental_marking() {
+            gc.incremental_mark_step();
+            iterations += 1;
+            if iterations > 100 {
+                panic!("incremental marking did not complete");
+            }
+        }
+
+        // Finish: sweep unreachable objects.
+        gc.finish_incremental_cycle();
+
+        // Only the reachable object should survive.
+        assert_eq!(gc.oldgen.object_count(), 1);
+        assert!(!root.is_null());
+
+        gc.roots.clear();
     }
 }
