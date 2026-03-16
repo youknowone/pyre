@@ -144,7 +144,9 @@ impl<S: JitState> JitDriver<S> {
             TraceAction::Continue => {}
             TraceAction::CloseLoop => {
                 // Bridge tracing: close as bridge instead of loop.
-                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) = self.bridge_info.take() {
+                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
+                    self.bridge_info.take()
+                {
                     let sym = self.sym.take();
                     self.trace_meta = None;
                     if let Some(sym) = sym {
@@ -894,7 +896,6 @@ impl<S: JitState> JitDriver<S> {
         self.bridge_info = Some((green_key, trace_id, fail_index));
         true
     }
-
 }
 
 #[cfg(test)]

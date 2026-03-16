@@ -27,12 +27,46 @@ pub mod jc_flags {
     pub const TRACING_OCCURRED: u8 = 0x08;
 }
 
+/// Explicit state of a JitCell in the JIT lifecycle.
+///
+/// warmstate.py expresses this implicitly through flag combinations:
+///   - no cell / flags==0           → NotHot
+///   - JC_TRACING set               → Tracing
+///   - loop_token present, valid    → Compiled
+///   - loop_token.invalidated       → Invalidated
+///   - JC_DONT_TRACE_HERE set       → DontTraceHere
+///
+/// We make these states explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitCellState {
+    /// Not yet hot; still interpreting.
+    NotHot,
+    /// Actively tracing.
+    Tracing,
+    /// Compiled loop exists and is valid.
+    Compiled,
+    /// Compiled loop was invalidated (quasi-immutable mutation, etc.).
+    Invalidated,
+    /// Tracing was aborted; don't trace at this location.
+    DontTraceHere,
+}
+
 /// Per-greenkey cell that tracks JIT state for a specific program location.
 ///
 /// Mirrors rpython/jit/metainterp/warmstate.py BaseJitCell.
 pub struct JitCell {
     /// JC_* flags.
     pub flags: u8,
+    /// Explicit lifecycle state.
+    pub state: JitCellState,
+    /// Hot counter value for this cell (local to this green key).
+    pub counter: u32,
+    /// Compiled loop token number, if a procedure token is owned.
+    /// Cleared on invalidation.
+    pub token: Option<u64>,
+    /// Generation at which tracing was last started.
+    /// Used to detect stale tracing sessions.
+    pub tracing_generation: u64,
     /// Compiled loop token, if compilation has completed.
     pub loop_token: Option<LoopToken>,
 }
@@ -41,6 +75,10 @@ impl JitCell {
     fn new() -> Self {
         JitCell {
             flags: 0,
+            state: JitCellState::NotHot,
+            counter: 0,
+            token: None,
+            tracing_generation: 0,
             loop_token: None,
         }
     }
@@ -55,6 +93,51 @@ impl JitCell {
 
     pub fn has_procedure_token(&self) -> bool {
         self.loop_token.is_some()
+    }
+
+    /// Get the procedure token, returning None if the token has been
+    /// invalidated (mirrors BaseJitCell.get_procedure_token).
+    pub fn get_procedure_token(&self) -> Option<&LoopToken> {
+        self.loop_token.as_ref().filter(|t| !t.is_invalidated())
+    }
+
+    /// Set the procedure token and update ownership state.
+    /// If `tmp` is true, sets the TEMPORARY flag (CALL_ASSEMBLER fallback).
+    pub fn set_procedure_token(&mut self, loop_token: LoopToken, tmp: bool) {
+        self.token = Some(loop_token.number);
+        self.loop_token = Some(loop_token);
+        if tmp {
+            self.flags |= jc_flags::TEMPORARY;
+        } else {
+            self.flags &= !jc_flags::TEMPORARY;
+            self.state = JitCellState::Compiled;
+        }
+    }
+
+    /// Check whether we have ever had a procedure token assigned
+    /// (mirrors BaseJitCell.has_seen_a_procedure_token).
+    ///
+    /// Returns true if a token was ever set, even if it was later
+    /// invalidated. The `token` field is a historical record and is
+    /// never cleared.
+    pub fn has_seen_a_procedure_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// Whether this cell should be removed (for GC of dead cells).
+    /// Mirrors BaseJitCell.should_remove_jitcell.
+    pub fn should_remove(&self) -> bool {
+        if self.get_procedure_token().is_some() {
+            return false; // has a valid procedure token
+        }
+        if self.flags & jc_flags::TRACING != 0 {
+            return false; // currently tracing
+        }
+        if self.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            // Remove only if we had a token that is now dead.
+            return self.has_seen_a_procedure_token();
+        }
+        true
     }
 }
 
@@ -156,7 +239,6 @@ const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
 
 /// Default function call threshold before inlining during tracing.
 ///
-/// Mirrors RPython's `function_threshold` from warmstate.py.
 /// When a function is called fewer than this many times during tracing,
 /// it is left as a residual call. After this threshold, the meta-interpreter
 /// starts inlining the function's body into the trace.
@@ -165,9 +247,27 @@ const DEFAULT_FUNCTION_THRESHOLD: u32 = 4;
 /// Maximum depth of inlined function calls during tracing.
 ///
 /// Prevents unbounded recursion and excessively long traces.
-/// Mirrors RPython's `MAX_INLINE_DEPTH` from warmstate.py.
 const DEFAULT_MAX_INLINE_DEPTH: u32 = 10;
+
+/// Default maximum number of operations in a single trace.
+const DEFAULT_TRACE_LIMIT: u32 = 6000;
+
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
+
+/// JIT statistics snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct JitStats {
+    /// Number of cells in Compiled state.
+    pub num_compiled: usize,
+    /// Number of cells in Tracing state.
+    pub num_tracing: usize,
+    /// Number of cells in Invalidated state.
+    pub num_invalidated: usize,
+    /// Number of cells in DontTraceHere state.
+    pub num_dont_trace_here: usize,
+    /// Total number of JitCells.
+    pub num_cells: usize,
+}
 
 pub struct WarmState {
     /// Global hot counter.
@@ -180,12 +280,17 @@ pub struct WarmState {
     bridge_threshold: u32,
     /// Function call threshold for inlining during tracing.
     ///
-    /// Mirrors RPython's `function_threshold` in warmstate.py.
     /// A function must be called at least this many times before
     /// the meta-interpreter inlines it into the trace.
     function_threshold: u32,
     /// Maximum depth of inlined function calls during tracing.
     max_inline_depth: u32,
+    /// Maximum number of operations per trace before aborting.
+    trace_limit: u32,
+    /// Global tracing generation counter.
+    /// Incremented each time tracing starts; stored in JitCell to
+    /// detect stale tracing sessions.
+    tracing_generation: u64,
     /// Optional profiling logger, enabled via MAJIT_STATS=1 or MAJIT_LOG=1.
     jitlog: Option<JitLog>,
     /// Quasi-immutable field invalidation registry.
@@ -193,8 +298,6 @@ pub struct WarmState {
     /// Maps a quasi-immutable field key (hash of object_id + field_index)
     /// to the set of green_key_hashes whose compiled loops depend on that field.
     /// When a quasi-immutable field is mutated, all dependent loops are invalidated.
-    ///
-    /// Mirrors rpython/jit/metainterp/quasiimmut.py QuasiImmut.
     quasiimmut_deps: HashMap<u64, HashSet<u64>>,
     /// Per-function call counts during the current trace.
     ///
@@ -227,6 +330,8 @@ impl WarmState {
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
             function_threshold: DEFAULT_FUNCTION_THRESHOLD,
             max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
+            trace_limit: DEFAULT_TRACE_LIMIT,
+            tracing_generation: 0,
             jitlog: JitLog::from_env(),
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
@@ -242,6 +347,8 @@ impl WarmState {
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
             function_threshold: DEFAULT_FUNCTION_THRESHOLD,
             max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
+            trace_limit: DEFAULT_TRACE_LIMIT,
+            tracing_generation: 0,
             jitlog,
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
@@ -271,11 +378,15 @@ impl WarmState {
 
         // Threshold reached: start tracing
         self.counter.reset(green_key_hash);
+        self.tracing_generation += 1;
+        let gen = self.tracing_generation;
         let cell = self
             .cells
             .entry(green_key_hash)
             .or_insert_with(JitCell::new);
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+        cell.state = JitCellState::Tracing;
+        cell.tracing_generation = gen;
 
         HotResult::StartTracing(TraceRecorder::new())
     }
@@ -298,11 +409,15 @@ impl WarmState {
         }
 
         self.counter.reset(green_key_hash);
+        self.tracing_generation += 1;
+        let gen = self.tracing_generation;
         let cell = self
             .cells
             .entry(green_key_hash)
             .or_insert_with(JitCell::new);
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+        cell.state = JitCellState::Tracing;
+        cell.tracing_generation = gen;
 
         HotResult::StartTracing(TraceRecorder::new())
     }
@@ -322,6 +437,7 @@ impl WarmState {
     pub fn finish_tracing(&mut self, green_key_hash: u64) {
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
+            // State remains Tracing until install_compiled is called.
         }
     }
 
@@ -332,6 +448,9 @@ impl WarmState {
             cell.flags &= !jc_flags::TRACING;
             if dont_trace_here {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.state = JitCellState::DontTraceHere;
+            } else {
+                cell.state = JitCellState::NotHot;
             }
         }
         if let Some(log) = &mut self.jitlog {
@@ -340,13 +459,16 @@ impl WarmState {
     }
 
     /// Install a compiled loop token for a green key.
+    ///
+    /// The cell transitions to Compiled state and takes ownership of
+    /// the procedure token.
     pub fn install_compiled(&mut self, green_key_hash: u64, token: LoopToken) {
         let cell = self
             .cells
             .entry(green_key_hash)
             .or_insert_with(JitCell::new);
         cell.flags &= !jc_flags::TRACING;
-        cell.loop_token = Some(token);
+        cell.set_procedure_token(token, false);
     }
 
     /// Get a reference to the compiled loop token for a green key.
@@ -527,9 +649,10 @@ impl WarmState {
 
         let mut invalidated = 0;
         for green_key_hash in &deps {
-            if let Some(cell) = self.cells.get(green_key_hash) {
+            if let Some(cell) = self.cells.get_mut(green_key_hash) {
                 if let Some(token) = &cell.loop_token {
                     token.invalidate();
+                    cell.state = JitCellState::Invalidated;
                     invalidated += 1;
                 }
             }
@@ -542,12 +665,124 @@ impl WarmState {
     /// This is a brute-force invalidation used when the specific qmut_key
     /// is not known (e.g., bulk invalidation after a class hierarchy change).
     pub fn invalidate_all(&mut self) {
-        for cell in self.cells.values() {
+        for cell in self.cells.values_mut() {
             if let Some(token) = &cell.loop_token {
                 token.invalidate();
+                cell.state = JitCellState::Invalidated;
             }
         }
         self.quasiimmut_deps.clear();
+    }
+
+    // ── JitCell state machine API ──
+
+    /// Get the explicit state of a JitCell for a green key.
+    /// Returns `NotHot` if no cell exists.
+    pub fn get_cell_state(&self, green_key_hash: u64) -> JitCellState {
+        self.cells
+            .get(&green_key_hash)
+            .map(|c| c.state)
+            .unwrap_or(JitCellState::NotHot)
+    }
+
+    /// Explicitly transition a cell to a new state.
+    ///
+    /// This is the low-level state-machine driver. Most callers should use
+    /// the higher-level methods (`maybe_compile`, `finish_tracing`,
+    /// `install_compiled`, `abort_tracing`) which call this internally.
+    pub fn transition_cell(&mut self, green_key_hash: u64, new_state: JitCellState) {
+        let cell = self
+            .cells
+            .entry(green_key_hash)
+            .or_insert_with(JitCell::new);
+
+        match new_state {
+            JitCellState::NotHot => {
+                cell.flags &= !(jc_flags::TRACING | jc_flags::DONT_TRACE_HERE);
+                cell.state = JitCellState::NotHot;
+            }
+            JitCellState::Tracing => {
+                cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+                cell.state = JitCellState::Tracing;
+            }
+            JitCellState::Compiled => {
+                cell.flags &= !jc_flags::TRACING;
+                cell.state = JitCellState::Compiled;
+            }
+            JitCellState::Invalidated => {
+                if let Some(token) = &cell.loop_token {
+                    token.invalidate();
+                }
+                cell.state = JitCellState::Invalidated;
+            }
+            JitCellState::DontTraceHere => {
+                cell.flags &= !jc_flags::TRACING;
+                cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.state = JitCellState::DontTraceHere;
+            }
+        }
+    }
+
+    // ── set_param / get_stats API ──
+
+    /// Set a JIT parameter by name, mirroring warmstate.py set_param_*().
+    ///
+    /// Supported parameters:
+    ///   - "threshold": compilation threshold
+    ///   - "trace_limit": max ops per trace
+    ///   - "bridge_threshold": guard fail count before bridge compilation
+    ///   - "function_threshold": calls before inlining
+    ///   - "max_inline_depth": maximum inlining depth
+    pub fn set_param(&mut self, name: &str, value: i64) {
+        match name {
+            "threshold" => self.set_threshold(value as u32),
+            "trace_limit" => self.trace_limit = value as u32,
+            "bridge_threshold" => self.bridge_threshold = value as u32,
+            "function_threshold" => self.function_threshold = value as u32,
+            "max_inline_depth" => self.max_inline_depth = value as u32,
+            _ => {}
+        }
+    }
+
+    /// Get a snapshot of current JIT statistics.
+    pub fn get_stats(&self) -> JitStats {
+        let mut stats = JitStats {
+            num_cells: self.cells.len(),
+            ..Default::default()
+        };
+        for cell in self.cells.values() {
+            match cell.state {
+                JitCellState::Compiled => stats.num_compiled += 1,
+                JitCellState::Tracing => stats.num_tracing += 1,
+                JitCellState::Invalidated => stats.num_invalidated += 1,
+                JitCellState::DontTraceHere => stats.num_dont_trace_here += 1,
+                JitCellState::NotHot => {}
+            }
+        }
+        stats
+    }
+
+    /// Get the current trace limit.
+    pub fn trace_limit(&self) -> u32 {
+        self.trace_limit
+    }
+
+    /// Set the trace limit.
+    pub fn set_trace_limit(&mut self, limit: u32) {
+        self.trace_limit = limit;
+    }
+
+    /// Get the current tracing generation.
+    pub fn tracing_generation(&self) -> u64 {
+        self.tracing_generation
+    }
+
+    /// Remove dead JitCells (mirrors should_remove_jitcell).
+    /// Returns the number of cells removed.
+    pub fn gc_cells(&mut self) -> usize {
+        let before = self.cells.len();
+        self.cells.retain(|_, cell| !cell.should_remove());
+        before - self.cells.len()
     }
 }
 
@@ -1150,7 +1385,7 @@ mod tests {
         let mut aging = LoopAging::new(2);
 
         aging.register_loop(1); // gen 0
-        // Advance until eviction
+                                // Advance until eviction
         aging.next_generation(); // gen 1
         aging.next_generation(); // gen 2
         let evicted = aging.next_generation(); // gen 3: threshold=1, 0 < 1 → evict
@@ -1251,10 +1486,7 @@ mod tests {
             let evicted = aging.next_generation();
 
             // Loop 1 should never be evicted
-            assert!(
-                !evicted.contains(&1),
-                "active loop should never be evicted"
-            );
+            assert!(!evicted.contains(&1), "active loop should never be evicted");
         }
 
         // Loop 1 should still be alive
@@ -1305,15 +1537,9 @@ mod tests {
         // Odd-indexed loops registered at gen i should be evicted
         // when generation > i + 4.
         for i in 0..10u64 {
-            let is_alive = aging
-                .loop_generations
-                .contains_key(&i);
+            let is_alive = aging.loop_generations.contains_key(&i);
             if i % 2 == 0 {
-                assert!(
-                    is_alive,
-                    "even-indexed loop {} should be alive",
-                    i
-                );
+                assert!(is_alive, "even-indexed loop {} should be alive", i);
             }
             // Odd loops registered early enough will have been evicted.
             // Loop i (odd) registered at gen i. After gen 10, threshold = 10 - 4 = 6.
@@ -1415,5 +1641,278 @@ mod tests {
             HotResult::AlreadyTracing => {}
             _ => panic!("expected AlreadyTracing on second force_start_tracing"),
         }
+    }
+
+    // ── JitCell state machine tests ──
+
+    #[test]
+    fn test_jitcell_state_transitions() {
+        // Full lifecycle: NotHot → Tracing → Compiled → Invalidated
+        let mut ws = WarmState::new(2);
+        let key = 0xA1;
+
+        // Initially no cell → NotHot
+        assert_eq!(ws.get_cell_state(key), JitCellState::NotHot);
+
+        // Tick to threshold → Tracing
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing"),
+        }
+        assert_eq!(ws.get_cell_state(key), JitCellState::Tracing);
+
+        // Finish tracing and install → Compiled
+        ws.finish_tracing(key);
+        let token = LoopToken::new(ws.alloc_token_number());
+        ws.install_compiled(key, token);
+        assert_eq!(ws.get_cell_state(key), JitCellState::Compiled);
+
+        // Invalidate via transition_cell → Invalidated
+        ws.transition_cell(key, JitCellState::Invalidated);
+        assert_eq!(ws.get_cell_state(key), JitCellState::Invalidated);
+
+        // The loop_token's invalidated flag should be set
+        let cell = ws.get_cell(key).unwrap();
+        assert!(cell.loop_token.as_ref().unwrap().is_invalidated());
+        // token number is preserved as a historical record
+        assert!(cell.token.is_some());
+    }
+
+    #[test]
+    fn test_procedure_token_ownership() {
+        // Compiled cell owns a token; invalidation revokes ownership.
+        let mut ws = WarmState::new(2);
+        let key = 0xB2;
+
+        // Compile a loop
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing"),
+        }
+        ws.finish_tracing(key);
+        let token_num = ws.alloc_token_number();
+        let token = LoopToken::new(token_num);
+        ws.install_compiled(key, token);
+
+        // Cell owns the token
+        let cell = ws.get_cell(key).unwrap();
+        assert_eq!(cell.token, Some(token_num));
+        assert!(cell.get_procedure_token().is_some());
+        assert!(cell.has_seen_a_procedure_token());
+
+        // Invalidate via quasiimmut
+        let qmut_key = 0xFF;
+        ws.register_quasiimmut_dependency(qmut_key, key);
+        ws.invalidate_quasiimmut(qmut_key);
+
+        // Token ownership revoked (state is Invalidated, but token number
+        // is preserved as historical record)
+        let cell = ws.get_cell(key).unwrap();
+        assert_eq!(cell.token, Some(token_num)); // historical record preserved
+        assert_eq!(cell.state, JitCellState::Invalidated);
+        // get_procedure_token returns None because the token is invalidated
+        assert!(cell.get_procedure_token().is_none());
+        // But we still know a token existed
+        assert!(cell.has_seen_a_procedure_token());
+    }
+
+    #[test]
+    fn test_set_param_threshold() {
+        let mut ws = WarmState::new(100);
+        assert_eq!(ws.threshold(), 100);
+
+        ws.set_param("threshold", 42);
+        assert_eq!(ws.threshold(), 42);
+
+        ws.set_param("trace_limit", 5000);
+        assert_eq!(ws.trace_limit(), 5000);
+
+        ws.set_param("bridge_threshold", 10);
+        assert_eq!(ws.bridge_threshold(), 10);
+
+        ws.set_param("function_threshold", 8);
+        assert_eq!(ws.function_threshold(), 8);
+
+        ws.set_param("max_inline_depth", 15);
+        assert_eq!(ws.max_inline_depth(), 15);
+
+        // Unknown param is ignored
+        ws.set_param("nonexistent", 999);
+    }
+
+    #[test]
+    fn test_get_stats() {
+        let mut ws = WarmState::new(2);
+
+        // Initially empty
+        let stats = ws.get_stats();
+        assert_eq!(stats.num_cells, 0);
+        assert_eq!(stats.num_compiled, 0);
+
+        // Start tracing two keys
+        assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(2), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing(_)));
+
+        let stats = ws.get_stats();
+        assert_eq!(stats.num_cells, 2);
+        assert_eq!(stats.num_tracing, 2);
+
+        // Compile key 1
+        ws.finish_tracing(1);
+        let token = LoopToken::new(ws.alloc_token_number());
+        ws.install_compiled(1, token);
+
+        let stats = ws.get_stats();
+        assert_eq!(stats.num_compiled, 1);
+        assert_eq!(stats.num_tracing, 1);
+
+        // Abort key 2 with dont_trace
+        ws.abort_tracing(2, true);
+
+        let stats = ws.get_stats();
+        assert_eq!(stats.num_compiled, 1);
+        assert_eq!(stats.num_tracing, 0);
+        assert_eq!(stats.num_dont_trace_here, 1);
+
+        // Invalidate key 1
+        ws.transition_cell(1, JitCellState::Invalidated);
+
+        let stats = ws.get_stats();
+        assert_eq!(stats.num_compiled, 0);
+        assert_eq!(stats.num_invalidated, 1);
+        assert_eq!(stats.num_dont_trace_here, 1);
+        assert_eq!(stats.num_cells, 2);
+    }
+
+    #[test]
+    fn test_jitcell_state_dont_trace_here() {
+        let mut ws = WarmState::new(2);
+        let key = 0xC3;
+
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing"),
+        }
+
+        // Abort with DONT_TRACE_HERE → state should be DontTraceHere
+        ws.abort_tracing(key, true);
+        assert_eq!(ws.get_cell_state(key), JitCellState::DontTraceHere);
+
+        // Future calls return NotHot
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+
+        // Can manually reset to NotHot
+        ws.transition_cell(key, JitCellState::NotHot);
+        assert_eq!(ws.get_cell_state(key), JitCellState::NotHot);
+        // DONT_TRACE_HERE flag should be cleared
+        let cell = ws.get_cell(key).unwrap();
+        assert!(cell.flags & jc_flags::DONT_TRACE_HERE == 0);
+    }
+
+    #[test]
+    fn test_tracing_generation_increments() {
+        let mut ws = WarmState::new(2);
+        let gen0 = ws.tracing_generation();
+        assert_eq!(gen0, 0);
+
+        // Start tracing key 1 → generation 1
+        assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing(_)));
+        assert_eq!(ws.tracing_generation(), 1);
+
+        let cell = ws.get_cell(1).unwrap();
+        assert_eq!(cell.tracing_generation, 1);
+
+        // Start tracing key 2 → generation 2
+        assert!(matches!(ws.maybe_compile(2), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing(_)));
+        assert_eq!(ws.tracing_generation(), 2);
+
+        let cell = ws.get_cell(2).unwrap();
+        assert_eq!(cell.tracing_generation, 2);
+    }
+
+    #[test]
+    fn test_jitcell_should_remove() {
+        // A freshly created cell with no token and no flags should be removable
+        let cell = JitCell::new();
+        assert!(cell.should_remove());
+
+        // A cell that is tracing should NOT be removable
+        let mut cell = JitCell::new();
+        cell.flags |= jc_flags::TRACING;
+        assert!(!cell.should_remove());
+
+        // A cell with DONT_TRACE_HERE but no token history is removable
+        let mut cell = JitCell::new();
+        cell.flags |= jc_flags::DONT_TRACE_HERE;
+        assert!(!cell.should_remove()); // has_seen_a_procedure_token is false
+
+        // A cell with DONT_TRACE_HERE and a past token should be removable
+        let mut cell = JitCell::new();
+        cell.flags |= jc_flags::DONT_TRACE_HERE;
+        cell.token = Some(42); // historical record of past token
+        assert!(cell.should_remove());
+    }
+
+    #[test]
+    fn test_gc_cells() {
+        let mut ws = WarmState::new(2);
+
+        // Create some cells in various states
+        // Key 1: compiled (should NOT be removed)
+        assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing(_)));
+        ws.finish_tracing(1);
+        let token = LoopToken::new(ws.alloc_token_number());
+        ws.install_compiled(1, token);
+
+        // Key 2: tracing (should NOT be removed)
+        assert!(matches!(ws.maybe_compile(2), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing(_)));
+
+        // Key 3: aborted without dont_trace → NotHot, removable
+        assert!(matches!(ws.maybe_compile(3), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(3), HotResult::StartTracing(_)));
+        ws.abort_tracing(3, false);
+
+        assert_eq!(ws.get_stats().num_cells, 3);
+        let removed = ws.gc_cells();
+        assert_eq!(removed, 1); // key 3 removed
+        assert_eq!(ws.get_stats().num_cells, 2);
+        assert!(ws.get_cell(1).is_some());
+        assert!(ws.get_cell(2).is_some());
+        assert!(ws.get_cell(3).is_none());
+    }
+
+    #[test]
+    fn test_invalidated_cell_allows_recompilation() {
+        // After invalidation, transitioning back to NotHot allows recompilation.
+        let mut ws = WarmState::new(2);
+        let key = 0xD4;
+
+        // Compile
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing(_)));
+        ws.finish_tracing(key);
+        let token = LoopToken::new(ws.alloc_token_number());
+        ws.install_compiled(key, token);
+        assert_eq!(ws.get_cell_state(key), JitCellState::Compiled);
+
+        // Invalidate
+        ws.transition_cell(key, JitCellState::Invalidated);
+        assert_eq!(ws.get_cell_state(key), JitCellState::Invalidated);
+
+        // Reset to NotHot and recompile
+        ws.transition_cell(key, JitCellState::NotHot);
+        let token2 = LoopToken::new(ws.alloc_token_number());
+        ws.install_compiled(key, token2);
+        assert_eq!(ws.get_cell_state(key), JitCellState::Compiled);
+        assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
     }
 }
