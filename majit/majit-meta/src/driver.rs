@@ -970,6 +970,88 @@ impl<S: JitState> JitDriver<S> {
         self.bridge_info = Some((green_key, trace_id, fail_index));
         true
     }
+
+    /// Generic back-edge runner for storage-pool interpreters.
+    ///
+    /// Encapsulates the common pattern: check tracing state, hash green key,
+    /// try compiled execution, and handle guard failure / bridge compilation.
+    ///
+    /// The caller provides:
+    /// - `green_values`: green key as i64 slice (e.g., `[target_pc, selected]`)
+    /// - `target_pc`: the back-edge target PC
+    /// - `pre_run`: callback to execute before compiled code (e.g., flush I/O)
+    /// - `on_guard_failure`: callback to restore interpreter state from guard
+    ///   failure values; returns `Some(resume_pc)` on success
+    ///
+    /// Returns `Some(resume_pc)` if compiled code ran or guard state was restored.
+    pub fn run_back_edge_generic(
+        &mut self,
+        green_values: &[i64],
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+        on_guard_failure: impl FnOnce(&mut S, &S::Meta, &[i64]) -> Option<usize>,
+    ) -> Option<usize> {
+        if self.is_tracing() || !state.can_trace() {
+            return None;
+        }
+
+        let key_hash = crate::green_key_hash(green_values);
+
+        if !self.has_compiled_loop(key_hash) {
+            let green_key = GreenKey::new(green_values.to_vec());
+            return self
+                .back_edge_structured(green_key, target_pc, state, env, pre_run)
+                .then_some(target_pc);
+        }
+
+        let meta = self.meta.get_compiled_meta(key_hash)?;
+        if !state.is_compatible(meta) {
+            return None;
+        }
+        let meta = meta.clone();
+        let live_values = state.extract_live_values(&meta);
+        pre_run();
+
+        let result = self
+            .meta
+            .run_compiled_raw_detailed_with_values(key_hash, &live_values)?;
+        let is_finish = result.is_finish;
+        let fail_index = result.fail_index;
+        let trace_id = result.trace_id;
+        let result_meta = result.meta.clone();
+        let typed_values = result.typed_values;
+        let raw_values = result.values;
+
+        if is_finish || fail_index == u32::MAX {
+            state.restore_values(&result_meta, &typed_values);
+            return Some(target_pc);
+        }
+
+        let should_bridge = self
+            .meta
+            .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
+        if should_bridge {
+            if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values) {
+                let started = self.start_bridge_tracing(
+                    key_hash,
+                    trace_id,
+                    fail_index,
+                    state,
+                    env,
+                    resume_pc,
+                    target_pc,
+                );
+                if started {
+                    return Some(resume_pc);
+                }
+            }
+            return None;
+        }
+
+        on_guard_failure(state, &result_meta, &raw_values)
+    }
 }
 
 #[cfg(test)]

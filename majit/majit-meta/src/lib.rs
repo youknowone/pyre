@@ -105,6 +105,43 @@ macro_rules! can_enter_jit {
     ($($tt:tt)*) => {};
 }
 
+/// Hash a green key from i64 slice values.
+///
+/// Uses the same algorithm as [`GreenKey::hash_u64`](majit_ir::GreenKey::hash_u64),
+/// so callers can compute a key hash without constructing a full `GreenKey`.
+pub fn green_key_hash(values: &[i64]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    values.hash(&mut hasher);
+    hasher.finish()
+}
+
 // ── we_are_jitted / JIT mode flag ──
 // Re-exported from majit-codegen so both meta and backend can access it.
 pub use majit_codegen::{set_jitted, we_are_jitted, JittedGuard};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn green_key_hash_deterministic() {
+        let a = green_key_hash(&[10, 20]);
+        let b = green_key_hash(&[10, 20]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn green_key_hash_different_values() {
+        let a = green_key_hash(&[10, 20]);
+        let b = green_key_hash(&[10, 21]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn green_key_hash_matches_green_key() {
+        let hash = green_key_hash(&[42, 7]);
+        let gk = majit_ir::GreenKey::new(vec![42, 7]);
+        assert_eq!(hash, gk.hash_u64());
+    }
+}
