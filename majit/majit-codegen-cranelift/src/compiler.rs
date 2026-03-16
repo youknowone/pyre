@@ -2235,17 +2235,11 @@ fn resolve_call_assembler_target(
             )
         })?;
     let finish_types = finish_descr.fail_arg_types();
-    if !finish_descr.force_token_slots.is_empty()
-        && !(call_descr.result_type() == Type::Ref
-            && finish_types == [Type::Ref]
-            && finish_descr.force_token_slots == [0])
-    {
-        return Err(unsupported_semantics(
-            opcode,
-            "call-assembler does not yet support this callee finish force-token shape",
-        ));
-    }
 
+    // Validate that the finish result type matches the call descriptor.
+    // When force_token_slots are present the finish output type is Ref
+    // (the raw force-token handle), so accept that as matching a Ref
+    // result descriptor even though the value isn't a real GC ref.
     match call_descr.result_type() {
         Type::Void => {
             if !finish_types.is_empty() {
@@ -12995,5 +12989,217 @@ mod tests {
         let descr = backend.get_latest_descr(&frame);
         assert_eq!(descr.fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 99);
+    }
+
+    /// Guard-bearing callee: guard passes -> finish result propagated.
+    /// Guard-bearing callee: guard fails  -> deadframe propagated.
+    #[test]
+    fn test_call_assembler_guard_bearing_callee_pass_and_fail() {
+        let mut backend = CraneliftBackend::new();
+
+        // Callee trace: GuardTrue(x > 0), then Finish(x + 10)
+        backend.set_next_trace_id(1500_300);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 0); // constant 0 for comparison
+        constants.insert(101, 10); // constant 10 for addition
+        backend.set_constants(constants);
+
+        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntGt, &[OpRef(0), OpRef(100)], 1), // x > 0
+            guard_op,                                           // guard(x > 0)
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(101)], 3), // x + 10
+            mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
+        ];
+        let mut callee = LoopToken::new(1500_300);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        // Caller: CallAssemblerI(callee, x) -> Finish(result)
+        backend.set_constants(HashMap::new());
+        backend.set_next_trace_id(1500_301);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_301);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        // Guard passes: x=5 > 0, result = 5 + 10 = 15
+        let frame = backend.execute_token(&caller, &[Value::Int(5)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish(), "guard passed, should reach caller finish");
+        assert_eq!(descr.trace_id(), 1500_301);
+        assert_eq!(backend.get_int_value(&frame, 0), 15);
+
+        // Guard fails: x=0, guard(0 > 0) fails -> deadframe from callee
+        let frame = backend.execute_token(&caller, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(!descr.is_finish(), "guard failed, should propagate deadframe");
+        assert_eq!(descr.trace_id(), 1500_300);
+        assert_eq!(descr.fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+
+        // Also verify raw path
+        let raw = backend.execute_token_ints_raw(&caller, &[5]);
+        assert!(raw.is_finish);
+        assert_eq!(raw.outputs, vec![15]);
+
+        let raw = backend.execute_token_ints_raw(&caller, &[0]);
+        assert!(!raw.is_finish);
+        assert_eq!(raw.trace_id, 1500_300);
+        assert_eq!(raw.fail_index, 0);
+    }
+
+    /// Guard-bearing callee with multiple guards: first guard passes, second
+    /// guard fails -> correct fail_index propagated.
+    #[test]
+    fn test_call_assembler_guard_bearing_callee_multiple_guards() {
+        let mut backend = CraneliftBackend::new();
+
+        // Callee: guard(x > 0), guard(x < 100), finish(x + 1)
+        backend.set_next_trace_id(1500_310);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 0);   // for x > 0
+        constants.insert(101, 100); // for x < 100
+        constants.insert(102, 1);   // for x + 1
+        backend.set_constants(constants);
+
+        let mut guard1 = mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0);
+        guard1.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let mut guard2 = mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0);
+        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntGt, &[OpRef(0), OpRef(100)], 1),  // x > 0
+            guard1,                                              // guard #0
+            mk_op(OpCode::IntLt, &[OpRef(0), OpRef(101)], 2),  // x < 100
+            guard2,                                              // guard #1
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(102)], 5), // x + 1
+            mk_op(OpCode::Finish, &[OpRef(5)], OpRef::NONE.0),
+        ];
+        let mut callee = LoopToken::new(1500_310);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        // Caller
+        backend.set_constants(HashMap::new());
+        backend.set_next_trace_id(1500_311);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_311);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        // Both guards pass: x=50
+        let frame = backend.execute_token(&caller, &[Value::Int(50)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 51);
+
+        // First guard fails: x=0
+        let frame = backend.execute_token(&caller, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(!descr.is_finish());
+        assert_eq!(descr.trace_id(), 1500_310);
+        assert_eq!(descr.fail_index(), 0);
+
+        // Second guard fails: x=200
+        let frame = backend.execute_token(&caller, &[Value::Int(200)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(!descr.is_finish());
+        assert_eq!(descr.trace_id(), 1500_310);
+        assert_eq!(descr.fail_index(), 1);
+    }
+
+    /// Guard-bearing callee with force_token finish shape:
+    /// Callee has ForceToken + GuardNotForced2 + Finish(force_token).
+    /// Caller uses CallAssemblerR and gets the force_token result.
+    #[test]
+    fn test_call_assembler_guard_bearing_callee_with_force_token_finish() {
+        let mut backend = CraneliftBackend::new();
+
+        // Callee: ForceToken, GuardNotForced2(fail_args=[int_result]),
+        //         Finish(force_token)
+        backend.set_next_trace_id(1500_320);
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 7);
+        backend.set_constants(constants);
+
+        let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1)]));
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1), // x + 7
+            mk_op(OpCode::ForceToken, &[], 2),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut callee = LoopToken::new(1500_320);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
+            .unwrap();
+
+        // Caller uses CallAssemblerR to call force_token callee
+        backend.set_constants(HashMap::new());
+        backend.set_next_trace_id(1500_321);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerR,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&callee, vec![Type::Int], Type::Ref),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = LoopToken::new(1500_321);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        // Execute: guard passes, caller gets force_token as ref result
+        let frame = backend.execute_token(&caller, &[Value::Int(10)]);
+        let frame_data = frame
+            .data
+            .downcast_ref::<FrameData>()
+            .expect("caller finish should produce FrameData");
+        assert!(frame_data.fail_descr.is_force_token_slot(0));
+        let force_token = backend.get_ref_value(&frame, 0);
+        assert_ne!(force_token, GcRef::NULL);
+
+        // Force the token to get callee guard values
+        let forced = backend.force(force_token).unwrap();
+        let descr = backend.get_latest_descr(&forced);
+        assert_eq!(descr.fail_index(), 0);
+        // x + 7 = 10 + 7 = 17
+        assert_eq!(backend.get_int_value(&forced, 0), 17);
     }
 }
