@@ -16,14 +16,26 @@ pub fn generate(result: &AnalysisResult) -> String {
     out.push_str(&format!(
         "// Analysis: {} opcodes, {} classified\n\n",
         result.opcodes.len(),
-        result
-            .opcodes
-            .iter()
-            .filter(|a| a.trace_pattern.is_some())
-            .count(),
+        result.opcodes.iter().filter(|a| a.trace_pattern.is_some()).count(),
     ));
 
-    // Generate the dispatch table as a const array
+    // Dispatch table
+    generate_dispatch_table(&mut out, result);
+
+    // Trace helper functions
+    generate_trace_functions(&mut out);
+
+    // Summary
+    let classified = result.opcodes.iter().filter(|a| a.trace_pattern.is_some()).count();
+    out.push_str(&format!(
+        "// Analysis summary: {}/{} opcodes classified, {} helpers, {} trait impls\n",
+        classified, result.opcodes.len(), result.helpers.len(), result.trait_impls.len(),
+    ));
+
+    out
+}
+
+fn generate_dispatch_table(out: &mut String, result: &AnalysisResult) {
     out.push_str("/// Trace pattern classification for each opcode.\n");
     out.push_str("pub const TRACE_PATTERNS: &[(&str, &str)] = &[\n");
     for arm in &result.opcodes {
@@ -38,38 +50,112 @@ pub fn generate(result: &AnalysisResult) -> String {
         ));
     }
     out.push_str("];\n\n");
+}
 
-    // Generate helper function summaries
-    out.push_str("/// Helper function classifications.\n");
-    out.push_str("pub const HELPER_COUNT: usize = ");
-    out.push_str(&result.helpers.len().to_string());
-    out.push_str(";\n\n");
+fn generate_trace_functions(out: &mut String) {
+    // ── Unbox/Box helpers ──
+    // These are the core building blocks for tracing Python operations.
+    // They mirror PyPy's RPython-generated unbox/box sequences.
 
-    // Generate trait impl summary
-    out.push_str("// Trait implementations found:\n");
-    for impl_info in &result.trait_impls {
-        out.push_str(&format!(
-            "// impl {} for {} — {} methods\n",
-            impl_info.trait_name,
-            impl_info.for_type,
-            impl_info.methods.len(),
-        ));
-    }
-    out.push('\n');
+    out.push_str(r#"
+/// Unbox a Python int object: emit GuardClass + GetfieldRawI.
+///
+/// Auto-generated equivalent of PyPy's int_unbox annotation.
+/// Returns the raw i64 OpRef.
+pub fn trace_unbox_int(
+    ctx: &mut majit_meta::TraceCtx,
+    obj: majit_ir::OpRef,
+    int_type_addr: i64,
+    ob_type_descr: majit_ir::DescrRef,
+    intval_descr: majit_ir::DescrRef,
+    fail_args: &[majit_ir::OpRef],
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+    let ob_type = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], ob_type_descr);
+    let type_const = ctx.const_int(int_type_addr);
+    ctx.record_guard_typed_with_fail_args(
+        OpCode::GuardClass, &[ob_type, type_const],
+        vec![majit_ir::Type::Int; fail_args.len()], fail_args,
+    );
+    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], intval_descr)
+}
 
-    // Summary stats
-    let classified = result
-        .opcodes
-        .iter()
-        .filter(|a| a.trace_pattern.is_some())
-        .count();
-    out.push_str(&format!(
-        "// Analysis summary: {}/{} opcodes classified, {} helpers, {} trait impls\n",
-        classified,
-        result.opcodes.len(),
-        result.helpers.len(),
-        result.trait_impls.len(),
-    ));
+/// Box a raw i64 into a Python int object: emit New + SetfieldRaw.
+///
+/// Auto-generated equivalent of PyPy's int_box annotation.
+pub fn trace_box_int(
+    ctx: &mut majit_meta::TraceCtx,
+    value: majit_ir::OpRef,
+    size_descr: majit_ir::DescrRef,
+    ob_type_descr: majit_ir::DescrRef,
+    intval_descr: majit_ir::DescrRef,
+    int_type_addr: i64,
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+    let obj = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    let type_ptr = ctx.const_int(int_type_addr);
+    ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, type_ptr], ob_type_descr);
+    ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, value], intval_descr);
+    obj
+}
 
-    out
+/// Emit an overflow-checked binary int operation.
+///
+/// Auto-generated: unbox a, unbox b, emit ovf op, guard no overflow, box result.
+pub fn trace_int_binop_ovf(
+    ctx: &mut majit_meta::TraceCtx,
+    a: majit_ir::OpRef,
+    b: majit_ir::OpRef,
+    opcode: majit_ir::OpCode,
+    int_type_addr: i64,
+    ob_type_descr: majit_ir::DescrRef,
+    intval_descr: majit_ir::DescrRef,
+    size_descr: majit_ir::DescrRef,
+    fail_args: &[majit_ir::OpRef],
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    let result = ctx.record_op(opcode, &[a_val, b_val]);
+    ctx.record_guard_typed_with_fail_args(
+        OpCode::GuardNoOverflow, &[],
+        vec![majit_ir::Type::Int; fail_args.len()], fail_args,
+    );
+    trace_box_int(ctx, result, size_descr, ob_type_descr, intval_descr, int_type_addr)
+}
+
+/// Emit a non-overflow binary int operation (bitwise ops, shifts).
+pub fn trace_int_binop(
+    ctx: &mut majit_meta::TraceCtx,
+    a: majit_ir::OpRef,
+    b: majit_ir::OpRef,
+    opcode: majit_ir::OpCode,
+    int_type_addr: i64,
+    ob_type_descr: majit_ir::DescrRef,
+    intval_descr: majit_ir::DescrRef,
+    size_descr: majit_ir::DescrRef,
+    fail_args: &[majit_ir::OpRef],
+) -> majit_ir::OpRef {
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    let result = ctx.record_op(opcode, &[a_val, b_val]);
+    trace_box_int(ctx, result, size_descr, ob_type_descr, intval_descr, int_type_addr)
+}
+
+/// Emit a comparison between two Python ints.
+pub fn trace_int_compare(
+    ctx: &mut majit_meta::TraceCtx,
+    a: majit_ir::OpRef,
+    b: majit_ir::OpRef,
+    opcode: majit_ir::OpCode,
+    int_type_addr: i64,
+    ob_type_descr: majit_ir::DescrRef,
+    intval_descr: majit_ir::DescrRef,
+    fail_args: &[majit_ir::OpRef],
+) -> majit_ir::OpRef {
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    ctx.record_op(opcode, &[a_val, b_val])
+}
+"#);
 }
