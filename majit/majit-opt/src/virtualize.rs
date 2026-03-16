@@ -459,6 +459,7 @@ impl OptVirtualize {
         PassResult::PassOn
     }
 
+    #[allow(dead_code)]
     fn optimize_new_array_clear(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         self.optimize_new_array(op, ctx)
     }

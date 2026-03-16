@@ -58,6 +58,7 @@ impl FailDescr for MetaFailDescr {
 /// When a guard fails, the backend uses the resume data to reconstruct
 /// the interpreter state (virtual objects, frame variables, etc.).
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ResumeGuardDescr {
     fail_index: u32,
     types: Vec<Type>,
@@ -84,6 +85,7 @@ impl FailDescr for ResumeGuardDescr {
 
 impl ResumeGuardDescr {
     /// Access the resume data for deoptimization.
+    #[allow(dead_code)]
     pub fn resume_data(&self) -> &ResumeData {
         &self.resume_data
     }
@@ -105,6 +107,7 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
 ///
 /// Used when the caller needs to control the fail_index (e.g., for
 /// bridge compilation where the fail_index must match the original guard).
+#[allow(dead_code)]
 pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef {
     Arc::new(MetaFailDescr {
         fail_index,
@@ -126,6 +129,7 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
 /// Mirrors RPython's ResumeGuardDescr which attaches snapshot data
 /// to each guard so the meta-interpreter can reconstruct the full
 /// interpreter state (including virtual objects) when deoptimizing.
+#[allow(dead_code)]
 pub fn make_resume_guard_descr(num_live: usize, resume_data: ResumeData) -> DescrRef {
     Arc::new(ResumeGuardDescr {
         fail_index: alloc_fail_index(),
@@ -135,6 +139,7 @@ pub fn make_resume_guard_descr(num_live: usize, resume_data: ResumeData) -> Desc
 }
 
 /// Create a ResumeGuardDescr with an explicit fail_index.
+#[allow(dead_code)]
 pub fn make_resume_guard_descr_with_index(
     fail_index: u32,
     num_live: usize,
