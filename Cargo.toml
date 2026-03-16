@@ -6,6 +6,7 @@ edition = "2024"
 resolver = "2"
 members = [
     # majit
+    "majit/majit",
     "majit/majit-ir",
     "majit/majit-opt",
     "majit/majit-trace",
