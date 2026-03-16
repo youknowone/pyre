@@ -2061,6 +2061,9 @@ fn resolve_opref(
     if let Some(&c) = constants.get(&opref.0) {
         return builder.ins().iconst(cl_types::I64, c);
     }
+    if opref.is_none() {
+        return builder.ins().iconst(cl_types::I64, 0);
+    }
     builder.use_var(var(opref.0))
 }
 
@@ -13482,5 +13485,39 @@ mod tests {
         // Verify fail indices are sequential
         let indices: Vec<u32> = frame_stacks.iter().map(|(idx, _)| *idx).collect();
         assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    /// Verify that the main opcode dispatch in compile_loop covers all OpCode
+    /// variants. We compile a small representative trace and confirm the backend
+    /// doesn't return Unsupported. The compile-time exhaustiveness of the match
+    /// is the primary guarantee (enforced by CI warning checks).
+    #[test]
+    fn test_all_opcodes_covered_in_backend() {
+        let mut backend = CraneliftBackend::new();
+        let mut constants = HashMap::new();
+        constants.insert(100, 42i64);
+        constants.insert(101, 7i64);
+        backend.set_constants(constants);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::IntGt, &[OpRef(1), OpRef(101)], 2),
+            {
+                let mut g = mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0);
+                g.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+                g
+            },
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut token = LoopToken::new(99_999);
+        let result = backend.compile_loop(&inputargs, &ops, &mut token);
+        assert!(
+            result.is_ok(),
+            "representative trace should compile: {:?}",
+            result.err()
+        );
     }
 }

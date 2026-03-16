@@ -523,6 +523,11 @@ impl OpCode {
         self as u16
     }
 
+    /// Iterate over all defined OpCode variants (0..OPCODE_COUNT).
+    pub fn all() -> impl Iterator<Item = OpCode> {
+        (0..OPCODE_COUNT as u16).map(|i| unsafe { std::mem::transmute::<u16, OpCode>(i) })
+    }
+
     // ── Category classification (mirrors rop.is_* static methods) ──
 
     pub fn is_final(self) -> bool {
