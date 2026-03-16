@@ -7035,6 +7035,24 @@ impl majit_codegen::Backend for CraneliftBackend {
         find_trace_info_in_fail_descrs(&compiled.fail_descrs, trace_id)
     }
 
+    fn compiled_guard_frame_stacks(
+        &self,
+        token: &LoopToken,
+    ) -> Option<Vec<(u32, Vec<majit_codegen::ExitFrameLayout>)>> {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        let mut result = Vec::new();
+        for descr in &compiled.fail_descrs {
+            let recovery = descr.recovery_layout.lock().unwrap();
+            if let Some(ref layout) = *recovery {
+                result.push((descr.fail_index, layout.frames.clone()));
+            }
+        }
+        Some(result)
+    }
+
     fn describe_deadframe(&self, frame: &DeadFrame) -> Option<majit_codegen::FailDescrLayout> {
         deadframe_layout(frame)
     }
@@ -13201,5 +13219,144 @@ mod tests {
         assert_eq!(descr.fail_index(), 0);
         // x + 7 = 10 + 7 = 17
         assert_eq!(backend.get_int_value(&forced, 0), 17);
+    }
+
+    #[test]
+    fn test_all_guards_have_recovery_layout() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut guard1 = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard1.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0), OpRef(1)]));
+        let int_add = mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2);
+        let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef(2)], OpRef::NONE.0);
+        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(2)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            guard1,
+            int_add,
+            guard2,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(500);
+        backend.set_next_header_pc(2000);
+        let mut token = LoopToken::new(9001);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let layouts = backend
+            .compiled_fail_descr_layouts(&token)
+            .expect("compiled layouts should exist");
+
+        // All fail descriptors (2 guards + 1 finish) should have recovery_layout
+        for (idx, layout) in layouts.iter().enumerate() {
+            assert!(
+                layout.recovery_layout.is_some(),
+                "fail_descr[{idx}] should have recovery_layout"
+            );
+            let recovery = layout.recovery_layout.as_ref().unwrap();
+            assert!(!recovery.frames.is_empty());
+            assert_eq!(recovery.frames[0].trace_id, Some(500));
+            assert_eq!(recovery.frames[0].header_pc, Some(2000));
+            // slot_types should always be populated
+            assert!(recovery.frames[0].slot_types.is_some());
+        }
+    }
+
+    #[test]
+    fn test_frame_layout_includes_slot_types() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![
+            InputArg::new_int(0),
+            InputArg::new_ref(1),
+            InputArg::new_float(2),
+        ];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args =
+            Some(smallvec::SmallVec::from_slice(&[OpRef(0), OpRef(1), OpRef(2)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(501);
+        backend.set_next_header_pc(3000);
+        let mut token = LoopToken::new(9002);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let layouts = backend
+            .compiled_fail_descr_layouts(&token)
+            .expect("compiled layouts should exist");
+
+        // Guard layout
+        let guard_layout = &layouts[0];
+        let recovery = guard_layout
+            .recovery_layout
+            .as_ref()
+            .expect("guard should have recovery layout");
+        let frame = &recovery.frames[0];
+        let slot_types = frame
+            .slot_types
+            .as_ref()
+            .expect("slot_types should always be populated");
+        assert_eq!(slot_types, &[Type::Int, Type::Ref, Type::Float]);
+
+        // frame_stack should mirror recovery frames
+        let frame_stack = guard_layout
+            .frame_stack
+            .as_ref()
+            .expect("frame_stack should be populated from recovery_layout");
+        assert_eq!(frame_stack.len(), 1);
+        assert_eq!(
+            frame_stack[0].slot_types,
+            Some(vec![Type::Int, Type::Ref, Type::Float])
+        );
+    }
+
+    #[test]
+    fn test_compiled_guard_frame_stacks_query() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut guard1 = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard1.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0), OpRef(1)]));
+        let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef(1)], OpRef::NONE.0);
+        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            guard1,
+            guard2,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        backend.set_next_trace_id(502);
+        backend.set_next_header_pc(4000);
+        let mut token = LoopToken::new(9003);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame_stacks = backend
+            .compiled_guard_frame_stacks(&token)
+            .expect("compiled_guard_frame_stacks should return Some");
+
+        // 2 guards + 1 finish = 3 entries, all with frame stacks
+        assert_eq!(frame_stacks.len(), 3);
+        for (fail_index, frames) in &frame_stacks {
+            assert!(
+                !frames.is_empty(),
+                "fail_index={fail_index} should have non-empty frame stack"
+            );
+            assert_eq!(frames[0].trace_id, Some(502));
+            assert_eq!(frames[0].header_pc, Some(4000));
+            // slot_types populated in every frame
+            for frame in frames {
+                assert!(frame.slot_types.is_some());
+            }
+        }
+
+        // Verify fail indices are sequential
+        let indices: Vec<u32> = frame_stacks.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
     }
 }

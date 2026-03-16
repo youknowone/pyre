@@ -307,6 +307,9 @@ pub struct FailDescrLayout {
     pub force_token_slots: Vec<usize>,
     /// Optional backend-origin recovery layout for this exit.
     pub recovery_layout: Option<ExitRecoveryLayout>,
+    /// Complete frame stack from innermost (this guard's frame) to outermost.
+    /// Present when multi-frame reconstruction is supported.
+    pub frame_stack: Option<Vec<ExitFrameLayout>>,
 }
 
 /// Static layout metadata for a terminal exit within a compiled trace.
@@ -653,6 +656,18 @@ pub trait Backend: Send {
         None
     }
 
+    /// Query complete frame-stack layouts for all guards in a compiled loop.
+    ///
+    /// Returns `(fail_index, frame_stack)` pairs for each guard that has
+    /// recovery layout metadata. Backends that populate recovery layouts
+    /// at compile time can override this to expose the frame stacks.
+    fn compiled_guard_frame_stacks(
+        &self,
+        _token: &LoopToken,
+    ) -> Option<Vec<(u32, Vec<ExitFrameLayout>)>> {
+        None
+    }
+
     /// Patch backend-owned recovery metadata for a specific compiled terminal exit.
     fn update_terminal_exit_recovery_layout(
         &mut self,
@@ -685,6 +700,7 @@ pub trait Backend: Send {
                 .collect(),
             force_token_slots: descr.force_token_slots().to_vec(),
             recovery_layout: None,
+            frame_stack: None,
         })
     }
 
