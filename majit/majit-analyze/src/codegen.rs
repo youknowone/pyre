@@ -258,5 +258,78 @@ pub fn trace_int_compare(
     let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
     ctx.record_op(opcode, &[a_val, b_val])
 }
+
+/// Unbox a Python float object: emit GuardClass + GetfieldRawF.
+///
+/// Returns the raw f64 OpRef.
+pub fn trace_unbox_float(
+    ctx: &mut majit_meta::TraceCtx,
+    obj: majit_ir::OpRef,
+    float_type_addr: i64,
+    ob_type_descr: majit_ir::DescrRef,
+    floatval_descr: majit_ir::DescrRef,
+    fail_args: &[majit_ir::OpRef],
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+    let ob_type = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], ob_type_descr);
+    let type_const = ctx.const_int(float_type_addr);
+    ctx.record_guard_typed_with_fail_args(
+        OpCode::GuardClass, &[ob_type, type_const],
+        vec![majit_ir::Type::Int; fail_args.len()], fail_args,
+    );
+    ctx.record_op_with_descr(OpCode::GetfieldRawF, &[obj], floatval_descr)
+}
+
+/// Box a raw f64 into a Python float object: emit ConvertFloatBytesToLonglong + New + SetfieldRaw.
+pub fn trace_box_float(
+    ctx: &mut majit_meta::TraceCtx,
+    value: majit_ir::OpRef,
+    size_descr: majit_ir::DescrRef,
+    ob_type_descr: majit_ir::DescrRef,
+    floatval_descr: majit_ir::DescrRef,
+    float_type_addr: i64,
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+    let bits = ctx.record_op(OpCode::ConvertFloatBytesToLonglong, &[value]);
+    let obj = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    let type_ptr = ctx.const_int(float_type_addr);
+    ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, type_ptr], ob_type_descr);
+    ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, bits], floatval_descr);
+    obj
+}
+
+/// Emit a binary float operation: unbox a, unbox b, emit float op, box result.
+pub fn trace_float_binop(
+    ctx: &mut majit_meta::TraceCtx,
+    a: majit_ir::OpRef,
+    b: majit_ir::OpRef,
+    opcode: majit_ir::OpCode,
+    float_type_addr: i64,
+    ob_type_descr: majit_ir::DescrRef,
+    floatval_descr: majit_ir::DescrRef,
+    size_descr: majit_ir::DescrRef,
+    fail_args: &[majit_ir::OpRef],
+) -> majit_ir::OpRef {
+    let a_val = trace_unbox_float(ctx, a, float_type_addr, ob_type_descr.clone(), floatval_descr.clone(), fail_args);
+    let b_val = trace_unbox_float(ctx, b, float_type_addr, ob_type_descr.clone(), floatval_descr.clone(), fail_args);
+    let result = ctx.record_op(opcode, &[a_val, b_val]);
+    trace_box_float(ctx, result, size_descr, ob_type_descr, floatval_descr, float_type_addr)
+}
+
+/// Emit a comparison between two Python floats.
+pub fn trace_float_compare(
+    ctx: &mut majit_meta::TraceCtx,
+    a: majit_ir::OpRef,
+    b: majit_ir::OpRef,
+    opcode: majit_ir::OpCode,
+    float_type_addr: i64,
+    ob_type_descr: majit_ir::DescrRef,
+    floatval_descr: majit_ir::DescrRef,
+    fail_args: &[majit_ir::OpRef],
+) -> majit_ir::OpRef {
+    let a_val = trace_unbox_float(ctx, a, float_type_addr, ob_type_descr.clone(), floatval_descr.clone(), fail_args);
+    let b_val = trace_unbox_float(ctx, b, float_type_addr, ob_type_descr.clone(), floatval_descr.clone(), fail_args);
+    ctx.record_op(opcode, &[a_val, b_val])
+}
 "#);
 }
