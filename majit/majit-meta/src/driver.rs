@@ -56,6 +56,11 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_compiled_meta(green_key)
     }
 
+    /// Set virtualizable array lengths for the current trace's preamble patching.
+    pub fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
+        self.meta.set_vable_array_lengths(lengths);
+    }
+
     pub fn with_declarative<D: DeclarativeJitDriver>(
         threshold: u32,
         green_types: &[Type],
