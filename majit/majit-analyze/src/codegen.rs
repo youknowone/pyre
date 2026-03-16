@@ -46,7 +46,7 @@ pub fn generate(result: &AnalysisResult) -> String {
     out.push_str(";\n\n");
 
     // Generate trait impl summary
-    out.push_str("/// Trait implementations found.\n");
+    out.push_str("// Trait implementations found:\n");
     for impl_info in &result.trait_impls {
         out.push_str(&format!(
             "// impl {} for {} — {} methods\n",
@@ -64,7 +64,7 @@ pub fn generate(result: &AnalysisResult) -> String {
         .filter(|a| a.trace_pattern.is_some())
         .count();
     out.push_str(&format!(
-        "/// Analysis summary: {}/{} opcodes classified, {} helpers, {} trait impls\n",
+        "// Analysis summary: {}/{} opcodes classified, {} helpers, {} trait impls\n",
         classified,
         result.opcodes.len(),
         result.helpers.len(),
