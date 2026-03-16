@@ -1640,14 +1640,24 @@ impl TraceFrameState {
         unsafe {
             if is_int(concrete_value) {
                 return self.with_ctx(|this, ctx| {
-                    let int_value = this.trace_guarded_int_payload(ctx, value);
+                    let fail_args = this.current_fail_args(ctx);
+                    let int_type_addr = &INT_TYPE as *const _ as i64;
+                    let int_value = crate::jit::generated::trace_unbox_int(
+                        ctx, value, int_type_addr,
+                        ob_type_descr(), int_intval_descr(), &fail_args,
+                    );
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[int_value, zero]))
                 });
             }
             if is_bool(concrete_value) {
                 return self.with_ctx(|this, ctx| {
-                    let bool_value = this.trace_guarded_bool_payload(ctx, value);
+                    let fail_args = this.current_fail_args(ctx);
+                    let bool_type_addr = &BOOL_TYPE as *const _ as i64;
+                    let bool_value = crate::jit::generated::trace_unbox_int(
+                        ctx, value, bool_type_addr,
+                        ob_type_descr(), bool_boolval_descr(), &fail_args,
+                    );
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[bool_value, zero]))
                 });
