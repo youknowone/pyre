@@ -1380,4 +1380,219 @@ mod tests {
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 0);
     }
+
+    // ── Event-driven JitHookInterface parity tests ──
+    // These exercise the full compilation pipeline (tracing → optimize → Cranelift)
+    // and verify hooks fire with correct metadata, unlike wiring-only tests that
+    // call hook closures directly.
+
+    #[test]
+    fn test_hook_on_compile_fires_through_real_pipeline() {
+        use std::sync::{Arc, Mutex};
+
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let events = compile_events.clone();
+        driver.set_on_compile_loop(move |green_key, ops_before, ops_after| {
+            events
+                .lock()
+                .unwrap()
+                .push((green_key, ops_before, ops_after));
+        });
+
+        let key = 42u64;
+
+        // Warm up: first back_edge increments counter, second starts tracing.
+        // Pass one live value so OpRef(0) = i0 is available.
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[0]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[0]),
+            BackEdgeAction::StartedTracing
+        ));
+
+        // Record a real trace: IntAdd + GuardFalse + JUMP
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef(0); // input arg from on_back_edge
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let cond = ctx.const_int(0);
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[sum]);
+        }
+
+        // Close and compile through the real Cranelift pipeline.
+        driver.meta.close_and_compile(&[OpRef(0)], ());
+        assert!(driver.has_compiled_loop(key));
+
+        let events = compile_events.lock().unwrap();
+        assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
+        assert_eq!(events[0].0, key, "green_key should match");
+        assert!(events[0].1 > 0, "num_ops_before should be positive");
+        assert!(events[0].2 > 0, "num_ops_after should be positive");
+    }
+
+    #[test]
+    fn test_hook_get_stats_matches_real_compile_count() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+
+        // Initially zero.
+        let stats = driver.get_stats();
+        assert_eq!(stats.loops_compiled, 0);
+        assert_eq!(stats.bridges_compiled, 0);
+
+        // Compile two distinct loops.
+        for key in [100u64, 200u64] {
+            assert!(matches!(
+                driver.meta.on_back_edge(key, &[0]),
+                BackEdgeAction::Interpret
+            ));
+            assert!(matches!(
+                driver.meta.on_back_edge(key, &[0]),
+                BackEdgeAction::StartedTracing
+            ));
+            {
+                let ctx = driver.meta.trace_ctx().expect("should be tracing");
+                let i0 = OpRef(0);
+                let c1 = ctx.const_int(1);
+                let _sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            }
+            driver.meta.close_and_compile(&[OpRef(0)], ());
+            assert!(driver.has_compiled_loop(key));
+        }
+
+        let stats = driver.get_stats();
+        assert_eq!(stats.loops_compiled, 2);
+        assert_eq!(stats.loops_aborted, 0);
+    }
+
+    #[test]
+    fn test_hook_on_compile_bridge_fires_through_real_pipeline() {
+        use std::sync::{Arc, Mutex};
+
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev = bridge_events.clone();
+        driver
+            .meta
+            .set_on_compile_bridge(move |gk, fi, nops| {
+                ev.lock().unwrap().push((gk, fi, nops));
+            });
+
+        let key = 50u64;
+
+        // Step 1: Compile a loop with a guard on a non-constant condition.
+        // The guard must survive optimization, so use an input arg as condition.
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[1]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[1]),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef(0); // input arg (non-constant = won't be folded)
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            // Guard on the input arg itself — optimizer cannot prove it's true,
+            // so the guard survives optimization.
+            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+        }
+        driver.meta.close_and_compile(&[OpRef(0)], ());
+        assert!(driver.has_compiled_loop(key));
+
+        // Identify the fail_index assigned to the first guard in the optimized trace.
+        // build_guard_metadata assigns fail_index sequentially starting from 0.
+        let fail_index = 0u32;
+
+        // Step 2: Start bridge tracing via start_retrace (simulates guard failure path).
+        assert!(driver.meta.start_retrace(key, fail_index, &[0]));
+
+        // Step 3: Record a bridge trace and compile it via close_bridge_with_finish.
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
+            let i0 = OpRef(0); // bridge input from start_retrace
+            let c2 = ctx.const_int(2);
+            let _sum = ctx.record_op(OpCode::IntAdd, &[i0, c2]);
+        }
+        let trace_id = 0u64; // will be normalized to root_trace_id
+        let compiled = driver
+            .meta
+            .close_bridge_with_finish(key, trace_id, fail_index, &[OpRef(0)]);
+        assert!(compiled, "bridge should compile successfully");
+
+        let events = bridge_events.lock().unwrap();
+        assert_eq!(events.len(), 1, "on_compile_bridge should fire exactly once");
+        assert_eq!(events[0].0, key, "bridge green_key should match");
+        assert_eq!(events[0].1, fail_index, "bridge fail_index should match");
+        assert!(events[0].2 > 0, "bridge num_ops should be positive");
+
+        // Stats should reflect 1 loop + 1 bridge.
+        let stats = driver.get_stats();
+        assert_eq!(stats.loops_compiled, 1);
+        assert_eq!(stats.bridges_compiled, 1);
+    }
+
+    #[test]
+    fn test_hook_on_compile_error_fires_on_real_failure() {
+        use std::sync::{Arc, Mutex};
+
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        let error_events: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev = error_events.clone();
+        driver.meta.set_on_compile_error(move |gk, msg| {
+            ev.lock().unwrap().push((gk, msg.to_string()));
+        });
+
+        let key = 99u64;
+
+        // Warm up and start tracing.
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[0]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[0]),
+            BackEdgeAction::StartedTracing
+        ));
+
+        // Record a trace with a guard whose fail_args include OpRef::NONE.
+        // The Cranelift backend rejects this with BackendError::Unsupported,
+        // which triggers the on_compile_error hook through the real pipeline.
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef(0);
+            // Guard on input arg so optimizer cannot fold it away.
+            ctx.record_guard_with_fail_args(
+                OpCode::GuardTrue,
+                &[i0],
+                0,
+                &[OpRef::NONE], // invalid: causes BackendError
+            );
+        }
+        driver.meta.close_and_compile(&[OpRef(0)], ());
+
+        // The loop should NOT have been compiled (error path).
+        assert!(!driver.has_compiled_loop(key));
+
+        let events = error_events.lock().unwrap();
+        // The error hook should have fired.
+        assert_eq!(
+            events.len(),
+            1,
+            "on_compile_error should fire exactly once on compilation failure"
+        );
+        assert_eq!(events[0].0, key, "error green_key should match");
+        assert!(!events[0].1.is_empty(), "error message should be non-empty");
+
+        // Stats should reflect an aborted loop.
+        let stats = driver.get_stats();
+        assert_eq!(stats.loops_compiled, 0);
+        assert_eq!(stats.loops_aborted, 1);
+    }
 }
