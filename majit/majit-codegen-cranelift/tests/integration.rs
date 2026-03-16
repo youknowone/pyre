@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use majit_codegen::{Backend, LoopToken};
+use majit_codegen::{Backend, ExitRecoveryLayout, ExitFrameLayout, ExitValueSourceLayout, LoopToken};
 use majit_codegen_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
+use majit_codegen_cranelift::guard::CraneliftFailDescr;
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
     Value,
@@ -2825,4 +2826,451 @@ fn test_ffi_call_exception_propagation() {
         99,
         "val=99: fail_args[0] = result = 99"
     );
+}
+
+// ===========================================================================
+// Frame-stack metadata integration tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test: Guard failure preserves frame-stack metadata in describe_deadframe
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
+    // Trace: input(x) -> result = x + 5 -> cmp = result < 100
+    //        -> guard_true(cmp) -> finish(result)
+    // Execute with x=50: guard passes, finish returns 55.
+    // Execute with x=200: result=205, 205 < 100 is false, guard fails.
+    // Verify the DeadFrame carries frame_stack metadata.
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+
+    let const_5 = OpRef(1000);
+    let const_100 = OpRef(1001);
+
+    let result = rec.record_op(OpCode::IntAdd, &[x, const_5]);
+    let cmp = rec.record_op(OpCode::IntLt, &[result, const_100]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp], make_descr(0));
+    rec.finish(&[result], make_descr(1));
+    let trace = rec.get_trace();
+
+    let mut opt = new_optimizer();
+    let optimized = opt.optimize(&trace.ops);
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 5i64);
+    constants.insert(1001, 100i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(900);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("compilation should succeed");
+
+    // x=50: guard passes (55 < 100), reaches Finish
+    let frame = backend.execute_token(&token, &[Value::Int(50)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(descr.fail_index(), 1, "x=50 should reach Finish");
+    assert_eq!(backend.get_int_value(&frame, 0), 55);
+
+    // x=200: guard fails (205 < 100 is false)
+    let frame = backend.execute_token(&token, &[Value::Int(200)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(descr.fail_index(), 0, "x=200 should fail guard");
+    // Guard saves input args: x=200
+    assert_eq!(backend.get_int_value(&frame, 0), 200);
+
+    // Verify describe_deadframe returns frame_stack metadata
+    let layout = backend
+        .describe_deadframe(&frame)
+        .expect("describe_deadframe should return a layout");
+    assert_eq!(layout.fail_index, 0);
+    assert!(
+        layout.frame_stack.is_some(),
+        "guard failure should carry frame_stack metadata"
+    );
+    let frame_stack = layout.frame_stack.unwrap();
+    assert!(
+        !frame_stack.is_empty(),
+        "frame_stack should have at least one frame"
+    );
+    // The innermost frame should have slot_types matching the guard's fail_arg_types
+    let innermost = &frame_stack[frame_stack.len() - 1];
+    assert!(
+        innermost.slot_types.is_some(),
+        "innermost frame should have slot_types"
+    );
+    let slot_types = innermost.slot_types.as_ref().unwrap();
+    assert_eq!(slot_types, &[Type::Int], "guard saves one Int input arg");
+}
+
+// ---------------------------------------------------------------------------
+// Test: Multi-guard trace exposes frame_stacks for all guards
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_compiled_trace_multi_guard_frame_stacks_query() {
+    // Trace: input(x) -> cmp1 = x > 0 -> guard_true(cmp1)
+    //        -> result = x + 1 -> cmp2 = result < 1000
+    //        -> guard_true(cmp2) -> finish(result)
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+
+    let const_0 = OpRef(1000);
+    let const_1 = OpRef(1001);
+    let const_1000 = OpRef(1002);
+
+    let cmp1 = rec.record_op(OpCode::IntGt, &[x, const_0]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp1], make_descr(0));
+    let result = rec.record_op(OpCode::IntAdd, &[x, const_1]);
+    let cmp2 = rec.record_op(OpCode::IntLt, &[result, const_1000]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp2], make_descr(1));
+    rec.finish(&[result], make_descr(2));
+    let trace = rec.get_trace();
+
+    let mut opt = new_optimizer();
+    let optimized = opt.optimize(&trace.ops);
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 1i64);
+    constants.insert(1002, 1000i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(901);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("compilation should succeed");
+
+    // Query frame stacks for all guards
+    let stacks = backend
+        .compiled_guard_frame_stacks(&token)
+        .expect("compiled_guard_frame_stacks should return Some");
+
+    // There should be entries for all guards + finish (each gets a fail_descr)
+    // Guards get fail_index 0 and 1, finish gets fail_index 2.
+    // All should have recovery layouts since collect_guards assigns them.
+    assert!(
+        stacks.len() >= 2,
+        "should have frame_stacks for at least 2 guards, got {}",
+        stacks.len()
+    );
+
+    // Each guard's frame_stack should have slot_types
+    for (fail_index, frames) in &stacks {
+        assert!(
+            !frames.is_empty(),
+            "fail_index={fail_index}: frame_stack should not be empty"
+        );
+        let innermost = &frames[frames.len() - 1];
+        assert!(
+            innermost.slot_types.is_some(),
+            "fail_index={fail_index}: innermost frame should have slot_types"
+        );
+    }
+
+    // Verify execution: x=5 -> both guards pass -> finish returns 6
+    let frame = backend.execute_token(&token, &[Value::Int(5)]);
+    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 2);
+    assert_eq!(backend.get_int_value(&frame, 0), 6);
+
+    // x=-1 -> first guard fails
+    let frame = backend.execute_token(&token, &[Value::Int(-1)]);
+    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Bridge guard failure carries frame-stack metadata
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_compiled_bridge_guard_failure_has_frame_stack() {
+    // Main loop: input(i, sum) -> sum2 = sum + i -> i2 = i - 1
+    //            -> cmp = i2 > 0 -> guard_true(cmp) -> jump(i2, sum2)
+    let mut rec = TraceRecorder::new();
+    let i = rec.record_input_arg(Type::Int);
+    let sum = rec.record_input_arg(Type::Int);
+
+    let const_one = OpRef(1000);
+    let const_zero = OpRef(1001);
+
+    let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
+    let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
+    let cmp = rec.record_op(OpCode::IntGt, &[i2, const_zero]);
+    rec.record_guard(OpCode::GuardTrue, &[cmp], make_descr(0));
+    rec.close_loop(&[i2, sum2]);
+    let trace = rec.get_trace();
+
+    let mut opt = new_optimizer();
+    let optimized = opt.optimize(&trace.ops);
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 1i64);
+    constants.insert(1001, 0i64);
+    backend.set_constants(constants);
+
+    backend.set_next_trace_id(910);
+    backend.set_next_header_pc(1000);
+    let mut token = LoopToken::new(902);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("main loop compilation should succeed");
+
+    // Set up recovery layout on the guard with 2 frames so the bridge
+    // inherits a caller prefix. compile_bridge pops the last frame from the
+    // source guard's recovery layout to form the caller prefix, then the
+    // bridge's own frame is appended, giving 2 frames total.
+    let source_layout = ExitRecoveryLayout {
+        frames: vec![
+            ExitFrameLayout {
+                trace_id: Some(909),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 500,
+                slots: vec![ExitValueSourceLayout::Constant(0)],
+                slot_types: Some(vec![Type::Int]),
+            },
+            ExitFrameLayout {
+                trace_id: Some(910),
+                header_pc: Some(1000),
+                source_guard: Some((909, 0)),
+                pc: 1000,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(0),
+                    ExitValueSourceLayout::ExitValue(1),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Int]),
+            },
+        ],
+        virtual_layouts: vec![],
+        pending_field_layouts: vec![],
+    };
+    assert!(backend.update_fail_descr_recovery_layout(&token, 910, 0, source_layout));
+
+    // Bridge: takes (i, sum), checks sum > 0, returns sum * 2
+    let mut bridge_rec = TraceRecorder::new();
+    let _bi = bridge_rec.record_input_arg(Type::Int);
+    let bsum = bridge_rec.record_input_arg(Type::Int);
+
+    let bridge_const_zero = OpRef(1000);
+    let bridge_const_two = OpRef(1001);
+
+    let bcmp = bridge_rec.record_op(OpCode::IntGt, &[bsum, bridge_const_zero]);
+    bridge_rec.record_guard(OpCode::GuardTrue, &[bcmp], make_descr(10));
+    let bresult = bridge_rec.record_op(OpCode::IntMul, &[bsum, bridge_const_two]);
+    bridge_rec.finish(&[bresult], make_descr(11));
+    let bridge_trace = bridge_rec.get_trace();
+
+    let mut bridge_opt = new_optimizer();
+    let bridge_optimized = bridge_opt.optimize(&bridge_trace.ops);
+
+    let mut bridge_constants = HashMap::new();
+    bridge_constants.insert(1000, 0i64);
+    bridge_constants.insert(1001, 2i64);
+    backend.set_constants(bridge_constants);
+
+    let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+        0,
+        910,
+        vec![Type::Int, Type::Int],
+        false,
+        Vec::new(),
+        None,
+    );
+
+    backend.set_next_trace_id(911);
+    backend.set_next_header_pc(2000);
+    let _bridge_info = backend
+        .compile_bridge(
+            &bridge_fail_descr,
+            &bridge_trace.inputargs,
+            &bridge_optimized,
+            &token,
+        )
+        .expect("bridge compilation should succeed");
+
+    // Execute: i=3, sum=0 -> loop runs 3 iters -> guard fails with i=1, sum=5
+    // Bridge runs: sum=5 > 0 passes, returns 5 * 2 = 10
+    let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
+    assert_eq!(backend.get_int_value(&frame, 0), 10);
+
+    // Now test bridge guard failure: i=3, sum=-100
+    //   iter1: i=3,sum=-100 -> sum2=-97, i2=2, pass -> jump(2,-97)
+    //   iter2: i=2,sum=-97 -> sum2=-95, i2=1, pass -> jump(1,-95)
+    //   iter3: i=1,sum=-95 -> sum2=-94, i2=0, fail -> bridge
+    // Bridge: sum=-95, -95 > 0 is false -> bridge guard fails
+    let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(-100)]);
+    let descr = backend.get_latest_descr(&frame);
+    // Bridge guard failure should have a fail_index from the bridge
+    assert!(!descr.is_finish(), "bridge guard should fail, not finish");
+
+    // Verify the DeadFrame has frame_stack metadata
+    let layout = backend
+        .describe_deadframe(&frame)
+        .expect("bridge guard failure should produce a layout");
+    assert!(
+        layout.frame_stack.is_some(),
+        "bridge guard failure should carry frame_stack metadata"
+    );
+    let frame_stack = layout.frame_stack.unwrap();
+    // Should have at least 2 frames: one from the main trace, one from the bridge
+    assert!(
+        frame_stack.len() >= 2,
+        "bridge guard frame_stack should have >= 2 frames, got {}",
+        frame_stack.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: CallAssemblerI callee guard failure propagates frame_stack
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_call_assembler_callee_guard_failure_frame_stack() {
+    // Compile a callee trace with a guard that fails:
+    //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
+    let callee_inputargs = vec![InputArg::new_int(0)];
+    let mut callee_ops = vec![
+        Op::new(OpCode::Label, &[OpRef(0)]),
+        Op::new(OpCode::IntGt, &[OpRef(0), OpRef(1000)]),
+        Op::with_descr(OpCode::GuardTrue, &[OpRef(1)], make_descr(0)),
+        Op::with_descr(OpCode::Finish, &[OpRef(0)], make_descr(1)),
+    ];
+    assign_positions(&mut callee_ops, 0);
+
+    let mut backend = CraneliftBackend::new();
+    backend.set_constants(HashMap::from([(1000, 10i64)]));
+
+    backend.set_next_trace_id(920);
+    backend.set_next_header_pc(3000);
+    let mut callee_token = LoopToken::new(903);
+    backend
+        .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+        .expect("callee compilation should succeed");
+
+    // x=20: guard passes, finish
+    let frame = backend.execute_token(&callee_token, &[Value::Int(20)]);
+    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+    assert_eq!(backend.get_int_value(&frame, 0), 20);
+
+    // x=5: guard fails (5 > 10 is false)
+    let frame = backend.execute_token(&callee_token, &[Value::Int(5)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(descr.fail_index(), 0);
+    assert_eq!(backend.get_int_value(&frame, 0), 5);
+
+    // Verify callee guard failure has frame_stack
+    let layout = backend
+        .describe_deadframe(&frame)
+        .expect("callee guard failure should have a layout");
+    assert!(
+        layout.frame_stack.is_some(),
+        "callee guard failure should carry frame_stack"
+    );
+    let frame_stack = layout.frame_stack.unwrap();
+    assert!(
+        !frame_stack.is_empty(),
+        "callee frame_stack should not be empty"
+    );
+    let innermost = &frame_stack[frame_stack.len() - 1];
+    assert!(
+        innermost.slot_types.is_some(),
+        "callee innermost frame should have slot_types"
+    );
+    assert_eq!(innermost.trace_id, Some(920));
+    assert_eq!(innermost.header_pc, Some(3000));
+}
+
+// ---------------------------------------------------------------------------
+// Test: Frame-stack slot_types match fail_arg_types for mixed Int+Float
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_frame_stack_slot_types_match_fail_arg_types() {
+    // Trace with mixed Int and Float fail args:
+    //   input(x_int, x_float) -> cmp = x_int > 0 -> guard_true(cmp, fail_args=[x_int, x_float])
+    //   -> finish(x_int)
+    let mut rec = TraceRecorder::new();
+    let x_int = rec.record_input_arg(Type::Int);
+    let x_float = rec.record_input_arg(Type::Float);
+
+    let const_0 = OpRef(1000);
+
+    let cmp = rec.record_op(OpCode::IntGt, &[x_int, const_0]);
+    rec.record_guard_with_fail_args(
+        OpCode::GuardTrue,
+        &[cmp],
+        make_descr(0),
+        &[x_int, x_float],
+    );
+    rec.finish(&[x_int], make_descr(1));
+    let trace = rec.get_trace();
+
+    let mut opt = new_optimizer();
+    let optimized = opt.optimize(&trace.ops);
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    backend.set_constants(constants);
+
+    backend.set_next_trace_id(930);
+    backend.set_next_header_pc(5000);
+    let mut token = LoopToken::new(904);
+    backend
+        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .expect("compilation should succeed");
+
+    // x_int=10, x_float=3.14: guard passes, finish returns 10
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(10), Value::Float(3.14)],
+    );
+    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+    assert_eq!(backend.get_int_value(&frame, 0), 10);
+
+    // x_int=-5, x_float=2.718: guard fails (-5 > 0 is false)
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(-5), Value::Float(2.718)],
+    );
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(descr.fail_index(), 0);
+    assert_eq!(backend.get_int_value(&frame, 0), -5);
+    assert!(
+        (backend.get_float_value(&frame, 1) - 2.718).abs() < 1e-10,
+        "float fail arg should be preserved"
+    );
+
+    // Verify frame_stack slot_types match the guard's fail_arg_types
+    let layout = backend
+        .describe_deadframe(&frame)
+        .expect("mixed-type guard failure should have a layout");
+    assert_eq!(
+        layout.fail_arg_types,
+        vec![Type::Int, Type::Float],
+        "fail_arg_types should be [Int, Float]"
+    );
+    assert!(
+        layout.frame_stack.is_some(),
+        "should carry frame_stack metadata"
+    );
+    let frame_stack = layout.frame_stack.unwrap();
+    let innermost = &frame_stack[frame_stack.len() - 1];
+    assert!(
+        innermost.slot_types.is_some(),
+        "innermost frame should have slot_types"
+    );
+    let slot_types = innermost.slot_types.as_ref().unwrap();
+    assert_eq!(
+        slot_types,
+        &[Type::Int, Type::Float],
+        "frame_stack slot_types should match fail_arg_types exactly"
+    );
+    assert_eq!(innermost.trace_id, Some(930));
+    assert_eq!(innermost.header_pc, Some(5000));
 }
