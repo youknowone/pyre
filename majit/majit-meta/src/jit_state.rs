@@ -25,6 +25,71 @@ pub enum PendingFieldWriteLayout {
     },
 }
 
+/// Session-scoped materialization cache that persists across guard failure
+/// resumption within the same deopt session.
+///
+/// When GUARD_NOT_FORCED triggers resumption after CALL_MAY_FORCE, the same
+/// virtuals may need to be materialized again. This cache ensures each virtual
+/// is materialized at most once per deopt session and reused throughout.
+#[derive(Debug, Clone, Default)]
+pub struct DeoptMaterializationCache {
+    /// Maps virtual indices to materialized GcRefs. `None` means not yet
+    /// materialized; `Some(gcref)` means already materialized in this session.
+    pub refs: Vec<Option<GcRef>>,
+}
+
+impl DeoptMaterializationCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self { refs: Vec::new() }
+    }
+
+    /// Create a cache pre-sized for the given number of virtuals.
+    pub fn with_capacity(num_virtuals: usize) -> Self {
+        Self {
+            refs: vec![None; num_virtuals],
+        }
+    }
+
+    /// Return the number of cached entries (including None slots).
+    pub fn len(&self) -> usize {
+        self.refs.len()
+    }
+
+    /// Return true if no slots have been allocated.
+    pub fn is_empty(&self) -> bool {
+        self.refs.is_empty()
+    }
+
+    /// Return the number of successfully materialized entries.
+    pub fn materialized_count(&self) -> usize {
+        self.refs.iter().filter(|r| r.is_some()).count()
+    }
+
+    /// Clear all cached entries, ending the deopt session.
+    pub fn clear(&mut self) {
+        self.refs.clear();
+    }
+
+    /// Look up a cached materialization by virtual index.
+    pub fn get(&self, virtual_index: usize) -> Option<GcRef> {
+        self.refs.get(virtual_index).copied().flatten()
+    }
+
+    /// Ensure the cache has room for at least `count` virtual indices.
+    pub fn ensure_capacity(&mut self, count: usize) {
+        if self.refs.len() < count {
+            self.refs.resize(count, None);
+        }
+    }
+
+    /// Insert a materialized ref at the given virtual index.
+    pub fn insert(&mut self, virtual_index: usize, gc_ref: GcRef) {
+        self.ensure_capacity(virtual_index + 1);
+        self.refs[virtual_index] = Some(gc_ref);
+    }
+}
+
 /// Interpreter-specific JIT state contract.
 pub trait JitState: Sized {
     type Meta: Clone;
@@ -512,8 +577,120 @@ pub trait JitState: Sized {
         pending_field_writes: &[ResolvedPendingFieldWrite],
         exception: &ExceptionState,
     ) -> bool {
+        self.restore_guard_failure_with_session_cache(
+            meta,
+            fail_values,
+            reconstructed_state,
+            frame_layouts,
+            materialized_virtuals,
+            pending_field_writes,
+            exception,
+            None,
+        )
+    }
+
+    fn materialize_virtual_refs(
+        &mut self,
+        meta: &Self::Meta,
+        materialized_virtuals: &[MaterializedVirtual],
+    ) -> Vec<Option<GcRef>> {
+        let mut refs = vec![None; materialized_virtuals.len()];
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for (virtual_index, virtual_value) in materialized_virtuals.iter().enumerate() {
+                if refs[virtual_index].is_some() {
+                    continue;
+                }
+                if let Some(materialized) = self.materialize_virtual_ref_with_refs(
+                    meta,
+                    virtual_index,
+                    virtual_value,
+                    &refs,
+                ) {
+                    refs[virtual_index] = Some(materialized);
+                    progress = true;
+                }
+            }
+        }
+        refs
+    }
+
+    /// Materialize virtual refs into an existing session cache.
+    ///
+    /// Virtuals that are already present in the cache (from a previous deopt
+    /// in the same session) are skipped. Only unmaterialized entries trigger
+    /// a call to `materialize_virtual_ref_with_refs`.
+    fn materialize_virtual_refs_into_cache(
+        &mut self,
+        meta: &Self::Meta,
+        materialized_virtuals: &[MaterializedVirtual],
+        cache: &mut DeoptMaterializationCache,
+    ) {
+        cache.ensure_capacity(materialized_virtuals.len());
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for (idx, virt) in materialized_virtuals.iter().enumerate() {
+                if cache.refs[idx].is_some() {
+                    continue; // Already materialized (possibly from previous session)
+                }
+                if let Some(materialized) =
+                    self.materialize_virtual_ref_with_refs(meta, idx, virt, &cache.refs)
+                {
+                    cache.refs[idx] = Some(materialized);
+                    progress = true;
+                }
+            }
+        }
+    }
+
+    /// Force a single virtual using the session cache. Returns the cached
+    /// result if already materialized, otherwise materializes and inserts
+    /// into the cache.
+    fn force_virtual_with_cache(
+        &mut self,
+        meta: &Self::Meta,
+        cache: &mut DeoptMaterializationCache,
+        virtual_index: usize,
+        materialized: &MaterializedVirtual,
+    ) -> Option<GcRef> {
+        // Check cache first
+        if let Some(cached) = cache.get(virtual_index) {
+            return Some(cached);
+        }
+        // Materialize and cache
+        cache.ensure_capacity(virtual_index + 1);
+        let result =
+            self.materialize_virtual_ref_with_refs(meta, virtual_index, materialized, &cache.refs)?;
+        cache.refs[virtual_index] = Some(result);
+        Some(result)
+    }
+
+    /// Restore guard failure state using a persistent session cache.
+    ///
+    /// This is the session-aware variant of `restore_guard_failure_with_resume_layout`.
+    /// When `session_cache` is provided, materialized virtuals are stored in
+    /// it and reused across subsequent deopts within the same session (e.g.,
+    /// when GUARD_NOT_FORCED triggers resumption after CALL_MAY_FORCE).
+    fn restore_guard_failure_with_session_cache(
+        &mut self,
+        meta: &Self::Meta,
+        fail_values: &[i64],
+        reconstructed_state: Option<&ReconstructedState>,
+        frame_layouts: Option<&[ResumeFrameLayoutSummary]>,
+        materialized_virtuals: &[MaterializedVirtual],
+        pending_field_writes: &[ResolvedPendingFieldWrite],
+        exception: &ExceptionState,
+        session_cache: Option<&mut DeoptMaterializationCache>,
+    ) -> bool {
         if let Some(reconstructed_state) = reconstructed_state {
-            let materialized_refs = self.materialize_virtual_refs(meta, materialized_virtuals);
+            let materialized_refs = if let Some(cache) = session_cache {
+                self.materialize_virtual_refs_into_cache(meta, materialized_virtuals, cache);
+                cache.refs.clone()
+            } else {
+                self.materialize_virtual_refs(meta, materialized_virtuals)
+            };
             let total_frames = reconstructed_state.frames.len();
             let can_use_generic_cache = total_frames == 1
                 || reconstructed_state
@@ -578,33 +755,6 @@ pub trait JitState: Sized {
 
         self.restore(meta, fail_values);
         true
-    }
-
-    fn materialize_virtual_refs(
-        &mut self,
-        meta: &Self::Meta,
-        materialized_virtuals: &[MaterializedVirtual],
-    ) -> Vec<Option<GcRef>> {
-        let mut refs = vec![None; materialized_virtuals.len()];
-        let mut progress = true;
-        while progress {
-            progress = false;
-            for (virtual_index, virtual_value) in materialized_virtuals.iter().enumerate() {
-                if refs[virtual_index].is_some() {
-                    continue;
-                }
-                if let Some(materialized) = self.materialize_virtual_ref_with_refs(
-                    meta,
-                    virtual_index,
-                    virtual_value,
-                    &refs,
-                ) {
-                    refs[virtual_index] = Some(materialized);
-                    progress = true;
-                }
-            }
-        }
-        refs
     }
 
     fn replay_pending_field_writes(
@@ -710,5 +860,451 @@ unsafe fn write_typed_value(ptr: *mut u8, value: i64, value_type: Type) {
         Type::Ref => (ptr as *mut usize).write(value as usize),
         Type::Float => (ptr as *mut f64).write(f64::from_bits(value as u64)),
         Type::Void => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resume::{
+        MaterializedValue, MaterializedVirtual, ReconstructedFrame, ReconstructedState,
+        ReconstructedValue, ResumeFrameLayoutSummary,
+    };
+    use majit_codegen::ExitFrameLayout;
+    use std::cell::Cell;
+
+    /// Test state that tracks how many times `materialize_virtual_ref` was
+    /// called, so we can verify the session cache prevents re-materialization.
+    #[derive(Default)]
+    struct CachingTestState {
+        materialize_call_count: Cell<usize>,
+        restored_values: Vec<Value>,
+        restored_frames: Vec<(usize, u64, Vec<Value>)>,
+    }
+
+    impl JitState for CachingTestState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _: usize, _: &()) -> () {}
+        fn extract_live(&self, _: &()) -> Vec<i64> {
+            Vec::new()
+        }
+        fn create_sym(_: &(), _: usize) -> () {}
+        fn is_compatible(&self, _: &()) -> bool {
+            true
+        }
+        fn restore(&mut self, _: &(), _: &[i64]) {}
+
+        fn restore_values(&mut self, _: &(), values: &[Value]) {
+            self.restored_values = values.to_vec();
+        }
+
+        fn restore_reconstructed_frame_values_with_metadata(
+            &mut self,
+            _meta: &(),
+            frame_index: usize,
+            _total_frames: usize,
+            frame: &crate::resume::ReconstructedFrame,
+            values: &[Value],
+            _exception: &ExceptionState,
+        ) -> bool {
+            self.restored_frames
+                .push((frame_index, frame.pc, values.to_vec()));
+            true
+        }
+
+        fn materialize_virtual_ref(
+            &mut self,
+            _meta: &(),
+            virtual_index: usize,
+            _materialized: &MaterializedVirtual,
+        ) -> Option<GcRef> {
+            self.materialize_call_count
+                .set(self.materialize_call_count.get() + 1);
+            Some(GcRef(0xB000 + virtual_index))
+        }
+
+        fn collect_jump_args(_: &()) -> Vec<OpRef> {
+            Vec::new()
+        }
+        fn validate_close(_: &(), _: &()) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_deopt_materialization_cache_basic() {
+        let mut cache = DeoptMaterializationCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.materialized_count(), 0);
+
+        cache.insert(0, GcRef(0x100));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(0), Some(GcRef(0x100)));
+        assert_eq!(cache.get(1), None);
+        assert_eq!(cache.materialized_count(), 1);
+
+        cache.insert(2, GcRef(0x200));
+        assert_eq!(cache.len(), 3); // 0, 1(None), 2
+        assert_eq!(cache.get(2), Some(GcRef(0x200)));
+        assert_eq!(cache.materialized_count(), 2);
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.materialized_count(), 0);
+    }
+
+    #[test]
+    fn test_materialization_cache_persists_across_guard_not_forced() {
+        let mut state = CachingTestState::default();
+
+        let virtuals_session1 = vec![
+            MaterializedVirtual::Obj {
+                type_id: 1,
+                descr_index: 0,
+                fields: vec![(0, MaterializedValue::Value(100))],
+            },
+            MaterializedVirtual::Obj {
+                type_id: 2,
+                descr_index: 1,
+                fields: vec![(0, MaterializedValue::Value(200))],
+            },
+        ];
+
+        // First deopt: materialize A and B into session cache
+        let mut session_cache = DeoptMaterializationCache::new();
+        state.materialize_virtual_refs_into_cache(&(), &virtuals_session1, &mut session_cache);
+
+        let calls_after_first = state.materialize_call_count.get();
+        assert_eq!(calls_after_first, 2);
+        assert_eq!(session_cache.get(0), Some(GcRef(0xB000)));
+        assert_eq!(session_cache.get(1), Some(GcRef(0xB001)));
+
+        // Second deopt (GUARD_NOT_FORCED resumption) in same session:
+        // same virtuals should NOT be re-materialized
+        state.materialize_virtual_refs_into_cache(&(), &virtuals_session1, &mut session_cache);
+
+        let calls_after_second = state.materialize_call_count.get();
+        assert_eq!(
+            calls_after_second, calls_after_first,
+            "virtuals should not be re-materialized from cache"
+        );
+        assert_eq!(session_cache.get(0), Some(GcRef(0xB000)));
+        assert_eq!(session_cache.get(1), Some(GcRef(0xB001)));
+    }
+
+    #[test]
+    fn test_materialization_cache_extends_for_new_virtuals() {
+        let mut state = CachingTestState::default();
+
+        let virtuals_first = vec![
+            MaterializedVirtual::Obj {
+                type_id: 1,
+                descr_index: 0,
+                fields: vec![(0, MaterializedValue::Value(100))],
+            },
+            MaterializedVirtual::Obj {
+                type_id: 2,
+                descr_index: 1,
+                fields: vec![(0, MaterializedValue::Value(200))],
+            },
+        ];
+
+        // First deopt: materialize A and B
+        let mut session_cache = DeoptMaterializationCache::new();
+        state.materialize_virtual_refs_into_cache(&(), &virtuals_first, &mut session_cache);
+        assert_eq!(state.materialize_call_count.get(), 2);
+
+        // Second deopt adds virtual C
+        let virtuals_second = vec![
+            MaterializedVirtual::Obj {
+                type_id: 1,
+                descr_index: 0,
+                fields: vec![(0, MaterializedValue::Value(100))],
+            },
+            MaterializedVirtual::Obj {
+                type_id: 2,
+                descr_index: 1,
+                fields: vec![(0, MaterializedValue::Value(200))],
+            },
+            MaterializedVirtual::Obj {
+                type_id: 3,
+                descr_index: 2,
+                fields: vec![(0, MaterializedValue::Value(300))],
+            },
+        ];
+
+        state.materialize_virtual_refs_into_cache(&(), &virtuals_second, &mut session_cache);
+
+        // Only 1 new call for virtual C (A and B were cached)
+        assert_eq!(state.materialize_call_count.get(), 3);
+        assert_eq!(session_cache.get(0), Some(GcRef(0xB000)));
+        assert_eq!(session_cache.get(1), Some(GcRef(0xB001)));
+        assert_eq!(session_cache.get(2), Some(GcRef(0xB002)));
+    }
+
+    #[test]
+    fn test_virtual_ref_forcing_uses_session_cache() {
+        let mut state = CachingTestState::default();
+        let mut cache = DeoptMaterializationCache::new();
+
+        let virt = MaterializedVirtual::Obj {
+            type_id: 1,
+            descr_index: 0,
+            fields: vec![(0, MaterializedValue::Value(42))],
+        };
+
+        // First call: materializes and caches
+        let result1 = state.force_virtual_with_cache(&(), &mut cache, 0, &virt);
+        assert_eq!(result1, Some(GcRef(0xB000)));
+        assert_eq!(state.materialize_call_count.get(), 1);
+
+        // Second call: returns cached value without materializing
+        let result2 = state.force_virtual_with_cache(&(), &mut cache, 0, &virt);
+        assert_eq!(result2, Some(GcRef(0xB000)));
+        assert_eq!(
+            state.materialize_call_count.get(),
+            1,
+            "should not re-materialize cached virtual"
+        );
+    }
+
+    #[test]
+    fn test_restore_guard_failure_with_session_cache_integration() {
+        let mut state = CachingTestState::default();
+
+        let reconstructed_state = ReconstructedState {
+            frames: vec![ReconstructedFrame {
+                trace_id: Some(100),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 10,
+                slot_types: None,
+                values: vec![
+                    ReconstructedValue::Value(42),
+                    ReconstructedValue::Virtual(0),
+                ],
+            }],
+            virtuals: vec![MaterializedVirtual::Obj {
+                type_id: 1,
+                descr_index: 0,
+                fields: vec![(0, MaterializedValue::Value(100))],
+            }],
+            pending_fields: Vec::new(),
+        };
+
+        let frame_layouts = vec![ResumeFrameLayoutSummary::from_exit_frame_layout(
+            &ExitFrameLayout {
+                trace_id: Some(100),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 10,
+                slots: vec![
+                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                    majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Ref]),
+            },
+        )];
+
+        let mut session_cache = DeoptMaterializationCache::new();
+
+        // First deopt with session cache
+        let restored = state.restore_guard_failure_with_session_cache(
+            &(),
+            &[42, 0],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &reconstructed_state.virtuals,
+            &[],
+            &ExceptionState::default(),
+            Some(&mut session_cache),
+        );
+        assert!(restored);
+        assert_eq!(state.materialize_call_count.get(), 1);
+
+        // Verify cache was populated
+        assert_eq!(session_cache.get(0), Some(GcRef(0xB000)));
+
+        // Reset state for second deopt
+        state.restored_frames.clear();
+
+        // Second deopt reusing the same session cache
+        let restored2 = state.restore_guard_failure_with_session_cache(
+            &(),
+            &[42, 0],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &reconstructed_state.virtuals,
+            &[],
+            &ExceptionState::default(),
+            Some(&mut session_cache),
+        );
+        assert!(restored2);
+        assert_eq!(
+            state.materialize_call_count.get(),
+            1,
+            "session cache should prevent re-materialization"
+        );
+    }
+
+    #[test]
+    fn test_restore_guard_failure_without_session_cache_backward_compat() {
+        let mut state = CachingTestState::default();
+
+        let reconstructed_state = ReconstructedState {
+            frames: vec![ReconstructedFrame {
+                trace_id: Some(100),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 10,
+                slot_types: None,
+                values: vec![
+                    ReconstructedValue::Value(42),
+                    ReconstructedValue::Virtual(0),
+                ],
+            }],
+            virtuals: vec![MaterializedVirtual::Obj {
+                type_id: 1,
+                descr_index: 0,
+                fields: vec![(0, MaterializedValue::Value(100))],
+            }],
+            pending_fields: Vec::new(),
+        };
+
+        let frame_layouts = vec![ResumeFrameLayoutSummary::from_exit_frame_layout(
+            &ExitFrameLayout {
+                trace_id: Some(100),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 10,
+                slots: vec![
+                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                    majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Ref]),
+            },
+        )];
+
+        // Using the old API (no session cache) should still work
+        let restored = state.restore_guard_failure_with_resume_layout(
+            &(),
+            &[42, 0],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &reconstructed_state.virtuals,
+            &[],
+            &ExceptionState::default(),
+        );
+        assert!(restored);
+        assert_eq!(state.materialize_call_count.get(), 1);
+    }
+
+    #[test]
+    fn test_session_cache_with_multi_frame_restore() {
+        let mut state = CachingTestState::default();
+
+        let reconstructed_state = ReconstructedState {
+            frames: vec![
+                ReconstructedFrame {
+                    trace_id: Some(100),
+                    header_pc: Some(500),
+                    source_guard: None,
+                    pc: 10,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(1),
+                        ReconstructedValue::Virtual(0),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(200),
+                    header_pc: Some(600),
+                    source_guard: None,
+                    pc: 20,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Virtual(1),
+                        ReconstructedValue::Value(99),
+                    ],
+                },
+            ],
+            virtuals: vec![
+                MaterializedVirtual::Obj {
+                    type_id: 1,
+                    descr_index: 0,
+                    fields: vec![(0, MaterializedValue::Value(100))],
+                },
+                MaterializedVirtual::Obj {
+                    type_id: 2,
+                    descr_index: 1,
+                    fields: vec![(0, MaterializedValue::Value(200))],
+                },
+            ],
+            pending_fields: Vec::new(),
+        };
+
+        let frame_layouts = vec![
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(100),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 10,
+                slots: vec![
+                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                    majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Ref]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(200),
+                header_pc: Some(600),
+                source_guard: None,
+                pc: 20,
+                slots: vec![
+                    majit_codegen::ExitValueSourceLayout::ExitValue(2),
+                    majit_codegen::ExitValueSourceLayout::ExitValue(3),
+                ],
+                slot_types: Some(vec![Type::Ref, Type::Int]),
+            }),
+        ];
+
+        let mut session_cache = DeoptMaterializationCache::new();
+
+        // First deopt
+        let restored = state.restore_guard_failure_with_session_cache(
+            &(),
+            &[1, 0, 0, 99],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &reconstructed_state.virtuals,
+            &[],
+            &ExceptionState::default(),
+            Some(&mut session_cache),
+        );
+        assert!(restored);
+        assert_eq!(state.materialize_call_count.get(), 2);
+        assert_eq!(session_cache.materialized_count(), 2);
+
+        // Second deopt with same cache — no re-materialization
+        state.restored_frames.clear();
+        let restored2 = state.restore_guard_failure_with_session_cache(
+            &(),
+            &[1, 0, 0, 99],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &reconstructed_state.virtuals,
+            &[],
+            &ExceptionState::default(),
+            Some(&mut session_cache),
+        );
+        assert!(restored2);
+        assert_eq!(
+            state.materialize_call_count.get(),
+            2,
+            "multi-frame session cache should prevent re-materialization"
+        );
     }
 }
