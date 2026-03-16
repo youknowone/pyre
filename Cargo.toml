@@ -15,6 +15,7 @@ members = [
     "majit/majit-macros",
     "majit/majit-runtime",
     "majit/majit-meta",
+    "majit/majit-analyze",
     "majit/examples/tlr",
     "majit/examples/tl",
     "majit/examples/tla",

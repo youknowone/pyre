@@ -1,0 +1,12 @@
+[package]
+name = "majit-analyze"
+version.workspace = true
+edition.workspace = true
+description = "Static program analyzer for majit — RPython's translator in Rust"
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+quote = "1"
+proc-macro2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
