@@ -2153,4 +2153,188 @@ mod tests {
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
     }
+
+    // ── VirtualRawBuffer optimization tests (RPython: test_rawmem.py parity) ──
+
+    fn run_pass_with_raw_buffer(
+        ops: &[Op],
+        constants: &[(OpRef, Value)],
+        raw_bufs: &[(OpRef, usize)],
+    ) -> Vec<Op> {
+        let mut ctx = OptContext::new(ops.len());
+        for &(opref, ref val) in constants {
+            ctx.make_constant(opref, val.clone());
+        }
+
+        let mut pass = OptVirtualize::new();
+        pass.setup();
+
+        // Pre-populate VirtualRawBuffer info for specified OpRefs
+        for &(opref, size) in raw_bufs {
+            pass.set_info(
+                opref,
+                PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
+                    size,
+                    entries: Vec::new(),
+                }),
+            );
+        }
+
+        for op in ops {
+            let mut resolved_op = op.clone();
+            for arg in &mut resolved_op.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+
+            match pass.propagate_forward(&resolved_op, &mut ctx) {
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                PassResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                PassResult::Remove => {}
+                PassResult::PassOn => {
+                    ctx.emit(resolved_op);
+                }
+            }
+        }
+
+        pass.flush();
+        ctx.new_operations
+    }
+
+    #[test]
+    fn test_raw_store_then_load_same_offset_forwarded() {
+        // Mirrors RPython's test_raw_storage_int: store a value, then
+        // load from the same offset on a virtual buffer.
+        // raw_store(buf, offset=0, val)
+        // i1 = raw_load_i(buf, offset=0)
+        // -> i1 should be forwarded to val, both ops removed.
+        let mut ops = vec![
+            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(200)]), // pos=0
+            Op::new(OpCode::RawLoadI, &[OpRef(0), OpRef(100)]),             // pos=1
+        ];
+        assign_positions(&mut ops);
+
+        let constants = vec![(OpRef(100), Value::Int(0))]; // offset = 0
+        let raw_bufs = vec![(OpRef(0), 32)];
+
+        let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
+        assert!(
+            result.is_empty(),
+            "raw_store + raw_load at same offset on virtual should be removed; got {} ops: {:?}",
+            result.len(),
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_raw_ops_different_offsets_no_interference() {
+        // Store two values at different offsets on a virtual raw buffer.
+        // Load from each offset separately: each should get its own value.
+        // raw_store(buf, offset=0, val_a)
+        // raw_store(buf, offset=8, val_b)
+        // i1 = raw_load_i(buf, offset=0)  -> val_a
+        // i2 = raw_load_i(buf, offset=8)  -> val_b
+        let mut ops = vec![
+            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(200)]), // pos=0
+            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(101), OpRef(201)]), // pos=1
+            Op::new(OpCode::RawLoadI, &[OpRef(0), OpRef(100)]),             // pos=2
+            Op::new(OpCode::RawLoadI, &[OpRef(0), OpRef(101)]),             // pos=3
+        ];
+        assign_positions(&mut ops);
+
+        let constants = vec![
+            (OpRef(100), Value::Int(0)),
+            (OpRef(101), Value::Int(8)),
+        ];
+        let raw_bufs = vec![(OpRef(0), 32)];
+
+        let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
+        assert!(
+            result.is_empty(),
+            "all raw ops on virtual buffer should be removed; got {} ops: {:?}",
+            result.len(),
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_raw_store_overwrite_same_offset() {
+        // Store twice at the same offset, then load.
+        // raw_store(buf, 0, val_a)
+        // raw_store(buf, 0, val_b)   <- overwrites
+        // i1 = raw_load_i(buf, 0)    -> val_b
+        // call_n(buf)                <- force
+        let mut ops = vec![
+            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(200)]), // pos=0
+            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(201)]), // pos=1
+            Op::new(OpCode::RawLoadI, &[OpRef(0), OpRef(100)]),             // pos=2
+        ];
+        assign_positions(&mut ops);
+
+        let constants = vec![(OpRef(100), Value::Int(0))];
+        let raw_bufs = vec![(OpRef(0), 32)];
+
+        let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
+        // All removed: stores absorbed into virtual, load forwarded.
+        assert!(
+            result.is_empty(),
+            "overwritten raw_store + load should be removed; got {} ops: {:?}",
+            result.len(),
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_raw_buffer_forced_at_call() {
+        // Virtual raw buffer escapes at a call, forcing materialization.
+        // raw_store(buf, 0, val)
+        // call_n(buf)   <- force
+        let mut ops = vec![
+            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(200)]), // pos=0
+            Op::new(OpCode::CallN, &[OpRef(0)]),                            // pos=1
+        ];
+        assign_positions(&mut ops);
+
+        let constants = vec![(OpRef(100), Value::Int(0))];
+        let raw_bufs = vec![(OpRef(0), 32)];
+
+        let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
+        // Should have forced: allocation + raw_store + call
+        assert!(
+            result.len() >= 2,
+            "forced raw buffer should emit allocation + call; got {} ops: {:?}",
+            result.len(),
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.last().unwrap().opcode,
+            OpCode::CallN,
+            "last op should be CALL_N"
+        );
+    }
+
+    #[test]
+    fn test_raw_load_on_non_virtual_passes_through() {
+        // When the buffer is NOT virtual, raw_load should pass through unchanged.
+        let mut ops = vec![
+            Op::new(OpCode::RawStore, &[OpRef(50), OpRef(100), OpRef(200)]),
+            Op::new(OpCode::RawLoadI, &[OpRef(50), OpRef(100)]),
+        ];
+        assign_positions(&mut ops);
+
+        let constants = vec![(OpRef(100), Value::Int(0))];
+        // No raw_bufs — OpRef(50) is NOT a virtual buffer.
+        let result = run_pass_with_raw_buffer(&ops, &constants, &[]);
+        assert_eq!(
+            result.len(),
+            2,
+            "non-virtual raw ops should pass through; got {} ops",
+            result.len()
+        );
+        assert_eq!(result[0].opcode, OpCode::RawStore);
+        assert_eq!(result[1].opcode, OpCode::RawLoadI);
+    }
 }

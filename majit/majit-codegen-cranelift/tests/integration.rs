@@ -2412,20 +2412,16 @@ fn raw_descr_float() -> DescrRef {
 #[test]
 fn test_raw_store_load_int_roundtrip() {
     let ad = raw_descr_int(8);
-
-    let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
     let const_offset = OpRef(1000);
 
-    let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]),
-        Op::with_descr(
-            OpCode::RawStore,
-            &[OpRef(0), const_offset, OpRef(1)],
-            ad.clone(),
-        ),
-        Op::with_descr(OpCode::RawLoadI, &[OpRef(0), const_offset], ad.clone()),
-        Op::with_descr(OpCode::Finish, &[OpRef(2)], make_descr(0)),
-    ];
+    let mut rec = TraceRecorder::new();
+    let r0 = rec.record_input_arg(Type::Ref);
+    let i0 = rec.record_input_arg(Type::Int);
+
+    rec.record_op_with_descr(OpCode::RawStore, &[r0, const_offset, i0], ad.clone());
+    let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, const_offset], ad.clone());
+    rec.finish(&[loaded], make_descr(0));
+    let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
@@ -2434,7 +2430,7 @@ fn test_raw_store_load_int_roundtrip() {
 
     let mut token = LoopToken::new(600);
     backend
-        .compile_loop(&inputargs, &ops, &mut token)
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("raw int roundtrip compilation should succeed");
 
     // Allocate a buffer and execute
@@ -2458,20 +2454,16 @@ fn test_raw_store_load_int_roundtrip() {
 #[test]
 fn test_raw_store_load_float_roundtrip() {
     let ad = raw_descr_float();
-
-    let inputargs = vec![InputArg::new_ref(0), InputArg::new_float(1)];
     let const_offset = OpRef(1000);
 
-    let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]),
-        Op::with_descr(
-            OpCode::RawStore,
-            &[OpRef(0), const_offset, OpRef(1)],
-            ad.clone(),
-        ),
-        Op::with_descr(OpCode::RawLoadF, &[OpRef(0), const_offset], ad.clone()),
-        Op::with_descr(OpCode::Finish, &[OpRef(2)], make_descr(0)),
-    ];
+    let mut rec = TraceRecorder::new();
+    let r0 = rec.record_input_arg(Type::Ref);
+    let f0 = rec.record_input_arg(Type::Float);
+
+    rec.record_op_with_descr(OpCode::RawStore, &[r0, const_offset, f0], ad.clone());
+    let loaded = rec.record_op_with_descr(OpCode::RawLoadF, &[r0, const_offset], ad.clone());
+    rec.finish(&[loaded], make_descr(0));
+    let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
@@ -2480,7 +2472,7 @@ fn test_raw_store_load_float_roundtrip() {
 
     let mut token = LoopToken::new(601);
     backend
-        .compile_loop(&inputargs, &ops, &mut token)
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("raw float roundtrip compilation should succeed");
 
     let mut buf = vec![0u8; 16];
@@ -2506,35 +2498,24 @@ fn test_raw_store_load_float_roundtrip() {
 #[test]
 fn test_raw_ops_different_offsets_no_interference() {
     let ad = raw_descr_int(8);
-
-    let inputargs = vec![
-        InputArg::new_ref(0),
-        InputArg::new_int(1),
-        InputArg::new_int(2),
-    ];
     let off0 = OpRef(1000);
     let off8 = OpRef(1001);
 
+    let mut rec = TraceRecorder::new();
+    let r0 = rec.record_input_arg(Type::Ref);
+    let i0 = rec.record_input_arg(Type::Int);
+    let i1 = rec.record_input_arg(Type::Int);
+
     // Store val1 at offset 0, val2 at offset 8
-    // Load from offset 0 -> should be val1
-    // Add the two loaded values together as result
-    let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)]),
-        Op::with_descr(
-            OpCode::RawStore,
-            &[OpRef(0), off0, OpRef(1)],
-            ad.clone(),
-        ),
-        Op::with_descr(
-            OpCode::RawStore,
-            &[OpRef(0), off8, OpRef(2)],
-            ad.clone(),
-        ),
-        Op::with_descr(OpCode::RawLoadI, &[OpRef(0), off0], ad.clone()), // -> OpRef(3)
-        Op::with_descr(OpCode::RawLoadI, &[OpRef(0), off8], ad.clone()), // -> OpRef(4)
-        Op::new(OpCode::IntAdd, &[OpRef(3), OpRef(4)]),                   // -> OpRef(5)
-        Op::with_descr(OpCode::Finish, &[OpRef(5)], make_descr(0)),
-    ];
+    rec.record_op_with_descr(OpCode::RawStore, &[r0, off0, i0], ad.clone());
+    rec.record_op_with_descr(OpCode::RawStore, &[r0, off8, i1], ad.clone());
+    // Load from each offset
+    let l0 = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, off0], ad.clone());
+    let l1 = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, off8], ad.clone());
+    // Add the two loaded values together
+    let sum = rec.record_op(OpCode::IntAdd, &[l0, l1]);
+    rec.finish(&[sum], make_descr(0));
+    let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
@@ -2544,7 +2525,7 @@ fn test_raw_ops_different_offsets_no_interference() {
 
     let mut token = LoopToken::new(602);
     backend
-        .compile_loop(&inputargs, &ops, &mut token)
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("multi-offset raw ops should compile");
 
     let mut buf = vec![0u8; 32];
@@ -2570,20 +2551,19 @@ fn test_raw_ops_different_offsets_no_interference() {
 
 #[test]
 fn test_raw_load_unsigned_byte() {
-    let ad = Arc::new(RawArrayDescr {
+    let ad: DescrRef = Arc::new(RawArrayDescr {
         item_size: 1,
         item_type: Type::Int,
         signed: false,
     });
-
-    let inputargs = vec![InputArg::new_ref(0)];
     let const_offset = OpRef(1000);
 
-    let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0)]),
-        Op::with_descr(OpCode::RawLoadI, &[OpRef(0), const_offset], ad as DescrRef),
-        Op::with_descr(OpCode::Finish, &[OpRef(1)], make_descr(0)),
-    ];
+    let mut rec = TraceRecorder::new();
+    let r0 = rec.record_input_arg(Type::Ref);
+
+    let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, const_offset], ad);
+    rec.finish(&[loaded], make_descr(0));
+    let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
@@ -2592,7 +2572,7 @@ fn test_raw_load_unsigned_byte() {
 
     let mut token = LoopToken::new(603);
     backend
-        .compile_loop(&inputargs, &ops, &mut token)
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("unsigned byte raw load should compile");
 
     let mut data = vec![0xFFu8];
