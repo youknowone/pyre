@@ -742,12 +742,12 @@ pub trait Backend: Send {
 
     /// Read a pending exception GC ref from a dead frame.
     fn grab_exc_value(&self, _frame: &DeadFrame) -> GcRef {
-        panic!("backend does not implement grab_exc_value()");
+        GcRef::NULL
     }
 
     /// Read the pending exception class from a dead frame.
     fn grab_exc_class(&self, _frame: &DeadFrame) -> i64 {
-        panic!("backend does not implement grab_exc_class()");
+        0
     }
 
     /// Read the FailDescr from the last guard failure.
