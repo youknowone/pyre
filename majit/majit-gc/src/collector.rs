@@ -739,7 +739,7 @@ impl CompiledCodeRegistry {
                 let slot_idx = word_idx * 64 + bit;
 
                 if slot_idx < region.frame_size_slots as usize {
-                    let slot_ptr = frame_base.add(slot_idx) as *mut GcRef;
+                    let slot_ptr = unsafe { frame_base.add(slot_idx) } as *mut GcRef;
                     roots.push(slot_ptr);
                 }
 
@@ -809,7 +809,7 @@ impl GcAllocator for MiniMarkGC {
     }
 
     unsafe fn add_root(&mut self, root: *mut GcRef) {
-        self.roots.add(root);
+        unsafe { self.roots.add(root) };
     }
 
     fn remove_root(&mut self, root: *mut GcRef) {

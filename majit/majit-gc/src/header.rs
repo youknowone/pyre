@@ -93,8 +93,8 @@ impl GcHeader {
     #[inline]
     pub unsafe fn set_forwarding_address(&mut self, new_addr: usize) {
         self.tid_and_flags = FORWARDED_MARKER;
-        let fwd_ptr = (self as *mut GcHeader).add(1) as *mut usize;
-        fwd_ptr.write(new_addr);
+        let fwd_ptr = unsafe { (self as *mut GcHeader).add(1) as *mut usize };
+        unsafe { fwd_ptr.write(new_addr) };
     }
 
     /// Read the forwarding address from a forwarded object.
@@ -103,8 +103,8 @@ impl GcHeader {
     /// Must only be called when `is_forwarded()` returns true.
     #[inline]
     pub unsafe fn forwarding_address(&self) -> usize {
-        let fwd_ptr = (self as *const GcHeader).add(1) as *const usize;
-        fwd_ptr.read()
+        let fwd_ptr = unsafe { (self as *const GcHeader).add(1) as *const usize };
+        unsafe { fwd_ptr.read() }
     }
 }
 
@@ -114,7 +114,7 @@ impl GcHeader {
 /// `obj_addr` must point to valid memory with a GcHeader immediately before it.
 #[inline]
 pub unsafe fn header_of(obj_addr: usize) -> &'static mut GcHeader {
-    &mut *((obj_addr - GcHeader::SIZE) as *mut GcHeader)
+    unsafe { &mut *((obj_addr - GcHeader::SIZE) as *mut GcHeader) }
 }
 
 #[cfg(test)]

@@ -661,7 +661,6 @@ fn frame_values_from_reconstructed(
             }
             (crate::resume::ReconstructedValue::Uninitialized, _) => Value::Void,
             (crate::resume::ReconstructedValue::Unavailable, _) => Value::Void,
-            _ => return None,
         };
         result.push(decoded);
     }

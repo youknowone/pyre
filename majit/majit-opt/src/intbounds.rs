@@ -819,6 +819,7 @@ impl OptIntBounds {
 
     // ── Backward propagation after constant discovery ──
 
+    #[allow(dead_code)]
     fn propagate_bounds_backward(&mut self, opref: OpRef, ctx: &OptContext) {
         let b = self.get_bound(opref, ctx);
         if b.is_constant() {
@@ -832,6 +833,7 @@ impl OptIntBounds {
         }
     }
 
+    #[allow(dead_code)]
     fn propagate_bounds_backward_op(&mut self, op: &Op, ctx: &OptContext) {
         match op.opcode {
             OpCode::IntAdd | OpCode::IntAddOvf => {

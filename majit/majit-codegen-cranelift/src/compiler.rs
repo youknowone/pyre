@@ -161,7 +161,7 @@ impl majit_ir::CallDescr for CallAssemblerDescr {
 struct RegisteredLoopTarget {
     trace_id: u64,
     header_pc: u64,
-    green_key: u64,
+    _green_key: u64,
     source_guard: Option<(u64, u32)>,
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     code_ptr: *const u8,
@@ -1195,7 +1195,7 @@ fn register_call_assembler_target(
     let target = RegisteredLoopTarget {
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
-        green_key: 0, // Populated by the meta-interp layer if needed
+        _green_key: 0, // Populated by the meta-interp layer if needed
         source_guard: None,
         caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: compiled.code_ptr,
@@ -3800,7 +3800,13 @@ impl CraneliftBackend {
                 | OpCode::CastPtrToInt
                 | OpCode::CastIntToPtr
                 | OpCode::CastOpaquePtr => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = if op.num_args() > 0 {
+                        resolve_opref(&mut builder, &constants, op.arg(0))
+                    } else if let Some(&c) = constants.get(&vi) {
+                        builder.ins().iconst(cl_types::I64, c)
+                    } else {
+                        builder.ins().iconst(cl_types::I64, 0)
+                    };
                     builder.def_var(var(vi), a);
                 }
 
@@ -6389,11 +6395,14 @@ impl CraneliftBackend {
                     .expect("jit_malloc_nursery_shim must return a value");
                     builder.def_var(var(vi), result);
                 }
-
-                other => {
+                // All OpCode variants are explicitly handled above.
+                // This arm is unreachable but kept for forward-compatibility
+                // when new opcodes are added to the IR.
+                #[allow(unreachable_patterns)]
+                _other => {
                     return Err(BackendError::Unsupported(format!(
-                        "opcode {:?} not yet implemented",
-                        other
+                        "opcode {:?} has no backend lowering",
+                        _other
                     )));
                 }
             }

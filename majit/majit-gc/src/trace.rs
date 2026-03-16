@@ -100,7 +100,7 @@ impl TypeInfo {
 
         // Variable-part GC pointer items.
         if self.items_have_gc_ptrs && self.item_size > 0 {
-            let length = *((obj_addr + self.length_offset) as *const usize);
+            let length = unsafe { *((obj_addr + self.length_offset) as *const usize) };
             let items_start = obj_addr + self.size;
             for i in 0..length {
                 f((items_start + i * self.item_size) as *mut GcRef);

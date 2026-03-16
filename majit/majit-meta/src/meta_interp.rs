@@ -6,7 +6,6 @@ use majit_codegen::{
 use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{GcRef, InputArg, OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
-use majit_opt::virtualize::VirtualizableConfig;
 use majit_trace::trace::Trace;
 use majit_trace::warmstate::{HotResult, WarmState};
 
@@ -202,7 +201,7 @@ impl StoredExitLayout {
 
 struct CompiledEntry<M> {
     token: LoopToken,
-    num_inputs: usize,
+    _num_inputs: usize,
     meta: M,
     /// Trace id of the root compiled loop.
     root_trace_id: u64,
@@ -916,7 +915,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         token,
-                        num_inputs: trace.inputargs.len(),
+                        _num_inputs: trace.inputargs.len(),
                         meta,
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
@@ -1079,7 +1078,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         token,
-                        num_inputs: trace.inputargs.len(),
+                        _num_inputs: trace.inputargs.len(),
                         meta,
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
@@ -1925,7 +1924,7 @@ impl<M: Clone> MetaInterp<M> {
         let old_token = self.compiled_loops.get(&old_key).map(|c| &c.token);
         let new_token = self.compiled_loops.get(&new_key).map(|c| &c.token);
         if let (Some(old), Some(new)) = (old_token, new_token) {
-            self.backend.redirect_call_assembler(old, new);
+            let _ = self.backend.redirect_call_assembler(old, new);
         }
     }
 
@@ -3732,7 +3731,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token,
-                num_inputs: inputargs.len(),
+                _num_inputs: inputargs.len(),
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
@@ -3796,7 +3795,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: LoopToken::new(1),
-                num_inputs: 2,
+                _num_inputs: 2,
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
@@ -3894,7 +3893,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: LoopToken::new(100),
-                num_inputs: 2,
+                _num_inputs: 2,
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
@@ -4179,7 +4178,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: LoopToken::new(2),
-                num_inputs: 1,
+                _num_inputs: 1,
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
@@ -4984,7 +4983,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: LoopToken::new(700),
-                num_inputs: 0,
+                _num_inputs: 0,
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),

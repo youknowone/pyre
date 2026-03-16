@@ -64,7 +64,7 @@ impl OldGen {
     /// `src` must point to at least `total_size` bytes of readable memory.
     pub unsafe fn alloc_and_copy(&mut self, src: *const u8, total_size: usize) -> *mut u8 {
         let dst = self.alloc(total_size);
-        ptr::copy_nonoverlapping(src, dst, total_size);
+        unsafe { ptr::copy_nonoverlapping(src, dst, total_size) };
         dst
     }
 
