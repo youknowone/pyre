@@ -16,6 +16,7 @@ This file is the Phase 0 seed artifact for tracking equivalence with the in-tree
 | Subsystem | RPython Reference | majit Status | Notes |
 |---|---|---|---|
 | IR opcode surface | `rpython/jit/metainterp/resoperation.py` | `implemented` | `majit-ir` defines a broad opcode surface including all arithmetic (int/float/div/mod), guards, calls (CallN/CallI/CallPureI/CallMayForce*/CallReleaseGil*/CallLoopinvariant*/CallAssembler*/CondCall*), GC ops, vector ops (I64X2/F64X2), and string/unicode ops. 1442+ tests passing. RPython parity tests cover resoperation surface. |
+| Static analyzer / translator | `rpython/jit/codewriter/*` + translation-time front-end | `partial` | `majit-analyze` parses multiple Rust source files, extracts opcode dispatch arms, resolves cross-file trait impls and helper classifications, collects type layouts, and generates tracing helper code. It is already consumed by `pyre-mjit` build.rs, which emits generated trace helpers and JSON metadata from `opcode_step.rs` + `eval.rs`. Current pyre analysis classifies 18/40 opcode arms directly and leaves the rest explicit residual/unclassified, so it is not yet the sole general lowering path for all interpreters. |
 | Trace recorder | `rpython/jit/metainterp/pyjitpl.py` | `implemented` | `#[jit_interp]` lowers into `JitCode` with generic `MIFrame`-style execution. Multi-branch match expressions lowered to IntEq + branch_reg_zero guard chains. `#[jit_module]` for auto-discovery. `helpers = [...]` list syntax. Loops within match arms rejected with clear error. |
 | Warm state / jitcell lifecycle | `rpython/jit/metainterp/warmstate.py` | `implemented` | JitCell state machine (NotHot/Tracing/Compiled/Invalidated/DontTraceHere) with procedure-token ownership, `set_param()` runtime tuning (threshold/trace_limit/bridge_threshold/function_threshold/max_inline_depth), `get_stats()` snapshots, `gc_cells()` dead cell cleanup, LoopAging eviction, QuasiImmut invalidation, tracelimit enforcement. 9 parity tests. |
 | Resume / blackhole | `rpython/jit/metainterp/resume.py` | `implemented` | `EncodedResumeData` has full `encode()`/`decode()` roundtrip with RPython-style tagged numbering, sparse fail-args with compact-numbered raw-slot remapping, `ResumeDataLoopMemo` shared constant pools, all 5 virtual kinds encode/decode, virtual materialization, `ResumeLayoutSummary` with per-frame slot-source detail. Complete compiled exit layouts (`CompiledExitLayout`, `CompiledExitArtifacts`, `CompiledTraceLayout`). Blackhole has `BlackholeMemory` trait for pluggable memory access, all 31 Vec* opcodes handled, call/memory ops delegated to BlackholeMemory, GUARD_NOT_FORCED no longer forces virtuals. `run_with_blackhole_fallback()` replays guard failures from compiled loops or bridges. |
@@ -35,10 +36,18 @@ The Cranelift backend must obey the following rules:
 
 ## Immediate Gaps
 
-All 9 subsystems are `implemented`. Frame-stack metadata is now exercised through E2E compiled code execution with guard failure, multi-guard query, bridge propagation, call_assembler callee guard, and mixed-type slot_types verification.
-3. **GC runtime**: generic stack-map scanning under real compiled-code GC stress; deeper JIT-GC integration (jit_free, jit_pinning).
-4. **Warm state**: full procedure-token ownership, jitcell state machine, multi-entry-point management.
-5. **Driver macros**: full RPython `JitDriver` lifecycle (set_param, get_stats, multi-entry).
+9 subsystems are `implemented`, 1 remains `partial`.
+
+Resolved since last revision:
+- **GC runtime**: `jit_free`, `jit_pinning` (pin/unpin/is_pinned) now implemented with nursery skip during evacuation. 97 GC tests.
+- **Warm state**: multi-entry lifecycle added (`register_entry_point`, `find_entry_point`, shared compiled loops). JitCell state machine, set_param, get_stats all present.
+- **FFI**: exchange-buffer pattern (RawStore→CallReleaseGil→RawLoadI) tested E2E.
+- **Deopt**: `DeoptMaterializationCache` persists across GUARD_NOT_FORCED sessions. `push_caller_frame`/`pop_to_caller_frame` for RPython resume.py-level multi-frame restore.
+
+Remaining gaps:
+
+1. **Static analyzer / translator**: `majit-analyze` classifies 18/40 pyre opcode arms; general CFG/pattern coverage is still partial.
+2. **Cranelift backend**: multi-frame push restore is implemented and tested up to 4 levels, but exercising it under real interpreter call stacks with arbitrary depth is the last structural gap.
 
 ## Next Expansion
 
