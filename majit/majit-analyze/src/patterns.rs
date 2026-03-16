@@ -169,10 +169,14 @@ pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePatt
             }
             // Collection construction
             "build_list" => {
-                return Some(TracePattern::BuildCollection { kind: "list".into() });
+                return Some(TracePattern::BuildCollection {
+                    kind: "list".into(),
+                });
             }
             "build_tuple" => {
-                return Some(TracePattern::BuildCollection { kind: "tuple".into() });
+                return Some(TracePattern::BuildCollection {
+                    kind: "tuple".into(),
+                });
             }
             "build_map" => {
                 return Some(TracePattern::BuildCollection { kind: "map".into() });
@@ -367,10 +371,14 @@ pub fn classify_from_pattern(pattern: &str) -> Option<TracePattern> {
 
     // Collection construction
     if pattern.contains("BuildList") {
-        return Some(TracePattern::BuildCollection { kind: "list".into() });
+        return Some(TracePattern::BuildCollection {
+            kind: "list".into(),
+        });
     }
     if pattern.contains("BuildTuple") {
-        return Some(TracePattern::BuildCollection { kind: "tuple".into() });
+        return Some(TracePattern::BuildCollection {
+            kind: "tuple".into(),
+        });
     }
     if pattern.contains("BuildMap") {
         return Some(TracePattern::BuildCollection { kind: "map".into() });

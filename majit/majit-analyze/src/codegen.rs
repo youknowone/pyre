@@ -7,7 +7,6 @@
 //! the equivalent IR ops. Unrecognized patterns fall back to residual calls.
 
 use crate::AnalysisResult;
-use crate::patterns::TracePattern;
 
 /// Generate tracing Rust source code from analysis results.
 pub fn generate(result: &AnalysisResult) -> String {
