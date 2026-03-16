@@ -831,6 +831,54 @@ impl<S: JitState> JitDriver<S> {
     pub fn inline_depth(&self) -> usize {
         self.meta.inline_depth()
     }
+
+    /// Start bridge tracing from a guard failure point.
+    ///
+    /// Builds meta/sym from the interpreter state at `resume_pc` and begins
+    /// a retrace on the MetaInterp. Returns `true` if tracing was started.
+    pub fn start_bridge_tracing(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        state: &mut S,
+        env: &S::Env,
+        resume_pc: usize,
+    ) -> bool {
+        let meta = state.build_meta(resume_pc, env);
+        let live_values = state.extract_live(& meta);
+
+        if !self.meta.start_retrace(green_key, fail_index, &live_values) {
+            return false;
+        }
+
+        self.sym = Some(S::create_sym(&meta, resume_pc));
+        self.trace_meta = Some(meta);
+        true
+    }
+
+    /// Close an active bridge trace and compile it.
+    ///
+    /// Collects the symbolic jump args from the current sym (which represent
+    /// the loop header's live state), then calls `close_bridge_with_finish`
+    /// on MetaInterp to finish, optimize, and compile the bridge.
+    pub fn close_bridge_trace(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> bool {
+        let sym = match self.sym.take() {
+            Some(sym) => sym,
+            None => return false,
+        };
+        self.trace_meta = None;
+
+        let finish_args = S::collect_jump_args(&sym);
+
+        self.meta
+            .close_bridge_with_finish(green_key, trace_id, fail_index, &finish_args)
+    }
 }
 
 #[cfg(test)]

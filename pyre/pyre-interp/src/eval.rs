@@ -235,7 +235,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             StepResult::CloseLoop(_) => {
                 let mut jit_state = build_jit_state(frame, info);
                 if let Some(outcome) =
-                    driver.back_edge_or_run_compiled(frame.next_instr, &mut jit_state, &env, || {})
+                    driver.back_edge_or_run_compiled_keyed(
+                        frame.code as u64, frame.next_instr, &mut jit_state, &env, || {},
+                    )
                 {
                     if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
                         return result;

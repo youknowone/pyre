@@ -1982,6 +1982,86 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     // ── Bridge Compilation ──────────────────────────────────────
+
+    /// Close the current bridge trace with a FINISH op, optimize, and compile
+    /// it as a bridge attached to the specified guard.
+    ///
+    /// `green_key` identifies the parent loop.
+    /// `trace_id` and `fail_index` identify the guard to attach the bridge to.
+    /// `finish_args` are the symbolic values at the bridge end (loop header state).
+    pub fn close_bridge_with_finish(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        finish_args: &[OpRef],
+    ) -> bool {
+        let ctx = match self.tracing.take() {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+
+        // Build finish arg types (all Int for aheuijit)
+        let finish_arg_types: Vec<Type> = finish_args.iter().map(|_| Type::Int).collect();
+
+        let mut recorder = ctx.recorder;
+        recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
+        let trace = recorder.get_trace();
+
+        let constants = ctx.constants.into_inner();
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] close_bridge_with_finish: key={}, trace_id={}, guard={}, ops={}",
+                green_key,
+                trace_id,
+                fail_index,
+                trace.ops.len()
+            );
+            eprintln!("--- bridge trace (before opt) ---");
+            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
+        }
+
+        // Look up the guard's fail_arg_types to build the fail_descr for the bridge
+        let fail_descr = {
+            let compiled = match self.compiled_loops.get(&green_key) {
+                Some(c) => c,
+                None => return false,
+            };
+            let norm_trace_id = Self::normalize_trace_id(compiled, trace_id);
+            let (_, trace_data) = match Self::trace_for_exit(compiled, norm_trace_id) {
+                Some(t) => t,
+                None => return false,
+            };
+            let guard_op_index = match trace_data.guard_op_indices.get(&fail_index) {
+                Some(&idx) => idx,
+                None => return false,
+            };
+            let guard_op = match trace_data.ops.get(guard_op_index) {
+                Some(op) => op,
+                None => return false,
+            };
+            let fail_arg_types: Vec<Type> = guard_op
+                .fail_args
+                .as_ref()
+                .map(|fa| fa.iter().map(|_| Type::Int).collect())
+                .unwrap_or_default();
+            Box::new(BridgeFailDescrProxy {
+                fail_index,
+                trace_id: norm_trace_id,
+                fail_arg_types,
+            }) as Box<dyn majit_ir::FailDescr>
+        };
+
+        self.compile_bridge(
+            green_key,
+            fail_index,
+            &*fail_descr,
+            &trace.ops,
+            &trace.inputargs,
+            constants,
+        )
+    }
 }
 
 /// Proxy FailDescr used when compiling bridges from guard failure points.
