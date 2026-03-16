@@ -3,7 +3,7 @@
 /// Provides:
 /// - #[jit_driver]: Annotate an interpreter's main dispatch loop
 /// - #[jit_interp]: Auto-generate trace_instruction and JitState from dispatch
-/// - #[jit_inline]: Serialize a simple integer helper into a hidden sub-JitCode
+/// - #[jit_inline]: Serialize a helper into a hidden sub-JitCode (Int, Ref, or Float return)
 /// - #[elidable]: Mark a function as pure (constant-foldable)
 /// - #[dont_look_inside]: Prevent tracing into a function
 /// - #[jit_may_force]: Mark a helper as a may-force call surface
@@ -832,14 +832,19 @@ pub fn jit_loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream 
     expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
 }
 
-/// Serialize a simple integer helper into a hidden `JitCode` builder.
+/// Serialize a helper into a hidden `JitCode` builder.
 ///
 /// This is the proc-macro side of RPython's `codewriter.py` helper serialization:
 /// the original function stays callable by the interpreter, and the macro also
 /// emits a hidden `__majit_inline_jitcode_*()` function that `#[jit_interp]`
 /// can use when a call policy maps the helper to `inline_int`.
+///
+/// Supports Int (i64/isize), Ref (usize/pointer), and Float (f64) return types
+/// and parameter types.
 #[proc_macro_attribute]
 pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
+    use jit_interp::jitcode_lower::InlineReturnKind;
+
     let args = parse_macro_input!(attr as JitInlineArgs);
     let func = parse_macro_input!(item as ItemFn);
     let helper = match jit_interp::jitcode_lower::generate_inline_helper_jitcode_with_calls(
@@ -865,8 +870,36 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     let helper_name = format_ident!("__majit_inline_jitcode_{}", sig.ident);
     let policy_name = format_ident!("__majit_call_policy_{}", sig.ident);
     let helper_body = helper.body;
-    let param_count = helper.param_count;
     let return_reg = helper.return_reg;
+
+    // Return kind code: 0 = Int, 1 = Ref, 2 = Float
+    let return_kind_code: u8 = match helper.return_kind {
+        InlineReturnKind::Int => 0,
+        InlineReturnKind::Ref => 1,
+        InlineReturnKind::Float => 2,
+    };
+
+    // Ensure the right register file for each parameter
+    let ensure_param_regs = {
+        let mut stmts = Vec::new();
+        for (index, arg) in func.sig.inputs.iter().enumerate() {
+            if let syn::FnArg::Typed(pat_type) = arg {
+                let reg = (index + 1) as u16;
+                if jit_interp::jitcode_lower::classify_param_type(&pat_type.ty)
+                    == Some(InlineReturnKind::Ref)
+                {
+                    stmts.push(quote! { __builder.ensure_r_regs(#reg); });
+                } else if jit_interp::jitcode_lower::classify_param_type(&pat_type.ty)
+                    == Some(InlineReturnKind::Float)
+                {
+                    stmts.push(quote! { __builder.ensure_f_regs(#reg); });
+                } else {
+                    stmts.push(quote! { __builder.ensure_i_regs(#reg); });
+                }
+            }
+        }
+        stmts
+    };
 
     let expanded = quote! {
         #(#attrs)*
@@ -875,11 +908,11 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[doc(hidden)]
-        pub(crate) fn #helper_name() -> (majit_meta::JitCode, u16) {
+        pub(crate) fn #helper_name() -> (majit_meta::JitCode, u16, u8) {
             let mut __builder = majit_meta::JitCodeBuilder::new();
-            __builder.ensure_i_regs(#param_count);
+            #(#ensure_param_regs)*
             #helper_body
-            (__builder.finish(), #return_reg)
+            (__builder.finish(), #return_reg, #return_kind_code)
         }
 
         #[doc(hidden)]
