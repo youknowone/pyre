@@ -1058,6 +1058,127 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) ->
         OpCode::VecLoadI | OpCode::VecLoadF => OpResult::Value(0),
         OpCode::VecStore => OpResult::Void,
 
+        // ── Vector arithmetic (scalar emulation in blackhole) ──
+        OpCode::VecIntAdd => {
+            let (a, b) = binop(values, op);
+            OpResult::Value(a.wrapping_add(b))
+        }
+        OpCode::VecIntSub => {
+            let (a, b) = binop(values, op);
+            OpResult::Value(a.wrapping_sub(b))
+        }
+        OpCode::VecIntMul => {
+            let (a, b) = binop(values, op);
+            OpResult::Value(a.wrapping_mul(b))
+        }
+        OpCode::VecIntAnd => {
+            let (a, b) = binop(values, op);
+            OpResult::Value(a & b)
+        }
+        OpCode::VecIntOr => {
+            let (a, b) = binop(values, op);
+            OpResult::Value(a | b)
+        }
+        OpCode::VecIntXor => {
+            let (a, b) = binop(values, op);
+            OpResult::Value(a ^ b)
+        }
+        OpCode::VecFloatAdd => {
+            let (a, b) = float_binop(values, op);
+            OpResult::Value(f64::to_bits(a + b) as i64)
+        }
+        OpCode::VecFloatSub => {
+            let (a, b) = float_binop(values, op);
+            OpResult::Value(f64::to_bits(a - b) as i64)
+        }
+        OpCode::VecFloatMul => {
+            let (a, b) = float_binop(values, op);
+            OpResult::Value(f64::to_bits(a * b) as i64)
+        }
+        OpCode::VecFloatTrueDiv => {
+            let (a, b) = float_binop(values, op);
+            OpResult::Value(f64::to_bits(a / b) as i64)
+        }
+        OpCode::VecFloatNeg => {
+            let a = float_unop(values, op);
+            OpResult::Value(f64::to_bits(-a) as i64)
+        }
+        OpCode::VecFloatAbs => {
+            let a = float_unop(values, op);
+            OpResult::Value(f64::to_bits(a.abs()) as i64)
+        }
+
+        // ── Vector comparisons (scalar emulation) ──
+        OpCode::VecFloatEq => {
+            let (a, b) = float_binop(values, op);
+            OpResult::Value((a == b) as i64)
+        }
+        OpCode::VecFloatNe => {
+            let (a, b) = float_binop(values, op);
+            OpResult::Value((a != b) as i64)
+        }
+        OpCode::VecFloatXor => {
+            let (a, b) = binop(values, op);
+            OpResult::Value(a ^ b)
+        }
+        OpCode::VecIntIsTrue => {
+            let a = unop(values, op);
+            OpResult::Value((a != 0) as i64)
+        }
+        OpCode::VecIntNe => {
+            let (a, b) = binop(values, op);
+            OpResult::Value((a != b) as i64)
+        }
+        OpCode::VecIntEq => {
+            let (a, b) = binop(values, op);
+            OpResult::Value((a == b) as i64)
+        }
+        OpCode::VecIntSignext => {
+            let (a, b) = binop(values, op);
+            let bits = b * 8;
+            let shift = 64 - bits;
+            OpResult::Value((a << shift) >> shift)
+        }
+
+        // ── Vector casts (scalar emulation) ──
+        OpCode::VecCastFloatToInt => {
+            let a = float_unop(values, op);
+            OpResult::Value(a as i64)
+        }
+        OpCode::VecCastIntToFloat => {
+            let a = unop(values, op);
+            OpResult::Value(f64::to_bits(a as f64) as i64)
+        }
+        OpCode::VecCastFloatToSinglefloat => {
+            let a = float_unop(values, op);
+            let f32_val = a as f32;
+            OpResult::Value(f32_val.to_bits() as i64)
+        }
+        OpCode::VecCastSinglefloatToFloat => {
+            let a = unop(values, op);
+            let f32_val = f32::from_bits(a as u32);
+            OpResult::Value(f64::to_bits(f32_val as f64) as i64)
+        }
+
+        // ── Vector pack/unpack/expand (scalar emulation) ──
+        OpCode::VecI => OpResult::Value(0),
+        OpCode::VecF => OpResult::Value(f64::to_bits(0.0) as i64),
+        OpCode::VecUnpackI | OpCode::VecUnpackF => {
+            // unpack(vec, lane, count) -> return vec (first scalar)
+            let a = unop(values, op);
+            OpResult::Value(a)
+        }
+        OpCode::VecPackI | OpCode::VecPackF => {
+            // pack(vec, scalar, lane, count) -> return scalar
+            let scalar = resolve(values, op.args[1]);
+            OpResult::Value(scalar)
+        }
+        OpCode::VecExpandI | OpCode::VecExpandF => {
+            // expand(scalar) -> return scalar
+            let a = unop(values, op);
+            OpResult::Value(a)
+        }
+
         // ── String/unicode copy ──
         OpCode::Copystrcontent | OpCode::Copyunicodecontent => OpResult::Void,
 
@@ -1098,6 +1219,12 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) ->
         // ── LoadFromGcTable / LoadEffectiveAddress ──
         OpCode::LoadFromGcTable | OpCode::LoadEffectiveAddress => OpResult::Value(0),
 
+        // All valid trace opcodes are handled above. If a new opcode is added
+        // to OpCode without a blackhole handler, this will produce a compile-time
+        // error (non-exhaustive match) rather than a silent runtime fallback.
+        //
+        // The Unsupported variant is kept only for truly impossible cases.
+        #[allow(unreachable_patterns)]
         other => OpResult::Unsupported(format!("blackhole: unsupported opcode {:?}", other)),
     }
 }

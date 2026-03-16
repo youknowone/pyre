@@ -1477,4 +1477,208 @@ mod tests {
         assert!(!gc.is_card_dirty(obj1, 0), "obj1 cards should be cleared");
         assert!(gc.is_card_dirty(obj2, 0), "obj2 cards should still be dirty");
     }
+
+    // ── SafepointMap tests ──
+
+    #[test]
+    fn test_safepoint_map_register_and_lookup() {
+        let mut smap = SafepointMap::new();
+
+        let mut gc_map_0 = crate::GcMap::new();
+        gc_map_0.set_ref(0);
+        gc_map_0.set_ref(3);
+
+        let mut gc_map_1 = crate::GcMap::new();
+        gc_map_1.set_ref(1);
+        gc_map_1.set_ref(7);
+
+        smap.add(100, gc_map_0);
+        smap.add(200, gc_map_1);
+
+        // Lookup existing entries.
+        let found_0 = smap.lookup(100).unwrap();
+        assert!(found_0.is_ref(0));
+        assert!(found_0.is_ref(3));
+        assert!(!found_0.is_ref(1));
+
+        let found_1 = smap.lookup(200).unwrap();
+        assert!(found_1.is_ref(1));
+        assert!(found_1.is_ref(7));
+        assert!(!found_1.is_ref(0));
+
+        // Lookup non-existent offset returns None.
+        assert!(smap.lookup(999).is_none());
+    }
+
+    #[test]
+    fn test_safepoint_map_empty() {
+        let smap = SafepointMap::new();
+        assert!(smap.lookup(0).is_none());
+        assert!(smap.entries.is_empty());
+    }
+
+    // ── CompiledCodeRegistry tests ──
+
+    #[test]
+    fn test_compiled_code_registry_register_and_find() {
+        let mut registry = CompiledCodeRegistry::new();
+        assert!(registry.is_empty());
+
+        let mut smap = SafepointMap::new();
+        let mut gc_map = crate::GcMap::new();
+        gc_map.set_ref(0);
+        gc_map.set_ref(2);
+        smap.add(16, gc_map);
+
+        registry.register(CompiledCodeRegion {
+            code_start: 0x1000,
+            code_size: 0x100,
+            safepoint_map: smap,
+            frame_size_slots: 4,
+            loop_token: 42,
+        });
+
+        assert_eq!(registry.len(), 1);
+
+        // Address inside the region.
+        let (region, offset) = registry.find_region(0x1010).unwrap();
+        assert_eq!(region.loop_token, 42);
+        assert_eq!(offset, 0x10);
+
+        // Address at the start.
+        let (region, offset) = registry.find_region(0x1000).unwrap();
+        assert_eq!(region.loop_token, 42);
+        assert_eq!(offset, 0);
+
+        // Address outside the region.
+        assert!(registry.find_region(0x900).is_none());
+        assert!(registry.find_region(0x1100).is_none());
+    }
+
+    #[test]
+    fn test_compiled_code_registry_multiple_regions() {
+        let mut registry = CompiledCodeRegistry::new();
+
+        registry.register(CompiledCodeRegion {
+            code_start: 0x1000,
+            code_size: 0x100,
+            safepoint_map: SafepointMap::new(),
+            frame_size_slots: 4,
+            loop_token: 1,
+        });
+        registry.register(CompiledCodeRegion {
+            code_start: 0x3000,
+            code_size: 0x200,
+            safepoint_map: SafepointMap::new(),
+            frame_size_slots: 8,
+            loop_token: 2,
+        });
+        registry.register(CompiledCodeRegion {
+            code_start: 0x2000,
+            code_size: 0x80,
+            safepoint_map: SafepointMap::new(),
+            frame_size_slots: 2,
+            loop_token: 3,
+        });
+
+        assert_eq!(registry.len(), 3);
+
+        // Each region should be findable.
+        assert_eq!(registry.find_region(0x1050).unwrap().0.loop_token, 1);
+        assert_eq!(registry.find_region(0x2040).unwrap().0.loop_token, 3);
+        assert_eq!(registry.find_region(0x3100).unwrap().0.loop_token, 2);
+
+        // Gap between regions returns None.
+        assert!(registry.find_region(0x1200).is_none());
+    }
+
+    #[test]
+    fn test_compiled_code_registry_unregister() {
+        let mut registry = CompiledCodeRegistry::new();
+
+        registry.register(CompiledCodeRegion {
+            code_start: 0x1000,
+            code_size: 0x100,
+            safepoint_map: SafepointMap::new(),
+            frame_size_slots: 4,
+            loop_token: 10,
+        });
+        registry.register(CompiledCodeRegion {
+            code_start: 0x2000,
+            code_size: 0x100,
+            safepoint_map: SafepointMap::new(),
+            frame_size_slots: 4,
+            loop_token: 20,
+        });
+
+        assert_eq!(registry.len(), 2);
+
+        registry.unregister(10);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.find_region(0x1050).is_none());
+        assert_eq!(registry.find_region(0x2050).unwrap().0.loop_token, 20);
+    }
+
+    #[test]
+    fn test_compiled_code_registry_safepoint_lookup_for_root_scanning() {
+        let mut registry = CompiledCodeRegistry::new();
+
+        let mut smap = SafepointMap::new();
+        let mut gc_map = crate::GcMap::new();
+        gc_map.set_ref(0);
+        gc_map.set_ref(2);
+        smap.add(0x20, gc_map);
+
+        registry.register(CompiledCodeRegion {
+            code_start: 0x5000,
+            code_size: 0x200,
+            safepoint_map: smap,
+            frame_size_slots: 4,
+            loop_token: 99,
+        });
+
+        // Simulate finding a return address and looking up the safepoint map.
+        let return_addr = 0x5020;
+        let (region, offset) = registry.find_region(return_addr).unwrap();
+        let gc_map = region.safepoint_map.lookup(offset).unwrap();
+
+        // Verify the GC map identifies the correct slots.
+        assert!(gc_map.is_ref(0), "slot 0 should be a GC ref");
+        assert!(!gc_map.is_ref(1), "slot 1 should not be a GC ref");
+        assert!(gc_map.is_ref(2), "slot 2 should be a GC ref");
+        assert!(!gc_map.is_ref(3), "slot 3 should not be a GC ref");
+    }
+
+    #[test]
+    fn test_scan_frame_enumerates_gc_ref_slots() {
+        let mut registry = CompiledCodeRegistry::new();
+
+        let mut smap = SafepointMap::new();
+        let mut gc_map = crate::GcMap::new();
+        gc_map.set_ref(0);
+        gc_map.set_ref(2);
+        smap.add(0x10, gc_map);
+
+        registry.register(CompiledCodeRegion {
+            code_start: 0xA000,
+            code_size: 0x100,
+            safepoint_map: smap,
+            frame_size_slots: 4,
+            loop_token: 77,
+        });
+
+        // Allocate a fake frame on the stack.
+        let frame: [usize; 4] = [111, 222, 333, 444];
+        let frame_base = frame.as_ptr();
+
+        let return_addr = 0xA010;
+        let roots = unsafe { registry.scan_frame(return_addr, frame_base) };
+
+        // Should find slots 0 and 2.
+        assert_eq!(roots.len(), 2);
+        unsafe {
+            assert_eq!(*(roots[0] as *const usize), 111);
+            assert_eq!(*(roots[1] as *const usize), 333);
+        }
+    }
 }
