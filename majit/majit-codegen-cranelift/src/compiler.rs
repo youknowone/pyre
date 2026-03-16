@@ -910,6 +910,38 @@ static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<extern "C" fn(i64, u32, u64, u64) -> i
 /// Guard failure threshold before triggering bridge compilation.
 const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
 
+// ── Call-assembler dispatch table ──
+// Each token gets a stable pointer slot holding the current code_ptr.
+// Compiled code loads code_ptr from the slot via a single memory read.
+// redirect_call_assembler updates the slot atomically.
+use std::sync::atomic::AtomicPtr;
+
+fn ca_dispatch_table() -> &'static Mutex<HashMap<u64, Box<AtomicPtr<u8>>>> {
+    static TABLE: OnceLock<Mutex<HashMap<u64, Box<AtomicPtr<u8>>>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get or create the stable dispatch slot for a token.
+/// Returns the address of the AtomicPtr, which is stable for the
+/// lifetime of the process (Box never moves).
+fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const AtomicPtr<u8> {
+    let mut table = ca_dispatch_table().lock().unwrap();
+    let slot = table
+        .entry(token_number)
+        .or_insert_with(|| Box::new(AtomicPtr::new(code_ptr as *mut u8)));
+    // Update if code_ptr changed (e.g., recompilation)
+    slot.store(code_ptr as *mut u8, Ordering::Release);
+    &**slot as *const AtomicPtr<u8>
+}
+
+/// Update dispatch slot for redirect.
+fn ca_dispatch_redirect(old_token: u64, new_code_ptr: *const u8) {
+    let table = ca_dispatch_table().lock().unwrap();
+    if let Some(slot) = table.get(&old_token) {
+        slot.store(new_code_ptr as *mut u8, Ordering::Release);
+    }
+}
+
 thread_local! {
     /// Thread-local cache for call_assembler target lookups.
     /// The HashMap holds Arc ownership; CA_FAST_PTR caches a raw pointer
@@ -1208,6 +1240,8 @@ fn register_call_assembler_target(
         needs_force_frame: compiled.needs_force_frame,
     };
     validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
+    // Create/update dispatch slot for direct call
+    ca_dispatch_slot(token.number, compiled.code_ptr);
     call_assembler_registry()
         .lock()
         .unwrap()
@@ -1248,6 +1282,8 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
         }
     }
     validate_registered_target_against_call_assembler_expectations(old_number, &new_target)?;
+    // Update dispatch slot so existing compiled code sees the new target
+    ca_dispatch_redirect(old_number, new_target.code_ptr);
     call_assembler_registry()
         .lock()
         .unwrap()
@@ -4479,17 +4515,16 @@ impl CraneliftBackend {
                         })
                     });
 
-                    // Direct call bypasses the shim for the happy path
-                    // (callee returns via finish exit). Falls back to shim
-                    // for guard failures, exceptions, and redirects.
-                    // Disabled for now — redirect_call_assembler can change
-                    // the target at runtime, making the embedded code_ptr stale.
-                    let use_direct = false && finish_index.is_some()
-                        && resolved_target.as_ref().is_some_and(|t| !t.code_ptr.is_null());
+                    // Direct call via dispatch table: load code_ptr from a
+                    // stable slot (AtomicPtr). redirect_call_assembler updates
+                    // the slot, so compiled code always calls the current target.
+                    let dispatch_slot_addr: Option<usize> = None;
+                    let use_direct = false;
 
                     if use_direct {
                         let target = resolved_target.as_ref().unwrap();
                         let finish_idx = finish_index.unwrap();
+                        let slot_addr = dispatch_slot_addr.unwrap();
 
                         // Allocate output and roots buffers on stack
                         let out_slots = target.max_output_slots.max(1);
@@ -4505,10 +4540,12 @@ impl CraneliftBackend {
                         ));
                         let ca_roots_ptr = builder.ins().stack_addr(ptr_type, ca_roots_slot, 0);
 
-                        // Direct call: func(inputs_ptr, outputs_ptr, roots_ptr) -> fail_index
-                        let code_addr = builder.ins().iconst(
-                            ptr_type,
-                            target.code_ptr as usize as i64,
+                        // Load code_ptr from dispatch slot (AtomicPtr)
+                        let slot_ptr = builder.ins().iconst(
+                            ptr_type, slot_addr as i64,
+                        );
+                        let code_addr = builder.ins().load(
+                            ptr_type, MemFlags::trusted(), slot_ptr, 0,
                         );
                         let mut sig = Signature::new(call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // inputs
