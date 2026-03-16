@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use majit_codegen::{Backend, LoopToken};
-use majit_codegen_cranelift::CraneliftBackend;
+use majit_codegen_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
     Value,
@@ -1977,8 +1977,7 @@ fn test_threadlocalref_get_basic() {
     // ThreadlocalrefGet returns a Ref type (pointer-sized).
     let got = backend.get_ref_value(&frame, 0);
     assert_eq!(
-        got.0 as i64,
-        0x544C,
+        got.0 as i64, 0x544C,
         "ThreadlocalrefGet should read back 0x544C"
     );
 }
@@ -2071,11 +2070,7 @@ fn test_threadlocalref_set_and_read_roundtrip() {
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         // ThreadlocalrefGet returns a Ref type (pointer-sized).
         let got = backend.get_ref_value(&frame, 0);
-        assert_eq!(
-            got.0 as i64,
-            value,
-            "roundtrip failed for value {value}"
-        );
+        assert_eq!(got.0 as i64, value, "roundtrip failed for value {value}");
     }
 }
 
@@ -2107,11 +2102,7 @@ fn test_threadlocalref_thread_isolation() {
         // We can't easily run compiled code on the child thread
         // (LoopToken/backend not Send), but we can verify via the shim.
         let base = majit_codegen_cranelift::compiler::jit_threadlocalref_base();
-        let val = if base.is_null() {
-            0
-        } else {
-            unsafe { *base }
-        };
+        let val = if base.is_null() { 0 } else { unsafe { *base } };
         val
     });
 
@@ -2186,11 +2177,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
     // The function pointer is a constant
     let fn_ptr = OpRef(1000);
 
-    let result = rec.record_op_with_descr(
-        OpCode::CallReleaseGilI,
-        &[fn_ptr, a, b],
-        cd,
-    );
+    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, a, b], cd);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
@@ -2478,10 +2465,7 @@ fn test_raw_store_load_float_roundtrip() {
     let mut buf = vec![0u8; 16];
     let ptr = buf.as_mut_ptr() as usize;
 
-    let frame = backend.execute_token(
-        &token,
-        &[Value::Ref(GcRef(ptr)), Value::Float(3.14159)],
-    );
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Float(3.14159)]);
     assert!(
         (backend.get_float_value(&frame, 0) - 3.14159).abs() < 1e-10,
         "raw_store then raw_load_f should roundtrip the float value"
@@ -2583,5 +2567,262 @@ fn test_raw_load_unsigned_byte() {
         backend.get_int_value(&frame, 0),
         255,
         "unsigned 1-byte load of 0xFF should yield 255"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FFI forcing and guard_not_forced parity tests
+// (rpython/jit/metainterp/test/test_fficall.py: test_guard_not_forced_fails)
+//
+// Verifies CallMayForceI + GuardNotForced and CallReleaseGilI + GuardNoException
+// compile and execute correctly, covering the forced path and exception
+// propagation semantics.
+// ---------------------------------------------------------------------------
+
+fn call_descr_may_force_i(idx: u32, arg_types: Vec<Type>) -> DescrRef {
+    Arc::new(TestCallDescr {
+        idx,
+        effect: majit_ir::EffectInfo {
+            extra_effect: majit_ir::ExtraEffect::CanRaise,
+            oopspec_index: majit_ir::OopSpecIndex::None,
+        },
+        arg_types,
+        result_type: Type::Int,
+    })
+}
+
+/// FFI function that never forces: returns a + b.
+extern "C" fn ffi_add_no_force(force_token: i64, a: i64) -> i64 {
+    let _ = force_token; // not used — no forcing
+    a * 2
+}
+
+/// FFI function that conditionally forces the frame.
+/// When flag != 0, forces via force_token_to_dead_frame.
+extern "C" fn ffi_maybe_force(force_token: i64, flag: i64) -> i64 {
+    if flag != 0 {
+        let _deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
+    }
+    flag * 2
+}
+
+/// FFI function that sets a pending exception via jit_exc_raise.
+extern "C" fn ffi_raise_exception(val: i64) -> i64 {
+    if val != 0 {
+        // Set a non-zero exception value + type to signal an exception
+        jit_exc_raise(val, 0xEE);
+    }
+    val
+}
+
+#[test]
+fn test_call_release_gil_with_guard_not_forced() {
+    // Parity with test_fficall.test_guard_not_forced_fails (non-forced path).
+    //
+    // Trace: input(x) -> force_token -> result = call_may_force_i(fn, token, x)
+    //        -> guard_not_forced(fail_args=[x, result]) -> finish(result)
+    //
+    // When the called function does NOT force, GuardNotForced passes and
+    // Finish returns the call result.
+    let cd = call_descr_may_force_i(70, vec![Type::Ref, Type::Int]);
+
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+
+    // ForceToken produces a Ref-typed value (the current frame handle)
+    let token_ref = rec.record_op(OpCode::ForceToken, &[]);
+
+    // fn_ptr is stored as a constant
+    let fn_ptr = OpRef(1000);
+
+    // CallMayForceI: arg(0)=fn_ptr, rest=[force_token, x]
+    let result = rec.record_op_with_descr(
+        OpCode::CallMayForceI,
+        &[fn_ptr, token_ref, x],
+        cd,
+    );
+
+    // GuardNotForced with fail_args — exits here if the callee forced
+    rec.record_guard_with_fail_args(
+        OpCode::GuardNotForced,
+        &[],
+        make_descr(0),
+        &[x, result],
+    );
+
+    rec.finish(&[result], make_descr(1));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, ffi_add_no_force as *const () as usize as i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(700);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("CallMayForceI + GuardNotForced should compile");
+
+    // Not forced: guard passes, finish returns result = x * 2
+    let frame = backend.execute_token(&token, &[Value::Int(21)]);
+    assert_eq!(
+        backend.get_latest_descr(&frame).fail_index(),
+        1,
+        "should reach Finish (descr index 1)"
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        42,
+        "ffi_add_no_force(token, 21) should return 42"
+    );
+
+    // Another input
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        0,
+        "ffi_add_no_force(token, 0) should return 0"
+    );
+}
+
+#[test]
+fn test_call_may_force_with_forcing_semantics() {
+    // Parity with test_fficall.test_guard_not_forced_fails (forced path).
+    //
+    // Trace: input(flag) -> force_token -> result = call_may_force_i(fn, token, flag)
+    //        -> guard_not_forced(fail_args=[flag, result]) -> finish(result)
+    //
+    // When flag != 0 the callee forces via force_token_to_dead_frame,
+    // so GuardNotForced fails and we exit through the guard's fail path.
+    let cd = call_descr_may_force_i(71, vec![Type::Ref, Type::Int]);
+
+    let mut rec = TraceRecorder::new();
+    let flag = rec.record_input_arg(Type::Int);
+
+    let token_ref = rec.record_op(OpCode::ForceToken, &[]);
+    let fn_ptr = OpRef(1000);
+
+    let result = rec.record_op_with_descr(
+        OpCode::CallMayForceI,
+        &[fn_ptr, token_ref, flag],
+        cd,
+    );
+
+    rec.record_guard_with_fail_args(
+        OpCode::GuardNotForced,
+        &[],
+        make_descr(0),
+        &[flag, result],
+    );
+
+    rec.finish(&[result], make_descr(1));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, ffi_maybe_force as *const () as usize as i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(701);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("CallMayForceI + GuardNotForced (forced) should compile");
+
+    // flag=0 -> not forced -> reaches Finish
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    assert_eq!(
+        backend.get_latest_descr(&frame).fail_index(),
+        1,
+        "flag=0: should reach Finish (descr 1)"
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        0,
+        "flag=0: result = 0*2 = 0"
+    );
+
+    // flag=1 -> forced -> exits via GuardNotForced (descr 0)
+    let frame = backend.execute_token(&token, &[Value::Int(1)]);
+    assert_eq!(
+        backend.get_latest_descr(&frame).fail_index(),
+        0,
+        "flag=1: should exit via GuardNotForced (descr 0)"
+    );
+    // fail_args are [flag, result]; result is a preview snapshot taken
+    // before the call (placeholder zero for forward-defined values).
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        1,
+        "flag=1: fail_args[0] = flag = 1"
+    );
+}
+
+#[test]
+fn test_ffi_call_exception_propagation() {
+    // Parity with test_fficall exception semantics.
+    //
+    // Trace: input(val) -> result = call_release_gil_i(ffi_raise_exception, val)
+    //        -> guard_no_exception(fail_args=[result]) -> finish(result)
+    //
+    // When val != 0, ffi_raise_exception sets a pending exception via
+    // jit_exc_raise, so GuardNoException fails and exits through the guard.
+    let cd = call_descr_release_gil_i(72, vec![Type::Int]);
+
+    let mut rec = TraceRecorder::new();
+    let val = rec.record_input_arg(Type::Int);
+
+    let fn_ptr = OpRef(1000);
+    let result = rec.record_op_with_descr(
+        OpCode::CallReleaseGilI,
+        &[fn_ptr, val],
+        cd,
+    );
+
+    // GuardNoException: exits if jit_exc_get_value() != 0
+    rec.record_guard_with_fail_args(
+        OpCode::GuardNoException,
+        &[],
+        make_descr(0),
+        &[result],
+    );
+
+    rec.finish(&[result], make_descr(1));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, ffi_raise_exception as *const () as usize as i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(702);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("CallReleaseGilI + GuardNoException should compile");
+
+    // val=0 -> no exception -> reaches Finish
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    assert_eq!(
+        backend.get_latest_descr(&frame).fail_index(),
+        1,
+        "val=0: should reach Finish (descr 1)"
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        0,
+        "val=0: result = 0"
+    );
+
+    // val=99 -> exception raised -> exits via GuardNoException (descr 0)
+    let frame = backend.execute_token(&token, &[Value::Int(99)]);
+    assert_eq!(
+        backend.get_latest_descr(&frame).fail_index(),
+        0,
+        "val=99: should exit via GuardNoException (descr 0)"
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        99,
+        "val=99: fail_args[0] = result = 99"
     );
 }
