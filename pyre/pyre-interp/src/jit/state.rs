@@ -20,8 +20,8 @@ use pyre_object::pyobject::{
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::strobject::is_str;
 use pyre_object::{
-    w_bool_from, w_int_get_value, w_list_can_append_without_realloc,
-    w_int_new, w_list_is_inline_storage, w_list_len, w_str_get_value, w_tuple_len,
+    w_bool_from, w_int_get_value, w_int_new, w_list_can_append_without_realloc,
+    w_list_is_inline_storage, w_list_len, w_str_get_value, w_tuple_len,
 };
 use pyre_objspace::truth_value as objspace_truth_value;
 use pyre_runtime::{
@@ -78,9 +78,9 @@ pub struct PyreMeta {
 /// Symbolic state during tracing.
 ///
 /// `frame` maps to a live IR `OpRef`. Symbolic frame field tracking
-/// (locals, stack, stack_depth, next_instr) persists across instructions
-/// to avoid emitting redundant IR ops. Only dirty values are flushed
-/// to the concrete frame before guards and at loop close.
+/// (locals, stack, stack_depth, next_instr) persists across instructions.
+/// Locals and stack are virtualized (carried through JUMP args);
+/// only next_instr and stack_depth are synced before guards / loop close.
 pub struct PyreSym {
     /// OpRef for the owning PyFrame pointer.
     pub frame: OpRef,
@@ -88,9 +88,6 @@ pub struct PyreSym {
     // These fields survive across per-instruction TraceFrameState lifetimes.
     pub(crate) symbolic_locals: Vec<OpRef>,
     pub(crate) symbolic_stack: Vec<OpRef>,
-    pub(crate) dirty_locals: Vec<bool>,
-    pub(crate) dirty_stack: Vec<bool>,
-    pub(crate) dirty_stack_depth: bool,
     pub(crate) pending_next_instr: Option<usize>,
     pub(crate) locals_array_ref: OpRef,
     pub(crate) stack_array_ref: OpRef,
@@ -282,9 +279,6 @@ impl PyreSym {
             frame,
             symbolic_locals: Vec::new(),
             symbolic_stack: Vec::new(),
-            dirty_locals: Vec::new(),
-            dirty_stack: Vec::new(),
-            dirty_stack_depth: false,
             pending_next_instr: None,
             locals_array_ref: OpRef::NONE,
             stack_array_ref: OpRef::NONE,
@@ -317,9 +311,6 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; stack_depth]
         };
-        self.dirty_locals = vec![false; nlocals];
-        self.dirty_stack = vec![false; stack_depth];
-        self.dirty_stack_depth = false;
         self.pending_next_instr = None;
         self.stack_depth = stack_depth;
         self.symbolic_initialized = true;
@@ -333,7 +324,10 @@ impl TraceFrameState {
         concrete_frame: usize,
         fallthrough_pc: usize,
     ) -> Self {
-        debug_assert!(concrete_frame != 0, "concrete_frame must be a valid frame pointer");
+        debug_assert!(
+            concrete_frame != 0,
+            "concrete_frame must be a valid frame pointer"
+        );
         sym.init_symbolic(ctx, concrete_frame);
         Self {
             ctx,
@@ -343,7 +337,6 @@ impl TraceFrameState {
             fallthrough_pc,
         }
     }
-
 
     pub(crate) fn ctx(&mut self) -> &mut TraceCtx {
         unsafe { &mut *self.ctx }
@@ -373,12 +366,9 @@ impl TraceFrameState {
         let idx = s.stack_depth;
         if idx >= s.symbolic_stack.len() {
             s.symbolic_stack.resize(idx + 1, OpRef::NONE);
-            s.dirty_stack.resize(idx + 1, false);
         }
         s.symbolic_stack[idx] = value;
-        s.dirty_stack[idx] = true;
         s.stack_depth += 1;
-        s.dirty_stack_depth = true;
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
@@ -394,11 +384,14 @@ impl TraceFrameState {
         }
         let value = s.symbolic_stack[top_idx];
         s.stack_depth -= 1;
-        s.dirty_stack_depth = true;
         Ok(value)
     }
 
-    pub(crate) fn peek_value(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<OpRef, PyError> {
+    pub(crate) fn peek_value(
+        &mut self,
+        ctx: &mut TraceCtx,
+        depth: usize,
+    ) -> Result<OpRef, PyError> {
         let s = self.sym_mut();
         let idx = s
             .stack_depth
@@ -406,8 +399,7 @@ impl TraceFrameState {
             .ok_or_else(|| pyre_runtime::stack_underflow_error("trace peek"))?;
         if s.symbolic_stack[idx] == OpRef::NONE {
             let idx_const = ctx.const_int(idx as i64);
-            s.symbolic_stack[idx] =
-                trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+            s.symbolic_stack[idx] = trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
         }
         Ok(s.symbolic_stack[idx])
     }
@@ -430,8 +422,6 @@ impl TraceFrameState {
                 trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
         }
         s.symbolic_stack.swap(top_idx, other_idx);
-        s.dirty_stack[top_idx] = true;
-        s.dirty_stack[other_idx] = true;
         Ok(())
     }
 
@@ -446,8 +436,7 @@ impl TraceFrameState {
         }
         if s.symbolic_locals[idx] == OpRef::NONE {
             let idx_const = ctx.const_int(idx as i64);
-            s.symbolic_locals[idx] =
-                trace_array_getitem_value(ctx, s.locals_array_ref, idx_const);
+            s.symbolic_locals[idx] = trace_array_getitem_value(ctx, s.locals_array_ref, idx_const);
         }
         Ok(s.symbolic_locals[idx])
     }
@@ -463,7 +452,6 @@ impl TraceFrameState {
             return Err(PyError::type_error("local index out of range in trace"));
         }
         s.symbolic_locals[idx] = value;
-        s.dirty_locals[idx] = true;
         Ok(())
     }
 
@@ -525,27 +513,15 @@ impl TraceFrameState {
         self.sym_mut().pending_next_instr = Some(self.fallthrough_pc);
     }
 
-    /// Flush all dirty symbolic state to the concrete frame via IR ops.
-    /// Called before guards and at loop close to ensure frame consistency.
+    /// Update virtualizable next_instr and stack_depth before guards / loop close.
+    /// Locals and stack are carried through JUMP args (virtualizable), not flushed to heap.
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let s = self.sym_mut();
-        // Locals are virtualized — carried through JUMP args, not written to heap.
-        for i in 0..s.dirty_locals.len() {
-            s.dirty_locals[i] = false;
-        }
-        // Stack is also virtualized — carried through JUMP args.
-        for i in 0..s.stack_depth.min(s.dirty_stack.len()) {
-            s.dirty_stack[i] = false;
-        }
-        if s.dirty_stack_depth {
-            let depth = ctx.const_int(s.stack_depth as i64);
-            s.vable_stack_depth = depth;
-            s.dirty_stack_depth = false;
-        }
         if let Some(pc) = s.pending_next_instr.take() {
-            let target = ctx.const_int(pc as i64);
-            s.vable_next_instr = target;
+            s.vable_next_instr = ctx.const_int(pc as i64);
         }
+        // stack_depth is unconditionally synced (const_int is cheap — deduped by HashMap).
+        s.vable_stack_depth = ctx.const_int(s.stack_depth as i64);
     }
 
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
@@ -562,8 +538,14 @@ impl TraceFrameState {
         let s = self.sym();
         let stack_slice = &s.symbolic_stack[..s.stack_depth.min(s.symbolic_stack.len())];
         record_current_state_guard(
-            ctx, s.frame, s.vable_next_instr, s.vable_stack_depth,
-            &s.symbolic_locals, stack_slice, opcode, args,
+            ctx,
+            s.frame,
+            s.vable_next_instr,
+            s.vable_stack_depth,
+            &s.symbolic_locals,
+            stack_slice,
+            opcode,
+            args,
         );
     }
 
@@ -584,7 +566,12 @@ impl TraceFrameState {
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected]);
     }
 
-    pub(crate) fn record_for_iter_guard(&mut self, ctx: &mut TraceCtx, next: OpRef, continues: bool) {
+    pub(crate) fn record_for_iter_guard(
+        &mut self,
+        ctx: &mut TraceCtx,
+        next: OpRef,
+        continues: bool,
+    ) {
         let opcode = if continues {
             OpCode::GuardNonnull
         } else {
@@ -1000,9 +987,7 @@ impl TraceFrameState {
                 OpCode::FloatFloorDiv
             }
             BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => OpCode::FloatMod,
-            BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
-                OpCode::FloatTrueDiv
-            }
+            BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => OpCode::FloatTrueDiv,
             _ => return self.trace_binary_value(a, b, op),
         };
 
@@ -1207,8 +1192,9 @@ impl TraceFrameState {
     }
 
     pub(crate) fn concrete_iter_continues(&self) -> Result<bool, PyError> {
-        let concrete_iter = concrete_stack_value(self.concrete_frame, self.sym().stack_depth - 1)
-            .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
+        let concrete_iter =
+            concrete_stack_value(self.concrete_frame, self.sym().stack_depth - 1)
+                .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
         range_iter_continues(concrete_iter)
     }
 
@@ -1385,7 +1371,11 @@ impl TraceFrameState {
             if is_int(concrete_a) && is_int(concrete_b) {
                 let lhs = w_int_get_value(concrete_a);
                 let rhs = w_int_get_value(concrete_b);
-                let concrete_result = if choose_max { lhs.max(rhs) } else { lhs.min(rhs) };
+                let concrete_result = if choose_max {
+                    lhs.max(rhs)
+                } else {
+                    lhs.min(rhs)
+                };
                 let concrete_obj = if choose_max {
                     if lhs >= rhs { concrete_a } else { concrete_b }
                 } else if lhs <= rhs {
@@ -1427,7 +1417,10 @@ impl TraceFrameState {
         args: &[OpRef],
     ) -> Result<OpRef, PyError> {
         let Some(concrete_callable) = self.concrete_callable_after_pops() else {
-            debug_assert!(false, "concrete_callable should always be available during tracing");
+            debug_assert!(
+                false,
+                "concrete_callable should always be available during tracing"
+            );
             return self.trace_call_callable(callable, args);
         };
 
@@ -1481,17 +1474,17 @@ impl TraceFrameState {
                     if let Some(frame_helper) = crate::call::callee_frame_helper(args.len()) {
                         // Get callee's num_locals from compiled meta or code object
                         let callee_meta = driver.get_compiled_meta(callee_key);
-                        let callee_nlocals = callee_meta
-                            .map(|m| m.num_locals)
-                            .unwrap_or_else(|| {
+                        let callee_nlocals =
+                            callee_meta.map(|m| m.num_locals).unwrap_or_else(|| {
                                 let code_ptr = w_func_get_code_ptr(concrete_callable)
                                     as *const pyre_bytecode::CodeObject;
-                                if code_ptr.is_null() { 0 }
-                                else { unsafe { &(*code_ptr).varnames }.len() }
+                                if code_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe { &(*code_ptr).varnames }.len()
+                                }
                             });
-                        let callee_sdepth = callee_meta
-                            .map(|m| m.stack_depth)
-                            .unwrap_or(0);
+                        let callee_sdepth = callee_meta.map(|m| m.stack_depth).unwrap_or(0);
 
                         return self.with_ctx(|this, ctx| {
                             this.guard_value(ctx, callable, concrete_callable as i64);
@@ -1521,9 +1514,7 @@ impl TraceFrameState {
                                 );
                                 ca_args.push(val);
                             }
-                            let result = ctx.call_assembler_int_by_number(
-                                token_number, &ca_args,
-                            );
+                            let result = ctx.call_assembler_int_by_number(token_number, &ca_args);
                             ctx.call_void(
                                 crate::call::jit_drop_callee_frame as *const (),
                                 &[callee_frame],
@@ -1565,8 +1556,9 @@ impl TraceFrameState {
     }
 
     pub(crate) fn iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
-        let concrete_iter = concrete_stack_value(self.concrete_frame, self.sym().stack_depth - 1)
-            .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
+        let concrete_iter =
+            concrete_stack_value(self.concrete_frame, self.sym().stack_depth - 1)
+                .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step =
             unsafe { (*(concrete_iter as *const pyre_object::rangeobject::W_RangeIterator)).step };
@@ -1778,8 +1770,10 @@ impl TraceFrameState {
             let nargs = args.len();
             let sd = this.sym().stack_depth;
             let concrete_args: Vec<PyObjectRef> = (0..nargs)
-                .map(|i| concrete_stack_value(this.concrete_frame, sd - nargs + i)
-                    .unwrap_or(std::ptr::null_mut()))
+                .map(|i| {
+                    concrete_stack_value(this.concrete_frame, sd - nargs + i)
+                        .unwrap_or(std::ptr::null_mut())
+                })
                 .collect();
             let mut callee_frame = crate::frame::PyFrame::new_for_call(
                 func_code,
@@ -1853,12 +1847,8 @@ fn inline_trace_and_execute(
         }
 
         // ── TRACE: record IR for this instruction ──
-        let mut frame_state = TraceFrameState::from_sym(
-            ctx,
-            &mut callee_sym,
-            callee as *const _ as usize,
-            pc + 1,
-        );
+        let mut frame_state =
+            TraceFrameState::from_sym(ctx, &mut callee_sym, callee as *const _ as usize, pc + 1);
         let trace_action = frame_state.trace_code_step(code, pc);
 
         match trace_action {
@@ -1875,17 +1865,14 @@ fn inline_trace_and_execute(
                     _ => {
                         return Err(pyre_runtime::PyError::type_error(
                             "expected concrete return after trace finish",
-                        ))
+                        ));
                     }
                 }
             }
             TraceAction::Abort | TraceAction::AbortPermanent => {
-                return Err(pyre_runtime::PyError::type_error(
-                    "inline trace aborted",
-                ));
+                return Err(pyre_runtime::PyError::type_error("inline trace aborted"));
             }
-            TraceAction::CloseLoop
-            | TraceAction::CloseLoopWithArgs { .. } => {
+            TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
                 return Err(pyre_runtime::PyError::type_error(
                     "inline callee has loop (not supported)",
                 ));
