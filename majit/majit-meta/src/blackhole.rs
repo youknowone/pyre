@@ -1259,13 +1259,14 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) ->
         // ── LoadFromGcTable / LoadEffectiveAddress ──
         OpCode::LoadFromGcTable | OpCode::LoadEffectiveAddress => OpResult::Value(0),
 
-        // All valid trace opcodes are handled above. If a new opcode is added
-        // to OpCode without a blackhole handler, this will produce a compile-time
-        // error (non-exhaustive match) rather than a silent runtime fallback.
-        //
-        // The Unsupported variant is kept only for truly impossible cases.
+        // All OpCode variants are explicitly handled above.
+        // This arm is unreachable but kept for forward-compatibility
+        // when new opcodes are added to the IR.
         #[allow(unreachable_patterns)]
-        other => OpResult::Unsupported(format!("blackhole: unsupported opcode {:?}", other)),
+        other => OpResult::Unsupported(format!(
+            "blackhole: opcode {:?} has no interpreter handler",
+            other
+        )),
     }
 }
 
@@ -2493,5 +2494,41 @@ mod tests {
     fn test_executor_int_invert_boundaries() {
         assert_eq!(exec_unop(OpCode::IntInvert, i64::MAX), i64::MIN);
         assert_eq!(exec_unop(OpCode::IntInvert, i64::MIN), i64::MAX);
+    }
+
+    /// Verify every OpCode variant has an explicit handler in execute_one
+    /// (i.e., none falls through to the Unsupported catch-all).
+    #[test]
+    fn test_all_opcodes_have_blackhole_handler() {
+        let dummy_args = &[OpRef(10_000), OpRef(10_001), OpRef(10_002)];
+        let mut constants = HashMap::new();
+        constants.insert(10_000, 1i64);
+        constants.insert(10_001, 2i64);
+        constants.insert(10_002, 3i64);
+
+        let mut values: HashMap<u32, i64> = constants.clone();
+        let mut exc = ExceptionState::default();
+
+        for opcode in OpCode::all() {
+            // Build a minimal op with enough args for any opcode
+            let arity = opcode.arity().unwrap_or(3) as usize;
+            let args = &dummy_args[..arity.min(3)];
+            let mut op = Op::new(opcode, args);
+            op.pos = OpRef(opcode.as_u16() as u32 + 20_000);
+
+            let result = execute_one(&op, &values, &mut exc);
+            // Store the result so subsequent ops can reference it
+            if let OpResult::Value(v) = &result {
+                values.insert(op.pos.0, *v);
+            }
+
+            match result {
+                OpResult::Unsupported(msg) => {
+                    panic!("OpCode {:?} returned Unsupported: {}", opcode, msg);
+                }
+                // Any other result (Value, Void, Finish, Jump, GuardFailed) is acceptable
+                _ => {}
+            }
+        }
     }
 }
