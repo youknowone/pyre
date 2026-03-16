@@ -1320,27 +1320,9 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
 
-        // Preamble patching for FINISH traces: CALL_ASSEMBLER now passes
-        // only [frame] (callee_frame may be a tagged pointer from force_cache).
-        // The preamble reads fields from frame in the entry block.
-        let (inputargs, optimized_ops) = if let Some(ref info) = self.virtualizable_info {
-            let num_static = info.num_static_fields;
-            let total_array = inputargs.len().saturating_sub(1 + num_static);
-            // At function entry, stack_depth=0, all array elements are locals
-            let lengths = if info.array_fields.len() == 2 {
-                vec![total_array, 0]
-            } else if !self.vable_array_lengths.is_empty() {
-                self.vable_array_lengths.clone()
-            } else {
-                vec![]
-            };
-            let (new_ia, new_ops) = patch_new_loop_to_load_virtualizable_fields(
-                info, &inputargs, optimized_ops, &mut constants, &lengths,
-            );
-            (new_ia, new_ops)
-        } else {
-            (inputargs, optimized_ops)
-        };
+        // No preamble for FINISH traces — CALL_ASSEMBLER passes all args
+        // directly (frame + ni + sd + locals). A guard before GETFIELD ops
+        // ensures tagged pointers (force_cache hits) don't get dereferenced.
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
