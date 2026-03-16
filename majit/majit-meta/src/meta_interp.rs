@@ -4047,6 +4047,7 @@ mod tests {
                 gc_ref_slots: Vec::new(),
                 force_token_slots: vec![0],
                 recovery_layout: Some(recovery.clone()),
+                frame_stack: None,
             }],
         );
 
