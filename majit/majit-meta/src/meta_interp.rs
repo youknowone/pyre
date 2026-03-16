@@ -1022,15 +1022,25 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
 
+        // Extend inputargs if the optimizer added virtual inputs (virtualizable)
+        let final_num_inputs = optimizer.final_num_inputs();
+        let mut inputargs = trace.inputargs.clone();
+        while inputargs.len() < final_num_inputs {
+            inputargs.push(majit_ir::InputArg {
+                tp: majit_ir::Type::Int,
+                index: inputargs.len() as u32,
+            });
+        }
+
         match self
             .backend
-            .compile_loop(&trace.inputargs, &optimized_ops, &mut token)
+            .compile_loop(&inputargs, &optimized_ops, &mut token)
         {
             Ok(_) => {
                 let (resume_data, guard_op_indices, mut exit_layouts) =
-                    build_guard_metadata(&trace.inputargs, &optimized_ops, green_key);
+                    build_guard_metadata(&inputargs, &optimized_ops, green_key);
                 let mut terminal_exit_layouts =
-                    build_terminal_exit_layouts(&trace.inputargs, &optimized_ops);
+                    build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }

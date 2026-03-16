@@ -218,6 +218,14 @@ pub(crate) fn frame_set_stack_depth(ctx: &mut TraceCtx, frame: OpRef, depth: OpR
     );
 }
 
+pub(crate) fn frame_get_next_instr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
+    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_next_instr_descr())
+}
+
+pub(crate) fn frame_get_stack_depth(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
+    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_stack_depth_descr())
+}
+
 pub(crate) fn frame_set_next_instr(ctx: &mut TraceCtx, frame: OpRef, next_instr: OpRef) {
     ctx.record_op_with_descr(
         OpCode::SetfieldRaw,
@@ -1471,13 +1479,59 @@ impl TraceFrameState {
 
                 if let Some(token_number) = token_number {
                     if let Some(frame_helper) = crate::call::callee_frame_helper(args.len()) {
+                        // Get callee's num_locals and stack_depth from compiled meta,
+                        // or from the current trace meta (for self-recursion where
+                        // the callee hasn't been compiled yet).
+                        let callee_meta = driver.get_compiled_meta(callee_key);
+                        let callee_nlocals = callee_meta
+                            .map(|m| m.num_locals)
+                            .unwrap_or_else(|| {
+                                // Self-recursion or pending: read nlocals from code object
+                                let code_ptr =
+                                    w_func_get_code_ptr(concrete_callable)
+                                        as *const pyre_bytecode::CodeObject;
+                                if code_ptr.is_null() { 0 }
+                                else { unsafe { &(*code_ptr).varnames }.len() }
+                            });
+                        let callee_sdepth = callee_meta
+                            .map(|m| m.stack_depth)
+                            .unwrap_or(0); // stack depth at entry is 0
+
                         return self.with_ctx(|this, ctx| {
                             this.guard_value(ctx, callable, concrete_callable as i64);
                             let mut helper_args = vec![this.frame(), callable];
                             helper_args.extend_from_slice(args);
                             let callee_frame = ctx.call_int(frame_helper, &helper_args);
-                            let result =
-                                ctx.call_assembler_int_by_number(token_number, &[callee_frame]);
+                            // Build callee input args matching target loop's
+                            // input layout: [frame, ni, sd, locals..., stack...]
+                            let callee_ni = frame_get_next_instr(ctx, callee_frame);
+                            let callee_sd = frame_get_stack_depth(ctx, callee_frame);
+                            let mut ca_args = vec![callee_frame, callee_ni, callee_sd];
+                            // Read locals from callee frame
+                            let callee_locals_ptr = frame_locals_array(ctx, callee_frame);
+                            for i in 0..callee_nlocals {
+                                let idx = ctx.const_int(i as i64);
+                                let val = ctx.record_op_with_descr(
+                                    OpCode::GetarrayitemRawI,
+                                    &[callee_locals_ptr, idx],
+                                    pyobject_array_descr(),
+                                );
+                                ca_args.push(val);
+                            }
+                            // Read stack from callee frame
+                            let callee_stack_ptr = frame_stack_array(ctx, callee_frame);
+                            for i in 0..callee_sdepth {
+                                let idx = ctx.const_int(i as i64);
+                                let val = ctx.record_op_with_descr(
+                                    OpCode::GetarrayitemRawI,
+                                    &[callee_stack_ptr, idx],
+                                    pyobject_array_descr(),
+                                );
+                                ca_args.push(val);
+                            }
+                            let result = ctx.call_assembler_int_by_number(
+                                token_number, &ca_args,
+                            );
                             ctx.call_void(
                                 crate::call::jit_drop_callee_frame as *const (),
                                 &[callee_frame],

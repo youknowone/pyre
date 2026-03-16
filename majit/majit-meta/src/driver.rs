@@ -47,6 +47,11 @@ impl<S: JitState> JitDriver<S> {
         driver
     }
 
+    /// Get compiled loop metadata for the given green key.
+    pub fn get_compiled_meta(&self, green_key: u64) -> Option<&S::Meta> {
+        self.meta.get_compiled_meta(green_key)
+    }
+
     pub fn with_declarative<D: DeclarativeJitDriver>(
         threshold: u32,
         green_types: &[Type],
