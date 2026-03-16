@@ -4458,10 +4458,100 @@ impl CraneliftBackend {
                         builder.ins().jump(ca_merge_block, &[cached_result]);
                     }
 
-                    // ── Normal path: call shim ──
+                    // ── Normal path ──
                     builder.switch_to_block(normal_block);
                     builder.seal_block(normal_block);
 
+                    // Try direct call if target is resolved and has a known
+                    // finish exit with primitive result type. This inlines the
+                    // hot path (call target → check finish → extract result)
+                    // into Cranelift IR, bypassing the shim entirely.
+                    let finish_index = resolved_target.as_ref().and_then(|t| {
+                        t.fail_descrs.iter().enumerate().find_map(|(i, d)| {
+                            if d.is_finish() {
+                                match d.fail_arg_types() {
+                                    [Type::Int] | [Type::Float] => Some(i as u32),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                    // Direct call bypasses the shim for the happy path
+                    // (callee returns via finish exit). Falls back to shim
+                    // for guard failures, exceptions, and redirects.
+                    // Disabled for now — redirect_call_assembler can change
+                    // the target at runtime, making the embedded code_ptr stale.
+                    let use_direct = false && finish_index.is_some()
+                        && resolved_target.as_ref().is_some_and(|t| !t.code_ptr.is_null());
+
+                    if use_direct {
+                        let target = resolved_target.as_ref().unwrap();
+                        let finish_idx = finish_index.unwrap();
+
+                        // Allocate output and roots buffers on stack
+                        let out_slots = target.max_output_slots.max(1);
+                        let out_bytes = (out_slots * 8) as u32;
+                        let out_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot, out_bytes, 3,
+                        ));
+                        let out_ptr = builder.ins().stack_addr(ptr_type, out_slot, 0);
+
+                        let roots_bytes = (target.num_ref_roots.max(1) * 8) as u32;
+                        let ca_roots_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot, roots_bytes, 3,
+                        ));
+                        let ca_roots_ptr = builder.ins().stack_addr(ptr_type, ca_roots_slot, 0);
+
+                        // Direct call: func(inputs_ptr, outputs_ptr, roots_ptr) -> fail_index
+                        let code_addr = builder.ins().iconst(
+                            ptr_type,
+                            target.code_ptr as usize as i64,
+                        );
+                        let mut sig = Signature::new(call_conv);
+                        sig.params.push(AbiParam::new(ptr_type)); // inputs
+                        sig.params.push(AbiParam::new(ptr_type)); // outputs
+                        sig.params.push(AbiParam::new(ptr_type)); // roots
+                        sig.returns.push(AbiParam::new(cl_types::I64)); // fail_index
+                        let sig_ref = builder.import_signature(sig);
+                        let fail_index_val = builder.ins().call_indirect(
+                            sig_ref, code_addr,
+                            &[args_ptr, out_ptr, ca_roots_ptr],
+                        );
+                        let fail_idx_raw = builder.inst_results(fail_index_val)[0];
+
+                        // Check: is it the finish exit?
+                        let expected_finish = builder.ins().iconst(
+                            cl_types::I64, finish_idx as i64,
+                        );
+                        let is_direct_finish = builder.ins().icmp(
+                            IntCC::Equal, fail_idx_raw, expected_finish,
+                        );
+                        let direct_finish_block = builder.create_block();
+                        let shim_fallback_block = builder.create_block();
+                        builder.ins().brif(
+                            is_direct_finish,
+                            direct_finish_block, &[],
+                            shim_fallback_block, &[],
+                        );
+
+                        // ── Direct finish: extract result from outputs[0] ──
+                        builder.switch_to_block(direct_finish_block);
+                        builder.seal_block(direct_finish_block);
+                        let direct_result = builder.ins().stack_load(
+                            cl_types::I64, out_slot, 0,
+                        );
+                        builder.ins().jump(ca_merge_block, &[direct_result]);
+
+                        // ── Fallback: guard failure or other exit → call shim ──
+                        builder.switch_to_block(shim_fallback_block);
+                        builder.seal_block(shim_fallback_block);
+                    }
+
+                    // Shim call (always present as fallback, or sole path
+                    // when target isn't resolved or has non-primitive result)
                     if call_descr.effect_info().can_raise() {
                         let _ = emit_host_call(
                             &mut builder,
