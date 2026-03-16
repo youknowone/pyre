@@ -1641,12 +1641,20 @@ mod tests {
             type Env = ();
 
             fn build_meta(&self, _: usize, _: &()) -> () {}
-            fn extract_live(&self, _: &()) -> Vec<i64> { Vec::new() }
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                Vec::new()
+            }
             fn create_sym(_: &(), _: usize) -> () {}
-            fn is_compatible(&self, _: &()) -> bool { true }
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
             fn restore(&mut self, _: &(), _: &[i64]) {}
-            fn collect_jump_args(_: &()) -> Vec<OpRef> { Vec::new() }
-            fn validate_close(_: &(), _: &()) -> bool { true }
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                Vec::new()
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
         }
 
         let mut recorder = TraceRecorder::new();
@@ -1686,17 +1694,22 @@ mod tests {
             type Env = ();
 
             fn build_meta(&self, _: usize, _: &()) -> () {}
-            fn extract_live(&self, _: &()) -> Vec<i64> { Vec::new() }
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                Vec::new()
+            }
             fn create_sym(_: &(), _: usize) -> () {}
-            fn is_compatible(&self, _: &()) -> bool { true }
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
             fn restore(&mut self, _: &(), _: &[i64]) {}
-            fn collect_jump_args(_: &()) -> Vec<OpRef> { Vec::new() }
-            fn validate_close(_: &(), _: &()) -> bool { true }
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                Vec::new()
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
 
-            fn sync_virtualizable_before_residual_call(
-                &self,
-                ctx: &mut TraceCtx,
-            ) {
+            fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 // Write field 0 to heap
                 ctx.vable_setfield(self.vable_ref, 0, self.field_val);
             }
@@ -1715,7 +1728,10 @@ mod tests {
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
-        let state = VableState { vable_ref: vable, field_val };
+        let state = VableState {
+            vable_ref: vable,
+            field_val,
+        };
 
         let (result, updated) = ctx.call_may_force_with_jitstate_sync_int(
             dummy_call_target as *const (),

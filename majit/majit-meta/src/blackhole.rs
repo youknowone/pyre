@@ -331,23 +331,39 @@ fn execute_one_with_memory(
         // ── Field access via descr offset ──
         OpCode::GetfieldGcI | OpCode::GetfieldRawI | OpCode::GetfieldGcPureI => {
             let base = resolve(values, op.args[0]);
-            let offset = op.descr.as_ref().and_then(|d| d.as_field_descr()).map_or(0, |f| f.offset() as i64);
+            let offset = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .map_or(0, |f| f.offset() as i64);
             OpResult::Value(memory.gc_load_i(base, offset))
         }
         OpCode::GetfieldGcR | OpCode::GetfieldRawR | OpCode::GetfieldGcPureR => {
             let base = resolve(values, op.args[0]);
-            let offset = op.descr.as_ref().and_then(|d| d.as_field_descr()).map_or(0, |f| f.offset() as i64);
+            let offset = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .map_or(0, |f| f.offset() as i64);
             OpResult::Value(memory.gc_load_r(base, offset))
         }
         OpCode::GetfieldGcF | OpCode::GetfieldRawF | OpCode::GetfieldGcPureF => {
             let base = resolve(values, op.args[0]);
-            let offset = op.descr.as_ref().and_then(|d| d.as_field_descr()).map_or(0, |f| f.offset() as i64);
+            let offset = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .map_or(0, |f| f.offset() as i64);
             OpResult::Value(memory.gc_load_f(base, offset))
         }
         OpCode::SetfieldGc | OpCode::SetfieldRaw => {
             let base = resolve(values, op.args[0]);
             let value = resolve(values, op.args[1]);
-            let offset = op.descr.as_ref().and_then(|d| d.as_field_descr()).map_or(0, |f| f.offset() as i64);
+            let offset = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .map_or(0, |f| f.offset() as i64);
             memory.gc_store(base, offset, value);
             OpResult::Void
         }
@@ -355,21 +371,30 @@ fn execute_one_with_memory(
         OpCode::GetarrayitemGcI | OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcPureI => {
             let base = resolve(values, op.args[0]);
             let index = resolve(values, op.args[1]);
-            let (item_size, base_ofs) = op.descr.as_ref().and_then(|d| d.as_array_descr())
+            let (item_size, base_ofs) = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_array_descr())
                 .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
             OpResult::Value(memory.gc_load_indexed_i(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcR | OpCode::GetarrayitemRawR | OpCode::GetarrayitemGcPureR => {
             let base = resolve(values, op.args[0]);
             let index = resolve(values, op.args[1]);
-            let (item_size, base_ofs) = op.descr.as_ref().and_then(|d| d.as_array_descr())
+            let (item_size, base_ofs) = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_array_descr())
                 .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
             OpResult::Value(memory.gc_load_indexed_r(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcF | OpCode::GetarrayitemRawF | OpCode::GetarrayitemGcPureF => {
             let base = resolve(values, op.args[0]);
             let index = resolve(values, op.args[1]);
-            let (item_size, base_ofs) = op.descr.as_ref().and_then(|d| d.as_array_descr())
+            let (item_size, base_ofs) = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_array_descr())
                 .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
             OpResult::Value(memory.gc_load_indexed_f(base, index, item_size, base_ofs))
         }
@@ -377,32 +402,47 @@ fn execute_one_with_memory(
             let base = resolve(values, op.args[0]);
             let index = resolve(values, op.args[1]);
             let value = resolve(values, op.args[2]);
-            let (item_size, base_ofs) = op.descr.as_ref().and_then(|d| d.as_array_descr())
+            let (item_size, base_ofs) = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_array_descr())
                 .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
             memory.gc_store_indexed(base, index, item_size, base_ofs, value);
             OpResult::Void
         }
         // Call with real dispatch (all call variants)
-        OpCode::CallI | OpCode::CallPureI | OpCode::CallMayForceI
-        | OpCode::CallReleaseGilI | OpCode::CallLoopinvariantI => {
+        OpCode::CallI
+        | OpCode::CallPureI
+        | OpCode::CallMayForceI
+        | OpCode::CallReleaseGilI
+        | OpCode::CallLoopinvariantI => {
             let func = resolve(values, op.args[0]);
             let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
             OpResult::Value(memory.call_i(func, &args))
         }
-        OpCode::CallR | OpCode::CallPureR | OpCode::CallMayForceR
-        | OpCode::CallReleaseGilR | OpCode::CallLoopinvariantR => {
+        OpCode::CallR
+        | OpCode::CallPureR
+        | OpCode::CallMayForceR
+        | OpCode::CallReleaseGilR
+        | OpCode::CallLoopinvariantR => {
             let func = resolve(values, op.args[0]);
             let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
             OpResult::Value(memory.call_r(func, &args))
         }
-        OpCode::CallF | OpCode::CallPureF | OpCode::CallMayForceF
-        | OpCode::CallReleaseGilF | OpCode::CallLoopinvariantF => {
+        OpCode::CallF
+        | OpCode::CallPureF
+        | OpCode::CallMayForceF
+        | OpCode::CallReleaseGilF
+        | OpCode::CallLoopinvariantF => {
             let func = resolve(values, op.args[0]);
             let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
             OpResult::Value(memory.call_f(func, &args))
         }
-        OpCode::CallN | OpCode::CallPureN | OpCode::CallMayForceN
-        | OpCode::CallReleaseGilN | OpCode::CallLoopinvariantN => {
+        OpCode::CallN
+        | OpCode::CallPureN
+        | OpCode::CallMayForceN
+        | OpCode::CallReleaseGilN
+        | OpCode::CallLoopinvariantN => {
             let func = resolve(values, op.args[0]);
             let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
             memory.call_n(func, &args);

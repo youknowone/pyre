@@ -506,10 +506,7 @@ impl MiniMarkGC {
         }
 
         let card_index = index >> card_page_shift;
-        self.card_dirty
-            .entry(obj.0)
-            .or_default()
-            .insert(card_index);
+        self.card_dirty.entry(obj.0).or_default().insert(card_index);
     }
 
     /// Check whether a specific card of an object is dirty.
@@ -1384,8 +1381,14 @@ mod tests {
         gc.do_write_barrier_card(obj, 5, DEFAULT_CARD_PAGE_SHIFT);
 
         // The card at index 5 >> 7 = 0 should be dirty.
-        assert!(gc.is_card_dirty(obj, 0), "card 0 should be dirty after writing index 5");
-        assert!(hdr.has_flag(flags::CARDS_SET), "CARDS_SET flag should be set");
+        assert!(
+            gc.is_card_dirty(obj, 0),
+            "card 0 should be dirty after writing index 5"
+        );
+        assert!(
+            hdr.has_flag(flags::CARDS_SET),
+            "CARDS_SET flag should be set"
+        );
 
         // Mark another index in a different card.
         gc.do_write_barrier_card(obj, 200, DEFAULT_CARD_PAGE_SHIFT);
@@ -1409,12 +1412,18 @@ mod tests {
         // Mark some cards.
         gc.do_write_barrier_card(obj, 0, DEFAULT_CARD_PAGE_SHIFT);
         gc.do_write_barrier_card(obj, 200, DEFAULT_CARD_PAGE_SHIFT);
-        assert!(!gc.card_dirty.is_empty(), "cards should be dirty before collection");
+        assert!(
+            !gc.card_dirty.is_empty(),
+            "cards should be dirty before collection"
+        );
 
         // Minor collection clears card table.
         gc.do_collect_nursery();
 
-        assert!(gc.card_dirty.is_empty(), "card table should be cleared after collection");
+        assert!(
+            gc.card_dirty.is_empty(),
+            "card table should be cleared after collection"
+        );
         let hdr = unsafe { header_of(obj.0) };
         assert!(
             !hdr.has_flag(flags::CARDS_SET),
@@ -1453,7 +1462,10 @@ mod tests {
 
         // Should fall back to full remembered set.
         assert_eq!(gc.remembered_set.len(), 1, "should add to remembered set");
-        assert!(gc.card_dirty.is_empty(), "should not mark cards without HAS_CARDS");
+        assert!(
+            gc.card_dirty.is_empty(),
+            "should not mark cards without HAS_CARDS"
+        );
     }
 
     #[test]
@@ -1475,7 +1487,10 @@ mod tests {
         gc.clear_cards(obj1.0);
 
         assert!(!gc.is_card_dirty(obj1, 0), "obj1 cards should be cleared");
-        assert!(gc.is_card_dirty(obj2, 0), "obj2 cards should still be dirty");
+        assert!(
+            gc.is_card_dirty(obj2, 0),
+            "obj2 cards should still be dirty"
+        );
     }
 
     // ── SafepointMap tests ──

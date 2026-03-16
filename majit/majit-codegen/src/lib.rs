@@ -869,10 +869,7 @@ mod tests {
         };
         let fail = descr.as_fail_descr().unwrap();
         assert_eq!(fail.fail_index(), 7);
-        assert_eq!(
-            fail.fail_arg_types(),
-            &[Type::Int, Type::Ref, Type::Float]
-        );
+        assert_eq!(fail.fail_arg_types(), &[Type::Int, Type::Ref, Type::Float]);
     }
 
     #[test]

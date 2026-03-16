@@ -39,7 +39,10 @@ impl QuasiImmut {
 
     /// Number of live watchers.
     pub fn num_watchers(&self) -> usize {
-        self.watchers.iter().filter(|w| w.strong_count() > 0).count()
+        self.watchers
+            .iter()
+            .filter(|w| w.strong_count() > 0)
+            .count()
     }
 }
 
