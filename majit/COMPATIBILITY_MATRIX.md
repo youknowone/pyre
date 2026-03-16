@@ -46,7 +46,7 @@ Resolved since last revision:
 
 Remaining gaps:
 
-1. **Static analyzer / translator**: `majit-analyze` now classifies 39/40 pyre opcode arms. Only the wildcard `other` arm remains unclassified. Remaining: complex CFG lowering within match arms (loop/while/for in arms emit compile_error instead of JitCode).
+1. **Static analyzer / translator**: `majit-analyze` classifies 39/40 pyre opcode arms. Complex CFG patterns (loop/while/for in match arms) now generate abort JitCode for interpreter fallback instead of compile_error, matching RPython's dont_look_inside semantics.
 2. **Cranelift backend**: arbitrary-depth multi-frame restore tested up to depth 50 with mixed types and virtual materialization. Infrastructure gap closed; remaining is E2E validation under real compiled interpreter stacks.
 
 ## Next Expansion
