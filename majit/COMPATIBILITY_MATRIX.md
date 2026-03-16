@@ -40,7 +40,7 @@ All 10 subsystems are `implemented`.
 
 No structural gaps remain. Breadth refinement areas:
 
-- **Static analyzer**: 39/40 pyre opcode arms classified. Complex CFG (loop/while/for in match arms) generates abort JitCode for interpreter fallback. Expanding to cover additional interpreter patterns would improve generated trace quality.
+- **Static analyzer**: 39/40 pyre opcode arms classified with 18 first-class TracePattern variants. Only `get_iter` and `make_function` remain Residual (matching RPython codewriter — these are genuine residual calls). Complex CFG generates abort JitCode for interpreter fallback.
 - **E2E validation**: arbitrary-depth multi-frame restore tested up to depth 50. Exercising under real compiled interpreter stacks (e.g., pyre recursive calls) would provide final confidence.
 
 ## Next Expansion
