@@ -1,6 +1,8 @@
 use std::cell::Cell;
 use std::sync::Once;
 
+use pyre_object::intobject::w_int_get_value;
+use pyre_object::pyobject::is_int;
 use pyre_object::PyObjectRef;
 use pyre_runtime::{
     PyResult, dispatch_callable, register_jit_function_caller, w_builtin_func_get,
@@ -27,6 +29,27 @@ pub(crate) fn set_inline_handled_result(result: PyObjectRef) {
 thread_local! {
     static FORCE_CACHE: Cell<[(usize, usize, i64); 2]> =
         const { Cell::new([(0, 0, 0); 2]) };
+}
+
+/// Compute a stable cache key for a Python argument.
+///
+/// For integers, uses the unboxed value so that different allocations
+/// of the same int value produce the same key. For other types, falls
+/// back to the object pointer address.
+#[inline]
+fn force_cache_arg_key(arg: PyObjectRef) -> usize {
+    if arg as usize == 0 {
+        return 0;
+    }
+    if unsafe { is_int(arg) } {
+        // Use the unboxed int value. Shift left by 1 and set bit 0
+        // to distinguish from pointer-based keys (pointers are aligned,
+        // so their bit 0 is always 0).
+        let v = unsafe { w_int_get_value(arg) };
+        ((v as usize) << 1) | 1
+    } else {
+        arg as usize
+    }
 }
 
 // ── Callee frame pool ────────────────────────────────────────────
@@ -140,7 +163,7 @@ extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 
     let code_key = frame.code as usize;
     let arg_key = if frame.locals_w.len() > 0 {
-        frame.locals_w[0] as usize
+        force_cache_arg_key(frame.locals_w[0])
     } else {
         0
     };
@@ -176,7 +199,93 @@ pub fn install_jit_call_bridge() {
     INSTALL.call_once(|| {
         register_jit_function_caller(jit_call_user_function_from_frame);
         majit_codegen_cranelift::register_call_assembler_force(jit_force_callee_frame);
+        majit_codegen_cranelift::register_call_assembler_bridge(jit_bridge_compile_callee);
     });
+}
+
+/// Bridge compilation callback for call_assembler guard failures.
+///
+/// When a guard in the callee's compiled trace fails enough times
+/// (>= DEFAULT_BRIDGE_THRESHOLD), this callback is invoked to compile
+/// a bridge. The bridge calls `jit_force_callee_frame` in compiled code,
+/// eliminating the Rust overhead of call_assembler_fast_path on
+/// subsequent guard failures.
+extern "C" fn jit_bridge_compile_callee(
+    frame_ptr: i64,
+    fail_index: u32,
+    trace_id: u64,
+    green_key: u64,
+) -> i64 {
+    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+    use std::collections::HashMap;
+
+    // 1. Run the interpreter to get the concrete result (same as force_fn)
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let result = match crate::eval::eval_loop_for_force(frame) {
+        Ok(r) => r as i64,
+        Err(e) => panic!("bridge force failed: {e}"),
+    };
+
+    // 2. Populate FORCE_CACHE with this result
+    let code_key = frame.code as usize;
+    let arg_key = if frame.locals_w.len() > 0 {
+        force_cache_arg_key(frame.locals_w[0])
+    } else {
+        0
+    };
+    let _ = FORCE_CACHE.try_with(|c| {
+        let mut entries = c.get();
+        entries[1] = entries[0];
+        entries[0] = (code_key, arg_key, result);
+        c.set(entries);
+    });
+
+    // 3. Build bridge IR: inputarg(frame_ptr) → call force_fn → FINISH
+    //    Function pointers are encoded as constants (first arg to CALL_I).
+    let bridge_inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let frame_opref = OpRef(0); // inputarg 0
+
+    // Constant for force_fn pointer
+    let force_fn_ptr = jit_force_callee_frame as *const () as i64;
+    let func_const_ref = OpRef(10_000); // constant OpRef
+    let mut constants: HashMap<u32, i64> = HashMap::new();
+    constants.insert(func_const_ref.0, force_fn_ptr);
+
+    // CALL_I(force_fn, frame_ptr) → result
+    let call_descr =
+        majit_meta::make_call_descr(&[Type::Int], Type::Int);
+    let call_result = OpRef(1);
+    let mut call_op = Op::with_descr(
+        OpCode::CallI,
+        &[func_const_ref, frame_opref],
+        call_descr,
+    );
+    call_op.pos = call_result;
+
+    // FINISH(result)
+    let finish_descr =
+        majit_meta::make_fail_descr_typed(vec![Type::Int]);
+    let mut finish_op = Op::with_descr(OpCode::Finish, &[call_result], finish_descr);
+    finish_op.pos = OpRef(2);
+
+    let bridge_ops = vec![call_op, finish_op];
+
+    // 4. Get the MetaInterp and compile the bridge
+    let driver = crate::eval::driver_pair();
+    let meta = driver.0.meta_interp_mut();
+
+    if let Some(fail_descr) = meta.get_fail_descr_for_bridge(green_key, trace_id, fail_index) {
+        meta.compile_bridge(
+            green_key,
+            fail_index,
+            fail_descr.as_ref(),
+            &bridge_ops,
+            &bridge_inputargs,
+            constants,
+        );
+    }
+
+    result
 }
 
 // ── Callee frame creation for call_assembler ─────────────────────
@@ -190,7 +299,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     // that the call_assembler shim recognizes as a pre-computed result.
     let code_key = code_ptr as usize;
     let arg_key = if !args.is_empty() {
-        args[0] as usize
+        force_cache_arg_key(args[0])
     } else {
         0
     };

@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 
-use majit_ir::{ArrayDescr, Descr, DescrRef, FieldDescr, Type};
+use majit_ir::{ArrayDescr, Descr, DescrRef, FieldDescr, SizeDescr, Type};
 
 const FIELD_DESCR_TAG: u32 = 0x1000_0000;
 const ARRAY_DESCR_TAG: u32 = 0x2000_0000;
+const SIZE_DESCR_TAG: u32 = 0x3000_0000;
 
 fn type_bits(tp: Type) -> u32 {
     match tp {
@@ -127,6 +128,41 @@ pub fn make_field_descr(
     })
 }
 
+/// Concrete size descriptor for fixed-size object allocations.
+#[derive(Debug)]
+pub struct PyreSizeDescr {
+    obj_size: usize,
+}
+
+impl Descr for PyreSizeDescr {
+    fn index(&self) -> u32 {
+        SIZE_DESCR_TAG | (self.obj_size as u32 & 0x0FFF_FFFF)
+    }
+
+    fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+        Some(self)
+    }
+}
+
+impl SizeDescr for PyreSizeDescr {
+    fn size(&self) -> usize {
+        self.obj_size
+    }
+
+    fn type_id(&self) -> u32 {
+        0
+    }
+
+    fn is_immutable(&self) -> bool {
+        false
+    }
+}
+
+/// Create a size descriptor for a fixed-size object.
+pub fn make_size_descr(obj_size: usize) -> DescrRef {
+    Arc::new(PyreSizeDescr { obj_size })
+}
+
 /// Create an array descriptor for a pointer-backed array field.
 pub fn make_array_descr(
     base_size: usize,
@@ -144,7 +180,9 @@ pub fn make_array_descr(
 
 // ── Range iterator field descriptors ─────────────────────────────────
 
-use pyre_object::floatobject::FLOAT_FLOATVAL_OFFSET;
+use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
+use pyre_object::intobject::W_IntObject;
+use pyre_object::pyobject::OB_TYPE_OFFSET;
 use pyre_object::rangeobject::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
 };
@@ -240,6 +278,23 @@ pub fn namespace_values_ptr_descr() -> DescrRef {
 
 pub fn namespace_values_len_descr() -> DescrRef {
     make_field_descr(PYNAMESPACE_VALUES_LEN_OFFSET, 8, Type::Int, false)
+}
+
+// ── Object header & allocation descriptors ──────────────────────────
+
+/// Field descriptor for ob_type (PyObject.ob_type pointer).
+pub fn ob_type_descr() -> DescrRef {
+    make_field_descr(OB_TYPE_OFFSET, 8, Type::Int, false)
+}
+
+/// Size descriptor for W_IntObject allocation via `New`.
+pub fn w_int_size_descr() -> DescrRef {
+    make_size_descr(std::mem::size_of::<W_IntObject>())
+}
+
+/// Size descriptor for W_FloatObject allocation via `New`.
+pub fn w_float_size_descr() -> DescrRef {
+    make_size_descr(std::mem::size_of::<W_FloatObject>())
 }
 
 #[cfg(test)]

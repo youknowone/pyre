@@ -5,18 +5,32 @@ use crate::{OptContext, OptimizationPass, PassResult};
 /// Chains multiple optimization passes and drives operations through them.
 use crate::{
     guard::OptGuard, heap::OptHeap, intbounds::OptIntBounds, pure::OptPure,
-    rewrite::OptRewrite, simplify::OptSimplify, virtualize::OptVirtualize, vstring::OptString,
+    rewrite::OptRewrite, simplify::OptSimplify,
+    virtualize::{OptVirtualize, VirtualizableConfig},
+    vstring::OptString,
 };
 use majit_ir::Op;
 
 /// The optimizer: chains passes and runs them over a trace.
 pub struct Optimizer {
     passes: Vec<Box<dyn OptimizationPass>>,
+    /// Final num_inputs after optimization (may increase if virtualizable
+    /// adds virtual input args).
+    final_num_inputs: usize,
 }
 
 impl Optimizer {
     pub fn new() -> Self {
-        Optimizer { passes: Vec::new() }
+        Optimizer {
+            passes: Vec::new(),
+            final_num_inputs: 0,
+        }
+    }
+
+    /// Get the final num_inputs after optimization.
+    /// May be larger than the original if virtualizable added virtual input args.
+    pub fn final_num_inputs(&self) -> usize {
+        self.final_num_inputs
     }
 
     /// Add an optimization pass to the chain.
@@ -57,7 +71,17 @@ impl Optimizer {
         num_inputs: usize,
     ) -> Vec<Op> {
         use majit_ir::{OpRef, Value};
-        let mut ctx = OptContext::with_num_inputs(ops.len(), num_inputs);
+        // Ensure new ops get positions beyond all original trace positions.
+        // Original ops keep their tracer-assigned positions; new ops (constants,
+        // force materializations) must not collide with them.
+        let max_pos = ops
+            .iter()
+            .map(|op| op.pos.0)
+            .filter(|&p| p != u32::MAX) // skip OpRef::NONE
+            .max()
+            .unwrap_or(0);
+        let effective_inputs = num_inputs.max((max_pos + 1) as usize);
+        let mut ctx = OptContext::with_num_inputs(ops.len(), effective_inputs);
 
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {
@@ -77,6 +101,65 @@ impl Optimizer {
         // Flush all passes
         for pass in &mut self.passes {
             pass.flush();
+        }
+
+        // final_num_inputs = original inputs + virtual inputs added by passes.
+        let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
+        self.final_num_inputs = num_inputs + num_virtual_inputs;
+
+        // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
+        // and all op positions are reassigned to start from final_num_inputs.
+        // This ensures no position collisions between input block params and ops.
+        if num_virtual_inputs > 0 {
+            let fni = self.final_num_inputs as u32;
+            let mut remap = std::collections::HashMap::new();
+
+            // Virtual input positions: optimizer used effective_inputs+k, backend needs num_inputs+k
+            for k in 0..num_virtual_inputs {
+                let opt_pos = (effective_inputs + k) as u32;
+                let be_pos = (num_inputs + k) as u32;
+                if opt_pos != be_pos {
+                    remap.insert(opt_pos, be_pos);
+                }
+            }
+
+            // Op positions: reassign to start from final_num_inputs
+            // to avoid collision with input positions 0..final_num_inputs
+            for (new_idx, op) in ctx.new_operations.iter_mut().enumerate() {
+                let new_pos = fni + new_idx as u32;
+                if op.pos.0 < fni && !op.pos.is_none() {
+                    remap.insert(op.pos.0, new_pos);
+                    op.pos = OpRef(new_pos);
+                }
+            }
+
+            // Apply remap to all args and fail_args
+            for op in &mut ctx.new_operations {
+                for arg in &mut op.args {
+                    if let Some(&new_pos) = remap.get(&arg.0) {
+                        *arg = OpRef(new_pos);
+                    }
+                }
+                if let Some(ref mut fail_args) = op.fail_args {
+                    for arg in fail_args.iter_mut() {
+                        if let Some(&new_pos) = remap.get(&arg.0) {
+                            *arg = OpRef(new_pos);
+                        }
+                    }
+                }
+            }
+
+            // Remap constants
+            let old_constants = std::mem::take(&mut ctx.constants);
+            for (idx, val) in old_constants.into_iter().enumerate() {
+                if let Some(v) = val {
+                    let target_idx = remap.get(&(idx as u32)).copied().unwrap_or(idx as u32) as usize;
+                    if target_idx >= ctx.constants.len() {
+                        ctx.constants.resize(target_idx + 1, None);
+                    }
+                    ctx.constants[target_idx] = Some(v);
+                }
+            }
         }
 
         // Export newly-discovered constants back to the caller's map.
@@ -136,6 +219,20 @@ impl Optimizer {
         opt.add_pass(Box::new(OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
         opt.add_pass(Box::new(OptVirtualize::new()));
+        opt.add_pass(Box::new(OptString::new()));
+        opt.add_pass(Box::new(OptPure::new()));
+        opt.add_pass(Box::new(OptGuard::new()));
+        opt.add_pass(Box::new(OptSimplify::new()));
+        opt.add_pass(Box::new(OptHeap::new()));
+        opt
+    }
+
+    /// Create an optimizer with virtualizable config for frame field tracking.
+    pub fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
+        let mut opt = Self::new();
+        opt.add_pass(Box::new(OptIntBounds::new()));
+        opt.add_pass(Box::new(OptRewrite::new()));
+        opt.add_pass(Box::new(OptVirtualize::with_virtualizable(config)));
         opt.add_pass(Box::new(OptString::new()));
         opt.add_pass(Box::new(OptPure::new()));
         opt.add_pass(Box::new(OptGuard::new()));

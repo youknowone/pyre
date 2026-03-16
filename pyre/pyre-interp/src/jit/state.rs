@@ -22,10 +22,9 @@ use pyre_object::pyobject::{
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::strobject::is_str;
 use pyre_object::{
-    jit_w_int_new, w_bool_from, w_int_get_value, w_list_can_append_without_realloc,
+    w_bool_from, w_int_get_value, w_list_can_append_without_realloc,
     w_int_new, w_list_is_inline_storage, w_list_len, w_str_get_value, w_tuple_len,
 };
-use pyre_object::floatobject::jit_w_float_new;
 use pyre_objspace::truth_value as objspace_truth_value;
 use pyre_runtime::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
@@ -38,9 +37,9 @@ use pyre_runtime::{
 use crate::jit::descr::{
     bool_boolval_descr, dict_len_descr, float_floatval_descr, int_intval_descr,
     list_items_heap_cap_descr, list_items_len_descr, list_items_ptr_descr, make_array_descr,
-    make_field_descr, namespace_values_len_descr, namespace_values_ptr_descr,
+    make_field_descr, namespace_values_len_descr, namespace_values_ptr_descr, ob_type_descr,
     range_iter_current_descr, range_iter_step_descr, range_iter_stop_descr, str_len_descr,
-    tuple_items_len_descr, tuple_items_ptr_descr,
+    tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr, w_int_size_descr,
 };
 use crate::jit::frame_layout::{
     PYFRAME_LOCALS_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
@@ -72,27 +71,46 @@ pub struct PyreMeta {
     pub ns_keys: Vec<String>,
     /// Stack depth at the merge point.
     pub stack_depth: usize,
+    /// Whether the optimizer uses the virtualizable mechanism.
+    /// When true, guard fail_args follow the layout:
+    ///   [frame, next_instr, stack_depth, locals_len, l0..lN, stack_len, s0..sM]
+    pub has_virtualizable: bool,
 }
 
 /// Symbolic state during tracing.
 ///
-/// `frame` maps to a live IR `OpRef`. Fast locals live only in the concrete
-/// and virtualizable `PyFrame`; the symbolic side is now just the live frame
-/// handle carried through trace recording.
+/// `frame` maps to a live IR `OpRef`. Symbolic frame field tracking
+/// (locals, stack, stack_depth, next_instr) persists across instructions
+/// to avoid emitting redundant IR ops. Only dirty values are flushed
+/// to the concrete frame before guards and at loop close.
 pub struct PyreSym {
     /// OpRef for the owning PyFrame pointer.
     pub frame: OpRef,
+    // ── Persistent symbolic frame field tracking ──
+    // These fields survive across per-instruction TraceFrameState lifetimes.
+    pub(crate) symbolic_locals: Vec<OpRef>,
+    pub(crate) symbolic_stack: Vec<OpRef>,
+    pub(crate) dirty_locals: Vec<bool>,
+    pub(crate) dirty_stack: Vec<bool>,
+    pub(crate) dirty_stack_depth: bool,
+    pub(crate) pending_next_instr: Option<usize>,
+    pub(crate) locals_array_ref: OpRef,
+    pub(crate) stack_array_ref: OpRef,
+    pub(crate) stack_depth: usize,
+    pub(crate) symbolic_initialized: bool,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
 ///
-/// This owns the trace-local stack-depth cursor while all live locals/stack
-/// values remain in the concrete + virtualizable frame arrays.
+/// Per-instruction wrapper that borrows persistent symbolic state from
+/// `PyreSym` via raw pointer. The symbolic tracking (locals, stack,
+/// stack_depth, next_instr) lives in PyreSym and survives across
+/// instructions; this struct provides the per-instruction context
+/// (ctx, fallthrough_pc, concrete_frame).
 pub(crate) struct TraceFrameState {
     ctx: *mut TraceCtx,
-    frame: OpRef,
+    sym: *mut PyreSym,
     concrete_frame: usize,
-    stack_depth: usize,
     ob_type_fd: DescrRef,
     fallthrough_pc: usize,
 }
@@ -251,23 +269,62 @@ pub(crate) fn record_current_state_guard(
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
 
+impl PyreSym {
+    pub(crate) fn new_uninit(frame: OpRef) -> Self {
+        Self {
+            frame,
+            symbolic_locals: Vec::new(),
+            symbolic_stack: Vec::new(),
+            dirty_locals: Vec::new(),
+            dirty_stack: Vec::new(),
+            dirty_stack_depth: false,
+            pending_next_instr: None,
+            locals_array_ref: OpRef::NONE,
+            stack_array_ref: OpRef::NONE,
+            stack_depth: 0,
+            symbolic_initialized: false,
+        }
+    }
+
+    /// Initialize symbolic tracking state on first trace instruction.
+    /// Subsequent calls are no-ops (state persists across instructions).
+    pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
+        if self.symbolic_initialized {
+            return;
+        }
+        let nlocals = concrete_locals_len(concrete_frame).unwrap_or(0);
+        let stack_depth = concrete_stack_depth(concrete_frame).unwrap_or(0);
+        self.locals_array_ref = frame_locals_array(ctx, self.frame);
+        self.stack_array_ref = frame_stack_array(ctx, self.frame);
+        self.symbolic_locals = vec![OpRef::NONE; nlocals];
+        self.symbolic_stack = vec![OpRef::NONE; stack_depth];
+        self.dirty_locals = vec![false; nlocals];
+        self.dirty_stack = vec![false; stack_depth];
+        self.dirty_stack_depth = false;
+        self.pending_next_instr = None;
+        self.stack_depth = stack_depth;
+        self.symbolic_initialized = true;
+    }
+}
+
 impl TraceFrameState {
-    pub(crate) fn from_concrete(
+    pub(crate) fn from_sym(
         ctx: &mut TraceCtx,
-        frame: OpRef,
+        sym: &mut PyreSym,
         concrete_frame: usize,
         fallthrough_pc: usize,
     ) -> Self {
         debug_assert!(concrete_frame != 0, "concrete_frame must be a valid frame pointer");
+        sym.init_symbolic(ctx, concrete_frame);
         Self {
             ctx,
-            frame,
+            sym,
             concrete_frame,
-            stack_depth: concrete_stack_depth(concrete_frame).unwrap_or(0),
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc,
         }
     }
+
 
     pub(crate) fn ctx(&mut self) -> &mut TraceCtx {
         unsafe { &mut *self.ctx }
@@ -278,93 +335,126 @@ impl TraceFrameState {
         unsafe { f(self, &mut *ctx) }
     }
 
-    pub(crate) fn frame(&self) -> OpRef {
-        self.frame
+    #[inline]
+    fn sym(&self) -> &PyreSym {
+        unsafe { &*self.sym }
     }
 
-    pub(crate) fn push_value(&mut self, ctx: &mut TraceCtx, value: OpRef) {
-        let stack_array = frame_stack_array(ctx, self.frame);
-        let idx = ctx.const_int(self.stack_depth as i64);
-        trace_vable_array_setitem_value(ctx, stack_array, idx, value);
-        self.stack_depth += 1;
-        let depth = ctx.const_int(self.stack_depth as i64);
-        frame_set_stack_depth(ctx, self.frame, depth);
+    #[inline]
+    fn sym_mut(&mut self) -> &mut PyreSym {
+        unsafe { &mut *self.sym }
+    }
+
+    pub(crate) fn frame(&self) -> OpRef {
+        self.sym().frame
+    }
+
+    pub(crate) fn push_value(&mut self, _ctx: &mut TraceCtx, value: OpRef) {
+        let s = self.sym_mut();
+        let idx = s.stack_depth;
+        if idx >= s.symbolic_stack.len() {
+            s.symbolic_stack.resize(idx + 1, OpRef::NONE);
+            s.dirty_stack.resize(idx + 1, false);
+        }
+        s.symbolic_stack[idx] = value;
+        s.dirty_stack[idx] = true;
+        s.stack_depth += 1;
+        s.dirty_stack_depth = true;
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
-        let top_idx = self
+        let s = self.sym_mut();
+        let top_idx = s
             .stack_depth
             .checked_sub(1)
             .ok_or_else(|| pyre_runtime::stack_underflow_error("trace opcode"))?;
-        let stack_array = frame_stack_array(ctx, self.frame);
-        let idx = ctx.const_int(top_idx as i64);
-        let value = trace_array_getitem_value(ctx, stack_array, idx);
-        self.stack_depth -= 1;
-        let depth = ctx.const_int(self.stack_depth as i64);
-        frame_set_stack_depth(ctx, self.frame, depth);
+        if s.symbolic_stack[top_idx] == OpRef::NONE {
+            let idx_const = ctx.const_int(top_idx as i64);
+            s.symbolic_stack[top_idx] =
+                trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+        }
+        let value = s.symbolic_stack[top_idx];
+        s.stack_depth -= 1;
+        s.dirty_stack_depth = true;
         Ok(value)
     }
 
-    pub(crate) fn peek_value(&self, ctx: &mut TraceCtx, depth: usize) -> Result<OpRef, PyError> {
-        let idx = self
+    pub(crate) fn peek_value(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<OpRef, PyError> {
+        let s = self.sym_mut();
+        let idx = s
             .stack_depth
             .checked_sub(depth + 1)
             .ok_or_else(|| pyre_runtime::stack_underflow_error("trace peek"))?;
-        let stack_array = frame_stack_array(ctx, self.frame);
-        let idx = ctx.const_int(idx as i64);
-        Ok(trace_array_getitem_value(ctx, stack_array, idx))
+        if s.symbolic_stack[idx] == OpRef::NONE {
+            let idx_const = ctx.const_int(idx as i64);
+            s.symbolic_stack[idx] =
+                trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+        }
+        Ok(s.symbolic_stack[idx])
     }
 
-    pub(crate) fn swap_values(&self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
-        if depth == 0 || self.stack_depth < depth {
+    pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
+        let s = self.sym_mut();
+        if depth == 0 || s.stack_depth < depth {
             return Err(PyError::type_error("stack underflow during trace swap"));
         }
-        let top_idx = self.stack_depth - 1;
-        let other_idx = self.stack_depth - depth;
-        let stack_array = frame_stack_array(ctx, self.frame);
-        let top_const = ctx.const_int(top_idx as i64);
-        let other_const = ctx.const_int(other_idx as i64);
-        let top_value = trace_array_getitem_value(ctx, stack_array, top_const);
-        let other_value = trace_array_getitem_value(ctx, stack_array, other_const);
-        trace_vable_array_setitem_value(ctx, stack_array, top_const, other_value);
-        trace_vable_array_setitem_value(ctx, stack_array, other_const, top_value);
+        let top_idx = s.stack_depth - 1;
+        let other_idx = s.stack_depth - depth;
+        if s.symbolic_stack[top_idx] == OpRef::NONE {
+            let idx_const = ctx.const_int(top_idx as i64);
+            s.symbolic_stack[top_idx] =
+                trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+        }
+        if s.symbolic_stack[other_idx] == OpRef::NONE {
+            let idx_const = ctx.const_int(other_idx as i64);
+            s.symbolic_stack[other_idx] =
+                trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+        }
+        s.symbolic_stack.swap(top_idx, other_idx);
+        s.dirty_stack[top_idx] = true;
+        s.dirty_stack[other_idx] = true;
         Ok(())
     }
 
     pub(crate) fn load_local_value(
-        &self,
+        &mut self,
         ctx: &mut TraceCtx,
         idx: usize,
     ) -> Result<OpRef, PyError> {
-        if idx >= concrete_locals_len(self.concrete_frame).unwrap_or(0) {
+        let s = self.sym_mut();
+        if idx >= s.symbolic_locals.len() {
             return Err(PyError::type_error("local index out of range in trace"));
         }
-        let idx_const = ctx.const_int(idx as i64);
-        let locals_array = frame_locals_array(ctx, self.frame);
-        Ok(trace_array_getitem_value(ctx, locals_array, idx_const))
+        if s.symbolic_locals[idx] == OpRef::NONE {
+            let idx_const = ctx.const_int(idx as i64);
+            s.symbolic_locals[idx] =
+                trace_array_getitem_value(ctx, s.locals_array_ref, idx_const);
+        }
+        Ok(s.symbolic_locals[idx])
     }
 
     pub(crate) fn store_local_value(
-        &self,
-        ctx: &mut TraceCtx,
+        &mut self,
+        _ctx: &mut TraceCtx,
         idx: usize,
         value: OpRef,
     ) -> Result<(), PyError> {
-        if idx >= concrete_locals_len(self.concrete_frame).unwrap_or(0) {
+        let s = self.sym_mut();
+        if idx >= s.symbolic_locals.len() {
             return Err(PyError::type_error("local index out of range in trace"));
         }
-        let locals_array = frame_locals_array(ctx, self.frame);
-        let idx_const = ctx.const_int(idx as i64);
-        trace_vable_array_setitem_value(ctx, locals_array, idx_const, value);
+        s.symbolic_locals[idx] = value;
+        s.dirty_locals[idx] = true;
         Ok(())
     }
 
     pub(crate) fn load_namespace_value(
-        &self,
+        &mut self,
         ctx: &mut TraceCtx,
         idx: usize,
     ) -> Result<OpRef, PyError> {
-        let namespace = frame_namespace_ptr(ctx, self.frame);
+        let frame = self.sym().frame;
+        let namespace = frame_namespace_ptr(ctx, frame);
         let len = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
@@ -381,12 +471,13 @@ impl TraceFrameState {
     }
 
     pub(crate) fn store_namespace_value(
-        &self,
+        &mut self,
         ctx: &mut TraceCtx,
         idx: usize,
         value: OpRef,
     ) -> Result<(), PyError> {
-        let namespace = frame_namespace_ptr(ctx, self.frame);
+        let frame = self.sym().frame;
+        let namespace = frame_namespace_ptr(ctx, frame);
         let len = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
@@ -403,9 +494,8 @@ impl TraceFrameState {
         Ok(())
     }
 
-    pub(crate) fn set_next_instr(&self, ctx: &mut TraceCtx, target: usize) {
-        let target = ctx.const_int(target as i64);
-        frame_set_next_instr(ctx, self.frame, target);
+    pub(crate) fn set_next_instr(&mut self, _ctx: &mut TraceCtx, target: usize) {
+        self.sym_mut().pending_next_instr = Some(target);
     }
 
     pub(crate) fn fallthrough_pc(&self) -> usize {
@@ -413,28 +503,69 @@ impl TraceFrameState {
     }
 
     pub(crate) fn prepare_fallthrough(&mut self) {
-        self.with_ctx(|this, ctx| TraceFrameState::set_next_instr(this, ctx, this.fallthrough_pc));
+        self.sym_mut().pending_next_instr = Some(self.fallthrough_pc);
     }
 
-    pub(crate) fn close_loop_args(&self, ctx: &mut TraceCtx) -> Vec<OpRef> {
-        let _ = ctx;
-        vec![self.frame]
+    /// Flush all dirty symbolic state to the concrete frame via IR ops.
+    /// Called before guards and at loop close to ensure frame consistency.
+    pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
+        let s = self.sym_mut();
+        for i in 0..s.dirty_locals.len() {
+            if s.dirty_locals[i] {
+                let idx = ctx.const_int(i as i64);
+                trace_vable_array_setitem_value(
+                    ctx,
+                    s.locals_array_ref,
+                    idx,
+                    s.symbolic_locals[i],
+                );
+                s.dirty_locals[i] = false;
+            }
+        }
+        for i in 0..s.stack_depth.min(s.dirty_stack.len()) {
+            if s.dirty_stack[i] {
+                let idx = ctx.const_int(i as i64);
+                trace_vable_array_setitem_value(
+                    ctx,
+                    s.stack_array_ref,
+                    idx,
+                    s.symbolic_stack[i],
+                );
+                s.dirty_stack[i] = false;
+            }
+        }
+        if s.dirty_stack_depth {
+            let depth = ctx.const_int(s.stack_depth as i64);
+            frame_set_stack_depth(ctx, s.frame, depth);
+            s.dirty_stack_depth = false;
+        }
+        if let Some(pc) = s.pending_next_instr.take() {
+            let target = ctx.const_int(pc as i64);
+            frame_set_next_instr(ctx, s.frame, target);
+        }
     }
 
-    pub(crate) fn record_guard(&self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
-        record_current_state_guard(ctx, self.frame, opcode, args);
+    pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
+        self.flush_to_frame(ctx);
+        vec![self.sym().frame]
     }
 
-    pub(crate) fn guard_value(&self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
+    pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
+        self.flush_to_frame(ctx);
+        let frame = self.sym().frame;
+        record_current_state_guard(ctx, frame, opcode, args);
+    }
+
+    pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
         let expected = ctx.const_int(expected);
         self.record_guard(ctx, OpCode::GuardValue, &[value, expected]);
     }
 
-    pub(crate) fn guard_nonnull(&self, ctx: &mut TraceCtx, value: OpRef) {
+    pub(crate) fn guard_nonnull(&mut self, ctx: &mut TraceCtx, value: OpRef) {
         self.record_guard(ctx, OpCode::GuardNonnull, &[value]);
     }
 
-    pub(crate) fn guard_range_iter(&self, ctx: &mut TraceCtx, obj: OpRef) {
+    pub(crate) fn guard_range_iter(&mut self, ctx: &mut TraceCtx, obj: OpRef) {
         let range_iter_type_ptr = &RANGE_ITER_TYPE as *const PyType as usize as i64;
         let actual_type =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
@@ -442,7 +573,7 @@ impl TraceFrameState {
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected]);
     }
 
-    pub(crate) fn record_for_iter_guard(&self, ctx: &mut TraceCtx, next: OpRef, continues: bool) {
+    pub(crate) fn record_for_iter_guard(&mut self, ctx: &mut TraceCtx, next: OpRef, continues: bool) {
         let opcode = if continues {
             OpCode::GuardNonnull
         } else {
@@ -452,7 +583,7 @@ impl TraceFrameState {
     }
 
     pub(crate) fn record_branch_guard(
-        &self,
+        &mut self,
         ctx: &mut TraceCtx,
         truth: OpRef,
         concrete_truth: bool,
@@ -466,49 +597,51 @@ impl TraceFrameState {
     }
 
     fn concrete_popped_value(&self) -> Option<PyObjectRef> {
-        concrete_stack_value(self.concrete_frame, self.stack_depth)
+        concrete_stack_value(self.concrete_frame, self.sym().stack_depth)
     }
 
     fn concrete_binary_operands(&self) -> Option<(PyObjectRef, PyObjectRef)> {
+        let sd = self.sym().stack_depth;
         Some((
-            concrete_stack_value(self.concrete_frame, self.stack_depth)?,
-            concrete_stack_value(self.concrete_frame, self.stack_depth + 1)?,
+            concrete_stack_value(self.concrete_frame, sd)?,
+            concrete_stack_value(self.concrete_frame, sd + 1)?,
         ))
     }
 
     fn concrete_store_subscr_operands(&self) -> Option<(PyObjectRef, PyObjectRef, PyObjectRef)> {
+        let sd = self.sym().stack_depth;
         Some((
-            concrete_stack_value(self.concrete_frame, self.stack_depth)?,
-            concrete_stack_value(self.concrete_frame, self.stack_depth + 1)?,
-            concrete_stack_value(self.concrete_frame, self.stack_depth + 2)?,
+            concrete_stack_value(self.concrete_frame, sd)?,
+            concrete_stack_value(self.concrete_frame, sd + 1)?,
+            concrete_stack_value(self.concrete_frame, sd + 2)?,
         ))
     }
 
-    fn guard_int_object_value(&self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
+    fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
         self.guard_object_class(ctx, int_obj, &INT_TYPE as *const PyType);
         let actual_value =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[int_obj], int_intval_descr());
         self.guard_value(ctx, actual_value, expected);
     }
 
-    fn guard_object_class(&self, ctx: &mut TraceCtx, obj: OpRef, expected_type: *const PyType) {
+    fn guard_object_class(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected_type: *const PyType) {
         let actual_type =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
         let expected_type = ctx.const_int(expected_type as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
     }
 
-    fn trace_guarded_int_payload(&self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
+    fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
         self.guard_object_class(ctx, int_obj, &INT_TYPE as *const PyType);
         ctx.record_op_with_descr(OpCode::GetfieldRawI, &[int_obj], int_intval_descr())
     }
 
-    fn trace_guarded_bool_payload(&self, ctx: &mut TraceCtx, bool_obj: OpRef) -> OpRef {
+    fn trace_guarded_bool_payload(&mut self, ctx: &mut TraceCtx, bool_obj: OpRef) -> OpRef {
         self.guard_object_class(ctx, bool_obj, &BOOL_TYPE as *const PyType);
         ctx.record_op_with_descr(OpCode::GetfieldRawI, &[bool_obj], bool_boolval_descr())
     }
 
-    fn trace_guarded_float_payload(&self, ctx: &mut TraceCtx, float_obj: OpRef) -> OpRef {
+    fn trace_guarded_float_payload(&mut self, ctx: &mut TraceCtx, float_obj: OpRef) -> OpRef {
         self.guard_object_class(ctx, float_obj, &FLOAT_TYPE as *const PyType);
         ctx.record_op_with_descr(OpCode::GetfieldRawF, &[float_obj], float_floatval_descr())
     }
@@ -548,26 +681,34 @@ impl TraceFrameState {
         value: OpRef,
         _concrete_value: i64,
     ) -> OpRef {
-        ctx.call_int(jit_w_int_new as *const (), &[value])
+        let obj = ctx.record_op_with_descr(OpCode::New, &[], w_int_size_descr());
+        let type_ptr = ctx.const_int(&INT_TYPE as *const PyType as usize as i64);
+        ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, type_ptr], ob_type_descr());
+        ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, value], int_intval_descr());
+        obj
     }
 
     fn trace_boxed_float_value(&self, ctx: &mut TraceCtx, value: OpRef) -> OpRef {
         let bits = ctx.record_op(OpCode::ConvertFloatBytesToLonglong, &[value]);
-        ctx.call_int(jit_w_float_new as *const (), &[bits])
+        let obj = ctx.record_op_with_descr(OpCode::New, &[], w_float_size_descr());
+        let type_ptr = ctx.const_int(&FLOAT_TYPE as *const PyType as usize as i64);
+        ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, type_ptr], ob_type_descr());
+        ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, bits], float_floatval_descr());
+        obj
     }
 
-    fn guard_len_gt_index(&self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
+    fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
         let index = ctx.const_int(index as i64);
         let in_bounds = ctx.record_op(OpCode::IntGt, &[len, index]);
         self.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
     }
 
-    fn guard_len_eq(&self, ctx: &mut TraceCtx, len: OpRef, expected: usize) {
+    fn guard_len_eq(&mut self, ctx: &mut TraceCtx, len: OpRef, expected: usize) {
         self.guard_value(ctx, len, expected as i64);
     }
 
     fn trace_direct_list_or_tuple_getitem(
-        &self,
+        &mut self,
         ctx: &mut TraceCtx,
         obj: OpRef,
         key: OpRef,
@@ -589,7 +730,7 @@ impl TraceFrameState {
     }
 
     fn trace_direct_negative_list_or_tuple_getitem(
-        &self,
+        &mut self,
         ctx: &mut TraceCtx,
         obj: OpRef,
         key: OpRef,
@@ -613,7 +754,7 @@ impl TraceFrameState {
     }
 
     fn trace_unpack_known_sequence(
-        &self,
+        &mut self,
         ctx: &mut TraceCtx,
         seq: OpRef,
         count: usize,
@@ -1055,17 +1196,17 @@ impl TraceFrameState {
     }
 
     pub(crate) fn concrete_iter_continues(&self) -> Result<bool, PyError> {
-        let concrete_iter = concrete_stack_value(self.concrete_frame, self.stack_depth - 1)
+        let concrete_iter = concrete_stack_value(self.concrete_frame, self.sym().stack_depth - 1)
             .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
         range_iter_continues(concrete_iter)
     }
 
     fn concrete_callable_after_pops(&self) -> Option<PyObjectRef> {
-        concrete_stack_value(self.concrete_frame, self.stack_depth)
+        concrete_stack_value(self.concrete_frame, self.sym().stack_depth)
     }
 
     fn concrete_call_arg_after_pops(&self, arg_idx: usize) -> Option<PyObjectRef> {
-        concrete_stack_value(self.concrete_frame, self.stack_depth + 2 + arg_idx)
+        concrete_stack_value(self.concrete_frame, self.sym().stack_depth + 2 + arg_idx)
     }
 
     fn direct_len_value(&mut self, callable: OpRef, value: OpRef) -> Result<OpRef, PyError> {
@@ -1375,7 +1516,7 @@ impl TraceFrameState {
     }
 
     pub(crate) fn iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
-        let concrete_iter = concrete_stack_value(self.concrete_frame, self.stack_depth - 1)
+        let concrete_iter = concrete_stack_value(self.concrete_frame, self.sym().stack_depth - 1)
             .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step =
@@ -1426,7 +1567,7 @@ impl TraceFrameState {
     }
 
     pub(crate) fn concrete_branch_truth(&self) -> Result<bool, PyError> {
-        let concrete_val = concrete_stack_value(self.concrete_frame, self.stack_depth)
+        let concrete_val = concrete_stack_value(self.concrete_frame, self.sym().stack_depth)
             .ok_or_else(|| PyError::type_error("missing concrete branch value during trace"))?;
         Ok(objspace_truth_value(concrete_val))
     }
@@ -1586,8 +1727,9 @@ impl TraceFrameState {
             let globals = unsafe { pyre_runtime::w_func_get_globals(concrete_callable) };
             let func_code = code_ptr as *const CodeObject;
             let nargs = args.len();
+            let sd = this.sym().stack_depth;
             let concrete_args: Vec<PyObjectRef> = (0..nargs)
-                .map(|i| concrete_stack_value(this.concrete_frame, this.stack_depth - nargs + i)
+                .map(|i| concrete_stack_value(this.concrete_frame, sd - nargs + i)
                     .unwrap_or(std::ptr::null_mut()))
                 .collect();
             let mut callee_frame = crate::frame::PyFrame::new_for_call(
@@ -1651,6 +1793,7 @@ fn inline_trace_and_execute(
 
     let code = unsafe { &*callee.code };
     let mut arg_state = OpArgState::default();
+    let mut callee_sym = PyreSym::new_uninit(callee_frame_opref);
 
     loop {
         let pc = callee.next_instr;
@@ -1661,9 +1804,9 @@ fn inline_trace_and_execute(
         }
 
         // ── TRACE: record IR for this instruction ──
-        let mut frame_state = TraceFrameState::from_concrete(
+        let mut frame_state = TraceFrameState::from_sym(
             ctx,
-            callee_frame_opref,
+            &mut callee_sym,
             callee as *const _ as usize,
             pc + 1,
         );
@@ -2025,6 +2168,12 @@ impl OpcodeStepExecutor for TraceFrameState {
 }
 
 impl PyreJitState {
+    /// Returns true if the optimizer virtualizable mechanism is active.
+    fn has_virtualizable_info(&self) -> bool {
+        // pyre always uses virtualizable (JitDriverDescriptor::with_virtualizable)
+        true
+    }
+
     fn frame_ptr(&self) -> Option<*mut u8> {
         (self.frame != 0).then_some(self.frame as *mut u8)
     }
@@ -2155,6 +2304,46 @@ impl PyreJitState {
         true
     }
 
+    /// Restore from virtualizable fail_args format:
+    ///   [frame, next_instr, stack_depth, locals_len, l0..lN, stack_len, s0..sM]
+    fn restore_virtualizable_i64(&mut self, values: &[i64]) {
+        let mut idx = 1;
+
+        // Static fields: next_instr, stack_depth
+        if idx < values.len() {
+            self.next_instr = values[idx] as usize;
+            idx += 1;
+        }
+        if idx < values.len() {
+            self.stack_depth = values[idx] as usize;
+            idx += 1;
+        }
+
+        // Locals array
+        if idx < values.len() {
+            let locals_len = values[idx] as usize;
+            idx += 1;
+            for i in 0..locals_len {
+                if idx < values.len() {
+                    let _ = self.set_local_at(i, values[idx] as PyObjectRef);
+                    idx += 1;
+                }
+            }
+        }
+
+        // Stack array
+        if idx < values.len() {
+            let stack_len = values[idx] as usize;
+            idx += 1;
+            for i in 0..stack_len {
+                if idx < values.len() {
+                    let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
+                    idx += 1;
+                }
+            }
+        }
+    }
+
     fn import_virtualizable_state(
         &mut self,
         static_boxes: &[i64],
@@ -2258,6 +2447,7 @@ impl JitState for PyreJitState {
             num_locals: self.local_count(),
             ns_keys: self.namespace_keys(),
             stack_depth: self.stack_depth,
+            has_virtualizable: self.has_virtualizable_info(),
         }
     }
 
@@ -2267,7 +2457,7 @@ impl JitState for PyreJitState {
 
     fn create_sym(meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
         let _ = meta;
-        PyreSym { frame: OpRef(0) }
+        PyreSym::new_uninit(OpRef(0))
     }
 
     fn driver_descriptor(&self, meta: &Self::Meta) -> Option<JitDriverDescriptor> {
@@ -2282,7 +2472,7 @@ impl JitState for PyreJitState {
             && self.stack_depth == meta.stack_depth
     }
 
-    fn restore(&mut self, _meta: &Self::Meta, values: &[i64]) {
+    fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
         let Some(&frame) = values.first() else {
             return;
         };
@@ -2292,14 +2482,20 @@ impl JitState for PyreJitState {
             return;
         }
 
-        let mut idx = 1;
-        for local_idx in 0..self.local_count() {
-            let _ = self.set_local_at(local_idx, values[idx] as PyObjectRef);
-            idx += 1;
-        }
-        for i in 0..self.stack_depth {
-            let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
-            idx += 1;
+        if meta.has_virtualizable {
+            // Virtualizable format:
+            //   [frame, next_instr, stack_depth, locals_len, l0..lN, stack_len, s0..sM]
+            self.restore_virtualizable_i64(values);
+        } else {
+            let mut idx = 1;
+            for local_idx in 0..self.local_count() {
+                let _ = self.set_local_at(local_idx, values[idx] as PyObjectRef);
+                idx += 1;
+            }
+            for i in 0..self.stack_depth {
+                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
+                idx += 1;
+            }
         }
         let _ = self.sync_scalar_fields_to_frame();
     }
@@ -2314,17 +2510,30 @@ impl JitState for PyreJitState {
             return;
         }
 
-        let mut idx = 1;
-        for local_idx in 0..self.local_count() {
-            let _ = self.set_local_at(local_idx, value_to_ptr(&values[idx]));
-            idx += 1;
+        if meta.has_virtualizable {
+            // Virtualizable format
+            let ints: Vec<i64> = values
+                .iter()
+                .map(|v| match v {
+                    Value::Int(i) => *i,
+                    Value::Ref(r) => r.as_usize() as i64,
+                    _ => 0,
+                })
+                .collect();
+            self.restore_virtualizable_i64(&ints);
+        } else {
+            let mut idx = 1;
+            for local_idx in 0..self.local_count() {
+                let _ = self.set_local_at(local_idx, value_to_ptr(&values[idx]));
+                idx += 1;
+            }
+            let stack_depth = meta.stack_depth;
+            for i in 0..stack_depth {
+                let _ = self.set_stack_at(i, value_to_ptr(&values[idx]));
+                idx += 1;
+            }
+            self.stack_depth = stack_depth;
         }
-        let stack_depth = meta.stack_depth;
-        for i in 0..stack_depth {
-            let _ = self.set_stack_at(i, value_to_ptr(&values[idx]));
-            idx += 1;
-        }
-        self.stack_depth = stack_depth;
         let _ = self.sync_scalar_fields_to_frame();
     }
 
