@@ -305,6 +305,22 @@ mod tests {
             "missing IterCleanup pattern"
         );
         assert!(pattern_str.contains("Noop"), "missing Noop pattern");
+        assert!(
+            pattern_str.contains("BuildCollection"),
+            "missing BuildCollection pattern"
+        );
+        assert!(
+            pattern_str.contains("UnpackSequence"),
+            "missing UnpackSequence pattern"
+        );
+        assert!(
+            pattern_str.contains("SequenceSetitem"),
+            "missing SequenceSetitem pattern"
+        );
+        assert!(
+            pattern_str.contains("CollectionAppend"),
+            "missing CollectionAppend pattern"
+        );
     }
 
     #[test]
@@ -325,6 +341,8 @@ mod tests {
         assert!(code.contains("NamespaceAccess"), "missing NamespaceAccess");
         assert!(code.contains("IterCleanup"), "missing IterCleanup");
         assert!(code.contains("Noop"), "missing Noop");
+        assert!(code.contains("BuildCollection"), "missing BuildCollection");
+        assert!(code.contains("SequenceSetitem"), "missing SequenceSetitem");
 
         eprintln!("=== Generated Code ({} bytes) ===", code.len());
         // Print first 50 lines
