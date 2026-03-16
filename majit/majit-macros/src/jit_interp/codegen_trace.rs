@@ -126,11 +126,18 @@ fn generate_jitcode_arm(
         ArmPattern::Nop => quote! {
             Some(majit_meta::JitCodeBuilder::new().finish())
         },
-        ArmPattern::Unsupported(reason) => {
-            let msg = format!(
-                "unsupported CFG pattern in match arm: {reason}"
-            );
-            quote! { compile_error!(#msg) }
+        ArmPattern::Unsupported(_reason) => {
+            // Complex CFG (loop/while/for in match arm) cannot be lowered to
+            // JitCode. Instead of compile_error!, emit an abort bytecode so
+            // tracing falls back to the interpreter — matching RPython's
+            // dont_look_inside behavior for complex code patterns.
+            quote! {
+                Some({
+                    let mut builder = majit_meta::JitCodeBuilder::new();
+                    builder.abort();
+                    builder.finish()
+                })
+            }
         }
     };
 
