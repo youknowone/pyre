@@ -330,12 +330,44 @@ fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident
 pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStream {
     let trace_fn = codegen_trace::generate_trace_fn(&config, &func);
     let state_impl = codegen_state::generate_jit_state(&config);
+    let merge_wrapper = generate_merge_wrapper(&config, &func);
     let transformed_fn = transform_function(&config, &func);
 
     quote! {
         #state_impl
         #trace_fn
+        #merge_wrapper
         #transformed_fn
+    }
+}
+
+/// Generate a `#[cold]` out-of-line wrapper for the merge_point call.
+///
+/// This keeps the mainloop hot path thin — only an `is_tracing()` flag check
+/// appears inline, while the closure capture and tracing logic live here.
+fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+    let fn_name = &func.sig.ident;
+    let merge_fn_name = quote::format_ident!("__merge_{}", fn_name);
+    let trace_fn_name = quote::format_ident!("__trace_{}", fn_name);
+    let state_type = &config.state_type;
+    let env_type = &config.env_type;
+    let pool_type = &config.storage.pool_type;
+
+    quote! {
+        #[cold]
+        #[inline(never)]
+        #[allow(non_snake_case)]
+        fn #merge_fn_name(
+            __driver: &mut majit_meta::JitDriver<#state_type>,
+            __env: &#env_type,
+            __pc: usize,
+            __pool: &#pool_type,
+            __sel: usize,
+        ) {
+            __driver.merge_point(|__ctx, __sym| {
+                #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel)
+            });
+        }
     }
 }
 
@@ -346,6 +378,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let attrs = &func.attrs;
     let fn_name = &func.sig.ident;
     let trace_fn_name = quote::format_ident!("__trace_{}", fn_name);
+    let merge_fn_name = quote::format_ident!("__merge_{}", fn_name);
 
     let pool_expr = &config.storage.pool;
     let sel_expr = &config.storage.selector;
@@ -354,6 +387,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let body = rewrite_body(
         &func.block,
         &trace_fn_name,
+        &merge_fn_name,
         pool_expr,
         sel_expr,
         &config.greens,
@@ -371,6 +405,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
 fn rewrite_body(
     block: &syn::Block,
     trace_fn_name: &Ident,
+    merge_fn_name: &Ident,
     pool_expr: &Expr,
     sel_expr: &Expr,
     default_greens: &[Expr],
@@ -476,6 +511,7 @@ fn rewrite_body(
 
     struct MarkerRewriter {
         trace_fn_name: Ident,
+        merge_fn_name: Ident,
         pool_expr: Expr,
         sel_expr: Expr,
         default_greens: Vec<Expr>,
@@ -500,16 +536,16 @@ fn rewrite_body(
                 if path_str == "jit_merge_point" || path_str.ends_with("::jit_merge_point") {
                     let args =
                         syn::parse2::<MergePointArgs>(mac.tokens.clone()).unwrap_or_default();
-                    let trace_fn = &self.trace_fn_name;
+                    let merge_fn = &self.merge_fn_name;
                     let driver = args.driver.unwrap_or_else(|| syn::parse_quote!(driver));
                     let env = args.env.unwrap_or_else(|| syn::parse_quote!(program));
                     let pc = args.pc.unwrap_or_else(|| syn::parse_quote!(pc));
                     let pool = &self.pool_expr;
                     let sel = &self.sel_expr;
                     let new_tokens: TokenStream = quote! {
-                        #driver.merge_point(|__ctx, __sym| {
-                            #trace_fn(__ctx, __sym, #env, #pc, &#pool, #sel)
-                        });
+                        if #driver.is_tracing() {
+                            #merge_fn(&mut #driver, #env, #pc, &#pool, #sel);
+                        }
                     };
                     *stmt =
                         syn::parse2(new_tokens).expect("failed to parse merge_point replacement");
@@ -611,6 +647,7 @@ fn rewrite_body(
     let mut cloned_block = block.clone();
     let mut rewriter = MarkerRewriter {
         trace_fn_name: trace_fn_name.clone(),
+        merge_fn_name: merge_fn_name.clone(),
         pool_expr: pool_expr.clone(),
         sel_expr: sel_expr.clone(),
         default_greens: default_greens.to_vec(),

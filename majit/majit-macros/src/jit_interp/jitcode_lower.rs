@@ -307,6 +307,18 @@ impl<'c> Lowerer<'c> {
             return self.lower_match_stmt(expr_match);
         }
 
+        if let Expr::While(expr_while) = expr {
+            return self.lower_while_loop(expr_while);
+        }
+
+        if let Expr::Loop(expr_loop) = expr {
+            return self.lower_loop_expr(expr_loop);
+        }
+
+        if let Expr::ForLoop(expr_for) = expr {
+            return self.lower_for_loop(expr_for);
+        }
+
         if let Some(()) = self.lower_config_call_stmt(expr) {
             return Some(());
         }
@@ -855,6 +867,215 @@ impl<'c> Lowerer<'c> {
         if let Some(default_body) = default_arm {
             let default_stmts = self.lower_branch_expr(default_body)?;
             self.statements.extend(default_stmts);
+        }
+
+        self.statements.push(quote! {
+            __builder.mark_label(#end_label);
+        });
+        Some(())
+    }
+
+    // ── Loop lowering ────────────────────────────────────────────────
+
+    /// Lower `while cond { body }` to a JitCode branch sequence:
+    /// ```text
+    /// loop_start:
+    ///   eval cond
+    ///   branch_reg_zero(cond, loop_end)
+    ///   eval body
+    ///   jump(loop_start)
+    /// loop_end:
+    /// ```
+    fn lower_while_loop(&mut self, expr_while: &syn::ExprWhile) -> Option<()> {
+        let loop_start = self.alloc_label();
+        let loop_end = self.alloc_label();
+
+        self.statements.push(quote! {
+            let #loop_start = __builder.new_label();
+        });
+        self.statements.push(quote! {
+            let #loop_end = __builder.new_label();
+        });
+        self.statements.push(quote! {
+            __builder.mark_label(#loop_start);
+        });
+
+        // Evaluate the condition
+        let cond = self.lower_value_expr(&expr_while.cond)?;
+        let cond_reg = cond.reg;
+        self.statements.push(quote! {
+            __builder.branch_reg_zero(#cond_reg, #loop_end);
+        });
+
+        // Lower the body, with break targets pointing to loop_end
+        let body_stmts = self.lower_loop_body(&expr_while.body, &loop_end, &loop_start)?;
+        self.statements.extend(body_stmts);
+
+        // Back-edge jump
+        self.statements.push(quote! {
+            __builder.jump(#loop_start);
+        });
+        self.statements.push(quote! {
+            __builder.mark_label(#loop_end);
+        });
+        Some(())
+    }
+
+    /// Lower `loop { body }` to a JitCode branch sequence:
+    /// ```text
+    /// loop_start:
+    ///   eval body (break → jump loop_end, continue → jump loop_start)
+    ///   jump(loop_start)
+    /// loop_end:
+    /// ```
+    fn lower_loop_expr(&mut self, expr_loop: &syn::ExprLoop) -> Option<()> {
+        let loop_start = self.alloc_label();
+        let loop_end = self.alloc_label();
+
+        self.statements.push(quote! {
+            let #loop_start = __builder.new_label();
+        });
+        self.statements.push(quote! {
+            let #loop_end = __builder.new_label();
+        });
+        self.statements.push(quote! {
+            __builder.mark_label(#loop_start);
+        });
+
+        let body_stmts = self.lower_loop_body(&expr_loop.body, &loop_end, &loop_start)?;
+        self.statements.extend(body_stmts);
+
+        self.statements.push(quote! {
+            __builder.jump(#loop_start);
+        });
+        self.statements.push(quote! {
+            __builder.mark_label(#loop_end);
+        });
+        Some(())
+    }
+
+    /// Lower `for _ in _ { body }`.
+    ///
+    /// For-loops involve Rust's iterator protocol which cannot be
+    /// statically decomposed at proc-macro time. Return `None` so the
+    /// arm falls back to opaque (not traced through by the JIT).
+    fn lower_for_loop(&mut self, _expr_for: &syn::ExprForLoop) -> Option<()> {
+        None
+    }
+
+    /// Lower a loop body block, translating `break` → jump to `break_label`
+    /// and `continue` → jump to `continue_label`.
+    fn lower_loop_body(
+        &mut self,
+        block: &syn::Block,
+        break_label: &syn::Ident,
+        continue_label: &syn::Ident,
+    ) -> Option<Vec<TokenStream>> {
+        let mut nested = Lowerer {
+            bindings: self.bindings.clone(),
+            statements: Vec::new(),
+            next_reg: self.next_reg,
+            next_label: self.next_label,
+            config: self.config,
+            call_policies: self.call_policies.clone(),
+            inference_failure_mode: self.inference_failure_mode,
+            auto_calls: self.auto_calls,
+        };
+
+        for stmt in &block.stmts {
+            if nested
+                .lower_loop_stmt(stmt, break_label, continue_label)
+                .is_none()
+            {
+                // Fall back: try normal lowering
+                nested.lower_stmt(stmt)?;
+            }
+        }
+
+        self.next_reg = self.next_reg.max(nested.next_reg);
+        self.next_label = self.next_label.max(nested.next_label);
+        Some(nested.statements)
+    }
+
+    /// Lower a statement inside a loop body, handling break/continue specially.
+    fn lower_loop_stmt(
+        &mut self,
+        stmt: &Stmt,
+        break_label: &syn::Ident,
+        continue_label: &syn::Ident,
+    ) -> Option<()> {
+        match stmt {
+            Stmt::Expr(Expr::Break(_), _) => {
+                self.statements.push(quote! {
+                    __builder.jump(#break_label);
+                });
+                Some(())
+            }
+            Stmt::Expr(Expr::Continue(_), _) => {
+                self.statements.push(quote! {
+                    __builder.jump(#continue_label);
+                });
+                Some(())
+            }
+            Stmt::Expr(Expr::If(expr_if), _) => {
+                self.lower_loop_if(expr_if, break_label, continue_label)
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower an if-expression inside a loop body, where branches may
+    /// contain break/continue.
+    fn lower_loop_if(
+        &mut self,
+        expr_if: &ExprIf,
+        break_label: &syn::Ident,
+        continue_label: &syn::Ident,
+    ) -> Option<()> {
+        // Check if any branch contains break or continue
+        let then_has_loop_ctrl = block_has_loop_control(&expr_if.then_branch);
+        let else_has_loop_ctrl = expr_if
+            .else_branch
+            .as_ref()
+            .is_some_and(|(_, e)| expr_has_loop_control(e));
+
+        if !then_has_loop_ctrl && !else_has_loop_ctrl {
+            return None; // no break/continue, fall back to normal lowering
+        }
+
+        let cond = self.lower_value_expr(&expr_if.cond)?;
+        let else_label = self.alloc_label();
+        let end_label = self.alloc_label();
+        let cond_reg = cond.reg;
+
+        self.statements.push(quote! {
+            let #else_label = __builder.new_label();
+        });
+        self.statements.push(quote! {
+            let #end_label = __builder.new_label();
+        });
+        self.statements.push(quote! {
+            __builder.branch_reg_zero(#cond_reg, #else_label);
+        });
+
+        // Lower then-branch with loop control
+        let then_stmts = self.lower_loop_body(&expr_if.then_branch, break_label, continue_label)?;
+        self.statements.extend(then_stmts);
+        self.statements.push(quote! {
+            __builder.jump(#end_label);
+        });
+        self.statements.push(quote! {
+            __builder.mark_label(#else_label);
+        });
+
+        // Lower else-branch with loop control
+        if let Some((_, else_expr)) = &expr_if.else_branch {
+            let else_block = match &**else_expr {
+                Expr::Block(block) => &block.block,
+                _ => return None,
+            };
+            let else_stmts = self.lower_loop_body(else_block, break_label, continue_label)?;
+            self.statements.extend(else_stmts);
         }
 
         self.statements.push(quote! {
@@ -1560,6 +1781,37 @@ impl<'c> Lowerer<'c> {
     }
 }
 
+// ── Loop control detection ───────────────────────────────────────────
+
+/// Check if a block contains break or continue at the top level (not nested in inner loops).
+fn block_has_loop_control(block: &Block) -> bool {
+    block.stmts.iter().any(|stmt| stmt_has_loop_control(stmt))
+}
+
+fn stmt_has_loop_control(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Expr(expr, _) => expr_has_loop_control(expr),
+        _ => false,
+    }
+}
+
+fn expr_has_loop_control(expr: &Expr) -> bool {
+    match expr {
+        Expr::Break(_) | Expr::Continue(_) => true,
+        Expr::If(expr_if) => {
+            block_has_loop_control(&expr_if.then_branch)
+                || expr_if
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|(_, e)| expr_has_loop_control(e))
+        }
+        Expr::Block(block) => block_has_loop_control(&block.block),
+        // Don't recurse into nested loops — they have their own break/continue scope
+        Expr::Loop(_) | Expr::While(_) | Expr::ForLoop(_) => false,
+        _ => false,
+    }
+}
+
 // ── Helper functions ─────────────────────────────────────────────────
 
 /// Extract the get_mut argument from a pool.get_mut(arg) expression.
@@ -1987,9 +2239,15 @@ mod tests {
             }
         }"#;
         let result = try_lower(code);
-        assert!(result.is_some(), "match with Or pattern should be lowerable");
+        assert!(
+            result.is_some(),
+            "match with Or pattern should be lowerable"
+        );
         let s = result.unwrap();
-        assert!(s.contains("IntOr"), "should generate OR for multi-literal pattern");
+        assert!(
+            s.contains("IntOr"),
+            "should generate OR for multi-literal pattern"
+        );
     }
 
     #[test]
@@ -2006,7 +2264,10 @@ mod tests {
         let result = try_lower(code);
         assert!(result.is_some(), "match as value should be lowerable");
         let s = result.unwrap();
-        assert!(s.contains("move_i"), "should produce move_i for value result");
+        assert!(
+            s.contains("move_i"),
+            "should produce move_i for value result"
+        );
     }
 
     fn parse_pat(code: &str) -> Pat {
@@ -2047,6 +2308,81 @@ mod tests {
             }
         }"#;
         let result = try_lower(code);
-        assert!(result.is_some(), "match without default should be lowerable");
+        assert!(
+            result.is_some(),
+            "match without default should be lowerable"
+        );
+    }
+
+    #[test]
+    fn lower_while_loop() {
+        let code = r#"{
+            let x = stack.pop();
+            while x > 0 {
+                stack.push(x);
+                break;
+            }
+        }"#;
+        let result = try_lower(code);
+        assert!(result.is_some(), "while loop should be lowerable");
+        let s = result.unwrap();
+        assert!(s.contains("mark_label"), "should generate loop labels");
+        assert!(s.contains("branch_reg_zero"), "should generate exit branch");
+        assert!(s.contains("jump"), "should generate back-edge jump");
+    }
+
+    #[test]
+    fn lower_loop_with_break() {
+        let code = r#"{
+            let x = stack.pop();
+            loop {
+                stack.push(x);
+                break;
+            }
+        }"#;
+        let result = try_lower(code);
+        assert!(result.is_some(), "loop with break should be lowerable");
+        let s = result.unwrap();
+        assert!(s.contains("mark_label"), "should generate loop labels");
+        assert!(
+            s.contains("jump"),
+            "should generate jumps for break and back-edge"
+        );
+    }
+
+    #[test]
+    fn lower_loop_with_conditional_break() {
+        let code = r#"{
+            let x = stack.pop();
+            loop {
+                if x > 0 {
+                    break;
+                }
+                stack.push(x);
+            }
+        }"#;
+        let result = try_lower(code);
+        assert!(
+            result.is_some(),
+            "loop with conditional break should be lowerable"
+        );
+        let s = result.unwrap();
+        assert!(s.contains("mark_label"), "should generate labels");
+        assert!(
+            s.contains("branch_reg_zero"),
+            "should generate conditional branch"
+        );
+    }
+
+    #[test]
+    fn lower_for_loop_returns_none() {
+        // For loops are not lowered (they fall back to opaque).
+        let code = r#"{
+            for i in 0..10 {
+                stack.push(i);
+            }
+        }"#;
+        let result = try_lower(code);
+        assert!(result.is_none(), "for loop should not be lowerable");
     }
 }
