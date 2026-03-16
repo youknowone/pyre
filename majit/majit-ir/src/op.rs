@@ -2639,8 +2639,8 @@ mod tests {
     #[test]
     fn test_op_getarg() {
         let op = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef(20)]);
-        assert_eq!(op.getarg(0), OpRef(10));
-        assert_eq!(op.getarg(1), OpRef(20));
+        assert_eq!(op.arg(0), OpRef(10));
+        assert_eq!(op.arg(1), OpRef(20));
     }
 
     // ── Descriptor requirements ──
@@ -2656,8 +2656,19 @@ mod tests {
 
     #[test]
     fn test_calls_have_descr() {
+        // All call subcategories (plain calls, call_assembler, call_may_force,
+        // call_pure, call_release_gil, call_loopinvariant, cond_call_value)
+        // must have descriptors. Backend helpers like CheckMemoryError and
+        // CallMallocNursery* are in the call range but don't need descriptors.
         for op in all_opcodes() {
-            if op.is_call() {
+            if op.is_plain_call()
+                || op.is_call_assembler()
+                || op.is_call_may_force()
+                || op.is_call_pure()
+                || op.is_call_release_gil()
+                || op.is_call_loopinvariant()
+                || op.is_cond_call_value()
+            {
                 assert!(op.has_descr(), "call {:?} should have has_descr=true", op);
             }
         }
