@@ -60,11 +60,13 @@ majit은 **일반 Rust**에서 동작합니다. 타입 추론이 필요 없고 (
 
 RPython의 codewriter는 RPython 소스를 **완전히 번역**하여 JitCode(바이트코드)를 생성합니다. 번역 시 모든 타입과 제어 흐름이 확정됩니다.
 
-majit은 두 가지 경로를 제공합니다:
+majit도 **build-time에 trace 코드를 자동 생성하여 삽입**합니다. 두 가지 경로가 있습니다:
 
-1. **`#[jit_interp]` proc-macro**: 컴파일 타임에 인터프리터의 match arms를 JitCode로 직접 lowering합니다. `while`/`loop`는 branch bytecode로, `match`는 guard chain으로, 복잡한 `for` 루프는 abort fallback (RPython의 `@dont_look_inside` 상당)으로 변환합니다.
+1. **`majit-analyze` 기반 (pyre-mjit)**: `build.rs`에서 `majit_analyze::analyze_multiple()`로 인터프리터 소스를 분석하고, `generate_trace_code()`로 trace helper 함수를 생성하여 `OUT_DIR/jit_trace_gen.rs`에 씁니다. 메인 크레이트가 `include!`로 가져옵니다. opcode dispatch arm 추출, cross-file trait impl 해석, helper 분류, 타입 레이아웃 추출을 수행합니다.
 
-2. **`majit-analyze` static analyzer**: 여러 Rust 소스 파일을 파싱하여 opcode dispatch, trait impl 해석, helper 분류, 타입 레이아웃 추출을 수행합니다. RPython의 annotation + rtyping에 대응하지만, 완전한 번역이 아닌 **분석 + 코드 생성** 방식입니다.
+2. **`#[jit_interp]` proc-macro 기반 (aheui-mjit)**: `build.rs`가 인터프리터 소스의 opcode match arm을 추출하고, `#[jit_interp]`가 붙은 JIT mainloop을 자동 생성합니다. `while`/`loop`는 branch bytecode로, `match`는 guard chain으로, `for` 루프는 abort fallback (RPython의 `@dont_look_inside` 상당)으로 변환합니다.
+
+두 경로 모두 **자동 생성·삽입은 완성**되어 있습니다. RPython과의 남은 차이는 생성 기능의 **일반성** — 더 많은 interpreter shape와 complex CFG를 직접 lowering하는 breadth입니다.
 
 ### 백엔드
 
