@@ -52,6 +52,69 @@ pub fn io_buffer_discard() {
     });
 }
 
+// ── Reusable I/O shims ───────────────────────────────────────────────
+//
+// Common JIT I/O operations that interpreters can use directly via
+// io_shims in `#[jit_interp]` instead of defining their own.
+
+/// Encode an i64 as decimal into a fixed buffer, returning the used slice.
+pub fn encode_decimal_i64(value: i64, buf: &mut [u8; 20]) -> &[u8] {
+    if value == 0 {
+        buf[19] = b'0';
+        return &buf[19..];
+    }
+    let negative = value < 0;
+    // Use u64 for magnitude to handle i64::MIN correctly
+    let mut v: u64 = if negative {
+        (value as u64).wrapping_neg()
+    } else {
+        value as u64
+    };
+    let mut pos = 20;
+    while v > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if negative {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    &buf[pos..]
+}
+
+/// Write an i64 as its decimal string representation to the JIT I/O buffer.
+///
+/// Suitable as an `extern "C"` shim for JIT-compiled numeric output.
+pub extern "C" fn jit_write_number_i64(value: i64) {
+    match value {
+        0 => io_buffer_write(b"0"),
+        1 => io_buffer_write(b"1"),
+        -1 => io_buffer_write(b"-1"),
+        _ => {
+            let mut buf = [0u8; 20];
+            io_buffer_write(encode_decimal_i64(value, &mut buf));
+        }
+    }
+}
+
+/// Write an i64 interpreted as a Unicode codepoint (UTF-8 encoded) to the
+/// JIT I/O buffer.
+///
+/// Suitable as an `extern "C"` shim for JIT-compiled character output.
+pub extern "C" fn jit_write_utf8_codepoint(value: i64) {
+    if (0..=0x7F).contains(&value) {
+        io_buffer_write(&[value as u8]);
+        return;
+    }
+    if let Some(c) = char::from_u32(value as u32) {
+        let mut buf = [0u8; 4];
+        io_buffer_write(c.encode_utf8(&mut buf).as_bytes());
+    } else {
+        io_buffer_write("\u{FFFD}".as_bytes());
+    }
+}
+
 // The actual extern "C" function that commit_io CallN calls.
 extern "C" fn jit_commit_io_shim() {
     io_buffer_commit();

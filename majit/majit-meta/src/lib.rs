@@ -37,7 +37,8 @@ pub use constant_pool::ConstantPool;
 pub use driver::JitDriver;
 pub use fail_descr::{make_fail_descr, make_fail_descr_typed};
 pub use io_buffer::{
-    emit_commit_io, io_buffer_commit, io_buffer_discard, io_buffer_write, io_buffer_write_fmt,
+    emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,
+    io_buffer_write_fmt, jit_write_number_i64, jit_write_utf8_codepoint,
 };
 pub use jit_state::{DeoptMaterializationCache, JitState, PendingFieldWriteLayout};
 pub use jitcode::{
