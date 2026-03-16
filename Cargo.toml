@@ -30,6 +30,7 @@ members = [
     "pyre/pyre-objspace",
     "pyre/pyre-bytecode",
     "pyre/pyre-interp",
+    "pyre/pyre-mjit",
     "pyre/pyre-main",
 ]
 
