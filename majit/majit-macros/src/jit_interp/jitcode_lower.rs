@@ -303,6 +303,10 @@ impl<'c> Lowerer<'c> {
             return self.lower_if_stmt(expr_if);
         }
 
+        if let Expr::Match(expr_match) = expr {
+            return self.lower_match_stmt(expr_match);
+        }
+
         if let Some(()) = self.lower_config_call_stmt(expr) {
             return Some(());
         }
@@ -741,6 +745,251 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
+    /// Lower a standalone match expression to a chained if-else guard sequence.
+    ///
+    /// ```text
+    /// match x { 1 => body1, 2 => body2, _ => default }
+    /// ```
+    /// becomes:
+    /// ```text
+    /// eq_1 = (x == 1); brz eq_1, next1; body1; jmp end; next1:
+    /// eq_2 = (x == 2); brz eq_2, next2; body2; jmp end; next2:
+    /// default; end:
+    /// ```
+    fn lower_match_stmt(&mut self, expr_match: &syn::ExprMatch) -> Option<()> {
+        let discriminant = self.lower_value_expr(&expr_match.expr)?;
+        if !matches!(discriminant.kind, BindingKind::Int) {
+            return None;
+        }
+
+        let end_label = self.alloc_label();
+        self.statements.push(quote! {
+            let #end_label = __builder.new_label();
+        });
+
+        // Separate literal/path arms from the wildcard/default arm.
+        let mut guarded_arms = Vec::new();
+        let mut default_arm = None;
+
+        for arm in &expr_match.arms {
+            match &arm.pat {
+                Pat::Wild(_) => {
+                    default_arm = Some(&arm.body);
+                }
+                Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
+                    // Catch-all binding like `x => ...` treated as default
+                    default_arm = Some(&arm.body);
+                }
+                _ => {
+                    let literals = extract_pat_literals(&arm.pat)?;
+                    guarded_arms.push((literals, &arm.body));
+                }
+            }
+        }
+
+        let disc_reg = discriminant.reg;
+
+        for (literals, body) in &guarded_arms {
+            let next_label = self.alloc_label();
+            self.statements.push(quote! {
+                let #next_label = __builder.new_label();
+            });
+
+            if literals.len() == 1 {
+                // Single literal: eq check + branch
+                let value = literals[0];
+                let const_reg = self.alloc_reg();
+                let eq_reg = self.alloc_reg();
+                self.statements.push(quote! {
+                    __builder.load_const_i_value(#const_reg, #value);
+                });
+                self.statements.push(quote! {
+                    __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
+                });
+                self.statements.push(quote! {
+                    __builder.branch_reg_zero(#eq_reg, #next_label);
+                });
+            } else {
+                // Multiple literals (Or pattern): chain with logical OR
+                // (val == lit1) | (val == lit2) | ...
+                let first_val = literals[0];
+                let first_const_reg = self.alloc_reg();
+                let mut or_reg = self.alloc_reg();
+                self.statements.push(quote! {
+                    __builder.load_const_i_value(#first_const_reg, #first_val);
+                });
+                self.statements.push(quote! {
+                    __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg);
+                });
+                for &lit_val in &literals[1..] {
+                    let const_reg = self.alloc_reg();
+                    let eq_reg = self.alloc_reg();
+                    let new_or_reg = self.alloc_reg();
+                    self.statements.push(quote! {
+                        __builder.load_const_i_value(#const_reg, #lit_val);
+                    });
+                    self.statements.push(quote! {
+                        __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
+                    });
+                    self.statements.push(quote! {
+                        __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg);
+                    });
+                    or_reg = new_or_reg;
+                }
+                self.statements.push(quote! {
+                    __builder.branch_reg_zero(#or_reg, #next_label);
+                });
+            }
+
+            let body_stmts = self.lower_branch_expr(body)?;
+            self.statements.extend(body_stmts);
+            self.statements.push(quote! {
+                __builder.jump(#end_label);
+            });
+            self.statements.push(quote! {
+                __builder.mark_label(#next_label);
+            });
+        }
+
+        // Default arm
+        if let Some(default_body) = default_arm {
+            let default_stmts = self.lower_branch_expr(default_body)?;
+            self.statements.extend(default_stmts);
+        }
+
+        self.statements.push(quote! {
+            __builder.mark_label(#end_label);
+        });
+        Some(())
+    }
+
+    /// Lower a match expression in value position to chained if-else guards
+    /// that produce a value.
+    fn lower_match_value(&mut self, expr_match: &syn::ExprMatch) -> Option<Binding> {
+        let discriminant = self.lower_value_expr(&expr_match.expr)?;
+        if !matches!(discriminant.kind, BindingKind::Int) {
+            return None;
+        }
+
+        let end_label = self.alloc_label();
+        let result_reg = self.alloc_reg();
+        self.statements.push(quote! {
+            let #end_label = __builder.new_label();
+        });
+
+        let mut guarded_arms = Vec::new();
+        let mut default_arm = None;
+        let mut depends_on_stack = discriminant.depends_on_stack;
+
+        for arm in &expr_match.arms {
+            match &arm.pat {
+                Pat::Wild(_) => {
+                    default_arm = Some(&arm.body);
+                }
+                Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
+                    default_arm = Some(&arm.body);
+                }
+                _ => {
+                    let literals = extract_pat_literals(&arm.pat)?;
+                    guarded_arms.push((literals, &arm.body));
+                }
+            }
+        }
+
+        let disc_reg = discriminant.reg;
+
+        for (literals, body) in &guarded_arms {
+            let next_label = self.alloc_label();
+            self.statements.push(quote! {
+                let #next_label = __builder.new_label();
+            });
+
+            if literals.len() == 1 {
+                let value = literals[0];
+                let const_reg = self.alloc_reg();
+                let eq_reg = self.alloc_reg();
+                self.statements.push(quote! {
+                    __builder.load_const_i_value(#const_reg, #value);
+                });
+                self.statements.push(quote! {
+                    __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
+                });
+                self.statements.push(quote! {
+                    __builder.branch_reg_zero(#eq_reg, #next_label);
+                });
+            } else {
+                let first_val = literals[0];
+                let first_const_reg = self.alloc_reg();
+                let mut or_reg = self.alloc_reg();
+                self.statements.push(quote! {
+                    __builder.load_const_i_value(#first_const_reg, #first_val);
+                });
+                self.statements.push(quote! {
+                    __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg);
+                });
+                for &lit_val in &literals[1..] {
+                    let const_reg = self.alloc_reg();
+                    let eq_reg = self.alloc_reg();
+                    let new_or_reg = self.alloc_reg();
+                    self.statements.push(quote! {
+                        __builder.load_const_i_value(#const_reg, #lit_val);
+                    });
+                    self.statements.push(quote! {
+                        __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
+                    });
+                    self.statements.push(quote! {
+                        __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg);
+                    });
+                    or_reg = new_or_reg;
+                }
+                self.statements.push(quote! {
+                    __builder.branch_reg_zero(#or_reg, #next_label);
+                });
+            }
+
+            let (body_stmts, binding) = self.lower_branch_value_expr(body)?;
+            if !matches!(binding.kind, BindingKind::Int) {
+                return None;
+            }
+            depends_on_stack |= binding.depends_on_stack;
+            let arm_reg = binding.reg;
+            self.statements.extend(body_stmts);
+            self.statements.push(quote! {
+                __builder.move_i(#result_reg, #arm_reg);
+            });
+            self.statements.push(quote! {
+                __builder.jump(#end_label);
+            });
+            self.statements.push(quote! {
+                __builder.mark_label(#next_label);
+            });
+        }
+
+        // Default arm
+        if let Some(default_body) = default_arm {
+            let (default_stmts, default_binding) = self.lower_branch_value_expr(default_body)?;
+            if !matches!(default_binding.kind, BindingKind::Int) {
+                return None;
+            }
+            depends_on_stack |= default_binding.depends_on_stack;
+            let default_reg = default_binding.reg;
+            self.statements.extend(default_stmts);
+            self.statements.push(quote! {
+                __builder.move_i(#result_reg, #default_reg);
+            });
+        }
+
+        self.statements.push(quote! {
+            __builder.mark_label(#end_label);
+        });
+
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack,
+        })
+    }
+
     fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
         if is_pop_value(expr) {
             let reg = self.alloc_reg();
@@ -795,6 +1044,7 @@ impl<'c> Lowerer<'c> {
             }
             Expr::Paren(ExprParen { expr, .. }) => self.lower_value_expr(expr),
             Expr::If(expr_if) => self.lower_if_value(expr_if),
+            Expr::Match(expr_match) => self.lower_match_value(expr_match),
             Expr::Unary(ExprUnary { op, expr, .. }) => self.lower_unary(op, expr),
             Expr::Binary(binary) => self.lower_binary(binary),
             Expr::Call(call) => self.lower_call_value(call),
@@ -1334,6 +1584,35 @@ fn extract_stmts(expr: &Expr) -> Vec<Stmt> {
     }
 }
 
+/// Extract integer literal values from a match arm pattern.
+///
+/// Supports `Pat::Lit` (integer literals), `Pat::Or` (multiple patterns
+/// like `1 | 2 | 3`), and `Pat::Path` (constant paths — evaluated at
+/// compile time via `#pat as i64`).
+///
+/// Returns `None` if the pattern contains unsupported constructs.
+fn extract_pat_literals(pat: &Pat) -> Option<Vec<i64>> {
+    match pat {
+        Pat::Lit(expr_lit) => {
+            if let Lit::Int(int_lit) = &expr_lit.lit {
+                Some(vec![int_lit.base10_parse::<i64>().ok()?])
+            } else {
+                None
+            }
+        }
+        Pat::Or(pat_or) => {
+            let mut values = Vec::new();
+            for case in &pat_or.cases {
+                values.extend(extract_pat_literals(case)?);
+            }
+            Some(values)
+        }
+        // Constant path pattern (e.g., `MY_CONST`): we cannot evaluate
+        // this at proc-macro time, so return None to bail out.
+        _ => None,
+    }
+}
+
 fn push_call_arg(expr: &Expr) -> Option<&Expr> {
     let Expr::MethodCall(ExprMethodCall { method, args, .. }) = expr else {
         return None;
@@ -1667,4 +1946,107 @@ fn try_generate_jitcode_body_inner(
     Some(quote! {
         #(#statements)*
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn try_lower(code: &str) -> Option<String> {
+        let expr: Expr = syn::parse_str(code).expect("failed to parse");
+        let result = try_generate_jitcode_body(&expr)?;
+        Some(result.to_string())
+    }
+
+    #[test]
+    fn lower_match_stmt_with_literals() {
+        let code = r#"{
+            let x = stack.pop();
+            match x {
+                1 => { stack.push(10); }
+                2 => { stack.push(20); }
+                _ => { stack.push(0); }
+            }
+        }"#;
+        let result = try_lower(code);
+        assert!(result.is_some(), "match should be lowerable");
+        let s = result.unwrap();
+        // Should contain IntEq comparisons and branch labels
+        assert!(s.contains("IntEq"), "should generate equality checks");
+        assert!(s.contains("branch_reg_zero"), "should generate branches");
+        assert!(s.contains("new_label"), "should generate labels");
+    }
+
+    #[test]
+    fn lower_match_or_pattern() {
+        let code = r#"{
+            let x = stack.pop();
+            match x {
+                1 | 2 => { stack.push(10); }
+                _ => { stack.push(0); }
+            }
+        }"#;
+        let result = try_lower(code);
+        assert!(result.is_some(), "match with Or pattern should be lowerable");
+        let s = result.unwrap();
+        assert!(s.contains("IntOr"), "should generate OR for multi-literal pattern");
+    }
+
+    #[test]
+    fn lower_match_value_expr() {
+        let code = r#"{
+            let x = stack.pop();
+            let y = match x {
+                1 => 10,
+                2 => 20,
+                _ => 0
+            };
+            stack.push(y);
+        }"#;
+        let result = try_lower(code);
+        assert!(result.is_some(), "match as value should be lowerable");
+        let s = result.unwrap();
+        assert!(s.contains("move_i"), "should produce move_i for value result");
+    }
+
+    fn parse_pat(code: &str) -> Pat {
+        let match_code = format!("match x {{ {code} => () }}");
+        let expr: syn::ExprMatch = syn::parse_str(&match_code).expect("failed to parse match");
+        expr.arms.into_iter().next().unwrap().pat
+    }
+
+    #[test]
+    fn extract_pat_literals_single() {
+        let pat = parse_pat("42");
+        let lits = extract_pat_literals(&pat);
+        assert_eq!(lits, Some(vec![42]));
+    }
+
+    #[test]
+    fn extract_pat_literals_or() {
+        let pat = parse_pat("1 | 2 | 3");
+        let lits = extract_pat_literals(&pat);
+        assert_eq!(lits, Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn extract_pat_literals_wildcard_returns_none() {
+        let pat = parse_pat("_");
+        let lits = extract_pat_literals(&pat);
+        assert_eq!(lits, None);
+    }
+
+    #[test]
+    fn lower_match_no_default() {
+        // Match without a wildcard arm; all arms are guarded.
+        let code = r#"{
+            let x = stack.pop();
+            match x {
+                1 => { stack.push(10); }
+                2 => { stack.push(20); }
+            }
+        }"#;
+        let result = try_lower(code);
+        assert!(result.is_some(), "match without default should be lowerable");
+    }
 }
