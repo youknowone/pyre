@@ -40,7 +40,7 @@ All 10 subsystems are `implemented`.
 
 No structural gaps remain. Breadth refinement areas:
 
-- **Static analyzer**: 39/40 pyre opcode arms classified with 18 first-class TracePattern variants. Only `get_iter` and `make_function` remain Residual (matching RPython codewriter — these are genuine residual calls). Complex CFG generates abort JitCode for interpreter fallback.
+- **Static analyzer**: 39/40 pyre opcode arms classified with 18 first-class TracePattern variants. Only `get_iter` and `make_function` remain Residual (matching RPython codewriter — these are genuine residual calls). `for` loops in match arms fall back to abort JitCode (Rust's iterator protocol cannot be statically decomposed at proc-macro time — equivalent to RPython's `@dont_look_inside`). Interpreter dispatch loops use `while`, not `for`, so this does not affect the main tracing path.
 - **E2E validation**: pyre fib(20) executes correctly with JIT (SIGBUS resolved). aheuijit logo.aheui achieves 110x speedup. Arbitrary-depth multi-frame restore tested up to depth 50.
 
 ## Next Expansion
