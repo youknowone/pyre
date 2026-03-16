@@ -425,6 +425,15 @@ impl OptIntBounds {
     // ── Overflow operations ──
 
     fn optimize_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        if let (Some(a), Some(b)) =
+            (ctx.get_constant_int(op.arg(0)), ctx.get_constant_int(op.arg(1)))
+        {
+            if let Some(result) = a.checked_add(b) {
+                self.make_constant_int(op, result, ctx);
+                self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
+                return PassResult::Remove;
+            }
+        }
         let b0 = self.get_bound(op.arg(0), ctx);
         let b1 = self.get_bound(op.arg(1), ctx);
         if b0.add_bound_cannot_overflow(&b1) {
@@ -457,6 +466,15 @@ impl OptIntBounds {
     }
 
     fn optimize_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        if let (Some(a), Some(b)) =
+            (ctx.get_constant_int(op.arg(0)), ctx.get_constant_int(op.arg(1)))
+        {
+            if let Some(result) = a.checked_sub(b) {
+                self.make_constant_int(op, result, ctx);
+                self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
+                return PassResult::Remove;
+            }
+        }
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -488,6 +506,15 @@ impl OptIntBounds {
     }
 
     fn optimize_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        if let (Some(a), Some(b)) =
+            (ctx.get_constant_int(op.arg(0)), ctx.get_constant_int(op.arg(1)))
+        {
+            if let Some(result) = a.checked_mul(b) {
+                self.make_constant_int(op, result, ctx);
+                self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
+                return PassResult::Remove;
+            }
+        }
         let b0 = self.get_bound(op.arg(0), ctx);
         let b1 = self.get_bound(op.arg(1), ctx);
         if b0.mul_bound_cannot_overflow(&b1) {

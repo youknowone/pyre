@@ -13,8 +13,8 @@ use majit_trace::warmstate::{HotResult, WarmState};
 use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionState};
 use crate::io_buffer;
 use crate::resume::{
-    EncodedResumeData, MaterializedVirtual, ReconstructedState, ResumeFrameLayoutSummary,
-    ResolvedPendingFieldWrite, ResumeData, ResumeDataBuilder, ResumeDataLoopMemo,
+    EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
+    ResumeData, ResumeDataBuilder, ResumeDataLoopMemo, ResumeFrameLayoutSummary,
     ResumeLayoutSummary,
 };
 use crate::trace_ctx::{JitDriverDescriptor, TraceCtx};
@@ -3497,11 +3497,7 @@ fn merge_frame_stack_into_resume_layout(
             new_frames.append(&mut resume_layout.frame_layouts);
             resume_layout.frame_layouts = new_frames;
             resume_layout.num_frames = resume_layout.frame_layouts.len();
-            resume_layout.frame_pcs = resume_layout
-                .frame_layouts
-                .iter()
-                .map(|f| f.pc)
-                .collect();
+            resume_layout.frame_pcs = resume_layout.frame_layouts.iter().map(|f| f.pc).collect();
             resume_layout.frame_slot_counts = resume_layout
                 .frame_layouts
                 .iter()
@@ -5391,11 +5387,13 @@ mod tests {
         // Parity with test_on_compile: after_compile hook fires with green_key,
         // num_ops_before, num_ops_after.
         let mut meta = MetaInterp::<()>::new(1);
-        let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = compile_events.clone();
         meta.set_on_compile_loop(move |green_key, ops_before, ops_after| {
-            events.lock().unwrap().push((green_key, ops_before, ops_after));
+            events
+                .lock()
+                .unwrap()
+                .push((green_key, ops_before, ops_after));
         });
 
         let green_key = 42;
@@ -5474,12 +5472,24 @@ mod tests {
         for _ in 0..2 {
             meta.on_back_edge(green_key, &[0]);
         }
-        assert_eq!(*trace_start_count.lock().unwrap(), 1, "on_trace_start should fire");
+        assert_eq!(
+            *trace_start_count.lock().unwrap(),
+            1,
+            "on_trace_start should fire"
+        );
 
         // Abort the trace
         meta.abort_trace(false);
-        assert_eq!(*trace_abort_count.lock().unwrap(), 1, "on_trace_abort should fire");
-        assert_eq!(*compile_count.lock().unwrap(), 0, "on_compile_loop should NOT fire yet");
+        assert_eq!(
+            *trace_abort_count.lock().unwrap(),
+            1,
+            "on_trace_abort should fire"
+        );
+        assert_eq!(
+            *compile_count.lock().unwrap(),
+            0,
+            "on_compile_loop should NOT fire yet"
+        );
 
         // Start another trace and compile it
         for _ in 0..2 {
@@ -5492,8 +5502,16 @@ mod tests {
             let _result = ctx.recorder.record_op(OpCode::IntAdd, &[i0, const_one]);
         }
         meta.close_and_compile(&[OpRef(0)], ());
-        assert_eq!(*compile_count.lock().unwrap(), 1, "on_compile_loop should fire after compile");
-        assert_eq!(*trace_start_count.lock().unwrap(), 2, "on_trace_start should fire twice total");
+        assert_eq!(
+            *compile_count.lock().unwrap(),
+            1,
+            "on_compile_loop should fire after compile"
+        );
+        assert_eq!(
+            *trace_start_count.lock().unwrap(),
+            2,
+            "on_trace_start should fire twice total"
+        );
     }
 
     #[test]
@@ -5528,7 +5546,10 @@ mod tests {
         assert_eq!(events[0].0, 10, "first event green_key=10");
         assert_eq!(events[1].0, 20, "second event green_key=20");
         // Both traces had the same ops, so op counts should be equal
-        assert_eq!(events[0].1, events[1].1, "ops_before should match for identical traces");
+        assert_eq!(
+            events[0].1, events[1].1,
+            "ops_before should match for identical traces"
+        );
     }
 
     #[test]
@@ -5536,8 +5557,7 @@ mod tests {
         // Parity with test_on_compile_bridge: after_compile_bridge hook fires
         // when a bridge is compiled.
         let mut meta = MetaInterp::<()>::new(10);
-        let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
         meta.set_on_compile_bridge(move |gk, fi, nops| {
             ev.lock().unwrap().push((gk, fi, nops));
@@ -5581,8 +5601,7 @@ mod tests {
     fn test_on_guard_failure_hook() {
         // Parity with test_get_stats: guard failure hook fires with correct args.
         let mut meta = MetaInterp::<()>::new(10);
-        let failure_events: Arc<Mutex<Vec<(u64, u32, u32)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let failure_events: Arc<Mutex<Vec<(u64, u32, u32)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = failure_events.clone();
         meta.set_on_guard_failure(move |gk, fi, fc| {
             ev.lock().unwrap().push((gk, fi, fc));
@@ -5667,9 +5686,13 @@ mod tests {
             type Env = ();
 
             fn build_meta(&self, _: usize, _: &()) -> () {}
-            fn extract_live(&self, _: &()) -> Vec<i64> { Vec::new() }
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                Vec::new()
+            }
             fn create_sym(_: &(), _: usize) -> () {}
-            fn is_compatible(&self, _: &()) -> bool { true }
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
             fn restore(&mut self, _: &(), _: &[i64]) {}
 
             fn restore_reconstructed_frame_values_with_metadata(
@@ -5681,12 +5704,17 @@ mod tests {
                 values: &[Value],
                 _exception: &ExceptionState,
             ) -> bool {
-                self.restored_frames.push((frame_index, frame.pc, values.to_vec()));
+                self.restored_frames
+                    .push((frame_index, frame.pc, values.to_vec()));
                 true
             }
 
-            fn collect_jump_args(_: &()) -> Vec<OpRef> { Vec::new() }
-            fn validate_close(_: &(), _: &()) -> bool { true }
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                Vec::new()
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
         }
 
         let mut state = MultiFrameState::default();
@@ -5708,10 +5736,7 @@ mod tests {
                     source_guard: None,
                     pc: 20,
                     slot_types: None,
-                    values: vec![
-                        ReconstructedValue::Value(7),
-                        ReconstructedValue::Value(8),
-                    ],
+                    values: vec![ReconstructedValue::Value(7), ReconstructedValue::Value(8)],
                 },
             ],
             virtuals: Vec::new(),
@@ -5752,21 +5777,26 @@ mod tests {
         );
 
         assert!(restored, "multi-frame restore should succeed");
-        assert_eq!(state.restored_frames.len(), 2, "both frames should be restored");
+        assert_eq!(
+            state.restored_frames.len(),
+            2,
+            "both frames should be restored"
+        );
         assert_eq!(state.restored_frames[0].0, 0); // frame_index 0
         assert_eq!(state.restored_frames[0].1, 10); // pc
         assert_eq!(state.restored_frames[0].2, vec![Value::Int(42)]);
         assert_eq!(state.restored_frames[1].0, 1); // frame_index 1
         assert_eq!(state.restored_frames[1].1, 20); // pc
-        assert_eq!(state.restored_frames[1].2, vec![Value::Int(7), Value::Int(8)]);
+        assert_eq!(
+            state.restored_frames[1].2,
+            vec![Value::Int(7), Value::Int(8)]
+        );
     }
 
     #[test]
     fn test_single_frame_restore_with_frame_stack() {
         use crate::jit_state::JitState;
-        use crate::resume::{
-            ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary,
-        };
+        use crate::resume::{ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary};
         use majit_codegen::ExitValueSourceLayout;
 
         #[derive(Default)]
@@ -5780,17 +5810,25 @@ mod tests {
             type Env = ();
 
             fn build_meta(&self, _: usize, _: &()) -> () {}
-            fn extract_live(&self, _: &()) -> Vec<i64> { Vec::new() }
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                Vec::new()
+            }
             fn create_sym(_: &(), _: usize) -> () {}
-            fn is_compatible(&self, _: &()) -> bool { true }
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
             fn restore(&mut self, _: &(), _: &[i64]) {}
 
             fn restore_values(&mut self, _: &(), values: &[Value]) {
                 self.restored_values = values.to_vec();
             }
 
-            fn collect_jump_args(_: &()) -> Vec<OpRef> { Vec::new() }
-            fn validate_close(_: &(), _: &()) -> bool { true }
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                Vec::new()
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
         }
 
         let mut state = SingleFrameState::default();
@@ -5812,8 +5850,8 @@ mod tests {
         };
 
         // Provide frame_stack metadata with slot_types.
-        let frame_layouts = vec![
-            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+        let frame_layouts = vec![ResumeFrameLayoutSummary::from_exit_frame_layout(
+            &ExitFrameLayout {
                 trace_id: Some(300),
                 header_pc: Some(700),
                 source_guard: None,
@@ -5823,8 +5861,8 @@ mod tests {
                     ExitValueSourceLayout::ExitValue(1),
                 ],
                 slot_types: Some(vec![Type::Int, Type::Float]),
-            }),
-        ];
+            },
+        )];
 
         let restored = state.restore_guard_failure_with_resume_layout(
             &(),
@@ -5911,9 +5949,7 @@ mod tests {
 
     #[test]
     fn test_merge_backend_exit_layouts_frame_stack_enriches_existing_resume() {
-        use crate::resume::{
-            ResumeValueKind, ResumeValueLayoutSummary,
-        };
+        use crate::resume::{ResumeValueKind, ResumeValueLayoutSummary};
 
         // Existing resume layout with one frame that has no slot_types.
         let existing_frame = ResumeFrameLayoutSummary {
@@ -6010,5 +6046,584 @@ mod tests {
         assert_eq!(resume.frame_layouts[1].pc, 20);
         assert_eq!(resume.frame_layouts[1].trace_id, Some(60));
         assert_eq!(resume.frame_layouts[1].slot_types, Some(vec![Type::Int]));
+    }
+
+    #[test]
+    fn test_three_level_nested_frame_restore_from_frame_stack_metadata() {
+        use crate::jit_state::JitState;
+        use crate::resume::{ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary};
+
+        // JitState implementation that records per-frame restores.
+        #[derive(Default)]
+        struct ThreeFrameState {
+            restored_frames: Vec<(usize, u64, Vec<Value>)>,
+        }
+
+        impl JitState for ThreeFrameState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+
+            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                Vec::new()
+            }
+            fn create_sym(_: &(), _: usize) -> () {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+
+            fn restore_reconstructed_frame_values_with_metadata(
+                &mut self,
+                _meta: &(),
+                frame_index: usize,
+                _total_frames: usize,
+                frame: &crate::resume::ReconstructedFrame,
+                values: &[Value],
+                _exception: &ExceptionState,
+            ) -> bool {
+                self.restored_frames
+                    .push((frame_index, frame.pc, values.to_vec()));
+                true
+            }
+
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                Vec::new()
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+        }
+
+        let mut state = ThreeFrameState::default();
+
+        // Frame 0 (outermost): 3 Int slots
+        // Frame 1 (middle):    1 Ref slot + 1 Float slot
+        // Frame 2 (innermost): 2 Int slots
+        let float_bits: i64 = 3.14f64.to_bits() as i64;
+        let ref_val: i64 = 0xBEEF;
+
+        let reconstructed_state = ReconstructedState {
+            frames: vec![
+                ReconstructedFrame {
+                    trace_id: Some(100),
+                    header_pc: Some(500),
+                    source_guard: None,
+                    pc: 10,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(1),
+                        ReconstructedValue::Value(2),
+                        ReconstructedValue::Value(3),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(200),
+                    header_pc: Some(600),
+                    source_guard: None,
+                    pc: 20,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(ref_val),
+                        ReconstructedValue::Value(float_bits),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(300),
+                    header_pc: Some(700),
+                    source_guard: None,
+                    pc: 30,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(42),
+                        ReconstructedValue::Value(99),
+                    ],
+                },
+            ],
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        };
+
+        // Build frame_stack metadata with slot_types for all 3 frames.
+        let frame_layouts = vec![
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(100),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 10,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(0),
+                    ExitValueSourceLayout::ExitValue(1),
+                    ExitValueSourceLayout::ExitValue(2),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Int, Type::Int]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(200),
+                header_pc: Some(600),
+                source_guard: None,
+                pc: 20,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(3),
+                    ExitValueSourceLayout::ExitValue(4),
+                ],
+                slot_types: Some(vec![Type::Ref, Type::Float]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(300),
+                header_pc: Some(700),
+                source_guard: None,
+                pc: 30,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(5),
+                    ExitValueSourceLayout::ExitValue(6),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Int]),
+            }),
+        ];
+
+        let restored = state.restore_guard_failure_with_resume_layout(
+            &(),
+            &[1, 2, 3, ref_val, float_bits, 42, 99],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &[],
+            &[],
+            &ExceptionState::default(),
+        );
+
+        assert!(restored, "three-frame restore should succeed");
+        assert_eq!(
+            state.restored_frames.len(),
+            3,
+            "all 3 frames should be restored"
+        );
+
+        // Frame 0 (outermost): 3 Int slots
+        assert_eq!(state.restored_frames[0].0, 0);
+        assert_eq!(state.restored_frames[0].1, 10);
+        assert_eq!(
+            state.restored_frames[0].2,
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)]
+        );
+
+        // Frame 1 (middle): 1 Ref slot + 1 Float slot
+        assert_eq!(state.restored_frames[1].0, 1);
+        assert_eq!(state.restored_frames[1].1, 20);
+        assert_eq!(
+            state.restored_frames[1].2,
+            vec![
+                Value::Ref(GcRef(ref_val as usize)),
+                Value::Float(f64::from_bits(float_bits as u64))
+            ]
+        );
+
+        // Frame 2 (innermost): 2 Int slots
+        assert_eq!(state.restored_frames[2].0, 2);
+        assert_eq!(state.restored_frames[2].1, 30);
+        assert_eq!(
+            state.restored_frames[2].2,
+            vec![Value::Int(42), Value::Int(99)]
+        );
+    }
+
+    #[test]
+    fn test_four_level_nested_frame_restore() {
+        use crate::jit_state::JitState;
+        use crate::resume::{ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary};
+
+        #[derive(Default)]
+        struct FourFrameState {
+            restored_frames: Vec<(usize, u64, Vec<Value>)>,
+        }
+
+        impl JitState for FourFrameState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+
+            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                Vec::new()
+            }
+            fn create_sym(_: &(), _: usize) -> () {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+
+            fn restore_reconstructed_frame_values_with_metadata(
+                &mut self,
+                _meta: &(),
+                frame_index: usize,
+                _total_frames: usize,
+                frame: &crate::resume::ReconstructedFrame,
+                values: &[Value],
+                _exception: &ExceptionState,
+            ) -> bool {
+                self.restored_frames
+                    .push((frame_index, frame.pc, values.to_vec()));
+                true
+            }
+
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                Vec::new()
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+        }
+
+        let mut state = FourFrameState::default();
+
+        let float1_bits: i64 = 1.5f64.to_bits() as i64;
+        let float2_bits: i64 = (-2.718f64).to_bits() as i64;
+        let ref1: i64 = 0xCAFE;
+        let ref2: i64 = 0xFACE;
+
+        // Frame 0: 1 Int
+        // Frame 1: 1 Float
+        // Frame 2: 2 Ref
+        // Frame 3: 1 Int + 1 Float + 1 Ref
+        let reconstructed_state = ReconstructedState {
+            frames: vec![
+                ReconstructedFrame {
+                    trace_id: Some(1000),
+                    header_pc: Some(5000),
+                    source_guard: None,
+                    pc: 100,
+                    slot_types: None,
+                    values: vec![ReconstructedValue::Value(77)],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(2000),
+                    header_pc: Some(6000),
+                    source_guard: None,
+                    pc: 200,
+                    slot_types: None,
+                    values: vec![ReconstructedValue::Value(float1_bits)],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(3000),
+                    header_pc: Some(7000),
+                    source_guard: None,
+                    pc: 300,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(ref1),
+                        ReconstructedValue::Value(ref2),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(4000),
+                    header_pc: Some(8000),
+                    source_guard: None,
+                    pc: 400,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(55),
+                        ReconstructedValue::Value(float2_bits),
+                        ReconstructedValue::Value(ref1),
+                    ],
+                },
+            ],
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        };
+
+        let frame_layouts = vec![
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(1000),
+                header_pc: Some(5000),
+                source_guard: None,
+                pc: 100,
+                slots: vec![ExitValueSourceLayout::ExitValue(0)],
+                slot_types: Some(vec![Type::Int]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(2000),
+                header_pc: Some(6000),
+                source_guard: None,
+                pc: 200,
+                slots: vec![ExitValueSourceLayout::ExitValue(1)],
+                slot_types: Some(vec![Type::Float]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(3000),
+                header_pc: Some(7000),
+                source_guard: None,
+                pc: 300,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(2),
+                    ExitValueSourceLayout::ExitValue(3),
+                ],
+                slot_types: Some(vec![Type::Ref, Type::Ref]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(4000),
+                header_pc: Some(8000),
+                source_guard: None,
+                pc: 400,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(4),
+                    ExitValueSourceLayout::ExitValue(5),
+                    ExitValueSourceLayout::ExitValue(6),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Float, Type::Ref]),
+            }),
+        ];
+
+        let restored = state.restore_guard_failure_with_resume_layout(
+            &(),
+            &[77, float1_bits, ref1, ref2, 55, float2_bits, ref1],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &[],
+            &[],
+            &ExceptionState::default(),
+        );
+
+        assert!(restored, "four-frame restore should succeed");
+        assert_eq!(
+            state.restored_frames.len(),
+            4,
+            "all 4 frames should be restored"
+        );
+
+        // Frame 0: 1 Int
+        assert_eq!(state.restored_frames[0].0, 0);
+        assert_eq!(state.restored_frames[0].1, 100);
+        assert_eq!(state.restored_frames[0].2, vec![Value::Int(77)]);
+
+        // Frame 1: 1 Float
+        assert_eq!(state.restored_frames[1].0, 1);
+        assert_eq!(state.restored_frames[1].1, 200);
+        assert_eq!(
+            state.restored_frames[1].2,
+            vec![Value::Float(f64::from_bits(float1_bits as u64))]
+        );
+
+        // Frame 2: 2 Ref
+        assert_eq!(state.restored_frames[2].0, 2);
+        assert_eq!(state.restored_frames[2].1, 300);
+        assert_eq!(
+            state.restored_frames[2].2,
+            vec![
+                Value::Ref(GcRef(ref1 as usize)),
+                Value::Ref(GcRef(ref2 as usize))
+            ]
+        );
+
+        // Frame 3: Int + Float + Ref
+        assert_eq!(state.restored_frames[3].0, 3);
+        assert_eq!(state.restored_frames[3].1, 400);
+        assert_eq!(
+            state.restored_frames[3].2,
+            vec![
+                Value::Int(55),
+                Value::Float(f64::from_bits(float2_bits as u64)),
+                Value::Ref(GcRef(ref1 as usize))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nested_frame_restore_with_virtuals() {
+        use crate::jit_state::JitState;
+        use crate::resume::{
+            MaterializedValue, MaterializedVirtual, ReconstructedFrame, ReconstructedValue,
+            ResumeFrameLayoutSummary,
+        };
+
+        #[derive(Default)]
+        struct VirtualFrameState {
+            restored_frames: Vec<(usize, u64, Vec<Value>)>,
+        }
+
+        impl JitState for VirtualFrameState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+
+            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                Vec::new()
+            }
+            fn create_sym(_: &(), _: usize) -> () {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+
+            fn restore_reconstructed_frame_values_with_metadata(
+                &mut self,
+                _meta: &(),
+                frame_index: usize,
+                _total_frames: usize,
+                frame: &crate::resume::ReconstructedFrame,
+                values: &[Value],
+                _exception: &ExceptionState,
+            ) -> bool {
+                self.restored_frames
+                    .push((frame_index, frame.pc, values.to_vec()));
+                true
+            }
+
+            fn materialize_virtual_ref(
+                &mut self,
+                _meta: &(),
+                virtual_index: usize,
+                _materialized: &MaterializedVirtual,
+            ) -> Option<GcRef> {
+                // Return a deterministic GcRef based on virtual_index.
+                Some(GcRef(0xA000 + virtual_index))
+            }
+
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                Vec::new()
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+        }
+
+        let mut state = VirtualFrameState::default();
+
+        // Frame 0 (outermost): 1 Int slot + 1 Virtual(0) slot
+        // Frame 1 (middle):    1 Float slot + 1 Virtual(1) slot
+        // Frame 2 (innermost): 2 Int slots
+        let float_bits: i64 = 9.81f64.to_bits() as i64;
+
+        let reconstructed_state = ReconstructedState {
+            frames: vec![
+                ReconstructedFrame {
+                    trace_id: Some(100),
+                    header_pc: Some(500),
+                    source_guard: None,
+                    pc: 10,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(42),
+                        ReconstructedValue::Virtual(0),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(200),
+                    header_pc: Some(600),
+                    source_guard: None,
+                    pc: 20,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(float_bits),
+                        ReconstructedValue::Virtual(1),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(300),
+                    header_pc: Some(700),
+                    source_guard: None,
+                    pc: 30,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(10),
+                        ReconstructedValue::Value(20),
+                    ],
+                },
+            ],
+            virtuals: vec![
+                MaterializedVirtual::Obj {
+                    type_id: 1,
+                    descr_index: 0,
+                    fields: vec![(0, MaterializedValue::Value(100))],
+                },
+                MaterializedVirtual::Obj {
+                    type_id: 2,
+                    descr_index: 1,
+                    fields: vec![(0, MaterializedValue::Value(200))],
+                },
+            ],
+            pending_fields: Vec::new(),
+        };
+
+        let frame_layouts = vec![
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(100),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 10,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(0),
+                    ExitValueSourceLayout::ExitValue(1),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Ref]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(200),
+                header_pc: Some(600),
+                source_guard: None,
+                pc: 20,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(2),
+                    ExitValueSourceLayout::ExitValue(3),
+                ],
+                slot_types: Some(vec![Type::Float, Type::Ref]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(300),
+                header_pc: Some(700),
+                source_guard: None,
+                pc: 30,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(4),
+                    ExitValueSourceLayout::ExitValue(5),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Int]),
+            }),
+        ];
+
+        let restored = state.restore_guard_failure_with_resume_layout(
+            &(),
+            &[42, 0, float_bits, 0, 10, 20], // Virtual slots have placeholder 0
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &reconstructed_state.virtuals,
+            &[],
+            &ExceptionState::default(),
+        );
+
+        assert!(restored, "nested frame restore with virtuals should succeed");
+        assert_eq!(
+            state.restored_frames.len(),
+            3,
+            "all 3 frames should be restored"
+        );
+
+        // Frame 0: Int(42) + Virtual(0) materialized as Ref(0xA000)
+        assert_eq!(state.restored_frames[0].0, 0);
+        assert_eq!(state.restored_frames[0].1, 10);
+        assert_eq!(
+            state.restored_frames[0].2,
+            vec![Value::Int(42), Value::Ref(GcRef(0xA000))]
+        );
+
+        // Frame 1: Float(9.81) + Virtual(1) materialized as Ref(0xA001)
+        assert_eq!(state.restored_frames[1].0, 1);
+        assert_eq!(state.restored_frames[1].1, 20);
+        assert_eq!(
+            state.restored_frames[1].2,
+            vec![
+                Value::Float(f64::from_bits(float_bits as u64)),
+                Value::Ref(GcRef(0xA001))
+            ]
+        );
+
+        // Frame 2: Int(10) + Int(20)
+        assert_eq!(state.restored_frames[2].0, 2);
+        assert_eq!(state.restored_frames[2].1, 30);
+        assert_eq!(
+            state.restored_frames[2].2,
+            vec![Value::Int(10), Value::Int(20)]
+        );
     }
 }
