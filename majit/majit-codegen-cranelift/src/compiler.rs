@@ -2231,10 +2231,10 @@ fn resolve_call_assembler_target(
         }
         result_type => {
             if finish_types != [result_type] {
-                return Err(unsupported_semantics(
-                    opcode,
-                    "call-assembler target finish result does not match the descriptor",
-                ));
+                // Type mismatch between caller's expected result and target's
+                // actual finish type. Treat as unresolved — runtime will use
+                // the helper fallback path.
+                return Ok(None);
             }
         }
     }
@@ -6513,7 +6513,20 @@ fn collect_guards(
 
         let (fail_arg_refs, fail_arg_types) = if is_finish {
             let refs: Vec<OpRef> = op.args.iter().copied().collect();
-            let types = infer_fail_arg_types(&refs, &value_types)?;
+            // Use the descriptor's explicit types for FINISH args — these are
+            // set by the tracer and represent the caller's view of the return
+            // type, which may differ from the op's inferred type (e.g. New
+            // produces Ref but the value is treated as Int by the caller).
+            let types = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+                let dt = fd.fail_arg_types();
+                if dt.len() == refs.len() {
+                    dt.to_vec()
+                } else {
+                    infer_fail_arg_types(&refs, &value_types)?
+                }
+            } else {
+                infer_fail_arg_types(&refs, &value_types)?
+            };
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();

@@ -167,7 +167,7 @@ const DEFAULT_FUNCTION_THRESHOLD: u32 = 4;
 /// Prevents unbounded recursion and excessively long traces.
 /// Mirrors RPython's `MAX_INLINE_DEPTH` from warmstate.py.
 const DEFAULT_MAX_INLINE_DEPTH: u32 = 10;
-static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(0);
+static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
 
 pub struct WarmState {
     /// Global hot counter.
