@@ -648,22 +648,6 @@ impl TraceFrameState {
         }
     }
 
-    fn trace_boxed_int_value(
-        &self,
-        ctx: &mut TraceCtx,
-        value: OpRef,
-        _concrete_value: i64,
-    ) -> OpRef {
-        crate::jit::generated::trace_box_int(
-            ctx,
-            value,
-            w_int_size_descr(),
-            ob_type_descr(),
-            int_intval_descr(),
-            &INT_TYPE as *const _ as i64,
-        )
-    }
-
     fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
         let index = ctx.const_int(index as i64);
         let in_bounds = ctx.record_op(OpCode::IntGt, &[len, index]);
@@ -1238,11 +1222,14 @@ impl TraceFrameState {
                     this.guard_object_class(ctx, value, &pyre_object::STR_TYPE as *const PyType);
                     let len =
                         ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], str_len_descr());
-                    Ok(this.trace_boxed_int_value(
-                        ctx,
-                        len,
-                        pyre_object::w_str_len(concrete_value) as i64,
-                    ))
+                    Ok({
+                        let int_type_addr = &INT_TYPE as *const _ as i64;
+                        crate::jit::generated::trace_box_int(
+                            ctx, len,
+                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            int_type_addr,
+                        )
+                    })
                 });
             }
             if is_dict(concrete_value) {
@@ -1250,11 +1237,14 @@ impl TraceFrameState {
                     this.guard_object_class(ctx, value, &DICT_TYPE as *const PyType);
                     let len =
                         ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], dict_len_descr());
-                    Ok(this.trace_boxed_int_value(
-                        ctx,
-                        len,
-                        pyre_object::w_dict_len(concrete_value) as i64,
-                    ))
+                    Ok({
+                        let int_type_addr = &INT_TYPE as *const _ as i64;
+                        crate::jit::generated::trace_box_int(
+                            ctx, len,
+                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            int_type_addr,
+                        )
+                    })
                 });
             }
             if is_list(concrete_value) {
@@ -1265,7 +1255,14 @@ impl TraceFrameState {
                         &[value],
                         list_items_len_descr(),
                     );
-                    Ok(this.trace_boxed_int_value(ctx, len, w_list_len(concrete_value) as i64))
+                    Ok({
+                        let int_type_addr = &INT_TYPE as *const _ as i64;
+                        crate::jit::generated::trace_box_int(
+                            ctx, len,
+                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            int_type_addr,
+                        )
+                    })
                 });
             }
             if is_tuple(concrete_value) {
@@ -1276,7 +1273,14 @@ impl TraceFrameState {
                         &[value],
                         tuple_items_len_descr(),
                     );
-                    Ok(this.trace_boxed_int_value(ctx, len, w_tuple_len(concrete_value) as i64))
+                    Ok({
+                        let int_type_addr = &INT_TYPE as *const _ as i64;
+                        crate::jit::generated::trace_box_int(
+                            ctx, len,
+                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            int_type_addr,
+                        )
+                    })
                 });
             }
         }
@@ -1310,7 +1314,14 @@ impl TraceFrameState {
                     let sign = ctx.record_op(OpCode::IntRshift, &[int_value, shift]);
                     let xor = ctx.record_op(OpCode::IntXor, &[int_value, sign]);
                     let abs_value = ctx.record_op(OpCode::IntSub, &[xor, sign]);
-                    Ok(this.trace_boxed_int_value(ctx, abs_value, concrete_int.abs()))
+                    Ok({
+                        let int_type_addr = &INT_TYPE as *const _ as i64;
+                        crate::jit::generated::trace_box_int(
+                            ctx, abs_value,
+                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            int_type_addr,
+                        )
+                    })
                 });
             }
         }
@@ -1420,7 +1431,14 @@ impl TraceFrameState {
                     } else {
                         ctx.record_op(OpCode::IntXor, &[rhs, select_bits])
                     };
-                    Ok(this.trace_boxed_int_value(ctx, selected, concrete_result))
+                    Ok({
+                        let int_type_addr = &INT_TYPE as *const _ as i64;
+                        crate::jit::generated::trace_box_int(
+                            ctx, selected,
+                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            int_type_addr,
+                        )
+                    })
                 });
             }
         }
@@ -1622,7 +1640,12 @@ impl TraceFrameState {
                 &[iter, next_current],
                 range_iter_current_descr(),
             );
-            Ok(this.trace_boxed_int_value(ctx, current, concrete_current))
+            let int_type_addr = &INT_TYPE as *const _ as i64;
+            Ok(crate::jit::generated::trace_box_int(
+                ctx, current,
+                w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                int_type_addr,
+            ))
         })
     }
 
