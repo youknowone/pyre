@@ -836,13 +836,8 @@ pub trait JitState: Sized {
         // direct caller of the innermost frame.
         for frame_index in 0..total_frames - 1 {
             let frame = &reconstructed_state.frames[frame_index];
-            let types = self.resolve_frame_types(
-                meta,
-                frame_index,
-                total_frames,
-                frame,
-                frame_layouts,
-            );
+            let types =
+                self.resolve_frame_types(meta, frame_index, total_frames, frame, frame_layouts);
             let Some(types) = types else {
                 return false;
             };
@@ -910,8 +905,7 @@ pub trait JitState: Sized {
                 frame_layouts
                     .and_then(|layouts| layouts.get(frame_index))
                     .filter(|layout| {
-                        layout.pc == frame.pc
-                            && layout.slot_layouts.len() == frame.values.len()
+                        layout.pc == frame.pc && layout.slot_layouts.len() == frame.values.len()
                     })
                     .and_then(|layout| layout.slot_types.clone())
             })
@@ -1563,10 +1557,7 @@ mod tests {
                     source_guard: None,
                     pc: 10,
                     slot_types: Some(vec![Type::Int, Type::Int]),
-                    values: vec![
-                        ReconstructedValue::Value(1),
-                        ReconstructedValue::Value(2),
-                    ],
+                    values: vec![ReconstructedValue::Value(1), ReconstructedValue::Value(2)],
                 },
                 ReconstructedFrame {
                     trace_id: Some(200),
@@ -1574,10 +1565,7 @@ mod tests {
                     source_guard: None,
                     pc: 20,
                     slot_types: Some(vec![Type::Int, Type::Ref]),
-                    values: vec![
-                        ReconstructedValue::Value(3),
-                        ReconstructedValue::Virtual(0),
-                    ],
+                    values: vec![ReconstructedValue::Value(3), ReconstructedValue::Virtual(0)],
                 },
                 ReconstructedFrame {
                     trace_id: Some(300),
@@ -1747,5 +1735,246 @@ mod tests {
         assert_eq!(*idx, 1);
         assert_eq!(*pc, 60);
         assert_eq!(vals, &[Value::Int(99)]);
+    }
+
+    #[test]
+    fn test_arbitrary_depth_caller_stack_restore() {
+        for depth in [1usize, 2, 5, 10, 20, 50] {
+            let mut state = MultiFrameTestState::default();
+
+            // Build `depth` frames, each with 2 Int slots derived from frame_index.
+            let frames: Vec<ReconstructedFrame> = (0..depth)
+                .map(|i| ReconstructedFrame {
+                    trace_id: Some((i * 100) as u64),
+                    header_pc: Some((i * 1000) as u64),
+                    source_guard: None,
+                    pc: (i * 10) as u64,
+                    slot_types: Some(vec![Type::Int, Type::Int]),
+                    values: vec![
+                        ReconstructedValue::Value((i * 100) as i64),
+                        ReconstructedValue::Value((i * 100 + 1) as i64),
+                    ],
+                })
+                .collect();
+
+            let reconstructed_state = ReconstructedState {
+                frames,
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            };
+
+            let restored = state.restore_guard_failure_with_session_cache(
+                &(),
+                &[],
+                Some(&reconstructed_state),
+                None,
+                &[],
+                &[],
+                &ExceptionState::default(),
+                None,
+            );
+            assert!(restored, "depth={depth}: restore should succeed");
+
+            if depth == 1 {
+                // Single frame: no push_caller_frame calls, restored via
+                // restore_reconstructed_frame_values_with_metadata directly.
+                assert_eq!(
+                    state.pushed_caller_frames.len(),
+                    0,
+                    "depth=1: no caller frames to push"
+                );
+                assert_eq!(state.restored_frames.len(), 1);
+                let (idx, pc, vals) = &state.restored_frames[0];
+                assert_eq!(*idx, 0);
+                assert_eq!(*pc, 0);
+                assert_eq!(vals, &[Value::Int(0), Value::Int(1)]);
+            } else {
+                // Outer frames pushed via push_caller_frame
+                assert_eq!(
+                    state.pushed_caller_frames.len(),
+                    depth - 1,
+                    "depth={depth}: should push {pushed} caller frames",
+                    pushed = depth - 1,
+                );
+                for i in 0..depth - 1 {
+                    let (idx, total, vals, pc) = &state.pushed_caller_frames[i];
+                    assert_eq!(*idx, i, "depth={depth}, frame {i}: frame_index");
+                    assert_eq!(*total, depth, "depth={depth}, frame {i}: total_frames");
+                    assert_eq!(*pc, (i * 10) as u64, "depth={depth}, frame {i}: pc");
+                    assert_eq!(
+                        vals,
+                        &[
+                            Value::Int((i * 100) as i64),
+                            Value::Int((i * 100 + 1) as i64),
+                        ],
+                        "depth={depth}, frame {i}: values",
+                    );
+                }
+
+                // Innermost frame restored as current state
+                assert_eq!(
+                    state.restored_frames.len(),
+                    1,
+                    "depth={depth}: exactly one innermost frame restored"
+                );
+                let last = depth - 1;
+                let (idx, pc, vals) = &state.restored_frames[0];
+                assert_eq!(*idx, last, "depth={depth}: innermost frame_index");
+                assert_eq!(*pc, (last * 10) as u64, "depth={depth}: innermost pc");
+                assert_eq!(
+                    vals,
+                    &[
+                        Value::Int((last * 100) as i64),
+                        Value::Int((last * 100 + 1) as i64),
+                    ],
+                    "depth={depth}: innermost values",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_arbitrary_depth_with_mixed_types() {
+        for depth in [1usize, 2, 5, 10, 20, 50] {
+            let mut state = MultiFrameTestState::default();
+
+            // Cycle through Int, Float, Ref types across frames.
+            // Each frame has 3 slots with one of each type pattern.
+            let type_patterns: &[&[Type]] = &[
+                &[Type::Int, Type::Float, Type::Ref],
+                &[Type::Float, Type::Ref, Type::Int],
+                &[Type::Ref, Type::Int, Type::Float],
+            ];
+
+            // Create one virtual per frame that uses Ref type
+            let num_virtuals = depth;
+            let virtuals: Vec<MaterializedVirtual> = (0..num_virtuals)
+                .map(|i| MaterializedVirtual::Obj {
+                    type_id: (i + 1) as u32,
+                    descr_index: i as u32,
+                    fields: vec![(0, MaterializedValue::Value((i * 1000) as i64))],
+                })
+                .collect();
+
+            let frames: Vec<ReconstructedFrame> = (0..depth)
+                .map(|i| {
+                    let types = type_patterns[i % type_patterns.len()];
+                    let values: Vec<ReconstructedValue> = types
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, ty)| match ty {
+                            Type::Int => ReconstructedValue::Value((i * 100 + slot) as i64),
+                            Type::Float => {
+                                let f = (i as f64) * 1.5 + (slot as f64) * 0.1;
+                                ReconstructedValue::Value(f64::to_bits(f) as i64)
+                            }
+                            Type::Ref => ReconstructedValue::Virtual(i),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    ReconstructedFrame {
+                        trace_id: Some((i * 100) as u64),
+                        header_pc: Some((i * 1000) as u64),
+                        source_guard: None,
+                        pc: (i * 10) as u64,
+                        slot_types: Some(types.to_vec()),
+                        values,
+                    }
+                })
+                .collect();
+
+            let reconstructed_state = ReconstructedState {
+                frames,
+                virtuals,
+                pending_fields: Vec::new(),
+            };
+
+            let restored = state.restore_guard_failure_with_session_cache(
+                &(),
+                &[],
+                Some(&reconstructed_state),
+                None,
+                &reconstructed_state.virtuals,
+                &[],
+                &ExceptionState::default(),
+                None,
+            );
+            assert!(restored, "depth={depth}: restore should succeed");
+
+            if depth == 1 {
+                assert_eq!(state.pushed_caller_frames.len(), 0);
+                assert_eq!(state.restored_frames.len(), 1);
+            } else {
+                assert_eq!(
+                    state.pushed_caller_frames.len(),
+                    depth - 1,
+                    "depth={depth}: should push {pushed} caller frames",
+                    pushed = depth - 1,
+                );
+
+                // Verify type preservation for each pushed caller frame
+                for i in 0..depth - 1 {
+                    let (idx, total, vals, pc) = &state.pushed_caller_frames[i];
+                    assert_eq!(*idx, i);
+                    assert_eq!(*total, depth);
+                    assert_eq!(*pc, (i * 10) as u64);
+                    assert_eq!(vals.len(), 3, "depth={depth}, frame {i}: 3 slots");
+
+                    let types = type_patterns[i % type_patterns.len()];
+                    for (slot, ty) in types.iter().enumerate() {
+                        match ty {
+                            Type::Int => {
+                                assert_eq!(
+                                    vals[slot],
+                                    Value::Int((i * 100 + slot) as i64),
+                                    "depth={depth}, frame {i}, slot {slot}: Int value",
+                                );
+                            }
+                            Type::Float => {
+                                let expected = (i as f64) * 1.5 + (slot as f64) * 0.1;
+                                assert_eq!(
+                                    vals[slot],
+                                    Value::Float(expected),
+                                    "depth={depth}, frame {i}, slot {slot}: Float value",
+                                );
+                            }
+                            Type::Ref => {
+                                assert_eq!(
+                                    vals[slot],
+                                    Value::Ref(GcRef(0xC000 + i)),
+                                    "depth={depth}, frame {i}, slot {slot}: Ref value",
+                                );
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+
+                // Verify innermost frame
+                let last = depth - 1;
+                assert_eq!(state.restored_frames.len(), 1);
+                let (idx, pc, vals) = &state.restored_frames[0];
+                assert_eq!(*idx, last);
+                assert_eq!(*pc, (last * 10) as u64);
+                assert_eq!(vals.len(), 3);
+
+                let types = type_patterns[last % type_patterns.len()];
+                for (slot, ty) in types.iter().enumerate() {
+                    match ty {
+                        Type::Int => {
+                            assert_eq!(vals[slot], Value::Int((last * 100 + slot) as i64));
+                        }
+                        Type::Float => {
+                            let expected = (last as f64) * 1.5 + (slot as f64) * 0.1;
+                            assert_eq!(vals[slot], Value::Float(expected));
+                        }
+                        Type::Ref => {
+                            assert_eq!(vals[slot], Value::Ref(GcRef(0xC000 + last)));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
     }
 }
