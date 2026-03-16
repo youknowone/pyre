@@ -31,7 +31,7 @@ pub struct LowererConfig {
     auto_calls: bool,
 }
 
-const MAX_HELPER_CALL_ARITY: usize = 8;
+const MAX_HELPER_CALL_ARITY: usize = 16;
 
 pub(crate) struct InlineHelperJitCode {
     pub body: TokenStream,
@@ -393,32 +393,60 @@ impl<'c> Lowerer<'c> {
         match policy {
             CallPolicySpec::Explicit(kind) => match kind.to_string().as_str() {
                 "residual_void" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.residual_call_void_typed_args(__fn_idx, #typed_args);
+                        });
+                    }
                 }
                 "may_force_void" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.call_may_force_void_args(__fn_idx, &[#(#arg_regs),*]);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_may_force_void_args(__fn_idx, &[#(#arg_regs),*]);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_may_force_void_typed_args(__fn_idx, #typed_args);
+                        });
+                    }
                 }
                 "release_gil_void" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.call_release_gil_void_args(__fn_idx, &[#(#arg_regs),*]);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_release_gil_void_args(__fn_idx, &[#(#arg_regs),*]);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args);
+                        });
+                    }
                 }
                 "loopinvariant_void" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.call_loopinvariant_void_args(__fn_idx, &[#(#arg_regs),*]);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_loopinvariant_void_args(__fn_idx, &[#(#arg_regs),*]);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args);
+                        });
+                    }
                 }
                 "residual_void_wrapped" => {
                     let policy_path = helper_policy_path(&call.func)?;
@@ -787,39 +815,74 @@ impl<'c> Lowerer<'c> {
         match policy {
             CallPolicySpec::Explicit(kind) => match kind.to_string().as_str() {
                 "residual_int" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                        });
+                    }
                 }
                 "may_force_int" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.call_may_force_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_may_force_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
+                        });
+                    }
                 }
                 "release_gil_int" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.call_release_gil_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_release_gil_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
+                        });
+                    }
                 }
                 "loopinvariant_int" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.call_loopinvariant_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_loopinvariant_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
+                        });
+                    }
                 }
                 "elidable_int" => {
-                    let arg_regs = int_arg_regs(&arg_bindings)?;
-                    self.statements.push(quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                        __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                    });
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                        });
+                    }
                 }
                 "residual_int_wrapped"
                 | "may_force_int_wrapped"
