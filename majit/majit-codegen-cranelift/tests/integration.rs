@@ -1932,3 +1932,196 @@ fn test_stress_cse_chain() {
     let frame = backend.execute_token(&token, &[Value::Int(-2), Value::Int(3)]);
     assert_eq!(backend.get_int_value(&frame, 0), -16);
 }
+
+// ===========================================================================
+// Threadlocal parity tests (RPython: test_threadlocal.py)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test: ThreadlocalrefGet compiles and reads back a value set via the shim
+//
+// Mirrors RPython's test_threadlocalref_get: set a TLS slot, then compile
+// a trace that reads it via ThreadlocalrefGet, verify the value matches.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_threadlocalref_get_basic() {
+    use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
+
+    // Set slot 0 (offset=0) to 0x544C (same magic value as RPython test).
+    jit_threadlocalref_set(0, 0x544C);
+
+    // Build trace: ThreadlocalrefGet(offset=0) -> finish(result)
+    let mut rec = TraceRecorder::new();
+    let _dummy = rec.record_input_arg(Type::Int); // need at least one input
+
+    let const_offset = OpRef(1000); // offset = 0 bytes
+    let result = rec.record_op(OpCode::ThreadlocalrefGet, &[const_offset]);
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64); // offset 0
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(500);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    // ThreadlocalrefGet returns a Ref type (pointer-sized).
+    let got = backend.get_ref_value(&frame, 0);
+    assert_eq!(
+        got.0 as i64,
+        0x544C,
+        "ThreadlocalrefGet should read back 0x544C"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: ThreadlocalrefGet reads different slots at different offsets
+//
+// Mirrors RPython's test_threadlocalref_get_char: verify that distinct
+// offsets map to distinct slots. Offsets are in bytes (divided by 8
+// internally to get slot index).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_threadlocalref_get_multiple_slots() {
+    use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
+
+    // Set slot 0 (offset 0) and slot 1 (offset 8) to different values.
+    jit_threadlocalref_set(0, 0xAAAA);
+    jit_threadlocalref_set(8, 0xBBBB);
+
+    // Build trace that reads both slots and adds them:
+    //   r0 = ThreadlocalrefGet(offset=0)
+    //   r1 = ThreadlocalrefGet(offset=8)
+    //   result = r0 + r1
+    //   finish(result)
+    let mut rec = TraceRecorder::new();
+    let _dummy = rec.record_input_arg(Type::Int);
+
+    let const_off0 = OpRef(1000);
+    let const_off8 = OpRef(1001);
+
+    let r0 = rec.record_op(OpCode::ThreadlocalrefGet, &[const_off0]);
+    let r1 = rec.record_op(OpCode::ThreadlocalrefGet, &[const_off8]);
+    let result = rec.record_op(OpCode::IntAdd, &[r0, r1]);
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 8i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(501);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        0xAAAA + 0xBBBB,
+        "Sum of two TLS slots should be 0xAAAA + 0xBBBB"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: ThreadlocalrefGet set-then-read roundtrip
+//
+// Verifies that writing a value with jit_threadlocalref_set and reading
+// it back via compiled ThreadlocalrefGet produces the same value, for
+// several test values including zero and negative numbers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_threadlocalref_set_and_read_roundtrip() {
+    use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
+
+    // Build trace once: ThreadlocalrefGet(offset=16) -> finish(result)
+    let mut rec = TraceRecorder::new();
+    let _dummy = rec.record_input_arg(Type::Int);
+
+    let const_offset = OpRef(1000);
+    let result = rec.record_op(OpCode::ThreadlocalrefGet, &[const_offset]);
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 16i64); // offset 16 -> slot index 2
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(502);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("compilation should succeed");
+
+    for value in [0i64, 1, -1, 0x544C, i64::MAX, i64::MIN] {
+        jit_threadlocalref_set(16, value);
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        // ThreadlocalrefGet returns a Ref type (pointer-sized).
+        let got = backend.get_ref_value(&frame, 0);
+        assert_eq!(
+            got.0 as i64,
+            value,
+            "roundtrip failed for value {value}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: Different threads see independent TLS values
+//
+// Mirrors RPython's implicit thread isolation: each thread has its own
+// JIT_THREADLOCAL_SLOTS (thread_local!). Verify that writing on one
+// thread does not affect reads on another.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_threadlocalref_thread_isolation() {
+    use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
+    use std::sync::{Arc as StdArc, Barrier};
+    use std::thread;
+
+    // Set the main-thread slot.
+    jit_threadlocalref_set(0, 0x1111);
+
+    let barrier = StdArc::new(Barrier::new(2));
+    let b2 = barrier.clone();
+
+    let child = thread::spawn(move || {
+        // Child thread: its TLS slot 0 should default to 0 (not 0x1111).
+        jit_threadlocalref_set(0, 0x2222);
+        b2.wait(); // synchronize so main can check its own value
+        // Read back to confirm child's slot is 0x2222.
+        // We can't easily run compiled code on the child thread
+        // (LoopToken/backend not Send), but we can verify via the shim.
+        let base = majit_codegen_cranelift::compiler::jit_threadlocalref_base();
+        let val = if base.is_null() {
+            0
+        } else {
+            unsafe { *base }
+        };
+        val
+    });
+
+    barrier.wait();
+    // Main thread's slot 0 should still be 0x1111.
+    let main_base = majit_codegen_cranelift::compiler::jit_threadlocalref_base();
+    let main_val = if main_base.is_null() {
+        0
+    } else {
+        unsafe { *main_base }
+    };
+    assert_eq!(main_val, 0x1111, "main thread TLS slot should be unchanged");
+
+    let child_val = child.join().unwrap();
+    assert_eq!(child_val, 0x2222, "child thread should see its own value");
+}

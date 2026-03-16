@@ -810,6 +810,150 @@ mod tests {
         assert!(!ws.should_inline_function(42));
     }
 
+    // ── Trace limit lifecycle tests (RPython: test_tracelimit.py) ──
+
+    #[test]
+    fn test_abort_tracing_too_long_sets_dont_trace() {
+        // When a trace is too long, the meta-interpreter calls
+        // abort_tracing(key, true) to prevent future tracing at that location.
+        // This mirrors RPython's ABORT_TOO_LONG behavior.
+        let mut ws = WarmState::new(2);
+        assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
+        match ws.maybe_compile(42) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing"),
+        }
+
+        // Simulate: recorder.is_too_long() was true, so abort with dont_trace.
+        ws.abort_tracing(42, true);
+
+        // The key is now blacklisted.
+        let cell = ws.get_cell(42).unwrap();
+        assert!(cell.flags & jc_flags::DONT_TRACE_HERE != 0);
+        assert!(!cell.is_tracing());
+
+        // Future maybe_compile returns NotHot even though counter might tick.
+        assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
+    }
+
+    #[test]
+    fn test_abort_too_long_then_retry_different_key() {
+        // Aborting one key's trace as too long should not affect other keys.
+        let mut ws = WarmState::new(2);
+
+        // Key 42: start and abort as too long.
+        assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
+        match ws.maybe_compile(42) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing for key 42"),
+        }
+        ws.abort_tracing(42, true);
+
+        // Key 99: should still work normally.
+        assert!(matches!(ws.maybe_compile(99), HotResult::NotHot));
+        match ws.maybe_compile(99) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing for key 99"),
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_with_trace_abort_and_recompile() {
+        // Full lifecycle: trace starts, is too long (abort without blacklist),
+        // then on retry a shorter trace succeeds and gets compiled.
+        let mut ws = WarmState::new(2);
+        let key = 0xCAFE;
+
+        // Phase 1: reach threshold, start tracing.
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing"),
+        }
+
+        // Phase 2: trace is too long, abort without blacklist.
+        ws.abort_tracing(key, false);
+
+        // Phase 3: retry, reach threshold again.
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_rec) => {
+                // Phase 4: this time the trace succeeds.
+                ws.finish_tracing(key);
+                let token = LoopToken::new(ws.alloc_token_number());
+                ws.install_compiled(key, token);
+            }
+            _ => panic!("expected StartTracing on retry"),
+        }
+
+        // Phase 5: compiled code should be available.
+        assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
+    }
+
+    #[test]
+    fn test_multiple_aborts_before_success() {
+        // Mirrors RPython's segmented trace behavior: a location can fail
+        // multiple times before eventually compiling.
+        // threshold=2 because the first tick always evicts (returns NotHot).
+        let mut ws = WarmState::new(2);
+        let key = 0xBEEF;
+
+        // First attempt: tick once (eviction), tick twice (threshold) -> StartTracing.
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing (attempt 1)"),
+        }
+        ws.abort_tracing(key, false);
+
+        // Second attempt: after abort, counter was reset, need to tick again.
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing (attempt 2)"),
+        }
+        ws.abort_tracing(key, false);
+
+        // Third attempt: succeeds and gets compiled.
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {
+                ws.finish_tracing(key);
+                let token = LoopToken::new(ws.alloc_token_number());
+                ws.install_compiled(key, token);
+            }
+            _ => panic!("expected StartTracing (attempt 3)"),
+        }
+        assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
+    }
+
+    #[test]
+    fn test_tracing_occurred_flag_persists_after_abort() {
+        // The TRACING_OCCURRED flag should remain set even after abort.
+        // This mirrors RPython's tracking of whether tracing was ever attempted.
+        let mut ws = WarmState::new(2);
+        let key = 42;
+
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing"),
+        }
+
+        let cell = ws.get_cell(key).unwrap();
+        assert!(cell.flags & jc_flags::TRACING_OCCURRED != 0);
+
+        ws.abort_tracing(key, false);
+
+        let cell = ws.get_cell(key).unwrap();
+        assert!(!cell.is_tracing());
+        assert!(
+            cell.flags & jc_flags::TRACING_OCCURRED != 0,
+            "TRACING_OCCURRED should persist after abort"
+        );
+    }
+
     #[test]
     fn test_quasiimmut_deps_cleared_after_invalidation() {
         let mut ws = WarmState::new(1);
