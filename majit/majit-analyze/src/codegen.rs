@@ -26,6 +26,9 @@ pub fn generate(result: &AnalysisResult) -> String {
     // Type layout constants (field offsets discovered from source)
     generate_type_layouts(&mut out, result);
 
+    // Named offset constants
+    generate_offset_constants(&mut out, result);
+
     // Helper function classifications
     generate_helper_summary(&mut out, result);
 
@@ -58,12 +61,24 @@ fn generate_type_layouts(out: &mut String, result: &AnalysisResult) {
     for layout in &result.type_layouts {
         out.push_str(&format!("// struct {} {{\n", layout.name));
         for (i, field) in layout.fields.iter().enumerate() {
-            out.push_str(&format!(
-                "//   [{}] {}: {}\n",
-                i, field.name, field.ty
-            ));
+            out.push_str(&format!("//   [{}] {}: {}\n", i, field.name, field.ty));
         }
         out.push_str("// }\n");
+    }
+    out.push('\n');
+}
+
+fn generate_offset_constants(out: &mut String, result: &AnalysisResult) {
+    if result.offset_constants.is_empty() {
+        return;
+    }
+    out.push_str("// ── Offset constants from interpreter source ──\n");
+    out.push_str(&format!(
+        "// {} constants discovered\n",
+        result.offset_constants.len()
+    ));
+    for (name, expr) in &result.offset_constants {
+        out.push_str(&format!("// {name} = {expr}\n"));
     }
     out.push('\n');
 }
@@ -77,20 +92,23 @@ fn generate_helper_summary(out: &mut String, result: &AnalysisResult) {
 
     for helper in &result.helpers {
         match &helper.classification {
-            HelperClassification::FieldRead { struct_name, field_name } => {
+            HelperClassification::FieldRead {
+                struct_name,
+                field_name,
+            } => {
                 field_reads.push(format!(
-                    "// FieldRead: {} → {}.{}", helper.name, struct_name, field_name
+                    "// FieldRead: {} → {}.{}",
+                    helper.name, struct_name, field_name
                 ));
             }
             HelperClassification::Constructor { struct_name } => {
                 constructors.push(format!(
-                    "// Constructor: {} → New({})", helper.name, struct_name
+                    "// Constructor: {} → New({})",
+                    helper.name, struct_name
                 ));
             }
             HelperClassification::TypeCheck { type_name } => {
-                type_checks.push(format!(
-                    "// TypeCheck: {} → is_{}", helper.name, type_name
-                ));
+                type_checks.push(format!("// TypeCheck: {} → is_{}", helper.name, type_name));
             }
             _ => {}
         }
@@ -99,11 +117,22 @@ fn generate_helper_summary(out: &mut String, result: &AnalysisResult) {
     out.push_str("// ── Helper function classifications ──\n");
     out.push_str(&format!(
         "// {} field reads, {} constructors, {} type checks\n",
-        field_reads.len(), constructors.len(), type_checks.len()
+        field_reads.len(),
+        constructors.len(),
+        type_checks.len()
     ));
-    for s in &field_reads { out.push_str(s); out.push('\n'); }
-    for s in &constructors { out.push_str(s); out.push('\n'); }
-    for s in &type_checks { out.push_str(s); out.push('\n'); }
+    for s in &field_reads {
+        out.push_str(s);
+        out.push('\n');
+    }
+    for s in &constructors {
+        out.push_str(s);
+        out.push('\n');
+    }
+    for s in &type_checks {
+        out.push_str(s);
+        out.push('\n');
+    }
     out.push('\n');
 }
 

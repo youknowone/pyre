@@ -147,6 +147,21 @@ pub fn extract_opcode_dispatch(
     arms
 }
 
+/// Extract named offset constants (pub const FOO_OFFSET: usize = ...).
+pub fn extract_offset_constants(parsed: &ParsedInterpreter) -> Vec<(String, String)> {
+    let mut constants = Vec::new();
+    for item in &parsed.file.items {
+        if let Item::Const(c) = item {
+            let name = c.ident.to_string();
+            if name.contains("OFFSET") || name.contains("_SIZE") {
+                let expr = quote::quote!(#c.expr).to_string();
+                constants.push((name, expr));
+            }
+        }
+    }
+    constants
+}
+
 /// Collect all function definitions into a name → body_summary map.
 pub fn collect_functions(
     parsed: &ParsedInterpreter,
