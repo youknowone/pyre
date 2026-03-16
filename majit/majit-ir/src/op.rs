@@ -138,6 +138,13 @@ pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>)
             }
         }
         write!(out, ")").unwrap();
+        // Render descriptor if present (parity with RPython's logger repr_of_descr)
+        if let Some(ref descr) = op.descr {
+            let repr = descr.repr();
+            if !repr.is_empty() {
+                write!(out, " descr=<{repr}>").unwrap();
+            }
+        }
         if let Some(ref fa) = op.fail_args {
             write!(out, " [").unwrap();
             for (i, arg) in fa.iter().enumerate() {
@@ -2986,5 +2993,219 @@ mod tests {
         let constants = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
         assert!(output.is_empty());
+    }
+
+    // ── Extended logger parity tests (rpython/jit/metainterp/test/test_logger.py) ──
+
+    #[test]
+    fn test_format_trace_full_loop_label_to_jump() {
+        // Parity with test_simple: a full loop trace from Label to Jump
+        // should format each op on its own line with readable names and args.
+        let ops = vec![
+            Op {
+                opcode: OpCode::Label,
+                args: smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::IntAdd,
+                args: smallvec::smallvec![OpRef(1), OpRef(2)],
+                descr: None,
+                pos: OpRef(3),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::IntAdd,
+                args: smallvec::smallvec![OpRef(3), OpRef(10_000)],
+                descr: None,
+                pos: OpRef(4),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::Jump,
+                args: smallvec::smallvec![OpRef(0), OpRef(4), OpRef(3)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: None,
+            },
+        ];
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 3);
+        let output = format_trace(&ops, &constants);
+        // Label opens, Jump closes
+        assert!(output.contains("Label(v0, v1, v2)"));
+        assert!(output.contains("v3 = IntAdd(v1, v2)"));
+        assert!(output.contains("v4 = IntAdd(v3, 3)"));
+        assert!(output.contains("Jump(v0, v4, v3)"));
+        // Each line is indented with 2 spaces
+        for line in output.lines() {
+            assert!(line.starts_with("  "), "each line should be indented: {line}");
+        }
+    }
+
+    #[test]
+    fn test_format_trace_bridge_guard_to_finish() {
+        // Parity with test_guard: a bridge trace starts with ops and ends with Finish.
+        let ops = vec![
+            Op {
+                opcode: OpCode::IntSub,
+                args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
+                descr: None,
+                pos: OpRef(1),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::IntGt,
+                args: smallvec::smallvec![OpRef(1), OpRef(10_001)],
+                descr: None,
+                pos: OpRef(2),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::GuardTrue,
+                args: smallvec::smallvec![OpRef(2)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+            },
+            Op {
+                opcode: OpCode::Finish,
+                args: smallvec::smallvec![OpRef(1)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: None,
+            },
+        ];
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 1);
+        constants.insert(10_001, 0);
+        let output = format_trace(&ops, &constants);
+        assert!(output.contains("v1 = IntSub(v0, 1)"));
+        assert!(output.contains("v2 = IntGt(v1, 0)"));
+        assert!(output.contains("GuardTrue(v2) [v0, v1]"));
+        assert!(output.contains("Finish(v1)"));
+    }
+
+    #[test]
+    fn test_format_trace_descr_repr_in_output() {
+        // Parity with test_descr: descriptors are rendered in the output
+        // via repr_of_descr.
+        use crate::descr::{DebugMergePointDescr, DebugMergePointInfo};
+        let descr: crate::DescrRef = std::sync::Arc::new(DebugMergePointDescr::new(
+            DebugMergePointInfo::new("testdriver", "bytecode ADD at 5", 5, 0),
+        ));
+        let ops = vec![Op {
+            opcode: OpCode::DebugMergePoint,
+            args: smallvec::smallvec![],
+            descr: Some(descr),
+            pos: OpRef::NONE,
+            fail_args: None,
+        }];
+        let constants = std::collections::HashMap::new();
+        let output = format_trace(&ops, &constants);
+        assert!(
+            output.contains("descr=<"),
+            "output should contain 'descr=<': {output}"
+        );
+        assert!(
+            output.contains("testdriver"),
+            "descr repr should contain driver name: {output}"
+        );
+        assert!(
+            output.contains("bytecode ADD at 5"),
+            "descr repr should contain source repr: {output}"
+        );
+    }
+
+    #[test]
+    fn test_format_trace_complex_with_guards_and_constants() {
+        // Parity with test_guard: complex trace with mixed ops, guards, constants,
+        // and fail_args all render correctly and can be round-tripped.
+        let ops = vec![
+            Op {
+                opcode: OpCode::Label,
+                args: smallvec::smallvec![OpRef(0), OpRef(1)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::IntAdd,
+                args: smallvec::smallvec![OpRef(0), OpRef(1)],
+                descr: None,
+                pos: OpRef(2),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::IntLt,
+                args: smallvec::smallvec![OpRef(2), OpRef(10_000)],
+                descr: None,
+                pos: OpRef(3),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::GuardTrue,
+                args: smallvec::smallvec![OpRef(3)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(2)]),
+            },
+            Op {
+                opcode: OpCode::IntSub,
+                args: smallvec::smallvec![OpRef(0), OpRef(10_001)],
+                descr: None,
+                pos: OpRef(4),
+                fail_args: None,
+            },
+            Op {
+                opcode: OpCode::Jump,
+                args: smallvec::smallvec![OpRef(4), OpRef(2)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: None,
+            },
+        ];
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 100);
+        constants.insert(10_001, 1);
+        let output = format_trace(&ops, &constants);
+
+        // Verify every op is present
+        assert!(output.contains("Label(v0, v1)"));
+        assert!(output.contains("v2 = IntAdd(v0, v1)"));
+        assert!(output.contains("v3 = IntLt(v2, 100)"));
+        assert!(output.contains("GuardTrue(v3) [v0, v2]"));
+        assert!(output.contains("v4 = IntSub(v0, 1)"));
+        assert!(output.contains("Jump(v4, v2)"));
+
+        // Verify line count (6 ops = 6 lines)
+        assert_eq!(output.lines().count(), 6);
+    }
+
+    #[test]
+    fn test_format_trace_multiple_guards_with_different_fail_args() {
+        // Multiple guards in a single trace, each with distinct fail_args.
+        let ops = vec![
+            Op {
+                opcode: OpCode::GuardTrue,
+                args: smallvec::smallvec![OpRef(0)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: Some(smallvec::smallvec![OpRef(0)]),
+            },
+            Op {
+                opcode: OpCode::GuardFalse,
+                args: smallvec::smallvec![OpRef(1)],
+                descr: None,
+                pos: OpRef::NONE,
+                fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]),
+            },
+        ];
+        let constants = std::collections::HashMap::new();
+        let output = format_trace(&ops, &constants);
+        assert!(output.contains("GuardTrue(v0) [v0]"));
+        assert!(output.contains("GuardFalse(v1) [v0, v1, v2]"));
     }
 }

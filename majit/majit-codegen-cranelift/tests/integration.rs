@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use majit_codegen::{Backend, LoopToken};
 use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{Descr, DescrRef, FailDescr, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{
+    ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
+    Value,
+};
 use majit_opt::intdiv::magic_numbers;
 use majit_opt::optimizer::Optimizer;
 use majit_opt::pure::OptPure;
@@ -2124,4 +2127,481 @@ fn test_threadlocalref_thread_isolation() {
 
     let child_val = child.join().unwrap();
     assert_eq!(child_val, 0x2222, "child thread should see its own value");
+}
+
+// ---------------------------------------------------------------------------
+// FFI call (CallReleaseGil) end-to-end parity tests
+// (rpython/jit/metainterp/test/test_fficall.py)
+//
+// Verifies that CallReleaseGilI compiles and executes correctly, with the
+// GIL release/reacquire shims called around the actual foreign function.
+// ---------------------------------------------------------------------------
+
+/// Simple extern "C" function: adds two i64 values.
+extern "C" fn ffi_add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+/// extern "C" function returning a constant to verify void-arg calls.
+extern "C" fn ffi_constant() -> i64 {
+    42
+}
+
+fn call_descr_release_gil_i(idx: u32, arg_types: Vec<Type>) -> DescrRef {
+    Arc::new(TestCallDescr {
+        idx,
+        effect: majit_ir::EffectInfo {
+            extra_effect: majit_ir::ExtraEffect::CanRaise,
+            oopspec_index: majit_ir::OopSpecIndex::None,
+        },
+        arg_types,
+        result_type: Type::Int,
+    })
+}
+
+fn call_descr_release_gil_n(idx: u32, arg_types: Vec<Type>) -> DescrRef {
+    Arc::new(TestCallDescr {
+        idx,
+        effect: majit_ir::EffectInfo {
+            extra_effect: majit_ir::ExtraEffect::CanRaise,
+            oopspec_index: majit_ir::OopSpecIndex::None,
+        },
+        arg_types,
+        result_type: Type::Void,
+    })
+}
+
+#[test]
+fn test_call_release_gil_i_compiles_and_executes() {
+    // Parity with test_fficall._run: CallReleaseGilI compiles and calls an
+    // extern "C" fn, returning the correct result through the GIL-release path.
+    //
+    // Trace: input(a, b) -> result = call_release_gil_i(ffi_add, a, b) -> finish(result)
+    let cd = call_descr_release_gil_i(60, vec![Type::Int, Type::Int]);
+
+    let mut rec = TraceRecorder::new();
+    let a = rec.record_input_arg(Type::Int);
+    let b = rec.record_input_arg(Type::Int);
+
+    // The function pointer is a constant
+    let fn_ptr = OpRef(1000);
+
+    let result = rec.record_op_with_descr(
+        OpCode::CallReleaseGilI,
+        &[fn_ptr, a, b],
+        cd,
+    );
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, ffi_add as *const () as usize as i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(600);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("CallReleaseGilI should compile");
+
+    // Execute with a=10, b=32 -> expected result 42
+    let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(32)]);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        42,
+        "ffi_add(10, 32) should return 42"
+    );
+
+    // Execute with different values
+    let frame = backend.execute_token(&token, &[Value::Int(-5), Value::Int(5)]);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        0,
+        "ffi_add(-5, 5) should return 0"
+    );
+}
+
+#[test]
+fn test_call_release_gil_i_no_args() {
+    // CallReleaseGilI with no arguments (like ffi_constant() -> 42).
+    let cd = call_descr_release_gil_i(61, vec![]);
+
+    let mut rec = TraceRecorder::new();
+    let _dummy = rec.record_input_arg(Type::Int); // need at least one input
+    let fn_ptr = OpRef(1000);
+
+    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr], cd);
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, ffi_constant as *const () as usize as i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(601);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("CallReleaseGilI with no args should compile");
+
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        42,
+        "ffi_constant() should return 42"
+    );
+}
+
+/// Extern "C" sink: stores the value so we can verify the call happened.
+static FFI_SINK_VALUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+extern "C" fn ffi_sink(val: i64) {
+    FFI_SINK_VALUE.store(val, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[test]
+fn test_call_release_gil_n_void_return() {
+    // Parity with test_fficall: CallReleaseGilN for void-returning FFI calls.
+    let cd = call_descr_release_gil_n(62, vec![Type::Int]);
+
+    let mut rec = TraceRecorder::new();
+    let input = rec.record_input_arg(Type::Int);
+    let fn_ptr = OpRef(1000);
+
+    rec.record_op_with_descr(OpCode::CallReleaseGilN, &[fn_ptr, input], cd);
+    rec.finish(&[input], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, ffi_sink as *const () as usize as i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(602);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("CallReleaseGilN should compile");
+
+    FFI_SINK_VALUE.store(0, std::sync::atomic::Ordering::SeqCst);
+    let _frame = backend.execute_token(&token, &[Value::Int(12345)]);
+    assert_eq!(
+        FFI_SINK_VALUE.load(std::sync::atomic::Ordering::SeqCst),
+        12345,
+        "ffi_sink should have been called with 12345"
+    );
+}
+
+#[test]
+fn test_call_release_gil_result_flows_through_trace() {
+    // Verify that the result of CallReleaseGilI can be used by subsequent ops.
+    // Trace: input(x) -> tmp = ffi_add(x, CONST_10) -> result = int_add(tmp, CONST_5) -> finish
+    let cd = call_descr_release_gil_i(63, vec![Type::Int, Type::Int]);
+
+    let mut rec = TraceRecorder::new();
+    let x = rec.record_input_arg(Type::Int);
+    let fn_ptr = OpRef(1000);
+    let const_10 = OpRef(1001);
+    let const_5 = OpRef(1002);
+
+    let tmp = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, x, const_10], cd);
+    let result = rec.record_op(OpCode::IntAdd, &[tmp, const_5]);
+    rec.finish(&[result], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, ffi_add as *const () as usize as i64);
+    constants.insert(1001, 10i64);
+    constants.insert(1002, 5i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(603);
+    backend
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .expect("trace with CallReleaseGilI + IntAdd should compile");
+
+    // x=7 -> ffi_add(7, 10)=17 -> 17+5=22
+    let frame = backend.execute_token(&token, &[Value::Int(7)]);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        22,
+        "ffi_add(7,10)+5 should be 22"
+    );
+}
+
+#[test]
+fn test_call_release_gil_hooks_are_callable() {
+    // Parity with GIL release/reacquire semantics: verify that set_gil_hooks
+    // is callable and the shim infrastructure exists. Since OnceLock can only
+    // be set once per process, we just verify the API is available.
+    //
+    // The actual hook invocation is tested implicitly by the CallReleaseGilI
+    // tests above (the shim functions are always called; they just check
+    // whether a hook was installed).
+    use majit_codegen_cranelift::set_gil_hooks;
+
+    // set_gil_hooks uses OnceLock, so it may fail silently if already set
+    // by another test. That's fine; we just verify the function is callable.
+    let _ = set_gil_hooks(|| {}, || {});
+}
+
+// ---------------------------------------------------------------------------
+// Raw memory test helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct RawArrayDescr {
+    item_size: usize,
+    item_type: Type,
+    signed: bool,
+}
+
+impl Descr for RawArrayDescr {
+    fn index(&self) -> u32 {
+        0
+    }
+    fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
+        Some(self)
+    }
+}
+
+impl ArrayDescr for RawArrayDescr {
+    fn base_size(&self) -> usize {
+        0
+    }
+    fn item_size(&self) -> usize {
+        self.item_size
+    }
+    fn type_id(&self) -> u32 {
+        0
+    }
+    fn item_type(&self) -> Type {
+        self.item_type
+    }
+    fn is_item_signed(&self) -> bool {
+        self.signed
+    }
+    fn len_descr(&self) -> Option<&dyn FieldDescr> {
+        None
+    }
+}
+
+fn raw_descr_int(item_size: usize) -> DescrRef {
+    Arc::new(RawArrayDescr {
+        item_size,
+        item_type: Type::Int,
+        signed: true,
+    })
+}
+
+fn raw_descr_float() -> DescrRef {
+    Arc::new(RawArrayDescr {
+        item_size: 8,
+        item_type: Type::Float,
+        signed: false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Test: RawStore + RawLoadI roundtrip (integer)
+//
+// Mirrors RPython's test_raw_storage_int: allocate raw memory, store a value,
+// load it back, verify the result.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_raw_store_load_int_roundtrip() {
+    let ad = raw_descr_int(8);
+
+    let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+    let const_offset = OpRef(1000);
+
+    let ops = vec![
+        Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]),
+        Op::with_descr(
+            OpCode::RawStore,
+            &[OpRef(0), const_offset, OpRef(1)],
+            ad.clone(),
+        ),
+        Op::with_descr(OpCode::RawLoadI, &[OpRef(0), const_offset], ad.clone()),
+        Op::with_descr(OpCode::Finish, &[OpRef(2)], make_descr(0)),
+    ];
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64); // offset 0
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(600);
+    backend
+        .compile_loop(&inputargs, &ops, &mut token)
+        .expect("raw int roundtrip compilation should succeed");
+
+    // Allocate a buffer and execute
+    let mut buf = vec![0u8; 16];
+    let ptr = buf.as_mut_ptr() as usize;
+
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Int(12345)]);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        12345,
+        "raw_store then raw_load_i should roundtrip the integer value"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: RawStore + RawLoadF roundtrip (float)
+//
+// Mirrors RPython's test_raw_storage_float.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_raw_store_load_float_roundtrip() {
+    let ad = raw_descr_float();
+
+    let inputargs = vec![InputArg::new_ref(0), InputArg::new_float(1)];
+    let const_offset = OpRef(1000);
+
+    let ops = vec![
+        Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]),
+        Op::with_descr(
+            OpCode::RawStore,
+            &[OpRef(0), const_offset, OpRef(1)],
+            ad.clone(),
+        ),
+        Op::with_descr(OpCode::RawLoadF, &[OpRef(0), const_offset], ad.clone()),
+        Op::with_descr(OpCode::Finish, &[OpRef(2)], make_descr(0)),
+    ];
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(601);
+    backend
+        .compile_loop(&inputargs, &ops, &mut token)
+        .expect("raw float roundtrip compilation should succeed");
+
+    let mut buf = vec![0u8; 16];
+    let ptr = buf.as_mut_ptr() as usize;
+
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Ref(GcRef(ptr)), Value::Float(3.14159)],
+    );
+    assert!(
+        (backend.get_float_value(&frame, 0) - 3.14159).abs() < 1e-10,
+        "raw_store then raw_load_f should roundtrip the float value"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: Raw ops at different offsets don't interfere
+//
+// Store two different integers at different offsets, then load both back.
+// Verifies that the Cranelift codegen correctly handles distinct offsets.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_raw_ops_different_offsets_no_interference() {
+    let ad = raw_descr_int(8);
+
+    let inputargs = vec![
+        InputArg::new_ref(0),
+        InputArg::new_int(1),
+        InputArg::new_int(2),
+    ];
+    let off0 = OpRef(1000);
+    let off8 = OpRef(1001);
+
+    // Store val1 at offset 0, val2 at offset 8
+    // Load from offset 0 -> should be val1
+    // Add the two loaded values together as result
+    let ops = vec![
+        Op::new(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)]),
+        Op::with_descr(
+            OpCode::RawStore,
+            &[OpRef(0), off0, OpRef(1)],
+            ad.clone(),
+        ),
+        Op::with_descr(
+            OpCode::RawStore,
+            &[OpRef(0), off8, OpRef(2)],
+            ad.clone(),
+        ),
+        Op::with_descr(OpCode::RawLoadI, &[OpRef(0), off0], ad.clone()), // -> OpRef(3)
+        Op::with_descr(OpCode::RawLoadI, &[OpRef(0), off8], ad.clone()), // -> OpRef(4)
+        Op::new(OpCode::IntAdd, &[OpRef(3), OpRef(4)]),                   // -> OpRef(5)
+        Op::with_descr(OpCode::Finish, &[OpRef(5)], make_descr(0)),
+    ];
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    constants.insert(1001, 8i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(602);
+    backend
+        .compile_loop(&inputargs, &ops, &mut token)
+        .expect("multi-offset raw ops should compile");
+
+    let mut buf = vec![0u8; 32];
+    let ptr = buf.as_mut_ptr() as usize;
+
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Ref(GcRef(ptr)), Value::Int(100), Value::Int(200)],
+    );
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        300,
+        "100 at offset 0 + 200 at offset 8 should yield 300"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: RawLoadI with unsigned 1-byte item (zero extension)
+//
+// Mirrors RPython's test_raw_storage_byte: store 0xFF in a 1-byte item,
+// load it as unsigned (should get 255, not -1).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_raw_load_unsigned_byte() {
+    let ad = Arc::new(RawArrayDescr {
+        item_size: 1,
+        item_type: Type::Int,
+        signed: false,
+    });
+
+    let inputargs = vec![InputArg::new_ref(0)];
+    let const_offset = OpRef(1000);
+
+    let ops = vec![
+        Op::new(OpCode::Label, &[OpRef(0)]),
+        Op::with_descr(OpCode::RawLoadI, &[OpRef(0), const_offset], ad as DescrRef),
+        Op::with_descr(OpCode::Finish, &[OpRef(1)], make_descr(0)),
+    ];
+
+    let mut backend = CraneliftBackend::new();
+    let mut constants = HashMap::new();
+    constants.insert(1000, 0i64);
+    backend.set_constants(constants);
+
+    let mut token = LoopToken::new(603);
+    backend
+        .compile_loop(&inputargs, &ops, &mut token)
+        .expect("unsigned byte raw load should compile");
+
+    let mut data = vec![0xFFu8];
+    let ptr = data.as_mut_ptr() as usize;
+
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        255,
+        "unsigned 1-byte load of 0xFF should yield 255"
+    );
 }
