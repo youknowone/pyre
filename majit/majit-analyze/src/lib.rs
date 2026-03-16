@@ -13,6 +13,7 @@ pub mod ast_transform;
 mod classify;
 mod codegen;
 pub mod interp_extract;
+pub mod mjit_codegen;
 mod parse;
 mod patterns;
 
