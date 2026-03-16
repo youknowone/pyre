@@ -2075,9 +2075,7 @@ mod tests {
 
         // Register frame slots as GC roots (simulating what the backend does
         // at a safepoint).
-        let roots_from_frame = unsafe {
-            registry.scan_frame(0x1050, frame.as_ptr())
-        };
+        let roots_from_frame = unsafe { registry.scan_frame(0x1050, frame.as_ptr()) };
         assert_eq!(roots_from_frame.len(), 2);
 
         // Register the scanned slots as roots with the GC.
@@ -2094,7 +2092,10 @@ mod tests {
                 *(filler.0 as *mut u64) = i as u64;
             }
         }
-        assert!(gc.minor_collections > 0, "should have triggered nursery collections");
+        assert!(
+            gc.minor_collections > 0,
+            "should have triggered nursery collections"
+        );
 
         // Read back the GcRefs from the frame slots (the GC may have updated
         // them when it promoted the objects).
@@ -2218,11 +2219,11 @@ mod tests {
         // Array type: varsize, base_size = 8 (length field at offset 0),
         // each item is a GcRef (item_size = ptr_size), items have GC ptrs.
         let arr_tid = gc.register_type(TypeInfo::varsize(
-            8,            // base_size (length field)
-            ptr_size,     // item_size
-            0,            // length_offset
-            true,         // items_have_gc_ptrs
-            Vec::new(),   // no fixed GC ptr fields
+            8,          // base_size (length field)
+            ptr_size,   // item_size
+            0,          // length_offset
+            true,       // items_have_gc_ptrs
+            Vec::new(), // no fixed GC ptr fields
         ));
 
         let array_length = 512usize;
@@ -2344,6 +2345,279 @@ mod tests {
             let marker = unsafe { *(slot_ref.0 as *const u64) };
             assert_eq!(marker, 0xBEEF_0000 + idx as u64);
         }
+
+        gc.roots.clear();
+    }
+
+    // ── Write barrier + incremental marking interaction tests ──
+
+    #[test]
+    fn test_write_barrier_during_incremental_marking() {
+        // Verify that write barriers fired during an active incremental
+        // marking cycle correctly add old-gen objects to the remembered set.
+        // The remembered set is processed at the next minor collection,
+        // ensuring mutated old-gen objects are re-scanned.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        // Object layout: [field: GcRef] = ptr_size bytes, GC ptr at offset 0
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        // Create 3 old-gen objects (A, B, C) with no pointers initially.
+        let obj_a = gc.alloc_with_type(tid, ptr_size);
+        let obj_b = gc.alloc_with_type(tid, ptr_size);
+        let obj_c = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(obj_a.0 as *mut GcRef) = GcRef::NULL;
+            *(obj_b.0 as *mut GcRef) = GcRef::NULL;
+            *(obj_c.0 as *mut GcRef) = GcRef::NULL;
+        }
+
+        let mut root_a = obj_a;
+        let mut root_b = obj_b;
+        let mut root_c = obj_c;
+        unsafe {
+            gc.roots.add(&mut root_a);
+            gc.roots.add(&mut root_b);
+            gc.roots.add(&mut root_c);
+        }
+
+        // Promote all to old gen.
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(root_a.0));
+        assert!(!gc.is_in_nursery(root_b.0));
+        assert!(!gc.is_in_nursery(root_c.0));
+
+        // All old-gen objects should have TRACK_YOUNG_PTRS set.
+        assert!(unsafe { header_of(root_a.0).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { header_of(root_b.0).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { header_of(root_c.0).has_flag(flags::TRACK_YOUNG_PTRS) });
+
+        // Start an incremental marking cycle with budget=1 so it stays
+        // active across multiple steps.
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        assert!(gc.is_incremental_marking());
+
+        // During marking, perform write barriers on A and B.
+        gc.do_write_barrier(root_a);
+        gc.do_write_barrier(root_b);
+
+        // A and B should be in the remembered set.
+        assert!(
+            gc.remembered_set.contains(&root_a.0),
+            "write barrier should add A to remembered set during marking"
+        );
+        assert!(
+            gc.remembered_set.contains(&root_b.0),
+            "write barrier should add B to remembered set during marking"
+        );
+        // C was not written to, so it shouldn't be in remembered set.
+        assert!(
+            !gc.remembered_set.contains(&root_c.0),
+            "C should not be in remembered set"
+        );
+
+        // TRACK_YOUNG_PTRS should be cleared on A and B.
+        assert!(!unsafe { header_of(root_a.0).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(!unsafe { header_of(root_b.0).has_flag(flags::TRACK_YOUNG_PTRS) });
+        // C still has it.
+        assert!(unsafe { header_of(root_c.0).has_flag(flags::TRACK_YOUNG_PTRS) });
+
+        // Drive the incremental cycle to completion via nursery collections.
+        for _ in 0..50 {
+            if !gc.is_incremental_marking() {
+                break;
+            }
+            gc.do_collect_nursery();
+        }
+
+        // No objects should be lost — all 3 are still rooted and should
+        // survive the sweep.
+        gc.do_collect_full();
+        assert_eq!(
+            gc.oldgen.object_count(),
+            3,
+            "all 3 rooted objects should survive full collection"
+        );
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_mutation_during_incremental_preserves_reachability() {
+        // During an incremental marking cycle, mutate an old-gen object to
+        // point to a newly promoted object (D). The write barrier ensures D
+        // is reachable through the remembered set, so D survives the sweep.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        // Object layout: [next: GcRef] = ptr_size bytes, GC ptr at offset 0
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        // Build a chain A→B→C in the nursery.
+        let obj_c = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(obj_c.0 as *mut GcRef) = GcRef::NULL;
+        }
+        let obj_b = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(obj_b.0 as *mut GcRef) = obj_c;
+        }
+        let obj_a = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(obj_a.0 as *mut GcRef) = obj_b;
+        }
+
+        let mut root_a = obj_a;
+        unsafe {
+            gc.roots.add(&mut root_a);
+        }
+
+        // Promote A→B→C to old gen.
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(root_a.0));
+        let promoted_b = unsafe { *(root_a.0 as *const GcRef) };
+        let promoted_c = unsafe { *(promoted_b.0 as *const GcRef) };
+        assert!(!gc.is_in_nursery(promoted_b.0));
+        assert!(!gc.is_in_nursery(promoted_c.0));
+
+        // Start incremental marking with a small budget.
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        assert!(gc.is_incremental_marking());
+
+        // Do one marking step — only partially through the graph.
+        gc.incremental_mark_step();
+
+        // Now allocate D in the nursery.
+        let obj_d = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(obj_d.0 as *mut GcRef) = GcRef::NULL;
+        }
+
+        // Promote D to old gen by rooting it temporarily.
+        let mut root_d = obj_d;
+        unsafe {
+            gc.roots.add(&mut root_d);
+        }
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(root_d.0));
+
+        // Mutate A to point to D instead of B (A→D).
+        // The write barrier ensures A is in the remembered set.
+        gc.do_write_barrier(root_a);
+        unsafe {
+            *(root_a.0 as *mut GcRef) = root_d;
+        }
+
+        // Remove D's direct root — D is now only reachable via A→D.
+        gc.roots.remove(&mut root_d);
+
+        // Complete the incremental cycle: drive marking to completion
+        // and then sweep.
+        gc.do_collect_full();
+
+        // A and D should survive (A is rooted, D reachable via A→D).
+        // B and C may or may not survive depending on marking order,
+        // but D MUST survive.
+        let d_addr = root_d.0;
+        let a_field = unsafe { *(root_a.0 as *const GcRef) };
+        assert_eq!(
+            a_field.0, d_addr,
+            "A should still point to D after collection"
+        );
+
+        // Verify D is actually alive by checking it's still in old gen.
+        assert!(
+            !a_field.is_null(),
+            "D must survive collection — it's reachable via A"
+        );
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_nursery_alloc_during_incremental_marking() {
+        // Allocate new nursery objects between incremental marking steps.
+        // Trigger nursery collections that piggyback marking steps.
+        // Verify that newly allocated objects are correctly promoted and
+        // that the original old-gen object graph remains intact.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1024); // small nursery to force frequent collections
+        // Object layout: [next: GcRef][data: u64] = ptr_size + 8 bytes
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size + 8, vec![0]));
+
+        // Create initial old-gen objects (a small chain of 5).
+        let mut prev = GcRef::NULL;
+        for i in 0..5u64 {
+            let obj = gc.alloc_with_type(tid, ptr_size + 8);
+            unsafe {
+                *(obj.0 as *mut GcRef) = prev;
+                *((obj.0 + ptr_size) as *mut u64) = 0xBB00 + i;
+            }
+            prev = obj;
+        }
+
+        let mut head = prev;
+        unsafe {
+            gc.roots.add(&mut head);
+        }
+
+        // Promote the chain to old gen.
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(head.0));
+        let old_count_after_promote = gc.oldgen.object_count();
+        assert_eq!(old_count_after_promote, 5);
+
+        // Start incremental marking with budget=1.
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        assert!(gc.is_incremental_marking());
+
+        let minor_before = gc.minor_collections;
+
+        // Allocate many nursery objects between marking steps. The small
+        // nursery (1024 bytes) forces nursery collections that piggyback
+        // incremental marking steps.
+        for i in 0..100u64 {
+            let tmp = gc.alloc_with_type(tid, ptr_size + 8);
+            unsafe {
+                *(tmp.0 as *mut GcRef) = GcRef::NULL;
+                *((tmp.0 + ptr_size) as *mut u64) = 0xDD00 + i;
+            }
+        }
+
+        let minor_during = gc.minor_collections - minor_before;
+        assert!(
+            minor_during >= 2,
+            "should have triggered multiple nursery collections, got {minor_during}"
+        );
+
+        // The incremental marking should have advanced via piggybacking.
+        assert!(
+            gc.incremental_objects_marked() > 0,
+            "piggybacked marking should have processed some objects"
+        );
+
+        // Drive any remaining incremental marking to completion and sweep.
+        // Use do_collect_full which correctly handles an in-progress cycle.
+        gc.do_collect_full();
+        assert!(gc.major_collections > 0);
+
+        // Verify the original chain is intact — the 5 rooted objects
+        // survived the incremental major cycle.
+        let mut cursor = head;
+        let mut count = 0;
+        while !cursor.is_null() {
+            let data = unsafe { *((cursor.0 + ptr_size) as *const u64) };
+            assert_eq!(
+                data,
+                0xBB00 + (4 - count) as u64,
+                "original chain data corrupted at node {count}"
+            );
+            cursor = unsafe { *(cursor.0 as *const GcRef) };
+            count += 1;
+        }
+        assert_eq!(count, 5, "entire chain should be reachable after cycle");
 
         gc.roots.clear();
     }

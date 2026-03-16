@@ -37,13 +37,13 @@ use syn::{
 ///    Infer helper policies from sidecar `#[elidable]` / `#[dont_look_inside]`
 ///    / `#[jit_inline]` attributes on every call site in the traced arms.
 ///
-/// ### Module-level discovery limitation
+/// ### Module-level discovery
 ///
-/// Unlike RPython's codewriter, which can scan an entire module for
-/// JIT-relevant functions, Rust proc macros operate on a single item.
-/// Full module scanning would require a `#[jit_module]` attribute macro
-/// on the enclosing `mod`, which is not yet implemented.  Use `helpers`
-/// or `calls` to explicitly list the functions that need JIT integration.
+/// For automatic helper discovery, use `#[jit_module]` on the enclosing
+/// `mod` block. It scans all items for JIT-annotated functions and
+/// generates hidden registry constants (`__MAJIT_DISCOVERED_HELPERS`,
+/// `__MAJIT_HELPER_POLICIES`). Alternatively, use `helpers` or `calls`
+/// to explicitly list the functions that need JIT integration.
 pub struct JitInterpConfig {
     /// The interpreter state type (e.g., `AheuiState`).
     pub state_type: Ident,
@@ -322,8 +322,7 @@ fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>>
 fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>> {
     let content;
     bracketed!(content in input);
-    let paths: Punctuated<Path, Token![,]> =
-        content.parse_terminated(Path::parse, Token![,])?;
+    let paths: Punctuated<Path, Token![,]> = content.parse_terminated(Path::parse, Token![,])?;
     Ok(paths.into_iter().map(|p| (p, None)).collect())
 }
 
@@ -668,14 +667,8 @@ mod tests {
         assert_eq!(result.len(), 2);
         // First has two path segments
         assert_eq!(result[0].0.segments.len(), 2);
-        assert_eq!(
-            result[0].0.segments[0].ident.to_string(),
-            "module"
-        );
-        assert_eq!(
-            result[0].0.segments[1].ident.to_string(),
-            "helper_a"
-        );
+        assert_eq!(result[0].0.segments[0].ident.to_string(), "module");
+        assert_eq!(result[0].0.segments[1].ident.to_string(), "helper_a");
     }
 
     /// Wrapper to make `parse_helpers_list` testable via `syn::parse2`.

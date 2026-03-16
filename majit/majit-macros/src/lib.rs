@@ -9,6 +9,7 @@
 /// - #[jit_may_force]: Mark a helper as a may-force call surface
 /// - #[jit_release_gil]: Mark a helper as a release-GIL call surface
 /// - #[jit_loop_invariant]: Mark a helper as a loop-invariant call surface
+/// - #[jit_module]: Module-level automatic helper discovery
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
@@ -989,6 +990,133 @@ pub fn jit_interp(attr: TokenStream, item: TokenStream) -> TokenStream {
     let config = parse_macro_input!(attr as jit_interp::JitInterpConfig);
     let func = parse_macro_input!(item as ItemFn);
     jit_interp::transform_jit_interp(config, func).into()
+}
+
+/// JIT attribute names recognized by `#[jit_module]` for automatic helper discovery.
+const JIT_HELPER_ATTRS: &[&str] = &[
+    "jit_inline",
+    "elidable",
+    "dont_look_inside",
+    "jit_may_force",
+    "jit_release_gil",
+    "jit_loop_invariant",
+];
+
+/// Check if a syn attribute path matches one of the JIT helper attributes.
+fn jit_attr_name(attr: &syn::Attribute) -> Option<String> {
+    let path = attr.path();
+    // Match both bare `elidable` and qualified `majit_macros::elidable`
+    let last_segment = path.segments.last()?;
+    let name = last_segment.ident.to_string();
+    if JIT_HELPER_ATTRS.contains(&name.as_str()) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Discovered helper entry: function name and its JIT attribute.
+struct DiscoveredHelper {
+    fn_name: Ident,
+    attr_name: String,
+}
+
+/// Scan a module's items for functions annotated with JIT helper attributes.
+fn discover_helpers(items: &[syn::Item]) -> Vec<DiscoveredHelper> {
+    let mut discovered = Vec::new();
+    for item in items {
+        if let syn::Item::Fn(func) = item {
+            for attr in &func.attrs {
+                if let Some(attr_name) = jit_attr_name(attr) {
+                    discovered.push(DiscoveredHelper {
+                        fn_name: func.sig.ident.clone(),
+                        attr_name,
+                    });
+                    // Only record the first JIT attribute per function
+                    break;
+                }
+            }
+        }
+    }
+    discovered
+}
+
+/// Module-level automatic helper discovery for JIT-annotated functions.
+///
+/// Place `#[jit_module]` on a `mod` block containing `#[jit_inline]`,
+/// `#[elidable]`, `#[dont_look_inside]`, `#[jit_may_force]`,
+/// `#[jit_release_gil]`, or `#[jit_loop_invariant]` functions.
+/// The macro scans all items and generates a hidden registry constant
+/// listing discovered helpers and their attributes.
+///
+/// # Example
+///
+/// ```ignore
+/// #[jit_module]
+/// mod my_interp {
+///     #[jit_inline]
+///     fn helper_add(a: i64, b: i64) -> i64 { a + b }
+///
+///     #[elidable]
+///     fn lookup(key: i64) -> i64 { /* ... */ }
+///
+///     #[dont_look_inside]
+///     fn opaque(x: i64) -> i64 { /* ... */ }
+///
+///     fn not_jit_relevant() { /* ignored */ }
+/// }
+///
+/// // After expansion, `my_interp` contains:
+/// // const __MAJIT_DISCOVERED_HELPERS: &[&str] = &["helper_add", "lookup", "opaque"];
+/// // const __MAJIT_HELPER_POLICIES: &[(&str, &str)] = &[
+/// //     ("helper_add", "jit_inline"),
+/// //     ("lookup", "elidable"),
+/// //     ("opaque", "dont_look_inside"),
+/// // ];
+/// ```
+#[proc_macro_attribute]
+pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut module = parse_macro_input!(item as syn::ItemMod);
+
+    let Some((brace, ref items)) = module.content else {
+        return syn::Error::new_spanned(
+            &module.ident,
+            "#[jit_module] requires an inline module body (not `mod foo;`)",
+        )
+        .to_compile_error()
+        .into();
+    };
+
+    let discovered = discover_helpers(items);
+
+    let helper_names: Vec<&Ident> = discovered.iter().map(|h| &h.fn_name).collect();
+    let helper_attr_names: Vec<&str> = discovered.iter().map(|h| h.attr_name.as_str()).collect();
+
+    let registry_names = quote! {
+        /// Hidden registry of automatically discovered JIT helpers.
+        #[doc(hidden)]
+        #[allow(dead_code)]
+        pub const __MAJIT_DISCOVERED_HELPERS: &[&str] = &[
+            #(stringify!(#helper_names)),*
+        ];
+    };
+
+    let registry_policies = quote! {
+        /// Hidden registry mapping each discovered helper to its JIT attribute.
+        #[doc(hidden)]
+        #[allow(dead_code)]
+        pub const __MAJIT_HELPER_POLICIES: &[(&str, &str)] = &[
+            #((stringify!(#helper_names), #helper_attr_names)),*
+        ];
+    };
+
+    // Inject the registry constants into the module body
+    let mut new_items = items.clone();
+    new_items.push(syn::parse2(registry_names).expect("failed to parse registry_names"));
+    new_items.push(syn::parse2(registry_policies).expect("failed to parse registry_policies"));
+    module.content = Some((brace, new_items));
+
+    quote! { #module }.into()
 }
 
 #[cfg(test)]
