@@ -31,6 +31,9 @@ pub struct AnalysisResult {
     pub type_layouts: Vec<TypeLayout>,
     /// Trait implementations found
     pub trait_impls: Vec<TraitImplInfo>,
+    /// Named offset constants (e.g., INT_INTVAL_OFFSET = offset_of!(...))
+    #[serde(default)]
+    pub offset_constants: Vec<(String, String)>,
 }
 
 /// A single opcode match arm
@@ -99,6 +102,7 @@ pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
     let mut all_types = Vec::new();
     let mut all_trait_impls = Vec::new();
     let mut all_functions = std::collections::HashMap::new();
+    let mut all_offset_constants = Vec::new();
 
     // Phase 1: Parse all files and collect items
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
@@ -107,6 +111,7 @@ pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
         all_helpers.extend(classify::classify_functions(parsed));
         all_types.extend(parse::extract_type_layouts(parsed));
         all_trait_impls.extend(parse::extract_trait_impls(parsed));
+        all_offset_constants.extend(parse::extract_offset_constants(parsed));
         parse::collect_functions(parsed, &mut all_functions);
     }
 
@@ -130,6 +135,7 @@ pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
         helpers: all_helpers,
         type_layouts: all_types,
         trait_impls: all_trait_impls,
+        offset_constants: all_offset_constants,
     }
 }
 
