@@ -4518,8 +4518,12 @@ impl CraneliftBackend {
                     // Direct call via dispatch table: load code_ptr from a
                     // stable slot (AtomicPtr). redirect_call_assembler updates
                     // the slot, so compiled code always calls the current target.
-                    let dispatch_slot_addr: Option<usize> = None;
-                    let use_direct = false;
+                    let dispatch_slot_addr = resolved_target.as_ref().and_then(|t| {
+                        if t.code_ptr.is_null() { return None; }
+                        let token_val = call_descr.call_target_token().unwrap_or(0);
+                        Some(ca_dispatch_slot(token_val, t.code_ptr) as usize)
+                    });
+                    let use_direct = finish_index.is_some() && dispatch_slot_addr.is_some();
 
                     if use_direct {
                         let target = resolved_target.as_ref().unwrap();
