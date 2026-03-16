@@ -786,16 +786,36 @@ impl OptVirtualize {
         }
 
         // Record the class for future lookups.
-        // arg(1) should be the expected class, but we can't easily read it
-        // as a GcRef here. Still emit the guard.
         self.set_info(
             obj_ref,
             PtrInfo::KnownClass {
-                class_ptr: majit_ir::GcRef::NULL, // placeholder
+                class_ptr: majit_ir::GcRef::NULL,
                 is_nonnull: true,
             },
         );
-        PassResult::PassOn
+
+        self.force_guard_fail_args(op, ctx)
+    }
+
+    /// Force virtual references in guard fail_args and re-resolve all args.
+    /// Must be called for any guard that PassOn instead of Remove.
+    fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+        if let Some(ref fail_args) = op.fail_args {
+            for &fa in fail_args {
+                let resolved = ctx.get_replacement(fa);
+                self.force_virtual(resolved, ctx);
+            }
+        }
+        let mut guard_op = op.clone();
+        if let Some(ref mut fa) = guard_op.fail_args {
+            for arg in fa.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+        }
+        for arg in &mut guard_op.args {
+            *arg = ctx.get_replacement(*arg);
+        }
+        PassResult::Replace(guard_op)
     }
 
     fn optimize_guard_nonnull(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -808,7 +828,7 @@ impl OptVirtualize {
         }
 
         self.set_info(obj_ref, PtrInfo::NonNull);
-        PassResult::PassOn
+        self.force_guard_fail_args(op, ctx)
     }
 
     fn optimize_guard_nonnull_class(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -839,7 +859,7 @@ impl OptVirtualize {
                 is_nonnull: true,
             },
         );
-        PassResult::PassOn
+        self.force_guard_fail_args(op, ctx)
     }
 
     fn optimize_guard_value(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -854,7 +874,7 @@ impl OptVirtualize {
             }
         }
 
-        PassResult::PassOn
+        self.force_guard_fail_args(op, ctx)
     }
 
     /// Handle VirtualRefR / VirtualRefI.
@@ -2263,10 +2283,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![
-            (OpRef(100), Value::Int(0)),
-            (OpRef(101), Value::Int(8)),
-        ];
+        let constants = vec![(OpRef(100), Value::Int(0)), (OpRef(101), Value::Int(8))];
         let raw_bufs = vec![(OpRef(0), 32)];
 
         let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
