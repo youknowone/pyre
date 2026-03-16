@@ -569,12 +569,17 @@ impl OptimizationPass for OptHeap {
             OpCode::SetfieldGc => self.optimize_setfield(op, ctx),
 
             // ── Array item reads ──
-            OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => {
-                self.optimize_getarrayitem(op, ctx)
-            }
+            OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcR
+            | OpCode::GetarrayitemGcF
+            | OpCode::GetarrayitemRawI
+            | OpCode::GetarrayitemRawR
+            | OpCode::GetarrayitemRawF => self.optimize_getarrayitem(op, ctx),
 
             // ── Array item writes ──
-            OpCode::SetarrayitemGc => self.optimize_setarrayitem(op, ctx),
+            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+                self.optimize_setarrayitem(op, ctx)
+            }
 
             // ── GUARD_NOT_INVALIDATED deduplication ──
             OpCode::GuardNotInvalidated => {
@@ -625,8 +630,8 @@ impl OptimizationPass for OptHeap {
                 PassResult::Emit(op.clone())
             }
 
-            // ── SETFIELD_RAW / SETARRAYITEM_RAW: no effect on GC caches ──
-            OpCode::SetfieldRaw | OpCode::SetarrayitemRaw => PassResult::Emit(op.clone()),
+            // ── SETFIELD_RAW: no effect on GC caches ──
+            OpCode::SetfieldRaw => PassResult::Emit(op.clone()),
 
             // ── Loop-invariant calls: cache results across the trace ──
             OpCode::CallLoopinvariantI
