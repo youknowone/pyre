@@ -1987,22 +1987,6 @@ extern "C" fn call_assembler_shim(
     // construction. Runs compiled code directly and handles the result
     // inline — avoids Box alloc, mutex lock, and Arc clone per call.
     if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
-        // Tagged pointer short-circuit: create_callee_frame returns
-        // (result << 1) | 1 on FORCE_CACHE hit. If input_slice[0] (the
-        // frame pointer) has bit 0 set, the result is already cached —
-        // skip compiled code execution entirely.
-        // This only applies when a force callback is registered, because
-        // the tagged encoding is produced by the meta-interp layer that
-        // also registers the force callback.
-        if !input_slice.is_empty() && (input_slice[0] & 1) != 0 {
-            let result = (input_slice[0] >> 1) as u64;
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
-            }
-            return result;
-        }
-
         return call_assembler_fast_path(target, input_slice, outcome, *force_fn);
     }
 
@@ -3569,9 +3553,7 @@ impl CraneliftBackend {
 
         // Determine loop block parameter count: Label's args if present,
         // otherwise num_inputs (backwards compatible).
-        let loop_param_count = label_idx
-            .map(|li| ops[li].args.len())
-            .unwrap_or(num_inputs);
+        let loop_param_count = label_idx.map(|li| ops[li].args.len()).unwrap_or(num_inputs);
 
         // Loop header block
         let loop_block = builder.create_block();
@@ -4454,49 +4436,11 @@ impl CraneliftBackend {
                             as i64,
                     );
 
-                    // ── Tagged pointer cache short-circuit ──
-                    // If the first arg (frame pointer) has bit 0 set, the
-                    // create_callee_frame helper already computed the result
-                    // and encoded it as (result << 1) | 1. Skip the shim
-                    // entirely — just extract the cached result.
-                    // ── Tagged pointer cache short-circuit ──
-                    // Only active when a force callback is registered (pyre).
-                    // Check at compile time via CALL_ASSEMBLER_FORCE_FN.
-                    let force_fn_registered = CALL_ASSEMBLER_FORCE_FN.get().is_some();
-                    let first_arg = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let cached_block = builder.create_block();
-                    let normal_block = builder.create_block();
+                    // No tagged pointer cache — callee is always executed
+                    // (matches PyPy's approach: always call, fast/slow path
+                    // only for result extraction after execution).
                     let ca_merge_block = builder.create_block();
-                    builder.append_block_param(ca_merge_block, cl_types::I64); // result
-
-                    if force_fn_registered {
-                        let one = builder.ins().iconst(cl_types::I64, 1);
-                        let masked = builder.ins().band(first_arg, one);
-                        let zero = builder.ins().iconst(cl_types::I64, 0);
-                        let is_normal = builder.ins().icmp(IntCC::Equal, masked, zero);
-                        builder
-                            .ins()
-                            .brif(is_normal, normal_block, &[], cached_block, &[]);
-                    } else {
-                        builder.ins().jump(normal_block, &[]);
-                        // Seal unused cached block
-                        builder.switch_to_block(cached_block);
-                        builder.seal_block(cached_block);
-                        let dummy = builder.ins().iconst(cl_types::I64, 0);
-                        builder.ins().jump(ca_merge_block, &[dummy]);
-                    }
-
-                    if force_fn_registered {
-                        // ── Cached path: extract result from tagged pointer ──
-                        builder.switch_to_block(cached_block);
-                        builder.seal_block(cached_block);
-                        let cached_result = builder.ins().ushr_imm(first_arg, 1);
-                        builder.ins().jump(ca_merge_block, &[cached_result]);
-                    }
-
-                    // ── Normal path ──
-                    builder.switch_to_block(normal_block);
-                    builder.seal_block(normal_block);
+                    builder.append_block_param(ca_merge_block, cl_types::I64);
 
                     // Try direct call if target is resolved and has a known
                     // finish exit with primitive result type. This inlines the
@@ -4519,7 +4463,9 @@ impl CraneliftBackend {
                     // stable slot (AtomicPtr). redirect_call_assembler updates
                     // the slot, so compiled code always calls the current target.
                     let dispatch_slot_addr = resolved_target.as_ref().and_then(|t| {
-                        if t.code_ptr.is_null() { return None; }
+                        if t.code_ptr.is_null() {
+                            return None;
+                        }
                         let token_val = call_descr.call_target_token().unwrap_or(0);
                         Some(ca_dispatch_slot(token_val, t.code_ptr) as usize)
                     });
@@ -4534,23 +4480,26 @@ impl CraneliftBackend {
                         let out_slots = target.max_output_slots.max(1);
                         let out_bytes = (out_slots * 8) as u32;
                         let out_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                            StackSlotKind::ExplicitSlot, out_bytes, 3,
+                            StackSlotKind::ExplicitSlot,
+                            out_bytes,
+                            3,
                         ));
                         let out_ptr = builder.ins().stack_addr(ptr_type, out_slot, 0);
 
                         let roots_bytes = (target.num_ref_roots.max(1) * 8) as u32;
                         let ca_roots_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                            StackSlotKind::ExplicitSlot, roots_bytes, 3,
+                            StackSlotKind::ExplicitSlot,
+                            roots_bytes,
+                            3,
                         ));
                         let ca_roots_ptr = builder.ins().stack_addr(ptr_type, ca_roots_slot, 0);
 
                         // Load code_ptr from dispatch slot (AtomicPtr)
-                        let slot_ptr = builder.ins().iconst(
-                            ptr_type, slot_addr as i64,
-                        );
-                        let code_addr = builder.ins().load(
-                            ptr_type, MemFlags::trusted(), slot_ptr, 0,
-                        );
+                        let slot_ptr = builder.ins().iconst(ptr_type, slot_addr as i64);
+                        let code_addr =
+                            builder
+                                .ins()
+                                .load(ptr_type, MemFlags::trusted(), slot_ptr, 0);
                         let mut sig = Signature::new(call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // inputs
                         sig.params.push(AbiParam::new(ptr_type)); // outputs
@@ -4558,32 +4507,33 @@ impl CraneliftBackend {
                         sig.returns.push(AbiParam::new(cl_types::I64)); // fail_index
                         let sig_ref = builder.import_signature(sig);
                         let fail_index_val = builder.ins().call_indirect(
-                            sig_ref, code_addr,
+                            sig_ref,
+                            code_addr,
                             &[args_ptr, out_ptr, ca_roots_ptr],
                         );
                         let fail_idx_raw = builder.inst_results(fail_index_val)[0];
 
                         // Check: is it the finish exit?
-                        let expected_finish = builder.ins().iconst(
-                            cl_types::I64, finish_idx as i64,
-                        );
-                        let is_direct_finish = builder.ins().icmp(
-                            IntCC::Equal, fail_idx_raw, expected_finish,
-                        );
+                        let expected_finish =
+                            builder.ins().iconst(cl_types::I64, finish_idx as i64);
+                        let is_direct_finish =
+                            builder
+                                .ins()
+                                .icmp(IntCC::Equal, fail_idx_raw, expected_finish);
                         let direct_finish_block = builder.create_block();
                         let shim_fallback_block = builder.create_block();
                         builder.ins().brif(
                             is_direct_finish,
-                            direct_finish_block, &[],
-                            shim_fallback_block, &[],
+                            direct_finish_block,
+                            &[],
+                            shim_fallback_block,
+                            &[],
                         );
 
                         // ── Direct finish: extract result from outputs[0] ──
                         builder.switch_to_block(direct_finish_block);
                         builder.seal_block(direct_finish_block);
-                        let direct_result = builder.ins().stack_load(
-                            cl_types::I64, out_slot, 0,
-                        );
+                        let direct_result = builder.ins().stack_load(cl_types::I64, out_slot, 0);
                         builder.ins().jump(ca_merge_block, &[direct_result]);
 
                         // ── Fallback: guard failure or other exit → call shim ──
@@ -4644,9 +4594,13 @@ impl CraneliftBackend {
                         .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
                     let is_finish = builder.ins().icmp(IntCC::Equal, outcome_kind, finish_kind);
                     let exit_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(is_finish, ca_merge_block, &[result.unwrap()], exit_block, &[]);
+                    builder.ins().brif(
+                        is_finish,
+                        ca_merge_block,
+                        &[result.unwrap()],
+                        exit_block,
+                        &[],
+                    );
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
