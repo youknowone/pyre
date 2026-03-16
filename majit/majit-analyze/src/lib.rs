@@ -9,13 +9,13 @@
 //! 5. Collects type layouts (struct fields, offsets)
 //! 6. Generates tracing code that mirrors the interpreter's execution
 
-mod parse;
 mod classify;
-mod patterns;
 mod codegen;
+mod parse;
+mod patterns;
 
+pub use classify::{FunctionInfo, HelperClassification};
 pub use parse::ParsedInterpreter;
-pub use classify::{HelperClassification, FunctionInfo};
 pub use patterns::TracePattern;
 
 use serde::{Deserialize, Serialize};
@@ -101,10 +101,7 @@ pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
     let mut all_functions = std::collections::HashMap::new();
 
     // Phase 1: Parse all files and collect items
-    let parsed_files: Vec<_> = sources
-        .iter()
-        .map(|s| parse::parse_source(s))
-        .collect();
+    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
 
     for parsed in &parsed_files {
         all_helpers.extend(classify::classify_functions(parsed));
@@ -227,13 +224,18 @@ mod tests {
         eprintln!("Trait impls: {}", result.trait_impls.len());
 
         // Should have trait impls from eval.rs (PyFrame impls)
-        let pyframe_impls: Vec<_> = result.trait_impls.iter()
+        let pyframe_impls: Vec<_> = result
+            .trait_impls
+            .iter()
             .filter(|i| i.for_type.contains("PyFrame"))
             .collect();
         eprintln!("\nPyFrame trait impls: {}", pyframe_impls.len());
         for impl_info in &pyframe_impls {
-            eprintln!("  impl {} for PyFrame — {} methods",
-                impl_info.trait_name, impl_info.methods.len());
+            eprintln!(
+                "  impl {} for PyFrame — {} methods",
+                impl_info.trait_name,
+                impl_info.methods.len()
+            );
             for m in &impl_info.methods {
                 eprintln!("    {}", m.name);
             }
@@ -248,12 +250,34 @@ mod tests {
         }
 
         // Verify key patterns are detected
-        let binary_op = result.opcodes.iter()
+        let binary_op = result
+            .opcodes
+            .iter()
             .find(|a| a.pattern.contains("BinaryOp"));
         assert!(binary_op.is_some(), "BinaryOp arm not found");
         assert!(
             binary_op.unwrap().trace_pattern.is_some(),
             "BinaryOp should have a trace pattern"
         );
+    }
+
+    #[test]
+    fn test_codegen_output() {
+        let opcode_step = read_pyre_file("pyre-runtime/src/opcode_step.rs");
+        let eval = read_pyre_file("pyre-interp/src/eval.rs");
+        let result = analyze_multiple(&[&opcode_step, &eval]);
+        let code = generate_trace_code(&result);
+
+        // Should contain dispatch table
+        assert!(code.contains("TRACE_PATTERNS"), "missing TRACE_PATTERNS");
+        assert!(code.contains("UnboxIntBinop"), "missing UnboxIntBinop");
+        assert!(code.contains("LocalRead"), "missing LocalRead");
+        assert!(code.contains("FunctionCall"), "missing FunctionCall");
+
+        eprintln!("=== Generated Code ({} bytes) ===", code.len());
+        // Print first 50 lines
+        for (i, line) in code.lines().enumerate().take(50) {
+            eprintln!("{:3}: {}", i + 1, line);
+        }
     }
 }

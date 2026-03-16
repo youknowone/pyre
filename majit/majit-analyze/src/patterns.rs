@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 pub enum TracePattern {
     /// Unbox two int operands → binary IR op → box result.
     /// Example: a + b where a, b are W_IntObject
-    UnboxIntBinop { op_name: String, has_overflow_guard: bool },
+    UnboxIntBinop {
+        op_name: String,
+        has_overflow_guard: bool,
+    },
 
     /// Unbox two float operands → binary IR op → box result.
     UnboxFloatBinop { op_name: String },
@@ -90,8 +93,8 @@ pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePatt
             "load_const" => return Some(TracePattern::ConstLoad),
             "call" => return Some(TracePattern::FunctionCall),
             "for_iter" => return Some(TracePattern::RangeIterNext),
-            "get_iter" | "build_list" | "build_tuple" | "build_map"
-            | "unpack_sequence" | "store_subscr" | "list_append" => {
+            "get_iter" | "build_list" | "build_tuple" | "build_map" | "unpack_sequence"
+            | "store_subscr" | "list_append" => {
                 return Some(TracePattern::Residual {
                     helper_name: name.clone(),
                 });
