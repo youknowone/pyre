@@ -188,7 +188,7 @@ struct ActiveForceFrame {
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
     gc_runtime_id: Option<u64>,
     pending_force: Mutex<Option<PendingForceFrame>>,
-    pending_may_force: Mutex<Option<PendingMayForceFrame>>,
+    pending_may_force: Mutex<Vec<PendingMayForceFrame>>,
     saved_data_root: Mutex<Option<Box<GcRef>>>,
 }
 
@@ -809,7 +809,7 @@ fn register_force_frame(
         fail_descrs: fail_descrs.to_vec(),
         gc_runtime_id,
         pending_force: Mutex::new(None),
-        pending_may_force: Mutex::new(None),
+        pending_may_force: Mutex::new(Vec::new()),
         saved_data_root: Mutex::new(None),
     });
     force_frame_registry()
@@ -869,7 +869,7 @@ pub(crate) fn release_force_token(handle: u64) {
         if let Some(pending) = frame.pending_force.lock().unwrap().take() {
             let _ = pending.into_raw_values(frame.gc_runtime_id);
         }
-        if let Some(pending) = frame.pending_may_force.lock().unwrap().take() {
+        for pending in frame.pending_may_force.lock().unwrap().drain(..) {
             let _ = pending.preview.into_raw_values(frame.gc_runtime_id);
         }
         let _ = take_force_frame_saved_data(&frame);
@@ -1378,11 +1378,7 @@ extern "C" fn begin_may_force_call_shim(fail_index: u64, values_ptr: u64, num_va
     };
     let preview = PendingForceFrame::new(fail_descr, frame.gc_runtime_id, raw_values);
     let mut pending_may_force = frame.pending_may_force.lock().unwrap();
-    assert!(
-        pending_may_force.is_none(),
-        "nested call_may_force in the same compiled frame is unsupported"
-    );
-    *pending_may_force = Some(PendingMayForceFrame {
+    pending_may_force.push(PendingMayForceFrame {
         preview,
         was_forced: false,
     });
@@ -1400,7 +1396,7 @@ extern "C" fn finish_may_force_guard_shim() -> u64 {
         .pending_may_force
         .lock()
         .unwrap()
-        .take()
+        .pop()
         .expect("guard_not_forced without a preceding call_may_force");
     let was_forced = pending.was_forced;
     let _ = pending.preview.into_raw_values(frame.gc_runtime_id);
@@ -1446,7 +1442,7 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
 
     {
         let mut pending_may_force = frame.pending_may_force.lock().unwrap();
-        if let Some(pending) = pending_may_force.as_mut() {
+        if let Some(pending) = pending_may_force.last_mut() {
             assert!(
                 !pending.was_forced,
                 "force token {handle} was already forced during call_may_force"
@@ -7094,8 +7090,8 @@ impl majit_codegen::Backend for CraneliftBackend {
         )
     }
 
-    fn force(&self, force_token: GcRef) -> DeadFrame {
-        force_token_to_dead_frame(force_token)
+    fn force(&self, force_token: GcRef) -> Option<DeadFrame> {
+        Some(force_token_to_dead_frame(force_token))
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
@@ -7123,9 +7119,8 @@ impl majit_codegen::Backend for CraneliftBackend {
             .expect("set_savedata_ref_on_deadframe failed");
     }
 
-    fn get_savedata_ref(&self, frame: &DeadFrame) -> GcRef {
-        get_savedata_ref_from_deadframe(frame)
-            .expect("get_savedata_ref_from_deadframe failed")
+    fn get_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
+        get_savedata_ref_from_deadframe(frame).ok()
     }
 
     fn grab_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
@@ -10862,7 +10857,7 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.get_int_value(&frame, 1), 10);
         assert_eq!(*may_force_void_values().lock().unwrap(), vec![0, 1, 10]);
-        assert_eq!(backend.get_savedata_ref(&frame), GcRef(0xDADA));
+        assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xDADA));
     }
 
     #[test]
@@ -10958,7 +10953,7 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 1), 42);
         assert_eq!(backend.get_int_value(&frame, 2), 10);
         assert_eq!(*may_force_int_values().lock().unwrap(), vec![1, 10]);
-        assert_eq!(backend.get_savedata_ref(&frame), GcRef(0xBABA));
+        assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xBABA));
     }
 
     #[test]
@@ -11090,7 +11085,7 @@ mod tests {
         assert_ne!(forced_live, GcRef::NULL);
         assert_eq!(forced_result, forced_return);
         assert_ne!(forced_result, forced_live);
-        assert_eq!(backend.get_savedata_ref(&frame), forced_live);
+        assert_eq!(backend.get_savedata_ref(&frame).unwrap(), forced_live);
         assert_eq!(
             *may_force_ref_values().lock().unwrap(),
             vec![GcRef::NULL.0, forced_live.0, forced_return.0]
@@ -11123,7 +11118,7 @@ mod tests {
         let force_token = backend.get_ref_value(&frame, 0);
         assert_ne!(force_token, GcRef::NULL);
 
-        let forced = backend.force(force_token);
+        let forced = backend.force(force_token).unwrap();
         let descr = backend.get_latest_descr(&forced);
         assert_eq!(descr.fail_index(), 0);
         assert_eq!(backend.get_int_value(&forced, 0), 30);
@@ -11166,7 +11161,7 @@ mod tests {
 
         with_gc_runtime(runtime_id, |gc| gc.collect_nursery());
 
-        let forced = backend.force(force_token);
+        let forced = backend.force(force_token).unwrap();
         let moved_root = backend.get_ref_value(&forced, 0);
         assert!(!moved_root.is_null());
         assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0x1234_5678);
@@ -12077,7 +12072,7 @@ mod tests {
         let force_token = backend.get_ref_value(&frame, 0);
         assert_ne!(force_token, GcRef::NULL);
 
-        let forced = backend.force(force_token);
+        let forced = backend.force(force_token).unwrap();
         let descr = backend.get_latest_descr(&forced);
         assert_eq!(descr.fail_index(), 0);
         assert_eq!(backend.get_int_value(&forced, 0), 30);
@@ -12190,7 +12185,7 @@ mod tests {
             other => panic!("expected single force-token ref output, got {other:?}"),
         };
 
-        let forced = backend.force(force_token);
+        let forced = backend.force(force_token).unwrap();
         let descr = backend.get_latest_descr(&forced);
         assert_eq!(descr.fail_index(), 0);
         assert_eq!(backend.get_int_value(&forced, 0), 30);

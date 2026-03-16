@@ -700,18 +700,18 @@ pub trait Backend: Send {
     }
 
     /// Force a frame identified by a `FORCE_TOKEN` result.
-    fn force(&self, _force_token: GcRef) -> DeadFrame {
-        panic!("backend does not implement force()");
+    fn force(&self, _force_token: GcRef) -> Option<DeadFrame> {
+        None
     }
 
     /// Store a saved-data GC ref on a dead frame.
     fn set_savedata_ref(&self, _frame: &mut DeadFrame, _data: GcRef) {
-        panic!("backend does not implement set_savedata_ref()");
+        // No-op: backend doesn't support savedata
     }
 
     /// Read a saved-data GC ref from a dead frame.
-    fn get_savedata_ref(&self, _frame: &DeadFrame) -> GcRef {
-        panic!("backend does not implement get_savedata_ref()");
+    fn get_savedata_ref(&self, _frame: &DeadFrame) -> Option<GcRef> {
+        None
     }
 
     /// Read the optional saved-data GC ref from a dead frame.
