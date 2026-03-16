@@ -61,7 +61,9 @@ fn test_empty_discovery() {
 
 #[jit_module]
 mod multi_attr_module {
-    use majit_macros::{dont_look_inside, elidable, jit_may_force, jit_release_gil, jit_loop_invariant};
+    use majit_macros::{
+        dont_look_inside, elidable, jit_loop_invariant, jit_may_force, jit_release_gil,
+    };
 
     #[elidable]
     pub fn pure_fn(x: i64) -> i64 {

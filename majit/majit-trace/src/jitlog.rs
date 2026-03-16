@@ -365,9 +365,21 @@ mod tests {
         // Parity with test_simple_loop: traces compiled count matches actual compilations
         let mut log = JitLog::new(false);
         assert_eq!(log.traces_compiled(), 0);
-        log.log_compile(1, 50, 30, Duration::from_millis(1), Duration::from_millis(2));
+        log.log_compile(
+            1,
+            50,
+            30,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
         assert_eq!(log.traces_compiled(), 1);
-        log.log_compile(2, 80, 40, Duration::from_millis(1), Duration::from_millis(2));
+        log.log_compile(
+            2,
+            80,
+            40,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
         assert_eq!(log.traces_compiled(), 2);
     }
 
@@ -375,7 +387,13 @@ mod tests {
     fn test_traces_aborted_counted_correctly() {
         // Aborted traces are counted separately from compiled
         let mut log = JitLog::new(false);
-        log.log_compile(1, 50, 30, Duration::from_millis(1), Duration::from_millis(2));
+        log.log_compile(
+            1,
+            50,
+            30,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
         log.log_abort();
         log.log_abort();
         log.log_abort();
@@ -413,12 +431,16 @@ mod tests {
         // Parity with profiler.times: compilation and optimization timing
         let mut log = JitLog::new(false);
         log.log_compile(
-            1, 50, 30,
+            1,
+            50,
+            30,
             Duration::from_millis(10), // opt time
             Duration::from_millis(20), // compile time
         );
         log.log_compile(
-            2, 80, 40,
+            2,
+            80,
+            40,
             Duration::from_millis(5),
             Duration::from_millis(15),
         );
@@ -456,8 +478,20 @@ mod tests {
     fn test_jitlog_summary_all_fields_present() {
         // Parity with profiler output: summary contains all tracked statistics
         let mut log = JitLog::new(false);
-        log.log_compile(1, 200, 100, Duration::from_millis(5), Duration::from_millis(10));
-        log.log_compile(2, 100, 50, Duration::from_millis(3), Duration::from_millis(7));
+        log.log_compile(
+            1,
+            200,
+            100,
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        );
+        log.log_compile(
+            2,
+            100,
+            50,
+            Duration::from_millis(3),
+            Duration::from_millis(7),
+        );
         log.log_abort();
         log.log_abort();
         log.log_guard_failure(0);

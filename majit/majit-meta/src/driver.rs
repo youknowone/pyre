@@ -1435,8 +1435,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
-        let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = compile_events.clone();
         driver.set_on_compile_loop(move |green_key, ops_before, ops_after| {
             events
@@ -1520,11 +1519,9 @@ mod tests {
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
         let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
-        driver
-            .meta
-            .set_on_compile_bridge(move |gk, fi, nops| {
-                ev.lock().unwrap().push((gk, fi, nops));
-            });
+        driver.meta.set_on_compile_bridge(move |gk, fi, nops| {
+            ev.lock().unwrap().push((gk, fi, nops));
+        });
 
         let key = 50u64;
 
@@ -1571,7 +1568,11 @@ mod tests {
         assert!(compiled, "bridge should compile successfully");
 
         let events = bridge_events.lock().unwrap();
-        assert_eq!(events.len(), 1, "on_compile_bridge should fire exactly once");
+        assert_eq!(
+            events.len(),
+            1,
+            "on_compile_bridge should fire exactly once"
+        );
         assert_eq!(events[0].0, key, "bridge green_key should match");
         assert_eq!(events[0].1, fail_index, "bridge fail_index should match");
         assert!(events[0].2 > 0, "bridge num_ops should be positive");
@@ -1658,12 +1659,16 @@ mod tests {
         assert_eq!(driver.entry_points().len(), 2);
 
         // Verify first entry point.
-        let ep0 = driver.find_entry_point("loop_main").expect("should find loop_main");
+        let ep0 = driver
+            .find_entry_point("loop_main")
+            .expect("should find loop_main");
         assert_eq!(ep0.name, "loop_main");
         assert_eq!(ep0.schema, vec![Type::Int]);
 
         // Verify second entry point.
-        let ep1 = driver.find_entry_point("loop_helper").expect("should find loop_helper");
+        let ep1 = driver
+            .find_entry_point("loop_helper")
+            .expect("should find loop_helper");
         assert_eq!(ep1.name, "loop_helper");
         assert_eq!(ep1.schema, vec![Type::Int, Type::Ref]);
 

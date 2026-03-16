@@ -416,10 +416,7 @@ mod tests {
 
         // One more op pushes it to the limit.
         let _over = rec.record_op(OpCode::IntAdd, &[last, i0]);
-        assert!(
-            rec.is_too_long(),
-            "TRACE_LIMIT ops should be too long"
-        );
+        assert!(rec.is_too_long(), "TRACE_LIMIT ops should be too long");
     }
 
     #[test]
@@ -585,7 +582,7 @@ mod tests {
         assert_eq!(trace.ops[0].pos, OpRef(1)); // after 1 inputarg
         assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
         assert_eq!(trace.ops[1].args[0], add); // references the add result
-        assert_eq!(trace.ops[1].args[1], i0);  // references the input arg
+        assert_eq!(trace.ops[1].args[1], i0); // references the input arg
     }
 
     #[test]
@@ -597,12 +594,8 @@ mod tests {
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         let descr = make_fail_descr(0);
-        let guard = rec.record_guard_with_fail_args(
-            OpCode::GuardTrue,
-            &[add],
-            descr,
-            &[i0, i1, add],
-        );
+        let guard =
+            rec.record_guard_with_fail_args(OpCode::GuardTrue, &[add], descr, &[i0, i1, add]);
 
         let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
         rec.close_loop(&[sub, i1]);
@@ -627,22 +620,12 @@ mod tests {
         let i1 = rec.record_input_arg(Type::Int);
 
         let descr0 = make_fail_descr(0);
-        rec.record_guard_with_fail_args(
-            OpCode::GuardTrue,
-            &[i0],
-            descr0,
-            &[i0, i1],
-        );
+        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], descr0, &[i0, i1]);
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
 
         let descr1 = make_fail_descr(1);
-        rec.record_guard_with_fail_args(
-            OpCode::GuardFalse,
-            &[add],
-            descr1,
-            &[i0, add],
-        );
+        rec.record_guard_with_fail_args(OpCode::GuardFalse, &[add], descr1, &[i0, add]);
 
         let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
         rec.close_loop(&[sub, i1]);
@@ -791,12 +774,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let descr = make_fail_descr(0);
-        rec.record_guard_with_fail_args(
-            OpCode::GuardTrue,
-            &[i0],
-            descr,
-            &[],
-        );
+        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], descr, &[]);
 
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
@@ -865,12 +843,7 @@ mod tests {
 
         let cmp = rec.record_op(OpCode::IntLt, &[i0, i1]);
         let descr = make_fail_descr(0);
-        rec.record_guard_with_fail_args(
-            OpCode::GuardTrue,
-            &[cmp],
-            descr,
-            &[i0, i1],
-        );
+        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], descr, &[i0, i1]);
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, i1]);
@@ -1113,12 +1086,7 @@ mod tests {
         fail_args.push(add);
 
         let descr = make_fail_descr(0);
-        let guard = rec.record_guard_with_fail_args(
-            OpCode::GuardTrue,
-            &[add],
-            descr,
-            &fail_args,
-        );
+        let guard = rec.record_guard_with_fail_args(OpCode::GuardTrue, &[add], descr, &fail_args);
 
         rec.close_loop(&inputs);
         let trace = rec.get_trace();

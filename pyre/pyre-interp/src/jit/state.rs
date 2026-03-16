@@ -1208,8 +1208,11 @@ impl TraceFrameState {
                     Ok({
                         let int_type_addr = &INT_TYPE as *const _ as i64;
                         crate::jit::generated::trace_box_int(
-                            ctx, len,
-                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            ctx,
+                            len,
+                            w_int_size_descr(),
+                            ob_type_descr(),
+                            int_intval_descr(),
                             int_type_addr,
                         )
                     })
@@ -1223,8 +1226,11 @@ impl TraceFrameState {
                     Ok({
                         let int_type_addr = &INT_TYPE as *const _ as i64;
                         crate::jit::generated::trace_box_int(
-                            ctx, len,
-                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            ctx,
+                            len,
+                            w_int_size_descr(),
+                            ob_type_descr(),
+                            int_intval_descr(),
                             int_type_addr,
                         )
                     })
@@ -1241,8 +1247,11 @@ impl TraceFrameState {
                     Ok({
                         let int_type_addr = &INT_TYPE as *const _ as i64;
                         crate::jit::generated::trace_box_int(
-                            ctx, len,
-                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            ctx,
+                            len,
+                            w_int_size_descr(),
+                            ob_type_descr(),
+                            int_intval_descr(),
                             int_type_addr,
                         )
                     })
@@ -1259,8 +1268,11 @@ impl TraceFrameState {
                     Ok({
                         let int_type_addr = &INT_TYPE as *const _ as i64;
                         crate::jit::generated::trace_box_int(
-                            ctx, len,
-                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            ctx,
+                            len,
+                            w_int_size_descr(),
+                            ob_type_descr(),
+                            int_intval_descr(),
                             int_type_addr,
                         )
                     })
@@ -1300,8 +1312,11 @@ impl TraceFrameState {
                     Ok({
                         let int_type_addr = &INT_TYPE as *const _ as i64;
                         crate::jit::generated::trace_box_int(
-                            ctx, abs_value,
-                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            ctx,
+                            abs_value,
+                            w_int_size_descr(),
+                            ob_type_descr(),
+                            int_intval_descr(),
                             int_type_addr,
                         )
                     })
@@ -1417,8 +1432,11 @@ impl TraceFrameState {
                     Ok({
                         let int_type_addr = &INT_TYPE as *const _ as i64;
                         crate::jit::generated::trace_box_int(
-                            ctx, selected,
-                            w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                            ctx,
+                            selected,
+                            w_int_size_descr(),
+                            ob_type_descr(),
+                            int_intval_descr(),
                             int_type_addr,
                         )
                     })
@@ -1625,8 +1643,11 @@ impl TraceFrameState {
             );
             let int_type_addr = &INT_TYPE as *const _ as i64;
             Ok(crate::jit::generated::trace_box_int(
-                ctx, current,
-                w_int_size_descr(), ob_type_descr(), int_intval_descr(),
+                ctx,
+                current,
+                w_int_size_descr(),
+                ob_type_descr(),
+                int_intval_descr(),
                 int_type_addr,
             ))
         })
@@ -1649,8 +1670,12 @@ impl TraceFrameState {
                     let fail_args = this.current_fail_args(ctx);
                     let int_type_addr = &INT_TYPE as *const _ as i64;
                     let int_value = crate::jit::generated::trace_unbox_int(
-                        ctx, value, int_type_addr,
-                        ob_type_descr(), int_intval_descr(), &fail_args,
+                        ctx,
+                        value,
+                        int_type_addr,
+                        ob_type_descr(),
+                        int_intval_descr(),
+                        &fail_args,
                     );
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[int_value, zero]))
@@ -1661,8 +1686,12 @@ impl TraceFrameState {
                     let fail_args = this.current_fail_args(ctx);
                     let bool_type_addr = &BOOL_TYPE as *const _ as i64;
                     let bool_value = crate::jit::generated::trace_unbox_int(
-                        ctx, value, bool_type_addr,
-                        ob_type_descr(), bool_boolval_descr(), &fail_args,
+                        ctx,
+                        value,
+                        bool_type_addr,
+                        ob_type_descr(),
+                        bool_boolval_descr(),
+                        &fail_args,
                     );
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[bool_value, zero]))

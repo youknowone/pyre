@@ -2195,7 +2195,12 @@ mod tests {
             OpCode::EscapeF,
         ];
         for op in &float_ops {
-            assert_eq!(op.result_type(), Type::Float, "{:?} should return Float", op);
+            assert_eq!(
+                op.result_type(),
+                Type::Float,
+                "{:?} should return Float",
+                op
+            );
         }
     }
 
@@ -2370,7 +2375,11 @@ mod tests {
         ];
         for op in &foldable_guards {
             assert!(op.is_foldable_guard(), "{:?} should be foldable", op);
-            assert!(op.is_guard(), "foldable guard {:?} must also be a guard", op);
+            assert!(
+                op.is_guard(),
+                "foldable guard {:?} must also be a guard",
+                op
+            );
         }
         let non_foldable = [
             OpCode::GuardNoException,
@@ -2417,7 +2426,11 @@ mod tests {
             OpCode::Unicodehash,
         ];
         for op in &extra_nosideeffect {
-            assert!(op.has_no_side_effect(), "{:?} should have no_side_effect", op);
+            assert!(
+                op.has_no_side_effect(),
+                "{:?} should have no_side_effect",
+                op
+            );
         }
     }
 
@@ -2494,7 +2507,11 @@ mod tests {
                 || op.is_call_loopinvariant()
                 || op.is_cond_call_value()
             {
-                assert!(op.is_call(), "{:?} is a call subcategory but not is_call()", op);
+                assert!(
+                    op.is_call(),
+                    "{:?} is a call subcategory but not is_call()",
+                    op
+                );
             }
         }
     }
@@ -2801,7 +2818,11 @@ mod tests {
             OpCode::VecFloatAbs,
         ];
         for op in &vec_arith {
-            assert!(op.is_vector_arithmetic(), "{:?} should be vec arithmetic", op);
+            assert!(
+                op.is_vector_arithmetic(),
+                "{:?} should be vec arithmetic",
+                op
+            );
         }
         assert!(!OpCode::IntAdd.is_vector_arithmetic());
     }
@@ -3046,7 +3067,10 @@ mod tests {
         assert!(output.contains("Jump(v0, v4, v3)"));
         // Each line is indented with 2 spaces
         for line in output.lines() {
-            assert!(line.starts_with("  "), "each line should be indented: {line}");
+            assert!(
+                line.starts_with("  "),
+                "each line should be indented: {line}"
+            );
         }
     }
 
