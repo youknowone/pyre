@@ -71,6 +71,18 @@ pub enum TracePattern {
     /// No-op instructions (nop, cache, resume, extended_arg).
     Noop,
 
+    /// Collection construction (build_list, build_tuple, build_map).
+    BuildCollection { kind: String },
+
+    /// Unpack sequence into locals.
+    UnpackSequence,
+
+    /// Collection item write (store_subscr).
+    SequenceSetitem,
+
+    /// Collection append (list_append).
+    CollectionAppend,
+
     /// Opaque — emit residual call.
     Residual { helper_name: String },
 
@@ -155,9 +167,24 @@ pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePatt
                     is_global: true,
                 });
             }
-            // Residual calls
-            "get_iter" | "build_list" | "build_tuple" | "build_map" | "unpack_sequence"
-            | "store_subscr" | "list_append" | "make_function" => {
+            // Collection construction
+            "build_list" => {
+                return Some(TracePattern::BuildCollection { kind: "list".into() });
+            }
+            "build_tuple" => {
+                return Some(TracePattern::BuildCollection { kind: "tuple".into() });
+            }
+            "build_map" => {
+                return Some(TracePattern::BuildCollection { kind: "map".into() });
+            }
+            // Sequence unpack into locals
+            "unpack_sequence" => return Some(TracePattern::UnpackSequence),
+            // Collection item write
+            "store_subscr" => return Some(TracePattern::SequenceSetitem),
+            // Collection append
+            "list_append" => return Some(TracePattern::CollectionAppend),
+            // True residual calls (allocation-heavy, stay as residual)
+            "get_iter" | "make_function" => {
                 return Some(TracePattern::Residual {
                     helper_name: name.clone(),
                 });
@@ -338,7 +365,33 @@ pub fn classify_from_pattern(pattern: &str) -> Option<TracePattern> {
         return Some(TracePattern::ConstLoad);
     }
 
-    // MakeFunction
+    // Collection construction
+    if pattern.contains("BuildList") {
+        return Some(TracePattern::BuildCollection { kind: "list".into() });
+    }
+    if pattern.contains("BuildTuple") {
+        return Some(TracePattern::BuildCollection { kind: "tuple".into() });
+    }
+    if pattern.contains("BuildMap") {
+        return Some(TracePattern::BuildCollection { kind: "map".into() });
+    }
+
+    // Unpack sequence
+    if pattern.contains("UnpackSequence") {
+        return Some(TracePattern::UnpackSequence);
+    }
+
+    // Collection item write
+    if pattern.contains("StoreSubscr") {
+        return Some(TracePattern::SequenceSetitem);
+    }
+
+    // Collection append
+    if pattern.contains("ListAppend") {
+        return Some(TracePattern::CollectionAppend);
+    }
+
+    // MakeFunction (true residual)
     if pattern.contains("MakeFunction") {
         return Some(TracePattern::Residual {
             helper_name: "make_function".into(),
