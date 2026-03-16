@@ -1212,9 +1212,7 @@ impl OptimizationPass for OptVirtualize {
             _ => {
                 let is_guard = op.opcode.is_guard();
 
-                // Force virtual args. For guards, skip the virtualizable frame
-                // (values go in fail_args instead). For all other ops (JUMP,
-                // calls, etc.), force normally to write values back to memory.
+                // Force virtual op args
                 for i in 0..op.num_args() {
                     let arg = ctx.get_replacement(op.arg(i));
                     if is_guard
@@ -1228,10 +1226,29 @@ impl OptimizationPass for OptVirtualize {
                     self.force_virtual(arg, ctx);
                 }
 
-                // Guards: augment fail_args with virtualizable field values
-                if is_guard && self.vable_config.is_some() {
+                // Guards: force virtual fail_args and re-resolve after forcing
+                if is_guard {
+                    if let Some(ref fail_args) = op.fail_args {
+                        for &fa in fail_args {
+                            let resolved = ctx.get_replacement(fa);
+                            self.force_virtual(resolved, ctx);
+                        }
+                    }
+                    // Re-resolve fail_args after forcing (force may create new forwarding)
                     let mut guard_op = op.clone();
-                    self.augment_guard_with_virtualizable(&mut guard_op, ctx);
+                    if let Some(ref mut fa) = guard_op.fail_args {
+                        for arg in fa.iter_mut() {
+                            *arg = ctx.get_replacement(*arg);
+                        }
+                    }
+                    // Also re-resolve op args
+                    for arg in &mut guard_op.args {
+                        *arg = ctx.get_replacement(*arg);
+                    }
+
+                    if self.vable_config.is_some() {
+                        self.augment_guard_with_virtualizable(&mut guard_op, ctx);
+                    }
                     return PassResult::Replace(guard_op);
                 }
 
