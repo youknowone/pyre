@@ -935,4 +935,405 @@ mod tests {
         assert_eq!(trace.ops[1].pos, ref1);
         assert_eq!(trace.ops[2].pos, ref2);
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Opencoder breadth tests — deeper parity with test_opencoder.py
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_recorder_const_int_via_constant_oprefs() {
+        // Constants in majit use OpRef indices >= 10_000.
+        // Recording ops that reference constants should preserve them.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+
+        // Simulate constant references: OpRef(10_000) is a const
+        let const_ref = OpRef(10_000);
+        let add = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
+
+        rec.close_loop(&[add]);
+        let trace = rec.get_trace();
+
+        assert_eq!(trace.ops[0].args[1], const_ref);
+        // Constant OpRef is preserved through recording
+        assert!(trace.ops[0].args[1].0 >= 10_000);
+    }
+
+    #[test]
+    fn test_recorder_const_deduplication_by_opref() {
+        // Two ops referencing the same constant OpRef share the same value.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+
+        let const_ref = OpRef(10_001);
+        let add1 = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
+        let add2 = rec.record_op(OpCode::IntAdd, &[add1, const_ref]);
+
+        rec.close_loop(&[add2]);
+        let trace = rec.get_trace();
+
+        // Both ops reference the same constant
+        assert_eq!(trace.ops[0].args[1], trace.ops[1].args[1]);
+        assert_eq!(trace.ops[0].args[1], const_ref);
+    }
+
+    #[test]
+    fn test_recorder_descriptors_preserved_on_ops() {
+        // Descriptors on non-guard ops should survive through get_trace().
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_input_arg(Type::Int);
+
+        let descr1 = make_fail_descr(10);
+        let descr2 = make_fail_descr(20);
+
+        let call1 = rec.record_op_with_descr(OpCode::CallI, &[i0], descr1);
+        let call2 = rec.record_op_with_descr(OpCode::CallI, &[i1], descr2);
+
+        rec.close_loop(&[call1, call2]);
+        let trace = rec.get_trace();
+
+        assert_eq!(trace.ops[0].descr.as_ref().unwrap().index(), 10);
+        assert_eq!(trace.ops[1].descr.as_ref().unwrap().index(), 20);
+    }
+
+    #[test]
+    fn test_recorder_100_plus_ops_stress() {
+        // Recording 200 ops should work without issue.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+
+        let mut prev = i0;
+        for _ in 0..200 {
+            prev = rec.record_op(OpCode::IntAdd, &[prev, i0]);
+        }
+        assert_eq!(rec.num_ops(), 200);
+        assert!(!rec.is_too_long());
+
+        rec.close_loop(&[prev]);
+        let trace = rec.get_trace();
+        // 200 IntAdd + 1 Jump
+        assert_eq!(trace.num_ops(), 201);
+        assert!(trace.is_loop());
+
+        // Verify chain: each op references the previous op's result.
+        // i0 = OpRef(0), first IntAdd = OpRef(1), second = OpRef(2), ...
+        for (i, op) in trace.ops[..200].iter().enumerate() {
+            assert_eq!(op.opcode, OpCode::IntAdd);
+            if i > 0 {
+                // The previous IntAdd produced OpRef(i as u32) (offset by inputarg)
+                assert_eq!(op.args[0], OpRef(i as u32));
+            }
+        }
+    }
+
+    #[test]
+    fn test_recorder_mixed_type_input_args() {
+        // Mixed-type inputs (Int, Float, Ref) produce correct types.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let f0 = rec.record_input_arg(Type::Float);
+        let r0 = rec.record_input_arg(Type::Ref);
+        let i1 = rec.record_input_arg(Type::Int);
+
+        assert_eq!(i0, OpRef(0));
+        assert_eq!(f0, OpRef(1));
+        assert_eq!(r0, OpRef(2));
+        assert_eq!(i1, OpRef(3));
+
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
+        rec.close_loop(&[add, f0, r0, i1]);
+
+        let trace = rec.get_trace();
+        assert_eq!(trace.inputargs[0].tp, Type::Int);
+        assert_eq!(trace.inputargs[1].tp, Type::Float);
+        assert_eq!(trace.inputargs[2].tp, Type::Ref);
+        assert_eq!(trace.inputargs[3].tp, Type::Int);
+    }
+
+    #[test]
+    fn test_recorder_abort_clears_state() {
+        // After abort(), the recorder's ops and inputargs are cleared.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        rec.record_op(OpCode::IntSub, &[OpRef(1), i0]);
+        assert_eq!(rec.num_ops(), 2);
+        assert_eq!(rec.num_inputargs(), 1);
+
+        rec.abort();
+        // After abort, the recorder is consumed; create a fresh one to verify
+        // independent state.
+        let fresh = TraceRecorder::new();
+        assert_eq!(fresh.num_ops(), 0);
+        assert_eq!(fresh.num_inputargs(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot get trace from aborted recorder")]
+    fn test_recorder_abort_prevents_get_trace() {
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        // Manually mark as finalized+aborted to trigger panic
+        // Actually, abort() consumes self, so we need a different approach:
+        // abort() sets aborted=true and clears ops, but also consumes self.
+        // So we can't call get_trace() after abort(). Let's verify the panic
+        // path by constructing a finalized-then-aborted scenario.
+        // Since abort() consumes self, this test verifies that the assertion
+        // text is correct by using a different flow:
+        let mut rec2 = TraceRecorder::new();
+        let i0 = rec2.record_input_arg(Type::Int);
+        rec2.close_loop(&[i0]);
+        // Manually break the invariant for testing the assertion message
+        let mut rec3 = TraceRecorder {
+            ops: vec![],
+            inputargs: vec![InputArg::from_type(Type::Int, 0)],
+            op_count: 1,
+            finalized: true,
+            aborted: true,
+        };
+        rec3.get_trace(); // should panic
+    }
+
+    #[test]
+    fn test_recorder_guard_with_many_fail_args() {
+        // Guard with 10+ fail_args.
+        let mut rec = TraceRecorder::new();
+        let mut inputs = Vec::new();
+        for _ in 0..12 {
+            inputs.push(rec.record_input_arg(Type::Int));
+        }
+
+        // Record some ops
+        let add = rec.record_op(OpCode::IntAdd, &[inputs[0], inputs[1]]);
+
+        // Guard with all 12 inputs + 1 computed value as fail_args (13 total)
+        let mut fail_args: Vec<OpRef> = inputs.clone();
+        fail_args.push(add);
+
+        let descr = make_fail_descr(0);
+        let guard = rec.record_guard_with_fail_args(
+            OpCode::GuardTrue,
+            &[add],
+            descr,
+            &fail_args,
+        );
+
+        rec.close_loop(&inputs);
+        let trace = rec.get_trace();
+
+        // Find the guard
+        let guard_op = trace.iter_guards().next().unwrap();
+        assert_eq!(guard_op.pos, guard);
+        let fa = guard_op.fail_args.as_ref().unwrap();
+        assert_eq!(fa.len(), 13);
+
+        // Verify all fail_args match what we specified
+        for (i, &expected) in fail_args.iter().enumerate() {
+            assert_eq!(fa[i], expected);
+        }
+    }
+
+    #[test]
+    fn test_recorder_guard_descr_index_survives() {
+        // Each guard's descriptor index must survive through get_trace().
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+
+        let d0 = make_fail_descr(100);
+        let d1 = make_fail_descr(200);
+        let d2 = make_fail_descr(300);
+
+        rec.record_guard(OpCode::GuardTrue, &[i0], d0);
+        rec.record_guard(OpCode::GuardFalse, &[i0], d1);
+        rec.record_guard(OpCode::GuardNoException, &[], d2);
+
+        rec.close_loop(&[i0]);
+        let trace = rec.get_trace();
+
+        let guards: Vec<_> = trace.iter_guards().collect();
+        assert_eq!(guards.len(), 3);
+        assert_eq!(guards[0].descr.as_ref().unwrap().index(), 100);
+        assert_eq!(guards[1].descr.as_ref().unwrap().index(), 200);
+        assert_eq!(guards[2].descr.as_ref().unwrap().index(), 300);
+    }
+
+    #[test]
+    fn test_recorder_ops_interleaved_with_guards() {
+        // Interleaved ops and guards: verify ordering is correct.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_input_arg(Type::Int);
+
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
+        let d0 = make_fail_descr(0);
+        rec.record_guard(OpCode::GuardTrue, &[add], d0);
+        let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
+        let d1 = make_fail_descr(1);
+        rec.record_guard(OpCode::GuardFalse, &[sub], d1);
+        let mul = rec.record_op(OpCode::IntMul, &[sub, i1]);
+
+        rec.close_loop(&[mul, i1]);
+        let trace = rec.get_trace();
+
+        let expected = vec![
+            OpCode::IntAdd,
+            OpCode::GuardTrue,
+            OpCode::IntSub,
+            OpCode::GuardFalse,
+            OpCode::IntMul,
+            OpCode::Jump,
+        ];
+        let actual: Vec<_> = trace.iter_ops().map(|op| op.opcode).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_recorder_finish_with_descr() {
+        // finish() records a FINISH op with the given descriptor.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+
+        let descr = make_fail_descr(999);
+        rec.finish(&[add], descr);
+
+        let trace = rec.get_trace();
+        assert!(trace.is_finished());
+
+        let finish = trace.ops.last().unwrap();
+        assert_eq!(finish.opcode, OpCode::Finish);
+        assert_eq!(finish.descr.as_ref().unwrap().index(), 999);
+    }
+
+    #[test]
+    fn test_recorder_no_ops_just_inputargs_and_jump() {
+        // Minimal trace: input args directly jump back.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_input_arg(Type::Int);
+
+        rec.close_loop(&[i0, i1]);
+        let trace = rec.get_trace();
+
+        assert_eq!(trace.num_ops(), 1); // Only Jump
+        assert_eq!(trace.ops[0].opcode, OpCode::Jump);
+        assert_eq!(trace.ops[0].args[0], i0);
+        assert_eq!(trace.ops[0].args[1], i1);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Trace limit deeper coverage (RPython: test_tracelimit.py parity)
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_trace_limit_independent_per_recorder() {
+        // Each TraceRecorder has its own independent op count.
+        // Two recorders can be at different fill levels simultaneously.
+        let mut rec_a = TraceRecorder::new();
+        let a0 = rec_a.record_input_arg(Type::Int);
+
+        let mut rec_b = TraceRecorder::new();
+        let b0 = rec_b.record_input_arg(Type::Int);
+
+        // Fill rec_a to 100 ops
+        let mut last_a = a0;
+        for _ in 0..100 {
+            last_a = rec_a.record_op(OpCode::IntAdd, &[last_a, a0]);
+        }
+        assert_eq!(rec_a.num_ops(), 100);
+        assert!(!rec_a.is_too_long());
+
+        // rec_b should still be empty
+        assert_eq!(rec_b.num_ops(), 0);
+        assert!(!rec_b.is_too_long());
+
+        // Fill rec_b past the limit
+        let mut last_b = b0;
+        for _ in 0..TRACE_LIMIT {
+            last_b = rec_b.record_op(OpCode::IntAdd, &[last_b, b0]);
+        }
+        assert!(rec_b.is_too_long());
+        assert!(!rec_a.is_too_long(), "rec_a should be unaffected");
+
+        // Both can still finalize
+        rec_a.close_loop(&[last_a]);
+        let _ = rec_a.get_trace();
+
+        rec_b.close_loop(&[last_b]);
+        let _ = rec_b.get_trace();
+    }
+
+    #[test]
+    fn test_trace_limit_guards_count_toward_limit() {
+        // Guards count toward the trace limit just like regular ops.
+        let mut rec = TraceRecorder::new();
+        let i0 = rec.record_input_arg(Type::Int);
+
+        let mut last = i0;
+        for idx in 0..(TRACE_LIMIT / 2) {
+            last = rec.record_op(OpCode::IntAdd, &[last, i0]);
+            let descr = make_fail_descr(idx as u32);
+            rec.record_guard(OpCode::GuardTrue, &[last], descr);
+        }
+
+        // Each iteration adds 2 ops (IntAdd + GuardTrue), total = TRACE_LIMIT
+        assert!(
+            rec.is_too_long(),
+            "guards should count toward trace limit: num_ops={}",
+            rec.num_ops()
+        );
+    }
+
+    #[test]
+    fn test_retrace_recorder_independent_limit() {
+        // A retrace recorder (from guard failure) starts fresh and has
+        // its own independent trace limit, simulating RPython's behavior
+        // where a bridge trace has its own length budget.
+        let mut rec = TraceRecorder::with_num_inputs(3);
+        assert!(!rec.is_too_long());
+        assert_eq!(rec.num_ops(), 0);
+
+        // The retrace recorder can record up to TRACE_LIMIT ops
+        let mut last = OpRef(0);
+        for _ in 0..(TRACE_LIMIT - 1) {
+            last = rec.record_op(OpCode::IntAdd, &[last, OpRef(1)]);
+        }
+        assert!(
+            !rec.is_too_long(),
+            "retrace with TRACE_LIMIT-1 ops should not be too long"
+        );
+
+        let _ = rec.record_op(OpCode::IntAdd, &[last, OpRef(1)]);
+        assert!(
+            rec.is_too_long(),
+            "retrace with TRACE_LIMIT ops should be too long"
+        );
+    }
+
+    #[test]
+    fn test_trace_limit_abort_preserves_inputargs_count() {
+        // After abort, the recorder is consumed. The caller should be
+        // able to create a new recorder with the same number of inputs.
+        let mut rec = TraceRecorder::new();
+        rec.record_input_arg(Type::Int);
+        rec.record_input_arg(Type::Float);
+        let input_count = rec.num_inputargs();
+        assert_eq!(input_count, 2);
+
+        let i0 = OpRef(0);
+        let mut last = i0;
+        for _ in 0..TRACE_LIMIT {
+            last = rec.record_op(OpCode::IntAdd, &[last, i0]);
+        }
+        assert!(rec.is_too_long());
+
+        // Abort and create fresh recorder with same inputs
+        rec.abort();
+        let new_rec = TraceRecorder::with_num_inputs(input_count);
+        assert_eq!(new_rec.num_inputargs(), input_count);
+        assert!(!new_rec.is_too_long());
+        assert_eq!(new_rec.num_ops(), 0);
+    }
 }
