@@ -565,6 +565,7 @@ fn import_single_value(
                 descr: descr.clone(),
                 known_class: *known_class,
                 fields: vfields,
+                field_descrs: Vec::new(),
             }));
         }
         VirtualStateInfo::VirtualArray { descr, items } => {
@@ -591,6 +592,7 @@ fn import_single_value(
             ptr_info[idx] = Some(PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vfields,
+                field_descrs: Vec::new(),
             }));
         }
         VirtualStateInfo::VirtualArrayStruct {
@@ -862,6 +864,7 @@ mod tests {
             descr: descr.clone(),
             known_class: None,
             fields: vec![(0, field_ref)],
+            field_descrs: Vec::new(),
         }));
 
         let state = export_state(&[opref], &ctx, &ptr_info);

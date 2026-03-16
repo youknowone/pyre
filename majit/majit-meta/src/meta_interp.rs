@@ -6,6 +6,7 @@ use majit_codegen::{
 use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{GcRef, InputArg, OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
+use majit_opt::virtualize::VirtualizableConfig;
 use majit_trace::trace::Trace;
 use majit_trace::warmstate::{HotResult, WarmState};
 
@@ -610,6 +611,18 @@ impl<M: Clone> MetaInterp<M> {
         self.virtualizable_info.as_ref()
     }
 
+    /// Create an optimizer with virtualizable config if available.
+    ///
+    /// Virtualizable fields become virtual input args — first reads are
+    /// replaced with input references and values flow through JUMP args.
+    /// No heap access for these fields on the hot path.
+    fn make_optimizer(&self) -> Optimizer {
+        // Virtualizable optimization is handled at the tracer level (pyre's
+        // JitState adds static field values as input args and JUMP args).
+        // The optimizer pass handles array field virtualization when enabled.
+        Optimizer::default_pipeline()
+    }
+
     /// Set a callback for loop compilation events.
     pub fn set_on_compile_loop(&mut self, f: impl Fn(u64, usize, usize) + Send + 'static) {
         self.hooks.on_compile_loop = Some(Box::new(f));
@@ -789,7 +802,7 @@ impl<M: Clone> MetaInterp<M> {
         recorder.close_loop(jump_args);
         let trace = recorder.get_trace();
 
-        let mut optimizer = Optimizer::default_pipeline();
+        let mut optimizer = self.make_optimizer();
         let mut constants = ctx.constants.into_inner();
 
         if crate::majit_log_enabled() {
@@ -804,6 +817,16 @@ impl<M: Clone> MetaInterp<M> {
             trace.inputargs.len(),
         );
         let num_ops_after = optimized_ops.len();
+        let final_num_inputs = optimizer.final_num_inputs();
+
+        // Extend inputargs if the optimizer added virtual inputs (virtualizable)
+        let mut inputargs = trace.inputargs.clone();
+        while inputargs.len() < final_num_inputs {
+            inputargs.push(majit_ir::InputArg {
+                tp: majit_ir::Type::Int,
+                index: inputargs.len() as u32,
+            });
+        }
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
@@ -826,21 +849,21 @@ impl<M: Clone> MetaInterp<M> {
 
         match self
             .backend
-            .compile_loop(&trace.inputargs, &optimized_ops, &mut token)
+            .compile_loop(&inputargs, &optimized_ops, &mut token)
         {
             Ok(_) => {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
                         green_key,
-                        trace.inputargs.len()
+                        inputargs.len()
                     );
                 }
                 // Build resume data and exit layouts for all guards in the optimized trace.
                 let (resume_data, guard_op_indices, mut exit_layouts) =
-                    build_guard_metadata(&trace.inputargs, &optimized_ops, green_key);
+                    build_guard_metadata(&inputargs, &optimized_ops, green_key);
                 let mut terminal_exit_layouts =
-                    build_terminal_exit_layouts(&trace.inputargs, &optimized_ops);
+                    build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }
@@ -959,7 +982,7 @@ impl<M: Clone> MetaInterp<M> {
         );
         let trace = recorder.get_trace();
 
-        let mut optimizer = Optimizer::default_pipeline();
+        let mut optimizer = self.make_optimizer();
         let mut constants = ctx.constants.into_inner();
 
         let num_ops_before = trace.ops.len();
@@ -1095,6 +1118,44 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
     }
 
+    /// Extend raw i64 input values with virtualizable static field values.
+    fn extend_inputs_i64_with_virtualizable(&self, live_values: &[i64]) -> Vec<i64> {
+        if let Some(ref vable) = self.virtualizable_info {
+            if !vable.static_fields.is_empty() {
+                let frame_ptr = live_values[0] as usize as *const u8;
+                let mut extended = live_values.to_vec();
+                for field in &vable.static_fields {
+                    let val = unsafe { *(frame_ptr.add(field.offset) as *const i64) };
+                    extended.push(val);
+                }
+                return extended;
+            }
+        }
+        live_values.to_vec()
+    }
+
+    /// Extend typed input values with virtualizable static field values.
+    ///
+    /// If virtualization added virtual input args, reads the field values
+    /// from the frame (first live_value) and appends them.
+    fn extend_inputs_with_virtualizable(&self, live_values: &[Value]) -> Vec<Value> {
+        if let Some(ref vable) = self.virtualizable_info {
+            if !vable.static_fields.is_empty() {
+                let frame_ptr = match &live_values[0] {
+                    Value::Int(v) => *v as usize as *const u8,
+                    _ => return live_values.to_vec(),
+                };
+                let mut extended = live_values.to_vec();
+                for field in &vable.static_fields {
+                    let val = unsafe { *(frame_ptr.add(field.offset) as *const i64) };
+                    extended.push(Value::Int(val));
+                }
+                return extended;
+            }
+        }
+        live_values.to_vec()
+    }
+
     /// Run the compiled loop for the given green key.
     ///
     /// `live_values` must have the same length and order as the values
@@ -1107,11 +1168,12 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns `None` if no compiled loop exists for this key.
     pub fn run_compiled(&mut self, green_key: u64, live_values: &[i64]) -> Option<(Vec<i64>, &M)> {
         let compiled = self.compiled_loops.get(&green_key)?;
+        let extended = self.extend_inputs_i64_with_virtualizable(live_values);
 
         Self::prepare_compiled_run_io();
         let result = self
             .backend
-            .execute_token_ints_raw(&compiled.token, live_values);
+            .execute_token_ints_raw(&compiled.token, &extended);
         Self::finish_compiled_run_io(result.is_finish);
 
         let fail_index = result.fail_index;
@@ -1206,9 +1268,10 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> Option<(Vec<Value>, &M)> {
         let compiled = self.compiled_loops.get(&green_key)?;
+        let extended = self.extend_inputs_with_virtualizable(live_values);
 
         Self::prepare_compiled_run_io();
-        let result = self.backend.execute_token_raw(&compiled.token, live_values);
+        let result = self.backend.execute_token_raw(&compiled.token, &extended);
         Self::finish_compiled_run_io(result.is_finish);
 
         let fail_index = result.fail_index;
@@ -1254,11 +1317,12 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[i64],
     ) -> Option<RawCompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
+        let extended = self.extend_inputs_i64_with_virtualizable(live_values);
 
         Self::prepare_compiled_run_io();
         let result = self
             .backend
-            .execute_token_ints_raw(&compiled.token, live_values);
+            .execute_token_ints_raw(&compiled.token, &extended);
         Self::finish_compiled_run_io(result.is_finish);
 
         let fail_index = result.fail_index;
@@ -2024,7 +2088,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Optimize the bridge trace
-        let mut optimizer = Optimizer::default_pipeline();
+        let mut optimizer = self.make_optimizer();
         let mut constants = constants;
         let optimized_ops = optimizer.optimize_with_constants_and_inputs(
             bridge_ops,

@@ -15,6 +15,6 @@ pub fn trace_bytecode(
     pc: usize,
     concrete_frame: usize,
 ) -> TraceAction {
-    let mut frame_state = TraceFrameState::from_concrete(ctx, sym.frame, concrete_frame, pc + 1);
+    let mut frame_state = TraceFrameState::from_sym(ctx, sym, concrete_frame, pc + 1);
     frame_state.trace_code_step(code, pc)
 }

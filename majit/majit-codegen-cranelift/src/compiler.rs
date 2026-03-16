@@ -3516,10 +3516,13 @@ impl CraneliftBackend {
         for i in 0..num_inputs {
             builder.declare_var(var(i as u32), cl_types::I64);
         }
-        // Declare variables for op results
+        // Declare variables for op results (skip positions already covered by inputs)
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
                 let vi = op_var_index(op, op_idx, num_inputs);
+                if vi < num_inputs {
+                    continue; // already declared as input variable
+                }
                 let cl_type = if vec_oprefs.contains(&(vi as u32)) {
                     if is_vec_float_producing(op.opcode) {
                         cl_types::F64X2

@@ -88,6 +88,8 @@ pub struct VirtualInfo {
     pub known_class: Option<GcRef>,
     /// Field values: (field_descr_index, value_opref).
     pub fields: Vec<(u32, OpRef)>,
+    /// Original field descriptors, preserving offset/size/type info for forcing.
+    pub field_descrs: Vec<(u32, DescrRef)>,
 }
 
 /// A virtual array.
@@ -277,6 +279,9 @@ pub struct VirtualizableFieldState {
     /// Tracked static field values: (field_descr_index, current_value_opref).
     /// Indices correspond to VirtualizableInfo::static_fields order.
     pub fields: Vec<(u32, OpRef)>,
+    /// Original field descriptors: (field_descr_index, original_descr).
+    /// Used to emit correct SetfieldRaw ops when forcing.
+    pub field_descrs: Vec<(u32, DescrRef)>,
     /// Tracked array field values: (array_field_index, element_values).
     /// Indices correspond to VirtualizableInfo::array_fields order.
     pub arrays: Vec<(u32, Vec<OpRef>)>,
