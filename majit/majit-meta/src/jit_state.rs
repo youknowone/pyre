@@ -296,6 +296,37 @@ pub trait JitState: Sized {
         Self::validate_close(sym, meta)
     }
 
+    /// Push a reconstructed caller frame onto the interpreter's call stack.
+    /// Called during multi-frame deopt: innermost frame is current,
+    /// outer frames are pushed in reverse order (outermost first).
+    ///
+    /// `frame_index`: 0 = outermost, N-1 = innermost (current)
+    /// `values`: typed values for this frame's slots
+    /// `pc`: the program counter / bytecode position for this frame
+    ///
+    /// Returns true if the frame was successfully pushed.
+    fn push_caller_frame(
+        &mut self,
+        _meta: &Self::Meta,
+        _frame_index: usize,
+        _total_frames: usize,
+        _values: &[Value],
+        _pc: u64,
+    ) -> bool {
+        false // Default: no multi-frame support
+    }
+
+    /// Pop the current frame and resume the caller frame.
+    /// Called when blackhole execution of the innermost frame completes.
+    fn pop_to_caller_frame(&mut self, _meta: &Self::Meta) -> bool {
+        false // Default: no multi-frame support
+    }
+
+    /// Check if multi-frame caller-stack restore is supported.
+    fn supports_multi_frame_restore(&self) -> bool {
+        false
+    }
+
     fn materialize_virtual_ref(
         &mut self,
         _meta: &Self::Meta,
@@ -692,6 +723,30 @@ pub trait JitState: Sized {
                 self.materialize_virtual_refs(meta, materialized_virtuals)
             };
             let total_frames = reconstructed_state.frames.len();
+
+            // Multi-frame caller-stack reconstruction: push outer frames onto
+            // the interpreter's call stack and restore only the innermost as
+            // current state. This mirrors RPython's resume.py which rebuilds
+            // the full framestack so blackhole can unwind through callers.
+            if total_frames > 1 && self.supports_multi_frame_restore() {
+                let restored = self.restore_multi_frame_with_caller_stack(
+                    meta,
+                    reconstructed_state,
+                    frame_layouts,
+                    exception,
+                    &materialized_refs,
+                );
+                if restored {
+                    self.replay_pending_field_writes(
+                        meta,
+                        pending_field_writes,
+                        &materialized_refs,
+                    );
+                    return true;
+                }
+                // Fall through to existing paths if multi-frame push failed
+            }
+
             let can_use_generic_cache = total_frames == 1
                 || reconstructed_state
                     .frames
@@ -755,6 +810,111 @@ pub trait JitState: Sized {
 
         self.restore(meta, fail_values);
         true
+    }
+
+    /// Multi-frame caller-stack reconstruction.
+    ///
+    /// Pushes outer frames (outermost first) onto the interpreter's call
+    /// stack via `push_caller_frame`, then restores the innermost frame as
+    /// the current interpreter state. This allows blackhole execution to
+    /// unwind through the reconstructed caller frames.
+    fn restore_multi_frame_with_caller_stack(
+        &mut self,
+        meta: &Self::Meta,
+        reconstructed_state: &ReconstructedState,
+        frame_layouts: Option<&[ResumeFrameLayoutSummary]>,
+        exception: &ExceptionState,
+        materialized_refs: &[Option<GcRef>],
+    ) -> bool {
+        let total_frames = reconstructed_state.frames.len();
+        if total_frames < 2 {
+            return false;
+        }
+
+        // Push outer frames (indices 0..total_frames-1) onto the call stack.
+        // Frame 0 is the outermost caller, frame total_frames-2 is the
+        // direct caller of the innermost frame.
+        for frame_index in 0..total_frames - 1 {
+            let frame = &reconstructed_state.frames[frame_index];
+            let types = self.resolve_frame_types(
+                meta,
+                frame_index,
+                total_frames,
+                frame,
+                frame_layouts,
+            );
+            let Some(types) = types else {
+                return false;
+            };
+            let Some(values) =
+                frame_values_from_reconstructed(&frame.values, &types, materialized_refs)
+            else {
+                return false;
+            };
+            if !self.push_caller_frame(meta, frame_index, total_frames, &values, frame.pc) {
+                return false;
+            }
+        }
+
+        // Restore the innermost frame as current state.
+        let innermost_index = total_frames - 1;
+        let innermost = &reconstructed_state.frames[innermost_index];
+        let types = self.resolve_frame_types(
+            meta,
+            innermost_index,
+            total_frames,
+            innermost,
+            frame_layouts,
+        );
+        let Some(types) = types else {
+            return false;
+        };
+        let Some(values) =
+            frame_values_from_reconstructed(&innermost.values, &types, materialized_refs)
+        else {
+            return false;
+        };
+        self.restore_reconstructed_frame_values_with_metadata(
+            meta,
+            innermost_index,
+            total_frames,
+            innermost,
+            &values,
+            exception,
+        )
+    }
+
+    /// Resolve the type layout for a single reconstructed frame, trying
+    /// (in order): per-frame slot_types, interpreter-provided types,
+    /// and resume layout types.
+    fn resolve_frame_types(
+        &self,
+        meta: &Self::Meta,
+        frame_index: usize,
+        total_frames: usize,
+        frame: &crate::resume::ReconstructedFrame,
+        frame_layouts: Option<&[ResumeFrameLayoutSummary]>,
+    ) -> Option<Vec<Type>> {
+        frame
+            .slot_types
+            .clone()
+            .or_else(|| {
+                self.reconstructed_frame_value_types_with_metadata(
+                    meta,
+                    frame_index,
+                    total_frames,
+                    frame,
+                )
+            })
+            .or_else(|| {
+                frame_layouts
+                    .and_then(|layouts| layouts.get(frame_index))
+                    .filter(|layout| {
+                        layout.pc == frame.pc
+                            && layout.slot_layouts.len() == frame.values.len()
+                    })
+                    .and_then(|layout| layout.slot_types.clone())
+            })
     }
 
     fn replay_pending_field_writes(
@@ -1214,10 +1374,7 @@ mod tests {
                     source_guard: None,
                     pc: 10,
                     slot_types: None,
-                    values: vec![
-                        ReconstructedValue::Value(1),
-                        ReconstructedValue::Virtual(0),
-                    ],
+                    values: vec![ReconstructedValue::Value(1), ReconstructedValue::Virtual(0)],
                 },
                 ReconstructedFrame {
                     trace_id: Some(200),
@@ -1306,5 +1463,289 @@ mod tests {
             2,
             "multi-frame session cache should prevent re-materialization"
         );
+    }
+
+    /// Test state that supports multi-frame caller-stack reconstruction.
+    /// Tracks pushed caller frames and innermost restore calls.
+    #[derive(Default)]
+    struct MultiFrameTestState {
+        materialize_call_count: Cell<usize>,
+        restored_values: Vec<Value>,
+        restored_frames: Vec<(usize, u64, Vec<Value>)>,
+        pushed_caller_frames: Vec<(usize, usize, Vec<Value>, u64)>,
+        popped_count: usize,
+    }
+
+    impl JitState for MultiFrameTestState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _: usize, _: &()) -> () {}
+        fn extract_live(&self, _: &()) -> Vec<i64> {
+            Vec::new()
+        }
+        fn create_sym(_: &(), _: usize) -> () {}
+        fn is_compatible(&self, _: &()) -> bool {
+            true
+        }
+        fn restore(&mut self, _: &(), _: &[i64]) {}
+
+        fn restore_values(&mut self, _: &(), values: &[Value]) {
+            self.restored_values = values.to_vec();
+        }
+
+        fn restore_reconstructed_frame_values_with_metadata(
+            &mut self,
+            _meta: &(),
+            frame_index: usize,
+            _total_frames: usize,
+            frame: &crate::resume::ReconstructedFrame,
+            values: &[Value],
+            _exception: &ExceptionState,
+        ) -> bool {
+            self.restored_frames
+                .push((frame_index, frame.pc, values.to_vec()));
+            true
+        }
+
+        fn materialize_virtual_ref(
+            &mut self,
+            _meta: &(),
+            virtual_index: usize,
+            _materialized: &MaterializedVirtual,
+        ) -> Option<GcRef> {
+            self.materialize_call_count
+                .set(self.materialize_call_count.get() + 1);
+            Some(GcRef(0xC000 + virtual_index))
+        }
+
+        fn collect_jump_args(_: &()) -> Vec<OpRef> {
+            Vec::new()
+        }
+        fn validate_close(_: &(), _: &()) -> bool {
+            true
+        }
+
+        fn supports_multi_frame_restore(&self) -> bool {
+            true
+        }
+
+        fn push_caller_frame(
+            &mut self,
+            _meta: &(),
+            frame_index: usize,
+            total_frames: usize,
+            values: &[Value],
+            pc: u64,
+        ) -> bool {
+            self.pushed_caller_frames
+                .push((frame_index, total_frames, values.to_vec(), pc));
+            true
+        }
+
+        fn pop_to_caller_frame(&mut self, _meta: &()) -> bool {
+            self.popped_count += 1;
+            !self.pushed_caller_frames.is_empty()
+        }
+    }
+
+    #[test]
+    fn test_multi_frame_push_restore_with_caller_stack() {
+        let mut state = MultiFrameTestState::default();
+
+        // 3 frames: outermost (0), middle (1), innermost (2)
+        let reconstructed_state = ReconstructedState {
+            frames: vec![
+                ReconstructedFrame {
+                    trace_id: Some(100),
+                    header_pc: Some(500),
+                    source_guard: None,
+                    pc: 10,
+                    slot_types: Some(vec![Type::Int, Type::Int]),
+                    values: vec![
+                        ReconstructedValue::Value(1),
+                        ReconstructedValue::Value(2),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(200),
+                    header_pc: Some(600),
+                    source_guard: None,
+                    pc: 20,
+                    slot_types: Some(vec![Type::Int, Type::Ref]),
+                    values: vec![
+                        ReconstructedValue::Value(3),
+                        ReconstructedValue::Virtual(0),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(300),
+                    header_pc: Some(700),
+                    source_guard: None,
+                    pc: 30,
+                    slot_types: Some(vec![Type::Int]),
+                    values: vec![ReconstructedValue::Value(42)],
+                },
+            ],
+            virtuals: vec![MaterializedVirtual::Obj {
+                type_id: 1,
+                descr_index: 0,
+                fields: vec![(0, MaterializedValue::Value(100))],
+            }],
+            pending_fields: Vec::new(),
+        };
+
+        let restored = state.restore_guard_failure_with_session_cache(
+            &(),
+            &[],
+            Some(&reconstructed_state),
+            None,
+            &reconstructed_state.virtuals,
+            &[],
+            &ExceptionState::default(),
+            None,
+        );
+        assert!(restored);
+
+        // Frames 0 and 1 should have been pushed via push_caller_frame
+        assert_eq!(state.pushed_caller_frames.len(), 2);
+
+        // Frame 0 (outermost): frame_index=0, total_frames=3, pc=10
+        let (idx, total, vals, pc) = &state.pushed_caller_frames[0];
+        assert_eq!(*idx, 0);
+        assert_eq!(*total, 3);
+        assert_eq!(*pc, 10);
+        assert_eq!(vals, &[Value::Int(1), Value::Int(2)]);
+
+        // Frame 1 (middle): frame_index=1, total_frames=3, pc=20
+        let (idx, total, vals, pc) = &state.pushed_caller_frames[1];
+        assert_eq!(*idx, 1);
+        assert_eq!(*total, 3);
+        assert_eq!(*pc, 20);
+        assert_eq!(vals, &[Value::Int(3), Value::Ref(GcRef(0xC000))]);
+
+        // Frame 2 (innermost) should be restored as current state
+        assert_eq!(state.restored_frames.len(), 1);
+        let (idx, pc, vals) = &state.restored_frames[0];
+        assert_eq!(*idx, 2);
+        assert_eq!(*pc, 30);
+        assert_eq!(vals, &[Value::Int(42)]);
+    }
+
+    #[test]
+    fn test_multi_frame_restore_falls_back_without_support() {
+        // CachingTestState does NOT implement supports_multi_frame_restore
+        // (returns false by default), so multi-frame should fall back to
+        // existing per-frame restore_reconstructed_frame_values path.
+        let mut state = CachingTestState::default();
+
+        let reconstructed_state = ReconstructedState {
+            frames: vec![
+                ReconstructedFrame {
+                    trace_id: Some(100),
+                    header_pc: Some(500),
+                    source_guard: None,
+                    pc: 10,
+                    slot_types: Some(vec![Type::Int]),
+                    values: vec![ReconstructedValue::Value(1)],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(200),
+                    header_pc: Some(600),
+                    source_guard: None,
+                    pc: 20,
+                    slot_types: Some(vec![Type::Int]),
+                    values: vec![ReconstructedValue::Value(2)],
+                },
+            ],
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        };
+
+        let restored = state.restore_guard_failure_with_session_cache(
+            &(),
+            &[],
+            Some(&reconstructed_state),
+            None,
+            &[],
+            &[],
+            &ExceptionState::default(),
+            None,
+        );
+        assert!(restored);
+
+        // Without multi-frame support, falls back to existing
+        // restore_reconstructed_frame_values_with_metadata for all frames
+        assert_eq!(state.restored_frames.len(), 2);
+        assert_eq!(state.restored_frames[0].0, 0); // frame_index 0
+        assert_eq!(state.restored_frames[1].0, 1); // frame_index 1
+    }
+
+    #[test]
+    fn test_push_caller_frame_receives_correct_values() {
+        let mut state = MultiFrameTestState::default();
+
+        // 2 frames with mixed types and a virtual reference
+        let reconstructed_state = ReconstructedState {
+            frames: vec![
+                ReconstructedFrame {
+                    trace_id: Some(100),
+                    header_pc: Some(500),
+                    source_guard: None,
+                    pc: 50,
+                    slot_types: Some(vec![Type::Int, Type::Float, Type::Ref]),
+                    values: vec![
+                        ReconstructedValue::Value(42),
+                        ReconstructedValue::Value(f64::to_bits(3.14) as i64),
+                        ReconstructedValue::Virtual(0),
+                    ],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(200),
+                    header_pc: Some(600),
+                    source_guard: None,
+                    pc: 60,
+                    slot_types: Some(vec![Type::Int]),
+                    values: vec![ReconstructedValue::Value(99)],
+                },
+            ],
+            virtuals: vec![MaterializedVirtual::Obj {
+                type_id: 1,
+                descr_index: 0,
+                fields: vec![(0, MaterializedValue::Value(777))],
+            }],
+            pending_fields: Vec::new(),
+        };
+
+        let restored = state.restore_guard_failure_with_session_cache(
+            &(),
+            &[],
+            Some(&reconstructed_state),
+            None,
+            &reconstructed_state.virtuals,
+            &[],
+            &ExceptionState::default(),
+            None,
+        );
+        assert!(restored);
+
+        // Outer frame pushed with correct typed values
+        assert_eq!(state.pushed_caller_frames.len(), 1);
+        let (idx, total, vals, pc) = &state.pushed_caller_frames[0];
+        assert_eq!(*idx, 0);
+        assert_eq!(*total, 2);
+        assert_eq!(*pc, 50);
+        assert_eq!(vals.len(), 3);
+        assert_eq!(vals[0], Value::Int(42));
+        assert_eq!(vals[1], Value::Float(3.14));
+        assert_eq!(vals[2], Value::Ref(GcRef(0xC000)));
+
+        // Innermost frame restored as current state
+        assert_eq!(state.restored_frames.len(), 1);
+        let (idx, pc, vals) = &state.restored_frames[0];
+        assert_eq!(*idx, 1);
+        assert_eq!(*pc, 60);
+        assert_eq!(vals, &[Value::Int(99)]);
     }
 }
