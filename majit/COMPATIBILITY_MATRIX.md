@@ -46,8 +46,8 @@ Resolved since last revision:
 
 Remaining gaps:
 
-1. **Static analyzer / translator**: `majit-analyze` classifies 18/40 pyre opcode arms; general CFG/pattern coverage is still partial.
-2. **Cranelift backend**: multi-frame push restore tested up to depth 50 with mixed Int/Float/Ref types and virtual materialization. No hardcoded depth limit. The last structural gap (arbitrary caller-stack restore) is now closed at the majit infrastructure level; remaining work is exercising it under real interpreter call stacks.
+1. **Static analyzer / translator**: `majit-analyze` now classifies 39/40 pyre opcode arms. Only the wildcard `other` arm remains unclassified. Remaining: complex CFG lowering within match arms (loop/while/for in arms emit compile_error instead of JitCode).
+2. **Cranelift backend**: arbitrary-depth multi-frame restore tested up to depth 50 with mixed types and virtual materialization. Infrastructure gap closed; remaining is E2E validation under real compiled interpreter stacks.
 
 ## Next Expansion
 
