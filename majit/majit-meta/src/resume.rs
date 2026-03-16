@@ -232,6 +232,72 @@ impl ResumeFrameLayoutSummary {
             slot_types: self.slot_types.clone(),
         }
     }
+
+    /// Build a `ResumeFrameLayoutSummary` from a backend-origin `ExitFrameLayout`.
+    ///
+    /// Each `ExitValueSourceLayout` slot is converted to the corresponding
+    /// `ResumeValueLayoutSummary`, preserving slot types when present.
+    pub fn from_exit_frame_layout(exit_frame: &ExitFrameLayout) -> Self {
+        let slot_layouts: Vec<ResumeValueLayoutSummary> = exit_frame
+            .slots
+            .iter()
+            .map(ResumeValueLayoutSummary::from_exit_value_source)
+            .collect();
+        let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|s| s.kind).collect();
+
+        Self {
+            trace_id: exit_frame.trace_id,
+            header_pc: exit_frame.header_pc,
+            source_guard: exit_frame.source_guard,
+            pc: exit_frame.pc,
+            slot_sources,
+            slot_layouts,
+            slot_types: exit_frame.slot_types.clone(),
+        }
+    }
+}
+
+impl ResumeValueLayoutSummary {
+    /// Build a `ResumeValueLayoutSummary` from a backend-origin `ExitValueSourceLayout`.
+    pub fn from_exit_value_source(source: &ExitValueSourceLayout) -> Self {
+        match source {
+            ExitValueSourceLayout::ExitValue(index) => Self {
+                kind: ResumeValueKind::FailArg,
+                fail_arg_index: Some(*index),
+                raw_fail_arg_position: Some(*index),
+                constant: None,
+                virtual_index: None,
+            },
+            ExitValueSourceLayout::Constant(value) => Self {
+                kind: ResumeValueKind::Constant,
+                fail_arg_index: None,
+                raw_fail_arg_position: None,
+                constant: Some(*value),
+                virtual_index: None,
+            },
+            ExitValueSourceLayout::Virtual(index) => Self {
+                kind: ResumeValueKind::Virtual,
+                fail_arg_index: None,
+                raw_fail_arg_position: None,
+                constant: None,
+                virtual_index: Some(*index),
+            },
+            ExitValueSourceLayout::Uninitialized => Self {
+                kind: ResumeValueKind::Uninitialized,
+                fail_arg_index: None,
+                raw_fail_arg_position: None,
+                constant: None,
+                virtual_index: None,
+            },
+            ExitValueSourceLayout::Unavailable => Self {
+                kind: ResumeValueKind::Unavailable,
+                fail_arg_index: None,
+                raw_fail_arg_position: None,
+                constant: None,
+                virtual_index: None,
+            },
+        }
+    }
 }
 
 impl ResumeVirtualLayoutSummary {
