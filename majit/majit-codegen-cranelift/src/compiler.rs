@@ -4460,24 +4460,42 @@ impl CraneliftBackend {
                     });
 
                     // Direct call via dispatch table: load code_ptr from a
-                    // stable slot (AtomicPtr). redirect_call_assembler updates
-                    // the slot, so compiled code always calls the current target.
-                    let dispatch_slot_addr = resolved_target.as_ref().and_then(|t| {
-                        if t.code_ptr.is_null() {
-                            return None;
+                    // stable slot (AtomicPtr). For self-recursion (target not
+                    // yet registered), pre-create the slot with null — compile
+                    // completion fills it. Runtime null check falls back to shim.
+                    let token_val = call_descr.call_target_token().unwrap_or(0);
+                    let dispatch_slot_addr = if let Some(t) = resolved_target.as_ref() {
+                        if !t.code_ptr.is_null() {
+                            Some(ca_dispatch_slot(token_val, t.code_ptr) as usize)
+                        } else {
+                            None
                         }
-                        let token_val = call_descr.call_target_token().unwrap_or(0);
-                        Some(ca_dispatch_slot(token_val, t.code_ptr) as usize)
-                    });
-                    let use_direct = finish_index.is_some() && dispatch_slot_addr.is_some();
+                    } else if token_val != 0 {
+                        // Self-recursion: pre-create slot with null code_ptr.
+                        // register_call_assembler_target fills it after compile.
+                        Some(ca_dispatch_slot(token_val, std::ptr::null()) as usize)
+                    } else {
+                        None
+                    };
+
+                    // finish_index: use the target's if resolved, otherwise
+                    // assume finish is the last fail_descr (common case).
+                    let use_direct = dispatch_slot_addr.is_some()
+                        && (finish_index.is_some() || resolved_target.is_none());
 
                     if use_direct {
-                        let target = resolved_target.as_ref().unwrap();
-                        let finish_idx = finish_index.unwrap();
                         let slot_addr = dispatch_slot_addr.unwrap();
 
+                        // For self-recursion (target unknown), use safe defaults
+                        let out_slots = resolved_target.as_ref()
+                            .map_or(16, |t| t.max_output_slots.max(1));
+                        let num_ref_roots = resolved_target.as_ref()
+                            .map_or(8, |t| t.num_ref_roots.max(1));
+                        // finish_idx: known from target, or -1 to skip finish check
+                        // (runtime: any non-negative fail_index that matches is finish)
+                        let finish_idx = finish_index.unwrap_or(u32::MAX);
+
                         // Allocate output and roots buffers on stack
-                        let out_slots = target.max_output_slots.max(1);
                         let out_bytes = (out_slots * 8) as u32;
                         let out_slot = builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
@@ -4486,7 +4504,7 @@ impl CraneliftBackend {
                         ));
                         let out_ptr = builder.ins().stack_addr(ptr_type, out_slot, 0);
 
-                        let roots_bytes = (target.num_ref_roots.max(1) * 8) as u32;
+                        let roots_bytes = (num_ref_roots * 8) as u32;
                         let ca_roots_slot = builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
                             roots_bytes,
@@ -4494,12 +4512,27 @@ impl CraneliftBackend {
                         ));
                         let ca_roots_ptr = builder.ins().stack_addr(ptr_type, ca_roots_slot, 0);
 
-                        // Load code_ptr from dispatch slot (AtomicPtr)
+                        // Load code_ptr from dispatch slot (AtomicPtr).
+                        // For self-recursion, first call may see null (filled
+                        // after compile). Null → fall through to shim.
                         let slot_ptr = builder.ins().iconst(ptr_type, slot_addr as i64);
                         let code_addr =
                             builder
                                 .ins()
                                 .load(ptr_type, MemFlags::trusted(), slot_ptr, 0);
+                        let null_ptr = builder.ins().iconst(ptr_type, 0);
+                        let is_null = builder.ins().icmp(IntCC::Equal, code_addr, null_ptr);
+                        let direct_call_block = builder.create_block();
+                        let shim_fallback_block = builder.create_block();
+                        builder.ins().brif(
+                            is_null,
+                            shim_fallback_block, &[],
+                            direct_call_block, &[],
+                        );
+
+                        builder.switch_to_block(direct_call_block);
+                        builder.seal_block(direct_call_block);
+
                         let mut sig = Signature::new(call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // inputs
                         sig.params.push(AbiParam::new(ptr_type)); // outputs
@@ -4521,7 +4554,6 @@ impl CraneliftBackend {
                                 .ins()
                                 .icmp(IntCC::Equal, fail_idx_raw, expected_finish);
                         let direct_finish_block = builder.create_block();
-                        let shim_fallback_block = builder.create_block();
                         builder.ins().brif(
                             is_direct_finish,
                             direct_finish_block,
