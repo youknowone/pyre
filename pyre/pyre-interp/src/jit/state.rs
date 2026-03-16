@@ -505,7 +505,7 @@ impl TraceFrameState {
     }
 
     /// Build the current fail_args for guards: [frame, ni, sd, locals..., stack...]
-    pub(crate) fn current_fail_args(&self, ctx: &mut TraceCtx) -> Vec<OpRef> {
+    pub(crate) fn current_fail_args(&self, _ctx: &mut TraceCtx) -> Vec<OpRef> {
         let s = self.sym();
         let mut fa = vec![s.frame, s.vable_next_instr, s.vable_stack_depth];
         fa.extend_from_slice(&s.symbolic_locals);
@@ -612,11 +612,6 @@ impl TraceFrameState {
     fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
         self.guard_object_class(ctx, int_obj, &INT_TYPE as *const PyType);
         ctx.record_op_with_descr(OpCode::GetfieldRawI, &[int_obj], int_intval_descr())
-    }
-
-    fn trace_guarded_bool_payload(&mut self, ctx: &mut TraceCtx, bool_obj: OpRef) -> OpRef {
-        self.guard_object_class(ctx, bool_obj, &BOOL_TYPE as *const PyType);
-        ctx.record_op_with_descr(OpCode::GetfieldRawI, &[bool_obj], bool_boolval_descr())
     }
 
     fn concrete_binary_int_operands(&self) -> Option<(i64, i64)> {
@@ -896,21 +891,9 @@ impl TraceFrameState {
             _ => return self.trace_binary_value(a, b, op),
         };
 
-        let concrete_result = match op {
-            BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.wrapping_add(rhs),
-            BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => lhs.wrapping_sub(rhs),
-            BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => lhs.wrapping_mul(rhs),
-            BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => lhs / rhs,
-            BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => lhs % rhs,
-            BinaryOperator::And | BinaryOperator::InplaceAnd => lhs & rhs,
-            BinaryOperator::Or | BinaryOperator::InplaceOr => lhs | rhs,
-            BinaryOperator::Xor | BinaryOperator::InplaceXor => lhs ^ rhs,
-            BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lhs
-                .checked_shl(rhs as u32)
-                .expect("validated shift should succeed"),
-            BinaryOperator::Rshift | BinaryOperator::InplaceRshift => lhs >> (rhs as u32),
-            _ => unreachable!("unexpected direct int binary op"),
-        };
+        // concrete_result no longer needed — generated trace functions
+        // handle boxing without concrete values.
+        let _ = (lhs, rhs); // suppress unused warnings for edge-case validation above
 
         let has_overflow = matches!(
             op_code,

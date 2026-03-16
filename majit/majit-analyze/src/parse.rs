@@ -1,6 +1,6 @@
 //! Source parsing: extract opcode dispatch, trait impls, type layouts.
 
-use syn::{File, Item, ItemFn, ItemImpl, ItemStruct, visit::Visit};
+use syn::{File, Item, ItemFn, visit::Visit};
 
 use crate::{FieldInfo, MethodInfo, OpcodeArm, TraitImplInfo, TypeLayout};
 
