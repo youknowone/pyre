@@ -113,6 +113,29 @@ pub trait GcAllocator: Send {
 
     /// Maximum size for nursery allocation (larger objects go to old gen directly).
     fn max_nursery_object_size(&self) -> usize;
+
+    /// Fast-path write barrier for JIT-compiled code.
+    ///
+    /// Adds the object directly to the remembered set. The JIT has already
+    /// performed the inline flag test (COND_CALL_GC_WB) and determined
+    /// that the barrier is needed.
+    fn jit_remember_young_pointer(&mut self, obj: GcRef) {
+        self.write_barrier(obj);
+    }
+
+    /// Whether the GC supports optimized conditional write barriers.
+    ///
+    /// When true, the JIT emits COND_CALL_GC_WB (inline flag test +
+    /// conditional call) instead of a full barrier call.
+    fn can_optimize_cond_call(&self) -> bool {
+        false
+    }
+
+    /// Perform one incremental GC step at a JIT safepoint.
+    /// Returns true if any GC work was done.
+    fn gc_step(&mut self) -> bool {
+        false
+    }
 }
 
 /// GC rewriter — transforms IR operations for GC integration.

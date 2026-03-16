@@ -731,6 +731,67 @@ impl MiniMarkGC {
         }
         self.card_dirty.clear();
     }
+
+    // ── JIT integration hooks ──
+
+    /// Fast-path write barrier for JIT-compiled code.
+    ///
+    /// Called from JIT-compiled code when a write barrier fires.
+    /// Adds the object directly to the remembered set without the
+    /// full flag-check logic of `do_write_barrier()`, because the
+    /// JIT has already determined that the barrier is needed (via
+    /// the inline flag test emitted by COND_CALL_GC_WB).
+    ///
+    /// Equivalent to incminimark's `jit_remember_young_pointer()`.
+    pub fn jit_remember_young_pointer(&mut self, obj: GcRef) {
+        if obj.is_null() {
+            return;
+        }
+        // Clear TRACK_YOUNG_PTRS so the object won't trigger the
+        // barrier again until it is re-processed in a minor collection.
+        let hdr = unsafe { header_of(obj.0) };
+        hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
+        self.remembered_set.push(obj.0);
+    }
+
+    /// Returns true if the GC supports optimized conditional write barriers.
+    ///
+    /// When true, the JIT can emit COND_CALL_GC_WB (an inline flag test +
+    /// conditional call) instead of a full write-barrier call. Nursery-based
+    /// collectors always support this because the barrier check is a simple
+    /// flag test on the object header.
+    pub fn can_optimize_cond_call(&self) -> bool {
+        true
+    }
+
+    /// Perform one incremental GC step. Called from JIT safepoints.
+    ///
+    /// If an incremental marking cycle should start, it is initiated.
+    /// If a cycle is already in progress, one bounded marking step is
+    /// performed. Returns true if any GC work was done.
+    pub fn gc_step(&mut self) -> bool {
+        if self.should_start_major_cycle() && !self.incr_state.marking_in_progress {
+            self.start_incremental_cycle();
+            let done = self.incremental_mark_step();
+            if done {
+                self.finish_incremental_cycle();
+            }
+            true
+        } else if self.incr_state.marking_in_progress {
+            let done = self.incremental_mark_step();
+            if done {
+                self.finish_incremental_cycle();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Number of objects in the remembered set (for testing / diagnostics).
+    pub fn remembered_set_len(&self) -> usize {
+        self.remembered_set.len()
+    }
 }
 
 /// Safepoint GC map: records which frame slots contain GC references
@@ -973,6 +1034,18 @@ impl GcAllocator for MiniMarkGC {
 
     fn max_nursery_object_size(&self) -> usize {
         self.config.large_object_threshold
+    }
+
+    fn jit_remember_young_pointer(&mut self, obj: GcRef) {
+        self.jit_remember_young_pointer(obj);
+    }
+
+    fn can_optimize_cond_call(&self) -> bool {
+        self.can_optimize_cond_call()
+    }
+
+    fn gc_step(&mut self) -> bool {
+        self.gc_step()
     }
 }
 
@@ -2618,6 +2691,174 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 5, "entire chain should be reachable after cycle");
+
+        gc.roots.clear();
+    }
+
+    // ── JIT integration hook tests ──
+
+    #[test]
+    fn test_jit_remember_young_pointer() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        // Allocate an old-gen object.
+        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        assert!(!gc.is_in_nursery(obj.0));
+
+        // Initially TRACK_YOUNG_PTRS is set.
+        let hdr = unsafe { header_of(obj.0) };
+        assert!(hdr.has_flag(flags::TRACK_YOUNG_PTRS));
+
+        // JIT fast-path barrier: clears flag and adds to remembered set.
+        gc.jit_remember_young_pointer(obj);
+
+        assert!(!hdr.has_flag(flags::TRACK_YOUNG_PTRS));
+        assert_eq!(gc.remembered_set_len(), 1);
+
+        // Calling again adds a second entry (JIT fast-path does not
+        // deduplicate; the collector handles this during minor collection).
+        gc.jit_remember_young_pointer(obj);
+        assert_eq!(gc.remembered_set_len(), 2);
+    }
+
+    #[test]
+    fn test_jit_remember_young_pointer_null_is_noop() {
+        let mut gc = test_gc(4096);
+        gc.jit_remember_young_pointer(GcRef::NULL);
+        assert_eq!(gc.remembered_set_len(), 0);
+    }
+
+    #[test]
+    fn test_jit_remember_young_pointer_survives_collection() {
+        // Verify that the remembered-set entry from jit_remember_young_pointer
+        // causes a young object to survive minor collection.
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<GcRef>(),
+            vec![0],
+        ));
+
+        // Create an old-gen parent and a young child.
+        let parent = gc.alloc_in_oldgen(tid, GcHeader::SIZE + std::mem::size_of::<GcRef>());
+        let child = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
+        unsafe {
+            *(child.0 as *mut u64) = 0xABCD_1234;
+            *(parent.0 as *mut GcRef) = child;
+        }
+
+        // Use the JIT hook instead of do_write_barrier.
+        gc.jit_remember_young_pointer(parent);
+
+        let mut root = parent;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        gc.collect_nursery();
+
+        // The child should have been promoted.
+        let child_ref = unsafe { *(root.0 as *const GcRef) };
+        assert!(!gc.is_in_nursery(child_ref.0));
+        assert!(!child_ref.is_null());
+        let val = unsafe { *(child_ref.0 as *const u64) };
+        assert_eq!(val, 0xABCD_1234);
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_can_optimize_cond_call() {
+        let gc = test_gc(4096);
+        assert!(gc.can_optimize_cond_call());
+    }
+
+    #[test]
+    fn test_can_optimize_cond_call_via_trait() {
+        let gc = test_gc(4096);
+        let alloc: &dyn GcAllocator = &gc;
+        assert!(alloc.can_optimize_cond_call());
+    }
+
+    #[test]
+    fn test_gc_step_no_work_when_old_gen_small() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        // With an almost-empty old gen, gc_step should do nothing.
+        assert!(!gc.gc_step());
+        assert!(!gc.is_incremental_marking());
+    }
+
+    #[test]
+    fn test_gc_step_triggers_incremental() {
+        let mut gc = test_gc(256);
+        gc.register_type(TypeInfo::simple(16));
+
+        // Force a minor collection to set last_major_bytes baseline.
+        let obj = gc.alloc_with_type(0, 16);
+        let mut root = obj;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+        gc.collect_full();
+
+        // Fill old gen to trigger the major-cycle ratio threshold.
+        // Allocate many objects directly in old gen.
+        for _ in 0..200 {
+            gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        }
+
+        // gc_step should now start an incremental cycle and do work.
+        let did_work = gc.gc_step();
+        assert!(did_work);
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_gc_step_advances_marking() {
+        let mut gc = test_gc(256);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        // Build a chain of old-gen objects so there's marking work to do.
+        let mut prev = GcRef::NULL;
+        let ptr_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<GcRef>(),
+            vec![0],
+        ));
+        for _ in 0..20 {
+            let obj = gc.alloc_with_type(ptr_tid, std::mem::size_of::<GcRef>());
+            unsafe {
+                *(obj.0 as *mut GcRef) = prev;
+            }
+            prev = obj;
+        }
+
+        let mut root = prev;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        // Promote everything to old gen.
+        gc.collect_nursery();
+
+        // Add more old-gen objects to trigger the ratio threshold.
+        for _ in 0..200 {
+            gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16);
+        }
+
+        // First step: start cycle.
+        let work1 = gc.gc_step();
+        assert!(work1);
+        let marked_after_1 = gc.incremental_objects_marked();
+
+        // Second step: advance marking further.
+        if gc.is_incremental_marking() {
+            let work2 = gc.gc_step();
+            assert!(work2);
+            assert!(gc.incremental_objects_marked() >= marked_after_1);
+        }
 
         gc.roots.clear();
     }
