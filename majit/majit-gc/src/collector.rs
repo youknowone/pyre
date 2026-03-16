@@ -2029,4 +2029,322 @@ mod tests {
 
         gc.roots.clear();
     }
+
+    // ── GC stress tests ──
+
+    #[test]
+    fn test_gc_stress_with_safepoint_scanning() {
+        // Register a compiled code region with a safepoint map, then
+        // allocate objects under pressure so nursery collections fire.
+        // After collection, verify that roots discovered via scan_frame
+        // point to valid, promoted objects.
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(512); // small nursery to force frequent collections
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size * 2, vec![0, ptr_size]));
+
+        // Build a compiled code registry with a safepoint map marking
+        // frame slots 0 and 2 as GC references.
+        let mut registry = CompiledCodeRegistry::new();
+        let mut smap = SafepointMap::new();
+        let mut gc_map = crate::GcMap::new();
+        gc_map.set_ref(0);
+        gc_map.set_ref(2);
+        smap.add(0x50, gc_map);
+
+        registry.register(CompiledCodeRegion {
+            code_start: 0x1000,
+            code_size: 0x100,
+            safepoint_map: smap,
+            frame_size_slots: 4,
+            loop_token: 1,
+        });
+
+        // Simulate a JIT frame: slots 0 and 2 hold GcRefs, slots 1 and 3
+        // hold non-pointer data.
+        let obj_a = gc.alloc_with_type(tid, ptr_size * 2);
+        let obj_b = gc.alloc_with_type(tid, ptr_size * 2);
+        unsafe {
+            *(obj_a.0 as *mut GcRef) = GcRef::NULL;
+            *((obj_a.0 + ptr_size) as *mut GcRef) = GcRef::NULL;
+            *(obj_b.0 as *mut GcRef) = GcRef::NULL;
+            *((obj_b.0 + ptr_size) as *mut GcRef) = GcRef::NULL;
+        }
+
+        let frame: [usize; 4] = [obj_a.0, 0xDEAD, obj_b.0, 0xBEEF];
+
+        // Register frame slots as GC roots (simulating what the backend does
+        // at a safepoint).
+        let roots_from_frame = unsafe {
+            registry.scan_frame(0x1050, frame.as_ptr())
+        };
+        assert_eq!(roots_from_frame.len(), 2);
+
+        // Register the scanned slots as roots with the GC.
+        for root_ptr in &roots_from_frame {
+            unsafe {
+                gc.roots.add(*root_ptr as *mut GcRef);
+            }
+        }
+
+        // Allocate many objects to force multiple nursery collections.
+        for i in 0..200 {
+            let filler = gc.alloc_with_type(tid, ptr_size * 2);
+            unsafe {
+                *(filler.0 as *mut u64) = i as u64;
+            }
+        }
+        assert!(gc.minor_collections > 0, "should have triggered nursery collections");
+
+        // Read back the GcRefs from the frame slots (the GC may have updated
+        // them when it promoted the objects).
+        let ref_a = GcRef(frame[0]);
+        let ref_b = GcRef(frame[2]);
+
+        // The original nursery objects should have been forwarded.
+        // The frame slots must now point to valid (non-nursery) addresses.
+        assert!(!ref_a.is_null());
+        assert!(!ref_b.is_null());
+        assert!(
+            !gc.is_in_nursery(ref_a.0),
+            "object A should have been promoted out of nursery"
+        );
+        assert!(
+            !gc.is_in_nursery(ref_b.0),
+            "object B should have been promoted out of nursery"
+        );
+
+        // Verify non-GC slots are untouched.
+        assert_eq!(frame[1], 0xDEAD);
+        assert_eq!(frame[3], 0xBEEF);
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_incremental_gc_under_allocation_pressure() {
+        // Allocate many objects forming a linked list, promote to old gen,
+        // then run an incremental major cycle with a tiny budget while
+        // continuing to allocate. Verify data integrity throughout.
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1024);
+        // Object layout: [next: GcRef][data: u64] = 16 bytes, GC ptr at offset 0
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size + 8, vec![0]));
+
+        // Build a linked list of 20 objects.
+        let mut prev = GcRef::NULL;
+        let mut all_roots: Vec<GcRef> = Vec::new();
+        for i in 0..20u64 {
+            let obj = gc.alloc_with_type(tid, ptr_size + 8);
+            unsafe {
+                *(obj.0 as *mut GcRef) = prev;
+                *((obj.0 + ptr_size) as *mut u64) = 0xA000 + i;
+            }
+            prev = obj;
+            all_roots.push(obj);
+        }
+
+        // Root only the head of the list.
+        let mut head = prev;
+        unsafe {
+            gc.roots.add(&mut head);
+        }
+
+        // Promote the whole list to old gen.
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(head.0));
+
+        // Start an incremental cycle with budget = 2 so it takes many steps.
+        gc.set_mark_budget(2);
+        gc.start_incremental_cycle();
+        assert!(gc.is_incremental_marking());
+
+        // Interleave incremental marking steps with new allocations.
+        let mut step_count = 0;
+        while gc.is_incremental_marking() {
+            // Allocate a few new (short-lived) objects to maintain pressure.
+            for _ in 0..5 {
+                let tmp = gc.alloc_with_type(tid, ptr_size + 8);
+                unsafe {
+                    *(tmp.0 as *mut GcRef) = GcRef::NULL;
+                    *((tmp.0 + ptr_size) as *mut u64) = 0xFFFF;
+                }
+            }
+            let done = gc.incremental_mark_step();
+            step_count += 1;
+            if done {
+                break;
+            }
+            assert!(step_count < 200, "incremental marking should converge");
+        }
+
+        // Complete the cycle.
+        gc.finish_incremental_cycle();
+        assert!(gc.major_collections > 0);
+
+        // Walk the list from the head and verify all data values.
+        let mut cursor = head;
+        let mut count = 0;
+        while !cursor.is_null() {
+            let data = unsafe { *((cursor.0 + ptr_size) as *const u64) };
+            // data should be 0xA000 + (19 - count) because the list was
+            // built in reverse.
+            assert_eq!(
+                data,
+                0xA000 + (19 - count) as u64,
+                "data corruption detected at node {count}"
+            );
+            cursor = unsafe { *(cursor.0 as *const GcRef) };
+            count += 1;
+        }
+        assert_eq!(count, 20, "entire list should be reachable");
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_card_marking_under_write_pressure() {
+        // Allocate a large array in old gen, write GC refs into many slots,
+        // and verify that card marking accurately tracks the dirty ranges
+        // so that nursery objects stored in the array survive collection.
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(2048);
+
+        // Element type: simple 16-byte object.
+        let elem_tid = gc.register_type(TypeInfo::simple(16));
+
+        // Array type: varsize, base_size = 8 (length field at offset 0),
+        // each item is a GcRef (item_size = ptr_size), items have GC ptrs.
+        let arr_tid = gc.register_type(TypeInfo::varsize(
+            8,            // base_size (length field)
+            ptr_size,     // item_size
+            0,            // length_offset
+            true,         // items_have_gc_ptrs
+            Vec::new(),   // no fixed GC ptr fields
+        ));
+
+        let array_length = 512usize;
+        let total_payload = 8 + ptr_size * array_length;
+
+        // Allocate the array directly in old gen (it's large).
+        let arr = gc.alloc_in_oldgen(arr_tid, GcHeader::SIZE + total_payload);
+
+        // Write the length field.
+        unsafe {
+            *(arr.0 as *mut usize) = array_length;
+        }
+
+        // Enable card marking on this object.
+        let hdr = unsafe { header_of(arr.0) };
+        hdr.set_flag(flags::HAS_CARDS);
+
+        // Initialize all array slots to NULL.
+        let items_start = arr.0 + 8;
+        for i in 0..array_length {
+            unsafe {
+                *((items_start + i * ptr_size) as *mut GcRef) = GcRef::NULL;
+            }
+        }
+
+        // Write nursery objects into scattered array positions and trigger
+        // card-marking write barriers.
+        let write_indices: Vec<usize> = vec![0, 1, 5, 64, 127, 128, 200, 255, 256, 400, 511];
+        let mut expected_cards: HashSet<usize> = HashSet::new();
+        let mut nursery_objs: Vec<(usize, GcRef)> = Vec::new();
+
+        for &idx in &write_indices {
+            let obj = gc.alloc_with_type(elem_tid, 16);
+            // Write a distinctive marker.
+            unsafe {
+                *(obj.0 as *mut u64) = 0xCAFE_0000 + idx as u64;
+            }
+            // Store into the array.
+            unsafe {
+                *((items_start + idx * ptr_size) as *mut GcRef) = obj;
+            }
+            // Write barrier with card marking.
+            gc.do_write_barrier_card(arr, idx, DEFAULT_CARD_PAGE_SHIFT);
+            expected_cards.insert(idx >> DEFAULT_CARD_PAGE_SHIFT);
+            nursery_objs.push((idx, obj));
+        }
+
+        // Verify the correct cards are dirty.
+        let dirty = gc.dirty_cards(arr);
+        let dirty_set: HashSet<usize> = dirty.into_iter().collect();
+        assert_eq!(
+            dirty_set, expected_cards,
+            "dirty card set should match expected cards"
+        );
+
+        // Root the array so the collection traces it via card scanning.
+        let mut root = arr;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        // Trigger nursery collection — this should use card scanning
+        // to find and promote the nursery objects stored in the array.
+        gc.do_collect_nursery();
+
+        // After collection, all stored objects should be promoted and
+        // their data should be intact.
+        for &(idx, _orig) in &nursery_objs {
+            let slot_ref = unsafe { *((items_start + idx * ptr_size) as *const GcRef) };
+            assert!(
+                !slot_ref.is_null(),
+                "array slot {idx} should not be null after collection"
+            );
+            assert!(
+                !gc.is_in_nursery(slot_ref.0),
+                "array slot {idx} should be promoted to old gen"
+            );
+            let marker = unsafe { *(slot_ref.0 as *const u64) };
+            assert_eq!(
+                marker,
+                0xCAFE_0000 + idx as u64,
+                "data in array slot {idx} should be preserved"
+            );
+        }
+
+        // Cards should be cleared after collection.
+        assert!(
+            gc.card_dirty.is_empty(),
+            "card table should be cleared after collection"
+        );
+        let hdr = unsafe { header_of(root.0) };
+        assert!(
+            !hdr.has_flag(flags::CARDS_SET),
+            "CARDS_SET should be cleared after collection"
+        );
+        assert!(
+            hdr.has_flag(flags::TRACK_YOUNG_PTRS),
+            "TRACK_YOUNG_PTRS should be re-set after collection"
+        );
+
+        // Now do a second round of writes to verify card marking works
+        // again after collection.
+        let more_indices = vec![10, 300, 450];
+        for &idx in &more_indices {
+            let obj = gc.alloc_with_type(elem_tid, 16);
+            unsafe {
+                *(obj.0 as *mut u64) = 0xBEEF_0000 + idx as u64;
+                *((items_start + idx * ptr_size) as *mut GcRef) = obj;
+            }
+            gc.do_write_barrier_card(arr, idx, DEFAULT_CARD_PAGE_SHIFT);
+        }
+
+        gc.do_collect_nursery();
+
+        for &idx in &more_indices {
+            let slot_ref = unsafe { *((items_start + idx * ptr_size) as *const GcRef) };
+            assert!(!slot_ref.is_null());
+            assert!(!gc.is_in_nursery(slot_ref.0));
+            let marker = unsafe { *(slot_ref.0 as *const u64) };
+            assert_eq!(marker, 0xBEEF_0000 + idx as u64);
+        }
+
+        gc.roots.clear();
+    }
 }
