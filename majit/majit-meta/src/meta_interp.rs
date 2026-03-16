@@ -1321,7 +1321,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // No preamble patching for FINISH traces — they are linear (no JUMP
-        // back-edge), so all inputargs are passed directly by CALL_ASSEMBLER.
+        // back-edge). CALL_ASSEMBLER passes all args directly.
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
