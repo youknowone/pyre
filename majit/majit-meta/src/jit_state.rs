@@ -53,10 +53,7 @@ pub trait JitState: Sized {
     }
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        self.extract_live(meta)
-            .iter()
-            .map(|_| Type::Int)
-            .collect()
+        self.extract_live(meta).iter().map(|_| Type::Int).collect()
     }
 
     fn create_sym(meta: &Self::Meta, header_pc: usize) -> Self::Sym;

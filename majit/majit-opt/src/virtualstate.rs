@@ -210,11 +210,11 @@ impl VirtualStateInfo {
                 if s1 != s2 || e1.len() != e2.len() {
                     return false;
                 }
-                e1.iter().zip(e2.iter()).all(
-                    |((off1, len1, v1), (off2, len2, v2))| {
+                e1.iter()
+                    .zip(e2.iter())
+                    .all(|((off1, len1, v1), (off2, len2, v2))| {
                         off1 == off2 && len1 == len2 && v1.is_compatible(v2)
-                    },
-                )
+                    })
             }
 
             // KnownClass: other must have the same class (or be virtual with matching class)

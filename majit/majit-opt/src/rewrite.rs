@@ -268,16 +268,14 @@ impl OptRewrite {
                 // Arithmetic right shift IS floor division for positive divisors.
                 let shift = divisor.trailing_zeros();
                 let shift_ref = self.emit_constant_int(ctx, shift as i64);
-                let result_ref =
-                    ctx.emit(Op::new(OpCode::IntRshift, &[arg0, shift_ref]));
+                let result_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, shift_ref]));
                 ctx.replace_op(op.pos, result_ref);
                 return PassResult::Remove;
             }
 
             // General constant divisor >= 3: magic number multiplication
             if divisor >= 3 {
-                let result =
-                    intdiv::division_operations(arg0, divisor, false, ctx);
+                let result = intdiv::division_operations(arg0, divisor, false, ctx);
                 ctx.replace_op(op.pos, result);
                 return PassResult::Remove;
             }
@@ -328,8 +326,7 @@ impl OptRewrite {
         // Strength reduction for constant divisor >= 3 (non-power-of-2)
         if let Some(divisor) = ctx.get_constant_int(arg1) {
             if divisor >= 3 && divisor.count_ones() != 1 {
-                let result =
-                    intdiv::modulo_operations(arg0, divisor, false, ctx);
+                let result = intdiv::modulo_operations(arg0, divisor, false, ctx);
                 ctx.replace_op(op.pos, result);
                 return PassResult::Remove;
             }
@@ -1052,9 +1049,10 @@ impl OptimizationPass for OptRewrite {
                     ctx.make_constant(op.pos, Value::Int(1));
                     return PassResult::Remove;
                 }
-                if let (Some(a), Some(b)) =
-                    (ctx.get_constant_int(op.arg(0)), ctx.get_constant_int(op.arg(1)))
-                {
+                if let (Some(a), Some(b)) = (
+                    ctx.get_constant_int(op.arg(0)),
+                    ctx.get_constant_int(op.arg(1)),
+                ) {
                     ctx.make_constant(op.pos, Value::Int(if a == b { 1 } else { 0 }));
                     return PassResult::Remove;
                 }
@@ -1065,9 +1063,10 @@ impl OptimizationPass for OptRewrite {
                     ctx.make_constant(op.pos, Value::Int(0));
                     return PassResult::Remove;
                 }
-                if let (Some(a), Some(b)) =
-                    (ctx.get_constant_int(op.arg(0)), ctx.get_constant_int(op.arg(1)))
-                {
+                if let (Some(a), Some(b)) = (
+                    ctx.get_constant_int(op.arg(0)),
+                    ctx.get_constant_int(op.arg(1)),
+                ) {
                     ctx.make_constant(op.pos, Value::Int(if a != b { 1 } else { 0 }));
                     return PassResult::Remove;
                 }
@@ -2601,9 +2600,9 @@ mod tests {
     fn test_float_neg_double_negation() {
         // FloatNeg(FloatNeg(x)) -> x
         let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),              // op0: x
-            Op::new(OpCode::FloatNeg, &[OpRef(0)]),     // op1: -x
-            Op::new(OpCode::FloatNeg, &[OpRef(1)]),     // op2: -(-x) -> x
+            Op::new(OpCode::SameAsF, &[]),          // op0: x
+            Op::new(OpCode::FloatNeg, &[OpRef(0)]), // op1: -x
+            Op::new(OpCode::FloatNeg, &[OpRef(1)]), // op2: -(-x) -> x
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
@@ -2684,10 +2683,10 @@ mod tests {
     fn test_cond_call_constant_false_removed() {
         // CondCallN(condition=0, func, arg1) -> removed (dead call)
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                                   // op0: condition (const 0)
-            Op::new(OpCode::SameAsI, &[]),                                   // op1: func
-            Op::new(OpCode::SameAsI, &[]),                                   // op2: arg1
-            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1), OpRef(2)]),     // op3
+            Op::new(OpCode::SameAsI, &[]), // op0: condition (const 0)
+            Op::new(OpCode::SameAsI, &[]), // op1: func
+            Op::new(OpCode::SameAsI, &[]), // op2: arg1
+            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1), OpRef(2)]), // op3
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
@@ -2705,10 +2704,10 @@ mod tests {
     fn test_cond_call_constant_true_to_direct_call() {
         // CondCallN(condition=1, func, arg1) -> CallN(func, arg1)
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                                   // op0: condition (const 1)
-            Op::new(OpCode::SameAsI, &[]),                                   // op1: func
-            Op::new(OpCode::SameAsI, &[]),                                   // op2: arg1
-            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1), OpRef(2)]),     // op3
+            Op::new(OpCode::SameAsI, &[]), // op0: condition (const 1)
+            Op::new(OpCode::SameAsI, &[]), // op1: func
+            Op::new(OpCode::SameAsI, &[]), // op2: arg1
+            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1), OpRef(2)]), // op3
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
@@ -2737,10 +2736,10 @@ mod tests {
     fn test_cond_call_value_nonnull_returns_value() {
         // CondCallValueI(value=42, func, arg1) -> value itself (no call needed)
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                                       // op0: value (const 42)
-            Op::new(OpCode::SameAsI, &[]),                                       // op1: func
-            Op::new(OpCode::SameAsI, &[]),                                       // op2: arg1
-            Op::new(OpCode::CondCallValueI, &[OpRef(0), OpRef(1), OpRef(2)]),    // op3
+            Op::new(OpCode::SameAsI, &[]), // op0: value (const 42)
+            Op::new(OpCode::SameAsI, &[]), // op1: func
+            Op::new(OpCode::SameAsI, &[]), // op2: arg1
+            Op::new(OpCode::CondCallValueI, &[OpRef(0), OpRef(1), OpRef(2)]), // op3
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
@@ -2759,10 +2758,10 @@ mod tests {
     fn test_cond_call_value_null_to_direct_call() {
         // CondCallValueI(value=0, func, arg1) -> CallI(func, arg1)
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                                       // op0: value (const 0)
-            Op::new(OpCode::SameAsI, &[]),                                       // op1: func
-            Op::new(OpCode::SameAsI, &[]),                                       // op2: arg1
-            Op::new(OpCode::CondCallValueI, &[OpRef(0), OpRef(1), OpRef(2)]),    // op3
+            Op::new(OpCode::SameAsI, &[]), // op0: value (const 0)
+            Op::new(OpCode::SameAsI, &[]), // op1: func
+            Op::new(OpCode::SameAsI, &[]), // op2: arg1
+            Op::new(OpCode::CondCallValueI, &[OpRef(0), OpRef(1), OpRef(2)]), // op3
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
@@ -2790,8 +2789,8 @@ mod tests {
     fn test_ptr_eq_same_opref() {
         // PtrEq(x, x) -> 1
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                   // op0: x
-            Op::new(OpCode::PtrEq, &[OpRef(0), OpRef(0)]),   // op1
+            Op::new(OpCode::SameAsR, &[]),                 // op0: x
+            Op::new(OpCode::PtrEq, &[OpRef(0), OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2807,8 +2806,8 @@ mod tests {
     fn test_ptr_ne_same_opref() {
         // PtrNe(x, x) -> 0
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                   // op0: x
-            Op::new(OpCode::PtrNe, &[OpRef(0), OpRef(0)]),   // op1
+            Op::new(OpCode::SameAsR, &[]),                 // op0: x
+            Op::new(OpCode::PtrNe, &[OpRef(0), OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2824,8 +2823,8 @@ mod tests {
     fn test_instance_ptr_eq_same_opref() {
         // InstancePtrEq(x, x) -> 1
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                           // op0: x
-            Op::new(OpCode::InstancePtrEq, &[OpRef(0), OpRef(0)]),   // op1
+            Op::new(OpCode::SameAsR, &[]),                         // op0: x
+            Op::new(OpCode::InstancePtrEq, &[OpRef(0), OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2841,8 +2840,8 @@ mod tests {
     fn test_instance_ptr_ne_same_opref() {
         // InstancePtrNe(x, x) -> 0
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                           // op0: x
-            Op::new(OpCode::InstancePtrNe, &[OpRef(0), OpRef(0)]),   // op1
+            Op::new(OpCode::SameAsR, &[]),                         // op0: x
+            Op::new(OpCode::InstancePtrNe, &[OpRef(0), OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2858,9 +2857,9 @@ mod tests {
     fn test_ptr_eq_constant_fold() {
         // PtrEq(const 100, const 200) -> 0
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                   // op0: const 100
-            Op::new(OpCode::SameAsR, &[]),                   // op1: const 200
-            Op::new(OpCode::PtrEq, &[OpRef(0), OpRef(1)]),   // op2
+            Op::new(OpCode::SameAsR, &[]),                 // op0: const 100
+            Op::new(OpCode::SameAsR, &[]),                 // op1: const 200
+            Op::new(OpCode::PtrEq, &[OpRef(0), OpRef(1)]), // op2
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
@@ -2881,8 +2880,8 @@ mod tests {
     fn test_cast_ptr_to_int_eliminated() {
         // CastPtrToInt(x) -> x
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                   // op0: x
-            Op::new(OpCode::CastPtrToInt, &[OpRef(0)]),      // op1
+            Op::new(OpCode::SameAsR, &[]),              // op0: x
+            Op::new(OpCode::CastPtrToInt, &[OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2898,8 +2897,8 @@ mod tests {
     fn test_cast_int_to_ptr_eliminated() {
         // CastIntToPtr(x) -> x
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                   // op0: x
-            Op::new(OpCode::CastIntToPtr, &[OpRef(0)]),      // op1
+            Op::new(OpCode::SameAsI, &[]),              // op0: x
+            Op::new(OpCode::CastIntToPtr, &[OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2915,8 +2914,8 @@ mod tests {
     fn test_cast_opaque_ptr_eliminated() {
         // CastOpaquePtr(x) -> x
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                   // op0: x
-            Op::new(OpCode::CastOpaquePtr, &[OpRef(0)]),     // op1
+            Op::new(OpCode::SameAsR, &[]),               // op0: x
+            Op::new(OpCode::CastOpaquePtr, &[OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2934,8 +2933,8 @@ mod tests {
     fn test_convert_float_bytes_to_longlong_eliminated() {
         // ConvertFloatBytesToLonglong(x) -> x
         let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),                              // op0: x
-            Op::new(OpCode::ConvertFloatBytesToLonglong, &[OpRef(0)]),   // op1
+            Op::new(OpCode::SameAsF, &[]),                             // op0: x
+            Op::new(OpCode::ConvertFloatBytesToLonglong, &[OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2951,8 +2950,8 @@ mod tests {
     fn test_convert_longlong_bytes_to_float_eliminated() {
         // ConvertLonglongBytesToFloat(x) -> x
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                              // op0: x
-            Op::new(OpCode::ConvertLonglongBytesToFloat, &[OpRef(0)]),   // op1
+            Op::new(OpCode::SameAsI, &[]),                             // op0: x
+            Op::new(OpCode::ConvertLonglongBytesToFloat, &[OpRef(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -2970,10 +2969,10 @@ mod tests {
     fn test_guard_no_exception_after_removed_call() {
         // CondCallN(condition=0, ...) -> removed, then GuardNoException -> removed
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                                   // op0: condition (const 0)
-            Op::new(OpCode::SameAsI, &[]),                                   // op1: func
-            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1)]),               // op2: removed
-            Op::new(OpCode::GuardNoException, &[]),                          // op3: should be removed
+            Op::new(OpCode::SameAsI, &[]), // op0: condition (const 0)
+            Op::new(OpCode::SameAsI, &[]), // op1: func
+            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1)]), // op2: removed
+            Op::new(OpCode::GuardNoException, &[]), // op3: should be removed
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
@@ -2995,9 +2994,9 @@ mod tests {
     fn test_guard_no_exception_after_emitted_call() {
         // CallN(...) -> emitted, then GuardNoException -> kept
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                                   // op0: func
-            Op::new(OpCode::CallN, &[OpRef(0)]),                             // op1: call
-            Op::new(OpCode::GuardNoException, &[]),                          // op2: should NOT be removed
+            Op::new(OpCode::SameAsI, &[]),          // op0: func
+            Op::new(OpCode::CallN, &[OpRef(0)]),    // op1: call
+            Op::new(OpCode::GuardNoException, &[]), // op2: should NOT be removed
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);

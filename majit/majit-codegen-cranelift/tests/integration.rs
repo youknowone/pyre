@@ -687,11 +687,11 @@ fn test_intdiv_power_of_two_pipeline() {
         (8, 1),
         (16, 2),
         (100, 12),
-        (-1, 0),       // truncation: -1/8 = 0
-        (-7, 0),       // truncation: -7/8 = 0
-        (-8, -1),      // exact: -8/8 = -1
-        (-9, -1),      // truncation: -9/8 = -1
-        (-100, -12),   // truncation: -100/8 = -12
+        (-1, 0),     // truncation: -1/8 = 0
+        (-7, 0),     // truncation: -7/8 = 0
+        (-8, -1),    // exact: -8/8 = -1
+        (-9, -1),    // truncation: -9/8 = -1
+        (-100, -12), // truncation: -100/8 = -12
         (i64::MAX, i64::MAX / 8),
         (i64::MIN + 1, (i64::MIN + 1) / 8),
     ];
@@ -715,7 +715,17 @@ fn test_intdiv_various_divisors() {
     for (tid, divisor) in [3i64, 5, 10, 13, 100, 127].iter().enumerate() {
         let (backend, token) = build_magic_div_trace(*divisor, 200 + tid as u64);
 
-        for input in [0i64, 1, *divisor - 1, *divisor, *divisor + 1, 999, -1, -*divisor, -999] {
+        for input in [
+            0i64,
+            1,
+            *divisor - 1,
+            *divisor,
+            *divisor + 1,
+            999,
+            -1,
+            -*divisor,
+            -999,
+        ] {
             let expected = floor_div(input, *divisor);
             let frame = backend.execute_token(&token, &[Value::Int(input)]);
             let actual = backend.get_int_value(&frame, 0);
@@ -943,10 +953,7 @@ fn test_vec_expand_add_simd() {
         .expect("compilation should succeed");
 
     // a=10, b=20, s=100 -> r0 = 10+100 = 110, r1 = 20+100 = 120
-    let frame = backend.execute_token(
-        &token,
-        &[Value::Int(10), Value::Int(20), Value::Int(100)],
-    );
+    let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(20), Value::Int(100)]);
     assert_eq!(backend.get_int_value(&frame, 0), 110);
     assert_eq!(backend.get_int_value(&frame, 1), 120);
 }
@@ -1225,11 +1232,7 @@ fn test_stress_virtual_guard_constfold() {
 
     let mut ops = vec![
         Op::with_descr(OpCode::NewWithVtable, &[], size_descr.clone()),
-        Op::with_descr(
-            OpCode::SetfieldGc,
-            &[OpRef(100), OpRef(1000)],
-            fd.clone(),
-        ),
+        Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(1000)], fd.clone()),
         Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], fd.clone()),
         Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(1001)]),
         Op::new(OpCode::IntGt, &[OpRef(103), OpRef(1002)]),
@@ -1247,15 +1250,9 @@ fn test_stress_virtual_guard_constfold() {
     let optimized = opt.optimize_with_constants(&mut ops, &mut constants);
 
     // The virtual object should be eliminated: no NewWithVtable, SetfieldGc, or GetfieldGcI.
-    let has_new = optimized
-        .iter()
-        .any(|o| o.opcode == OpCode::NewWithVtable);
-    let has_setfield = optimized
-        .iter()
-        .any(|o| o.opcode == OpCode::SetfieldGc);
-    let has_getfield = optimized
-        .iter()
-        .any(|o| o.opcode == OpCode::GetfieldGcI);
+    let has_new = optimized.iter().any(|o| o.opcode == OpCode::NewWithVtable);
+    let has_setfield = optimized.iter().any(|o| o.opcode == OpCode::SetfieldGc);
+    let has_getfield = optimized.iter().any(|o| o.opcode == OpCode::GetfieldGcI);
     assert!(
         !has_new,
         "NewWithVtable should be virtualized and eliminated"
@@ -1682,7 +1679,10 @@ fn test_stress_string_virtualization() {
 
     // Newstr should be virtualized and eliminated.
     let has_newstr = optimized.iter().any(|o| o.opcode == OpCode::Newstr);
-    assert!(!has_newstr, "Newstr should be eliminated by string virtualization");
+    assert!(
+        !has_newstr,
+        "Newstr should be eliminated by string virtualization"
+    );
 
     // All strsetitem should be eliminated.
     let has_setitem = optimized.iter().any(|o| o.opcode == OpCode::Strsetitem);
@@ -1844,7 +1844,11 @@ fn test_stress_loop_intbounds_guard_cse() {
     assert_eq!(final_x, 1, "x at guard failure");
     assert_eq!(final_acc, 13, "acc at guard failure");
     // Sum of squares 1..3 = 14. At failure: acc=13 + x^2 = 13 + 1 = 14.
-    assert_eq!(final_acc + final_x * final_x, 14, "total sum of squares 1+4+9=14");
+    assert_eq!(
+        final_acc + final_x * final_x,
+        14,
+        "total sum of squares 1+4+9=14"
+    );
 }
 
 // ---------------------------------------------------------------------------

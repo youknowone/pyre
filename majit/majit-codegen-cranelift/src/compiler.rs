@@ -656,9 +656,7 @@ fn resolve_opref_vec_int(
         let v = builder.use_var(var(opref.0));
         if vec_float_oprefs.contains(&opref.0) {
             // Variable is F64X2, bitcast to I64X2
-            return builder
-                .ins()
-                .bitcast(cl_types::I64X2, MemFlags::new(), v);
+            return builder.ins().bitcast(cl_types::I64X2, MemFlags::new(), v);
         }
         return v;
     }
@@ -691,9 +689,7 @@ fn resolve_opref_vec_float(
             return v;
         }
         // I64X2 -> F64X2 bitcast
-        return builder
-            .ins()
-            .bitcast(cl_types::F64X2, MemFlags::new(), v);
+        return builder.ins().bitcast(cl_types::F64X2, MemFlags::new(), v);
     }
     // Scalar variable: bitcast i64 -> f64 then splat
     let scalar = builder.use_var(var(opref.0));
@@ -1508,9 +1504,7 @@ pub fn set_savedata_ref_on_deadframe(
     ))
 }
 
-pub fn get_latest_descr_from_deadframe(
-    frame: &DeadFrame,
-) -> Result<&dyn FailDescr, BackendError> {
+pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDescr, BackendError> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.fail_descr.as_ref());
     }
@@ -1753,11 +1747,8 @@ fn call_assembler_fast_path(
             [Type::Int] | [Type::Float] => outputs[0] as u64,
             _ => {
                 let outputs_vec = outputs[..actual_outputs].to_vec();
-                let mut frame = build_deadframe_from_outputs(
-                    outputs_vec,
-                    fail_descr,
-                    target.gc_runtime_id,
-                );
+                let mut frame =
+                    build_deadframe_from_outputs(outputs_vec, fail_descr, target.gc_runtime_id);
                 finish_result_from_deadframe(&mut frame)
                     .expect("finish_result_from_deadframe failed") as u64
             }
@@ -1772,11 +1763,8 @@ fn call_assembler_fast_path(
     if let Some(ref bridge) = *bridge_guard {
         release_force_token(handle);
         let outputs_slice = &outputs[..actual_outputs];
-        let mut frame = CraneliftBackend::execute_bridge(
-            bridge,
-            outputs_slice,
-            &fail_descr.fail_arg_types,
-        );
+        let mut frame =
+            CraneliftBackend::execute_bridge(bridge, outputs_slice, &fail_descr.fail_arg_types);
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
             .expect("bridge deadframe must have a descriptor");
         if bridge_descr.is_finish() {
@@ -1863,11 +1851,8 @@ fn call_assembler_fast_path_heap(
             [] | [Type::Void] => 0,
             [Type::Int] | [Type::Float] => outputs[0] as u64,
             _ => {
-                let mut frame = build_deadframe_from_outputs(
-                    outputs,
-                    fail_descr,
-                    target.gc_runtime_id,
-                );
+                let mut frame =
+                    build_deadframe_from_outputs(outputs, fail_descr, target.gc_runtime_id);
                 finish_result_from_deadframe(&mut frame)
                     .expect("finish_result_from_deadframe failed") as u64
             }
@@ -1880,11 +1865,8 @@ fn call_assembler_fast_path_heap(
     let bridge_guard = fail_descr.bridge.lock().unwrap();
     if let Some(ref bridge) = *bridge_guard {
         release_force_token(handle);
-        let mut frame = CraneliftBackend::execute_bridge(
-            bridge,
-            &outputs,
-            &fail_descr.fail_arg_types,
-        );
+        let mut frame =
+            CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
             .expect("bridge deadframe must have a descriptor");
         if bridge_descr.is_finish() {
@@ -1985,18 +1967,13 @@ extern "C" fn call_assembler_shim(
             return result;
         }
 
-        return call_assembler_fast_path(
-            target,
-            input_slice,
-            outcome,
-            *force_fn,
-        );
+        return call_assembler_fast_path(target, input_slice, outcome, *force_fn);
     }
 
     // Slow path: full DeadFrame construction
     let mut frame = execute_registered_loop_target(target, input_slice);
-    let descr = get_latest_descr_from_deadframe(&frame)
-        .expect("get_latest_descr_from_deadframe failed");
+    let descr =
+        get_latest_descr_from_deadframe(&frame).expect("get_latest_descr_from_deadframe failed");
     if descr.is_finish() {
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -4028,9 +4005,8 @@ impl CraneliftBackend {
                     // GuardNotForced are allowed. We only require that a
                     // preceding CallMayForce exists somewhere earlier in the
                     // trace (the push/pop shim mechanism is position-independent).
-                    let has_preceding_call_may_force = ops[..op_idx]
-                        .iter()
-                        .any(|o| o.opcode.is_call_may_force());
+                    let has_preceding_call_may_force =
+                        ops[..op_idx].iter().any(|o| o.opcode.is_call_may_force());
                     if !has_preceding_call_may_force {
                         return Err(unsupported_semantics(
                             op.opcode,
@@ -5769,10 +5745,18 @@ impl CraneliftBackend {
                 | OpCode::VecIntXor => {
                     if USE_NATIVE_SIMD {
                         let a = resolve_opref_vec_int(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let b = resolve_opref_vec_int(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[1],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[1],
                         );
                         let result = match op.opcode {
                             OpCode::VecIntAdd => builder.ins().iadd(a, b),
@@ -5807,10 +5791,18 @@ impl CraneliftBackend {
                 | OpCode::VecFloatTrueDiv => {
                     if USE_NATIVE_SIMD {
                         let a = resolve_opref_vec_float(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let b = resolve_opref_vec_float(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[1],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[1],
                         );
                         let result = match op.opcode {
                             OpCode::VecFloatAdd => builder.ins().fadd(a, b),
@@ -5842,7 +5834,11 @@ impl CraneliftBackend {
                 OpCode::VecFloatNeg => {
                     if USE_NATIVE_SIMD {
                         let a = resolve_opref_vec_float(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let result = builder.ins().fneg(a);
                         builder.def_var(var(vi), result);
@@ -5860,7 +5856,11 @@ impl CraneliftBackend {
                 OpCode::VecFloatAbs => {
                     if USE_NATIVE_SIMD {
                         let a = resolve_opref_vec_float(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let result = builder.ins().fabs(a);
                         builder.def_var(var(vi), result);
@@ -5879,10 +5879,18 @@ impl CraneliftBackend {
                     if USE_NATIVE_SIMD {
                         // XOR on the raw bits: operate on I64X2 representation
                         let a = resolve_opref_vec_int(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let b = resolve_opref_vec_int(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[1],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[1],
                         );
                         let xored = builder.ins().bxor(a, b);
                         // Result is declared as F64X2, bitcast from I64X2
@@ -5998,9 +6006,10 @@ impl CraneliftBackend {
                         // Zero-initialized vector
                         if op.opcode == OpCode::VecF {
                             let zero_i = builder.ins().iconst(cl_types::I64, 0);
-                            let zero_f = builder
-                                .ins()
-                                .bitcast(cl_types::F64, MemFlags::new(), zero_i);
+                            let zero_f =
+                                builder
+                                    .ins()
+                                    .bitcast(cl_types::F64, MemFlags::new(), zero_i);
                             let result = builder.ins().splat(cl_types::F64X2, zero_f);
                             builder.def_var(var(vi), result);
                         } else {
@@ -6019,7 +6028,11 @@ impl CraneliftBackend {
                         // vec_pack(vec, scalar, lane_const, count_const)
                         // insertlane(vec, scalar, lane_idx)
                         let vec_val = resolve_opref_vec_int(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
                         let lane = constants.get(&op.args[2].0).copied().unwrap_or(0) as u8;
@@ -6036,12 +6049,17 @@ impl CraneliftBackend {
                         // vec_pack(vec, scalar, lane_const, count_const)
                         // insertlane(vec, scalar, lane_idx)
                         let vec_val = resolve_opref_vec_float(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let scalar_i = resolve_opref(&mut builder, &constants, op.args[1]);
-                        let scalar_f = builder
-                            .ins()
-                            .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
+                        let scalar_f =
+                            builder
+                                .ins()
+                                .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
                         let lane = constants.get(&op.args[2].0).copied().unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar_f, lane);
                         builder.def_var(var(vi), result);
@@ -6055,7 +6073,11 @@ impl CraneliftBackend {
                     if USE_NATIVE_SIMD {
                         // vec_unpack(vec, lane_const, count_const) → scalar i64
                         let vec_val = resolve_opref_vec_int(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let lane = constants.get(&op.args[1].0).copied().unwrap_or(0) as u8;
                         let result = builder.ins().extractlane(vec_val, lane);
@@ -6070,13 +6092,18 @@ impl CraneliftBackend {
                     if USE_NATIVE_SIMD {
                         // vec_unpack(vec, lane_const, count_const) → scalar f64 as i64
                         let vec_val = resolve_opref_vec_float(
-                            &mut builder, &constants, &vec_oprefs, &vec_float_oprefs, op.args[0],
+                            &mut builder,
+                            &constants,
+                            &vec_oprefs,
+                            &vec_float_oprefs,
+                            op.args[0],
                         );
                         let lane = constants.get(&op.args[1].0).copied().unwrap_or(0) as u8;
                         let scalar_f = builder.ins().extractlane(vec_val, lane);
-                        let result = builder
-                            .ins()
-                            .bitcast(cl_types::I64, MemFlags::new(), scalar_f);
+                        let result =
+                            builder
+                                .ins()
+                                .bitcast(cl_types::I64, MemFlags::new(), scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
                         let vec_val = resolve_opref(&mut builder, &constants, op.args[0]);
@@ -6100,9 +6127,10 @@ impl CraneliftBackend {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar f64 to all lanes
                         let scalar_i = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let scalar_f = builder
-                            .ins()
-                            .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
+                        let scalar_f =
+                            builder
+                                .ins()
+                                .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
                         let result = builder.ins().splat(cl_types::F64X2, scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
@@ -6127,9 +6155,7 @@ impl CraneliftBackend {
                         } else {
                             cl_types::I64X2
                         };
-                        let result = builder
-                            .ins()
-                            .load(load_type, MemFlags::trusted(), addr, 0);
+                        let result = builder.ins().load(load_type, MemFlags::trusted(), addr, 0);
                         builder.def_var(var(vi), result);
                     } else {
                         let base = resolve_opref(&mut builder, &constants, op.args[0]);
@@ -6139,9 +6165,10 @@ impl CraneliftBackend {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
                         let addr = builder.ins().iadd(base, offset_val);
-                        let result = builder
-                            .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), addr, 0);
+                        let result =
+                            builder
+                                .ins()
+                                .load(cl_types::I64, MemFlags::trusted(), addr, 0);
                         builder.def_var(var(vi), result);
                     }
                 }
@@ -7123,28 +7150,23 @@ impl majit_codegen::Backend for CraneliftBackend {
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
-        get_latest_descr_from_deadframe(frame)
-            .expect("get_latest_descr_from_deadframe failed")
+        get_latest_descr_from_deadframe(frame).expect("get_latest_descr_from_deadframe failed")
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
-        get_int_from_deadframe(frame, index)
-            .expect("get_int_from_deadframe failed")
+        get_int_from_deadframe(frame, index).expect("get_int_from_deadframe failed")
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
-        get_float_from_deadframe(frame, index)
-            .expect("get_float_from_deadframe failed")
+        get_float_from_deadframe(frame, index).expect("get_float_from_deadframe failed")
     }
 
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> GcRef {
-        get_ref_from_deadframe(frame, index)
-            .expect("get_ref_from_deadframe failed")
+        get_ref_from_deadframe(frame, index).expect("get_ref_from_deadframe failed")
     }
 
     fn set_savedata_ref(&self, frame: &mut DeadFrame, data: GcRef) {
-        set_savedata_ref_on_deadframe(frame, data)
-            .expect("set_savedata_ref_on_deadframe failed");
+        set_savedata_ref_on_deadframe(frame, data).expect("set_savedata_ref_on_deadframe failed");
     }
 
     fn get_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
@@ -7157,21 +7179,17 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn grab_exception_state(&self, frame: &DeadFrame) -> (i64, GcRef) {
         (
-            grab_exc_class_from_deadframe(frame)
-                .expect("grab_exc_class_from_deadframe failed"),
-            grab_exc_value_from_deadframe(frame)
-                .expect("grab_exc_value_from_deadframe failed"),
+            grab_exc_class_from_deadframe(frame).expect("grab_exc_class_from_deadframe failed"),
+            grab_exc_value_from_deadframe(frame).expect("grab_exc_value_from_deadframe failed"),
         )
     }
 
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
-        grab_exc_value_from_deadframe(frame)
-            .expect("grab_exc_value_from_deadframe failed")
+        grab_exc_value_from_deadframe(frame).expect("grab_exc_value_from_deadframe failed")
     }
 
     fn grab_exc_class(&self, frame: &DeadFrame) -> i64 {
-        grab_exc_class_from_deadframe(frame)
-            .expect("grab_exc_class_from_deadframe failed")
+        grab_exc_class_from_deadframe(frame).expect("grab_exc_class_from_deadframe failed")
     }
 
     fn invalidate_loop(&self, token: &LoopToken) {
@@ -7330,7 +7348,11 @@ mod tests {
         if flag != 0 {
             let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
             let mut values = may_force_void_values().lock().unwrap();
-            values.push(get_latest_descr_from_deadframe(&deadframe).unwrap().fail_index() as i64);
+            values.push(
+                get_latest_descr_from_deadframe(&deadframe)
+                    .unwrap()
+                    .fail_index() as i64,
+            );
             values.push(get_int_from_deadframe(&deadframe, 0).unwrap());
             values.push(get_int_from_deadframe(&deadframe, 1).unwrap());
             drop(values);
@@ -13108,7 +13130,7 @@ mod tests {
         let callee_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::IntGt, &[OpRef(0), OpRef(100)], 1), // x > 0
-            guard_op,                                           // guard(x > 0)
+            guard_op,                                         // guard(x > 0)
             mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(101)], 3), // x + 10
             mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
         ];
@@ -13139,14 +13161,20 @@ mod tests {
         // Guard passes: x=5 > 0, result = 5 + 10 = 15
         let frame = backend.execute_token(&caller, &[Value::Int(5)]);
         let descr = backend.get_latest_descr(&frame);
-        assert!(descr.is_finish(), "guard passed, should reach caller finish");
+        assert!(
+            descr.is_finish(),
+            "guard passed, should reach caller finish"
+        );
         assert_eq!(descr.trace_id(), 1500_301);
         assert_eq!(backend.get_int_value(&frame, 0), 15);
 
         // Guard fails: x=0, guard(0 > 0) fails -> deadframe from callee
         let frame = backend.execute_token(&caller, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
-        assert!(!descr.is_finish(), "guard failed, should propagate deadframe");
+        assert!(
+            !descr.is_finish(),
+            "guard failed, should propagate deadframe"
+        );
         assert_eq!(descr.trace_id(), 1500_300);
         assert_eq!(descr.fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
@@ -13172,9 +13200,9 @@ mod tests {
         backend.set_next_trace_id(1500_310);
         let callee_inputargs = vec![InputArg::new_int(0)];
         let mut constants = HashMap::new();
-        constants.insert(100, 0);   // for x > 0
+        constants.insert(100, 0); // for x > 0
         constants.insert(101, 100); // for x < 100
-        constants.insert(102, 1);   // for x + 1
+        constants.insert(102, 1); // for x + 1
         backend.set_constants(constants);
 
         let mut guard1 = mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0);
@@ -13183,10 +13211,10 @@ mod tests {
         guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
         let callee_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::IntGt, &[OpRef(0), OpRef(100)], 1),  // x > 0
-            guard1,                                              // guard #0
-            mk_op(OpCode::IntLt, &[OpRef(0), OpRef(101)], 2),  // x < 100
-            guard2,                                              // guard #1
+            mk_op(OpCode::IntGt, &[OpRef(0), OpRef(100)], 1), // x > 0
+            guard1,                                           // guard #0
+            mk_op(OpCode::IntLt, &[OpRef(0), OpRef(101)], 2), // x < 100
+            guard2,                                           // guard #1
             mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(102)], 5), // x + 1
             mk_op(OpCode::Finish, &[OpRef(5)], OpRef::NONE.0),
         ];
@@ -13353,10 +13381,17 @@ mod tests {
             InputArg::new_float(2),
         ];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
-        guard.fail_args =
-            Some(smallvec::SmallVec::from_slice(&[OpRef(0), OpRef(1), OpRef(2)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[
+            OpRef(0),
+            OpRef(1),
+            OpRef(2),
+        ]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Label,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+                OpRef::NONE.0,
+            ),
             guard,
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];

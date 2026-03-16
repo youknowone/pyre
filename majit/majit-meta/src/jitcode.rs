@@ -2104,25 +2104,73 @@ fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) -> i64 = std::mem::transmute(func_ptr);
                 func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10)
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) -> i64 = std::mem::transmute(func_ptr);
                 func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11)
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) -> i64 = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12)
+                func(
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12,
+                )
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) -> i64 = std::mem::transmute(func_ptr);
                 func(
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
@@ -2130,21 +2178,48 @@ fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) -> i64 = std::mem::transmute(func_ptr);
                 func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
-                    *a14,
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
                 )
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                     i64,
                 ) -> i64 = std::mem::transmute(func_ptr);
                 func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
-                    *a14, *a15,
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
+                    *a15,
                 )
             }
             _ => panic!(
@@ -2209,26 +2284,63 @@ fn call_void_function(func_ptr: *const (), args: &[i64]) {
                 func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9)
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10] => {
-                let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
-                ) = std::mem::transmute(func_ptr);
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+                    std::mem::transmute(func_ptr);
                 func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10)
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) = std::mem::transmute(func_ptr);
                 func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11)
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12)
+                func(
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12,
+                )
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) = std::mem::transmute(func_ptr);
                 func(
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
@@ -2236,21 +2348,48 @@ fn call_void_function(func_ptr: *const (), args: &[i64]) {
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                 ) = std::mem::transmute(func_ptr);
                 func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
-                    *a14,
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
                 )
             }
             [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
                 let func: extern "C" fn(
-                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
                     i64,
                 ) = std::mem::transmute(func_ptr);
                 func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
-                    *a14, *a15,
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
+                    *a15,
                 )
             }
             _ => panic!(

@@ -839,7 +839,11 @@ impl<M: Clone> MetaInterp<M> {
         // Use pre-allocated token number if available (for self-recursion
         // support), otherwise allocate a fresh one.
         let token_num = if let Some((pk, pn)) = self.pending_token.take() {
-            if pk == green_key { pn } else { self.warm_state.alloc_token_number() }
+            if pk == green_key {
+                pn
+            } else {
+                self.warm_state.alloc_token_number()
+            }
         } else {
             self.warm_state.alloc_token_number()
         };
@@ -976,10 +980,7 @@ impl<M: Clone> MetaInterp<M> {
         let green_key = ctx.green_key;
 
         let mut recorder = ctx.recorder;
-        recorder.finish(
-            finish_args,
-            crate::make_fail_descr_typed(finish_arg_types),
-        );
+        recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
         let trace = recorder.get_trace();
 
         let mut optimizer = self.make_optimizer();
@@ -1010,7 +1011,11 @@ impl<M: Clone> MetaInterp<M> {
         // Use pre-allocated token number if available (for self-recursion
         // support), otherwise allocate a fresh one.
         let token_num = if let Some((pk, pn)) = self.pending_token.take() {
-            if pk == green_key { pn } else { self.warm_state.alloc_token_number() }
+            if pk == green_key {
+                pn
+            } else {
+                self.warm_state.alloc_token_number()
+            }
         } else {
             self.warm_state.alloc_token_number()
         };
@@ -1118,44 +1123,6 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
     }
 
-    /// Extend raw i64 input values with virtualizable static field values.
-    fn extend_inputs_i64_with_virtualizable(&self, live_values: &[i64]) -> Vec<i64> {
-        if let Some(ref vable) = self.virtualizable_info {
-            if !vable.static_fields.is_empty() {
-                let frame_ptr = live_values[0] as usize as *const u8;
-                let mut extended = live_values.to_vec();
-                for field in &vable.static_fields {
-                    let val = unsafe { *(frame_ptr.add(field.offset) as *const i64) };
-                    extended.push(val);
-                }
-                return extended;
-            }
-        }
-        live_values.to_vec()
-    }
-
-    /// Extend typed input values with virtualizable static field values.
-    ///
-    /// If virtualization added virtual input args, reads the field values
-    /// from the frame (first live_value) and appends them.
-    fn extend_inputs_with_virtualizable(&self, live_values: &[Value]) -> Vec<Value> {
-        if let Some(ref vable) = self.virtualizable_info {
-            if !vable.static_fields.is_empty() {
-                let frame_ptr = match &live_values[0] {
-                    Value::Int(v) => *v as usize as *const u8,
-                    _ => return live_values.to_vec(),
-                };
-                let mut extended = live_values.to_vec();
-                for field in &vable.static_fields {
-                    let val = unsafe { *(frame_ptr.add(field.offset) as *const i64) };
-                    extended.push(Value::Int(val));
-                }
-                return extended;
-            }
-        }
-        live_values.to_vec()
-    }
-
     /// Run the compiled loop for the given green key.
     ///
     /// `live_values` must have the same length and order as the values
@@ -1168,12 +1135,11 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns `None` if no compiled loop exists for this key.
     pub fn run_compiled(&mut self, green_key: u64, live_values: &[i64]) -> Option<(Vec<i64>, &M)> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let extended = self.extend_inputs_i64_with_virtualizable(live_values);
 
         Self::prepare_compiled_run_io();
         let result = self
             .backend
-            .execute_token_ints_raw(&compiled.token, &extended);
+            .execute_token_ints_raw(&compiled.token, live_values);
         Self::finish_compiled_run_io(result.is_finish);
 
         let fail_index = result.fail_index;
@@ -1268,10 +1234,9 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> Option<(Vec<Value>, &M)> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let extended = self.extend_inputs_with_virtualizable(live_values);
 
         Self::prepare_compiled_run_io();
-        let result = self.backend.execute_token_raw(&compiled.token, &extended);
+        let result = self.backend.execute_token_raw(&compiled.token, live_values);
         Self::finish_compiled_run_io(result.is_finish);
 
         let fail_index = result.fail_index;
@@ -1317,12 +1282,11 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[i64],
     ) -> Option<RawCompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let extended = self.extend_inputs_i64_with_virtualizable(live_values);
 
         Self::prepare_compiled_run_io();
         let result = self
             .backend
-            .execute_token_ints_raw(&compiled.token, &extended);
+            .execute_token_ints_raw(&compiled.token, live_values);
         Self::finish_compiled_run_io(result.is_finish);
 
         let fail_index = result.fail_index;
@@ -2042,7 +2006,6 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
 }
 
 impl<M: Clone> MetaInterp<M> {
-
     /// Obtain a FailDescr proxy for a guard identified by green_key,
     /// trace_id, and fail_index. Used by call_assembler bridge callbacks
     /// that need to pass a FailDescr to compile_bridge.
@@ -3696,7 +3659,11 @@ mod tests {
             let mut values = may_force_void_values()
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
-            values.push(get_latest_descr_from_deadframe(&deadframe).unwrap().fail_index() as i64);
+            values.push(
+                get_latest_descr_from_deadframe(&deadframe)
+                    .unwrap()
+                    .fail_index() as i64,
+            );
             values.push(get_int_from_deadframe(&deadframe, 0).unwrap());
             values.push(get_int_from_deadframe(&deadframe, 1).unwrap());
             drop(values);

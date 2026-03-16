@@ -244,9 +244,7 @@ impl CraneliftFailDescr {
             .filter_map(|(slot, _)| self.gc_map.is_ref(slot).then_some(slot))
             .collect();
         let recovery = self.recovery_layout.lock().unwrap().clone();
-        let frame_stack = recovery
-            .as_ref()
-            .map(|r| r.frames.clone());
+        let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
         FailDescrLayout {
             fail_index: self.fail_index,
             source_op_index: self.source_op_index,

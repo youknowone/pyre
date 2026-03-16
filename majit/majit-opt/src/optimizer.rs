@@ -1,14 +1,18 @@
-use crate::{OptContext, OptimizationPass, PassResult};
 /// Main optimization driver.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
 /// Chains multiple optimization passes and drives operations through them.
 use crate::{
-    guard::OptGuard, heap::OptHeap, intbounds::OptIntBounds, pure::OptPure,
-    rewrite::OptRewrite, simplify::OptSimplify,
+    guard::OptGuard,
+    heap::OptHeap,
+    intbounds::OptIntBounds,
+    pure::OptPure,
+    rewrite::OptRewrite,
+    simplify::OptSimplify,
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
+use crate::{OptContext, OptimizationPass, PassResult};
 use majit_ir::Op;
 
 /// The optimizer: chains passes and runs them over a trace.
@@ -153,7 +157,8 @@ impl Optimizer {
             let old_constants = std::mem::take(&mut ctx.constants);
             for (idx, val) in old_constants.into_iter().enumerate() {
                 if let Some(v) = val {
-                    let target_idx = remap.get(&(idx as u32)).copied().unwrap_or(idx as u32) as usize;
+                    let target_idx =
+                        remap.get(&(idx as u32)).copied().unwrap_or(idx as u32) as usize;
                     if target_idx >= ctx.constants.len() {
                         ctx.constants.resize(target_idx + 1, None);
                     }

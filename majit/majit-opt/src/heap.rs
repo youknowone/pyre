@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use majit_ir::{Op, OpCode, OpRef, OopSpecIndex};
+use majit_ir::{OopSpecIndex, Op, OpCode, OpRef};
 
 use crate::{OptContext, OptimizationPass, PassResult};
 
@@ -61,7 +61,6 @@ pub struct OptHeap {
     immutable_field_descrs: HashSet<u32>,
 
     // ── Aliasing analysis state ──
-
     /// Objects allocated during this trace (NEW/NEW_WITH_VTABLE/NEW_ARRAY/etc.).
     /// These cannot alias each other or pre-existing (input arg) objects.
     seen_allocation: HashSet<OpRef>,
@@ -72,7 +71,6 @@ pub struct OptHeap {
     unescaped: HashSet<OpRef>,
 
     // ── Nullity tracking ──
-
     /// Values known to be non-null: proven by guards (GuardNonnull, GuardClass,
     /// GuardNonnullClass, GuardValue) or by allocation (New, NewWithVtable, etc.).
     /// Used to eliminate redundant GuardNonnull checks.
@@ -163,8 +161,7 @@ impl OptHeap {
     /// - Unescaped object caches: calls cannot access objects that haven't
     ///   been passed to a call or stored into the heap.
     fn invalidate_caches(&mut self) {
-        let has_survivors =
-            !self.immutable_field_descrs.is_empty() || !self.unescaped.is_empty();
+        let has_survivors = !self.immutable_field_descrs.is_empty() || !self.unescaped.is_empty();
 
         if has_survivors {
             self.cached_fields.retain(|&(obj, descr_idx), _| {
@@ -235,18 +232,19 @@ impl OptHeap {
         dest_start: Option<i64>,
         length: Option<i64>,
     ) {
-        self.cached_arrayitems.retain(|&(obj, _descr_idx, index), _| {
-            if obj != dest_ref {
-                return true; // different array, keep
-            }
-            // If we know both start and length, only invalidate entries within range
-            if let (Some(start), Some(len)) = (dest_start, length) {
-                if index < start || index >= start + len {
-                    return true; // outside copy range, keep
+        self.cached_arrayitems
+            .retain(|&(obj, _descr_idx, index), _| {
+                if obj != dest_ref {
+                    return true; // different array, keep
                 }
-            }
-            false // within range or unknown range, invalidate
-        });
+                // If we know both start and length, only invalidate entries within range
+                if let (Some(start), Some(len)) = (dest_start, length) {
+                    if index < start || index >= start + len {
+                        return true; // outside copy range, keep
+                    }
+                }
+                false // within range or unknown range, invalidate
+            });
     }
 
     /// Extract OopSpecIndex from a call op's descriptor, if available.
@@ -496,7 +494,11 @@ impl OptHeap {
                     self.mark_args_escaped(op);
                     self.force_all_lazy(ctx);
 
-                    let dest_ref = if op.args.len() > 2 { op.arg(2) } else { OpRef::NONE };
+                    let dest_ref = if op.args.len() > 2 {
+                        op.arg(2)
+                    } else {
+                        OpRef::NONE
+                    };
                     let dest_start = if op.args.len() > 4 {
                         ctx.get_constant_int(op.arg(4))
                     } else {
@@ -611,8 +613,12 @@ impl OptimizationPass for OptHeap {
             // ── GC_LOAD / GC_LOAD_INDEXED: generic memory loads ──
             // These could read from any field/array slot, so force all
             // pending lazy writes to ensure correct values.
-            OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF
-            | OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
+            OpCode::GcLoadI
+            | OpCode::GcLoadR
+            | OpCode::GcLoadF
+            | OpCode::GcLoadIndexedI
+            | OpCode::GcLoadIndexedR
+            | OpCode::GcLoadIndexedF => {
                 self.force_all_lazy_setfields(ctx);
                 self.force_all_lazy_setarrayitems(ctx);
                 self.known_nonnull.insert(op.arg(0));
@@ -1355,12 +1361,12 @@ mod tests {
         // i2 = getfield_gc_i(p0, descr=d0)   <- still cached! p1 can't alias p0
         let d = descr(0);
         let mut ops = vec![
-            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
-            Op::new(OpCode::New, &[]),                                              // pos=1 -> p1
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),  // set p0.f = i10
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),            // read p0.f -> cached
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(20)], d.clone()),  // set p1.f = i20
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),            // read p0.f -> still cached
+            Op::new(OpCode::New, &[]), // pos=0 -> p0
+            Op::new(OpCode::New, &[]), // pos=1 -> p1
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()), // set p0.f = i10
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()), // read p0.f -> cached
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(20)], d.clone()), // set p1.f = i20
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()), // read p0.f -> still cached
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -1373,7 +1379,10 @@ mod tests {
             "both GETFIELDs should be eliminated, got: {opcodes:?}"
         );
         assert_eq!(
-            result.iter().filter(|o| o.opcode == OpCode::SetfieldGc).count(),
+            result
+                .iter()
+                .filter(|o| o.opcode == OpCode::SetfieldGc)
+                .count(),
             2
         );
     }
@@ -1396,8 +1405,14 @@ mod tests {
         let result = run_heap_opt(&mut ops);
 
         // GETFIELD + SETFIELD + GETFIELD (re-emitted) + Jump.
-        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
-        assert_eq!(get_count, 2, "second GETFIELD must be re-emitted for unknown-origin objects");
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            get_count, 2,
+            "second GETFIELD must be re-emitted for unknown-origin objects"
+        );
     }
 
     // ── Test 26: Unescaped allocation's cache survives call ──
@@ -1410,9 +1425,9 @@ mod tests {
         // i1 = getfield_gc_i(p0, descr=d0) <- still cached (p0 is unescaped)
         let d = descr(0);
         let mut ops = vec![
-            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
+            Op::new(OpCode::New, &[]), // pos=0 -> p0
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),                                  // some unrelated func
+            Op::new(OpCode::CallN, &[OpRef(200)]), // some unrelated func
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -1437,17 +1452,23 @@ mod tests {
         // i1 = getfield_gc_i(p0, descr=d0) <- must re-emit (call might have modified p0)
         let d = descr(0);
         let mut ops = vec![
-            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
+            Op::new(OpCode::New, &[]), // pos=0 -> p0
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(0)]),                                    // pass p0 to call
+            Op::new(OpCode::CallN, &[OpRef(0)]), // pass p0 to call
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
 
         // NEW + SETFIELD + CALL + GETFIELD (re-emitted) + Jump.
-        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
-        assert_eq!(get_count, 1, "GETFIELD must be re-emitted after escape via call");
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "GETFIELD must be re-emitted after escape via call"
+        );
     }
 
     // ── Test 28: SetfieldGc marks stored value as escaped ──
@@ -1463,19 +1484,25 @@ mod tests {
         let d0 = descr(0);
         let d1 = descr(1);
         let mut ops = vec![
-            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
-            Op::new(OpCode::New, &[]),                                              // pos=1 -> p1
+            Op::new(OpCode::New, &[]), // pos=0 -> p0
+            Op::new(OpCode::New, &[]), // pos=1 -> p1
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d0.clone()), // p0.f0 = i10
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(0)], d1.clone()),  // p1.f1 = p0 (p0 escapes)
-            Op::new(OpCode::CallN, &[OpRef(1)]),                                    // call(p1) (p1 escapes)
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(0)], d1.clone()), // p1.f1 = p0 (p0 escapes)
+            Op::new(OpCode::CallN, &[OpRef(1)]), // call(p1) (p1 escapes)
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d0.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
 
         // p0 escaped via setfield, so its cache is invalidated by the call.
-        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
-        assert_eq!(get_count, 1, "GETFIELD must be re-emitted after p0 escaped via setfield");
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "GETFIELD must be re-emitted after p0 escaped via setfield"
+        );
     }
 
     // ── Test 29: Seen-allocation cache survives write from unknown-origin object ──
@@ -1488,7 +1515,7 @@ mod tests {
         // i1 = getfield_gc_i(p0, descr=d0)       <- still cached (p0 is seen alloc, can't alias unknown)
         let d = descr(0);
         let mut ops = vec![
-            Op::new(OpCode::New, &[]),                                              // pos=0 -> p0
+            Op::new(OpCode::New, &[]), // pos=0 -> p0
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(20)], d.clone()), // unknown object
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
@@ -1522,7 +1549,10 @@ mod tests {
         let result = run_heap_opt(&mut ops);
 
         // GETFIELD(d1) + SETFIELD(d0) + Jump. Second GETFIELD eliminated.
-        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
         assert_eq!(get_count, 1, "write to d0 should not invalidate d1 cache");
     }
 
@@ -1537,8 +1567,12 @@ mod tests {
         let d = descr(0);
         let idx = OpRef(50);
         let mut ops = vec![
-            Op::new(OpCode::NewArray, &[OpRef(5)]),                                     // pos=0 -> p0
-            Op::with_descr(OpCode::SetarrayitemGc, &[OpRef(0), idx, OpRef(10)], d.clone()),
+            Op::new(OpCode::NewArray, &[OpRef(5)]), // pos=0 -> p0
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(0), idx, OpRef(10)],
+                d.clone(),
+            ),
             Op::new(OpCode::CallN, &[OpRef(200)]),
             Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(0), idx], d.clone()),
             Op::new(OpCode::Jump, &[]),
@@ -1557,10 +1591,16 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
                 PassResult::Remove => {}
-                PassResult::Replace(replaced) => { ctx.emit(replaced); }
-                PassResult::PassOn => { ctx.emit(resolved); }
+                PassResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                PassResult::PassOn => {
+                    ctx.emit(resolved);
+                }
             }
         }
 
@@ -1625,7 +1665,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
             .count();
-        assert_eq!(loopinv_count, 1, "second identical loopinvariant call should be eliminated");
+        assert_eq!(
+            loopinv_count, 1,
+            "second identical loopinvariant call should be eliminated"
+        );
         assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
     }
 
@@ -1699,16 +1742,8 @@ mod tests {
         let d1 = descr(10);
         let d2 = descr(20);
         let mut ops = vec![
-            Op::with_descr(
-                OpCode::CallLoopinvariantI,
-                &[OpRef(100), OpRef(101)],
-                d1,
-            ),
-            Op::with_descr(
-                OpCode::CallLoopinvariantI,
-                &[OpRef(100), OpRef(101)],
-                d2,
-            ),
+            Op::with_descr(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)], d1),
+            Op::with_descr(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)], d2),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -1742,7 +1777,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
-        assert_eq!(nonnull_count, 0, "guard_nonnull after allocation should be removed");
+        assert_eq!(
+            nonnull_count, 0,
+            "guard_nonnull after allocation should be removed"
+        );
     }
 
     // ── Test 38: GuardNonnull after GuardNonnull is removed ──
@@ -1782,7 +1820,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
-        assert_eq!(nonnull_count, 0, "guard_nonnull after guard_class should be removed");
+        assert_eq!(
+            nonnull_count, 0,
+            "guard_nonnull after guard_class should be removed"
+        );
     }
 
     // ── Test 40: GuardNonnull on unknown input arg is kept ──
@@ -1870,7 +1911,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
-        assert_eq!(nonnull_count, 0, "guard_nonnull after guard_nonnull_class should be removed");
+        assert_eq!(
+            nonnull_count, 0,
+            "guard_nonnull after guard_nonnull_class should be removed"
+        );
     }
 
     // ── Test 44: GuardNonnull after GuardValue is removed ──
@@ -1890,7 +1934,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
-        assert_eq!(nonnull_count, 0, "guard_nonnull after guard_value should be removed");
+        assert_eq!(
+            nonnull_count, 0,
+            "guard_nonnull after guard_value should be removed"
+        );
     }
 
     // ── Test 45: GuardNonnull after NewWithVtable is removed ──
@@ -1908,7 +1955,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
-        assert_eq!(nonnull_count, 0, "guard_nonnull after new_with_vtable should be removed");
+        assert_eq!(
+            nonnull_count, 0,
+            "guard_nonnull after new_with_vtable should be removed"
+        );
     }
 
     // ── Test 46: GuardNonnull after NewArray is removed ──
@@ -1926,7 +1976,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
-        assert_eq!(nonnull_count, 0, "guard_nonnull after new_array should be removed");
+        assert_eq!(
+            nonnull_count, 0,
+            "guard_nonnull after new_array should be removed"
+        );
     }
 
     // ── Call descriptor with OopSpecIndex for arraycopy tests ──
@@ -2009,7 +2062,14 @@ mod tests {
             // pos=2: call_n(func, src, dst, src_start, dst_start, length)
             Op::with_descr(
                 OpCode::CallN,
-                &[OpRef(300), OpRef(100), OpRef(200), src_start_ref, dst_start_ref, length_ref],
+                &[
+                    OpRef(300),
+                    OpRef(100),
+                    OpRef(200),
+                    src_start_ref,
+                    dst_start_ref,
+                    length_ref,
+                ],
                 ac_d,
             ),
             // pos=3: getarrayitem_gc_i(dst, idx=0)
@@ -2036,16 +2096,25 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
                 PassResult::Remove => {}
-                PassResult::Replace(replaced) => { ctx.emit(replaced); }
-                PassResult::PassOn => { ctx.emit(resolved); }
+                PassResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                PassResult::PassOn => {
+                    ctx.emit(resolved);
+                }
             }
         }
 
         // Both GETARRAYITEMs should be eliminated (dest[0] and dest[5] are outside [2..5)).
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
-        let get_count = opcodes.iter().filter(|&&o| o == OpCode::GetarrayitemGcI).count();
+        let get_count = opcodes
+            .iter()
+            .filter(|&&o| o == OpCode::GetarrayitemGcI)
+            .count();
         assert_eq!(
             get_count, 0,
             "dest[0] and dest[5] outside copy range [2..5) should be cached, got: {opcodes:?}"
@@ -2075,7 +2144,14 @@ mod tests {
             ),
             Op::with_descr(
                 OpCode::CallN,
-                &[OpRef(300), OpRef(100), OpRef(200), src_start_ref, dst_start_ref, length_ref],
+                &[
+                    OpRef(300),
+                    OpRef(100),
+                    OpRef(200),
+                    src_start_ref,
+                    dst_start_ref,
+                    length_ref,
+                ],
                 ac_d,
             ),
             Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx0], d.clone()),
@@ -2098,15 +2174,23 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
                 PassResult::Remove => {}
-                PassResult::Replace(replaced) => { ctx.emit(replaced); }
-                PassResult::PassOn => { ctx.emit(resolved); }
+                PassResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                PassResult::PassOn => {
+                    ctx.emit(resolved);
+                }
             }
         }
 
         // GETARRAYITEM must be re-emitted (unknown length invalidates all dest entries).
-        let get_count = ctx.new_operations.iter()
+        let get_count = ctx
+            .new_operations
+            .iter()
             .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
             .count();
         assert_eq!(
@@ -2137,7 +2221,10 @@ mod tests {
 
         // GUARD_NOT_INVALIDATED + GETFIELD (first read) + CALL + Jump.
         // Second GETFIELD eliminated (quasi-immut cache survives call).
-        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
         assert_eq!(
             get_count, 1,
             "second GETFIELD after call should be eliminated for quasi-immutable field"
@@ -2189,7 +2276,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
-        assert_eq!(nonnull_count, 0, "guard_nonnull after gc_load should be removed");
+        assert_eq!(
+            nonnull_count, 0,
+            "guard_nonnull after gc_load should be removed"
+        );
     }
 
     // ── Test 52: QUASIIMMUT_FIELD on field 0 doesn't affect field 1 ──
@@ -2212,7 +2302,10 @@ mod tests {
         let result = run_heap_opt(&mut ops);
 
         // GUARD_NOT_INVALIDATED + GETFIELD(d1) + CALL + GETFIELD(d1, re-emitted) + Jump.
-        let get_count = result.iter().filter(|o| o.opcode == OpCode::GetfieldGcI).count();
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
         assert_eq!(
             get_count, 2,
             "quasi-immut on field 0 should not affect field 1"

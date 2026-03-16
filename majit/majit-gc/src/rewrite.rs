@@ -207,7 +207,11 @@ impl RewriteState {
     /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
     /// so the pending zero for that slot can be skipped.
     fn record_setarrayitem_index(&mut self, array_ref: OpRef, index: usize) {
-        if self.pending_zeros.iter().any(|pz| pz.array_ref == array_ref) {
+        if self
+            .pending_zeros
+            .iter()
+            .any(|pz| pz.array_ref == array_ref)
+        {
             self.initialized_indices
                 .entry(array_ref.0)
                 .or_default()
@@ -1143,11 +1147,7 @@ mod tests {
     fn test_pending_zero_fully_initialized() {
         // NEW_ARRAY_CLEAR(3) + SET[0] + SET[1] + SET[2] → no ZERO_ARRAY emitted.
         let rw = make_rewriter();
-        let mut new_array = Op::with_descr(
-            OpCode::NewArrayClear,
-            &[OpRef(3)],
-            array_descr_int(),
-        );
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![
@@ -1187,11 +1187,7 @@ mod tests {
     fn test_pending_zero_partially_initialized() {
         // NEW_ARRAY_CLEAR(4) + SET[0] + SET[1] → ZERO_ARRAY(arr, 2, 2)
         let rw = make_rewriter();
-        let mut new_array = Op::with_descr(
-            OpCode::NewArrayClear,
-            &[OpRef(4)],
-            array_descr_int(),
-        );
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(4)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![
@@ -1225,11 +1221,7 @@ mod tests {
     fn test_pending_zero_flushed_at_guard() {
         // Guard forces pending zero flush even if no indices were SET.
         let rw = make_rewriter();
-        let mut new_array = Op::with_descr(
-            OpCode::NewArrayClear,
-            &[OpRef(3)],
-            array_descr_int(),
-        );
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![
@@ -1241,12 +1233,8 @@ mod tests {
         let result = rw.rewrite_for_gc(&ops);
 
         // The ZERO_ARRAY should appear before the guard.
-        let zero_idx = result
-            .iter()
-            .position(|o| o.opcode == OpCode::ZeroArray);
-        let guard_idx = result
-            .iter()
-            .position(|o| o.opcode == OpCode::GuardTrue);
+        let zero_idx = result.iter().position(|o| o.opcode == OpCode::ZeroArray);
+        let guard_idx = result.iter().position(|o| o.opcode == OpCode::GuardTrue);
         assert!(zero_idx.is_some(), "ZERO_ARRAY should be emitted");
         assert!(guard_idx.is_some(), "GuardTrue should be present");
         assert!(
@@ -1266,11 +1254,7 @@ mod tests {
     fn test_pending_zero_gap_in_middle() {
         // NEW_ARRAY_CLEAR(5) + SET[0] + SET[2] + SET[4] → two ZERO_ARRAY runs.
         let rw = make_rewriter();
-        let mut new_array = Op::with_descr(
-            OpCode::NewArrayClear,
-            &[OpRef(5)],
-            array_descr_int(),
-        );
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(5)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![
@@ -1315,11 +1299,7 @@ mod tests {
     fn test_pending_zero_no_clear() {
         // Plain NEW_ARRAY (not CLEAR) should NOT produce any ZERO_ARRAY.
         let rw = make_rewriter();
-        let mut new_array = Op::with_descr(
-            OpCode::NewArray,
-            &[OpRef(3)],
-            array_descr_int(),
-        );
+        let mut new_array = Op::with_descr(OpCode::NewArray, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];

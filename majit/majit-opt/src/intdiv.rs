@@ -126,12 +126,7 @@ pub fn division_operations(
 /// Generate modulo operations: `n % m` using division + multiply + subtract.
 ///
 /// Computes: `n - (n // m) * m`.
-pub fn modulo_operations(
-    n_ref: OpRef,
-    m: i64,
-    known_nonneg: bool,
-    ctx: &mut OptContext,
-) -> OpRef {
+pub fn modulo_operations(n_ref: OpRef, m: i64, known_nonneg: bool, ctx: &mut OptContext) -> OpRef {
     let div_ref = division_operations(n_ref, m, known_nonneg, ctx);
 
     // product = div_result * m
@@ -223,7 +218,11 @@ mod tests {
     fn floor_div(a: i64, b: i64) -> i64 {
         let d = a / b;
         let r = a % b;
-        if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d }
+        if (r != 0) && ((r ^ b) < 0) {
+            d - 1
+        } else {
+            d
+        }
     }
 
     // ── division_operations tests ──
