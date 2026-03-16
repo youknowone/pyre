@@ -18,9 +18,15 @@ pub enum HelperClassification {
     /// Opaque call — emit residual CALL during tracing.
     Residual,
     /// Direct field read — maps to GetfieldRawI.
-    FieldRead { struct_name: String, field_name: String },
+    FieldRead {
+        struct_name: String,
+        field_name: String,
+    },
     /// Direct field write — maps to SetfieldRaw.
-    FieldWrite { struct_name: String, field_name: String },
+    FieldWrite {
+        struct_name: String,
+        field_name: String,
+    },
     /// Never trace into this function.
     DontLookInside,
     /// Unclassified — needs manual annotation.
