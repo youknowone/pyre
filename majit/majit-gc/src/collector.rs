@@ -6,6 +6,8 @@
 /// - Write barrier with remembered set for old-to-young pointers
 ///
 /// Modeled after incminimark's minor/major collection.
+use std::collections::{HashMap, HashSet};
+
 use majit_ir::GcRef;
 
 use crate::GcAllocator;
@@ -87,6 +89,9 @@ impl Default for RootSet {
     }
 }
 
+/// Default card page shift: each card covers 2^7 = 128 array elements.
+pub const DEFAULT_CARD_PAGE_SHIFT: u32 = 7;
+
 /// The MiniMark generational GC.
 pub struct MiniMarkGC {
     /// The nursery (young generation).
@@ -101,6 +106,11 @@ pub struct MiniMarkGC {
     /// These are old-gen object payload addresses whose TRACK_YOUNG_PTRS
     /// flag has been cleared by the write barrier.
     remembered_set: Vec<usize>,
+    /// Card table: maps object address to set of dirty card indices.
+    /// Used for large arrays where scanning the entire array during
+    /// minor collection is too expensive. Only dirty card ranges are
+    /// scanned instead of the whole array.
+    card_dirty: HashMap<usize, HashSet<usize>>,
     /// Configuration.
     config: GcConfig,
     /// Count of minor collections performed.
@@ -123,6 +133,7 @@ impl MiniMarkGC {
             types: TypeRegistry::new(),
             roots: RootSet::new(),
             remembered_set: Vec::new(),
+            card_dirty: HashMap::new(),
             config,
             minor_collections: 0,
             major_collections: 0,
@@ -239,19 +250,32 @@ impl MiniMarkGC {
             let obj_addr = self.remembered_set[idx];
             idx += 1;
 
-            // Re-set TRACK_YOUNG_PTRS on this old object since we're
-            // processing all its young references now.
-            unsafe {
-                header_of(obj_addr).set_flag(flags::TRACK_YOUNG_PTRS);
-            }
+            let has_cards = unsafe { header_of(obj_addr).has_flag(flags::CARDS_SET) };
 
-            // Trace this old-gen object's fields and copy any nursery
-            // objects they reference.
-            self.trace_and_update_object(obj_addr);
+            if has_cards {
+                // Card-marked object: scan only dirty card ranges.
+                self.scan_cards_for_young_refs(obj_addr, DEFAULT_CARD_PAGE_SHIFT);
+                self.clear_cards(obj_addr);
+                // Re-set TRACK_YOUNG_PTRS for future write barriers.
+                unsafe {
+                    header_of(obj_addr).set_flag(flags::TRACK_YOUNG_PTRS);
+                }
+            } else {
+                // Re-set TRACK_YOUNG_PTRS on this old object since we're
+                // processing all its young references now.
+                unsafe {
+                    header_of(obj_addr).set_flag(flags::TRACK_YOUNG_PTRS);
+                }
+
+                // Trace this old-gen object's fields and copy any nursery
+                // objects they reference.
+                self.trace_and_update_object(obj_addr);
+            }
         }
 
-        // Clear remembered set.
+        // Clear remembered set and any remaining card entries.
         self.remembered_set.clear();
+        self.clear_all_cards();
 
         // Reset nursery for new allocations.
         self.nursery.reset();
@@ -481,14 +505,87 @@ impl MiniMarkGC {
             self.remembered_set.push(obj.0);
         }
 
-        // Store dirty mark in card table (bytes before the header).
-        // card_index = index >> card_page_shift
         let card_index = index >> card_page_shift;
-        let header_addr = obj.0 - GcHeader::SIZE;
-        // Card bytes are stored at negative offsets from the header.
-        // We use the object's type info's extra card space (if allocated).
-        // For now, store in the card tracking set.
-        let _ = (header_addr, card_index); // Card byte storage is type-layout dependent
+        self.card_dirty
+            .entry(obj.0)
+            .or_default()
+            .insert(card_index);
+    }
+
+    /// Check whether a specific card of an object is dirty.
+    pub fn is_card_dirty(&self, obj: GcRef, card_index: usize) -> bool {
+        self.card_dirty
+            .get(&obj.0)
+            .is_some_and(|cards| cards.contains(&card_index))
+    }
+
+    /// Return all dirty card indices for the given object.
+    pub fn dirty_cards(&self, obj: GcRef) -> Vec<usize> {
+        self.card_dirty
+            .get(&obj.0)
+            .map(|cards| {
+                let mut v: Vec<usize> = cards.iter().copied().collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default()
+    }
+
+    /// Scan only dirty card ranges of a card-marked array object for
+    /// young-generation references. Avoids rescanning the entire array.
+    fn scan_cards_for_young_refs(&mut self, obj_addr: usize, card_page_shift: u32) {
+        let type_id = unsafe { header_of(obj_addr).type_id() };
+        let type_info = self.types.get(type_id);
+
+        if !type_info.items_have_gc_ptrs || type_info.item_size == 0 {
+            return;
+        }
+
+        let item_size = type_info.item_size;
+        let base_size = type_info.size;
+        let length_offset = type_info.length_offset;
+        let length = unsafe { *((obj_addr + length_offset) as *const usize) };
+        let items_start = obj_addr + base_size;
+
+        let dirty_cards: Vec<usize> = self
+            .card_dirty
+            .get(&obj_addr)
+            .map(|cards| cards.iter().copied().collect())
+            .unwrap_or_default();
+
+        for card_idx in dirty_cards {
+            let start = card_idx << card_page_shift;
+            let end = ((card_idx + 1) << card_page_shift).min(length);
+
+            for i in start..end {
+                let slot = (items_start + i * item_size) as *mut GcRef;
+                let field_ref = unsafe { *slot };
+                if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
+                    let new_ref = self.copy_nursery_object(field_ref.0);
+                    unsafe {
+                        *slot = new_ref;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear card table entries for a given object.
+    pub fn clear_cards(&mut self, obj_addr: usize) {
+        self.card_dirty.remove(&obj_addr);
+        let hdr = unsafe { header_of(obj_addr) };
+        hdr.clear_flag(flags::CARDS_SET);
+    }
+
+    /// Clear all card table entries. Called during minor collection
+    /// after processing all card-marked objects.
+    pub fn clear_all_cards(&mut self) {
+        let addrs: Vec<usize> = self.card_dirty.keys().copied().collect();
+        for addr in addrs {
+            let hdr = unsafe { header_of(addr) };
+            hdr.clear_flag(flags::CARDS_SET);
+        }
+        self.card_dirty.clear();
     }
 }
 
@@ -1269,5 +1366,115 @@ mod tests {
         assert_eq!(c3, 0x5555_6666_7777_8888);
 
         gc.roots.clear();
+    }
+
+    // ── Card marking tests ──
+
+    #[test]
+    fn test_card_marking_basic() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        // Allocate an old-gen object with HAS_CARDS flag.
+        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        let hdr = unsafe { header_of(obj.0) };
+        hdr.set_flag(flags::HAS_CARDS);
+
+        // Card-marking write barrier: mark card for index 5.
+        gc.do_write_barrier_card(obj, 5, DEFAULT_CARD_PAGE_SHIFT);
+
+        // The card at index 5 >> 7 = 0 should be dirty.
+        assert!(gc.is_card_dirty(obj, 0), "card 0 should be dirty after writing index 5");
+        assert!(hdr.has_flag(flags::CARDS_SET), "CARDS_SET flag should be set");
+
+        // Mark another index in a different card.
+        gc.do_write_barrier_card(obj, 200, DEFAULT_CARD_PAGE_SHIFT);
+        let card_idx = 200 >> DEFAULT_CARD_PAGE_SHIFT;
+        assert!(
+            gc.is_card_dirty(obj, card_idx as usize),
+            "card for index 200 should be dirty"
+        );
+    }
+
+    #[test]
+    fn test_card_marking_clear_after_collection() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        // Allocate an old-gen object with HAS_CARDS.
+        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        let hdr = unsafe { header_of(obj.0) };
+        hdr.set_flag(flags::HAS_CARDS);
+
+        // Mark some cards.
+        gc.do_write_barrier_card(obj, 0, DEFAULT_CARD_PAGE_SHIFT);
+        gc.do_write_barrier_card(obj, 200, DEFAULT_CARD_PAGE_SHIFT);
+        assert!(!gc.card_dirty.is_empty(), "cards should be dirty before collection");
+
+        // Minor collection clears card table.
+        gc.do_collect_nursery();
+
+        assert!(gc.card_dirty.is_empty(), "card table should be cleared after collection");
+        let hdr = unsafe { header_of(obj.0) };
+        assert!(
+            !hdr.has_flag(flags::CARDS_SET),
+            "CARDS_SET flag should be cleared after collection"
+        );
+    }
+
+    #[test]
+    fn test_card_marking_dirty_cards_list() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        let hdr = unsafe { header_of(obj.0) };
+        hdr.set_flag(flags::HAS_CARDS);
+
+        // Mark cards for indices in different card pages.
+        gc.do_write_barrier_card(obj, 0, DEFAULT_CARD_PAGE_SHIFT);
+        gc.do_write_barrier_card(obj, 128, DEFAULT_CARD_PAGE_SHIFT);
+        gc.do_write_barrier_card(obj, 256, DEFAULT_CARD_PAGE_SHIFT);
+
+        let dirty = gc.dirty_cards(obj);
+        assert_eq!(dirty, vec![0, 1, 2], "should have cards 0, 1, 2 dirty");
+    }
+
+    #[test]
+    fn test_card_marking_fallback_without_has_cards() {
+        // Object without HAS_CARDS should fall back to remembered set.
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        // Do NOT set HAS_CARDS.
+
+        gc.do_write_barrier_card(obj, 5, DEFAULT_CARD_PAGE_SHIFT);
+
+        // Should fall back to full remembered set.
+        assert_eq!(gc.remembered_set.len(), 1, "should add to remembered set");
+        assert!(gc.card_dirty.is_empty(), "should not mark cards without HAS_CARDS");
+    }
+
+    #[test]
+    fn test_card_clear_individual() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        let obj1 = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        let obj2 = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        let hdr1 = unsafe { header_of(obj1.0) };
+        let hdr2 = unsafe { header_of(obj2.0) };
+        hdr1.set_flag(flags::HAS_CARDS);
+        hdr2.set_flag(flags::HAS_CARDS);
+
+        gc.do_write_barrier_card(obj1, 0, DEFAULT_CARD_PAGE_SHIFT);
+        gc.do_write_barrier_card(obj2, 0, DEFAULT_CARD_PAGE_SHIFT);
+
+        // Clear only obj1's cards.
+        gc.clear_cards(obj1.0);
+
+        assert!(!gc.is_card_dirty(obj1, 0), "obj1 cards should be cleared");
+        assert!(gc.is_card_dirty(obj2, 0), "obj2 cards should still be dirty");
     }
 }
