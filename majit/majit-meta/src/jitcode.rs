@@ -62,7 +62,7 @@ const BC_CALL_ASSEMBLER_INT: u8 = 50;
 const BC_CALL_ASSEMBLER_REF: u8 = 51;
 const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;
 const BC_CALL_ASSEMBLER_VOID: u8 = 53;
-const MAX_HOST_CALL_ARITY: usize = 8;
+const MAX_HOST_CALL_ARITY: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LivenessInfo {
@@ -2092,6 +2092,61 @@ fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
                     std::mem::transmute(func_ptr);
                 func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7)
             }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) -> i64 = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) -> i64 = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) -> i64 = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) -> i64 = std::mem::transmute(func_ptr);
+                func(
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
+                )
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) -> i64 = std::mem::transmute(func_ptr);
+                func(
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
+                    *a14,
+                )
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                ) -> i64 = std::mem::transmute(func_ptr);
+                func(
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
+                    *a14, *a15,
+                )
+            }
             _ => panic!(
                 "unsupported JitCode int call arity {} (max {})",
                 args.len(),
@@ -2142,6 +2197,61 @@ fn call_void_function(func_ptr: *const (), args: &[i64]) {
                 let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) =
                     std::mem::transmute(func_ptr);
                 func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9] => {
+                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+                    std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) = std::mem::transmute(func_ptr);
+                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12)
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) = std::mem::transmute(func_ptr);
+                func(
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
+                )
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                ) = std::mem::transmute(func_ptr);
+                func(
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
+                    *a14,
+                )
+            }
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
+                let func: extern "C" fn(
+                    i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+                    i64,
+                ) = std::mem::transmute(func_ptr);
+                func(
+                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
+                    *a14, *a15,
+                )
             }
             _ => panic!(
                 "unsupported JitCode void call arity {} (max {})",
