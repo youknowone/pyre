@@ -181,19 +181,6 @@ pub(crate) fn trace_raw_array_getitem_value(
     )
 }
 
-pub(crate) fn trace_vable_array_setitem_value(
-    ctx: &mut TraceCtx,
-    array: OpRef,
-    index: OpRef,
-    value: OpRef,
-) {
-    ctx.record_op_with_descr(
-        OpCode::SetarrayitemRaw,
-        &[array, index, value],
-        pyobject_array_descr(),
-    );
-}
-
 pub(crate) fn trace_raw_array_setitem_value(
     ctx: &mut TraceCtx,
     array: OpRef,
@@ -207,28 +194,12 @@ pub(crate) fn trace_raw_array_setitem_value(
     );
 }
 
-pub(crate) fn frame_set_stack_depth(ctx: &mut TraceCtx, frame: OpRef, depth: OpRef) {
-    ctx.record_op_with_descr(
-        OpCode::SetfieldRaw,
-        &[frame, depth],
-        frame_stack_depth_descr(),
-    );
-}
-
 pub(crate) fn frame_get_next_instr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_next_instr_descr())
 }
 
 pub(crate) fn frame_get_stack_depth(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_stack_depth_descr())
-}
-
-pub(crate) fn frame_set_next_instr(ctx: &mut TraceCtx, frame: OpRef, next_instr: OpRef) {
-    ctx.record_op_with_descr(
-        OpCode::SetfieldRaw,
-        &[frame, next_instr],
-        frame_next_instr_descr(),
-    );
 }
 
 pub(crate) fn concrete_stack_value(frame: usize, idx: usize) -> Option<PyObjectRef> {
