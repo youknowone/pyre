@@ -18,14 +18,20 @@
 //! - **Standalone match**: `match x { 1 => ..., 2 => ..., _ => ... }` is
 //!   lowered to a chained if-else guard sequence
 //!
+//! ## Loop CFG patterns
+//!
+//! Loops within match arms are lowered to JitCode branch sequences:
+//!
+//! - **while loops**: `while cond { body }` → branch-zero exit check + back-edge jump
+//! - **loop with break**: `loop { ... break ... }` → unconditional back-edge + break targets
+//! - **for loops**: `for x in iter { body }` → the lowerer falls back to `None`
+//!   (not lowered), which makes the entire arm opaque to the JIT
+//!
 //! ## Unsupported CFG patterns
 //!
 //! These patterns within match arms will cause the arm to be classified as
 //! `Unsupported` and produce a compile-time error:
 //!
-//! - **loop/while within arms**: iteration inside an opcode handler
-//!   (extract to a `#[dont_look_inside]` helper)
-//! - **for loops within arms**: same as loop/while
 //! - **goto/label patterns**: not applicable in safe Rust, but any
 //!   `unsafe` block with computed jumps is unsupported
 
@@ -177,22 +183,35 @@ fn check_expr_unsupported(expr: &Expr) -> Option<String> {
             }
             None
         }
-        // Loop/while/for within an arm
-        Expr::Loop(_) => Some(
-            "loop within a match arm is not supported in JIT-traced arms; \
-             extract to a #[dont_look_inside] helper function"
-                .to_string(),
-        ),
-        Expr::While(_) => Some(
-            "while loop within a match arm is not supported in JIT-traced arms; \
-             extract to a #[dont_look_inside] helper function"
-                .to_string(),
-        ),
-        Expr::ForLoop(_) => Some(
-            "for loop within a match arm is not supported in JIT-traced arms; \
-             extract to a #[dont_look_inside] helper function"
-                .to_string(),
-        ),
+        // Loops within arms are lowered to JitCode branch sequences
+        // by the Lowerer (while/loop) or fall back to opaque (for).
+        Expr::Loop(loop_expr) => {
+            // Recurse into loop body to check for nested unsupported constructs
+            for s in &loop_expr.body.stmts {
+                if let Some(reason) = check_stmt_unsupported(s) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        Expr::While(while_expr) => {
+            // Recurse into while body to check for nested unsupported constructs
+            for s in &while_expr.body.stmts {
+                if let Some(reason) = check_stmt_unsupported(s) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        Expr::ForLoop(for_expr) => {
+            // Recurse into for body to check for nested unsupported constructs
+            for s in &for_expr.body.stmts {
+                if let Some(reason) = check_stmt_unsupported(s) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
         // Recurse into if/else branches — if/else itself is supported,
         // but it may contain unsupported constructs within.
         Expr::If(if_expr) => {
@@ -278,38 +297,38 @@ mod tests {
     }
 
     #[test]
-    fn classify_nested_match_with_loop_as_unsupported() {
+    fn classify_nested_match_with_loop_as_lowerable() {
         let arm = parse_arm("0 => { match op { 1 => { loop { break; } }, _ => b() } },");
         let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("loop")));
+        assert!(matches!(result, ArmPattern::Lowerable));
     }
 
     #[test]
-    fn classify_loop_as_unsupported() {
+    fn classify_loop_as_lowerable() {
         let arm = parse_arm("0 => { loop { break; } },");
         let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("loop")),);
+        assert!(matches!(result, ArmPattern::Lowerable));
     }
 
     #[test]
-    fn classify_while_as_unsupported() {
+    fn classify_while_as_lowerable() {
         let arm = parse_arm("0 => { while cond { x(); } },");
         let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("while")),);
+        assert!(matches!(result, ArmPattern::Lowerable));
     }
 
     #[test]
-    fn classify_for_as_unsupported() {
+    fn classify_for_as_lowerable() {
         let arm = parse_arm("0 => { for i in 0..10 { x(); } },");
         let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("for")),);
+        assert!(matches!(result, ArmPattern::Lowerable));
     }
 
     #[test]
-    fn classify_nested_loop_in_if_as_unsupported() {
+    fn classify_nested_loop_in_if_as_lowerable() {
         let arm = parse_arm("0 => { if cond { loop { break; } } else { x(); } },");
         let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("loop")),);
+        assert!(matches!(result, ArmPattern::Lowerable));
     }
 
     #[test]
