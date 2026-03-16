@@ -235,21 +235,16 @@ impl LoopAging {
 /// WarmState decides whether to start tracing, continue interpreting,
 /// or dispatch to compiled code.
 /// Default number of guard failures before triggering bridge compilation.
-const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
+/// PyPy default: trace_eagerness = 200
+const DEFAULT_BRIDGE_THRESHOLD: u32 = 200;
 
-/// Default function call threshold before inlining during tracing.
-///
-/// When a function is called fewer than this many times during tracing,
-/// it is left as a residual call. After this threshold, the meta-interpreter
-/// starts inlining the function's body into the trace.
-const DEFAULT_FUNCTION_THRESHOLD: u32 = 4;
+/// PyPy default: function_threshold = 1619 (prime, above threshold)
+const DEFAULT_FUNCTION_THRESHOLD: u32 = 1619;
 
-/// Maximum depth of inlined function calls during tracing.
-///
-/// Prevents unbounded recursion and excessively long traces.
-const DEFAULT_MAX_INLINE_DEPTH: u32 = 10;
+/// PyPy default: max_unroll_recursion = 7
+const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
 
-/// Default maximum number of operations in a single trace.
+/// PyPy default: trace_limit = 6000
 const DEFAULT_TRACE_LIMIT: u32 = 6000;
 
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
@@ -979,7 +974,7 @@ mod tests {
     #[test]
     fn test_bridge_threshold_default() {
         let ws = WarmState::new(3);
-        assert_eq!(ws.bridge_threshold(), 5);
+        assert_eq!(ws.bridge_threshold(), 200); // PyPy default: trace_eagerness
     }
 
     #[test]
@@ -993,9 +988,9 @@ mod tests {
     fn test_should_compile_bridge() {
         let ws = WarmState::new(3);
         assert!(!ws.should_compile_bridge(0));
-        assert!(!ws.should_compile_bridge(4));
-        assert!(ws.should_compile_bridge(5));
-        assert!(ws.should_compile_bridge(100));
+        assert!(!ws.should_compile_bridge(199));
+        assert!(ws.should_compile_bridge(200));
+        assert!(ws.should_compile_bridge(300));
     }
 
     // ── Quasi-immutable invalidation tests ──
@@ -1068,7 +1063,7 @@ mod tests {
     #[test]
     fn test_function_threshold_default() {
         let ws = WarmState::new(3);
-        assert_eq!(ws.function_threshold(), 4); // DEFAULT_FUNCTION_THRESHOLD
+        assert_eq!(ws.function_threshold(), 1619); // PyPy default
     }
 
     #[test]
