@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use majit_codegen::{
-    Backend, CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, LoopToken, TerminalExitLayout,
+    Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, LoopToken,
+    TerminalExitLayout,
 };
 use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{GcRef, InputArg, OpCode, OpRef, Type, Value};
@@ -12,8 +13,9 @@ use majit_trace::warmstate::{HotResult, WarmState};
 use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionState};
 use crate::io_buffer;
 use crate::resume::{
-    EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
-    ResumeData, ResumeDataBuilder, ResumeDataLoopMemo, ResumeLayoutSummary,
+    EncodedResumeData, MaterializedVirtual, ReconstructedState, ResumeFrameLayoutSummary,
+    ResolvedPendingFieldWrite, ResumeData, ResumeDataBuilder, ResumeDataLoopMemo,
+    ResumeLayoutSummary,
 };
 use crate::trace_ctx::{JitDriverDescriptor, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
@@ -1333,22 +1335,30 @@ impl<M: Clone> MetaInterp<M> {
             });
         let exit_layout = result
             .exit_layout
-            .map(|layout| CompiledExitLayout {
-                trace_id,
-                fail_index: layout.fail_index,
-                source_op_index: layout.source_op_index.or_else(|| {
-                    trace_layout
-                        .as_ref()
-                        .and_then(|layout| layout.source_op_index)
-                }),
-                exit_types: layout.fail_arg_types,
-                is_finish: layout.is_finish,
-                gc_ref_slots: layout.gc_ref_slots,
-                force_token_slots: layout.force_token_slots,
-                recovery_layout: layout.recovery_layout,
-                resume_layout: trace_layout
+            .map(|layout| {
+                let mut resume_layout = trace_layout
                     .as_ref()
-                    .and_then(|layout| layout.resume_layout.clone()),
+                    .and_then(|tl| tl.resume_layout.clone());
+                enrich_resume_layout_with_frame_stack(
+                    &mut resume_layout,
+                    layout.frame_stack.as_deref(),
+                    &layout.fail_arg_types,
+                );
+                CompiledExitLayout {
+                    trace_id,
+                    fail_index: layout.fail_index,
+                    source_op_index: layout.source_op_index.or_else(|| {
+                        trace_layout
+                            .as_ref()
+                            .and_then(|layout| layout.source_op_index)
+                    }),
+                    exit_types: layout.fail_arg_types,
+                    is_finish: layout.is_finish,
+                    gc_ref_slots: layout.gc_ref_slots,
+                    force_token_slots: layout.force_token_slots,
+                    recovery_layout: layout.recovery_layout,
+                    resume_layout,
+                }
             })
             .or(trace_layout)
             .unwrap_or_else(|| CompiledExitLayout {
@@ -1432,22 +1442,30 @@ impl<M: Clone> MetaInterp<M> {
             });
         let exit_layout = result
             .exit_layout
-            .map(|layout| CompiledExitLayout {
-                trace_id,
-                fail_index: layout.fail_index,
-                source_op_index: layout.source_op_index.or_else(|| {
-                    trace_layout
-                        .as_ref()
-                        .and_then(|layout| layout.source_op_index)
-                }),
-                exit_types: layout.fail_arg_types,
-                is_finish: layout.is_finish,
-                gc_ref_slots: layout.gc_ref_slots,
-                force_token_slots: layout.force_token_slots,
-                recovery_layout: layout.recovery_layout,
-                resume_layout: trace_layout
+            .map(|layout| {
+                let mut resume_layout = trace_layout
                     .as_ref()
-                    .and_then(|layout| layout.resume_layout.clone()),
+                    .and_then(|tl| tl.resume_layout.clone());
+                enrich_resume_layout_with_frame_stack(
+                    &mut resume_layout,
+                    layout.frame_stack.as_deref(),
+                    &layout.fail_arg_types,
+                );
+                CompiledExitLayout {
+                    trace_id,
+                    fail_index: layout.fail_index,
+                    source_op_index: layout.source_op_index.or_else(|| {
+                        trace_layout
+                            .as_ref()
+                            .and_then(|layout| layout.source_op_index)
+                    }),
+                    exit_types: layout.fail_arg_types,
+                    is_finish: layout.is_finish,
+                    gc_ref_slots: layout.gc_ref_slots,
+                    force_token_slots: layout.force_token_slots,
+                    recovery_layout: layout.recovery_layout,
+                    resume_layout,
+                }
             })
             .or(trace_layout)
             .unwrap_or_else(|| CompiledExitLayout {
@@ -3414,6 +3432,180 @@ fn merge_backend_exit_layouts(
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
         entry.recovery_layout = layout.recovery_layout.clone();
+
+        // Merge backend frame_stack metadata into the stored resume layout.
+        if let Some(frame_stack) = &layout.frame_stack {
+            merge_frame_stack_into_resume_layout(entry, frame_stack);
+        }
+    }
+}
+
+/// Merge backend-origin `frame_stack` metadata into a `StoredExitLayout`'s
+/// resume layout, enriching or creating `frame_layouts` entries with slot
+/// types from the backend's `ExitFrameLayout`.
+fn merge_frame_stack_into_resume_layout(
+    entry: &mut StoredExitLayout,
+    frame_stack: &[ExitFrameLayout],
+) {
+    if frame_stack.is_empty() {
+        return;
+    }
+
+    let frame_layouts: Vec<ResumeFrameLayoutSummary> = frame_stack
+        .iter()
+        .map(ResumeFrameLayoutSummary::from_exit_frame_layout)
+        .collect();
+
+    if let Some(ref mut resume_layout) = entry.resume_layout {
+        // Merge slot types from frame_stack into existing frame_layouts.
+        let shared = resume_layout.frame_layouts.len().min(frame_layouts.len());
+        for offset in 0..shared {
+            let resume_index = resume_layout.frame_layouts.len() - 1 - offset;
+            let fs_index = frame_layouts.len() - 1 - offset;
+            let target = &mut resume_layout.frame_layouts[resume_index];
+            let source = &frame_layouts[fs_index];
+
+            if target.trace_id.is_none() {
+                target.trace_id = source.trace_id;
+            }
+            if target.header_pc.is_none() {
+                target.header_pc = source.header_pc;
+            }
+            if target.source_guard.is_none() {
+                target.source_guard = source.source_guard;
+            }
+
+            let needs_slot_types = target
+                .slot_types
+                .as_ref()
+                .map_or(true, |types| types.len() != target.slot_layouts.len());
+            if needs_slot_types
+                && source
+                    .slot_types
+                    .as_ref()
+                    .is_some_and(|types| types.len() == target.slot_layouts.len())
+            {
+                target.slot_types = source.slot_types.clone();
+            }
+        }
+
+        // If the frame_stack has more frames than the existing resume layout,
+        // prepend the extra outer frames.
+        if frame_layouts.len() > resume_layout.frame_layouts.len() {
+            let extra_count = frame_layouts.len() - resume_layout.frame_layouts.len();
+            let mut new_frames = frame_layouts[..extra_count].to_vec();
+            new_frames.append(&mut resume_layout.frame_layouts);
+            resume_layout.frame_layouts = new_frames;
+            resume_layout.num_frames = resume_layout.frame_layouts.len();
+            resume_layout.frame_pcs = resume_layout
+                .frame_layouts
+                .iter()
+                .map(|f| f.pc)
+                .collect();
+            resume_layout.frame_slot_counts = resume_layout
+                .frame_layouts
+                .iter()
+                .map(|f| f.slot_layouts.len())
+                .collect();
+        }
+    } else {
+        // No existing resume layout; create one from the frame_stack.
+        entry.resume_layout = Some(ResumeLayoutSummary {
+            num_frames: frame_layouts.len(),
+            frame_pcs: frame_layouts.iter().map(|f| f.pc).collect(),
+            frame_slot_counts: frame_layouts.iter().map(|f| f.slot_layouts.len()).collect(),
+            frame_layouts,
+            num_virtuals: 0,
+            virtual_kinds: Vec::new(),
+            virtual_layouts: Vec::new(),
+            num_fail_args: entry.exit_types.len(),
+            fail_arg_positions: (0..entry.exit_types.len()).collect(),
+            pending_field_count: 0,
+            pending_field_layouts: Vec::new(),
+            const_pool_size: 0,
+        });
+    }
+}
+
+/// Enrich an `Option<ResumeLayoutSummary>` with backend-origin `frame_stack`
+/// metadata at runtime, merging slot types and outer frames.
+fn enrich_resume_layout_with_frame_stack(
+    resume_layout: &mut Option<ResumeLayoutSummary>,
+    frame_stack: Option<&[ExitFrameLayout]>,
+    exit_types: &[Type],
+) {
+    let Some(frame_stack) = frame_stack else {
+        return;
+    };
+    if frame_stack.is_empty() {
+        return;
+    }
+
+    let frame_layouts: Vec<ResumeFrameLayoutSummary> = frame_stack
+        .iter()
+        .map(ResumeFrameLayoutSummary::from_exit_frame_layout)
+        .collect();
+
+    if let Some(ref mut layout) = resume_layout {
+        let shared = layout.frame_layouts.len().min(frame_layouts.len());
+        for offset in 0..shared {
+            let resume_index = layout.frame_layouts.len() - 1 - offset;
+            let fs_index = frame_layouts.len() - 1 - offset;
+            let target = &mut layout.frame_layouts[resume_index];
+            let source = &frame_layouts[fs_index];
+
+            if target.trace_id.is_none() {
+                target.trace_id = source.trace_id;
+            }
+            if target.header_pc.is_none() {
+                target.header_pc = source.header_pc;
+            }
+            if target.source_guard.is_none() {
+                target.source_guard = source.source_guard;
+            }
+
+            let needs_slot_types = target
+                .slot_types
+                .as_ref()
+                .map_or(true, |types| types.len() != target.slot_layouts.len());
+            if needs_slot_types
+                && source
+                    .slot_types
+                    .as_ref()
+                    .is_some_and(|types| types.len() == target.slot_layouts.len())
+            {
+                target.slot_types = source.slot_types.clone();
+            }
+        }
+
+        if frame_layouts.len() > layout.frame_layouts.len() {
+            let extra_count = frame_layouts.len() - layout.frame_layouts.len();
+            let mut new_frames = frame_layouts[..extra_count].to_vec();
+            new_frames.append(&mut layout.frame_layouts);
+            layout.frame_layouts = new_frames;
+            layout.num_frames = layout.frame_layouts.len();
+            layout.frame_pcs = layout.frame_layouts.iter().map(|f| f.pc).collect();
+            layout.frame_slot_counts = layout
+                .frame_layouts
+                .iter()
+                .map(|f| f.slot_layouts.len())
+                .collect();
+        }
+    } else {
+        *resume_layout = Some(ResumeLayoutSummary {
+            num_frames: frame_layouts.len(),
+            frame_pcs: frame_layouts.iter().map(|f| f.pc).collect(),
+            frame_slot_counts: frame_layouts.iter().map(|f| f.slot_layouts.len()).collect(),
+            frame_layouts,
+            num_virtuals: 0,
+            virtual_kinds: Vec::new(),
+            virtual_layouts: Vec::new(),
+            num_fail_args: exit_types.len(),
+            fail_arg_positions: (0..exit_types.len()).collect(),
+            pending_field_count: 0,
+            pending_field_layouts: Vec::new(),
+            const_pool_size: 0,
+        });
     }
 }
 
@@ -3662,7 +3854,7 @@ mod tests {
     use super::*;
     use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     use majit_codegen::DeadFrame;
-    use majit_codegen::{Backend, ExitFrameLayout, ExitRecoveryLayout};
+    use majit_codegen::{Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
     use majit_codegen_cranelift::compiler::{
         force_token_to_dead_frame, get_int_from_deadframe, get_latest_descr_from_deadframe,
         set_savedata_ref_on_deadframe,
@@ -5456,5 +5648,371 @@ mod tests {
         assert!(hooks.on_trace_start.is_none());
         assert!(hooks.on_trace_abort.is_none());
         assert!(hooks.on_compile_error.is_none());
+    }
+
+    #[test]
+    fn test_multi_frame_restore_uses_frame_stack_metadata() {
+        use crate::jit_state::JitState;
+        use crate::resume::{
+            ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary,
+            ResumeValueKind, ResumeValueLayoutSummary,
+        };
+        use majit_codegen::ExitValueSourceLayout;
+
+        // JitState implementation that records per-frame restores.
+        #[derive(Default)]
+        struct MultiFrameState {
+            restored_frames: Vec<(usize, u64, Vec<Value>)>,
+        }
+
+        impl JitState for MultiFrameState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+
+            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn extract_live(&self, _: &()) -> Vec<i64> { Vec::new() }
+            fn create_sym(_: &(), _: usize) -> () {}
+            fn is_compatible(&self, _: &()) -> bool { true }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+
+            fn restore_reconstructed_frame_values_with_metadata(
+                &mut self,
+                _meta: &(),
+                frame_index: usize,
+                _total_frames: usize,
+                frame: &crate::resume::ReconstructedFrame,
+                values: &[Value],
+                _exception: &ExceptionState,
+            ) -> bool {
+                self.restored_frames.push((frame_index, frame.pc, values.to_vec()));
+                true
+            }
+
+            fn collect_jump_args(_: &()) -> Vec<OpRef> { Vec::new() }
+            fn validate_close(_: &(), _: &()) -> bool { true }
+        }
+
+        let mut state = MultiFrameState::default();
+
+        // Build a ReconstructedState with 2 frames (outermost first).
+        let reconstructed_state = ReconstructedState {
+            frames: vec![
+                ReconstructedFrame {
+                    trace_id: Some(100),
+                    header_pc: Some(500),
+                    source_guard: None,
+                    pc: 10,
+                    slot_types: None,
+                    values: vec![ReconstructedValue::Value(42)],
+                },
+                ReconstructedFrame {
+                    trace_id: Some(200),
+                    header_pc: Some(600),
+                    source_guard: None,
+                    pc: 20,
+                    slot_types: None,
+                    values: vec![
+                        ReconstructedValue::Value(7),
+                        ReconstructedValue::Value(8),
+                    ],
+                },
+            ],
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        };
+
+        // Build frame_stack metadata with slot_types for both frames.
+        let frame_layouts = vec![
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(100),
+                header_pc: Some(500),
+                source_guard: None,
+                pc: 10,
+                slots: vec![ExitValueSourceLayout::ExitValue(0)],
+                slot_types: Some(vec![Type::Int]),
+            }),
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(200),
+                header_pc: Some(600),
+                source_guard: None,
+                pc: 20,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(1),
+                    ExitValueSourceLayout::ExitValue(2),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Int]),
+            }),
+        ];
+
+        let restored = state.restore_guard_failure_with_resume_layout(
+            &(),
+            &[42, 7, 8],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &[],
+            &[],
+            &ExceptionState::default(),
+        );
+
+        assert!(restored, "multi-frame restore should succeed");
+        assert_eq!(state.restored_frames.len(), 2, "both frames should be restored");
+        assert_eq!(state.restored_frames[0].0, 0); // frame_index 0
+        assert_eq!(state.restored_frames[0].1, 10); // pc
+        assert_eq!(state.restored_frames[0].2, vec![Value::Int(42)]);
+        assert_eq!(state.restored_frames[1].0, 1); // frame_index 1
+        assert_eq!(state.restored_frames[1].1, 20); // pc
+        assert_eq!(state.restored_frames[1].2, vec![Value::Int(7), Value::Int(8)]);
+    }
+
+    #[test]
+    fn test_single_frame_restore_with_frame_stack() {
+        use crate::jit_state::JitState;
+        use crate::resume::{
+            ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary,
+        };
+        use majit_codegen::ExitValueSourceLayout;
+
+        #[derive(Default)]
+        struct SingleFrameState {
+            restored_values: Vec<Value>,
+        }
+
+        impl JitState for SingleFrameState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+
+            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn extract_live(&self, _: &()) -> Vec<i64> { Vec::new() }
+            fn create_sym(_: &(), _: usize) -> () {}
+            fn is_compatible(&self, _: &()) -> bool { true }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+
+            fn restore_values(&mut self, _: &(), values: &[Value]) {
+                self.restored_values = values.to_vec();
+            }
+
+            fn collect_jump_args(_: &()) -> Vec<OpRef> { Vec::new() }
+            fn validate_close(_: &(), _: &()) -> bool { true }
+        }
+
+        let mut state = SingleFrameState::default();
+
+        let reconstructed_state = ReconstructedState {
+            frames: vec![ReconstructedFrame {
+                trace_id: Some(300),
+                header_pc: Some(700),
+                source_guard: None,
+                pc: 30,
+                slot_types: None,
+                values: vec![
+                    ReconstructedValue::Value(100),
+                    ReconstructedValue::Value(200),
+                ],
+            }],
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        };
+
+        // Provide frame_stack metadata with slot_types.
+        let frame_layouts = vec![
+            ResumeFrameLayoutSummary::from_exit_frame_layout(&ExitFrameLayout {
+                trace_id: Some(300),
+                header_pc: Some(700),
+                source_guard: None,
+                pc: 30,
+                slots: vec![
+                    ExitValueSourceLayout::ExitValue(0),
+                    ExitValueSourceLayout::ExitValue(1),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Float]),
+            }),
+        ];
+
+        let restored = state.restore_guard_failure_with_resume_layout(
+            &(),
+            &[100, 200],
+            Some(&reconstructed_state),
+            Some(&frame_layouts),
+            &[],
+            &[],
+            &ExceptionState::default(),
+        );
+
+        assert!(restored, "single-frame restore should succeed");
+        assert_eq!(state.restored_values.len(), 2);
+        assert_eq!(state.restored_values[0], Value::Int(100));
+        // 200 as f64 bits
+        assert_eq!(state.restored_values[1], Value::Float(f64::from_bits(200)));
+    }
+
+    #[test]
+    fn test_merge_backend_exit_layouts_with_frame_stack() {
+        let mut exit_layouts = HashMap::new();
+        exit_layouts.insert(
+            0,
+            StoredExitLayout {
+                source_op_index: None,
+                exit_types: vec![Type::Int, Type::Int],
+                is_finish: false,
+                gc_ref_slots: Vec::new(),
+                force_token_slots: Vec::new(),
+                recovery_layout: None,
+                resume_layout: None,
+            },
+        );
+
+        // Merge with frame_stack containing two frames.
+        merge_backend_exit_layouts(
+            &mut exit_layouts,
+            &[FailDescrLayout {
+                fail_index: 0,
+                source_op_index: Some(3),
+                trace_id: 50,
+                trace_info: None,
+                fail_arg_types: vec![Type::Int, Type::Int],
+                is_finish: false,
+                gc_ref_slots: Vec::new(),
+                force_token_slots: Vec::new(),
+                recovery_layout: None,
+                frame_stack: Some(vec![
+                    ExitFrameLayout {
+                        trace_id: Some(40),
+                        header_pc: Some(400),
+                        source_guard: None,
+                        pc: 10,
+                        slots: vec![ExitValueSourceLayout::ExitValue(0)],
+                        slot_types: Some(vec![Type::Int]),
+                    },
+                    ExitFrameLayout {
+                        trace_id: Some(50),
+                        header_pc: Some(500),
+                        source_guard: None,
+                        pc: 20,
+                        slots: vec![ExitValueSourceLayout::ExitValue(1)],
+                        slot_types: Some(vec![Type::Int]),
+                    },
+                ]),
+            }],
+        );
+
+        let layout = exit_layouts.get(&0).expect("layout should exist");
+        let resume = layout
+            .resume_layout
+            .as_ref()
+            .expect("resume_layout should be created from frame_stack");
+        assert_eq!(resume.frame_layouts.len(), 2);
+        assert_eq!(resume.frame_layouts[0].pc, 10);
+        assert_eq!(resume.frame_layouts[0].trace_id, Some(40));
+        assert_eq!(resume.frame_layouts[0].slot_types, Some(vec![Type::Int]));
+        assert_eq!(resume.frame_layouts[1].pc, 20);
+        assert_eq!(resume.frame_layouts[1].trace_id, Some(50));
+        assert_eq!(resume.frame_layouts[1].slot_types, Some(vec![Type::Int]));
+        assert_eq!(resume.num_frames, 2);
+        assert_eq!(resume.frame_pcs, vec![10, 20]);
+    }
+
+    #[test]
+    fn test_merge_backend_exit_layouts_frame_stack_enriches_existing_resume() {
+        use crate::resume::{
+            ResumeValueKind, ResumeValueLayoutSummary,
+        };
+
+        // Existing resume layout with one frame that has no slot_types.
+        let existing_frame = ResumeFrameLayoutSummary {
+            trace_id: None,
+            header_pc: None,
+            source_guard: None,
+            pc: 20,
+            slot_sources: vec![ResumeValueKind::FailArg],
+            slot_layouts: vec![ResumeValueLayoutSummary {
+                kind: ResumeValueKind::FailArg,
+                fail_arg_index: Some(0),
+                raw_fail_arg_position: Some(0),
+                constant: None,
+                virtual_index: None,
+            }],
+            slot_types: None,
+        };
+        let existing_resume = ResumeLayoutSummary {
+            num_frames: 1,
+            frame_pcs: vec![20],
+            frame_slot_counts: vec![1],
+            frame_layouts: vec![existing_frame],
+            num_virtuals: 0,
+            virtual_kinds: Vec::new(),
+            virtual_layouts: Vec::new(),
+            num_fail_args: 1,
+            fail_arg_positions: vec![0],
+            pending_field_count: 0,
+            pending_field_layouts: Vec::new(),
+            const_pool_size: 0,
+        };
+
+        let mut exit_layouts = HashMap::new();
+        exit_layouts.insert(
+            0,
+            StoredExitLayout {
+                source_op_index: None,
+                exit_types: vec![Type::Int],
+                is_finish: false,
+                gc_ref_slots: Vec::new(),
+                force_token_slots: Vec::new(),
+                recovery_layout: None,
+                resume_layout: Some(existing_resume),
+            },
+        );
+
+        // frame_stack with an outer frame (new) and the same innermost frame
+        // (with slot_types that the existing resume layout lacked).
+        merge_backend_exit_layouts(
+            &mut exit_layouts,
+            &[FailDescrLayout {
+                fail_index: 0,
+                source_op_index: Some(5),
+                trace_id: 60,
+                trace_info: None,
+                fail_arg_types: vec![Type::Int],
+                is_finish: false,
+                gc_ref_slots: Vec::new(),
+                force_token_slots: Vec::new(),
+                recovery_layout: None,
+                frame_stack: Some(vec![
+                    ExitFrameLayout {
+                        trace_id: Some(55),
+                        header_pc: Some(550),
+                        source_guard: None,
+                        pc: 10,
+                        slots: vec![ExitValueSourceLayout::Constant(99)],
+                        slot_types: Some(vec![Type::Int]),
+                    },
+                    ExitFrameLayout {
+                        trace_id: Some(60),
+                        header_pc: Some(600),
+                        source_guard: None,
+                        pc: 20,
+                        slots: vec![ExitValueSourceLayout::ExitValue(0)],
+                        slot_types: Some(vec![Type::Int]),
+                    },
+                ]),
+            }],
+        );
+
+        let layout = exit_layouts.get(&0).expect("layout should exist");
+        let resume = layout
+            .resume_layout
+            .as_ref()
+            .expect("resume_layout should exist");
+
+        // Now should have 2 frames: outer prepended + existing enriched.
+        assert_eq!(resume.frame_layouts.len(), 2);
+        // Outer frame (prepended from frame_stack).
+        assert_eq!(resume.frame_layouts[0].pc, 10);
+        assert_eq!(resume.frame_layouts[0].trace_id, Some(55));
+        // Innermost frame: trace_id enriched, slot_types filled.
+        assert_eq!(resume.frame_layouts[1].pc, 20);
+        assert_eq!(resume.frame_layouts[1].trace_id, Some(60));
+        assert_eq!(resume.frame_layouts[1].slot_types, Some(vec![Type::Int]));
     }
 }

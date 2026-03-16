@@ -28,6 +28,8 @@ pub struct JitDriver<S: JitState> {
     sym: Option<S::Sym>,
     trace_meta: Option<S::Meta>,
     descriptor: Option<JitDriverDescriptor>,
+    /// Bridge tracing state: (green_key, trace_id, fail_index).
+    bridge_info: Option<(u64, u64, u32)>,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -38,6 +40,7 @@ impl<S: JitState> JitDriver<S> {
             sym: None,
             trace_meta: None,
             descriptor: None,
+            bridge_info: None,
         }
     }
 
@@ -67,6 +70,12 @@ impl<S: JitState> JitDriver<S> {
         self.meta.is_tracing()
     }
 
+    /// Whether the driver is currently tracing a bridge.
+    #[inline]
+    pub fn is_bridge_tracing(&self) -> bool {
+        self.bridge_info.is_some()
+    }
+
     /// The green key of the active trace, if any.
     pub fn current_trace_green_key(&mut self) -> Option<u64> {
         self.meta.trace_ctx().map(|ctx| ctx.green_key())
@@ -78,6 +87,7 @@ impl<S: JitState> JitDriver<S> {
             self.meta.abort_trace(permanent);
             self.sym = None;
             self.trace_meta = None;
+            self.bridge_info = None;
         }
     }
 
@@ -133,6 +143,23 @@ impl<S: JitState> JitDriver<S> {
         match action {
             TraceAction::Continue => {}
             TraceAction::CloseLoop => {
+                // Bridge tracing: close as bridge instead of loop.
+                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) = self.bridge_info.take() {
+                    let sym = self.sym.take();
+                    self.trace_meta = None;
+                    if let Some(sym) = sym {
+                        let finish_args = S::collect_jump_args(&sym);
+                        self.meta.close_bridge_with_finish(
+                            bridge_key,
+                            bridge_trace_id,
+                            bridge_fail_index,
+                            &finish_args,
+                        );
+                    } else {
+                        self.meta.abort_trace(false);
+                    }
+                    return;
+                }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
                     self.meta.abort_trace(false);
                     self.sym = None;
@@ -188,11 +215,13 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.abort_trace(false);
                 self.sym = None;
                 self.trace_meta = None;
+                self.bridge_info = None;
             }
             TraceAction::AbortPermanent => {
                 self.meta.abort_trace(true);
                 self.sym = None;
                 self.trace_meta = None;
+                self.bridge_info = None;
             }
         }
     }
@@ -834,51 +863,38 @@ impl<S: JitState> JitDriver<S> {
 
     /// Start bridge tracing from a guard failure point.
     ///
-    /// Builds meta/sym from the interpreter state at `resume_pc` and begins
-    /// a retrace on the MetaInterp. Returns `true` if tracing was started.
+    /// Uses the compiled loop's stored meta so that the sym's
+    /// storage_layout matches the parent loop's inputargs format.
+    /// `resume_pc` is where interpretation resumes after the guard failure.
+    /// `loop_header_pc` is the parent loop's back-edge target.
     pub fn start_bridge_tracing(
         &mut self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
         state: &mut S,
-        env: &S::Env,
-        resume_pc: usize,
+        _env: &S::Env,
+        _resume_pc: usize,
+        loop_header_pc: usize,
     ) -> bool {
-        let meta = state.build_meta(resume_pc, env);
-        let live_values = state.extract_live(& meta);
+        // Use the compiled loop's meta so the bridge's FINISH args
+        // match the parent loop's inputargs exactly.
+        let Some(loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+            return false;
+        };
+
+        let live_values = state.extract_live(&loop_meta);
 
         if !self.meta.start_retrace(green_key, fail_index, &live_values) {
             return false;
         }
 
-        self.sym = Some(S::create_sym(&meta, resume_pc));
-        self.trace_meta = Some(meta);
+        self.sym = Some(S::create_sym(&loop_meta, loop_header_pc));
+        self.trace_meta = Some(loop_meta);
+        self.bridge_info = Some((green_key, trace_id, fail_index));
         true
     }
 
-    /// Close an active bridge trace and compile it.
-    ///
-    /// Collects the symbolic jump args from the current sym (which represent
-    /// the loop header's live state), then calls `close_bridge_with_finish`
-    /// on MetaInterp to finish, optimize, and compile the bridge.
-    pub fn close_bridge_trace(
-        &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> bool {
-        let sym = match self.sym.take() {
-            Some(sym) => sym,
-            None => return false,
-        };
-        self.trace_meta = None;
-
-        let finish_args = S::collect_jump_args(&sym);
-
-        self.meta
-            .close_bridge_with_finish(green_key, trace_id, fail_index, &finish_args)
-    }
 }
 
 #[cfg(test)]

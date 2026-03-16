@@ -1,9 +1,9 @@
 use std::cell::Cell;
 use std::sync::Once;
 
+use pyre_object::PyObjectRef;
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::pyobject::is_int;
-use pyre_object::PyObjectRef;
 use pyre_runtime::{
     PyResult, dispatch_callable, register_jit_function_caller, w_builtin_func_get,
     w_func_get_code_ptr, w_func_get_globals,
@@ -252,19 +252,13 @@ extern "C" fn jit_bridge_compile_callee(
     constants.insert(func_const_ref.0, force_fn_ptr);
 
     // CALL_I(force_fn, frame_ptr) → result
-    let call_descr =
-        majit_meta::make_call_descr(&[Type::Int], Type::Int);
+    let call_descr = majit_meta::make_call_descr(&[Type::Int], Type::Int);
     let call_result = OpRef(1);
-    let mut call_op = Op::with_descr(
-        OpCode::CallI,
-        &[func_const_ref, frame_opref],
-        call_descr,
-    );
+    let mut call_op = Op::with_descr(OpCode::CallI, &[func_const_ref, frame_opref], call_descr);
     call_op.pos = call_result;
 
     // FINISH(result)
-    let finish_descr =
-        majit_meta::make_fail_descr_typed(vec![Type::Int]);
+    let finish_descr = majit_meta::make_fail_descr_typed(vec![Type::Int]);
     let mut finish_op = Op::with_descr(OpCode::Finish, &[call_result], finish_descr);
     finish_op.pos = OpRef(2);
 
@@ -343,11 +337,7 @@ pub extern "C" fn jit_create_callee_frame_0(caller_frame: i64, callable: i64) ->
     create_callee_frame_impl(caller_frame, callable, &[])
 }
 
-pub extern "C" fn jit_create_callee_frame_1(
-    caller_frame: i64,
-    callable: i64,
-    arg0: i64,
-) -> i64 {
+pub extern "C" fn jit_create_callee_frame_1(caller_frame: i64, callable: i64, arg0: i64) -> i64 {
     create_callee_frame_impl(caller_frame, callable, &[arg0 as PyObjectRef])
 }
 
