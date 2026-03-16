@@ -2642,8 +2642,9 @@ impl JitState for PyreJitState {
         meta: &Self::Meta,
         jump_args: &[OpRef],
     ) -> bool {
-        let _ = meta;
-        jump_args.len() == 1
+        // [frame, next_instr, stack_depth, locals..., stack...]
+        let expected = 3 + meta.num_locals + meta.stack_depth;
+        jump_args.len() == expected
     }
 }
 
