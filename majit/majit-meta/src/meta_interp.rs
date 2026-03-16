@@ -9,9 +9,9 @@ use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
 };
 use majit_opt::optimizer::Optimizer;
-use std::sync::Arc;
 use majit_trace::trace::Trace;
 use majit_trace::warmstate::{HotResult, WarmState};
+use std::sync::Arc;
 
 use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionState};
 use crate::io_buffer;
@@ -136,7 +136,13 @@ fn patch_new_loop_to_load_virtualizable_fields(
         array_lengths.to_vec()
     };
 
-    patch_with_array_lengths(info, original_inputargs, optimized_ops, constants, &effective_lengths)
+    patch_with_array_lengths(
+        info,
+        original_inputargs,
+        optimized_ops,
+        constants,
+        &effective_lengths,
+    )
 }
 
 /// Core preamble patching with explicit array lengths.
@@ -1101,18 +1107,10 @@ impl<M: Clone> MetaInterp<M> {
         // Patch: prepend virtualizable field loads as a preamble before the
         // loop body. Entry block reads fields from frame; Label defines the
         // loop header block params; JUMP targets them on the back-edge.
-        let (inputargs, optimized_ops) = if let Some(ref info) = self.virtualizable_info {
-            let (new_ia, new_ops) = patch_new_loop_to_load_virtualizable_fields(
-                info,
-                &inputargs,
-                optimized_ops,
-                &mut constants,
-                &self.vable_array_lengths,
-            );
-            (new_ia, new_ops)
-        } else {
-            (inputargs, optimized_ops)
-        };
+        // Preamble patching disabled — causes Cranelift SSA panic for
+        // functions with locals (Label args / JUMP args mismatch).
+        // TODO: fix preamble to correctly include all loop-carried values.
+        let (inputargs, optimized_ops) = (inputargs, optimized_ops);
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
@@ -1137,10 +1135,21 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
 
-        match self
-            .backend
-            .compile_loop(&inputargs, &optimized_ops, &mut token)
-        {
+        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.backend
+                .compile_loop(&inputargs, &optimized_ops, &mut token)
+        }));
+        let compile_result = match compile_result {
+            Ok(r) => r,
+            Err(_) => {
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit] compile_loop panicked, aborting trace at key={green_key}");
+                }
+                self.warm_state.abort_tracing(green_key, true);
+                return;
+            }
+        };
+        match compile_result {
             Ok(_) => {
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -6438,10 +6447,7 @@ mod tests {
                     source_guard: None,
                     pc: 30,
                     slot_types: None,
-                    values: vec![
-                        ReconstructedValue::Value(42),
-                        ReconstructedValue::Value(99),
-                    ],
+                    values: vec![ReconstructedValue::Value(42), ReconstructedValue::Value(99)],
                 },
             ],
             virtuals: Vec::new(),
@@ -6828,10 +6834,7 @@ mod tests {
                     source_guard: None,
                     pc: 30,
                     slot_types: None,
-                    values: vec![
-                        ReconstructedValue::Value(10),
-                        ReconstructedValue::Value(20),
-                    ],
+                    values: vec![ReconstructedValue::Value(10), ReconstructedValue::Value(20)],
                 },
             ],
             virtuals: vec![
@@ -6895,7 +6898,10 @@ mod tests {
             &ExceptionState::default(),
         );
 
-        assert!(restored, "nested frame restore with virtuals should succeed");
+        assert!(
+            restored,
+            "nested frame restore with virtuals should succeed"
+        );
         assert_eq!(
             state.restored_frames.len(),
             3,
