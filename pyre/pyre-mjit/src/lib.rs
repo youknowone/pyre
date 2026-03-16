@@ -22,6 +22,7 @@
 
 pub mod driver;
 pub mod eval;
+mod trace_verify;
 
 // Include auto-generated trace dispatch table and helpers
 include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));

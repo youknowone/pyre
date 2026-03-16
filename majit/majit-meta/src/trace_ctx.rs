@@ -141,6 +141,20 @@ pub struct TraceCtx {
 }
 
 impl TraceCtx {
+    /// Create a standalone TraceCtx for testing or external use.
+    pub fn for_test(num_inputs: usize) -> Self {
+        let mut recorder = TraceRecorder::new();
+        for _ in 0..num_inputs {
+            recorder.record_input_arg(majit_ir::Type::Int);
+        }
+        Self::new(recorder, 0)
+    }
+
+    /// Take the recorder out of this context (consumes self).
+    pub fn into_recorder(self) -> TraceRecorder {
+        self.recorder
+    }
+
     pub(crate) fn new(recorder: TraceRecorder, green_key: u64) -> Self {
         TraceCtx {
             recorder,
