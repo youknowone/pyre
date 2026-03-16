@@ -3526,35 +3526,71 @@ impl CraneliftBackend {
             builder.def_var(var(i as u32), val);
         }
 
-        // Find LABEL
+        // Find LABEL — when present, ops before it form the preamble
+        // (executed once in the entry block), and the Label's args define
+        // the loop header's block parameters.
         let label_idx = ops.iter().position(|op| op.opcode == OpCode::Label);
+
+        // Determine loop block parameter count: Label's args if present,
+        // otherwise num_inputs (backwards compatible).
+        let loop_param_count = label_idx
+            .map(|li| ops[li].args.len())
+            .unwrap_or(num_inputs);
 
         // Loop header block
         let loop_block = builder.create_block();
-        for _ in 0..num_inputs {
+        for _ in 0..loop_param_count {
             builder.append_block_param(loop_block, cl_types::I64);
         }
 
-        // Jump entry -> loop
-        {
-            let vals: Vec<CValue> = (0..num_inputs)
-                .map(|i| builder.use_var(var(i as u32)))
-                .collect();
-            builder.ins().jump(loop_block, &vals);
-        }
-
-        builder.switch_to_block(loop_block);
-        for i in 0..num_inputs {
-            let param = builder.block_params(loop_block)[i];
-            builder.def_var(var(i as u32), param);
-        }
-
-        // Emit body
+        // Preamble ops (0..label_idx) execute in the entry block.
+        // After them we jump to loop_block and emit the body.
         let body_start = label_idx.map_or(0, |i| i + 1);
         let mut guard_idx: usize = 0;
         let mut last_ovf_flag: Option<CValue> = None;
 
-        for op_idx in body_start..ops.len() {
+        // If no Label, jump entry -> loop immediately (old behavior)
+        if label_idx.is_none() {
+            let vals: Vec<CValue> = (0..num_inputs)
+                .map(|i| builder.use_var(var(i as u32)))
+                .collect();
+            builder.ins().jump(loop_block, &vals);
+            builder.switch_to_block(loop_block);
+            for i in 0..num_inputs {
+                let param = builder.block_params(loop_block)[i];
+                builder.def_var(var(i as u32), param);
+            }
+        }
+
+        for op_idx in 0..ops.len() {
+            // Skip ops before body_start when there's no Label
+            // (they don't exist in the no-label case since body_start=0)
+            if label_idx.is_none() && op_idx < body_start {
+                continue;
+            }
+
+            // When we reach the Label op, perform the entry->loop transition
+            if let Some(li) = label_idx {
+                if op_idx == li {
+                    // Jump entry -> loop with Label's arg values
+                    let vals: Vec<CValue> = ops[li]
+                        .args
+                        .iter()
+                        .map(|&r| resolve_opref(&mut builder, &constants, r))
+                        .collect();
+                    builder.ins().jump(loop_block, &vals);
+
+                    // Switch to loop block and bind block params
+                    builder.switch_to_block(loop_block);
+                    for (i, &arg_ref) in ops[li].args.iter().enumerate() {
+                        let param = builder.block_params(loop_block)[i];
+                        if !arg_ref.is_none() && !constants.contains_key(&arg_ref.0) {
+                            builder.def_var(var(arg_ref.0), param);
+                        }
+                    }
+                    continue; // skip emitting the Label op itself
+                }
+            }
             let op = &ops[op_idx];
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
 
