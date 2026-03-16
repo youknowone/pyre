@@ -136,6 +136,23 @@ pub trait GcAllocator: Send {
     fn gc_step(&mut self) -> bool {
         false
     }
+
+    /// Free memory associated with invalidated JIT compiled code.
+    fn jit_free(&mut self, _code_ptr: usize, _size: usize) {}
+
+    /// Pin a nursery object so it won't move during minor collection.
+    /// Returns true if pinning succeeded.
+    fn pin(&mut self, _obj: GcRef) -> bool {
+        false
+    }
+
+    /// Unpin a previously pinned object.
+    fn unpin(&mut self, _obj: GcRef) {}
+
+    /// Check if an object is pinned.
+    fn is_pinned(&self, _obj: GcRef) -> bool {
+        false
+    }
 }
 
 /// GC rewriter — transforms IR operations for GC integration.

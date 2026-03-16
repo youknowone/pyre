@@ -155,6 +155,10 @@ pub struct MiniMarkGC {
     /// Old-gen bytes at the end of the last completed major collection.
     /// Used to decide when to start the next incremental cycle.
     last_major_bytes: usize,
+    /// Pinned nursery objects that must not be moved during minor collection.
+    pinned_objects: HashSet<usize>,
+    /// Registry of compiled code regions for GC root scanning.
+    pub compiled_code_registry: CompiledCodeRegistry,
 }
 
 impl MiniMarkGC {
@@ -177,6 +181,8 @@ impl MiniMarkGC {
             major_collections: 0,
             incr_state: IncrementalMarkState::new(),
             last_major_bytes: 0,
+            pinned_objects: HashSet::new(),
+            compiled_code_registry: CompiledCodeRegistry::new(),
         }
     }
 
@@ -268,10 +274,15 @@ impl MiniMarkGC {
         // Phase 1: Process roots — copy nursery objects they point to.
         // We use raw pointers to avoid borrow checker issues since
         // copy_nursery_object mutates oldgen/nursery.
+        // Pinned objects are left in place (not copied to old gen).
         let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
         for root_ptr in roots {
             let gcref = unsafe { *root_ptr };
             if !gcref.is_null() && self.is_in_nursery(gcref.0) {
+                if self.pinned_objects.contains(&gcref.0) {
+                    // Pinned: leave the object in the nursery.
+                    continue;
+                }
                 let new_ref = self.copy_nursery_object(gcref.0);
                 unsafe {
                     *root_ptr = new_ref;
@@ -317,8 +328,12 @@ impl MiniMarkGC {
         self.remembered_set.clear();
         self.clear_all_cards();
 
-        // Reset nursery for new allocations.
-        self.nursery.reset();
+        // Reset nursery for new allocations, preserving pinned objects.
+        if self.pinned_objects.is_empty() {
+            self.nursery.reset();
+        } else {
+            self.reset_nursery_with_pinned();
+        }
 
         // Incremental marking piggyback: if an incremental cycle is in
         // progress, perform one bounded marking step.
@@ -337,7 +352,13 @@ impl MiniMarkGC {
 
     /// Copy a single nursery object to old gen.
     /// If already forwarded, returns the forwarding address.
+    /// Pinned objects are left in place and returned as-is.
     fn copy_nursery_object(&mut self, obj_addr: usize) -> GcRef {
+        // Pinned objects must stay in the nursery.
+        if self.pinned_objects.contains(&obj_addr) {
+            return GcRef(obj_addr);
+        }
+
         let hdr = unsafe { &mut *((obj_addr - GcHeader::SIZE) as *mut GcHeader) };
 
         // Already forwarded?
@@ -788,6 +809,108 @@ impl MiniMarkGC {
         }
     }
 
+    /// Reset the nursery while preserving pinned objects.
+    ///
+    /// Saves pinned object data, zeroes the nursery, restores pinned objects,
+    /// and sets the free pointer past the highest pinned object.
+    fn reset_nursery_with_pinned(&mut self) {
+        let nursery_start = self.nursery.start_ptr() as usize;
+
+        // Collect (header_start, total_size, data) for each pinned object.
+        let mut saved: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+        for &obj_addr in &self.pinned_objects {
+            let type_id = unsafe { header_of(obj_addr).type_id() };
+            let type_info = self.types.get(type_id);
+            let payload_size = if type_info.item_size > 0 {
+                let length =
+                    unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+                type_info.total_instance_size(length)
+            } else {
+                type_info.size
+            };
+            let total_size = (GcHeader::SIZE + payload_size).max(GcHeader::MIN_NURSERY_OBJ_SIZE);
+            let total_size = (total_size + 7) & !7;
+            let header_start = obj_addr - GcHeader::SIZE;
+            let data = unsafe {
+                std::slice::from_raw_parts(header_start as *const u8, total_size).to_vec()
+            };
+            saved.push((header_start, total_size, data));
+        }
+
+        // Zero-fill the entire nursery.
+        self.nursery.reset();
+
+        // Restore pinned objects and compute the highest end.
+        let mut max_end = nursery_start;
+        for (header_start, total_size, data) in &saved {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    *header_start as *mut u8,
+                    *total_size,
+                );
+            }
+            let end = header_start + total_size;
+            if end > max_end {
+                max_end = end;
+            }
+        }
+
+        // Set free pointer past the highest pinned object so new allocations
+        // don't overwrite it.
+        if max_end > nursery_start {
+            unsafe {
+                self.nursery.set_free_ptr(max_end as *mut u8);
+            }
+        }
+    }
+
+    /// Pin a nursery object so it won't be moved during minor collection.
+    /// Sets the PINNED flag in the object header and records the address.
+    /// Returns true if pinning succeeded, false if the object is null or
+    /// not in the nursery.
+    pub fn pin(&mut self, obj: GcRef) -> bool {
+        if obj.is_null() || !self.is_in_nursery(obj.0) {
+            return false;
+        }
+        unsafe {
+            header_of(obj.0).set_flag(flags::PINNED);
+        }
+        self.pinned_objects.insert(obj.0);
+        true
+    }
+
+    /// Unpin a previously pinned object.
+    pub fn unpin(&mut self, obj: GcRef) {
+        if obj.is_null() {
+            return;
+        }
+        // Clear the header flag if the object is still in the nursery.
+        if self.is_in_nursery(obj.0) {
+            unsafe {
+                header_of(obj.0).clear_flag(flags::PINNED);
+            }
+        }
+        self.pinned_objects.remove(&obj.0);
+    }
+
+    /// Check if an object is currently pinned.
+    pub fn is_pinned(&self, obj: GcRef) -> bool {
+        self.pinned_objects.contains(&obj.0)
+    }
+
+    /// Free memory associated with invalidated JIT compiled code.
+    ///
+    /// `code_ptr` and `size` identify the compiled code region to release.
+    /// The region is looked up and removed from the compiled code registry
+    /// so the GC no longer scans it for root references.
+    pub fn jit_free(&mut self, code_ptr: usize, size: usize) {
+        // Find and remove any compiled code region that matches the given range.
+        self.compiled_code_registry
+            .regions
+            .retain(|r| !(r.code_start == code_ptr && r.code_size == size));
+    }
+
     /// Number of objects in the remembered set (for testing / diagnostics).
     pub fn remembered_set_len(&self) -> usize {
         self.remembered_set.len()
@@ -1046,6 +1169,22 @@ impl GcAllocator for MiniMarkGC {
 
     fn gc_step(&mut self) -> bool {
         self.gc_step()
+    }
+
+    fn jit_free(&mut self, code_ptr: usize, size: usize) {
+        self.jit_free(code_ptr, size);
+    }
+
+    fn pin(&mut self, obj: GcRef) -> bool {
+        self.pin(obj)
+    }
+
+    fn unpin(&mut self, obj: GcRef) {
+        self.unpin(obj);
+    }
+
+    fn is_pinned(&self, obj: GcRef) -> bool {
+        self.is_pinned(obj)
     }
 }
 
@@ -2861,5 +3000,139 @@ mod tests {
         }
 
         gc.roots.clear();
+    }
+
+    // ── Pin / Unpin / jit_free tests ──
+
+    #[test]
+    fn test_pin_prevents_nursery_move() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(obj.0));
+
+        // Write a marker value.
+        unsafe {
+            *(obj.0 as *mut u64) = 0xCAFE_BABE;
+        }
+
+        // Pin the object and root it.
+        assert!(gc.pin(obj));
+        assert!(gc.is_pinned(obj));
+
+        let mut root = obj;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        // Trigger minor collection.
+        gc.do_collect_nursery();
+
+        // The root should still point to the same nursery address.
+        assert_eq!(root.0, obj.0);
+        assert!(gc.is_in_nursery(root.0));
+
+        // Data should be intact.
+        let val = unsafe { *(root.0 as *const u64) };
+        assert_eq!(val, 0xCAFE_BABE);
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_unpin_allows_move() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(obj.0));
+
+        // Write a marker.
+        unsafe {
+            *(obj.0 as *mut u64) = 0xDEAD_BEEF;
+        }
+
+        // Pin, then unpin.
+        assert!(gc.pin(obj));
+        gc.unpin(obj);
+        assert!(!gc.is_pinned(obj));
+
+        let mut root = obj;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        // Collection should now move the object to old gen.
+        gc.do_collect_nursery();
+
+        // The root should now point to old gen (different address).
+        assert!(!gc.is_in_nursery(root.0));
+        assert_ne!(root.0, obj.0);
+
+        // Data should be preserved after the move.
+        let val = unsafe { *(root.0 as *const u64) };
+        assert_eq!(val, 0xDEAD_BEEF);
+
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn test_is_pinned_query() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(0, 16);
+
+        // Not pinned by default.
+        assert!(!gc.is_pinned(obj));
+
+        // Pin it.
+        assert!(gc.pin(obj));
+        assert!(gc.is_pinned(obj));
+
+        // Null cannot be pinned.
+        assert!(!gc.pin(GcRef(0)));
+        assert!(!gc.is_pinned(GcRef(0)));
+
+        // Unpin.
+        gc.unpin(obj);
+        assert!(!gc.is_pinned(obj));
+    }
+
+    #[test]
+    fn test_jit_free_unregisters_code() {
+        let mut gc = test_gc(4096);
+
+        let smap = SafepointMap::new();
+        gc.compiled_code_registry.register(CompiledCodeRegion {
+            code_start: 0x1000,
+            code_size: 256,
+            safepoint_map: smap,
+            frame_size_slots: 4,
+            loop_token: 1,
+        });
+
+        let smap2 = SafepointMap::new();
+        gc.compiled_code_registry.register(CompiledCodeRegion {
+            code_start: 0x2000,
+            code_size: 512,
+            safepoint_map: smap2,
+            frame_size_slots: 8,
+            loop_token: 2,
+        });
+
+        assert_eq!(gc.compiled_code_registry.len(), 2);
+
+        // Free the first region.
+        gc.jit_free(0x1000, 256);
+
+        assert_eq!(gc.compiled_code_registry.len(), 1);
+        assert!(gc.compiled_code_registry.find_region(0x1050).is_none());
+        assert!(gc.compiled_code_registry.find_region(0x2050).is_some());
+
+        // Free the second region.
+        gc.jit_free(0x2000, 512);
+        assert_eq!(gc.compiled_code_registry.len(), 0);
     }
 }
