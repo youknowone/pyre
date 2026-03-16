@@ -234,10 +234,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             StepResult::Continue => {}
             StepResult::CloseLoop(_) => {
                 let mut jit_state = build_jit_state(frame, info);
-                driver.set_vable_array_lengths(vec![
-                    jit_state.local_count(),
-                    jit_state.stack_depth,
-                ]);
+                driver
+                    .set_vable_array_lengths(vec![jit_state.local_count(), jit_state.stack_depth]);
                 if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
                     frame.code as u64,
                     frame.next_instr,
@@ -279,10 +277,7 @@ fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if driver.has_compiled_loop(green_key) {
         let env = PyreEnv;
         let mut jit_state = build_jit_state(frame, info);
-        driver.set_vable_array_lengths(vec![
-            jit_state.local_count(),
-            jit_state.stack_depth,
-        ]);
+        driver.set_vable_array_lengths(vec![jit_state.local_count(), jit_state.stack_depth]);
         if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
             green_key,
             frame.next_instr,
