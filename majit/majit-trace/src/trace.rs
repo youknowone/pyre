@@ -307,4 +307,229 @@ mod tests {
             vec![OpCode::IntAdd, OpCode::IntMul, OpCode::IntSub, OpCode::Jump]
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // History breadth tests — deeper parity with test_history.py
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_trace_ops_with_descrs() {
+        // Ops can carry descriptors (field descrs, call descrs).
+        use majit_ir::DescrRef;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct TestDescr(u32);
+        impl majit_ir::Descr for TestDescr {
+            fn index(&self) -> u32 {
+                self.0
+            }
+        }
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let descr: DescrRef = Arc::new(TestDescr(42));
+        let ops = vec![
+            Op::with_descr(OpCode::CallI, &[OpRef(0)], descr.clone()),
+            Op::with_descr(OpCode::GuardTrue, &[OpRef(0)], descr.clone()),
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
+        ];
+        let trace = Trace::new(inputargs, ops);
+
+        // Call op has descr
+        assert!(trace.ops[0].descr.is_some());
+        assert_eq!(trace.ops[0].descr.as_ref().unwrap().index(), 42);
+        // Guard op has descr
+        assert!(trace.ops[1].descr.is_some());
+        assert_eq!(trace.ops[1].descr.as_ref().unwrap().index(), 42);
+        // Jump op has no descr
+        assert!(trace.ops[2].descr.is_none());
+    }
+
+    #[test]
+    fn test_trace_iteration_order_matches_recording() {
+        // Iteration order must match the order in which ops were recorded.
+        let inputargs = vec![InputArg::new_int(0)];
+        let expected_opcodes = vec![
+            OpCode::IntAdd,
+            OpCode::IntSub,
+            OpCode::IntMul,
+            OpCode::IntNeg,
+            OpCode::IntLt,
+            OpCode::Jump,
+        ];
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
+            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(0)]),
+            Op::new(OpCode::IntMul, &[OpRef(2), OpRef(0)]),
+            Op::new(OpCode::IntNeg, &[OpRef(3)]),
+            Op::new(OpCode::IntLt, &[OpRef(4), OpRef(0)]),
+            Op::new(OpCode::Jump, &[OpRef(4)]),
+        ];
+        let trace = Trace::new(inputargs, ops);
+
+        let actual: Vec<_> = trace.iter_ops().map(|op| op.opcode).collect();
+        assert_eq!(actual, expected_opcodes);
+    }
+
+    #[test]
+    fn test_trace_is_immutable_snapshot() {
+        // After creation, Trace fields are only accessible as immutable references.
+        // Verify that cloning a trace produces an independent copy.
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
+            Op::new(OpCode::Jump, &[OpRef(1)]),
+        ];
+        let trace = Trace::new(inputargs, ops);
+        let trace2 = trace.clone();
+
+        assert_eq!(trace.num_ops(), trace2.num_ops());
+        assert_eq!(trace.num_inputargs(), trace2.num_inputargs());
+        assert_eq!(trace.is_loop(), trace2.is_loop());
+    }
+
+    #[test]
+    fn test_trace_stress_100_ops() {
+        // Stress test: a trace with 100+ operations.
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut ops = Vec::new();
+        let mut prev = OpRef(0);
+        for i in 0..100 {
+            let mut op = Op::new(OpCode::IntAdd, &[prev, OpRef(0)]);
+            op.pos = OpRef(i + 1);
+            ops.push(op);
+            prev = OpRef(i + 1);
+        }
+        ops.push(Op::new(OpCode::Jump, &[prev]));
+        let trace = Trace::new(inputargs, ops);
+
+        assert_eq!(trace.num_ops(), 101); // 100 IntAdd + 1 Jump
+        assert!(trace.is_loop());
+
+        // Verify first and last ops
+        assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
+        assert_eq!(trace.ops[99].opcode, OpCode::IntAdd);
+        assert_eq!(trace.ops[100].opcode, OpCode::Jump);
+
+        // All intermediate ops should be IntAdd
+        for op in &trace.ops[..100] {
+            assert_eq!(op.opcode, OpCode::IntAdd);
+        }
+    }
+
+    #[test]
+    fn test_trace_guard_fail_args_reference_valid_refs() {
+        // fail_args must reference valid input or op refs.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+
+        let add_op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef(2)]);
+        // fail_args referencing input args (0, 1) and the add result (2)
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]);
+
+        let ops = vec![
+            add_op,
+            guard_op,
+            Op::new(OpCode::Jump, &[OpRef(2), OpRef(1)]),
+        ];
+        let trace = Trace::new(inputargs, ops);
+
+        let guard = trace.iter_guards().next().unwrap();
+        let fa = guard.fail_args.as_ref().unwrap();
+        // All referenced OpRefs are valid: 0, 1 are inputargs; 2 is the add op
+        assert!(fa.iter().all(|r| r.0 <= 2));
+        assert_eq!(fa.len(), 3);
+    }
+
+    #[test]
+    fn test_trace_many_guards_with_varying_fail_args() {
+        // Multiple guards with varying fail_args sizes.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+
+        let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef(0)]);
+        g0.fail_args = Some(smallvec::smallvec![]);
+
+        let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef(1)]);
+        g1.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+
+        let add = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+
+        let mut g2 = Op::new(OpCode::GuardTrue, &[OpRef(0)]);
+        g2.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]);
+
+        let ops = vec![
+            g0,
+            g1,
+            add,
+            g2,
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
+        ];
+        let trace = Trace::new(inputargs, ops);
+
+        let guards: Vec<_> = trace.iter_guards().collect();
+        assert_eq!(guards.len(), 3);
+        assert_eq!(guards[0].fail_args.as_ref().unwrap().len(), 0);
+        assert_eq!(guards[1].fail_args.as_ref().unwrap().len(), 1);
+        assert_eq!(guards[2].fail_args.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_trace_get_op_returns_correct_positions() {
+        // get_op with valid and invalid indices.
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
+            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(0)]),
+            Op::new(OpCode::IntMul, &[OpRef(2), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(3)]),
+        ];
+        let trace = Trace::new(inputargs, ops);
+
+        assert_eq!(trace.get_op(OpRef(0)).unwrap().opcode, OpCode::IntAdd);
+        assert_eq!(trace.get_op(OpRef(1)).unwrap().opcode, OpCode::IntSub);
+        assert_eq!(trace.get_op(OpRef(2)).unwrap().opcode, OpCode::IntMul);
+        assert_eq!(trace.get_op(OpRef(3)).unwrap().opcode, OpCode::Jump);
+        assert!(trace.get_op(OpRef(4)).is_none());
+        assert!(trace.get_op(OpRef(100)).is_none());
+    }
+
+    #[test]
+    fn test_trace_clone_independence() {
+        // Modifications to a cloned trace do not affect the original.
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
+            Op::new(OpCode::Jump, &[OpRef(1)]),
+        ];
+        let trace = Trace::new(inputargs, ops);
+        let mut trace2 = trace.clone();
+
+        trace2.ops.push(Op::new(OpCode::IntSub, &[OpRef(0), OpRef(0)]));
+        assert_eq!(trace.num_ops(), 2);
+        assert_eq!(trace2.num_ops(), 3);
+    }
+
+    #[test]
+    fn test_trace_only_guards_in_iter_guards() {
+        // iter_guards must skip all non-guard ops, even in a complex trace.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef(2)]),
+            Op::new(OpCode::IntMul, &[OpRef(2), OpRef(3)]),
+            Op::new(OpCode::IntNeg, &[OpRef(4)]),
+            Op::new(OpCode::GuardFalse, &[OpRef(5)]),
+            Op::new(OpCode::IntLt, &[OpRef(4), OpRef(5)]),
+            Op::new(OpCode::GuardNoException, &[]),
+            Op::new(OpCode::Jump, &[OpRef(4), OpRef(5)]),
+        ];
+        let trace = Trace::new(inputargs, ops);
+
+        let guard_opcodes: Vec<_> = trace.iter_guards().map(|op| op.opcode).collect();
+        assert_eq!(
+            guard_opcodes,
+            vec![OpCode::GuardTrue, OpCode::GuardFalse, OpCode::GuardNoException]
+        );
+    }
 }
