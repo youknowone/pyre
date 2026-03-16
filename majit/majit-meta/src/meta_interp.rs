@@ -5653,11 +5653,7 @@ mod tests {
     #[test]
     fn test_multi_frame_restore_uses_frame_stack_metadata() {
         use crate::jit_state::JitState;
-        use crate::resume::{
-            ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary,
-            ResumeValueKind, ResumeValueLayoutSummary,
-        };
-        use majit_codegen::ExitValueSourceLayout;
+        use crate::resume::{ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary};
 
         // JitState implementation that records per-frame restores.
         #[derive(Default)]
