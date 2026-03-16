@@ -37,7 +37,7 @@ use crate::jit::descr::{
     list_items_heap_cap_descr, list_items_len_descr, list_items_ptr_descr, make_array_descr,
     make_field_descr, namespace_values_len_descr, namespace_values_ptr_descr, ob_type_descr,
     range_iter_current_descr, range_iter_step_descr, range_iter_stop_descr, str_len_descr,
-    tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr, w_int_size_descr,
+    tuple_items_len_descr, tuple_items_ptr_descr, w_int_size_descr,
 };
 use crate::jit::frame_layout::{
     PYFRAME_LOCALS_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
@@ -619,11 +619,6 @@ impl TraceFrameState {
         ctx.record_op_with_descr(OpCode::GetfieldRawI, &[bool_obj], bool_boolval_descr())
     }
 
-    fn trace_guarded_float_payload(&mut self, ctx: &mut TraceCtx, float_obj: OpRef) -> OpRef {
-        self.guard_object_class(ctx, float_obj, &FLOAT_TYPE as *const PyType);
-        ctx.record_op_with_descr(OpCode::GetfieldRawF, &[float_obj], float_floatval_descr())
-    }
-
     fn concrete_binary_int_operands(&self) -> Option<(i64, i64)> {
         let (lhs, rhs) = self.concrete_binary_operands()?;
         unsafe {
@@ -667,15 +662,6 @@ impl TraceFrameState {
             int_intval_descr(),
             &INT_TYPE as *const _ as i64,
         )
-    }
-
-    fn trace_boxed_float_value(&self, ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-        let bits = ctx.record_op(OpCode::ConvertFloatBytesToLonglong, &[value]);
-        let obj = ctx.record_op_with_descr(OpCode::New, &[], w_float_size_descr());
-        let type_ptr = ctx.const_int(&FLOAT_TYPE as *const PyType as usize as i64);
-        ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, type_ptr], ob_type_descr());
-        ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, bits], float_floatval_descr());
-        obj
     }
 
     fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
@@ -997,10 +983,20 @@ impl TraceFrameState {
         };
 
         self.with_ctx(|this, ctx| {
-            let lhs = this.trace_guarded_float_payload(ctx, a);
-            let rhs = this.trace_guarded_float_payload(ctx, b);
-            let result = ctx.record_op(op_code, &[lhs, rhs]);
-            Ok(this.trace_boxed_float_value(ctx, result))
+            let fail_args = this.current_fail_args(ctx);
+            let float_type_addr = &FLOAT_TYPE as *const _ as i64;
+            let result = crate::jit::generated::trace_float_binop(
+                ctx,
+                a,
+                b,
+                op_code,
+                float_type_addr,
+                crate::jit::descr::ob_type_descr(),
+                crate::jit::descr::float_floatval_descr(),
+                crate::jit::descr::w_float_size_descr(),
+                &fail_args,
+            );
+            Ok(result)
         })
     }
 
@@ -1050,9 +1046,18 @@ impl TraceFrameState {
                     ComparisonOperator::NotEqual => OpCode::FloatNe,
                 };
                 return self.with_ctx(|this, ctx| {
-                    let lhs = this.trace_guarded_float_payload(ctx, a);
-                    let rhs = this.trace_guarded_float_payload(ctx, b);
-                    let truth = ctx.record_op(cmp, &[lhs, rhs]);
+                    let fail_args = this.current_fail_args(ctx);
+                    let float_type_addr = &FLOAT_TYPE as *const _ as i64;
+                    let truth = crate::jit::generated::trace_float_compare(
+                        ctx,
+                        a,
+                        b,
+                        cmp,
+                        float_type_addr,
+                        ob_type_descr(),
+                        float_floatval_descr(),
+                        &fail_args,
+                    );
                     Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
                 });
             }
@@ -1655,7 +1660,16 @@ impl TraceFrameState {
             }
             if is_float(concrete_value) {
                 return self.with_ctx(|this, ctx| {
-                    let float_value = this.trace_guarded_float_payload(ctx, value);
+                    let fail_args = this.current_fail_args(ctx);
+                    let float_type_addr = &FLOAT_TYPE as *const _ as i64;
+                    let float_value = crate::jit::generated::trace_unbox_float(
+                        ctx,
+                        value,
+                        float_type_addr,
+                        ob_type_descr(),
+                        float_floatval_descr(),
+                        &fail_args,
+                    );
                     let zero = ctx.const_int(0);
                     let zero_float = ctx.record_op(OpCode::CastIntToFloat, &[zero]);
                     Ok(ctx.record_op(OpCode::FloatNe, &[float_value, zero_float]))
