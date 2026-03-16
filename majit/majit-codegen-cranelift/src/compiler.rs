@@ -3516,13 +3516,18 @@ impl CraneliftBackend {
         for i in 0..num_inputs {
             builder.declare_var(var(i as u32), cl_types::I64);
         }
-        // Declare variables for op results (skip positions already covered by inputs)
+        // Declare variables for op results
+        let mut declared_vars = std::collections::HashSet::new();
+        for i in 0..num_inputs {
+            declared_vars.insert(i as u32);
+        }
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
                 let vi = op_var_index(op, op_idx, num_inputs);
-                if vi < num_inputs {
-                    continue; // already declared as input variable
+                if declared_vars.contains(&(vi as u32)) {
+                    continue; // already declared
                 }
+                declared_vars.insert(vi as u32);
                 let cl_type = if vec_oprefs.contains(&(vi as u32)) {
                     if is_vec_float_producing(op.opcode) {
                         cl_types::F64X2
@@ -4487,9 +4492,11 @@ impl CraneliftBackend {
                         let slot_addr = dispatch_slot_addr.unwrap();
 
                         // For self-recursion (target unknown), use safe defaults
-                        let out_slots = resolved_target.as_ref()
+                        let out_slots = resolved_target
+                            .as_ref()
                             .map_or(16, |t| t.max_output_slots.max(1));
-                        let num_ref_roots = resolved_target.as_ref()
+                        let num_ref_roots = resolved_target
+                            .as_ref()
                             .map_or(8, |t| t.num_ref_roots.max(1));
                         // finish_idx: known from target, or -1 to skip finish check
                         // (runtime: any non-negative fail_index that matches is finish)
@@ -4526,8 +4533,10 @@ impl CraneliftBackend {
                         let shim_fallback_block = builder.create_block();
                         builder.ins().brif(
                             is_null,
-                            shim_fallback_block, &[],
-                            direct_call_block, &[],
+                            shim_fallback_block,
+                            &[],
+                            direct_call_block,
+                            &[],
                         );
 
                         builder.switch_to_block(direct_call_block);
