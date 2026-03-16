@@ -98,6 +98,8 @@ pub struct PyreSym {
     pub(crate) stack_array_ref: OpRef,
     pub(crate) stack_depth: usize,
     pub(crate) symbolic_initialized: bool,
+    pub(crate) vable_next_instr: OpRef,
+    pub(crate) vable_stack_depth: OpRef,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -124,7 +126,7 @@ fn pyre_driver_descriptor() -> JitDriverDescriptor {
         .get_or_init(|| {
             JitDriverDescriptor::with_virtualizable(
                 Vec::new(),
-                vec![("frame", Type::Int)],
+                vec![("frame", Type::Int), ("next_instr", Type::Int), ("stack_depth", Type::Int)],
                 Some("frame"),
             )
         })
@@ -261,11 +263,13 @@ pub(crate) fn concrete_namespace_slot(frame: usize, name: &str) -> Option<usize>
 pub(crate) fn record_current_state_guard(
     ctx: &mut TraceCtx,
     frame: OpRef,
+    next_instr: OpRef,
+    stack_depth: OpRef,
     opcode: OpCode,
     args: &[OpRef],
 ) {
-    let fail_args = vec![frame];
-    let fail_arg_types = vec![Type::Int];
+    let fail_args = vec![frame, next_instr, stack_depth];
+    let fail_arg_types = vec![Type::Int, Type::Int, Type::Int];
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
 
@@ -283,6 +287,8 @@ impl PyreSym {
             stack_array_ref: OpRef::NONE,
             stack_depth: 0,
             symbolic_initialized: false,
+            vable_next_instr: OpRef::NONE,
+            vable_stack_depth: OpRef::NONE,
         }
     }
 
@@ -536,24 +542,25 @@ impl TraceFrameState {
         }
         if s.dirty_stack_depth {
             let depth = ctx.const_int(s.stack_depth as i64);
-            frame_set_stack_depth(ctx, s.frame, depth);
+            s.vable_stack_depth = depth;
             s.dirty_stack_depth = false;
         }
         if let Some(pc) = s.pending_next_instr.take() {
             let target = ctx.const_int(pc as i64);
-            frame_set_next_instr(ctx, s.frame, target);
+            s.vable_next_instr = target;
         }
     }
 
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame(ctx);
-        vec![self.sym().frame]
+        let s = self.sym();
+        vec![s.frame, s.vable_next_instr, s.vable_stack_depth]
     }
 
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         self.flush_to_frame(ctx);
-        let frame = self.sym().frame;
-        record_current_state_guard(ctx, frame, opcode, args);
+        let s = self.sym();
+        record_current_state_guard(ctx, s.frame, s.vable_next_instr, s.vable_stack_depth, opcode, args);
     }
 
     pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
@@ -2452,12 +2459,15 @@ impl JitState for PyreJitState {
     }
 
     fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
-        vec![self.frame as i64]
+        vec![self.frame as i64, self.next_instr as i64, self.stack_depth as i64]
     }
 
     fn create_sym(meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
         let _ = meta;
-        PyreSym::new_uninit(OpRef(0))
+        let mut sym = PyreSym::new_uninit(OpRef(0));
+        sym.vable_next_instr = OpRef(1);
+        sym.vable_stack_depth = OpRef(2);
+        sym
     }
 
     fn driver_descriptor(&self, meta: &Self::Meta) -> Option<JitDriverDescriptor> {

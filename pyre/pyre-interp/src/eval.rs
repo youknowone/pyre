@@ -24,9 +24,9 @@ use pyre_runtime::{
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 
-use majit_meta::{DetailedDriverRunOutcome, JitDriver};
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
+use majit_meta::{DetailedDriverRunOutcome, JitDriver};
 
 use crate::call::{call_callable, install_jit_call_bridge};
 use crate::frame::{PyFrame, build_pyframe_virtualizable_info};
@@ -803,7 +803,8 @@ mod tests {
         let meta = <PyreJitState as JitState>::build_meta(&jit_state, frame.next_instr, &PyreEnv);
         let live = <PyreJitState as JitState>::extract_live(&jit_state, &meta);
 
-        assert_eq!(live, vec![(&frame as *const PyFrame as usize) as i64]);
+        let frame_ptr = (&frame as *const PyFrame as usize) as i64;
+        assert_eq!(live, vec![frame_ptr, 7, 1]); // frame, next_instr, stack_depth
     }
 
     #[test]
