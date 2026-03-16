@@ -2311,4 +2311,177 @@ mod tests {
             "quasi-immut on field 0 should not affect field 1"
         );
     }
+
+    // ── Test 53: Bytearray-as-array heap cache verification ──
+    //
+    // RPython treats bytearray as regular arrays with item_size=1.
+    // Verify the heap cache works correctly with byte-sized array items.
+
+    /// Array descriptor with item_size=1 (byte array).
+    #[derive(Debug)]
+    struct ByteArrayDescr(u32);
+
+    impl Descr for ByteArrayDescr {
+        fn index(&self) -> u32 {
+            self.0
+        }
+        fn as_array_descr(&self) -> Option<&dyn majit_ir::ArrayDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::ArrayDescr for ByteArrayDescr {
+        fn base_size(&self) -> usize {
+            8 // typical GC header
+        }
+        fn item_size(&self) -> usize {
+            1 // byte-sized items
+        }
+        fn type_id(&self) -> u32 {
+            0
+        }
+        fn item_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Int
+        }
+    }
+
+    fn byte_array_descr(idx: u32) -> DescrRef {
+        Arc::new(ByteArrayDescr(idx))
+    }
+
+    #[test]
+    fn test_bytearray_setitem_then_getitem_cached() {
+        // setarrayitem_gc(p0, idx, val, descr=byte_array)
+        // i2 = getarrayitem_gc_i(p0, idx, descr=byte_array)  <- eliminated
+        let d = byte_array_descr(50);
+        let idx = OpRef(60);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(100), idx, OpRef(101)],
+                d.clone(),
+            ),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(idx, majit_ir::Value::Int(5)); // byte index 5
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Remove => {}
+                PassResult::Replace(replaced) => { ctx.emit(replaced); }
+                PassResult::PassOn => { ctx.emit(resolved); }
+            }
+        }
+
+        // SETARRAYITEM_GC (forced at Jump) + Jump. GETARRAYITEM eliminated.
+        let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![OpCode::SetarrayitemGc, OpCode::Jump],
+            "byte-array getitem should be cached after setitem"
+        );
+    }
+
+    #[test]
+    fn test_bytearray_different_indices_not_cached() {
+        // setarrayitem_gc(p0, idx=5, val, descr=byte_array)
+        // i2 = getarrayitem_gc_i(p0, idx=6, descr=byte_array)  <- NOT cached (different index)
+        let d = byte_array_descr(50);
+        let idx5 = OpRef(60);
+        let idx6 = OpRef(61);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(100), idx5, OpRef(101)],
+                d.clone(),
+            ),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx6], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(idx5, majit_ir::Value::Int(5));
+        ctx.make_constant(idx6, majit_ir::Value::Int(6));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Remove => {}
+                PassResult::Replace(replaced) => { ctx.emit(replaced); }
+                PassResult::PassOn => { ctx.emit(resolved); }
+            }
+        }
+
+        // GETARRAYITEM must be emitted (not cached — different index).
+        let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
+        assert!(
+            opcodes.contains(&OpCode::GetarrayitemGcI),
+            "different byte-array index should not use cache: {:?}",
+            opcodes
+        );
+    }
+
+    #[test]
+    fn test_bytearray_read_after_read_cached() {
+        // i1 = getarrayitem_gc_i(p0, idx=3, descr=byte_array)
+        // i2 = getarrayitem_gc_i(p0, idx=3, descr=byte_array)  <- eliminated (same read)
+        let d = byte_array_descr(50);
+        let idx = OpRef(60);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone()),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(idx, majit_ir::Value::Int(3));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Remove => {}
+                PassResult::Replace(replaced) => { ctx.emit(replaced); }
+                PassResult::PassOn => { ctx.emit(resolved); }
+            }
+        }
+
+        // Only one GETARRAYITEM + Jump: the second read is eliminated.
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "byte-array read-after-read should be cached"
+        );
+    }
 }

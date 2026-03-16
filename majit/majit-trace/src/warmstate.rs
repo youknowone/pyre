@@ -68,6 +68,83 @@ pub enum JitState {
     Compiled(LoopToken),
 }
 
+/// Generation-based loop aging. Loops not accessed for `max_age`
+/// generations are candidates for eviction.
+///
+/// Reference: rpython/jit/metainterp/memmgr.py MemoryManager.
+pub struct LoopAging {
+    generation: u64,
+    max_age: u64,
+    /// loop_key → last access generation.
+    loop_generations: HashMap<u64, u64>,
+}
+
+impl LoopAging {
+    /// Create a new LoopAging with the given max_age.
+    /// `max_age == 0` disables eviction.
+    pub fn new(max_age: u64) -> Self {
+        LoopAging {
+            generation: 0,
+            max_age,
+            loop_generations: HashMap::new(),
+        }
+    }
+
+    /// Set the maximum age before eviction.
+    pub fn set_max_age(&mut self, max_age: u64) {
+        self.max_age = max_age;
+    }
+
+    /// Get the current max_age setting.
+    pub fn max_age(&self) -> u64 {
+        self.max_age
+    }
+
+    /// Mark a loop as alive in the current generation.
+    pub fn keep_loop_alive(&mut self, loop_key: u64) {
+        self.loop_generations.insert(loop_key, self.generation);
+    }
+
+    /// Register a new loop at the current generation.
+    pub fn register_loop(&mut self, loop_key: u64) {
+        self.loop_generations.insert(loop_key, self.generation);
+    }
+
+    /// Advance the generation counter. Returns the set of loop keys
+    /// that are now too old and should be evicted.
+    pub fn next_generation(&mut self) -> Vec<u64> {
+        self.generation += 1;
+
+        if self.max_age == 0 {
+            return vec![];
+        }
+
+        let threshold = self.generation.saturating_sub(self.max_age);
+        let evicted: Vec<u64> = self
+            .loop_generations
+            .iter()
+            .filter(|&(_, &last_access)| last_access < threshold)
+            .map(|(&key, _)| key)
+            .collect();
+
+        for key in &evicted {
+            self.loop_generations.remove(key);
+        }
+
+        evicted
+    }
+
+    /// Get the current generation number.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Number of tracked loops.
+    pub fn alive_count(&self) -> usize {
+        self.loop_generations.len()
+    }
+}
+
 /// Warm state manager — the orchestrator of the JIT lifecycle.
 ///
 /// Keeps track of per-greenkey cells and the global hot counter.
@@ -966,5 +1043,101 @@ mod tests {
         // Second invalidation should find no deps.
         let count = ws.invalidate_quasiimmut(qmut_key);
         assert_eq!(count, 0);
+    }
+
+    // ── Loop aging (memmgr parity) tests ──
+    //
+    // Ported from rpython/jit/metainterp/test/test_memmgr.py.
+
+    #[test]
+    fn test_loop_aging_basic() {
+        // Loops not accessed for max_age generations are evicted.
+        let mut aging = LoopAging::new(3);
+
+        aging.register_loop(1);
+        aging.register_loop(2);
+        assert_eq!(aging.alive_count(), 2);
+
+        // Advance 3 generations without refreshing.
+        let evicted = aging.next_generation(); // gen 1
+        assert!(evicted.is_empty());
+        let evicted = aging.next_generation(); // gen 2
+        assert!(evicted.is_empty());
+        let evicted = aging.next_generation(); // gen 3
+        assert!(evicted.is_empty());
+
+        // gen 4: loops registered at gen 0, threshold = 4-3 = 1, 0 < 1 → evict
+        let evicted = aging.next_generation();
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(aging.alive_count(), 0);
+    }
+
+    #[test]
+    fn test_loop_aging_disabled() {
+        // max_age=0 disables eviction entirely.
+        let mut aging = LoopAging::new(0);
+
+        aging.register_loop(1);
+        aging.register_loop(2);
+
+        for _ in 0..100 {
+            let evicted = aging.next_generation();
+            assert!(evicted.is_empty());
+        }
+        assert_eq!(aging.alive_count(), 2);
+    }
+
+    #[test]
+    fn test_loop_aging_refresh() {
+        // Accessing a loop resets its age.
+        let mut aging = LoopAging::new(3);
+
+        aging.register_loop(1);
+        aging.register_loop(2);
+
+        // Advance 2 generations, refreshing loop 1 each time.
+        aging.next_generation(); // gen 1
+        aging.keep_loop_alive(1);
+        aging.next_generation(); // gen 2
+        aging.keep_loop_alive(1);
+        aging.next_generation(); // gen 3
+
+        // gen 4: loop 2 was registered at gen 0, threshold = 4-3=1, 0 < 1 → evict
+        // loop 1 was refreshed at gen 2, 2 >= 1 → alive
+        let evicted = aging.next_generation();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0], 2);
+        assert_eq!(aging.alive_count(), 1);
+
+        // Keep refreshing loop 1 — it should never be evicted.
+        aging.keep_loop_alive(1);
+        for _ in 0..10 {
+            let evicted = aging.next_generation();
+            assert!(evicted.is_empty());
+            aging.keep_loop_alive(1);
+        }
+        assert_eq!(aging.alive_count(), 1);
+    }
+
+    #[test]
+    fn test_loop_aging_mixed() {
+        // Mix of registering at different generations.
+        let mut aging = LoopAging::new(2);
+
+        aging.register_loop(1); // registered at gen 0
+        aging.next_generation(); // gen 1
+        aging.register_loop(2); // registered at gen 1
+
+        // gen 2: threshold = 2-2=0, loop 1 at gen 0: 0 >= 0 → alive,
+        //        loop 2 at gen 1: 1 >= 0 → alive
+        let evicted = aging.next_generation();
+        assert!(evicted.is_empty());
+
+        // gen 3: threshold = 3-2=1, loop 1 at gen 0: 0 < 1 → evict,
+        //        loop 2 at gen 1: 1 >= 1 → alive
+        let evicted = aging.next_generation();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0], 1);
+        assert_eq!(aging.alive_count(), 1);
     }
 }
