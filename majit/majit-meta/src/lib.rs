@@ -39,7 +39,7 @@ pub use fail_descr::{make_fail_descr, make_fail_descr_typed};
 pub use io_buffer::{
     emit_commit_io, io_buffer_commit, io_buffer_discard, io_buffer_write, io_buffer_write_fmt,
 };
-pub use jit_state::{JitState, PendingFieldWriteLayout};
+pub use jit_state::{DeoptMaterializationCache, JitState, PendingFieldWriteLayout};
 pub use jitcode::{
     trace_jitcode, ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
     JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
