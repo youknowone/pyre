@@ -911,34 +911,61 @@ static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<extern "C" fn(i64, u32, u64, u64) -> i
 const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
 
 // ── Call-assembler dispatch table ──
-// Each token gets a stable pointer slot holding the current code_ptr.
-// Compiled code loads code_ptr from the slot via a single memory read.
-// redirect_call_assembler updates the slot atomically.
+// Each token gets a stable dispatch entry holding code_ptr + finish_index.
+// Compiled code loads both from the entry via memory reads.
+// redirect_call_assembler / register_call_assembler_target update atomically.
 use std::sync::atomic::AtomicPtr;
 
-fn ca_dispatch_table() -> &'static Mutex<HashMap<u64, Box<AtomicPtr<u8>>>> {
-    static TABLE: OnceLock<Mutex<HashMap<u64, Box<AtomicPtr<u8>>>>> = OnceLock::new();
+/// Dispatch entry: code_ptr at offset 0, finish_index at offset 8.
+/// Laid out as two 8-byte words so Cranelift can load them directly.
+#[repr(C)]
+struct CaDispatchEntry {
+    code_ptr: AtomicPtr<u8>,
+    finish_index: AtomicU64,
+}
+
+/// Sentinel: finish_index not yet known (self-recursion before compile).
+const CA_FINISH_INDEX_UNKNOWN: u64 = u64::MAX;
+
+fn ca_dispatch_table() -> &'static Mutex<HashMap<u64, Box<CaDispatchEntry>>> {
+    static TABLE: OnceLock<Mutex<HashMap<u64, Box<CaDispatchEntry>>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Get or create the stable dispatch slot for a token.
-/// Returns the address of the AtomicPtr, which is stable for the
-/// lifetime of the process (Box never moves).
-fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const AtomicPtr<u8> {
+/// Get or create the stable dispatch entry for a token.
+/// Returns the address of the entry (stable for process lifetime).
+fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatchEntry {
     let mut table = ca_dispatch_table().lock().unwrap();
-    let slot = table
-        .entry(token_number)
-        .or_insert_with(|| Box::new(AtomicPtr::new(code_ptr as *mut u8)));
-    // Update if code_ptr changed (e.g., recompilation)
-    slot.store(code_ptr as *mut u8, Ordering::Release);
-    &**slot as *const AtomicPtr<u8>
+    let entry = table.entry(token_number).or_insert_with(|| {
+        Box::new(CaDispatchEntry {
+            code_ptr: AtomicPtr::new(code_ptr as *mut u8),
+            finish_index: AtomicU64::new(CA_FINISH_INDEX_UNKNOWN),
+        })
+    });
+    // Update code_ptr if changed (e.g., recompilation)
+    entry
+        .code_ptr
+        .store(code_ptr as *mut u8, Ordering::Release);
+    &**entry as *const CaDispatchEntry
+}
+
+/// Update the finish_index for a token's dispatch entry.
+fn ca_dispatch_set_finish_index(token_number: u64, finish_index: u32) {
+    let table = ca_dispatch_table().lock().unwrap();
+    if let Some(entry) = table.get(&token_number) {
+        entry
+            .finish_index
+            .store(finish_index as u64, Ordering::Release);
+    }
 }
 
 /// Update dispatch slot for redirect.
 fn ca_dispatch_redirect(old_token: u64, new_code_ptr: *const u8) {
     let table = ca_dispatch_table().lock().unwrap();
-    if let Some(slot) = table.get(&old_token) {
-        slot.store(new_code_ptr as *mut u8, Ordering::Release);
+    if let Some(entry) = table.get(&old_token) {
+        entry
+            .code_ptr
+            .store(new_code_ptr as *mut u8, Ordering::Release);
     }
 }
 
@@ -1242,6 +1269,10 @@ fn register_call_assembler_target(
     validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
     // Create/update dispatch slot for direct call
     ca_dispatch_slot(token.number, compiled.code_ptr);
+    // Set the finish_index so the direct call path can check it at runtime
+    if let Some(finish_idx) = compiled.fail_descrs.iter().position(|d| d.is_finish()) {
+        ca_dispatch_set_finish_index(token.number, finish_idx as u32);
+    }
     call_assembler_registry()
         .lock()
         .unwrap()
@@ -4483,10 +4514,13 @@ impl CraneliftBackend {
                         None
                     };
 
-                    // finish_index: use the target's if resolved, otherwise
-                    // assume finish is the last fail_descr (common case).
-                    let use_direct = dispatch_slot_addr.is_some()
-                        && (finish_index.is_some() || resolved_target.is_none());
+                    // Use direct call when dispatch slot exists and result
+                    // is a primitive type (Int/Float). For self-recursion
+                    // (target unknown), finish_index is loaded from the
+                    // dispatch entry at runtime (set after compile).
+                    let has_primitive_result = finish_index.is_some()
+                        || resolved_target.is_none(); // self-recursion: assume primitive
+                    let use_direct = dispatch_slot_addr.is_some() && has_primitive_result;
 
                     if use_direct {
                         let slot_addr = dispatch_slot_addr.unwrap();
@@ -4498,9 +4532,6 @@ impl CraneliftBackend {
                         let num_ref_roots = resolved_target
                             .as_ref()
                             .map_or(8, |t| t.num_ref_roots.max(1));
-                        // finish_idx: known from target, or -1 to skip finish check
-                        // (runtime: any non-negative fail_index that matches is finish)
-                        let finish_idx = finish_index.unwrap_or(u32::MAX);
 
                         // Allocate output and roots buffers on stack
                         let out_bytes = (out_slots * 8) as u32;
@@ -4519,20 +4550,39 @@ impl CraneliftBackend {
                         ));
                         let ca_roots_ptr = builder.ins().stack_addr(ptr_type, ca_roots_slot, 0);
 
-                        // Load code_ptr from dispatch slot (AtomicPtr).
-                        // For self-recursion, first call may see null (filled
-                        // after compile). Null → fall through to shim.
-                        let slot_ptr = builder.ins().iconst(ptr_type, slot_addr as i64);
+                        // Load code_ptr and finish_index from dispatch entry.
+                        // CaDispatchEntry layout: [code_ptr: 8B, finish_index: 8B]
+                        // For self-recursion, first call may see null code_ptr
+                        // and CA_FINISH_INDEX_UNKNOWN (both filled after compile).
+                        let entry_ptr = builder.ins().iconst(ptr_type, slot_addr as i64);
                         let code_addr =
                             builder
                                 .ins()
-                                .load(ptr_type, MemFlags::trusted(), slot_ptr, 0);
+                                .load(ptr_type, MemFlags::trusted(), entry_ptr, 0);
+                        let runtime_finish_idx = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            entry_ptr,
+                            8, // offset of finish_index in CaDispatchEntry
+                        );
                         let null_ptr = builder.ins().iconst(ptr_type, 0);
                         let is_null = builder.ins().icmp(IntCC::Equal, code_addr, null_ptr);
+                        // Also check finish_index != CA_FINISH_INDEX_UNKNOWN
+                        let unknown_sentinel =
+                            builder
+                                .ins()
+                                .iconst(cl_types::I64, CA_FINISH_INDEX_UNKNOWN as i64);
+                        let finish_unknown = builder.ins().icmp(
+                            IntCC::Equal,
+                            runtime_finish_idx,
+                            unknown_sentinel,
+                        );
+                        let cant_direct =
+                            builder.ins().bor(is_null, finish_unknown);
                         let direct_call_block = builder.create_block();
                         let shim_fallback_block = builder.create_block();
                         builder.ins().brif(
-                            is_null,
+                            cant_direct,
                             shim_fallback_block,
                             &[],
                             direct_call_block,
@@ -4556,18 +4606,29 @@ impl CraneliftBackend {
                         let fail_idx_raw = builder.inst_results(fail_index_val)[0];
 
                         // Check: is it the finish exit?
-                        let expected_finish =
-                            builder.ins().iconst(cl_types::I64, finish_idx as i64);
+                        // Compare with runtime_finish_idx loaded from dispatch entry.
                         let is_direct_finish =
                             builder
                                 .ins()
-                                .icmp(IntCC::Equal, fail_idx_raw, expected_finish);
+                                .icmp(IntCC::Equal, fail_idx_raw, runtime_finish_idx);
                         let direct_finish_block = builder.create_block();
+                        // When force_fn is available, route non-finish guard
+                        // failures through a direct force path instead of the
+                        // full shim (avoids double execution of compiled code).
+                        let direct_nonfinish_block =
+                            if CALL_ASSEMBLER_FORCE_FN.get().is_some() {
+                                let b = builder.create_block();
+                                Some(b)
+                            } else {
+                                None
+                            };
+                        let nonfinish_target =
+                            direct_nonfinish_block.unwrap_or(shim_fallback_block);
                         builder.ins().brif(
                             is_direct_finish,
                             direct_finish_block,
                             &[],
-                            shim_fallback_block,
+                            nonfinish_target,
                             &[],
                         );
 
@@ -4577,7 +4638,50 @@ impl CraneliftBackend {
                         let direct_result = builder.ins().stack_load(cl_types::I64, out_slot, 0);
                         builder.ins().jump(ca_merge_block, &[direct_result]);
 
-                        // ── Fallback: guard failure or other exit → call shim ──
+                        // ── Direct guard failure: call force_fn on frame ──
+                        if let Some(nonfinish_block) = direct_nonfinish_block {
+                            builder.switch_to_block(nonfinish_block);
+                            builder.seal_block(nonfinish_block);
+                            // Check for DEADFRAME sentinel (nested CALL_ASSEMBLER
+                            // propagation) — must go through shim for that case.
+                            let deadframe_sentinel_val = builder.ins().iconst(
+                                cl_types::I64,
+                                CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64,
+                            );
+                            let is_deadframe = builder.ins().icmp(
+                                IntCC::Equal,
+                                fail_idx_raw,
+                                deadframe_sentinel_val,
+                            );
+                            let direct_force_block = builder.create_block();
+                            builder.ins().brif(
+                                is_deadframe,
+                                shim_fallback_block,
+                                &[],
+                                direct_force_block,
+                                &[],
+                            );
+
+                            builder.switch_to_block(direct_force_block);
+                            builder.seal_block(direct_force_block);
+                            // outputs[0] = callee frame pointer
+                            let frame_ptr =
+                                builder.ins().stack_load(cl_types::I64, out_slot, 0);
+                            let force_fn_ptr = *CALL_ASSEMBLER_FORCE_FN.get().unwrap();
+                            let force_result = emit_host_call(
+                                &mut builder,
+                                ptr_type,
+                                call_conv,
+                                force_fn_ptr as *const () as usize,
+                                &[frame_ptr],
+                                Some(cl_types::I64),
+                            );
+                            builder
+                                .ins()
+                                .jump(ca_merge_block, &[force_result.unwrap()]);
+                        }
+
+                        // ── Fallback: null code_ptr, unknown finish, or deadframe ──
                         builder.switch_to_block(shim_fallback_block);
                         builder.seal_block(shim_fallback_block);
                     }
