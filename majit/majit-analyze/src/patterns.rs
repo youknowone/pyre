@@ -50,8 +50,26 @@ pub enum TracePattern {
     /// Function call (dispatch to CALL_ASSEMBLER/inline/residual).
     FunctionCall,
 
-    /// Stack manipulation (swap, dup, rot).
+    /// Stack manipulation (pop, swap, copy, dup, rot).
     StackManip,
+
+    /// Unconditional jump (forward/backward).
+    Jump,
+
+    /// Conditional jump (pop_jump_if_true/false).
+    ConditionalJump,
+
+    /// Return value from function.
+    Return,
+
+    /// Namespace access (load/store name/global).
+    NamespaceAccess { is_load: bool, is_global: bool },
+
+    /// Iterator cleanup (end_for, pop_iter).
+    IterCleanup,
+
+    /// No-op instructions (nop, cache, resume, extended_arg).
+    Noop,
 
     /// Opaque — emit residual call.
     Residual { helper_name: String },
@@ -88,13 +106,56 @@ pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePatt
             "unary_not" => {
                 return Some(TracePattern::TruthCheck);
             }
-            "load_fast" | "load_fast_checked" => return Some(TracePattern::LocalRead),
-            "store_fast" | "store_fast_checked" => return Some(TracePattern::LocalWrite),
-            "load_const" => return Some(TracePattern::ConstLoad),
+            // Local variable access
+            "load_fast" | "load_fast_checked" | "load_fast_load_fast"
+            | "load_fast_pair_checked" => return Some(TracePattern::LocalRead),
+            "store_fast" | "store_fast_checked" | "store_fast_store_fast" => {
+                return Some(TracePattern::LocalWrite);
+            }
+            "store_fast_load_fast" => {
+                // Combined store + load; classify as LocalWrite (the dominant operation)
+                return Some(TracePattern::LocalWrite);
+            }
+            // Constants
+            "load_const" | "load_small_int" => return Some(TracePattern::ConstLoad),
+            // Function call
             "call" => return Some(TracePattern::FunctionCall),
+            // Iterator
             "for_iter" => return Some(TracePattern::RangeIterNext),
+            "end_for" | "pop_iter" => return Some(TracePattern::IterCleanup),
+            // Stack manipulation
+            "pop_top" | "copy_value" | "swap" | "push_null" => {
+                return Some(TracePattern::StackManip);
+            }
+            // Jumps
+            "jump_forward" | "jump_backward" => return Some(TracePattern::Jump),
+            "pop_jump_if_false" | "pop_jump_if_true" => {
+                return Some(TracePattern::ConditionalJump);
+            }
+            // Return
+            "return_value" => return Some(TracePattern::Return),
+            // Namespace access
+            "store_name" => {
+                return Some(TracePattern::NamespaceAccess {
+                    is_load: false,
+                    is_global: false,
+                });
+            }
+            "load_name" => {
+                return Some(TracePattern::NamespaceAccess {
+                    is_load: true,
+                    is_global: false,
+                });
+            }
+            "load_global" => {
+                return Some(TracePattern::NamespaceAccess {
+                    is_load: true,
+                    is_global: true,
+                });
+            }
+            // Residual calls
             "get_iter" | "build_list" | "build_tuple" | "build_map" | "unpack_sequence"
-            | "store_subscr" | "list_append" => {
+            | "store_subscr" | "list_append" | "make_function" => {
                 return Some(TracePattern::Residual {
                     helper_name: name.clone(),
                 });
@@ -143,6 +204,145 @@ pub fn classify_method_body(body_summary: &str) -> Option<TracePattern> {
 
     if body_summary.contains("truth") || body_summary.contains("bool") {
         return Some(TracePattern::TruthCheck);
+    }
+
+    // Stack manipulation heuristics
+    if body_summary.contains("pop_value") && !body_summary.contains("push_value") {
+        return Some(TracePattern::StackManip);
+    }
+
+    if body_summary.contains("swap_values") || body_summary.contains("peek_at") {
+        return Some(TracePattern::StackManip);
+    }
+
+    // Jump / control flow heuristics
+    if body_summary.contains("set_next_instr") && body_summary.contains("close_loop") {
+        return Some(TracePattern::Jump);
+    }
+
+    if body_summary.contains("set_next_instr")
+        && body_summary.contains("record_branch_guard")
+    {
+        return Some(TracePattern::ConditionalJump);
+    }
+
+    if body_summary.contains("set_next_instr")
+        && !body_summary.contains("close_loop")
+        && !body_summary.contains("truth")
+    {
+        return Some(TracePattern::Jump);
+    }
+
+    // Return heuristic
+    if body_summary.contains("finish_value") || body_summary.contains("ReturnValue") {
+        return Some(TracePattern::Return);
+    }
+
+    // Namespace heuristics
+    if body_summary.contains("store_name_value") {
+        return Some(TracePattern::NamespaceAccess {
+            is_load: false,
+            is_global: false,
+        });
+    }
+
+    if body_summary.contains("load_name_value") || body_summary.contains("load_name_checked") {
+        return Some(TracePattern::NamespaceAccess {
+            is_load: true,
+            is_global: false,
+        });
+    }
+
+    if body_summary.contains("null_value") {
+        return Some(TracePattern::StackManip);
+    }
+
+    None
+}
+
+/// Classify from the opcode pattern text (fallback when call chain resolution fails).
+///
+/// Handles cases where the match arm body doesn't call a named handler method
+/// (e.g., no-op arms that just return `Ok(StepResult::Continue)`).
+pub fn classify_from_pattern(pattern: &str) -> Option<TracePattern> {
+    // No-op instructions
+    if pattern.contains("ExtendedArg")
+        || pattern.contains("Resume")
+        || pattern.contains("Nop")
+        || pattern.contains("Cache")
+        || pattern.contains("NotTaken")
+    {
+        return Some(TracePattern::Noop);
+    }
+
+    // Local variable access (superword instructions)
+    if pattern.contains("LoadFastBorrowLoadFastBorrow")
+        || pattern.contains("LoadFastLoadFast")
+    {
+        return Some(TracePattern::LocalRead);
+    }
+    if pattern.contains("StoreFastStoreFast") {
+        return Some(TracePattern::LocalWrite);
+    }
+    if pattern.contains("StoreFastLoadFast") {
+        return Some(TracePattern::LocalWrite);
+    }
+
+    // Namespace
+    if pattern.contains("StoreName") || pattern.contains("StoreGlobal") {
+        return Some(TracePattern::NamespaceAccess {
+            is_load: false,
+            is_global: pattern.contains("Global"),
+        });
+    }
+    if pattern.contains("LoadGlobal") {
+        return Some(TracePattern::NamespaceAccess {
+            is_load: true,
+            is_global: true,
+        });
+    }
+    if pattern.contains("LoadName") {
+        return Some(TracePattern::NamespaceAccess {
+            is_load: true,
+            is_global: false,
+        });
+    }
+
+    // Stack
+    if pattern.contains("PopTop") || pattern.contains("PushNull")
+        || pattern.contains("Copy") || pattern.contains("Swap")
+    {
+        return Some(TracePattern::StackManip);
+    }
+
+    // Jumps
+    if pattern.contains("JumpForward") || pattern.contains("JumpBackward") {
+        return Some(TracePattern::Jump);
+    }
+    if pattern.contains("PopJumpIf") {
+        return Some(TracePattern::ConditionalJump);
+    }
+
+    // Return
+    if pattern.contains("ReturnValue") {
+        return Some(TracePattern::Return);
+    }
+
+    // Iterator cleanup
+    if pattern.contains("EndFor") || pattern.contains("PopIter") {
+        return Some(TracePattern::IterCleanup);
+    }
+
+    // Constants
+    if pattern.contains("LoadSmallInt") {
+        return Some(TracePattern::ConstLoad);
+    }
+
+    // MakeFunction
+    if pattern.contains("MakeFunction") {
+        return Some(TracePattern::Residual {
+            helper_name: "make_function".into(),
+        });
     }
 
     None

@@ -173,6 +173,11 @@ fn resolve_call_chain(
     if arm.trace_pattern.is_none() {
         arm.trace_pattern = patterns::classify_from_resolved(&arm.resolved_calls);
     }
+
+    // Fallback: classify from the opcode pattern text itself
+    if arm.trace_pattern.is_none() {
+        arm.trace_pattern = patterns::classify_from_pattern(&arm.pattern);
+    }
 }
 
 /// Generate tracing code from analysis results.
@@ -259,6 +264,41 @@ mod tests {
             binary_op.unwrap().trace_pattern.is_some(),
             "BinaryOp should have a trace pattern"
         );
+
+        // Verify classification coverage (39/40 — only `other` wildcard is unclassified)
+        let classified_count = result
+            .opcodes
+            .iter()
+            .filter(|a| a.trace_pattern.is_some())
+            .count();
+        assert!(
+            classified_count >= 30,
+            "expected >=30 classified, got {}",
+            classified_count
+        );
+
+        // Verify new pattern categories are present
+        let patterns_debug: Vec<String> = result
+            .opcodes
+            .iter()
+            .filter_map(|a| a.trace_pattern.as_ref().map(|p| format!("{:?}", p)))
+            .collect();
+        let pattern_str = patterns_debug.join(" ");
+        assert!(pattern_str.contains("Jump"), "missing Jump pattern");
+        assert!(
+            pattern_str.contains("ConditionalJump"),
+            "missing ConditionalJump pattern"
+        );
+        assert!(pattern_str.contains("Return"), "missing Return pattern");
+        assert!(
+            pattern_str.contains("NamespaceAccess"),
+            "missing NamespaceAccess pattern"
+        );
+        assert!(
+            pattern_str.contains("IterCleanup"),
+            "missing IterCleanup pattern"
+        );
+        assert!(pattern_str.contains("Noop"), "missing Noop pattern");
     }
 
     #[test]
@@ -273,6 +313,12 @@ mod tests {
         assert!(code.contains("UnboxIntBinop"), "missing UnboxIntBinop");
         assert!(code.contains("LocalRead"), "missing LocalRead");
         assert!(code.contains("FunctionCall"), "missing FunctionCall");
+        assert!(code.contains("Jump"), "missing Jump");
+        assert!(code.contains("ConditionalJump"), "missing ConditionalJump");
+        assert!(code.contains("Return"), "missing Return");
+        assert!(code.contains("NamespaceAccess"), "missing NamespaceAccess");
+        assert!(code.contains("IterCleanup"), "missing IterCleanup");
+        assert!(code.contains("Noop"), "missing Noop");
 
         eprintln!("=== Generated Code ({} bytes) ===", code.len());
         // Print first 50 lines
