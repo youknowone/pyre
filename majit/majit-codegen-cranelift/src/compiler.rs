@@ -4021,10 +4021,17 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardNotForced => {
-                    if op_idx == 0 || !ops[op_idx - 1].opcode.is_call_may_force() {
+                    // Intervening non-guard ops between CallMayForce and
+                    // GuardNotForced are allowed. We only require that a
+                    // preceding CallMayForce exists somewhere earlier in the
+                    // trace (the push/pop shim mechanism is position-independent).
+                    let has_preceding_call_may_force = ops[..op_idx]
+                        .iter()
+                        .any(|o| o.opcode.is_call_may_force());
+                    if !has_preceding_call_may_force {
                         return Err(unsupported_semantics(
                             op.opcode,
-                            "guard_not_forced currently requires an immediately preceding call_may_force",
+                            "guard_not_forced requires a preceding call_may_force",
                         ));
                     }
                     let info = &guard_infos[guard_idx];
@@ -4467,16 +4474,18 @@ impl CraneliftBackend {
                 | OpCode::CallMayForceR
                 | OpCode::CallMayForceF
                 | OpCode::CallMayForceN => {
-                    let next_op = ops.get(op_idx + 1).ok_or_else(|| {
-                        unsupported_semantics(
-                            op.opcode,
-                            "call_may_force must be followed by guard_not_forced",
-                        )
-                    })?;
-                    if next_op.opcode != OpCode::GuardNotForced {
+                    // Intervening non-guard ops (SameAs, SaveException, etc.)
+                    // are allowed between CallMayForce and GuardNotForced.
+                    // The push/pop mechanism in pending_may_force is
+                    // position-independent; we only require that a matching
+                    // GuardNotForced appears later in the trace.
+                    let has_guard_not_forced = ops[op_idx + 1..]
+                        .iter()
+                        .any(|o| o.opcode == OpCode::GuardNotForced);
+                    if !has_guard_not_forced {
                         return Err(unsupported_semantics(
                             op.opcode,
-                            "call_may_force currently requires an immediately following guard_not_forced",
+                            "call_may_force must be followed by guard_not_forced",
                         ));
                     }
                     let info = &guard_infos[guard_idx];
@@ -4489,7 +4498,11 @@ impl CraneliftBackend {
                     ));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-                        let raw = if arg_ref.0 == vi {
+                        // Values defined at or after this op (vi) are not yet
+                        // available — use zero as a placeholder in the preview
+                        // snapshot.  Constants (stored in the constants map)
+                        // are always resolvable regardless of position.
+                        let raw = if arg_ref.0 >= vi && !constants.contains_key(&arg_ref.0) {
                             zero
                         } else {
                             resolve_opref(&mut builder, &constants, arg_ref)
@@ -7320,6 +7333,16 @@ mod tests {
             drop(values);
             set_savedata_ref_on_deadframe(&mut deadframe, GcRef(0xDADA)).unwrap();
         }
+    }
+
+    /// Like `maybe_force_and_return_int` but does not write to the global
+    /// `may_force_int_values` vec, avoiding cross-test interference.
+    extern "C" fn maybe_force_and_return_int_isolated(force_token: i64, flag: i64) -> i64 {
+        if flag != 0 {
+            let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
+            set_savedata_ref_on_deadframe(&mut deadframe, GcRef(0xBABA)).unwrap();
+        }
+        42
     }
 
     extern "C" fn maybe_force_and_return_int(force_token: i64, flag: i64) -> i64 {
@@ -10919,6 +10942,60 @@ mod tests {
         assert_eq!(layout.source_op_index, Some(3));
         assert!(layout.recovery_layout.is_some());
         assert_eq!(*may_force_void_values().lock().unwrap(), vec![0, 1, 10]);
+    }
+
+    #[test]
+    fn test_call_may_force_with_intervening_ops() {
+        // CallMayForceI -> SameAsI -> GuardNotForced
+        // Verifies that intervening non-guard ops between
+        // CallMayForce and GuardNotForced compile and execute correctly.
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.0);
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+            OpRef(1),
+            OpRef(3),
+            OpRef(0),
+        ]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::ForceToken, &[], 2),
+            mk_op_with_descr(
+                OpCode::CallMayForceI,
+                &[OpRef(100), OpRef(2), OpRef(1)],
+                3,
+                descr,
+            ),
+            // Intervening op: SameAsI copies the call result.
+            // This proves the codegen accepts non-adjacent placement.
+            mk_op(OpCode::SameAsI, &[OpRef(3)], 4),
+            guard_op,
+            mk_op(OpCode::Finish, &[OpRef(4)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(
+            100,
+            maybe_force_and_return_int_isolated as *const () as usize as i64,
+        );
+        backend.set_constants(constants);
+
+        let mut token = LoopToken::new(1500_410);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Not forced: reaches Finish with SameAsI result (== call result == 42)
+        let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert_eq!(backend.get_int_value(&frame, 0), 42);
+
+        // Forced: exits via GuardNotForced
+        let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.get_int_value(&frame, 1), 42);
+        assert_eq!(backend.get_int_value(&frame, 2), 10);
+        assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xBABA));
     }
 
     #[test]
