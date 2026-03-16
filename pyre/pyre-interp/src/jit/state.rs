@@ -659,11 +659,14 @@ impl TraceFrameState {
         value: OpRef,
         _concrete_value: i64,
     ) -> OpRef {
-        let obj = ctx.record_op_with_descr(OpCode::New, &[], w_int_size_descr());
-        let type_ptr = ctx.const_int(&INT_TYPE as *const PyType as usize as i64);
-        ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, type_ptr], ob_type_descr());
-        ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, value], int_intval_descr());
-        obj
+        crate::jit::generated::trace_box_int(
+            ctx,
+            value,
+            w_int_size_descr(),
+            ob_type_descr(),
+            int_intval_descr(),
+            &INT_TYPE as *const _ as i64,
+        )
     }
 
     fn trace_boxed_float_value(&self, ctx: &mut TraceCtx, value: OpRef) -> OpRef {
@@ -1022,9 +1025,18 @@ impl TraceFrameState {
                     ComparisonOperator::NotEqual => OpCode::IntNe,
                 };
                 return self.with_ctx(|this, ctx| {
-                    let lhs = this.trace_guarded_int_payload(ctx, a);
-                    let rhs = this.trace_guarded_int_payload(ctx, b);
-                    let truth = ctx.record_op(cmp, &[lhs, rhs]);
+                    let fail_args = this.current_fail_args(ctx);
+                    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+                    let truth = crate::jit::generated::trace_int_compare(
+                        ctx,
+                        a,
+                        b,
+                        cmp,
+                        int_type_addr,
+                        ob_type_descr(),
+                        int_intval_descr(),
+                        &fail_args,
+                    );
                     Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
                 });
             }
@@ -1710,14 +1722,30 @@ impl TraceFrameState {
         }
 
         self.with_ctx(|this, ctx| {
-            let payload = this.trace_guarded_int_payload(ctx, value);
+            let fail_args = this.current_fail_args(ctx);
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let payload = crate::jit::generated::trace_unbox_int(
+                ctx,
+                value,
+                int_type_addr,
+                ob_type_descr(),
+                int_intval_descr(),
+                &fail_args,
+            );
             if matches!(opcode, OpCode::IntNeg) {
                 let min_val = ctx.const_int(i64::MIN);
                 let is_min = ctx.record_op(OpCode::IntEq, &[payload, min_val]);
                 this.record_guard(ctx, OpCode::GuardFalse, &[is_min]);
             }
             let result = ctx.record_op(opcode, &[payload]);
-            Ok(this.trace_boxed_int_value(ctx, result, 0))
+            Ok(crate::jit::generated::trace_box_int(
+                ctx,
+                result,
+                w_int_size_descr(),
+                ob_type_descr(),
+                int_intval_descr(),
+                int_type_addr,
+            ))
         })
     }
 
