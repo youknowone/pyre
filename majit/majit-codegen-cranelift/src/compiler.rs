@@ -4418,6 +4418,50 @@ impl CraneliftBackend {
                             as i64,
                     );
 
+                    // ── Tagged pointer cache short-circuit ──
+                    // If the first arg (frame pointer) has bit 0 set, the
+                    // create_callee_frame helper already computed the result
+                    // and encoded it as (result << 1) | 1. Skip the shim
+                    // entirely — just extract the cached result.
+                    // ── Tagged pointer cache short-circuit ──
+                    // Only active when a force callback is registered (pyre).
+                    // Check at compile time via CALL_ASSEMBLER_FORCE_FN.
+                    let force_fn_registered = CALL_ASSEMBLER_FORCE_FN.get().is_some();
+                    let first_arg = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let cached_block = builder.create_block();
+                    let normal_block = builder.create_block();
+                    let ca_merge_block = builder.create_block();
+                    builder.append_block_param(ca_merge_block, cl_types::I64); // result
+
+                    if force_fn_registered {
+                        let one = builder.ins().iconst(cl_types::I64, 1);
+                        let masked = builder.ins().band(first_arg, one);
+                        let zero = builder.ins().iconst(cl_types::I64, 0);
+                        let is_normal = builder.ins().icmp(IntCC::Equal, masked, zero);
+                        builder
+                            .ins()
+                            .brif(is_normal, normal_block, &[], cached_block, &[]);
+                    } else {
+                        builder.ins().jump(normal_block, &[]);
+                        // Seal unused cached block
+                        builder.switch_to_block(cached_block);
+                        builder.seal_block(cached_block);
+                        let dummy = builder.ins().iconst(cl_types::I64, 0);
+                        builder.ins().jump(ca_merge_block, &[dummy]);
+                    }
+
+                    if force_fn_registered {
+                        // ── Cached path: extract result from tagged pointer ──
+                        builder.switch_to_block(cached_block);
+                        builder.seal_block(cached_block);
+                        let cached_result = builder.ins().ushr_imm(first_arg, 1);
+                        builder.ins().jump(ca_merge_block, &[cached_result]);
+                    }
+
+                    // ── Normal path: call shim ──
+                    builder.switch_to_block(normal_block);
+                    builder.seal_block(normal_block);
+
                     if call_descr.effect_info().can_raise() {
                         let _ = emit_host_call(
                             &mut builder,
@@ -4468,11 +4512,10 @@ impl CraneliftBackend {
                         .ins()
                         .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
                     let is_finish = builder.ins().icmp(IntCC::Equal, outcome_kind, finish_kind);
-                    let cont_block = builder.create_block();
                     let exit_block = builder.create_block();
                     builder
                         .ins()
-                        .brif(is_finish, cont_block, &[], exit_block, &[]);
+                        .brif(is_finish, ca_merge_block, &[result.unwrap()], exit_block, &[]);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
@@ -4485,12 +4528,13 @@ impl CraneliftBackend {
                         .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
                     builder.ins().return_(&[sentinel]);
 
-                    builder.switch_to_block(cont_block);
-                    builder.seal_block(cont_block);
+                    // ── Merge: result from cache or shim ──
+                    builder.switch_to_block(ca_merge_block);
+                    builder.seal_block(ca_merge_block);
+                    let merged_result = builder.block_params(ca_merge_block)[0];
 
                     if op.result_type() != Type::Void {
-                        let result = result.expect("call_assembler shim must return a value");
-                        builder.def_var(var(vi), result);
+                        builder.def_var(var(vi), merged_result);
                     }
                 }
 
