@@ -26,10 +26,10 @@ pub(crate) fn set_inline_handled_result(result: PyObjectRef) {
 
 // Fast 2-entry cache for force callback results.
 // Covers the common case (e.g. fib base cases: n=0 and n=1).
-thread_local! {
-    static FORCE_CACHE: Cell<[(usize, usize, i64); 2]> =
-        const { Cell::new([(0, 0, 0); 2]) };
-}
+// Uses raw statics instead of thread_local! to avoid TLS lookup overhead
+// on the hot path (~29M calls for fib(35)).
+static mut FORCE_CACHE_0: (usize, usize, i64) = (0, 0, 0);
+static mut FORCE_CACHE_1: (usize, usize, i64) = (0, 0, 0);
 
 /// Compute a stable cache key for a Python argument.
 ///
@@ -168,26 +168,23 @@ extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         0
     };
 
-    // Fast path: check 2-entry cache
-    if let Ok(entries) = FORCE_CACHE.try_with(|c| c.get()) {
-        if entries[0].0 == code_key && entries[0].1 == arg_key {
-            return entries[0].2;
+    // Fast path: check 2-entry static cache (no TLS overhead)
+    unsafe {
+        if FORCE_CACHE_0.0 == code_key && FORCE_CACHE_0.1 == arg_key {
+            return FORCE_CACHE_0.2;
         }
-        if entries[1].0 == code_key && entries[1].1 == arg_key {
-            return entries[1].2;
+        if FORCE_CACHE_1.0 == code_key && FORCE_CACHE_1.1 == arg_key {
+            return FORCE_CACHE_1.2;
         }
     }
 
     // Slow path: run interpreter, then cache the result
     match crate::eval::eval_loop_for_force(frame) {
         Ok(result) => {
-            let _ = FORCE_CACHE.try_with(|c| {
-                let mut entries = c.get();
-                // Shift entry 0 → 1, insert new at 0
-                entries[1] = entries[0];
-                entries[0] = (code_key, arg_key, result as i64);
-                c.set(entries);
-            });
+            unsafe {
+                FORCE_CACHE_1 = FORCE_CACHE_0;
+                FORCE_CACHE_0 = (code_key, arg_key, result as i64);
+            }
             result as i64
         }
         Err(err) => panic!("jit force callee frame failed: {err}"),
@@ -233,12 +230,10 @@ extern "C" fn jit_bridge_compile_callee(
     } else {
         0
     };
-    let _ = FORCE_CACHE.try_with(|c| {
-        let mut entries = c.get();
-        entries[1] = entries[0];
-        entries[0] = (code_key, arg_key, result);
-        c.set(entries);
-    });
+    unsafe {
+        FORCE_CACHE_1 = FORCE_CACHE_0;
+        FORCE_CACHE_0 = (code_key, arg_key, result);
+    }
 
     // 3. Build bridge IR: inputarg(frame_ptr) → call force_fn → FINISH
     //    Function pointers are encoded as constants (first arg to CALL_I).
