@@ -15,14 +15,14 @@
 //! - **match on opcode** (the main dispatch): the top-level opcode match
 //! - **Nested match in let-binding**: `let x = match ... { ... };` is
 //!   recognized as a `BranchGroup` (BRPOP/JMP/BRZ pattern)
+//! - **Standalone match**: `match x { 1 => ..., 2 => ..., _ => ... }` is
+//!   lowered to a chained if-else guard sequence
 //!
 //! ## Unsupported CFG patterns
 //!
 //! These patterns within match arms will cause the arm to be classified as
 //! `Unsupported` and produce a compile-time error:
 //!
-//! - **Nested match as a statement**: `match ... { ... }` not in a
-//!   let-binding position (use helper functions instead)
 //! - **loop/while within arms**: iteration inside an opcode handler
 //!   (extract to a `#[dont_look_inside]` helper)
 //! - **for loops within arms**: same as loop/while
@@ -164,27 +164,33 @@ fn check_stmt_unsupported(stmt: &Stmt) -> Option<String> {
 
 fn check_expr_unsupported(expr: &Expr) -> Option<String> {
     match expr {
-        // Standalone match expression (not in a let-binding) is unsupported
-        Expr::Match(_) => Some(
-            "nested match expression is not supported in JIT-traced arms; \
-             extract the logic into a helper function annotated with \
-             #[dont_look_inside] or #[jit_inline]"
-                .to_string(),
-        ),
+        // Standalone match expression — lowered to an if-else guard chain.
+        // Recurse into the arm bodies to check for unsupported constructs.
+        Expr::Match(match_expr) => {
+            for arm in &match_expr.arms {
+                let arm_stmts = extract_stmts(&arm.body);
+                for s in &arm_stmts {
+                    if let Some(reason) = check_stmt_unsupported(s) {
+                        return Some(reason);
+                    }
+                }
+            }
+            None
+        }
         // Loop/while/for within an arm
         Expr::Loop(_) => Some(
             "loop within a match arm is not supported in JIT-traced arms; \
-             extract to a #[dont_look_inside] helper"
+             extract to a #[dont_look_inside] helper function"
                 .to_string(),
         ),
         Expr::While(_) => Some(
             "while loop within a match arm is not supported in JIT-traced arms; \
-             extract to a #[dont_look_inside] helper"
+             extract to a #[dont_look_inside] helper function"
                 .to_string(),
         ),
         Expr::ForLoop(_) => Some(
             "for loop within a match arm is not supported in JIT-traced arms; \
-             extract to a #[dont_look_inside] helper"
+             extract to a #[dont_look_inside] helper function"
                 .to_string(),
         ),
         // Recurse into if/else branches — if/else itself is supported,
@@ -252,9 +258,7 @@ mod tests {
 
     #[test]
     fn classify_nested_if_else_as_lowerable() {
-        let arm = parse_arm(
-            "0 => { if a { if b { x(); } else { y(); } } else { z(); } },",
-        );
+        let arm = parse_arm("0 => { if a { if b { x(); } else { y(); } } else { z(); } },");
         let result = classify_arm_body(&arm.body);
         assert!(matches!(result, ArmPattern::Lowerable));
     }
@@ -267,48 +271,45 @@ mod tests {
     }
 
     #[test]
-    fn classify_standalone_match_as_unsupported() {
+    fn classify_standalone_match_as_lowerable() {
         let arm = parse_arm("0 => { match op { 1 => a(), _ => b() } },");
         let result = classify_arm_body(&arm.body);
-        assert!(
-            matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("nested match")),
-        );
+        assert!(matches!(result, ArmPattern::Lowerable));
+    }
+
+    #[test]
+    fn classify_nested_match_with_loop_as_unsupported() {
+        let arm = parse_arm("0 => { match op { 1 => { loop { break; } }, _ => b() } },");
+        let result = classify_arm_body(&arm.body);
+        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("loop")));
     }
 
     #[test]
     fn classify_loop_as_unsupported() {
         let arm = parse_arm("0 => { loop { break; } },");
         let result = classify_arm_body(&arm.body);
-        assert!(
-            matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("loop")),
-        );
+        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("loop")),);
     }
 
     #[test]
     fn classify_while_as_unsupported() {
         let arm = parse_arm("0 => { while cond { x(); } },");
         let result = classify_arm_body(&arm.body);
-        assert!(
-            matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("while")),
-        );
+        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("while")),);
     }
 
     #[test]
     fn classify_for_as_unsupported() {
         let arm = parse_arm("0 => { for i in 0..10 { x(); } },");
         let result = classify_arm_body(&arm.body);
-        assert!(
-            matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("for")),
-        );
+        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("for")),);
     }
 
     #[test]
     fn classify_nested_loop_in_if_as_unsupported() {
         let arm = parse_arm("0 => { if cond { loop { break; } } else { x(); } },");
         let result = classify_arm_body(&arm.body);
-        assert!(
-            matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("loop")),
-        );
+        assert!(matches!(result, ArmPattern::Unsupported(ref msg) if msg.contains("loop")),);
     }
 
     #[test]
