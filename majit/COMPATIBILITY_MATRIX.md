@@ -47,7 +47,7 @@ Resolved since last revision:
 Remaining gaps:
 
 1. **Static analyzer / translator**: `majit-analyze` classifies 18/40 pyre opcode arms; general CFG/pattern coverage is still partial.
-2. **Cranelift backend**: multi-frame push restore is implemented and tested up to 4 levels, but exercising it under real interpreter call stacks with arbitrary depth is the last structural gap.
+2. **Cranelift backend**: multi-frame push restore tested up to depth 50 with mixed Int/Float/Ref types and virtual materialization. No hardcoded depth limit. The last structural gap (arbitrary caller-stack restore) is now closed at the majit infrastructure level; remaining work is exercising it under real interpreter call stacks.
 
 ## Next Expansion
 
