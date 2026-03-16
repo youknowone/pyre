@@ -656,7 +656,10 @@ fn frame_values_from_reconstructed(
                 Value::Float(f64::from_bits(*raw as u64))
             }
             (crate::resume::ReconstructedValue::Value(_), Type::Void) => Value::Void,
-            (crate::resume::ReconstructedValue::Virtual(index), Type::Ref) => {
+            (crate::resume::ReconstructedValue::Virtual(index), _) => {
+                // Virtual objects always materialize as Ref, regardless of the
+                // expected type. The interpreter's restore_values() knows to
+                // treat these as object references.
                 Value::Ref(materialized_refs.get(*index).copied().flatten()?)
             }
             (crate::resume::ReconstructedValue::Uninitialized, _) => Value::Void,
