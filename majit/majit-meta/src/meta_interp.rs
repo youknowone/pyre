@@ -1107,10 +1107,21 @@ impl<M: Clone> MetaInterp<M> {
         // Patch: prepend virtualizable field loads as a preamble before the
         // loop body. Entry block reads fields from frame; Label defines the
         // loop header block params; JUMP targets them on the back-edge.
-        // Preamble patching disabled — causes Cranelift SSA panic for
-        // functions with locals (Label args / JUMP args mismatch).
-        // TODO: fix preamble to correctly include all loop-carried values.
-        let (inputargs, optimized_ops) = (inputargs, optimized_ops);
+        // Patch: prepend virtualizable field loads as a preamble before the
+        // loop body. Entry block reads fields from frame; Label defines the
+        // loop header block params; JUMP targets them on the back-edge.
+        let (inputargs, optimized_ops) = if let Some(ref info) = self.virtualizable_info {
+            let (new_ia, new_ops) = patch_new_loop_to_load_virtualizable_fields(
+                info,
+                &inputargs,
+                optimized_ops,
+                &mut constants,
+                &self.vable_array_lengths,
+            );
+            (new_ia, new_ops)
+        } else {
+            (inputargs, optimized_ops)
+        };
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
