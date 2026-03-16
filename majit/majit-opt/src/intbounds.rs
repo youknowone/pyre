@@ -425,9 +425,10 @@ impl OptIntBounds {
     // ── Overflow operations ──
 
     fn optimize_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
-        if let (Some(a), Some(b)) =
-            (ctx.get_constant_int(op.arg(0)), ctx.get_constant_int(op.arg(1)))
-        {
+        if let (Some(a), Some(b)) = (
+            ctx.get_constant_int(op.arg(0)),
+            ctx.get_constant_int(op.arg(1)),
+        ) {
             if let Some(result) = a.checked_add(b) {
                 self.make_constant_int(op, result, ctx);
                 self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
@@ -466,9 +467,10 @@ impl OptIntBounds {
     }
 
     fn optimize_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
-        if let (Some(a), Some(b)) =
-            (ctx.get_constant_int(op.arg(0)), ctx.get_constant_int(op.arg(1)))
-        {
+        if let (Some(a), Some(b)) = (
+            ctx.get_constant_int(op.arg(0)),
+            ctx.get_constant_int(op.arg(1)),
+        ) {
             if let Some(result) = a.checked_sub(b) {
                 self.make_constant_int(op, result, ctx);
                 self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
@@ -506,9 +508,10 @@ impl OptIntBounds {
     }
 
     fn optimize_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
-        if let (Some(a), Some(b)) =
-            (ctx.get_constant_int(op.arg(0)), ctx.get_constant_int(op.arg(1)))
-        {
+        if let (Some(a), Some(b)) = (
+            ctx.get_constant_int(op.arg(0)),
+            ctx.get_constant_int(op.arg(1)),
+        ) {
             if let Some(result) = a.checked_mul(b) {
                 self.make_constant_int(op, result, ctx);
                 self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);

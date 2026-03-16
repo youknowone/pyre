@@ -2378,10 +2378,16 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
                 PassResult::Remove => {}
-                PassResult::Replace(replaced) => { ctx.emit(replaced); }
-                PassResult::PassOn => { ctx.emit(resolved); }
+                PassResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                PassResult::PassOn => {
+                    ctx.emit(resolved);
+                }
             }
         }
 
@@ -2425,10 +2431,16 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
                 PassResult::Remove => {}
-                PassResult::Replace(replaced) => { ctx.emit(replaced); }
-                PassResult::PassOn => { ctx.emit(resolved); }
+                PassResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                PassResult::PassOn => {
+                    ctx.emit(resolved);
+                }
             }
         }
 
@@ -2466,10 +2478,16 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => { ctx.emit(emitted); }
+                PassResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
                 PassResult::Remove => {}
-                PassResult::Replace(replaced) => { ctx.emit(replaced); }
-                PassResult::PassOn => { ctx.emit(resolved); }
+                PassResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                PassResult::PassOn => {
+                    ctx.emit(resolved);
+                }
             }
         }
 
@@ -2479,9 +2497,6 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
             .count();
-        assert_eq!(
-            get_count, 1,
-            "byte-array read-after-read should be cached"
-        );
+        assert_eq!(get_count, 1, "byte-array read-after-read should be cached");
     }
 }

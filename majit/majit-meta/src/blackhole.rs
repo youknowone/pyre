@@ -2353,10 +2353,7 @@ mod tests {
         // 0xFFFFFFFF sign-extended from 4 bytes = -1
         assert_eq!(exec_binop(OpCode::IntSignext, 0xFFFFFFFF_i64, 4), -1);
         // 0x7FFFFFFF = 2147483647
-        assert_eq!(
-            exec_binop(OpCode::IntSignext, 0x7FFFFFFF, 4),
-            2147483647
-        );
+        assert_eq!(exec_binop(OpCode::IntSignext, 0x7FFFFFFF, 4), 2147483647);
         // 0x80000000 = -2147483648
         assert_eq!(
             exec_binop(OpCode::IntSignext, 0x80000000_i64, 4),

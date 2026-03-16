@@ -504,7 +504,9 @@ mod tests {
         let trace = Trace::new(inputargs, ops);
         let mut trace2 = trace.clone();
 
-        trace2.ops.push(Op::new(OpCode::IntSub, &[OpRef(0), OpRef(0)]));
+        trace2
+            .ops
+            .push(Op::new(OpCode::IntSub, &[OpRef(0), OpRef(0)]));
         assert_eq!(trace.num_ops(), 2);
         assert_eq!(trace2.num_ops(), 3);
     }
@@ -529,7 +531,11 @@ mod tests {
         let guard_opcodes: Vec<_> = trace.iter_guards().map(|op| op.opcode).collect();
         assert_eq!(
             guard_opcodes,
-            vec![OpCode::GuardTrue, OpCode::GuardFalse, OpCode::GuardNoException]
+            vec![
+                OpCode::GuardTrue,
+                OpCode::GuardFalse,
+                OpCode::GuardNoException
+            ]
         );
     }
 }

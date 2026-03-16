@@ -5,9 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use majit_codegen::{Backend, ExitRecoveryLayout, ExitFrameLayout, ExitValueSourceLayout, LoopToken};
-use majit_codegen_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
+use majit_codegen::{
+    Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, LoopToken,
+};
 use majit_codegen_cranelift::guard::CraneliftFailDescr;
+use majit_codegen_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
     Value,
@@ -2637,19 +2639,10 @@ fn test_call_release_gil_with_guard_not_forced() {
     let fn_ptr = OpRef(1000);
 
     // CallMayForceI: arg(0)=fn_ptr, rest=[force_token, x]
-    let result = rec.record_op_with_descr(
-        OpCode::CallMayForceI,
-        &[fn_ptr, token_ref, x],
-        cd,
-    );
+    let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, x], cd);
 
     // GuardNotForced with fail_args — exits here if the callee forced
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNotForced,
-        &[],
-        make_descr(0),
-        &[x, result],
-    );
+    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[x, result]);
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -2704,18 +2697,9 @@ fn test_call_may_force_with_forcing_semantics() {
     let token_ref = rec.record_op(OpCode::ForceToken, &[]);
     let fn_ptr = OpRef(1000);
 
-    let result = rec.record_op_with_descr(
-        OpCode::CallMayForceI,
-        &[fn_ptr, token_ref, flag],
-        cd,
-    );
+    let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, flag], cd);
 
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNotForced,
-        &[],
-        make_descr(0),
-        &[flag, result],
-    );
+    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[flag, result]);
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -2774,19 +2758,10 @@ fn test_ffi_call_exception_propagation() {
     let val = rec.record_input_arg(Type::Int);
 
     let fn_ptr = OpRef(1000);
-    let result = rec.record_op_with_descr(
-        OpCode::CallReleaseGilI,
-        &[fn_ptr, val],
-        cd,
-    );
+    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, val], cd);
 
     // GuardNoException: exits if jit_exc_get_value() != 0
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNoException,
-        &[],
-        make_descr(0),
-        &[result],
-    );
+    rec.record_guard_with_fail_args(OpCode::GuardNoException, &[], make_descr(0), &[result]);
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -2808,11 +2783,7 @@ fn test_ffi_call_exception_propagation() {
         1,
         "val=0: should reach Finish (descr 1)"
     );
-    assert_eq!(
-        backend.get_int_value(&frame, 0),
-        0,
-        "val=0: result = 0"
-    );
+    assert_eq!(backend.get_int_value(&frame, 0), 0, "val=0: result = 0");
 
     // val=99 -> exception raised -> exits via GuardNoException (descr 0)
     let frame = backend.execute_token(&token, &[Value::Int(99)]);
@@ -3201,12 +3172,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     let const_0 = OpRef(1000);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x_int, const_0]);
-    rec.record_guard_with_fail_args(
-        OpCode::GuardTrue,
-        &[cmp],
-        make_descr(0),
-        &[x_int, x_float],
-    );
+    rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], make_descr(0), &[x_int, x_float]);
     rec.finish(&[x_int], make_descr(1));
     let trace = rec.get_trace();
 
@@ -3226,18 +3192,12 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
         .expect("compilation should succeed");
 
     // x_int=10, x_float=3.14: guard passes, finish returns 10
-    let frame = backend.execute_token(
-        &token,
-        &[Value::Int(10), Value::Float(3.14)],
-    );
+    let frame = backend.execute_token(&token, &[Value::Int(10), Value::Float(3.14)]);
     assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
     assert_eq!(backend.get_int_value(&frame, 0), 10);
 
     // x_int=-5, x_float=2.718: guard fails (-5 > 0 is false)
-    let frame = backend.execute_token(
-        &token,
-        &[Value::Int(-5), Value::Float(2.718)],
-    );
+    let frame = backend.execute_token(&token, &[Value::Int(-5), Value::Float(2.718)]);
     let descr = backend.get_latest_descr(&frame);
     assert_eq!(descr.fail_index(), 0);
     assert_eq!(backend.get_int_value(&frame, 0), -5);
@@ -3314,9 +3274,9 @@ fn test_ffi_exchange_buffer_pattern() {
     let cd = call_descr_release_gil_i(80, vec![Type::Ref]);
 
     // Constants: offset_16 = 16 (exchange_args[0]), offset_32 = 32 (exchange_result)
-    let off_arg = OpRef(1000);   // offset 16
+    let off_arg = OpRef(1000); // offset 16
     let off_result = OpRef(1001); // offset 32
-    let fn_ptr = OpRef(1002);     // ffi_exchange_buffer_fn
+    let fn_ptr = OpRef(1002); // ffi_exchange_buffer_fn
 
     let mut rec = TraceRecorder::new();
     // Inputs: r0 = exchange buffer pointer, i0 = argument value
@@ -3327,11 +3287,7 @@ fn test_ffi_exchange_buffer_pattern() {
     rec.record_op_with_descr(OpCode::RawStore, &[r0, off_arg, i0], ad.clone());
 
     // Step 2: Call the FFI function with buffer pointer
-    let _call_result = rec.record_op_with_descr(
-        OpCode::CallReleaseGilI,
-        &[fn_ptr, r0],
-        cd,
-    );
+    let _call_result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, r0], cd);
 
     // Step 3: Load result from buffer at offset 32 (exchange_result)
     let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, off_result], ad);
@@ -3356,10 +3312,7 @@ fn test_ffi_exchange_buffer_pattern() {
     let ptr = exbuf.as_mut_ptr() as usize;
 
     // Execute with arg=25: store 25 at offset 16, FFI computes 25*2=50, load from offset 32
-    let frame = backend.execute_token(
-        &token,
-        &[Value::Ref(GcRef(ptr)), Value::Int(25)],
-    );
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Int(25)]);
     assert_eq!(
         backend.get_int_value(&frame, 0),
         50,
@@ -3373,10 +3326,7 @@ fn test_ffi_exchange_buffer_pattern() {
     // Execute with another value: arg=0
     exbuf.fill(0);
     let ptr = exbuf.as_mut_ptr() as usize;
-    let frame = backend.execute_token(
-        &token,
-        &[Value::Ref(GcRef(ptr)), Value::Int(0)],
-    );
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Int(0)]);
     assert_eq!(
         backend.get_int_value(&frame, 0),
         0,
@@ -3386,10 +3336,7 @@ fn test_ffi_exchange_buffer_pattern() {
     // Execute with negative value: arg=-10
     exbuf.fill(0);
     let ptr = exbuf.as_mut_ptr() as usize;
-    let frame = backend.execute_token(
-        &token,
-        &[Value::Ref(GcRef(ptr)), Value::Int(-10)],
-    );
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Int(-10)]);
     assert_eq!(
         backend.get_int_value(&frame, 0),
         -20,

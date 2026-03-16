@@ -822,8 +822,7 @@ impl MiniMarkGC {
             let type_id = unsafe { header_of(obj_addr).type_id() };
             let type_info = self.types.get(type_id);
             let payload_size = if type_info.item_size > 0 {
-                let length =
-                    unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
                 type_info.total_instance_size(length)
             } else {
                 type_info.size
@@ -844,11 +843,7 @@ impl MiniMarkGC {
         let mut max_end = nursery_start;
         for (header_start, total_size, data) in &saved {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    *header_start as *mut u8,
-                    *total_size,
-                );
+                std::ptr::copy_nonoverlapping(data.as_ptr(), *header_start as *mut u8, *total_size);
             }
             let end = header_start + total_size;
             if end > max_end {
