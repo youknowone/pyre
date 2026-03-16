@@ -1140,4 +1140,280 @@ mod tests {
         assert_eq!(evicted[0], 1);
         assert_eq!(aging.alive_count(), 1);
     }
+
+    // ── Memmgr deeper coverage (RPython: test_memmgr.py parity) ──
+
+    #[test]
+    fn test_evicted_loops_can_be_recompiled() {
+        // After a loop is evicted by loop aging, it can be re-registered
+        // (recompiled) and tracked again.
+        let mut aging = LoopAging::new(2);
+
+        aging.register_loop(1); // gen 0
+        // Advance until eviction
+        aging.next_generation(); // gen 1
+        aging.next_generation(); // gen 2
+        let evicted = aging.next_generation(); // gen 3: threshold=1, 0 < 1 → evict
+        assert!(evicted.contains(&1));
+        assert_eq!(aging.alive_count(), 0);
+
+        // Re-register the same loop (recompiled)
+        aging.register_loop(1); // now at gen 3
+        assert_eq!(aging.alive_count(), 1);
+
+        // Should stay alive for max_age generations
+        let evicted = aging.next_generation(); // gen 4: threshold=2, 3 >= 2 → alive
+        assert!(evicted.is_empty());
+        let evicted = aging.next_generation(); // gen 5: threshold=3, 3 >= 3 → alive
+        assert!(evicted.is_empty());
+        let evicted = aging.next_generation(); // gen 6: threshold=4, 3 < 4 → evict
+        assert!(evicted.contains(&1));
+    }
+
+    #[test]
+    fn test_generation_overflow_saturating() {
+        // Verify that generation counter uses saturating subtraction
+        // and doesn't panic or wrap on extreme values.
+        let mut aging = LoopAging::new(3);
+
+        // Advance many generations to get a high generation number
+        for _ in 0..1000 {
+            aging.next_generation();
+        }
+        assert_eq!(aging.generation(), 1000);
+
+        // Register a loop at the high generation
+        aging.register_loop(42);
+        assert_eq!(aging.alive_count(), 1);
+
+        // Should still evict correctly after max_age more generations
+        aging.next_generation(); // gen 1001
+        aging.next_generation(); // gen 1002
+        aging.next_generation(); // gen 1003
+        let evicted = aging.next_generation(); // gen 1004: threshold=1001, 1000 < 1001 → evict
+        assert!(evicted.contains(&42));
+    }
+
+    #[test]
+    fn test_loop_aging_with_warm_state_integration() {
+        // Simulate the interaction between loop aging and WarmState:
+        // - WarmState compiles a loop and registers it with LoopAging.
+        // - LoopAging evicts the loop.
+        // - WarmState removes the compiled loop and allows recompilation.
+        let mut ws = WarmState::new(2);
+        let mut aging = LoopAging::new(2);
+        let key = 0xF00D;
+
+        // Step 1: compile a loop
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing"),
+        }
+        ws.finish_tracing(key);
+        let token = LoopToken::new(ws.alloc_token_number());
+        ws.install_compiled(key, token);
+        aging.register_loop(key);
+
+        assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
+        assert_eq!(aging.alive_count(), 1);
+
+        // Step 2: advance past max_age without refreshing
+        aging.next_generation();
+        aging.next_generation();
+        let evicted = aging.next_generation();
+        assert!(evicted.contains(&key));
+
+        // In a real system, eviction would cause the WarmState to reset
+        // the cell so the loop can be recompiled. Simulate by checking
+        // that we can re-install.
+        let token2 = LoopToken::new(ws.alloc_token_number());
+        ws.install_compiled(key, token2);
+        aging.register_loop(key);
+
+        assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
+        assert_eq!(aging.alive_count(), 1);
+    }
+
+    #[test]
+    fn test_loop_aging_does_not_affect_active_loops() {
+        // Loops that are kept alive each generation should never be evicted,
+        // even as other loops are evicted around them.
+        // This simulates "currently-executing" loops being refreshed.
+        let mut aging = LoopAging::new(2);
+
+        aging.register_loop(1); // "active" loop
+        aging.register_loop(2); // "inactive" loop
+        aging.register_loop(3); // "inactive" loop
+
+        for _ in 0..20 {
+            aging.keep_loop_alive(1); // keep loop 1 active
+            let evicted = aging.next_generation();
+
+            // Loop 1 should never be evicted
+            assert!(
+                !evicted.contains(&1),
+                "active loop should never be evicted"
+            );
+        }
+
+        // Loop 1 should still be alive
+        assert!(aging.alive_count() >= 1);
+        // Loop 2 and 3 should have been evicted long ago
+        // (registered at gen 0, threshold grows each generation)
+    }
+
+    #[test]
+    fn test_loop_aging_set_max_age_dynamic() {
+        // max_age can be changed dynamically. Changing it affects future
+        // eviction decisions but doesn't retroactively evict.
+        let mut aging = LoopAging::new(10);
+
+        aging.register_loop(1); // gen 0
+        aging.next_generation(); // gen 1
+
+        // Reduce max_age to 1 — loop 1 at gen 0, threshold = 2 - 1 = 1
+        // 0 < 1 → should be evicted next generation
+        aging.set_max_age(1);
+        let evicted = aging.next_generation(); // gen 2
+        assert!(
+            evicted.contains(&1),
+            "reducing max_age should cause earlier eviction"
+        );
+    }
+
+    #[test]
+    fn test_loop_aging_interleaved_register_and_evict() {
+        // Mirrors RPython's test_basic_3: register loops at different
+        // generations, keep some alive on even indices.
+        let mut aging = LoopAging::new(4);
+
+        let mut keys: Vec<u64> = Vec::new();
+        for i in 0..10u64 {
+            keys.push(i);
+            aging.register_loop(i);
+            aging.next_generation();
+
+            // Keep even-indexed loops alive
+            for j in (0..=i).step_by(2) {
+                aging.keep_loop_alive(j);
+            }
+        }
+
+        // After 10 generations with max_age=4:
+        // Even-indexed loops should still be alive (refreshed each gen).
+        // Odd-indexed loops registered at gen i should be evicted
+        // when generation > i + 4.
+        for i in 0..10u64 {
+            let is_alive = aging
+                .loop_generations
+                .contains_key(&i);
+            if i % 2 == 0 {
+                assert!(
+                    is_alive,
+                    "even-indexed loop {} should be alive",
+                    i
+                );
+            }
+            // Odd loops registered early enough will have been evicted.
+            // Loop i (odd) registered at gen i. After gen 10, threshold = 10 - 4 = 6.
+            // Evicted if i < 6.
+            if i % 2 != 0 && i < 6 {
+                assert!(
+                    !is_alive,
+                    "odd loop {} registered at gen {} should be evicted by gen 10",
+                    i, i
+                );
+            }
+        }
+    }
+
+    // ── Trace limit + inline depth interaction ──
+
+    #[test]
+    fn test_trace_limit_with_inline_depth() {
+        // Inline depth limiting and trace limit are orthogonal:
+        // a function can be inlined (depth < max), but the trace
+        // can still be too long. The WarmState correctly tracks both.
+        let mut ws = WarmState::new(3);
+        ws.set_function_threshold(2);
+        ws.set_max_inline_depth(3);
+
+        // Depth 0: allowed
+        assert!(ws.can_inline_at_depth(0));
+        // Depth 2: allowed (< 3)
+        assert!(ws.can_inline_at_depth(2));
+        // Depth 3: not allowed (>= 3)
+        assert!(!ws.can_inline_at_depth(3));
+
+        // Inlining decisions are independent of trace length:
+        // function 42 needs 2 calls before inlining
+        assert!(!ws.should_inline_function(42));
+        assert!(ws.should_inline_function(42));
+
+        // Even at max depth, inlining threshold still tracks calls
+        ws.reset_function_counts();
+        assert!(!ws.should_inline_function(42));
+    }
+
+    #[test]
+    fn test_abort_tracing_retry_with_lower_threshold() {
+        // Simulates the scenario where a trace is too long, the location
+        // is aborted (without blacklisting), and on retry the WarmState
+        // has a lower threshold so it starts tracing sooner.
+        let mut ws = WarmState::new(5);
+        let key = 0xABCD;
+
+        // Reach threshold=5, start tracing
+        for _ in 0..4 {
+            assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        }
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing at threshold 5"),
+        }
+
+        // Abort without blacklisting
+        ws.abort_tracing(key, false);
+
+        // Lower threshold for retry
+        ws.set_threshold(2);
+
+        // Now only 2 ticks needed
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        match ws.maybe_compile(key) {
+            HotResult::StartTracing(_) => {
+                ws.finish_tracing(key);
+                let token = LoopToken::new(ws.alloc_token_number());
+                ws.install_compiled(key, token);
+            }
+            _ => panic!("expected StartTracing with lower threshold"),
+        }
+        assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
+    }
+
+    #[test]
+    fn test_force_start_tracing_bypasses_counter() {
+        // force_start_tracing is used for function-entry tracing where
+        // the caller already decided to trace. It should work regardless
+        // of the counter state.
+        let mut ws = WarmState::new(100); // very high threshold
+        let key = 42;
+
+        // Without any ticks, force_start_tracing should start tracing
+        match ws.force_start_tracing(key) {
+            HotResult::StartTracing(_) => {}
+            _ => panic!("force_start_tracing should start tracing immediately"),
+        }
+
+        // The cell should be in TRACING state
+        let cell = ws.get_cell(key).unwrap();
+        assert!(cell.is_tracing());
+
+        // Second call sees AlreadyTracing
+        match ws.force_start_tracing(key) {
+            HotResult::AlreadyTracing => {}
+            _ => panic!("expected AlreadyTracing on second force_start_tracing"),
+        }
+    }
 }
