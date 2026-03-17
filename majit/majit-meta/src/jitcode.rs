@@ -2,7 +2,7 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use majit_codegen::LoopToken;
+use majit_codegen::JitCellToken;
 use majit_ir::{OpCode, OpRef};
 
 use crate::{SymbolicStack, TraceAction, TraceCtx};
@@ -1002,7 +1002,7 @@ where
                 }
                 if bytecode == BC_CALL_ASSEMBLER_VOID {
                     let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
-                    let token = LoopToken::new(target.token_number);
+                    let token = JitCellToken::new(target.token_number);
                     ctx.call_assembler_void_typed(&token, &args, &arg_types);
                     call_void_function(target.concrete_ptr, &concrete_args);
                 } else {
@@ -1050,19 +1050,23 @@ where
                 // No distinction between "virtualizable" and "non-virtualizable"
                 // at the JitCode level. Both use boxes. The preamble loads values
                 // from heap, and JUMP carries them as args.
-                if sym.stack(new_selected).is_none() {
-                    let len = runtime.stack_len(new_selected);
-                    let offset = sym.total_slots();
-                    sym.ensure_stack(new_selected, offset, len);
-                    let _ = self.runtime_stack_mut(new_selected, runtime);
-                }
-                // Virtualizable: init array ref for newly-selected storage
-                if sym.is_virtualizable_storage() && sym.vable_array_ref(new_selected).is_none() {
-                    let data_ptr = runtime.stack_data_ptr(new_selected);
-                    let len = runtime.stack_len(new_selected);
-                    let arr_ref = ctx.const_int(data_ptr as i64);
-                    let len_ref = ctx.const_int(len as i64);
-                    sym.init_vable_storage(new_selected, arr_ref, len_ref);
+                if sym.is_virtualizable_storage() {
+                    // Virtualizable: init array ref for newly-selected storage.
+                    // Do NOT call ensure_stack — virtualizable doesn't use SymbolicStack.
+                    if sym.vable_array_ref(new_selected).is_none() {
+                        let data_ptr = runtime.stack_data_ptr(new_selected);
+                        let len = runtime.stack_len(new_selected);
+                        let arr_ref = ctx.const_int(data_ptr as i64);
+                        let len_ref = ctx.const_int(len as i64);
+                        sym.init_vable_storage(new_selected, arr_ref, len_ref);
+                    }
+                } else {
+                    if sym.stack(new_selected).is_none() {
+                        let len = runtime.stack_len(new_selected);
+                        let offset = sym.total_slots();
+                        sym.ensure_stack(new_selected, offset, len);
+                        let _ = self.runtime_stack_mut(new_selected, runtime);
+                    }
                 }
                 let selected_value = ctx.const_int(new_selected as i64);
                 sym.set_current_selected_value(new_selected, selected_value);
@@ -1073,12 +1077,6 @@ where
                     (frame.next_u16() as usize, frame.next_u16() as usize)
                 };
                 let (value, concrete) = self.read_int_reg(src_idx);
-                if sym.stack(target).is_none() {
-                    let len = runtime.stack_len(target);
-                    let offset = sym.total_slots();
-                    sym.ensure_stack(target, offset, len);
-                    let _ = self.runtime_stack_mut(target, runtime);
-                }
                 if sym.is_virtualizable_storage() {
                     // Ensure target has vable refs
                     if sym.vable_array_ref(target).is_none() {
@@ -1099,6 +1097,12 @@ where
                         return TraceAction::Abort;
                     }
                 } else {
+                    if sym.stack(target).is_none() {
+                        let len = runtime.stack_len(target);
+                        let offset = sym.total_slots();
+                        sym.ensure_stack(target, offset, len);
+                        let _ = self.runtime_stack_mut(target, runtime);
+                    }
                     let stack = sym.stack_mut(target).expect("missing target stack");
                     stack.push(value);
                     self.runtime_stack_mut(target, runtime).push(concrete);
@@ -1143,7 +1147,7 @@ where
                 }
                 if opcode == BC_CALL_ASSEMBLER_INT {
                     let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
-                    let token = LoopToken::new(target.token_number);
+                    let token = JitCellToken::new(target.token_number);
                     let traced = ctx.call_assembler_int_typed(&token, &args, &arg_types);
                     let concrete = call_int_function(target.concrete_ptr, &concrete_args);
                     self.set_int_reg(dst, Some(traced), Some(concrete));
@@ -1251,7 +1255,7 @@ where
                 }
                 if opcode == BC_CALL_ASSEMBLER_REF {
                     let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
-                    let token = LoopToken::new(target.token_number);
+                    let token = JitCellToken::new(target.token_number);
                     let traced = ctx.call_assembler_ref_typed(&token, &args, &arg_types);
                     let concrete = call_int_function(target.concrete_ptr, &concrete_args);
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
@@ -1359,7 +1363,7 @@ where
                 }
                 if opcode == BC_CALL_ASSEMBLER_FLOAT {
                     let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
-                    let token = LoopToken::new(target.token_number);
+                    let token = JitCellToken::new(target.token_number);
                     let traced = ctx.call_assembler_float_typed(&token, &args, &arg_types);
                     let concrete = call_int_function(target.concrete_ptr, &concrete_args);
                     self.set_float_reg(dst, Some(traced), Some(concrete));
@@ -2258,7 +2262,7 @@ impl JitCodeBuilder {
 
     pub fn add_call_assembler_target(
         &mut self,
-        target: &LoopToken,
+        target: &JitCellToken,
         concrete_ptr: *const (),
     ) -> u16 {
         self.add_call_assembler_target_number(target.number, concrete_ptr)
