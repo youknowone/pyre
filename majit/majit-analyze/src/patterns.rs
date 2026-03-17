@@ -264,15 +264,30 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     let mut calls: Vec<String> = Vec::new();
     let mut has_guard = false;
 
-    for op in ops {
-        match &op.kind {
-            OpKind::FieldRead { field, .. } => field_reads.push(field.clone()),
-            OpKind::FieldWrite { field, .. } => field_writes.push(field.clone()),
-            OpKind::ArrayRead { .. } => array_reads += 1,
-            OpKind::ArrayWrite { .. } => array_writes += 1,
-            OpKind::Call { target, .. } => calls.push(target.clone()),
-            OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => has_guard = true,
-            _ => {}
+    let mut has_vable_field = false;
+    let mut has_vable_array = false;
+
+    // Analyze ALL blocks (not just entry) for multi-block graphs
+    for block in &graph.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::FieldRead { field, .. } => field_reads.push(field.clone()),
+                OpKind::FieldWrite { field, .. } => field_writes.push(field.clone()),
+                OpKind::ArrayRead { .. } => array_reads += 1,
+                OpKind::ArrayWrite { .. } => array_writes += 1,
+                OpKind::Call { target, .. }
+                | OpKind::CallElidable { target, .. }
+                | OpKind::CallResidual { target, .. }
+                | OpKind::CallMayForce { target, .. } => calls.push(target.clone()),
+                OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => has_guard = true,
+                OpKind::VableFieldRead { .. } | OpKind::VableFieldWrite { .. } => {
+                    has_vable_field = true;
+                }
+                OpKind::VableArrayRead { .. } | OpKind::VableArrayWrite { .. } => {
+                    has_vable_array = true;
+                }
+                _ => {}
+            }
         }
     }
 
