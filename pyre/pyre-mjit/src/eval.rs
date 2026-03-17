@@ -1,10 +1,11 @@
 //! JIT-enabled evaluation entry point.
 //!
-//! This module wraps pyre-interp's eval_frame with JIT capabilities.
-//! Currently delegates to pyre-interp's existing JIT-enabled eval_frame.
-//! As JIT code migrates from pyre-interp to pyre-mjit, this becomes
-//! the sole entry point for JIT execution.
+//! This module is the sole entry point for JIT execution.
+//! It orchestrates JIT function-entry checks, tracing, and
+//! compiled-code execution, delegating pure interpretation
+//! to pyre-interp's eval_frame_plain.
 
+use pyre_interp::eval;
 use pyre_interp::frame::PyFrame;
 use pyre_runtime::PyResult;
 
@@ -13,12 +14,28 @@ use pyre_runtime::PyResult;
 /// This is the main entry point for pyre-mjit. It replaces
 /// pyre-interp's eval_frame for JIT-enabled execution.
 ///
-/// Currently delegates to pyre-interp's eval_frame (which still
-/// has JIT code). As the migration progresses, JIT logic moves here.
+/// Flow:
+/// 1. Install JIT call bridges (force/bridge callbacks)
+/// 2. Try function-entry JIT (compiled code or start tracing)
+/// 3. If tracing active → JIT-enabled eval loop
+/// 4. Otherwise → plain interpreter loop
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
-    // Phase 1: delegate to existing eval_frame
-    // Phase 2: replace with mjit-native tracing using auto-generated code
-    pyre_interp::eval::eval_frame(frame)
+    pyre_interp::call::install_jit_call_bridge();
+    frame.fix_array_ptrs();
+
+    // Try running compiled code or start tracing for this function
+    if let Some(result) = eval::try_function_entry_jit(frame) {
+        return result;
+    }
+
+    // If function-entry triggered tracing, use JIT-enabled loop
+    let (driver, _) = eval::driver_pair();
+    if driver.is_tracing() {
+        return eval::eval_loop_jit(frame);
+    }
+
+    // No JIT activity → pure interpreter
+    eval::eval_frame_plain(frame)
 }
 
 #[cfg(test)]
