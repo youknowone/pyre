@@ -232,7 +232,7 @@ impl LoopAging {
 ///
 /// Keeps track of per-greenkey cells and the global hot counter.
 /// The interpreter calls `maybe_compile()` at loop headers;
-/// WarmState decides whether to start tracing, continue interpreting,
+/// WarmEnterState decides whether to start tracing, continue interpreting,
 /// or dispatch to compiled code.
 /// Default number of guard failures before triggering bridge compilation.
 /// PyPy default: trace_eagerness = 200
@@ -264,7 +264,7 @@ pub struct JitStats {
     pub num_cells: usize,
 }
 
-pub struct WarmState {
+pub struct WarmEnterState {
     /// Global hot counter.
     counter: JitCounter,
     /// Per-greenkey cells, keyed by the hash of the green key.
@@ -314,11 +314,11 @@ pub enum HotResult {
     RunCompiled,
 }
 
-impl WarmState {
-    /// Create a new WarmState with the given threshold.
+impl WarmEnterState {
+    /// Create a new WarmEnterState with the given threshold.
     /// Automatically enables JitLog if MAJIT_STATS=1 or MAJIT_LOG=1.
     pub fn new(threshold: u32) -> Self {
-        WarmState {
+        WarmEnterState {
             counter: JitCounter::new(threshold),
             cells: HashMap::new(),
             threshold,
@@ -333,9 +333,9 @@ impl WarmState {
         }
     }
 
-    /// Create a new WarmState with an explicit JitLog.
+    /// Create a new WarmEnterState with an explicit JitLog.
     pub fn with_jitlog(threshold: u32, jitlog: Option<JitLog>) -> Self {
-        WarmState {
+        WarmEnterState {
             counter: JitCounter::new(threshold),
             cells: HashMap::new(),
             threshold,
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_not_hot_initially() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         match ws.maybe_compile(42) {
             HotResult::NotHot => {}
             _ => panic!("expected NotHot"),
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_start_tracing_at_threshold() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         // Tick 1, 2: not hot
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_already_tracing() {
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         // First tick: eviction (always false). Second tick: threshold reached.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_run_compiled() {
-        let mut ws = WarmState::new(1);
+        let mut ws = WarmEnterState::new(1);
         let token_num = ws.alloc_token_number();
         let token = LoopToken::new(token_num);
         ws.install_compiled(42, token);
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn test_finish_tracing() {
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
             HotResult::StartTracing(_) => {}
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_abort_tracing() {
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
             HotResult::StartTracing(_) => {}
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn test_abort_tracing_allows_retry() {
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
             HotResult::StartTracing(_) => {}
@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_different_green_keys() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         // Key 1: tick 1 (eviction), tick 2 (count=2 < 3)
         assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn test_alloc_token_number() {
-        let mut ws = WarmState::new(10);
+        let mut ws = WarmEnterState::new(10);
         let first = ws.alloc_token_number();
         let second = ws.alloc_token_number();
         let third = ws.alloc_token_number();
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_set_threshold() {
-        let mut ws = WarmState::new(100);
+        let mut ws = WarmEnterState::new(100);
         assert_eq!(ws.threshold(), 100);
         ws.set_threshold(50);
         assert_eq!(ws.threshold(), 50);
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn test_get_compiled() {
-        let mut ws = WarmState::new(1);
+        let mut ws = WarmEnterState::new(1);
         assert!(ws.get_compiled(42).is_none());
 
         let token = LoopToken::new(0);
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_full_lifecycle() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         let key = 0xDEAD;
 
         // Phase 1: Not hot (need 3 ticks to reach threshold=3)
@@ -973,20 +973,20 @@ mod tests {
 
     #[test]
     fn test_bridge_threshold_default() {
-        let ws = WarmState::new(3);
+        let ws = WarmEnterState::new(3);
         assert_eq!(ws.bridge_threshold(), 200); // PyPy default: trace_eagerness
     }
 
     #[test]
     fn test_bridge_threshold_custom() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         ws.set_bridge_threshold(10);
         assert_eq!(ws.bridge_threshold(), 10);
     }
 
     #[test]
     fn test_should_compile_bridge() {
-        let ws = WarmState::new(3);
+        let ws = WarmEnterState::new(3);
         assert!(!ws.should_compile_bridge(0));
         assert!(!ws.should_compile_bridge(199));
         assert!(ws.should_compile_bridge(200));
@@ -997,7 +997,7 @@ mod tests {
 
     #[test]
     fn test_quasiimmut_register_and_invalidate() {
-        let mut ws = WarmState::new(1);
+        let mut ws = WarmEnterState::new(1);
         let token = LoopToken::new(ws.alloc_token_number());
         let green_key = 42;
         let qmut_key = 0xABCD;
@@ -1015,7 +1015,7 @@ mod tests {
 
     #[test]
     fn test_quasiimmut_no_deps() {
-        let mut ws = WarmState::new(1);
+        let mut ws = WarmEnterState::new(1);
         // No dependencies registered → invalidation returns 0.
         let count = ws.invalidate_quasiimmut(0xDEAD);
         assert_eq!(count, 0);
@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_quasiimmut_multiple_deps() {
-        let mut ws = WarmState::new(1);
+        let mut ws = WarmEnterState::new(1);
         let qmut_key = 0xABCD;
 
         // Install two loops depending on the same quasi-immutable field.
@@ -1044,7 +1044,7 @@ mod tests {
 
     #[test]
     fn test_quasiimmut_invalidate_all() {
-        let mut ws = WarmState::new(1);
+        let mut ws = WarmEnterState::new(1);
         for green_key in [1, 2, 3] {
             let token = LoopToken::new(ws.alloc_token_number());
             ws.install_compiled(green_key, token);
@@ -1062,20 +1062,20 @@ mod tests {
 
     #[test]
     fn test_function_threshold_default() {
-        let ws = WarmState::new(3);
+        let ws = WarmEnterState::new(3);
         assert_eq!(ws.function_threshold(), 1619); // PyPy default
     }
 
     #[test]
     fn test_function_threshold_custom() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         ws.set_function_threshold(10);
         assert_eq!(ws.function_threshold(), 10);
     }
 
     #[test]
     fn test_should_inline_function_below_threshold() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         ws.set_function_threshold(3);
 
         // First two calls: below threshold, don't inline
@@ -1091,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_should_inline_function_different_keys() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         ws.set_function_threshold(2);
 
         assert!(!ws.should_inline_function(1));
@@ -1104,7 +1104,7 @@ mod tests {
 
     #[test]
     fn test_function_count_reset() {
-        let mut ws = WarmState::new(3);
+        let mut ws = WarmEnterState::new(3);
         ws.set_function_threshold(2);
 
         assert!(!ws.should_inline_function(42));
@@ -1124,7 +1124,7 @@ mod tests {
         // When a trace is too long, the meta-interpreter calls
         // abort_tracing(key, true) to prevent future tracing at that location.
         // This mirrors RPython's ABORT_TOO_LONG behavior.
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
             HotResult::StartTracing(_) => {}
@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn test_abort_too_long_then_retry_different_key() {
         // Aborting one key's trace as too long should not affect other keys.
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
 
         // Key 42: start and abort as too long.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
@@ -1169,7 +1169,7 @@ mod tests {
     fn test_lifecycle_with_trace_abort_and_recompile() {
         // Full lifecycle: trace starts, is too long (abort without blacklist),
         // then on retry a shorter trace succeeds and gets compiled.
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         let key = 0xCAFE;
 
         // Phase 1: reach threshold, start tracing.
@@ -1203,7 +1203,7 @@ mod tests {
         // Mirrors RPython's segmented trace behavior: a location can fail
         // multiple times before eventually compiling.
         // threshold=2 because the first tick always evicts (returns NotHot).
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         let key = 0xBEEF;
 
         // First attempt: tick once (eviction), tick twice (threshold) -> StartTracing.
@@ -1239,7 +1239,7 @@ mod tests {
     fn test_tracing_occurred_flag_persists_after_abort() {
         // The TRACING_OCCURRED flag should remain set even after abort.
         // This mirrors RPython's tracking of whether tracing was ever attempted.
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         let key = 42;
 
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
@@ -1263,7 +1263,7 @@ mod tests {
 
     #[test]
     fn test_quasiimmut_deps_cleared_after_invalidation() {
-        let mut ws = WarmState::new(1);
+        let mut ws = WarmEnterState::new(1);
         let qmut_key = 0xABCD;
         let token = LoopToken::new(ws.alloc_token_number());
         ws.install_compiled(42, token);
@@ -1426,11 +1426,11 @@ mod tests {
 
     #[test]
     fn test_loop_aging_with_warm_state_integration() {
-        // Simulate the interaction between loop aging and WarmState:
-        // - WarmState compiles a loop and registers it with LoopAging.
+        // Simulate the interaction between loop aging and WarmEnterState:
+        // - WarmEnterState compiles a loop and registers it with LoopAging.
         // - LoopAging evicts the loop.
-        // - WarmState removes the compiled loop and allows recompilation.
-        let mut ws = WarmState::new(2);
+        // - WarmEnterState removes the compiled loop and allows recompilation.
+        let mut ws = WarmEnterState::new(2);
         let mut aging = LoopAging::new(2);
         let key = 0xF00D;
 
@@ -1454,7 +1454,7 @@ mod tests {
         let evicted = aging.next_generation();
         assert!(evicted.contains(&key));
 
-        // In a real system, eviction would cause the WarmState to reset
+        // In a real system, eviction would cause the WarmEnterState to reset
         // the cell so the loop can be recompiled. Simulate by checking
         // that we can re-install.
         let token2 = LoopToken::new(ws.alloc_token_number());
@@ -1555,8 +1555,8 @@ mod tests {
     fn test_trace_limit_with_inline_depth() {
         // Inline depth limiting and trace limit are orthogonal:
         // a function can be inlined (depth < max), but the trace
-        // can still be too long. The WarmState correctly tracks both.
-        let mut ws = WarmState::new(3);
+        // can still be too long. The WarmEnterState correctly tracks both.
+        let mut ws = WarmEnterState::new(3);
         ws.set_function_threshold(2);
         ws.set_max_inline_depth(3);
 
@@ -1580,9 +1580,9 @@ mod tests {
     #[test]
     fn test_abort_tracing_retry_with_lower_threshold() {
         // Simulates the scenario where a trace is too long, the location
-        // is aborted (without blacklisting), and on retry the WarmState
+        // is aborted (without blacklisting), and on retry the WarmEnterState
         // has a lower threshold so it starts tracing sooner.
-        let mut ws = WarmState::new(5);
+        let mut ws = WarmEnterState::new(5);
         let key = 0xABCD;
 
         // Reach threshold=5, start tracing
@@ -1618,7 +1618,7 @@ mod tests {
         // force_start_tracing is used for function-entry tracing where
         // the caller already decided to trace. It should work regardless
         // of the counter state.
-        let mut ws = WarmState::new(100); // very high threshold
+        let mut ws = WarmEnterState::new(100); // very high threshold
         let key = 42;
 
         // Without any ticks, force_start_tracing should start tracing
@@ -1643,7 +1643,7 @@ mod tests {
     #[test]
     fn test_jitcell_state_transitions() {
         // Full lifecycle: NotHot → Tracing → Compiled → Invalidated
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         let key = 0xA1;
 
         // Initially no cell → NotHot
@@ -1677,7 +1677,7 @@ mod tests {
     #[test]
     fn test_procedure_token_ownership() {
         // Compiled cell owns a token; invalidation revokes ownership.
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         let key = 0xB2;
 
         // Compile a loop
@@ -1715,7 +1715,7 @@ mod tests {
 
     #[test]
     fn test_set_param_threshold() {
-        let mut ws = WarmState::new(100);
+        let mut ws = WarmEnterState::new(100);
         assert_eq!(ws.threshold(), 100);
 
         ws.set_param("threshold", 42);
@@ -1739,7 +1739,7 @@ mod tests {
 
     #[test]
     fn test_get_stats() {
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
 
         // Initially empty
         let stats = ws.get_stats();
@@ -1785,7 +1785,7 @@ mod tests {
 
     #[test]
     fn test_jitcell_state_dont_trace_here() {
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         let key = 0xC3;
 
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
@@ -1811,7 +1811,7 @@ mod tests {
 
     #[test]
     fn test_tracing_generation_increments() {
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         let gen0 = ws.tracing_generation();
         assert_eq!(gen0, 0);
 
@@ -1857,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_gc_cells() {
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
 
         // Create some cells in various states
         // Key 1: compiled (should NOT be removed)
@@ -1888,7 +1888,7 @@ mod tests {
     #[test]
     fn test_invalidated_cell_allows_recompilation() {
         // After invalidation, transitioning back to NotHot allows recompilation.
-        let mut ws = WarmState::new(2);
+        let mut ws = WarmEnterState::new(2);
         let key = 0xD4;
 
         // Compile

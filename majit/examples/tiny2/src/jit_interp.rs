@@ -16,7 +16,7 @@ use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
 use majit_trace::recorder::TraceRecorder;
-use majit_trace::warmstate::{HotResult, WarmState};
+use majit_trace::warmstate::{HotResult, WarmEnterState};
 
 const DEFAULT_THRESHOLD: u32 = 3;
 
@@ -52,7 +52,7 @@ impl TracingState {
 }
 
 pub struct JitTiny2Interp {
-    warm_state: WarmState,
+    warm_state: WarmEnterState,
     backend: CraneliftBackend,
     compiled_loops: HashMap<usize, CompiledLoop>,
     tracing: Option<TracingState>,
@@ -61,7 +61,7 @@ pub struct JitTiny2Interp {
 impl JitTiny2Interp {
     pub fn new() -> Self {
         JitTiny2Interp {
-            warm_state: WarmState::new(DEFAULT_THRESHOLD),
+            warm_state: WarmEnterState::new(DEFAULT_THRESHOLD),
             backend: CraneliftBackend::new(),
             compiled_loops: HashMap::new(),
             tracing: None,

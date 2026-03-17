@@ -10,7 +10,7 @@ use majit_ir::{
 };
 use majit_opt::optimizer::Optimizer;
 use majit_trace::trace::Trace;
-use majit_trace::warmstate::{HotResult, WarmState};
+use majit_trace::warmenterstate::{HotResult, WarmEnterState};
 use std::sync::Arc;
 
 use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionState};
@@ -456,7 +456,7 @@ struct CompiledEntry<M> {
 /// (e.g., storage layout, register mapping). The interpreter provides `M` when
 /// closing a trace and receives it back when running compiled code.
 pub struct MetaInterp<M: Clone> {
-    warm_state: WarmState,
+    warm_state: WarmEnterState,
     backend: CraneliftBackend,
     compiled_loops: HashMap<u64, CompiledEntry<M>>,
     tracing: Option<TraceCtx>,
@@ -817,7 +817,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Create a new MetaInterp with the given compilation threshold.
     pub fn new(threshold: u32) -> Self {
         MetaInterp {
-            warm_state: WarmState::new(threshold),
+            warm_state: WarmEnterState::new(threshold),
             backend: CraneliftBackend::new(),
             compiled_loops: HashMap::new(),
             tracing: None,
@@ -3516,7 +3516,7 @@ impl<M: Clone> MetaInterp<M> {
 }
 
 /// Default maximum inlining depth during tracing.
-/// Configurable via WarmState::set_max_inline_depth().
+/// Configurable via WarmEnterState::set_max_inline_depth().
 const MAX_INLINE_DEPTH: usize = 10;
 
 /// Describes the recovery state after a guard failure.

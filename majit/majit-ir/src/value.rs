@@ -244,7 +244,7 @@ impl GreenKey {
     /// Compute a hash suitable for use as HashMap key.
     ///
     /// This is equivalent to the `green_key_hash: u64` currently used
-    /// in WarmState, but computed from the structured values.
+    /// in WarmEnterState, but computed from the structured values.
     pub fn hash_u64(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
