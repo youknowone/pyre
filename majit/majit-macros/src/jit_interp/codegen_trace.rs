@@ -26,6 +26,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         &config.io_shims,
         &config.calls,
         config.auto_calls,
+        config.virtualizable_decl.as_ref(),
     );
 
     let classified = classify_arms(&match_expr.arms);

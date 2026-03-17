@@ -29,6 +29,16 @@ pub struct LowererConfig {
     calls: Vec<(String, CallPolicySpec)>,
     /// Whether top-level traced calls should auto-infer helper policy.
     auto_calls: bool,
+    /// Virtualizable variable name (normalized, e.g., "frame").
+    /// RPython jtransform.py: `is_virtualizable_getset()` uses this to check
+    /// if a field access target is the virtualizable variable.
+    vable_var: Option<String>,
+    /// Field name → (field_index, field_type_str).
+    /// RPython: `vinfo.static_field_to_extra_box[fieldname]` → index.
+    vable_fields: HashMap<String, (usize, String)>,
+    /// Array name → (array_index, item_type_str).
+    /// RPython: `vinfo.array_field_counter[fieldname]` → index.
+    vable_arrays: HashMap<String, (usize, String)>,
 }
 
 const MAX_HELPER_CALL_ARITY: usize = 16;
@@ -66,6 +76,7 @@ impl LowererConfig {
         io_shims: &[(Path, Ident)],
         calls: &[(Path, Option<Ident>)],
         auto_calls: bool,
+        vable_decl: Option<&crate::jit_interp::VirtualizableDecl>,
     ) -> Self {
         let pool_str = normalize(&quote!(#pool_expr).to_string());
         let selector_str = normalize(&quote!(#selector_expr).to_string());
@@ -88,6 +99,24 @@ impl LowererConfig {
                 (normalize(&quote!(#p).to_string()), spec)
             })
             .collect();
+        let (vable_var, vable_fields, vable_arrays) = if let Some(decl) = vable_decl {
+            let var = Some(decl.var_name.to_string());
+            let fields = decl
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.name.to_string(), (i, f.field_type.to_string())))
+                .collect();
+            let arrays = decl
+                .arrays
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a.name.to_string(), (i, a.item_type.to_string())))
+                .collect();
+            (var, fields, arrays)
+        } else {
+            (None, HashMap::new(), HashMap::new())
+        };
         Self {
             pool_str,
             selector_str,
@@ -96,6 +125,9 @@ impl LowererConfig {
             io_shims,
             calls,
             auto_calls,
+            vable_var,
+            vable_fields,
+            vable_arrays,
         }
     }
 }
