@@ -241,6 +241,8 @@ pub trait JitCodeRuntime {
     fn stack_len(&self, selected: usize) -> usize;
     fn stack_peek(&self, selected: usize, pos: usize) -> i64;
     fn label_at(&self, pc: usize) -> usize;
+    /// Raw data pointer of a storage's backing array (for virtualizable access).
+    fn stack_data_ptr(&self, _selected: usize) -> usize { 0 }
 }
 
 pub struct ClosureRuntime<FLen, FPeek, FLabel> {
@@ -871,16 +873,15 @@ where
                 };
                 if sym.is_virtualizable_storage() {
                     // Virtualizable: if this storage isn't initialized yet,
-                    // emit IR to load array pointer + length from the heap.
+                    // load array pointer + length as traced constants.
                     // RPython parity: PyPy's value_stack_w is a virtualizable
                     // array field — first access loads via GETFIELD_GC_R.
                     if sym.vable_array_ref(new_selected).is_none() {
                         let len = runtime.stack_len(new_selected);
                         let len_ref = ctx.const_int(len as i64);
-                        // Array data pointer: loaded from storage pool at runtime.
-                        // For now, use a const placeholder that the preamble will
-                        // replace with the actual GETFIELD load.
-                        let arr_ref = ctx.const_int(0); // placeholder
+                        // Load actual array data pointer from runtime.
+                        let data_ptr = runtime.stack_data_ptr(new_selected);
+                        let arr_ref = ctx.const_int(data_ptr as i64);
                         sym.init_vable_storage(new_selected, arr_ref, len_ref);
                     }
                 } else {
