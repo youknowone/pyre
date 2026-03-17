@@ -1,12 +1,8 @@
-//! Bytecode evaluation loop with JIT integration.
+//! Bytecode evaluation loop — pure interpreter.
 //!
-//! The main dispatch loop processes RustPython instructions.
-//! `JitDriver` merge points and back-edge hooks are integrated from day 1.
-//!
-//! The JitDriver lives in an `UnsafeCell` to allow re-entrant access from
-//! recursive function calls. When compiled code makes a residual call,
-//! the callee's `eval_frame` can access the same driver for function-entry
-//! JIT — matching PyPy's single-MetaInterp-per-thread model.
+//! JIT integration lives in pyre-jit/src/eval.rs. This module is
+//! JIT-free: it processes bytecode instructions with no tracing,
+//! no merge points, and no compiled-code hooks.
 
 use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction, OpArgState};
 use pyre_object::*;
@@ -21,24 +17,17 @@ use pyre_runtime::{
     w_code_new,
 };
 
+use crate::call::call_callable;
+use crate::frame::PyFrame;
+
+// ── JIT driver TLS (transitional) ──────────────────────────────
+// These remain here while pyre-interp/src/jit/ still exists.
+// Once jit/ moves to pyre-jit, these move with it.
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
-
-use crate::jit::state::{PyreEnv, PyreJitState};
-use crate::jit::trace::trace_bytecode;
-use majit_meta::{DetailedDriverRunOutcome, JitDriver};
-
-use crate::call::{call_callable, install_jit_call_bridge};
-use crate::frame::PyFrame;
+use crate::jit::state::PyreJitState;
 use crate::jit::frame_layout::build_pyframe_virtualizable_info;
-
-/// JIT hot-count threshold for back-edge (loop) detection.
-const JIT_THRESHOLD: u32 = 1039;
-
-/// Function-entry tracing threshold. Kept low so that tracing starts
-/// early in a deep recursion (when n is still large), capturing the
-/// recursive path rather than the base case.
-const FUNC_ENTRY_THRESHOLD: u32 = 7;
+use majit_meta::JitDriver;
 
 type JitDriverPair = (
     JitDriver<PyreJitState>,
@@ -46,137 +35,32 @@ type JitDriverPair = (
 );
 
 thread_local! {
-    /// Shared JitDriver accessed via `UnsafeCell` to allow re-entrant
-    /// access from recursive function calls.
-    ///
-    /// SAFETY: thread_local guarantees single-thread access. Re-entrant
-    /// calls through compiled-code residual calls create overlapping
-    /// `&mut` references on the stack, but the outer reference is never
-    /// accessed while the inner one is active — the JitDriver's state
-    /// is consistent at each re-entry point.
     static JIT_DRIVER: UnsafeCell<JitDriverPair> = UnsafeCell::new({
         let info = build_pyframe_virtualizable_info();
-        let mut d = JitDriver::new(JIT_THRESHOLD);
+        let mut d = JitDriver::new(1039);
         d.set_virtualizable_info(info.clone());
         (d, info)
     });
 }
 
-thread_local! {
-    /// Per-code-object function-entry counter. Tracks how many times
-    /// each function has been entered, using the code object pointer
-    /// as key. Only when the count reaches JIT_THRESHOLD do we invoke
-    /// the expensive driver path (build_meta, extract_live, etc.).
-    static FUNC_ENTRY_COUNTS: UnsafeCell<HashMap<u64, u32>> =
-        UnsafeCell::new(HashMap::new());
-
-    /// JIT call depth counter. Tracks how deep we are in nested
-    /// eval_frame calls due to JIT activity (tracing or compiled code).
-    ///
-    /// When > 0, this eval_loop is executing a residual call from
-    /// either the traced function or compiled code. Effects:
-    ///   - merge_points are skipped (inner instructions must not
-    ///     pollute the outer trace)
-    ///   - try_function_entry_jit is skipped (prevents infinite
-    ///     recursion: compiled fib → residual call → run compiled
-    ///     fib → residual call → ...)
-    ///
-    /// Matches PyPy's model where residual calls run in a
-    /// "blackhole" interpreter without JIT hooks.
-    /// JIT call depth counter. When > 0, this eval_loop is executing
-    /// a residual call — merge_points and function-entry JIT are
-    /// suppressed.
-    static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
-
-    /// Lightweight tracing-active flag. Mirrors `driver.is_tracing()`
-    /// to avoid the expensive UnsafeCell TLS lookup per call.
-    static JIT_TRACING: Cell<bool> = Cell::new(false);
-}
-
-/// Get a mutable reference to the thread-local JitDriver pair.
-///
-/// SAFETY: Only call from `eval_frame` and its JIT helper functions.
-/// The caller must ensure that no other live `&mut` reference to the
-/// driver is being actively used (suspended references on the call
-/// stack from re-entrant compiled-code execution are acceptable).
+/// Transitional: provides JitDriver access for jit/state.rs and call.rs.
+/// Will move to pyre-jit when jit/ module moves.
 #[inline]
 pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
 
-#[inline]
-#[allow(dead_code)]
-fn func_entry_counts() -> &'static mut HashMap<u64, u32> {
-    FUNC_ENTRY_COUNTS.with(|cell| unsafe { &mut *cell.get() })
-}
-
-/// RAII guard that decrements `JIT_CALL_DEPTH` on drop.
-pub struct JitCallDepthGuard;
-
-impl Drop for JitCallDepthGuard {
-    fn drop(&mut self) {
-        JIT_CALL_DEPTH.with(|d| d.set(d.get() - 1));
-    }
-}
-
-/// Bump the JIT call depth. Returns a guard that restores the
-/// depth when dropped. Only bumps if we're inside a JIT context
-/// (depth > 0 or tracing active).
-#[inline]
-pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
-    let depth = JIT_CALL_DEPTH.with(|d| d.get());
-    if depth > 0 || JIT_TRACING.with(|t| t.get()) {
-        JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
-        Some(JitCallDepthGuard)
-    } else {
-        None
-    }
-}
-
-/// Execute a Python code object and return its result.
-///
-/// The returned value is the result of `ReturnValue`,
-/// or `None` if the code falls through without returning.
-pub fn eval_frame(frame: &mut PyFrame) -> PyResult {
-    install_jit_call_bridge();
-    frame.fix_array_ptrs();
-    if let Some(result) = try_function_entry_jit(frame) {
-        return result;
-    }
-    // If function-entry triggered tracing, use the JIT-enabled loop
-    // so merge_point records trace ops. Without this, eval_loop would
-    // skip merge points and the trace would never complete.
-    let (driver, _) = driver_pair();
-    if driver.is_tracing() {
-        return eval_loop_jit(frame);
-    }
-    eval_loop(frame)
-}
-
-/// Execute a frame without JIT — pure interpreter only.
-///
-/// Used by pyre-mjit as the fallback when JIT hasn't kicked in,
-/// and by force callbacks when compiled code hits a guard failure.
+/// Execute a frame — pure interpreter, no JIT.
 pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     frame.fix_array_ptrs();
     eval_loop(frame)
 }
 
-/// Run the interpreter on a frame whose state was partially updated by
-/// compiled code (call_assembler guard failure forcing).
-///
-/// Skips the JIT function-entry check and runs the plain eval_loop
-/// from the frame's current next_instr.
-pub(crate) fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
+/// Resume interpretation after compiled code guard failure.
+pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
     eval_loop(frame)
 }
 
-/// Evaluation loop with deferred JIT initialization.
-///
-/// The JitDriver TLS lookup is deferred until the first back-edge
-/// (CloseLoop). Functions without loops (like fib) never pay the
-/// driver_pair() TLS cost. Once a back-edge is seen, we switch to
-/// the full JIT-enabled loop for the remainder of the function.
 fn eval_loop(frame: &mut PyFrame) -> PyResult {
     let mut arg_state = OpArgState::default();
     let code = unsafe { &*frame.code };
@@ -190,175 +74,10 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         let (instruction, op_arg) = arg_state.get(code_unit);
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
-        match execute_opcode_step(frame, &code, instruction, op_arg, next_instr)? {
-            StepResult::Continue => {}
-            StepResult::CloseLoop(_) => {
-                // First back-edge: switch to the JIT-enabled loop
-                // that fetches the driver and handles merge points.
-                return eval_loop_jit(frame);
-            }
+        match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
+            StepResult::Continue | StepResult::CloseLoop(_) => {}
             StepResult::Return(result) => return Ok(result),
         }
-    }
-}
-
-/// JIT-enabled evaluation loop, entered after the first back-edge.
-///
-/// The JitDriver reference is obtained once via TLS lookup and held
-/// as a local variable. Recursive calls through `call_callable`
-/// re-enter `eval_frame` → `eval_loop` (the deferred variant),
-/// creating a new `&mut` alias only if they also hit a back-edge.
-pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
-    let env = PyreEnv;
-    let mut arg_state = OpArgState::default();
-    let code = unsafe { &*frame.code };
-    let (driver, info) = driver_pair();
-
-    loop {
-        if frame.next_instr >= code.instructions.len() {
-            return Ok(w_none());
-        }
-
-        // ── JIT merge point ──────────────────────────────────────
-        // Only record trace ops at depth 0 (the function being traced).
-        // Deeper levels are residual calls whose instructions must not
-        // pollute the outer trace.
-        if driver.is_tracing() {
-            JIT_TRACING.with(|t| t.set(true));
-            if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
-                let pc = frame.next_instr;
-                let concrete_frame = frame as *mut PyFrame as usize;
-                driver.merge_point(|ctx, sym| trace_bytecode(ctx, sym, code, pc, concrete_frame));
-            }
-            // Tracing may have ended inside merge_point (abort/compile).
-            if !driver.is_tracing() {
-                JIT_TRACING.with(|t| t.set(false));
-            }
-        }
-
-        let code_unit = code.instructions[frame.next_instr];
-        let (instruction, op_arg) = arg_state.get(code_unit);
-        frame.next_instr += 1;
-        let next_instr = frame.next_instr;
-        match execute_opcode_step(frame, &code, instruction, op_arg, next_instr)? {
-            StepResult::Continue => {}
-            StepResult::CloseLoop(_) => {
-                let mut jit_state = build_jit_state(frame, info);
-                driver
-                    .set_vable_array_lengths(vec![jit_state.local_count(), jit_state.stack_depth]);
-                if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
-                    frame.code as u64,
-                    frame.next_instr,
-                    &mut jit_state,
-                    &env,
-                    || {},
-                ) {
-                    if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
-                        return result;
-                    }
-                    // Guard failure with restored state — continue interpreting
-                }
-            }
-            StepResult::Return(result) => return Ok(result),
-        }
-    }
-}
-
-/// Try running compiled code or count function entry.
-///
-/// Uses the code object pointer as a green key, so all calls to the
-/// same function share one counter and one compiled trace.
-///
-/// Fast path: increment a lightweight local counter. Only call into
-/// the expensive driver path when the counter reaches the threshold
-/// or when compiled code already exists for this key.
-///
-pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
-    // Residual calls (from tracing or compiled code) run in pure
-    // interpreter — no JIT hooks. Matches PyPy's blackhole model.
-    if JIT_CALL_DEPTH.with(|d| d.get()) > 0 {
-        return None;
-    }
-
-    let green_key = frame.code as u64;
-    let (driver, info) = driver_pair();
-
-    // Run compiled code if available.
-    if driver.has_compiled_loop(green_key) {
-        let env = PyreEnv;
-        let mut jit_state = build_jit_state(frame, info);
-        driver.set_vable_array_lengths(vec![jit_state.local_count(), jit_state.stack_depth]);
-        if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
-            green_key,
-            frame.next_instr,
-            &mut jit_state,
-            &env,
-            || {},
-        ) {
-            if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
-                return Some(result);
-            }
-        }
-        // Guard failure → fall through to interpreter
-        return None;
-    }
-
-    // Fast path: if already tracing, skip counting.
-    if driver.is_tracing() {
-        return None;
-    }
-
-    // Lightweight local counting with a low threshold so that tracing
-    // starts early in a deep recursion (capturing the recursive path).
-    let counts = func_entry_counts();
-    let count = counts.entry(green_key).or_insert(0);
-    *count += 1;
-    if *count != FUNC_ENTRY_THRESHOLD {
-        return None;
-    }
-
-    // Threshold reached — force-start tracing (bypasses driver's
-    // internal hot counter since we already did our own counting).
-    let env = PyreEnv;
-    let mut jit_state = build_jit_state(frame, info);
-    driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
-    None
-}
-
-/// Handle a `DetailedDriverRunOutcome` from compiled code execution.
-fn handle_jit_outcome(
-    outcome: DetailedDriverRunOutcome,
-    jit_state: &PyreJitState,
-    frame: &mut PyFrame,
-    info: &majit_meta::virtualizable::VirtualizableInfo,
-) -> Option<PyResult> {
-    match outcome {
-        DetailedDriverRunOutcome::Finished { typed_values, .. } => {
-            let [value] = typed_values.as_slice() else {
-                return Some(Err(PyError::type_error(
-                    "compiled finish did not produce a single object return value",
-                )));
-            };
-            let value = match value {
-                majit_ir::Value::Int(raw) => *raw as PyObjectRef,
-                majit_ir::Value::Ref(value) => value.as_usize() as PyObjectRef,
-                _ => {
-                    return Some(Err(PyError::type_error(
-                        "compiled finish produced a non-object return value",
-                    )));
-                }
-            };
-            Some(Ok(value))
-        }
-        DetailedDriverRunOutcome::Jump { .. }
-        | DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            sync_jit_state_to_frame(jit_state, frame, info);
-            None // Continue interpretation
-        }
-        DetailedDriverRunOutcome::GuardFailure {
-            restored: false, ..
-        }
-        | DetailedDriverRunOutcome::Abort { .. } => None,
     }
 }
 
@@ -614,48 +333,9 @@ impl OpcodeStepExecutor for PyFrame {
 
 // ── JitState ↔ PyFrame conversion ────────────────────────────────────
 
-/// Build a `PyreJitState` from the current frame state.
-///
-/// Namespace entries are sorted by key for deterministic ordering.
-fn build_jit_state(
-    frame: &PyFrame,
-    virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
-) -> PyreJitState {
-    let mut jit_state = PyreJitState {
-        frame: frame as *const PyFrame as usize,
-        next_instr: frame.next_instr,
-        stack_depth: frame.stack_depth,
-    };
-
-    if !jit_state.sync_from_virtualizable(virtualizable_info) {
-        jit_state.next_instr = frame.next_instr;
-        jit_state.stack_depth = frame.stack_depth;
-    }
-
-    jit_state
-}
-
-/// Restore frame state from a `PyreJitState` after JIT code execution.
-fn sync_jit_state_to_frame(
-    jit_state: &PyreJitState,
-    frame: &mut PyFrame,
-    virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
-) {
-    if !jit_state.sync_to_virtualizable(virtualizable_info) {
-        frame.next_instr = jit_state.next_instr;
-        frame.stack_depth = jit_state.stack_depth;
-    }
-
-    frame.next_instr = jit_state.next_instr;
-    frame.stack_depth = jit_state.stack_depth;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::Value;
-    use majit_meta::JitState;
-    use majit_meta::blackhole::ExceptionState;
     use pyre_bytecode::*;
     use pyre_runtime::{PyExecutionContext, w_func_new};
     use std::rc::Rc;
@@ -663,13 +343,13 @@ mod tests {
     fn run_eval(source: &str) -> PyResult {
         let code = compile_eval(source).expect("compile failed");
         let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
-        eval_frame(&mut frame)
+        eval_frame_plain(&mut frame)
     }
 
     fn run_exec_frame(source: &str) -> (PyResult, PyFrame) {
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
-        let result = eval_frame(&mut frame);
+        let result = eval_frame_plain(&mut frame);
         (result, frame)
     }
 
@@ -999,7 +679,7 @@ mod tests {
         let source = "x = 5\ny = x * x";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let x = *(*frame.namespace).get("x").unwrap();
             let y = *(*frame.namespace).get("y").unwrap();
@@ -1013,7 +693,7 @@ mod tests {
         let source = "i = 0\nwhile i < 10:\n    i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             assert_eq!(w_int_get_value(i), 10);
@@ -1142,7 +822,7 @@ mod tests {
         let source = "s = 0\nfor i in range(10):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 45);
@@ -1154,7 +834,7 @@ mod tests {
         let source = "s = 0\nfor i in range(3000):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 4_498_500);
@@ -1174,7 +854,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1194,7 +874,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1215,7 +895,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1236,7 +916,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1255,7 +935,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1274,7 +954,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1293,7 +973,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1312,7 +992,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1333,7 +1013,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1356,7 +1036,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1379,7 +1059,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1400,7 +1080,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1421,7 +1101,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1444,7 +1124,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1465,7 +1145,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1485,7 +1165,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1505,7 +1185,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1526,7 +1206,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1549,7 +1229,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1570,7 +1250,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1589,7 +1269,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1608,7 +1288,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1631,7 +1311,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1652,7 +1332,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1674,7 +1354,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1695,7 +1375,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             let acc = *(*frame.namespace).get("acc").unwrap();
@@ -1709,7 +1389,7 @@ while i < 3000:
         let source = "s = 0\nfor i in range(5, 10):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 35);
@@ -1721,7 +1401,7 @@ while i < 3000:
         let source = "s = 0\nfor i in range(0, 10, 2):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             // 0 + 2 + 4 + 6 + 8 = 20
@@ -1734,7 +1414,7 @@ while i < 3000:
         let source = "s = 42\nfor i in range(0):\n    s = 0";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 42);
@@ -1746,7 +1426,7 @@ while i < 3000:
         let source = "s = 0\nfor i in range(5):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             // 0 + 1 + 2 + 3 + 4 = 10
@@ -1761,7 +1441,7 @@ while i < 3000:
         let source = "x = len([1, 2, 3])";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let x = *(*frame.namespace).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 3);
@@ -1773,7 +1453,7 @@ while i < 3000:
         let source = "x = abs(-5)";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let x = *(*frame.namespace).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 5);
@@ -1785,7 +1465,7 @@ while i < 3000:
         let source = "a = min(3, 7)\nb = max(3, 7)";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame(&mut frame);
+        let _ = eval_frame_plain(&mut frame);
         unsafe {
             let a = *(*frame.namespace).get("a").unwrap();
             let b = *(*frame.namespace).get("b").unwrap();
