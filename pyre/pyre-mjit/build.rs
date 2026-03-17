@@ -35,14 +35,38 @@ fn main() {
     let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
     let result = majit_analyze::analyze_multiple(&source_refs);
 
-    // Generate tracing code
+    // Generate tracing code (existing path: pattern-based dispatch table)
     let code = majit_analyze::generate_trace_code(&result);
 
-    // Write to OUT_DIR
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
-    // Also generate JSON metadata for debugging
+    // ── New path: extract opcode match from pyre-runtime and generate
+    //    JIT mainloop via codewriter (like aheui-mjit). ──
+    //    RPython equivalent: codewriter.transform_graph_to_jitcode()
+    let opcode_step_path = format!("{pyre_base}/pyre-runtime/src/opcode_step.rs");
+    if let Ok(opcode_src) = std::fs::read_to_string(&opcode_step_path) {
+        if let Ok(file) = syn::parse_str::<syn::File>(&opcode_src) {
+            use majit_analyze::interp_extract::{find_function, find_opcode_match};
+            if let Some(func) = find_function(&file, "execute_opcode_step") {
+                if let Some(opcode_match) = find_opcode_match(func) {
+                    eprintln!(
+                        "[pyre-mjit build.rs] extracted opcode match: {} arms from execute_opcode_step",
+                        opcode_match.arms.len()
+                    );
+                    // TODO: construct JitDriverConfig for pyre and call
+                    // codewriter::generate_jitcode(opcode_match, &binops, &config)
+                    // to generate jit_mainloop_gen.rs
+                } else {
+                    eprintln!("[pyre-mjit build.rs] warning: no opcode match found in execute_opcode_step");
+                }
+            } else {
+                eprintln!("[pyre-mjit build.rs] warning: execute_opcode_step not found");
+            }
+        }
+    }
+
+    // JSON metadata for debugging
     let json = serde_json::to_string_pretty(&result).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
 
