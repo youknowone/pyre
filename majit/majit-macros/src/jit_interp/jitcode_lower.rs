@@ -382,7 +382,6 @@ impl<'c> Lowerer<'c> {
         let config = self.config?;
         let _vable_var = config.vable_var.as_ref()?;
 
-        // Pattern: Expr::Macro with path ending in "hint_force_virtualizable"
         let mac = match expr {
             Expr::Macro(m) => m,
             _ => return None,
@@ -397,6 +396,57 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
+    /// RPython jtransform.py:655 — suppress identity hint function calls.
+    ///
+    /// `hint_access_directly(frame)` and `hint_fresh_virtualizable(frame)`
+    /// are identity functions that return their argument unchanged.
+    /// The Lowerer recognizes these calls and lowers the argument directly,
+    /// effectively eliminating the hint call.
+    fn lower_vable_hint_identity_call(&mut self, expr: &Expr) -> Option<Binding> {
+        let call = match expr {
+            Expr::Call(c) => c,
+            _ => return None,
+        };
+        let func_name = match &*call.func {
+            Expr::Path(p) => {
+                let seg = p.path.segments.last()?;
+                seg.ident.to_string()
+            }
+            _ => return None,
+        };
+        match func_name.as_str() {
+            "hint_access_directly" | "hint_fresh_virtualizable" => {
+                // These are identity: return lower(arg)
+                let arg = call.args.first()?;
+                self.lower_value_expr(arg)
+            }
+            _ => None,
+        }
+    }
+
+    /// RPython jtransform.py:655 `hint(access_directly=True)` /
+    /// `hint(fresh_virtualizable=True)`.
+    ///
+    /// These hints are consumed by the translator — jtransform suppresses
+    /// them (returns None = no opcode generated). The codewriter has already
+    /// rewritten field accesses to use vable_getfield/setfield, so the
+    /// access_directly hint is redundant at this point.
+    ///
+    /// In majit, the Lowerer recognizes these macro calls and emits nothing,
+    /// which matches RPython's behavior exactly.
+    fn lower_vable_hint_suppress(&self, expr: &Expr) -> Option<()> {
+        let _config = self.config?;
+        let mac = match expr {
+            Expr::Macro(m) => m,
+            _ => return None,
+        };
+        let seg = mac.mac.path.segments.last()?;
+        match seg.ident.to_string().as_str() {
+            "hint_access_directly" | "hint_fresh_virtualizable" => Some(()),
+            _ => None,
+        }
+    }
+
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
         // RPython jtransform.py:923 — virtualizable field write rewrite.
         if let Some(()) = self.lower_vable_field_write(expr) {
@@ -408,6 +458,10 @@ impl<'c> Lowerer<'c> {
         }
         // RPython jtransform.py:650 — hint_force_virtualizable rewrite.
         if let Some(()) = self.lower_vable_force(expr) {
+            return Some(());
+        }
+        // RPython jtransform.py:655 — access_directly/fresh_virtualizable suppression.
+        if let Some(()) = self.lower_vable_hint_suppress(expr) {
             return Some(());
         }
 
@@ -1473,6 +1527,12 @@ impl<'c> Lowerer<'c> {
         }
         // RPython jtransform.py:760 — virtualizable array read rewrite.
         if let Some(binding) = self.lower_vable_array_read(expr) {
+            return Some(binding);
+        }
+        // RPython jtransform.py:655 — suppress hint_access_directly(frame) /
+        // hint_fresh_virtualizable(frame) function calls as identity.
+        // These return the frame unchanged, so lower the argument instead.
+        if let Some(binding) = self.lower_vable_hint_identity_call(expr) {
             return Some(binding);
         }
 
