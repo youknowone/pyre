@@ -3537,15 +3537,20 @@ impl<M: Clone> MetaInterp<M> {
                 return InlineDecision::ResidualCall;
             }
 
-            // Self-recursion: inline up to MAX_RECURSIVE_UNROLL.
+            // Self-recursion: use CallAssembler if compiled, otherwise
+            // ResidualCall + boost to trigger functrace quickly.
+            // (Recursive inline via pending_inline is not connected to
+            // the runtime path yet — using it causes SIGSEGV from
+            // unresolved placeholder OpRefs in the compiled trace.)
             if is_self_recursive {
-                if recursive_depth >= MAX_RECURSIVE_UNROLL {
-                    if self.compiled_loops.contains_key(&callee_key) {
-                        return InlineDecision::CallAssembler;
-                    }
-                    return InlineDecision::ResidualCall;
+                if self.compiled_loops.contains_key(&callee_key) {
+                    return InlineDecision::CallAssembler;
                 }
-                return InlineDecision::Inline;
+                // Boost callee's entry counter so it gets traced quickly.
+                // After a few residual calls, eval_with_jit will trace
+                // the callee as a separate function → compiled → CallAssembler.
+                self.warm_state.boost_function_entry(callee_key);
+                return InlineDecision::ResidualCall;
             }
 
             if !self.warm_state.should_inline_function(callee_key) {
