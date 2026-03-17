@@ -24,7 +24,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use majit_ir::{Op, OpCode, OpRef};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 // ── Dependency Graph ────────────────────────────────────────────────────
 
@@ -428,7 +428,7 @@ impl OptimizationPass for OptVectorize {
         match op.opcode {
             OpCode::Label => {
                 self.in_loop = true;
-                PassResult::Emit(op.clone())
+                OptimizationResult::Emit(op.clone())
             }
             OpCode::Jump if self.in_loop => {
                 // End of loop body — attempt vectorization
@@ -443,16 +443,16 @@ impl OptimizationPass for OptVectorize {
                     }
                 }
                 self.in_loop = false;
-                PassResult::Emit(op.clone())
+                OptimizationResult::Emit(op.clone())
             }
             _ => {
                 if self.in_loop {
                     // Buffer loop body ops
                     self.body_ops.push(op.clone());
-                    PassResult::Remove
+                    OptimizationResult::Remove
                 } else {
                     // Not in a loop — pass through unchanged
-                    PassResult::PassOn
+                    OptimizationResult::PassOn
                 }
             }
         }
@@ -677,7 +677,7 @@ mod tests {
         assign_positions(&mut ops, 0);
 
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptVectorize::new()));
+        opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result = opt.optimize(&ops);
 
         // No loop to vectorize, ops should pass through
@@ -699,7 +699,7 @@ mod tests {
         assign_positions(&mut ops, 0);
 
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptVectorize::new()));
+        opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result = opt.optimize(&ops);
 
         // Should still have Label and Jump

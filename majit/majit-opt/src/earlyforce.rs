@@ -10,7 +10,7 @@
 /// forcing happens in the correct order.
 use majit_ir::{Op, OpCode};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 pub struct OptEarlyForce;
 
@@ -47,9 +47,9 @@ impl OptimizationPass for OptEarlyForce {
                 for arg in &mut new_op.args {
                     *arg = ctx.get_replacement(*arg);
                 }
-                PassResult::Emit(new_op)
+                OptimizationResult::Emit(new_op)
             }
-            _ => PassResult::PassOn,
+            _ => OptimizationResult::PassOn,
         }
     }
 

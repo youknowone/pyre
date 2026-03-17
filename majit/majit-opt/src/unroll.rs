@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use majit_ir::{Op, OpCode, OpRef};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 pub struct OptUnroll {
     /// Buffer of ops received before the Jump back-edge.
@@ -143,7 +143,7 @@ impl OptimizationPass for OptUnroll {
 
             if self.buffer.is_empty() {
                 // Empty loop body, nothing to peel.
-                return PassResult::Emit(op.clone());
+                return OptimizationResult::Emit(op.clone());
             }
 
             // Perform the peeling: emit peeled body + Label + original body.
@@ -167,17 +167,17 @@ impl OptimizationPass for OptUnroll {
             }
 
             jump.pos = OpRef(ctx.new_operations.len() as u32);
-            return PassResult::Emit(jump);
+            return OptimizationResult::Emit(jump);
         }
 
         // For non-Jump ops (or after we've already unrolled), buffer them.
         if !self.seen_jump {
             self.buffer.push(op.clone());
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // After unrolling, pass everything through.
-        PassResult::Emit(op.clone())
+        OptimizationResult::Emit(op.clone())
     }
 
     fn setup(&mut self) {

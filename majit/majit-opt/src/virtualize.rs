@@ -15,7 +15,7 @@ use crate::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
     VirtualStructInfo, VirtualizableFieldState,
 };
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 /// Optimizer-level config for virtualizable frame tracking.
 ///
@@ -454,7 +454,7 @@ impl OptVirtualize {
             field_descrs: Vec::new(),
         };
         self.set_info(op.pos, PtrInfo::Virtual(vinfo));
-        PassResult::Remove
+        OptimizationResult::Remove
     }
 
     fn optimize_new(&mut self, op: &Op, _ctx: &mut OptContext) -> PassResult {
@@ -465,7 +465,7 @@ impl OptVirtualize {
             field_descrs: Vec::new(),
         };
         self.set_info(op.pos, PtrInfo::VirtualStruct(vinfo));
-        PassResult::Remove
+        OptimizationResult::Remove
     }
 
     fn optimize_new_array(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -476,10 +476,10 @@ impl OptVirtualize {
                 let items = vec![OpRef::NONE; size as usize];
                 let vinfo = VirtualArrayInfo { descr, items };
                 self.set_info(op.pos, PtrInfo::VirtualArray(vinfo));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     #[allow(dead_code)]
@@ -500,14 +500,14 @@ impl OptVirtualize {
                         if let Some(descr) = &op.descr {
                             set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
                         }
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
                         set_field(&mut vinfo.fields, field_idx, value_ref);
                         if let Some(descr) = &op.descr {
                             set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
                         }
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                     PtrInfo::Virtualizable(vstate) => {
                         set_field(&mut vstate.fields, field_idx, value_ref);
@@ -515,13 +515,13 @@ impl OptVirtualize {
                         if let Some(d) = op.descr.clone() {
                             set_field_descr(&mut vstate.field_descrs, field_idx, d);
                         }
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                     _ => {}
                 }
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -538,7 +538,7 @@ impl OptVirtualize {
                 };
                 if let Some(val_ref) = field_val {
                     ctx.replace_op(op.pos, val_ref);
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 // Virtualizable: first read of an untracked field.
                 // Let the op emit, but cache result for future reads
@@ -548,7 +548,7 @@ impl OptVirtualize {
                 }
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Handle first read of a virtualizable field (no cached value yet).
@@ -577,7 +577,7 @@ impl OptVirtualize {
                             set_field_descr(&mut vstate.field_descrs, field_idx, d);
                         }
                     }
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
             }
             // Check if this reads an array pointer field
@@ -594,7 +594,7 @@ impl OptVirtualize {
                 }
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -619,7 +619,7 @@ impl OptVirtualize {
                         index as usize,
                         value_ref,
                     );
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
             }
         }
@@ -630,16 +630,16 @@ impl OptVirtualize {
                     let idx = index as usize;
                     if idx < vinfo.items.len() {
                         vinfo.items[idx] = value_ref;
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                 }
             }
         }
         // Force any virtual args before emitting the setarrayitem
         if self.has_any_virtual_arg(op, ctx) {
-            return PassResult::Replace(self.force_all_args(op, ctx));
+            return OptimizationResult::Replace(self.force_all_args(op, ctx));
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -661,7 +661,7 @@ impl OptVirtualize {
                         get_array_element(&vstate.arrays, arr_idx as u32, index as usize)
                     {
                         ctx.replace_op(op.pos, val);
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                 }
             }
@@ -675,13 +675,13 @@ impl OptVirtualize {
                         let item_ref = vinfo.items[idx];
                         if !item_ref.is_none() {
                             ctx.replace_op(op.pos, item_ref);
-                            return PassResult::Remove;
+                            return OptimizationResult::Remove;
                         }
                     }
                 }
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -690,9 +690,9 @@ impl OptVirtualize {
         if let Some(PtrInfo::VirtualArray(vinfo)) = self.get_info(array_ref) {
             let len = vinfo.items.len() as i64;
             ctx.make_constant(op.pos, Value::Int(len));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -701,9 +701,9 @@ impl OptVirtualize {
         if let Some(PtrInfo::VirtualArray(vinfo)) = self.get_info(str_ref) {
             let len = vinfo.items.len() as i64;
             ctx.make_constant(op.pos, Value::Int(len));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_getinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -717,12 +717,12 @@ impl OptVirtualize {
                 if elem_idx < vinfo.element_fields.len() {
                     if let Some(val) = get_field(&vinfo.element_fields[elem_idx], field_idx) {
                         ctx.replace_op(op.pos, val);
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                 }
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_setinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -737,12 +737,12 @@ impl OptVirtualize {
                     let elem_idx = index as usize;
                     if elem_idx < vinfo.element_fields.len() {
                         set_field(&mut vinfo.element_fields[elem_idx], field_idx, value_ref);
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                 }
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -756,11 +756,11 @@ impl OptVirtualize {
                     vinfo.entries.iter().find(|(off, _, _)| *off == offset)
                 {
                     ctx.replace_op(op.pos, *val_ref);
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -781,11 +781,11 @@ impl OptVirtualize {
                         // Default length of 8 bytes (word-sized store).
                         let _ = vinfo.write_value(offset, 8, value_ref);
                     }
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_guard_class(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -798,11 +798,11 @@ impl OptVirtualize {
                 | PtrInfo::VirtualStruct(_)
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_) => {
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 PtrInfo::KnownClass { .. } => {
                     // Class already known from prior guard or virtual forcing
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 _ => {}
             }
@@ -838,7 +838,7 @@ impl OptVirtualize {
         for arg in &mut guard_op.args {
             *arg = ctx.get_replacement(*arg);
         }
-        PassResult::Replace(guard_op)
+        OptimizationResult::Replace(guard_op)
     }
 
     fn optimize_guard_nonnull(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -846,7 +846,7 @@ impl OptVirtualize {
 
         if let Some(info) = self.get_info(obj_ref) {
             if info.is_nonnull() {
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
@@ -864,12 +864,12 @@ impl OptVirtualize {
                 | PtrInfo::VirtualArray(_)
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_) => {
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 PtrInfo::KnownClass {
                     is_nonnull: true, ..
                 } => {
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 _ => {}
             }
@@ -892,7 +892,7 @@ impl OptVirtualize {
         if let Some(val) = ctx.get_constant(obj_ref) {
             if let Some(expected) = ctx.get_constant(ctx.get_replacement(op.arg(1))) {
                 if val == expected {
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
             }
         }
@@ -941,7 +941,7 @@ impl OptVirtualize {
         };
         self.set_info(op.pos, PtrInfo::VirtualStruct(vinfo));
 
-        PassResult::Remove
+        OptimizationResult::Remove
     }
 
     /// Handle VirtualRefFinish(vref, virtual_obj).
@@ -976,7 +976,7 @@ impl OptVirtualize {
                     if let Some(PtrInfo::VirtualStruct(vinfo)) = self.get_info_mut(vref_ref) {
                         set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_ref);
                     }
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
             }
         }
@@ -996,13 +996,13 @@ impl OptVirtualize {
         set_token.descr = Some(make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
         ctx.emit(set_token);
 
-        PassResult::Remove
+        OptimizationResult::Remove
     }
 
     /// Handle operations that may cause virtuals to escape.
     fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         let forced = self.force_all_args(op, ctx);
-        PassResult::Replace(forced)
+        OptimizationResult::Replace(forced)
     }
 
     /// Extend JUMP args with current tracked virtualizable field values.
@@ -1173,7 +1173,7 @@ impl OptimizationPass for OptVirtualize {
             // If the force_token from the preceding CALL_MAY_FORCE is virtual
             // (never escaped), the guard always succeeds. Otherwise, pass through.
             // Must not hit the is_call() or default branch which would force all virtuals.
-            OpCode::GuardNotForced | OpCode::GuardNotForced2 => PassResult::PassOn,
+            OpCode::GuardNotForced | OpCode::GuardNotForced2 => OptimizationResult::PassOn,
 
             // Calls / escaping operations — force all virtual args
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
@@ -1204,7 +1204,7 @@ impl OptimizationPass for OptVirtualize {
                 }
                 // Add virtualizable field values to JUMP args
                 self.augment_jump_with_virtualizable(&mut jump_op, ctx);
-                PassResult::Replace(jump_op)
+                OptimizationResult::Replace(jump_op)
             }
 
             // JUMP (no virtualizable) / FINISH — force all virtual args
@@ -1232,7 +1232,7 @@ impl OptimizationPass for OptVirtualize {
                         },
                     );
                 }
-                PassResult::Remove
+                OptimizationResult::Remove
             }
 
             // RECORD_EXACT_VALUE_I(ref, int_const): record that ref has exact int value.
@@ -1241,19 +1241,19 @@ impl OptimizationPass for OptVirtualize {
                 if let Some(val) = ctx.get_constant_int(op.arg(1)) {
                     ctx.make_constant(ref_opref, Value::Int(val));
                 }
-                PassResult::Remove
+                OptimizationResult::Remove
             }
 
             // RECORD_EXACT_VALUE_R(ref, ref_const): record that ref equals ref_const.
             OpCode::RecordExactValueR => {
                 let ref_opref = ctx.get_replacement(op.arg(0));
                 ctx.replace_op(ref_opref, ctx.get_replacement(op.arg(1)));
-                PassResult::Remove
+                OptimizationResult::Remove
             }
 
             // RECORD_KNOWN_RESULT: record that a call with given args produces known result.
             // Consumed by pure pass (CSE) — just remove here.
-            OpCode::RecordKnownResult => PassResult::Remove,
+            OpCode::RecordKnownResult => OptimizationResult::Remove,
 
             // Everything else passes through, but force any virtual args first
             _ => {
@@ -1296,10 +1296,10 @@ impl OptimizationPass for OptVirtualize {
                     if self.vable_config.is_some() {
                         self.augment_guard_with_virtualizable(&mut guard_op, ctx);
                     }
-                    return PassResult::Replace(guard_op);
+                    return OptimizationResult::Replace(guard_op);
                 }
 
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
         }
     }
@@ -1576,16 +1576,16 @@ mod tests {
             }
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::Remove => {
+                OptimizationResult::Remove => {
                     // removed, nothing to do
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved_op);
                 }
             }
@@ -2252,14 +2252,14 @@ mod tests {
             }
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::Remove => {}
-                PassResult::PassOn => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved_op);
                 }
             }

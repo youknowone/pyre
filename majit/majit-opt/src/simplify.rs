@@ -14,7 +14,7 @@
 /// 4. Rewrites VIRTUAL_REF to SAME_AS_R (the virtualisation is resolved).
 use majit_ir::{Op, OpCode};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 pub struct OptSimplify;
 
@@ -44,20 +44,20 @@ impl OptimizationPass for OptSimplify {
         match op.opcode {
             // CALL_PURE_* -> CALL_*
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
-                PassResult::Emit(Self::rewrite_call(op))
+                OptimizationResult::Emit(Self::rewrite_call(op))
             }
 
             // CALL_LOOPINVARIANT_* -> CALL_*
             OpCode::CallLoopinvariantI
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantF
-            | OpCode::CallLoopinvariantN => PassResult::Emit(Self::rewrite_call(op)),
+            | OpCode::CallLoopinvariantN => OptimizationResult::Emit(Self::rewrite_call(op)),
 
             // VIRTUAL_REF -> SAME_AS_R (just forward the first arg)
             OpCode::VirtualRefR => {
                 let mut new_op = Op::new(OpCode::SameAsR, &[op.arg(0)]);
                 new_op.pos = op.pos;
-                PassResult::Emit(new_op)
+                OptimizationResult::Emit(new_op)
             }
 
             // Hint operations that are simply removed
@@ -67,9 +67,9 @@ impl OptimizationPass for OptSimplify {
             | OpCode::RecordExactClass
             | OpCode::RecordExactValueR
             | OpCode::RecordExactValueI
-            | OpCode::RecordKnownResult => PassResult::Remove,
+            | OpCode::RecordKnownResult => OptimizationResult::Remove,
 
-            _ => PassResult::PassOn,
+            _ => OptimizationResult::PassOn,
         }
     }
 

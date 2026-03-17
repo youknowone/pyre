@@ -5,7 +5,7 @@
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Op, OpCode, OpRef, Value};
 
-use crate::{intdiv, OptContext, OptimizationPass, PassResult};
+use crate::{intdiv, OptContext, Optimization, OptimizationResult};
 
 /// Rewrite operations into equivalent, cheaper forms.
 ///
@@ -118,27 +118,27 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntAdd, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x + 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // 0 + x -> x
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.replace_op(op.pos, arg1);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x + x -> x << 1 (strength reduction)
         if arg0 == arg1 {
             let one = self.emit_constant_int(ctx, 1);
-            return PassResult::Emit(Op::new(OpCode::IntLshift, &[arg0, one]));
+            return OptimizationResult::Emit(Op::new(OpCode::IntLshift, &[arg0, one]));
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_SUB.
@@ -151,22 +151,22 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntSub, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x - 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x - x -> 0
         if arg0 == arg1 {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_MUL.
@@ -179,47 +179,47 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntMul, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x * 0 -> 0 (absorbing element)
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // 0 * x -> 0
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x * 1 -> x (identity)
         if let Some(1) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // 1 * x -> x
         if let Some(1) = ctx.get_constant_int(arg0) {
             ctx.replace_op(op.pos, arg1);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // Strength reduction: x * 2^n -> x << n
         if let Some(c) = ctx.get_constant_int(arg1) {
             if c > 0 && (c & (c - 1)) == 0 {
                 let shift = c.trailing_zeros() as i64;
                 let shift_ref = self.emit_constant_int(ctx, shift);
-                return PassResult::Emit(Op::new(OpCode::IntLshift, &[arg0, shift_ref]));
+                return OptimizationResult::Emit(Op::new(OpCode::IntLshift, &[arg0, shift_ref]));
             }
         }
         if let Some(c) = ctx.get_constant_int(arg0) {
             if c > 0 && (c & (c - 1)) == 0 {
                 let shift = c.trailing_zeros() as i64;
                 let shift_ref = self.emit_constant_int(ctx, shift);
-                return PassResult::Emit(Op::new(OpCode::IntLshift, &[arg1, shift_ref]));
+                return OptimizationResult::Emit(Op::new(OpCode::IntLshift, &[arg1, shift_ref]));
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_FLOORDIV.
@@ -232,33 +232,33 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntFloorDiv, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x // 1 -> x (identity)
         if let Some(1) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // x // (-1) -> INT_NEG(x)
         if let Some(-1) = ctx.get_constant_int(arg1) {
             let mut neg = Op::new(OpCode::IntNeg, &[arg0]);
             neg.pos = op.pos;
-            return PassResult::Replace(neg);
+            return OptimizationResult::Replace(neg);
         }
 
         // 0 // x -> 0 (zero dividend)
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // x // x -> 1 (self-division, x != 0 guaranteed by semantics)
         if arg0 == arg1 {
             ctx.make_constant(op.pos, Value::Int(1));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // Strength reduction for constant divisor >= 2
@@ -270,18 +270,18 @@ impl OptRewrite {
                 let shift_ref = self.emit_constant_int(ctx, shift as i64);
                 let result_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, shift_ref]));
                 ctx.replace_op(op.pos, result_ref);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
 
             // General constant divisor >= 3: magic number multiplication
             if divisor >= 3 {
                 let result = intdiv::division_operations(arg0, divisor, false, ctx);
                 ctx.replace_op(op.pos, result);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_MOD.
@@ -295,32 +295,32 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntMod, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x % 1 -> 0 (any integer mod 1 is 0)
         if let Some(1) = ctx.get_constant_int(arg1) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // x % (-1) -> 0 (any integer mod -1 is 0)
         if let Some(-1) = ctx.get_constant_int(arg1) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // 0 % x -> 0 (zero dividend)
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // x % x -> 0 (self-modulo)
         if arg0 == arg1 {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // Strength reduction for constant divisor >= 3 (non-power-of-2)
@@ -328,11 +328,11 @@ impl OptRewrite {
             if divisor >= 3 && divisor.count_ones() != 1 {
                 let result = intdiv::modulo_operations(arg0, divisor, false, ctx);
                 ctx.replace_op(op.pos, result);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_AND.
@@ -345,35 +345,35 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntAnd, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x & 0 -> 0
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x & -1 -> x (all bits set = identity)
         if let Some(-1) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         if let Some(-1) = ctx.get_constant_int(arg0) {
             ctx.replace_op(op.pos, arg1);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x & x -> x
         if arg0 == arg1 {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_OR.
@@ -386,35 +386,35 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntOr, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x | 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.replace_op(op.pos, arg1);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x | -1 -> -1
         if let Some(-1) = ctx.get_constant_int(arg1) {
             ctx.make_constant(op.pos, Value::Int(-1));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         if let Some(-1) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(-1));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x | x -> x
         if arg0 == arg1 {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_XOR.
@@ -427,33 +427,33 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntXor, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x ^ 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.replace_op(op.pos, arg1);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x ^ x -> 0
         if arg0 == arg1 {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // x ^ -1 -> ~x (INT_INVERT)
         if let Some(-1) = ctx.get_constant_int(arg1) {
-            return PassResult::Emit(Op::new(OpCode::IntInvert, &[arg0]));
+            return OptimizationResult::Emit(Op::new(OpCode::IntInvert, &[arg0]));
         }
         if let Some(-1) = ctx.get_constant_int(arg0) {
-            return PassResult::Emit(Op::new(OpCode::IntInvert, &[arg1]));
+            return OptimizationResult::Emit(Op::new(OpCode::IntInvert, &[arg1]));
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_LSHIFT.
@@ -466,22 +466,22 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntLshift, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x << 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // 0 << x -> 0
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_RSHIFT.
@@ -494,22 +494,22 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::IntRshift, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x >> 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // 0 >> x -> 0
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for UINT_RSHIFT.
@@ -522,22 +522,22 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(OpCode::UintRshift, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         // x >>> 0 -> x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         // 0 >>> x -> 0
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     // ── Unary operations ──
@@ -549,11 +549,11 @@ impl OptRewrite {
         if let Some(a) = ctx.get_constant_int(arg0) {
             if let Some(result) = self.try_fold_unary_int(OpCode::IntNeg, a) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Constant fold or simplify INT_INVERT.
@@ -563,11 +563,11 @@ impl OptRewrite {
         if let Some(a) = ctx.get_constant_int(arg0) {
             if let Some(result) = self.try_fold_unary_int(OpCode::IntInvert, a) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Constant fold INT_IS_ZERO. Also handles INT_IS_ZERO(INT_IS_ZERO(x)) -> INT_IS_TRUE(x)
@@ -577,10 +577,10 @@ impl OptRewrite {
 
         if let Some(a) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(if a == 0 { 1 } else { 0 }));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Constant fold INT_IS_TRUE.
@@ -589,10 +589,10 @@ impl OptRewrite {
 
         if let Some(a) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(if a != 0 { 1 } else { 0 }));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Constant fold INT_FORCE_GE_ZERO.
@@ -601,10 +601,10 @@ impl OptRewrite {
 
         if let Some(a) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(if a < 0 { 0 } else { a }));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Constant fold int_between(a, b, c) => a <= b < c.
@@ -620,10 +620,10 @@ impl OptRewrite {
         ) {
             let result = (a <= b && b < c) as i64;
             ctx.make_constant(op.pos, Value::Int(result));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     // ── Comparisons ──
@@ -636,11 +636,11 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1)) {
             if let Some(result) = self.try_fold_binary_int(op.opcode, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     // ── Guards ──
@@ -653,12 +653,12 @@ impl OptRewrite {
         if let Some(val) = ctx.get_constant_int(arg0) {
             if val != 0 {
                 // Guard always passes -> remove
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
             // val == 0: guard always fails. Keep it (the backend must handle it).
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Optimize GUARD_FALSE: if arg is known constant 0 -> remove,
@@ -669,18 +669,18 @@ impl OptRewrite {
         if let Some(val) = ctx.get_constant_int(arg0) {
             if val == 0 {
                 // Guard always passes -> remove
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
             // val != 0: guard always fails. Keep it.
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Optimize GUARD_VALUE: if the guarded value equals the expected constant -> remove.
     fn optimize_guard_value(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
         if op.num_args() < 2 {
-            return PassResult::PassOn;
+            return OptimizationResult::PassOn;
         }
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
@@ -689,12 +689,12 @@ impl OptRewrite {
             (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1))
         {
             if actual == expected {
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
             // Mismatch: guard always fails. Keep it.
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     // ── SAME_AS identity ──
@@ -702,11 +702,11 @@ impl OptRewrite {
     /// SAME_AS_I/R/F(x) -> x
     fn optimize_same_as(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
         if op.num_args() == 0 {
-            return PassResult::PassOn;
+            return OptimizationResult::PassOn;
         }
         let arg0 = op.arg(0);
         ctx.replace_op(op.pos, arg0);
-        PassResult::Remove
+        OptimizationResult::Remove
     }
 
     // ── Boolean inverse/reflex rewrites ──
@@ -766,7 +766,7 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatAdd, a, b) {
                 ctx.make_constant(op.pos, Value::Float(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
@@ -774,18 +774,18 @@ impl OptRewrite {
         if let Some(v) = ctx.get_constant_float(arg1) {
             if v == 0.0 {
                 ctx.replace_op(op.pos, arg0);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
         // 0.0 + x -> x
         if let Some(v) = ctx.get_constant_float(arg0) {
             if v == 0.0 {
                 ctx.replace_op(op.pos, arg1);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// `FloatSub(x, 0.0) -> x`, constant fold.
@@ -796,7 +796,7 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatSub, a, b) {
                 ctx.make_constant(op.pos, Value::Float(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
@@ -804,11 +804,11 @@ impl OptRewrite {
         if let Some(v) = ctx.get_constant_float(arg1) {
             if v == 0.0 {
                 ctx.replace_op(op.pos, arg0);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// `FloatMul(x, 1.0) -> x`, `FloatMul(1.0, x) -> x`, constant fold.
@@ -819,7 +819,7 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatMul, a, b) {
                 ctx.make_constant(op.pos, Value::Float(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
@@ -827,18 +827,18 @@ impl OptRewrite {
         if let Some(v) = ctx.get_constant_float(arg1) {
             if v == 1.0 {
                 ctx.replace_op(op.pos, arg0);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
         // 1.0 * x -> x
         if let Some(v) = ctx.get_constant_float(arg0) {
             if v == 1.0 {
                 ctx.replace_op(op.pos, arg1);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// `FloatTrueDiv(x, 1.0) -> x`, constant fold.
@@ -849,7 +849,7 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatTrueDiv, a, b) {
                 ctx.make_constant(op.pos, Value::Float(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
@@ -857,11 +857,11 @@ impl OptRewrite {
         if let Some(v) = ctx.get_constant_float(arg1) {
             if v == 1.0 {
                 ctx.replace_op(op.pos, arg0);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// `FloatNeg(FloatNeg(x)) -> x`, constant fold.
@@ -870,7 +870,7 @@ impl OptRewrite {
 
         if let Some(a) = ctx.get_constant_float(arg0) {
             ctx.make_constant(op.pos, Value::Float(-a));
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // FloatNeg(FloatNeg(x)) -> x (double negation elimination)
@@ -878,11 +878,11 @@ impl OptRewrite {
             if inner_op.opcode == OpCode::FloatNeg {
                 let inner_arg = inner_op.arg(0);
                 ctx.replace_op(op.pos, inner_arg);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Constant fold FloatFloorDiv.
@@ -893,11 +893,11 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatFloorDiv, a, b) {
                 ctx.make_constant(op.pos, Value::Float(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Constant fold FloatMod.
@@ -908,11 +908,11 @@ impl OptRewrite {
         if let (Some(a), Some(b)) = (ctx.get_constant_float(arg0), ctx.get_constant_float(arg1)) {
             if let Some(result) = self.try_fold_binary_float(OpCode::FloatMod, a, b) {
                 ctx.make_constant(op.pos, Value::Float(result));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     // ── Helper ──
@@ -996,7 +996,7 @@ impl OptimizationPass for OptRewrite {
             OpCode::CondCallN => {
                 if let Some(0) = ctx.get_constant_int(op.arg(0)) {
                     self.last_op_removed = true;
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 if let Some(c) = ctx.get_constant_int(op.arg(0)) {
                     if c != 0 {
@@ -1004,97 +1004,97 @@ impl OptimizationPass for OptRewrite {
                         call_op.pos = op.pos;
                         call_op.descr = op.descr.clone();
                         self.last_op_removed = false;
-                        return PassResult::Replace(call_op);
+                        return OptimizationResult::Replace(call_op);
                     }
                 }
                 self.last_op_removed = false;
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::CondCallValueI => {
                 if let Some(v) = ctx.get_constant_int(op.arg(0)) {
                     if v != 0 {
                         ctx.replace_op(op.pos, op.arg(0));
                         self.last_op_removed = true;
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                     let mut call_op = Op::new(OpCode::CallI, &op.args[1..]);
                     call_op.pos = op.pos;
                     call_op.descr = op.descr.clone();
                     self.last_op_removed = false;
-                    return PassResult::Replace(call_op);
+                    return OptimizationResult::Replace(call_op);
                 }
                 self.last_op_removed = false;
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::CondCallValueR => {
                 if let Some(v) = ctx.get_constant_int(op.arg(0)) {
                     if v != 0 {
                         ctx.replace_op(op.pos, op.arg(0));
                         self.last_op_removed = true;
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                     let mut call_op = Op::new(OpCode::CallR, &op.args[1..]);
                     call_op.pos = op.pos;
                     call_op.descr = op.descr.clone();
                     self.last_op_removed = false;
-                    return PassResult::Replace(call_op);
+                    return OptimizationResult::Replace(call_op);
                 }
                 self.last_op_removed = false;
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
             // ── Pointer equality ──
             OpCode::PtrEq | OpCode::InstancePtrEq => {
                 if op.arg(0) == op.arg(1) {
                     ctx.make_constant(op.pos, Value::Int(1));
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 if let (Some(a), Some(b)) = (
                     ctx.get_constant_int(op.arg(0)),
                     ctx.get_constant_int(op.arg(1)),
                 ) {
                     ctx.make_constant(op.pos, Value::Int(if a == b { 1 } else { 0 }));
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::PtrNe | OpCode::InstancePtrNe => {
                 if op.arg(0) == op.arg(1) {
                     ctx.make_constant(op.pos, Value::Int(0));
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 if let (Some(a), Some(b)) = (
                     ctx.get_constant_int(op.arg(0)),
                     ctx.get_constant_int(op.arg(1)),
                 ) {
                     ctx.make_constant(op.pos, Value::Int(if a != b { 1 } else { 0 }));
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
             // ── Cast round-trip elimination ──
             OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
                 ctx.replace_op(op.pos, op.arg(0));
-                PassResult::Remove
+                OptimizationResult::Remove
             }
 
             // ── Float-bytes conversion round-trip elimination ──
             OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
                 ctx.replace_op(op.pos, op.arg(0));
-                PassResult::Remove
+                OptimizationResult::Remove
             }
 
             // ── Guard no exception after removed call ──
             OpCode::GuardNoException => {
                 if self.last_op_removed {
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
             // Everything else: pass on to next optimization pass
-            _ => PassResult::PassOn,
+            _ => OptimizationResult::PassOn,
         }
     }
 
@@ -1139,16 +1139,16 @@ mod tests {
             }
 
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Replace(replacement) => {
+                OptimizationResult::Replace(replacement) => {
                     ctx.emit(replacement);
                 }
-                PassResult::Remove => {
+                OptimizationResult::Remove => {
                     // removed, nothing emitted
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -1184,7 +1184,7 @@ mod tests {
         ctx.emit(ops[1].clone());
 
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         // op2 should be forwarded to op0
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
@@ -1204,7 +1204,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
     }
 
@@ -1224,7 +1224,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(30));
     }
 
@@ -1241,7 +1241,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         match result {
-            PassResult::Emit(emitted) => {
+            OptimizationResult::Emit(emitted) => {
                 assert_eq!(emitted.opcode, OpCode::IntLshift);
                 assert_eq!(emitted.arg(0), OpRef(0));
                 // Second arg should be constant 1
@@ -1269,7 +1269,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -1285,7 +1285,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
     }
 
@@ -1305,7 +1305,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(58));
     }
 
@@ -1326,7 +1326,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -1345,7 +1345,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -1365,7 +1365,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(42));
     }
 
@@ -1385,7 +1385,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         match result {
-            PassResult::Emit(emitted) => {
+            OptimizationResult::Emit(emitted) => {
                 assert_eq!(emitted.opcode, OpCode::IntLshift);
                 assert_eq!(emitted.arg(0), OpRef(0));
                 let shift_ref = emitted.arg(1);
@@ -1412,7 +1412,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -1432,7 +1432,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(7));
     }
 
@@ -1452,7 +1452,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         match result {
-            PassResult::Replace(op) => {
+            OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::IntNeg);
                 assert_eq!(op.args[0], OpRef(0));
             }
@@ -1475,7 +1475,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -1491,7 +1491,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
     }
 
@@ -1510,7 +1510,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -1529,7 +1529,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -1548,7 +1548,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -1564,7 +1564,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
     }
 
@@ -1585,7 +1585,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -1604,7 +1604,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -1620,7 +1620,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
     }
 
@@ -1641,7 +1641,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -1660,7 +1660,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(-1));
     }
 
@@ -1676,7 +1676,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
     }
 
@@ -1697,7 +1697,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -1713,7 +1713,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
     }
 
@@ -1733,7 +1733,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         match result {
-            PassResult::Emit(emitted) => {
+            OptimizationResult::Emit(emitted) => {
                 assert_eq!(emitted.opcode, OpCode::IntInvert);
                 assert_eq!(emitted.arg(0), OpRef(0));
             }
@@ -1757,7 +1757,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0xF0));
     }
 
@@ -1778,7 +1778,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -1797,7 +1797,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -1817,7 +1817,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(1024));
     }
 
@@ -1836,7 +1836,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(-42));
     }
 
@@ -1853,7 +1853,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(-1));
     }
 
@@ -1870,7 +1870,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
     }
 
@@ -1887,7 +1887,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
     }
 
@@ -1904,7 +1904,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
     }
 
@@ -1921,7 +1921,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(10));
     }
 
@@ -1938,7 +1938,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
     }
 
@@ -1960,7 +1960,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(1)); // 3 < 5 -> true
     }
 
@@ -1980,7 +1980,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(1)); // 42 == 42 -> true
     }
 
@@ -2000,7 +2000,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         // -1 as u64 is u64::MAX, which is NOT less than 1
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
@@ -2020,7 +2020,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
     }
 
     #[test]
@@ -2037,7 +2037,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         // Guard always fails, but we pass on (backend handles it)
-        assert!(matches!(result, PassResult::PassOn));
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     #[test]
@@ -2052,7 +2052,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::PassOn));
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     #[test]
@@ -2068,7 +2068,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
     }
 
     #[test]
@@ -2087,7 +2087,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
     }
 
     // ── SAME_AS tests ──
@@ -2104,7 +2104,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
     }
 
@@ -2139,14 +2139,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Replace(replacement) => {
+                OptimizationResult::Replace(replacement) => {
                     ctx.emit(replacement);
                 }
-                PassResult::Remove => {}
-                PassResult::PassOn => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -2180,14 +2180,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Replace(replacement) => {
+                OptimizationResult::Replace(replacement) => {
                     ctx.emit(replacement);
                 }
-                PassResult::Remove => {}
-                PassResult::PassOn => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -2223,7 +2223,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(i64::MIN)); // wrapping
     }
 
@@ -2244,7 +2244,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -2263,7 +2263,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -2283,7 +2283,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::PassOn));
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     #[test]
@@ -2294,7 +2294,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[0], &mut ctx);
-        assert!(matches!(result, PassResult::PassOn));
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     // ── INT_AND constant fold ──
@@ -2315,7 +2315,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0x0F));
     }
 
@@ -2337,7 +2337,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0xFF));
     }
 
@@ -2358,7 +2358,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -2378,7 +2378,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         // u64::MAX >> 1 = i64::MAX
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(i64::MAX));
     }
@@ -2400,7 +2400,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -2419,7 +2419,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
     }
 
@@ -2439,7 +2439,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_float(OpRef(2)), Some(4.0));
     }
 
@@ -2458,7 +2458,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -2478,7 +2478,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_float(OpRef(2)), Some(2.0));
     }
 
@@ -2497,7 +2497,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -2516,7 +2516,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
     }
 
@@ -2536,7 +2536,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_float(OpRef(2)), Some(12.0));
     }
 
@@ -2555,7 +2555,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -2575,7 +2575,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_float(OpRef(2)), Some(5.0));
     }
 
@@ -2592,7 +2592,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_float(OpRef(1)), Some(-3.14));
     }
 
@@ -2611,12 +2611,12 @@ mod tests {
         let mut pass = OptRewrite::new();
         // Process op1 first (pass it through)
         let result1 = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result1, PassResult::PassOn));
+        assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit(ops[1].clone());
 
         // Process op2: should detect double negation
         let result2 = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result2, PassResult::Remove));
+        assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
     }
 
@@ -2636,7 +2636,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_float(OpRef(2)), Some(3.0));
     }
 
@@ -2656,7 +2656,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_float(OpRef(2)), Some(1.0));
     }
 
@@ -2674,7 +2674,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::PassOn));
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     // ── COND_CALL tests ──
@@ -2697,7 +2697,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
     }
 
     #[test]
@@ -2719,7 +2719,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
         match result {
-            PassResult::Replace(op) => {
+            OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallN);
                 // Should have args [func, arg1] (condition arg stripped)
                 assert_eq!(op.args.len(), 2);
@@ -2750,7 +2750,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(3)), OpRef(0));
     }
 
@@ -2773,7 +2773,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
         match result {
-            PassResult::Replace(op) => {
+            OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallI);
                 assert_eq!(op.args.len(), 2);
                 assert_eq!(op.arg(0), OpRef(1));
@@ -2798,7 +2798,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
     }
 
@@ -2815,7 +2815,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
     }
 
@@ -2832,7 +2832,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
     }
 
@@ -2849,7 +2849,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
     }
 
@@ -2870,7 +2870,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
     }
 
@@ -2889,7 +2889,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
     }
 
@@ -2906,7 +2906,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
     }
 
@@ -2923,7 +2923,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
     }
 
@@ -2942,7 +2942,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
     }
 
@@ -2959,7 +2959,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, PassResult::Remove));
+        assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
     }
 
@@ -2983,11 +2983,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
         let result2 = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result2, PassResult::Remove));
+        assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed
         let result3 = pass.propagate_forward(&ops[3], &mut ctx);
-        assert!(matches!(result3, PassResult::Remove));
+        assert!(matches!(result3, OptimizationResult::Remove));
     }
 
     #[test]
@@ -3005,11 +3005,11 @@ mod tests {
         let mut pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
         let result1 = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result1, PassResult::PassOn));
+        assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit(ops[1].clone());
 
         // Process GuardNoException -> should NOT be removed
         let result2 = pass.propagate_forward(&ops[2], &mut ctx);
-        assert!(matches!(result2, PassResult::PassOn));
+        assert!(matches!(result2, OptimizationResult::PassOn));
     }
 }

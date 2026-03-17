@@ -8,7 +8,7 @@
 use majit_ir::{Op, OpCode, OpRef, Value};
 
 use crate::intutils::IntBound;
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingOverflowGuard {
@@ -100,13 +100,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if b0.known_lt(&b1) {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_ge(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -117,13 +117,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if b0.known_gt(&b1) {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_le(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -134,13 +134,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if b0.known_le(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_gt(&b1) {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -151,13 +151,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if b0.known_ge(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_lt(&b1) {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -168,13 +168,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_ne(&b1) {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -185,13 +185,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if arg0 == arg1 {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_ne(&b1) {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -204,13 +204,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if b0.known_unsigned_lt(&b1) {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_unsigned_ge(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -221,13 +221,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if b0.known_unsigned_gt(&b1) {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_unsigned_le(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -238,13 +238,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if b0.known_unsigned_le(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_unsigned_gt(&b1) {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -255,13 +255,13 @@ impl OptIntBounds {
         let b1 = self.get_bound(arg1, ctx);
         if b0.known_unsigned_ge(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else if b0.known_unsigned_lt(&b1) {
             self.make_constant_int(op, 0, ctx);
-            PassResult::Remove
+            OptimizationResult::Remove
         } else {
             self.postprocess_bool_result(op);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -404,11 +404,11 @@ impl OptIntBounds {
             if b.is_within_range(start, stop - 1) {
                 // The value already fits; replace with the input.
                 ctx.replace_op(op.pos, op.arg(0));
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
         self.postprocess_int_signext(op, ctx);
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn postprocess_int_signext(&mut self, op: &Op, ctx: &OptContext) {
@@ -432,7 +432,7 @@ impl OptIntBounds {
             if let Some(result) = a.checked_add(b) {
                 self.make_constant_int(op, result, ctx);
                 self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
         let b0 = self.get_bound(op.arg(0), ctx);
@@ -445,11 +445,11 @@ impl OptIntBounds {
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
             self.postprocess_int_add(&new_op, ctx);
-            PassResult::Emit(new_op)
+            OptimizationResult::Emit(new_op)
         } else {
             self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
             self.postprocess_int_add_ovf(op, ctx);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -474,7 +474,7 @@ impl OptIntBounds {
             if let Some(result) = a.checked_sub(b) {
                 self.make_constant_int(op, result, ctx);
                 self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
         let arg0 = ctx.get_replacement(op.arg(0));
@@ -484,7 +484,7 @@ impl OptIntBounds {
         if arg0 == arg1 {
             // x - x = 0
             self.make_constant_int(op, 0, ctx);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
         if b0.sub_bound_cannot_overflow(&b1) {
             self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
@@ -492,11 +492,11 @@ impl OptIntBounds {
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
             self.postprocess_int_sub(&new_op, ctx);
-            PassResult::Emit(new_op)
+            OptimizationResult::Emit(new_op)
         } else {
             self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
             self.postprocess_int_sub_ovf(op, ctx);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -515,7 +515,7 @@ impl OptIntBounds {
             if let Some(result) = a.checked_mul(b) {
                 self.make_constant_int(op, result, ctx);
                 self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
         let b0 = self.get_bound(op.arg(0), ctx);
@@ -526,11 +526,11 @@ impl OptIntBounds {
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
             self.postprocess_int_mul(&new_op, ctx);
-            PassResult::Emit(new_op)
+            OptimizationResult::Emit(new_op)
         } else {
             self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
             self.postprocess_int_mul_ovf(op, ctx);
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
     }
 
@@ -549,10 +549,10 @@ impl OptIntBounds {
 
     fn optimize_guard_no_overflow(&mut self, op: &Op) -> PassResult {
         match self.pending_overflow_guard.take() {
-            Some(PendingOverflowGuard::Present) => PassResult::PassOn,
+            Some(PendingOverflowGuard::Present) => OptimizationResult::PassOn,
             Some(PendingOverflowGuard::ProvenSafeRemoved) | None => {
                 let _ = op;
-                PassResult::Remove
+                OptimizationResult::Remove
             }
         }
     }
@@ -560,7 +560,7 @@ impl OptIntBounds {
     fn optimize_guard_overflow(&mut self, op: &Op) -> PassResult {
         self.pending_overflow_guard = None;
         let _ = op;
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     // ── Guard optimizations ──
@@ -572,7 +572,7 @@ impl OptIntBounds {
         if let Some(val) = ctx.get_constant_int(cond_ref) {
             if val != 0 {
                 // Guard always passes, remove it
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
             // Guard always fails - still emit it (will fail at runtime)
         }
@@ -581,13 +581,13 @@ impl OptIntBounds {
         let b = self.get_bound(cond_ref, ctx);
         if b.known_gt_const(0) {
             // known nonzero, guard always passes
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // After emitting, propagate bounds backward from the guard
         // The condition is known to be true (nonzero) after this guard
         self.propagate_bounds_from_guard_true(cond_ref, ctx);
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn optimize_guard_false(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -595,17 +595,17 @@ impl OptIntBounds {
 
         if let Some(val) = ctx.get_constant_int(cond_ref) {
             if val == 0 {
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
         let b = self.get_bound(cond_ref, ctx);
         if b.known_eq_const(0) {
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         self.propagate_bounds_from_guard_false(cond_ref, ctx);
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Find the operation that produced cond_ref by searching new_operations.
@@ -1036,86 +1036,86 @@ impl OptimizationPass for OptIntBounds {
             // ── Arithmetic (postprocess to set bounds, then pass on) ──
             OpCode::IntAdd => {
                 self.postprocess_int_add(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntSub => {
                 self.postprocess_int_sub(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntMul => {
                 self.postprocess_int_mul(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntAnd => {
                 self.postprocess_int_and(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntOr => {
                 self.postprocess_int_or(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntXor => {
                 self.postprocess_int_xor(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntLshift => {
                 self.postprocess_int_lshift(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntRshift => {
                 self.postprocess_int_rshift(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::UintRshift => {
                 self.postprocess_uint_rshift(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntFloorDiv => {
                 self.postprocess_int_floordiv(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntMod => {
                 self.postprocess_int_mod(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntNeg => {
                 self.postprocess_int_neg(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntInvert => {
                 self.postprocess_int_invert(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntForceGeZero => {
                 self.postprocess_int_force_ge_zero(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::IntIsZero | OpCode::IntIsTrue | OpCode::IntBetween => {
                 self.postprocess_bool_result(op);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
             // ── Lengths (always non-negative) ──
             OpCode::ArraylenGc => {
                 self.postprocess_arraylen_gc(op);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::Strlen => {
                 self.postprocess_strlen(op);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
             OpCode::Unicodelen => {
                 self.postprocess_unicodelen(op);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
-            _ => PassResult::PassOn,
+            _ => OptimizationResult::PassOn,
         };
 
         // Track last emitted for overflow guard handling
         match &result {
-            PassResult::Emit(emitted_op) => self.record_emitted(emitted_op),
-            PassResult::PassOn => self.record_emitted(op),
+            OptimizationResult::Emit(emitted_op) => self.record_emitted(emitted_op),
+            OptimizationResult::PassOn => self.record_emitted(op),
             _ => {
                 // Remove: don't update last_emitted
             }
@@ -1168,14 +1168,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved_op, &mut ctx) {
-                PassResult::Emit(emit_op) => {
+                OptimizationResult::Emit(emit_op) => {
                     ctx.emit(emit_op);
                 }
-                PassResult::Replace(rep_op) => {
+                OptimizationResult::Replace(rep_op) => {
                     ctx.emit(rep_op);
                 }
-                PassResult::Remove => {}
-                PassResult::PassOn => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved_op);
                 }
             }

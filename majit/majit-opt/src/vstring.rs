@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use majit_ir::{Op, OpCode, OpRef, Value};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 /// Maximum constant string length we will virtualize.
 const MAX_CONST_LEN: usize = 100;
@@ -237,10 +237,10 @@ impl OptString {
                 };
                 self.vstrings.insert(op.pos, info);
                 self.known_lengths.insert(op.pos, len_ref);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
@@ -255,14 +255,14 @@ impl OptString {
                     let i = idx as usize;
                     if i < chars.len() {
                         chars[i] = Some(ctx.get_replacement(char_ref));
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                 }
             }
         }
         // Not virtual or index not constant -> force and emit.
         self.force_if_virtual(str_ref, ctx);
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Handle STRGETITEM: if source is virtual, resolve the character.
@@ -274,12 +274,12 @@ impl OptString {
             if let Some(ch_ref) = self.try_get_char(str_ref, idx, ctx) {
                 let ch_resolved = ctx.get_replacement(ch_ref);
                 ctx.replace_op(op.pos, ch_resolved);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
         // Not fully resolved -> force the string.
         self.force_if_virtual(str_ref, ctx);
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Handle STRLEN: if source is virtual, return known length.
@@ -289,9 +289,9 @@ impl OptString {
         if let Some(len) = self.get_known_length(str_ref, ctx) {
             ctx.make_constant(op.pos, Value::Int(len));
             self.known_lengths.insert(op.pos, op.pos);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Handle COPYSTRCONTENT: if destination is virtual Plain, track characters.
@@ -330,7 +330,7 @@ impl OptString {
                                 chars[dst_idx] = ch;
                             }
                         }
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                 }
             }
@@ -339,7 +339,7 @@ impl OptString {
         // Force both src and dst if virtual.
         self.force_if_virtual(src_ref, ctx);
         self.force_if_virtual(dst_ref, ctx);
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     /// Force a string if it is virtual.
@@ -386,7 +386,7 @@ impl OptimizationPass for OptString {
             _ => {
                 // For any other op, force virtual strings that appear as arguments.
                 self.force_args_if_virtual(op, ctx);
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
         }
     }
@@ -431,16 +431,16 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved_op, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::Remove => {
+                OptimizationResult::Remove => {
                     // Op removed, nothing emitted.
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved_op);
                 }
             }

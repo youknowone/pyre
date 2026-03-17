@@ -12,7 +12,7 @@ use crate::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 use majit_ir::Op;
 
 /// The optimizer: chains passes and runs them over a trace.
@@ -194,18 +194,18 @@ impl Optimizer {
 
         for pass in &mut self.passes {
             match pass.propagate_forward(&current_op, ctx) {
-                PassResult::Emit(op) => {
+                OptimizationResult::Emit(op) => {
                     ctx.emit(op);
                     return;
                 }
-                PassResult::Replace(op) => {
+                OptimizationResult::Replace(op) => {
                     current_op = op;
                     // Continue to next pass with the replacement
                 }
-                PassResult::Remove => {
+                OptimizationResult::Remove => {
                     return;
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     // Continue to next pass with the same op
                 }
             }
@@ -273,10 +273,10 @@ mod tests {
                 if let Some(0) = ctx.get_constant_int(op.arg(1)) {
                     // Replace with first arg
                     ctx.replace_op(op.pos, op.arg(0));
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
             }
-            PassResult::PassOn
+            OptimizationResult::PassOn
         }
 
         fn name(&self) -> &'static str {

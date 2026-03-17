@@ -15,7 +15,7 @@ use std::hash::{Hash, Hasher};
 
 use majit_ir::{OopSpecIndex, Op, OpCode, OpRef};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 /// Hash the argument OpRefs of an operation for loop-invariant call caching.
 fn hash_args(args: &[OpRef]) -> u64 {
@@ -268,7 +268,7 @@ impl OptHeap {
     fn optimize_getfield(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
-            None => return PassResult::Emit(op.clone()),
+            None => return OptimizationResult::Emit(op.clone()),
         };
 
         // Register immutable field descriptors so their cache entries survive
@@ -284,14 +284,14 @@ impl OptHeap {
         if let Some(lazy_op) = self.lazy_setfields.get(&key) {
             let cached = lazy_op.arg(1);
             ctx.replace_op(op.pos, cached);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // Check read cache.
         if let Some(&cached) = self.cached_fields.get(&key) {
             let cached = ctx.get_replacement(cached);
             ctx.replace_op(op.pos, cached);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // Check quasi-immutable cache: if this field was marked by
@@ -301,24 +301,24 @@ impl OptHeap {
                 // Subsequent read: reuse the cached value.
                 let qi_cached = ctx.get_replacement(qi_cached);
                 ctx.replace_op(op.pos, qi_cached);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
             // First read after QUASIIMMUT_FIELD: emit the load, then cache
             // the result so it survives calls (unlike normal mutable fields).
             self.quasi_immut_cache.insert(key, op.pos);
             self.cached_fields.insert(key, op.pos);
-            return PassResult::Emit(op.clone());
+            return OptimizationResult::Emit(op.clone());
         }
 
         // Cache miss: emit the load and cache the result.
         self.cached_fields.insert(key, op.pos);
-        PassResult::Emit(op.clone())
+        OptimizationResult::Emit(op.clone())
     }
 
     fn optimize_setfield(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
-            None => return PassResult::Emit(op.clone()),
+            None => return OptimizationResult::Emit(op.clone()),
         };
 
         let (obj, field_idx) = key;
@@ -331,13 +331,13 @@ impl OptHeap {
         if let Some(lazy_op) = self.lazy_setfields.get(&key) {
             if lazy_op.arg(1) == new_value {
                 // Writing the same value as the pending lazy set -> redundant.
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         } else if let Some(&cached) = self.cached_fields.get(&key) {
             let cached = ctx.get_replacement(cached);
             if cached == new_value {
                 // Writing the same value already in the cache -> redundant.
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
@@ -350,32 +350,32 @@ impl OptHeap {
         // Either way, store as a new lazy set.
         self.lazy_setfields.insert(key, op.clone());
 
-        PassResult::Remove
+        OptimizationResult::Remove
     }
 
     fn optimize_getarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         let key = match Self::arrayitem_key(op, ctx) {
             Some(k) => k,
-            None => return PassResult::Emit(op.clone()),
+            None => return OptimizationResult::Emit(op.clone()),
         };
 
         // Check lazy set first.
         if let Some(lazy_op) = self.lazy_setarrayitems.get(&key) {
             let cached = lazy_op.arg(2);
             ctx.replace_op(op.pos, cached);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // Check read cache.
         if let Some(&cached) = self.cached_arrayitems.get(&key) {
             let cached = ctx.get_replacement(cached);
             ctx.replace_op(op.pos, cached);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // Cache miss: emit and cache.
         self.cached_arrayitems.insert(key, op.pos);
-        PassResult::Emit(op.clone())
+        OptimizationResult::Emit(op.clone())
     }
 
     fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
@@ -389,7 +389,7 @@ impl OptHeap {
                 // Non-constant index: force all lazy array stores and invalidate array cache.
                 self.force_all_lazy_setarrayitems(ctx);
                 self.cached_arrayitems.clear();
-                return PassResult::Emit(op.clone());
+                return OptimizationResult::Emit(op.clone());
             }
         };
 
@@ -398,12 +398,12 @@ impl OptHeap {
         // Check if writing the same value.
         if let Some(lazy_op) = self.lazy_setarrayitems.get(&key) {
             if lazy_op.arg(2) == new_value {
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         } else if let Some(&cached) = self.cached_arrayitems.get(&key) {
             let cached = ctx.get_replacement(cached);
             if cached == new_value {
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
         }
 
@@ -411,7 +411,7 @@ impl OptHeap {
         self.lazy_setarrayitems.insert(key, op.clone());
         self.cached_arrayitems.remove(&key);
 
-        PassResult::Remove
+        OptimizationResult::Remove
     }
 
     /// Handle CALL_LOOPINVARIANT_*: cache the result by (descr_index, args_hash).
@@ -426,7 +426,7 @@ impl OptHeap {
         if let Some(&cached_result) = self.loopinvariant_cache.get(&cache_key) {
             let cached_result = ctx.get_replacement(cached_result);
             ctx.replace_op(op.pos, cached_result);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // First time: cache the result, then treat as a normal call for
@@ -435,7 +435,7 @@ impl OptHeap {
         self.mark_args_escaped(op);
         self.force_all_lazy(ctx);
         self.invalidate_caches();
-        PassResult::Emit(op.clone())
+        OptimizationResult::Emit(op.clone())
     }
 
     /// Handle operations that may have side effects.
@@ -450,7 +450,7 @@ impl OptHeap {
             self.seen_allocation.insert(op.pos);
             self.unescaped.insert(op.pos);
             self.known_nonnull.insert(op.pos);
-            return PassResult::Emit(op.clone());
+            return OptimizationResult::Emit(op.clone());
         }
 
         // Guards: force lazy sets but keep caches (guards don't mutate the heap).
@@ -460,7 +460,7 @@ impl OptHeap {
             if opcode == OpCode::GuardNonnull {
                 let arg = op.arg(0);
                 if self.known_nonnull.contains(&arg) || self.seen_allocation.contains(&arg) {
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
                 self.known_nonnull.insert(arg);
             }
@@ -474,13 +474,13 @@ impl OptHeap {
             }
 
             self.force_all_lazy(ctx);
-            return PassResult::Emit(op.clone());
+            return OptimizationResult::Emit(op.clone());
         }
 
         // Final operations (Jump, Finish): force everything.
         if opcode.is_final() {
             self.force_all_lazy(ctx);
-            return PassResult::Emit(op.clone());
+            return OptimizationResult::Emit(op.clone());
         }
 
         // Calls: mark arguments as escaped, force lazy sets, and invalidate.
@@ -528,13 +528,13 @@ impl OptHeap {
                         false
                     });
 
-                    return PassResult::Emit(op.clone());
+                    return OptimizationResult::Emit(op.clone());
                 }
                 _ => {
                     self.mark_args_escaped(op);
                     self.force_all_lazy(ctx);
                     self.invalidate_caches();
-                    return PassResult::Emit(op.clone());
+                    return OptimizationResult::Emit(op.clone());
                 }
             }
         }
@@ -543,11 +543,11 @@ impl OptHeap {
         if !opcode.has_no_side_effect() && !opcode.is_ovf() {
             self.force_all_lazy(ctx);
             self.invalidate_caches();
-            return PassResult::Emit(op.clone());
+            return OptimizationResult::Emit(op.clone());
         }
 
         // Pure / no-side-effect / overflow ops: pass through.
-        PassResult::Emit(op.clone())
+        OptimizationResult::Emit(op.clone())
     }
 }
 
@@ -582,11 +582,11 @@ impl OptimizationPass for OptHeap {
             // ── GUARD_NOT_INVALIDATED deduplication ──
             OpCode::GuardNotInvalidated => {
                 if self.seen_guard_not_invalidated {
-                    PassResult::Remove
+                    OptimizationResult::Remove
                 } else {
                     self.seen_guard_not_invalidated = true;
                     self.force_all_lazy(ctx);
-                    PassResult::Emit(op.clone())
+                    OptimizationResult::Emit(op.clone())
                 }
             }
 
@@ -610,7 +610,7 @@ impl OptimizationPass for OptHeap {
                     self.quasi_immut_cache.insert((obj, field_idx), OpRef::NONE);
                 }
                 // The QUASIIMMUT_FIELD itself is a no-op marker.
-                PassResult::Remove
+                OptimizationResult::Remove
             }
 
             // ── GC_LOAD / GC_LOAD_INDEXED: generic memory loads ──
@@ -625,11 +625,11 @@ impl OptimizationPass for OptHeap {
                 self.force_all_lazy_setfields(ctx);
                 self.force_all_lazy_setarrayitems(ctx);
                 self.known_nonnull.insert(op.arg(0));
-                PassResult::Emit(op.clone())
+                OptimizationResult::Emit(op.clone())
             }
 
             // ── SETFIELD_RAW: no effect on GC caches ──
-            OpCode::SetfieldRaw => PassResult::Emit(op.clone()),
+            OpCode::SetfieldRaw => OptimizationResult::Emit(op.clone()),
 
             // ── Loop-invariant calls: cache results across the trace ──
             OpCode::CallLoopinvariantI
@@ -689,7 +689,7 @@ mod tests {
     };
 
     use crate::optimizer::Optimizer;
-    use crate::{OptContext, OptimizationPass, PassResult};
+    use crate::{OptContext, Optimization, OptimizationResult};
 
     use super::OptHeap;
 
@@ -884,14 +884,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Remove => {}
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -1103,14 +1103,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Remove => {}
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -1594,14 +1594,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Remove => {}
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -2099,14 +2099,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Remove => {}
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -2177,14 +2177,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Remove => {}
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -2381,14 +2381,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Remove => {}
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -2434,14 +2434,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Remove => {}
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }
@@ -2481,14 +2481,14 @@ mod tests {
                 *arg = ctx.get_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
-                PassResult::Emit(emitted) => {
+                OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                PassResult::Remove => {}
-                PassResult::Replace(replaced) => {
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
                     ctx.emit(replaced);
                 }
-                PassResult::PassOn => {
+                OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
             }

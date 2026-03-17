@@ -39,7 +39,7 @@ use std::collections::HashSet;
 
 use majit_ir::{DescrRef, Op, OpCode, OpRef};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 /// Key that uniquely identifies a guard condition.
 ///
@@ -158,14 +158,14 @@ impl OptimizationPass for GuardStrengthenOpt {
             // Non-guard operations invalidate the last-guard descriptor
             // tracking (no longer consecutive).
             self.last_guard_descr = None;
-            return PassResult::PassOn;
+            return OptimizationResult::PassOn;
         }
 
         // --- Redundant guard removal (exact match) ---
         if Self::can_remove_as_duplicate(op.opcode) {
             let key = GuardKey::from_op(op);
             if self.seen.contains(&key) {
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
 
             self.seen.insert(key);
@@ -173,7 +173,7 @@ impl OptimizationPass for GuardStrengthenOpt {
 
         // --- Guard strengthening (subsumption) ---
         if self.is_subsumed(op) {
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // The guard is not redundant – record it and emit.
@@ -186,7 +186,7 @@ impl OptimizationPass for GuardStrengthenOpt {
         // Track this guard's descriptor for the next consecutive guard.
         self.last_guard_descr = fused_op.descr.clone();
 
-        PassResult::Emit(fused_op)
+        OptimizationResult::Emit(fused_op)
     }
 
     fn setup(&mut self) {
