@@ -3,7 +3,8 @@
 //!
 //! Separated from pyre-interp/src/call.rs so pyre-interp stays JIT-free.
 
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
+use std::mem::MaybeUninit;
 use std::sync::Once;
 
 use pyre_object::PyObjectRef;
@@ -30,46 +31,75 @@ fn force_cache_arg_key(arg: PyObjectRef) -> usize {
     }
 }
 
-// ── Callee frame pool ────────────────────────────────────────────
-const FRAME_POOL_CAP: usize = 4;
+// ── Callee frame arena (RPython nursery bump equivalent) ─────────
+//
+// LIFO stack of pre-allocated PyFrame slots. Recursive call/return
+// order is naturally LIFO, so arena_take/arena_put are O(1).
+// Eliminates heap allocation for recursion depths up to ARENA_CAP.
+
+const ARENA_CAP: usize = 64;
+
+struct FrameArena {
+    buf: Box<[MaybeUninit<PyFrame>; ARENA_CAP]>,
+    /// Number of frames currently in use (LIFO stack pointer).
+    top: usize,
+    /// Frames below this index have been initialized at least once.
+    /// Reuse only needs reinit of changed fields, not full new_for_call.
+    initialized: usize,
+}
+
+impl FrameArena {
+    fn new() -> Self {
+        Self {
+            buf: Box::new([const { MaybeUninit::uninit() }; ARENA_CAP]),
+            top: 0,
+            initialized: 0,
+        }
+    }
+
+    /// Take the next frame slot. Returns (ptr, was_previously_initialized).
+    #[inline]
+    fn take(&mut self) -> Option<(*mut PyFrame, bool)> {
+        if self.top < ARENA_CAP {
+            let idx = self.top;
+            self.top += 1;
+            let ptr = self.buf[idx].as_mut_ptr();
+            let was_init = idx < self.initialized;
+            Some((ptr, was_init))
+        } else {
+            None
+        }
+    }
+
+    /// Return a frame to the arena. Must be the most recently taken frame (LIFO).
+    #[inline]
+    fn put(&mut self, ptr: *mut PyFrame) -> bool {
+        if self.top > 0 {
+            let expected = self.buf[self.top - 1].as_mut_ptr();
+            if ptr == expected {
+                self.top -= 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mark that frames up to `top` have been fully initialized.
+    #[inline]
+    fn mark_initialized(&mut self) {
+        if self.top > self.initialized {
+            self.initialized = self.top;
+        }
+    }
+}
 
 thread_local! {
-    static FRAME_POOL: Cell<([*mut PyFrame; FRAME_POOL_CAP], usize)> =
-        const { Cell::new(([std::ptr::null_mut(); FRAME_POOL_CAP], 0)) };
+    static FRAME_ARENA: UnsafeCell<FrameArena> = UnsafeCell::new(FrameArena::new());
 }
 
 #[inline]
-fn pool_take() -> *mut PyFrame {
-    FRAME_POOL
-        .try_with(|c| {
-            let (mut arr, len) = c.get();
-            if len > 0 {
-                let new_len = len - 1;
-                let ptr = arr[new_len];
-                arr[new_len] = std::ptr::null_mut();
-                c.set((arr, new_len));
-                ptr
-            } else {
-                std::ptr::null_mut()
-            }
-        })
-        .unwrap_or(std::ptr::null_mut())
-}
-
-#[inline]
-fn pool_put(ptr: *mut PyFrame) -> bool {
-    FRAME_POOL
-        .try_with(|c| {
-            let (mut arr, len) = c.get();
-            if len < FRAME_POOL_CAP {
-                arr[len] = ptr;
-                c.set((arr, len + 1));
-                true
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false)
+fn arena_ref() -> &'static mut FrameArena {
+    FRAME_ARENA.with(|cell| unsafe { &mut *cell.get() })
 }
 
 // ── JIT call callbacks ───────────────────────────────────────────
@@ -211,28 +241,58 @@ extern "C" fn jit_bridge_compile_callee(
 fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
     let callable = callable as PyObjectRef;
     let code_ptr = unsafe { w_func_get_code_ptr(callable) };
-    let frame = unsafe { &*(caller_frame as *const PyFrame) };
+    let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { w_func_get_globals(callable) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
 
-    let raw = pool_take();
-    let frame_ptr = if raw.is_null() {
-        Box::into_raw(Box::new(PyFrame::new_for_call(
-            func_code,
-            args,
-            globals,
-            frame.execution_context,
-        )))
-    } else {
-        unsafe {
-            std::ptr::drop_in_place(raw);
-            std::ptr::write(
-                raw,
-                PyFrame::new_for_call(func_code, args, globals, frame.execution_context),
-            );
+    let arena = arena_ref();
+    if let Some((ptr, was_init)) = arena.take() {
+        if was_init {
+            // Fast reinit: only update fields that change between calls.
+            // code, execution_context, namespace, locals_w.ptr, value_stack_w.ptr
+            // are stable for self-recursion (same function, same module).
+            let f = unsafe { &mut *ptr };
+            let same_code = f.code == func_code;
+            if same_code {
+                // Self-recursion hot path: ~4 writes instead of ~40
+                let nargs = args.len().min(f.locals_w.len());
+                for i in 0..nargs {
+                    f.locals_w[i] = args[i];
+                }
+                f.stack_depth = 0;
+                f.next_instr = 0;
+                f.vable_token = 0;
+            } else {
+                // Different function: full reinit (rare for fib)
+                unsafe {
+                    std::ptr::write(
+                        ptr,
+                        PyFrame::new_for_call(func_code, args, globals, caller.execution_context),
+                    );
+                    (&mut *ptr).fix_array_ptrs();
+                }
+            }
+        } else {
+            // First-time init for this arena slot
+            unsafe {
+                std::ptr::write(
+                    ptr,
+                    PyFrame::new_for_call(func_code, args, globals, caller.execution_context),
+                );
+                (&mut *ptr).fix_array_ptrs();
+            }
+            arena.mark_initialized();
         }
-        raw
-    };
+        return ptr as i64;
+    }
+
+    // Arena full: heap fallback (should not happen for recursion < 64)
+    let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
+        func_code,
+        args,
+        globals,
+        caller.execution_context,
+    )));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -243,6 +303,17 @@ pub extern "C" fn jit_create_callee_frame_0(caller_frame: i64, callable: i64) ->
 
 pub extern "C" fn jit_create_callee_frame_1(caller_frame: i64, callable: i64, arg0: i64) -> i64 {
     create_callee_frame_impl(caller_frame, callable, &[arg0 as PyObjectRef])
+}
+
+/// Raw-int variant: accepts a raw int and boxes it internally.
+/// Eliminates trace_box_int CallI from the trace (boxing folded into frame creation).
+pub extern "C" fn jit_create_callee_frame_1_raw_int(
+    caller_frame: i64,
+    callable: i64,
+    raw_int_arg: i64,
+) -> i64 {
+    let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
+    create_callee_frame_impl(caller_frame, callable, &[boxed])
 }
 
 pub extern "C" fn jit_create_callee_frame_2(
@@ -312,7 +383,9 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
         return;
     }
     let ptr = frame_ptr as *mut PyFrame;
-    if !pool_put(ptr) {
+    let arena = arena_ref();
+    if !arena.put(ptr) {
+        // Not an arena frame (heap fallback) — free it
         unsafe { drop(Box::from_raw(ptr)) };
     }
 }

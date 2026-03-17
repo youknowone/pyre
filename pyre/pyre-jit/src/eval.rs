@@ -38,6 +38,10 @@ thread_local! {
         let mut d = JitDriver::new(JIT_THRESHOLD);
         d.set_virtualizable_info(info.clone());
         d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
+        d.register_create_frame_raw(
+            crate::call_jit::jit_create_callee_frame_1 as *const (),
+            crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),
+        );
         (d, info)
     });
 }

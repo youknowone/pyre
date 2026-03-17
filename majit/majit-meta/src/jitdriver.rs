@@ -100,6 +100,11 @@ impl<S: JitState> JitDriver<S> {
         self.meta.register_raw_int_box_helper(helper);
     }
 
+    /// Register a create_frame_N → create_frame_N_raw_int mapping for box folding.
+    pub fn register_create_frame_raw(&mut self, normal: *const (), raw_int: *const ()) {
+        self.meta.register_create_frame_raw(normal, raw_int);
+    }
+
     pub fn with_declarative<D: DeclarativeJitDriver>(
         threshold: u32,
         green_types: &[Type],
