@@ -162,6 +162,33 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                     }
                 }
 
+                // ── Virtualizable array write → VableArrayWrite ──
+                // RPython jtransform.py:794 `setarrayitem_vable`
+                OpKind::ArrayWrite {
+                    base,
+                    index,
+                    value,
+                    item_ty,
+                } if config.lower_virtualizable => {
+                    if let Some(&arr_idx) = vable_array_values.get(base) {
+                        notes.push(GraphTransformNote {
+                            function: graph.name.clone(),
+                            detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
+                        });
+                        vable_rewrites += 1;
+                        new_ops.push(Op {
+                            result: op.result,
+                            kind: OpKind::VableArrayWrite {
+                                array_index: arr_idx,
+                                elem_index: *index,
+                                value: *value,
+                                item_ty: item_ty.clone(),
+                            },
+                        });
+                        continue;
+                    }
+                }
+
                 // ── Call classification ──
                 OpKind::Call {
                     target,
