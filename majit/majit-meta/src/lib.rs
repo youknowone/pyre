@@ -206,13 +206,9 @@ mod tests {
         let layout = [(0, 2), (1, 1)];
         let mut result: Vec<(usize, Vec<i64>)> = Vec::new();
 
-        let outcome = restore_storage_pool_guard_state(
-            &values,
-            &layout,
-            10,
-            100,
-            |idx, vals| result.push((idx, vals.to_vec())),
-        );
+        let outcome = restore_storage_pool_guard_state(&values, &layout, 10, 100, |idx, vals| {
+            result.push((idx, vals.to_vec()))
+        });
 
         assert_eq!(outcome, Some((42, 3)));
         assert_eq!(result.len(), 2);
@@ -242,13 +238,9 @@ mod tests {
         let values = [10, 20, 3, 5, 42];
         let layout = [(0, 2)];
 
-        let outcome = restore_storage_pool_guard_state(
-            &values,
-            &layout,
-            10,
-            100,
-            |_, _| panic!("should not be called"),
-        );
+        let outcome = restore_storage_pool_guard_state(&values, &layout, 10, 100, |_, _| {
+            panic!("should not be called")
+        });
 
         assert_eq!(outcome, None);
     }

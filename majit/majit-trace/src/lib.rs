@@ -13,3 +13,5 @@ pub mod jitlog;
 pub mod recorder;
 pub mod trace;
 pub mod warmenterstate;
+/// Backward-compat alias — examples still import `warmstate::*`.
+pub use warmenterstate as warmstate;

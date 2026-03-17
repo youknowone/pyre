@@ -7,8 +7,8 @@ use crate::resume::{
 };
 use crate::trace_ctx::JitDriverDescriptor;
 use crate::virtualizable::{
-    clear_vable_token, read_all_virtualizable_boxes, read_array_lengths,
-    write_all_virtualizable_boxes, VirtualizableInfo,
+    clear_vable_token, read_all_virtualizable_boxes, write_all_virtualizable_boxes,
+    VirtualizableInfo,
 };
 
 /// Layout description for replaying a pending field or array write during deopt.

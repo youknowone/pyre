@@ -948,9 +948,7 @@ fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatch
         })
     });
     // Update code_ptr if changed (e.g., recompilation)
-    entry
-        .code_ptr
-        .store(code_ptr as *mut u8, Ordering::Release);
+    entry.code_ptr.store(code_ptr as *mut u8, Ordering::Release);
     &**entry as *const CaDispatchEntry
 }
 
@@ -4519,8 +4517,7 @@ impl CraneliftBackend {
                     // is a primitive type (Int/Float). For self-recursion
                     // (target unknown), finish_index is loaded from the
                     // dispatch entry at runtime (set after compile).
-                    let has_primitive_result = finish_index.is_some()
-                        || resolved_target.is_none(); // self-recursion: assume primitive
+                    let has_primitive_result = finish_index.is_some() || resolved_target.is_none(); // self-recursion: assume primitive
                     let use_direct = dispatch_slot_addr.is_some() && has_primitive_result;
 
                     if use_direct {
@@ -4569,17 +4566,14 @@ impl CraneliftBackend {
                         let null_ptr = builder.ins().iconst(ptr_type, 0);
                         let is_null = builder.ins().icmp(IntCC::Equal, code_addr, null_ptr);
                         // Also check finish_index != CA_FINISH_INDEX_UNKNOWN
-                        let unknown_sentinel =
+                        let unknown_sentinel = builder
+                            .ins()
+                            .iconst(cl_types::I64, CA_FINISH_INDEX_UNKNOWN as i64);
+                        let finish_unknown =
                             builder
                                 .ins()
-                                .iconst(cl_types::I64, CA_FINISH_INDEX_UNKNOWN as i64);
-                        let finish_unknown = builder.ins().icmp(
-                            IntCC::Equal,
-                            runtime_finish_idx,
-                            unknown_sentinel,
-                        );
-                        let cant_direct =
-                            builder.ins().bor(is_null, finish_unknown);
+                                .icmp(IntCC::Equal, runtime_finish_idx, unknown_sentinel);
+                        let cant_direct = builder.ins().bor(is_null, finish_unknown);
                         let direct_call_block = builder.create_block();
                         let shim_fallback_block = builder.create_block();
                         builder.ins().brif(
@@ -4616,13 +4610,12 @@ impl CraneliftBackend {
                         // When force_fn is available, route non-finish guard
                         // failures through a direct force path instead of the
                         // full shim (avoids double execution of compiled code).
-                        let direct_nonfinish_block =
-                            if CALL_ASSEMBLER_FORCE_FN.get().is_some() {
-                                let b = builder.create_block();
-                                Some(b)
-                            } else {
-                                None
-                            };
+                        let direct_nonfinish_block = if CALL_ASSEMBLER_FORCE_FN.get().is_some() {
+                            let b = builder.create_block();
+                            Some(b)
+                        } else {
+                            None
+                        };
                         let nonfinish_target =
                             direct_nonfinish_block.unwrap_or(shim_fallback_block);
                         builder.ins().brif(
@@ -4645,10 +4638,9 @@ impl CraneliftBackend {
                             builder.seal_block(nonfinish_block);
                             // Check for DEADFRAME sentinel (nested CALL_ASSEMBLER
                             // propagation) — must go through shim for that case.
-                            let deadframe_sentinel_val = builder.ins().iconst(
-                                cl_types::I64,
-                                CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64,
-                            );
+                            let deadframe_sentinel_val = builder
+                                .ins()
+                                .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
                             let is_deadframe = builder.ins().icmp(
                                 IntCC::Equal,
                                 fail_idx_raw,
@@ -4666,8 +4658,7 @@ impl CraneliftBackend {
                             builder.switch_to_block(direct_force_block);
                             builder.seal_block(direct_force_block);
                             // outputs[0] = callee frame pointer
-                            let frame_ptr =
-                                builder.ins().stack_load(cl_types::I64, out_slot, 0);
+                            let frame_ptr = builder.ins().stack_load(cl_types::I64, out_slot, 0);
                             let force_fn_ptr = *CALL_ASSEMBLER_FORCE_FN.get().unwrap();
                             let force_result = emit_host_call(
                                 &mut builder,
@@ -4677,9 +4668,7 @@ impl CraneliftBackend {
                                 &[frame_ptr],
                                 Some(cl_types::I64),
                             );
-                            builder
-                                .ins()
-                                .jump(ca_merge_block, &[force_result.unwrap()]);
+                            builder.ins().jump(ca_merge_block, &[force_result.unwrap()]);
                         }
 
                         // ── Fallback: null code_ptr, unknown finish, or deadframe ──

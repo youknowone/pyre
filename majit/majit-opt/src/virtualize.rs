@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use majit_ir::{Descr, DescrRef, FieldDescr, Op, OpCode, OpRef, Value};
+use majit_ir::{Descr, DescrRef, FieldDescr, Op, OpCode, OpRef, Type, Value};
 
 use crate::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
@@ -26,8 +26,12 @@ use crate::{OptContext, OptimizationPass, PassResult};
 pub struct VirtualizableConfig {
     /// Byte offsets of static (scalar) frame fields (e.g. next_instr, stack_depth).
     pub static_field_offsets: Vec<usize>,
+    /// Types of static (scalar) frame fields, parallel to `static_field_offsets`.
+    pub static_field_types: Vec<Type>,
     /// Byte offsets of array pointer frame fields (e.g. locals_w, value_stack_w).
     pub array_field_offsets: Vec<usize>,
+    /// Item types of array fields, parallel to `array_field_offsets`.
+    pub array_item_types: Vec<Type>,
 }
 
 /// Field descriptor index for the `virtual_token` field of JitVirtualRef.

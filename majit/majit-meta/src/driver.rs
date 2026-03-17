@@ -963,6 +963,13 @@ impl<S: JitState> JitDriver<S> {
             return false;
         };
 
+        // Verify the current state is compatible with the loop's meta.
+        // If guard failure changed storage depths, bridge tracing cannot
+        // produce FINISH args matching the parent loop — skip.
+        if !state.is_compatible(&loop_meta) {
+            return false;
+        }
+
         let live_values = state.extract_live(&loop_meta);
 
         if !self.meta.start_retrace(green_key, fail_index, &live_values) {

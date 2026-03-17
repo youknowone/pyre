@@ -816,6 +816,22 @@ impl OpCode {
             _ => OpCode::GetarrayitemGcI,
         }
     }
+
+    pub fn getfield_raw_for_type(tp: Type) -> OpCode {
+        match tp {
+            Type::Ref => OpCode::GetfieldRawR,
+            Type::Float => OpCode::GetfieldRawF,
+            _ => OpCode::GetfieldRawI,
+        }
+    }
+
+    pub fn getarrayitem_raw_for_type(tp: Type) -> OpCode {
+        match tp {
+            Type::Ref => OpCode::GetarrayitemRawR,
+            Type::Float => OpCode::GetarrayitemRawF,
+            _ => OpCode::GetarrayitemRawI,
+        }
+    }
 }
 
 // ── Boolean inverse/reflex tables (from resoperation.py) ──

@@ -119,19 +119,16 @@ fn patch_new_loop_to_load_virtualizable_fields(
     array_lengths: &[usize],
 ) -> (Vec<InputArg>, Vec<Op>) {
     let num_static = info.num_static_fields;
-    let total_array_elements = original_inputargs.len().saturating_sub(1 + num_static);
 
-    if total_array_elements == 0 && num_static == 0 {
+    // No virtualizable fields at all → skip preamble patching entirely.
+    if num_static == 0 && info.array_fields.is_empty() {
         return (original_inputargs.to_vec(), optimized_ops);
     }
 
     let effective_lengths = if array_lengths.is_empty() {
-        let num_arrays = info.array_fields.len();
-        if num_arrays == 1 {
-            vec![total_array_elements]
-        } else {
-            return (original_inputargs.to_vec(), optimized_ops);
-        }
+        // No array lengths provided — skip array preamble entirely.
+        // RPython uses translator-known descriptors; we never guess.
+        vec![]
     } else {
         array_lengths.to_vec()
     };
@@ -158,11 +155,12 @@ fn patch_with_array_lengths(
     let mut preamble = Vec::new();
     let mut label_args: Vec<OpRef> = vec![frame_ref];
 
-    // Static fields
+    // Static fields — use typed GETFIELD_RAW based on field descriptor type
     for (i, field) in info.static_fields.iter().enumerate() {
         let pos = OpRef((1 + i) as u32);
         let descr = make_vable_field_descr(field.offset, true);
-        let mut op = Op::with_descr(OpCode::GetfieldRawI, &[frame_ref], descr);
+        let opcode = OpCode::getfield_raw_for_type(field.field_type);
+        let mut op = Op::with_descr(opcode, &[frame_ref], descr);
         op.pos = pos;
         preamble.push(op);
         label_args.push(pos);
@@ -198,7 +196,7 @@ fn patch_with_array_lengths(
     for (ai, array_field) in info.array_fields.iter().enumerate() {
         let count = array_lengths.get(ai).copied().unwrap_or(0);
 
-        // Load array pointer from frame
+        // Load array pointer from frame — raw pointer stored as i64
         let array_ptr_descr = make_vable_field_descr(array_field.field_offset, false);
         let array_ptr_pos = OpRef(tmp_pos);
         tmp_pos += 1;
@@ -206,7 +204,8 @@ fn patch_with_array_lengths(
         ptr_op.pos = array_ptr_pos;
         preamble.push(ptr_op);
 
-        // Load each element
+        // Load each element — typed by array item_type
+        let elem_opcode = OpCode::getarrayitem_raw_for_type(array_field.item_type);
         for ei in 0..count {
             let elem_pos = OpRef(arg_idx);
             arg_idx += 1;
@@ -217,7 +216,7 @@ fn patch_with_array_lengths(
             let idx_ref = OpRef(idx_const_key);
 
             let mut elem_op = Op::with_descr(
-                OpCode::GetarrayitemRawI,
+                elem_opcode,
                 &[array_ptr_pos, idx_ref],
                 array_descr.clone(),
             );
@@ -3432,20 +3431,15 @@ impl<M: Clone> MetaInterp<M> {
                     return InlineDecision::ResidualCall;
                 }
 
-                // Self-recursion: use CALL_ASSEMBLER if compiled,
-                // otherwise residual. Recursive inlining requires
-                // non-recursive tracing (PyPy's meta-interpreter style)
-                // which we don't have yet — our tracing executes the
-                // callee concretely, causing exponential cost for fib.
-                // Self-recursion: never inline during tracing.
-                // Our tracing executes callees concretely, so recursive
-                // inlining causes exponential cost. Phase 3 (iterative
-                // meta-interpreter) will enable this safely.
+                // Self-recursion: inline up to MAX_INLINE_DEPTH.
+                // The iterative meta-interpreter (Phase 3) handles this
+                // without Rust stack growth via pending_inline side-channel.
                 if ctx.is_tracing_key(callee_key) {
+                    // Already at depth limit — use CallAssembler if compiled
                     if self.compiled_loops.contains_key(&callee_key) {
                         return InlineDecision::CallAssembler;
                     }
-                    return InlineDecision::ResidualCall;
+                    return InlineDecision::Inline;
                 }
             }
 

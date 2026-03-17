@@ -1551,9 +1551,9 @@ fn declarative_driver_invokes_virtualizable_sync_hooks_on_trace_and_compiled_exi
         DeclarativeDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
     let mut driver = JitDriver::<VirtualizableSyncState>::with_descriptor(2, descriptor);
-    let mut info = VirtualizableInfo::new(0);
-    info.add_field("stackpos", Type::Int, 8);
-    driver.set_virtualizable_info(info);
+    // Only set virtualizable_info with token_offset — no static fields.
+    // This test verifies sync hook invocation, not field loading.
+    driver.set_virtualizable_info(VirtualizableInfo::new(0));
     let mut state = VirtualizableSyncState {
         frame: 10,
         stack: 20,
@@ -1646,6 +1646,7 @@ fn declarative_driver_auto_syncs_virtualizable_heap_state() {
     info.add_field("stackpos", Type::Int, 8);
     info.add_array_field("stack", Type::Int, 16);
     driver.set_virtualizable_info(info);
+    driver.set_vable_array_lengths(vec![1]);
 
     let mut stack = vec![41_i64];
     let mut frame = AutoVirtualizableFrame {
@@ -1696,6 +1697,7 @@ fn declarative_driver_blackhole_fallback_jump_restores_and_syncs_virtualizable_s
     info.add_field("stackpos", Type::Int, 8);
     info.add_array_field("stack", Type::Int, 16);
     driver.set_virtualizable_info(info);
+    driver.set_vable_array_lengths(vec![1]);
 
     let mut stack = vec![41_i64];
     let mut frame = AutoVirtualizableFrame {
@@ -1750,6 +1752,7 @@ fn declarative_driver_blackhole_guard_failure_restores_and_syncs_virtualizable_s
     info.add_field("stackpos", Type::Int, 8);
     info.add_array_field("stack", Type::Int, 16);
     driver.set_virtualizable_info(info);
+    driver.set_vable_array_lengths(vec![1]);
 
     let mut stack = vec![41_i64];
     let mut frame = AutoVirtualizableFrame {
