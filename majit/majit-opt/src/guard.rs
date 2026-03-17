@@ -60,7 +60,7 @@ impl GuardKey {
     }
 }
 
-pub struct OptGuard {
+pub struct GuardStrengthenOpt {
     /// Set of guard conditions already verified in the trace.
     seen: HashSet<GuardKey>,
 
@@ -74,9 +74,9 @@ pub struct OptGuard {
     last_guard_descr: Option<DescrRef>,
 }
 
-impl OptGuard {
+impl GuardStrengthenOpt {
     pub fn new() -> Self {
-        OptGuard {
+        GuardStrengthenOpt {
             seen: HashSet::new(),
             truthy_values: HashSet::new(),
             last_guard_descr: None,
@@ -146,13 +146,13 @@ impl OptGuard {
     }
 }
 
-impl Default for OptGuard {
+impl Default for GuardStrengthenOpt {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl OptimizationPass for OptGuard {
+impl OptimizationPass for GuardStrengthenOpt {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
         if !op.opcode.is_guard() {
             // Non-guard operations invalidate the last-guard descriptor
@@ -215,7 +215,7 @@ mod tests {
 
     fn run_guard_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptGuard::new()));
+        opt.add_pass(Box::new(GuardStrengthenOpt::new()));
         opt.optimize(ops)
     }
 
@@ -480,7 +480,7 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
-    // ── Integration: OptGuard in the default pipeline ───────────────────
+    // ── Integration: GuardStrengthenOpt in the default pipeline ───────────────────
 
     #[test]
     fn test_guard_in_full_pipeline() {

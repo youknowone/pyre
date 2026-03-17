@@ -9,7 +9,7 @@ use majit_meta::virtualizable::{
     VirtualizableInfo, clear_vable_token, read_all_virtualizable_boxes,
     write_all_virtualizable_boxes,
 };
-use majit_meta::{JitDriverDescriptor, JitState, TraceAction, TraceCtx};
+use majit_meta::{JitDriverStaticData, JitState, TraceAction, TraceCtx};
 
 use pyre_bytecode::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 use pyre_object::PyObjectRef;
@@ -2292,7 +2292,7 @@ impl OpcodeStepExecutor for TraceFrameState {
 impl PyreJitState {
     /// Returns true if the optimizer virtualizable mechanism is active.
     fn has_virtualizable_info(&self) -> bool {
-        // pyre always uses virtualizable (JitDriverDescriptor::with_virtualizable)
+        // pyre always uses virtualizable (JitDriverStaticData::with_virtualizable)
         true
     }
 
@@ -2590,7 +2590,7 @@ impl JitState for PyreJitState {
         sym
     }
 
-    fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverDescriptor> {
+    fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverStaticData> {
         None
     }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use majit_ir::{Op, OpRef, Type};
-use majit_trace::trace::Trace;
+use majit_trace::trace::TreeLoop;
 
 /// A small, stable parity case format for comparing majit traces against
 /// RPython-derived expectations.
@@ -51,7 +51,7 @@ fn render_op(op: &Op, constants: &HashMap<u32, i64>) -> String {
 }
 
 /// Normalize a completed trace into stable line strings for parity checks.
-pub fn normalize_trace(trace: &Trace, constants: &HashMap<u32, i64>) -> Vec<String> {
+pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<String> {
     trace
         .ops
         .iter()
@@ -67,7 +67,7 @@ pub fn normalize_ops(ops: &[Op], constants: &HashMap<u32, i64>) -> Vec<String> {
 
 /// Assert that a trace matches a normalized parity case.
 pub fn assert_trace_parity(
-    trace: &Trace,
+    trace: &TreeLoop,
     constants: &HashMap<u32, i64>,
     case: &TraceParityCase<'_>,
 ) {
@@ -90,9 +90,9 @@ mod tests {
     use super::*;
     use crate::{make_fail_descr, SymbolicStack, TraceAction, TraceCtx};
     use majit_ir::{OpCode, Type};
-    use majit_trace::recorder::TraceRecorder;
+    use majit_trace::recorder::Trace;
 
-    fn finish_trace_ctx(mut ctx: TraceCtx, finish_args: &[OpRef]) -> (Trace, HashMap<u32, i64>) {
+    fn finish_trace_ctx(mut ctx: TraceCtx, finish_args: &[OpRef]) -> (TreeLoop, HashMap<u32, i64>) {
         ctx.recorder
             .finish(finish_args, make_fail_descr(finish_args.len()));
         let trace = ctx.recorder.get_trace();
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn trace_ctx_binop_matches_parity_case() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
         let i1 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn trace_ctx_constants_match_parity_case() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
 
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn guard_fail_args_are_part_of_normalized_trace() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
         let zero = ctx.const_int(0);
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn unary_bitwise_and_comparison_ops_normalize_stably() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
         let i1 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn div_and_mod_ops_match_expected_trace_shape() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
 
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn shift_ops_match_expected_trace_shape() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
         let i1 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn branch_guard_taken_on_false_matches_guard_false_trace() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
         let mut stack = SymbolicStack::new();
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn branch_guard_taken_on_true_can_close_loop() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
         let mut stack = SymbolicStack::new();

@@ -55,7 +55,7 @@ pub use pyjitpl::{
 pub use parity::{assert_trace_parity, normalize_ops, normalize_trace, TraceParityCase};
 pub use quasi_immut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;
-pub use trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx, VableSyncField};
+pub use trace_ctx::{DeclarativeJitDriver, JitDriverStaticData, TraceCtx, VableSyncField};
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 pub fn majit_log_enabled() -> bool {

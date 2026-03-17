@@ -596,7 +596,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn descriptor(
                 green_types: &[majit_ir::Type],
                 red_types: &[majit_ir::Type],
-            ) -> Result<majit_meta::JitDriverDescriptor, &'static str> {
+            ) -> Result<majit_meta::JitDriverStaticData, &'static str> {
                 if green_types.len() != Self::NUM_GREENS {
                     return Err("wrong number of green variable types");
                 }
@@ -614,7 +614,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .zip(red_types.iter().copied())
                     .map(|(name, tp)| (*name, tp))
                     .collect::<Vec<_>>();
-                let descriptor = majit_meta::JitDriverDescriptor::with_virtualizable(
+                let descriptor = majit_meta::JitDriverStaticData::with_virtualizable(
                     greens,
                     reds,
                     Self::VIRTUALIZABLE,
@@ -646,7 +646,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn descriptor(
                 green_types: &[majit_ir::Type],
                 red_types: &[majit_ir::Type],
-            ) -> Result<majit_meta::JitDriverDescriptor, &'static str> {
+            ) -> Result<majit_meta::JitDriverStaticData, &'static str> {
                 <Self>::descriptor(green_types, red_types)
             }
 

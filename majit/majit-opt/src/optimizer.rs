@@ -3,7 +3,7 @@
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
 /// Chains multiple optimization passes and drives operations through them.
 use crate::{
-    guard::OptGuard,
+    guard::GuardStrengthenOpt,
     heap::OptHeap,
     intbounds::OptIntBounds,
     pure::OptPure,
@@ -226,7 +226,7 @@ impl Optimizer {
         opt.add_pass(Box::new(OptVirtualize::new()));
         opt.add_pass(Box::new(OptString::new()));
         opt.add_pass(Box::new(OptPure::new()));
-        opt.add_pass(Box::new(OptGuard::new()));
+        opt.add_pass(Box::new(GuardStrengthenOpt::new()));
         opt.add_pass(Box::new(OptSimplify::new()));
         opt.add_pass(Box::new(OptHeap::new()));
         opt
@@ -240,7 +240,7 @@ impl Optimizer {
         opt.add_pass(Box::new(OptVirtualize::with_virtualizable(config)));
         opt.add_pass(Box::new(OptString::new()));
         opt.add_pass(Box::new(OptPure::new()));
-        opt.add_pass(Box::new(OptGuard::new()));
+        opt.add_pass(Box::new(GuardStrengthenOpt::new()));
         opt.add_pass(Box::new(OptSimplify::new()));
         opt.add_pass(Box::new(OptHeap::new()));
         opt

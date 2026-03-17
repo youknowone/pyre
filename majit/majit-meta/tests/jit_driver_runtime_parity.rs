@@ -1,7 +1,7 @@
 use majit_ir::{GcRef, GreenKey, OpCode, OpRef, Type, Value};
 use majit_macros::jit_driver;
 use majit_meta::{
-    resume::{MaterializedValue, MaterializedVirtual, ResumeDataBuilder},
+    resume::{MaterializedValue, MaterializedVirtual, ResumeDataVirtualAdder},
     virtualizable::VirtualizableInfo,
     DeclarativeJitDriver, DriverRunOutcome, JitDriver, JitState, PendingFieldWriteLayout,
     TraceAction,
@@ -1820,7 +1820,7 @@ fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
         TraceAction::CloseLoop
     });
 
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(444);
     resume.set_slot_constant(0, frame_ptr as i64);
     resume.map_slot(1, 0);
@@ -1872,7 +1872,7 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
         TraceAction::CloseLoop
     });
 
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(555);
     let virtual_index = resume.add_virtual_struct(
         0,
@@ -1915,7 +1915,7 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
         materialize_order: Vec::new(),
     };
     let meta = TestMeta { header_pc: 556 };
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(556);
     let inner = resume.add_virtual_struct(
         0,
@@ -1964,7 +1964,7 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
         materialize_order: Vec::new(),
     };
     let meta = TestMeta { header_pc: 557 };
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(557);
     let parent = resume.add_virtual_struct(0, 30, vec![]);
     let child = resume.add_virtual_struct(0, 31, vec![]);
@@ -2014,7 +2014,7 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
         TraceAction::CloseLoop
     });
 
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(666);
     resume.set_slot_constant(0, state.obj as i64);
     resume.map_slot(1, 0);
@@ -2066,7 +2066,7 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
         TraceAction::CloseLoop
     });
 
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(888);
     resume.set_slot_constant(0, state.array as i64);
     resume.map_slot(1, 0);
@@ -2119,7 +2119,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
         TraceAction::CloseLoop
     });
 
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(100);
     resume.set_slot_constant(0, frame_ptr as i64);
     resume.set_slot_constant(1, 1);
@@ -2175,7 +2175,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
         TraceAction::CloseLoop
     });
 
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(300);
     let virtual_index = resume.add_virtual_struct(0, 55, vec![]);
     resume.set_slot_virtual(0, virtual_index);
@@ -2237,7 +2237,7 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
         TraceAction::CloseLoop
     });
 
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(500);
     let virtual_index = resume.add_virtual_struct(0, 56, vec![]);
     resume.set_slot_virtual(0, virtual_index);
@@ -2296,7 +2296,7 @@ fn declarative_driver_guard_failure_uses_resume_layout_slot_types_for_generic_re
         TraceAction::CloseLoop
     });
 
-    let mut resume = ResumeDataBuilder::new();
+    let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(780);
     resume.set_slot_constant(0, frame_ptr as i64);
     resume.map_slot(1, 0);

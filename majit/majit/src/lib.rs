@@ -17,7 +17,7 @@
 //! use majit::opt::optimizer::Optimizer;
 //! use majit::codegen::Backend;
 //! use majit::cranelift::CraneliftBackend;
-//! use majit::trace::recorder::TraceRecorder;
+//! use majit::trace::recorder::Trace;
 //! use majit::gc;
 //! use majit::runtime;
 //! ```
@@ -31,7 +31,7 @@ pub use majit_opt as opt;
 /// Trace recording: hot counting, recorder, warm state.
 pub use majit_trace as trace;
 
-/// Backend abstraction: Backend trait, LoopToken, DeadFrame.
+/// Backend abstraction: Backend trait, JitCellToken, DeadFrame.
 pub use majit_codegen as codegen;
 
 /// Cranelift backend: native code generation.

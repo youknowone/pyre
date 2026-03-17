@@ -1,6 +1,6 @@
 /// The Trace data structure — a completed sequence of IR operations.
 ///
-/// A Trace is the output of the TraceRecorder and the input to the
+/// A Trace is the output of the Trace and the input to the
 /// optimizer and backend. It represents a linear sequence of operations
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
@@ -9,17 +9,17 @@ use majit_ir::{InputArg, Op, OpCode, OpRef};
 
 /// A completed trace ready for optimization and compilation.
 #[derive(Clone, Debug)]
-pub struct Trace {
+pub struct TreeLoop {
     /// Input arguments to the trace (loop header variables).
     pub inputargs: Vec<InputArg>,
     /// The recorded operations, in execution order.
     pub ops: Vec<Op>,
 }
 
-impl Trace {
+impl TreeLoop {
     /// Create a new trace from input arguments and operations.
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
-        Trace { inputargs, ops }
+        TreeLoop { inputargs, ops }
     }
 
     /// Number of operations in the trace.
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn test_empty_trace() {
-        let trace = Trace::new(vec![], vec![]);
+        let trace = TreeLoop::new(vec![], vec![]);
         assert_eq!(trace.num_ops(), 0);
         assert_eq!(trace.num_inputargs(), 0);
         assert!(!trace.is_loop());
@@ -81,7 +81,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
             Op::new(OpCode::Jump, &[OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.is_loop());
         assert!(!trace.is_finished());
         assert_eq!(trace.num_ops(), 2);
@@ -95,7 +95,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
             Op::new(OpCode::Finish, &[OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.is_loop());
         assert!(trace.is_finished());
     }
@@ -107,7 +107,7 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_float(2),
         ];
-        let trace = Trace::new(inputargs, vec![]);
+        let trace = TreeLoop::new(inputargs, vec![]);
         assert_eq!(trace.inputargs[0].tp, Type::Int);
         assert_eq!(trace.inputargs[1].tp, Type::Ref);
         assert_eq!(trace.inputargs[2].tp, Type::Float);
@@ -127,7 +127,7 @@ mod tests {
             Op::new(OpCode::IntSub, &[OpRef(2), OpRef(0)]),
             Op::new(OpCode::Jump, &[OpRef(3), OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         assert_eq!(trace.num_inputargs(), 2);
         assert_eq!(trace.num_ops(), 3);
@@ -146,7 +146,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
             Op::new(OpCode::Jump, &[OpRef(2), OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
@@ -164,7 +164,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
             Op::new(OpCode::Jump, &[OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let op0 = trace.get_op(OpRef(0)).unwrap();
         assert_eq!(op0.opcode, OpCode::IntAdd);
@@ -186,7 +186,7 @@ mod tests {
             Op::new(OpCode::GuardFalse, &[OpRef(3)]),
             Op::new(OpCode::Jump, &[OpRef(3), OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 2);
@@ -199,7 +199,7 @@ mod tests {
         // A trace without Jump or Finish is neither loop nor finished.
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)])];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.is_loop());
         assert!(!trace.is_finished());
     }
@@ -209,7 +209,7 @@ mod tests {
         // A trace cannot be both a loop and finished.
         let inputargs = vec![InputArg::new_int(0)];
 
-        let loop_trace = Trace::new(
+        let loop_trace = TreeLoop::new(
             inputargs.clone(),
             vec![
                 Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
@@ -219,7 +219,7 @@ mod tests {
         assert!(loop_trace.is_loop());
         assert!(!loop_trace.is_finished());
 
-        let finish_trace = Trace::new(
+        let finish_trace = TreeLoop::new(
             inputargs,
             vec![
                 Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
@@ -239,7 +239,7 @@ mod tests {
             InputArg::new_float(2),
         ];
         let ops = vec![Op::new(OpCode::Jump, &[OpRef(0), OpRef(1), OpRef(2)])];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         assert_eq!(trace.num_inputargs(), 3);
         assert_eq!(trace.inputargs[0].tp, Type::Int);
@@ -265,7 +265,7 @@ mod tests {
             g1,
             Op::new(OpCode::Jump, &[OpRef(2), OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 2);
@@ -282,7 +282,7 @@ mod tests {
             Op::new(OpCode::GuardTrue, &[OpRef(0)]),
             Op::new(OpCode::Jump, &[OpRef(0)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
@@ -299,7 +299,7 @@ mod tests {
             Op::new(OpCode::IntSub, &[OpRef(3), OpRef(1)]),
             Op::new(OpCode::Jump, &[OpRef(4), OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let opcodes: Vec<_> = trace.iter_ops().map(|op| op.opcode).collect();
         assert_eq!(
@@ -333,7 +333,7 @@ mod tests {
             Op::with_descr(OpCode::GuardTrue, &[OpRef(0)], descr.clone()),
             Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         // Call op has descr
         assert!(trace.ops[0].descr.is_some());
@@ -365,7 +365,7 @@ mod tests {
             Op::new(OpCode::IntLt, &[OpRef(4), OpRef(0)]),
             Op::new(OpCode::Jump, &[OpRef(4)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let actual: Vec<_> = trace.iter_ops().map(|op| op.opcode).collect();
         assert_eq!(actual, expected_opcodes);
@@ -380,7 +380,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
             Op::new(OpCode::Jump, &[OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
         let trace2 = trace.clone();
 
         assert_eq!(trace.num_ops(), trace2.num_ops());
@@ -401,7 +401,7 @@ mod tests {
             prev = OpRef(i + 1);
         }
         ops.push(Op::new(OpCode::Jump, &[prev]));
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         assert_eq!(trace.num_ops(), 101); // 100 IntAdd + 1 Jump
         assert!(trace.is_loop());
@@ -432,7 +432,7 @@ mod tests {
             guard_op,
             Op::new(OpCode::Jump, &[OpRef(2), OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let guard = trace.iter_guards().next().unwrap();
         let fa = guard.fail_args.as_ref().unwrap();
@@ -464,7 +464,7 @@ mod tests {
             g2,
             Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 3);
@@ -483,7 +483,7 @@ mod tests {
             Op::new(OpCode::IntMul, &[OpRef(2), OpRef(1)]),
             Op::new(OpCode::Jump, &[OpRef(3)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         assert_eq!(trace.get_op(OpRef(0)).unwrap().opcode, OpCode::IntAdd);
         assert_eq!(trace.get_op(OpRef(1)).unwrap().opcode, OpCode::IntSub);
@@ -501,7 +501,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
             Op::new(OpCode::Jump, &[OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
         let mut trace2 = trace.clone();
 
         trace2
@@ -526,7 +526,7 @@ mod tests {
             Op::new(OpCode::GuardNoException, &[]),
             Op::new(OpCode::Jump, &[OpRef(4), OpRef(5)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let guard_opcodes: Vec<_> = trace.iter_guards().map(|op| op.opcode).collect();
         assert_eq!(

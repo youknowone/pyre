@@ -33,7 +33,7 @@ pub struct TraceRecord {
 ///
 /// Collects statistics about trace compilation, guard failures,
 /// and loop entries. Prints a summary on drop when enabled.
-pub struct JitLog {
+pub struct Logger {
     /// Successfully compiled traces.
     compiled: Vec<TraceRecord>,
     /// Number of traces that were aborted.
@@ -48,11 +48,11 @@ pub struct JitLog {
     print_on_drop: bool,
 }
 
-impl JitLog {
-    /// Create a new JitLog. If `print_on_drop` is true, a summary
-    /// is printed to stderr when the JitLog is dropped.
+impl Logger {
+    /// Create a new Logger. If `print_on_drop` is true, a summary
+    /// is printed to stderr when the Logger is dropped.
     pub fn new(print_on_drop: bool) -> Self {
-        JitLog {
+        Logger {
             compiled: Vec::new(),
             aborted: 0,
             bridges_compiled: 0,
@@ -62,8 +62,8 @@ impl JitLog {
         }
     }
 
-    /// Create a JitLog that is enabled based on environment variables.
-    /// Returns `Some(JitLog)` if MAJIT_STATS=1 or MAJIT_LOG=1, else `None`.
+    /// Create a Logger that is enabled based on environment variables.
+    /// Returns `Some(Logger)` if MAJIT_STATS=1 or MAJIT_LOG=1, else `None`.
     pub fn from_env() -> Option<Self> {
         if stats_enabled() {
             Some(Self::new(true))
@@ -199,7 +199,7 @@ Compilation time: {:.1}ms",
     }
 }
 
-impl Drop for JitLog {
+impl Drop for Logger {
     fn drop(&mut self) {
         if self.print_on_drop && (self.traces_compiled() > 0 || self.traces_aborted() > 0) {
             eprintln!("{}", self.summary());
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_jitlog_empty() {
-        let log = JitLog::new(false);
+        let log = Logger::new(false);
         assert_eq!(log.traces_compiled(), 0);
         assert_eq!(log.traces_aborted(), 0);
         assert_eq!(log.total_guard_failures(), 0);
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_jitlog_compile() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_compile(
             42,
             100,
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_jitlog_abort() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_abort();
         log.log_abort();
         assert_eq!(log.traces_aborted(), 2);
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_jitlog_guard_failures() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_guard_failure(0);
         log.log_guard_failure(0);
         log.log_guard_failure(1);
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_jitlog_loop_entries() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_loop_entry(100);
         log.log_loop_entry(100);
         log.log_loop_entry(200);
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_jitlog_summary_format() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_compile(
             1,
             50,
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_jitlog_reduction_percentage() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_compile(1, 200, 100, Duration::ZERO, Duration::ZERO);
         let summary = log.summary();
         assert!(summary.contains("50% reduction"));
@@ -326,14 +326,14 @@ mod tests {
 
     #[test]
     fn test_jitlog_zero_ops_no_panic() {
-        let log = JitLog::new(false);
+        let log = Logger::new(false);
         let summary = log.summary();
         assert!(summary.contains("0% reduction"));
     }
 
     #[test]
     fn test_jitlog_multiple_compiles_accumulate() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         for i in 0..5 {
             log.log_compile(
                 i,
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn test_traces_compiled_counted_correctly() {
         // Parity with test_simple_loop: traces compiled count matches actual compilations
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         assert_eq!(log.traces_compiled(), 0);
         log.log_compile(
             1,
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn test_traces_aborted_counted_correctly() {
         // Aborted traces are counted separately from compiled
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_compile(
             1,
             50,
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn test_ops_before_after_optimization() {
         // Parity with profiler.counters: total ops tracked before and after optimization
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_compile(1, 100, 60, Duration::ZERO, Duration::ZERO);
         log.log_compile(2, 50, 25, Duration::ZERO, Duration::ZERO);
         assert_eq!(log.total_ops_before(), 150);
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn test_guard_failures_per_guard() {
         // Guard failure tracking — per-guard counts like profiler.counters
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_guard_failure(0);
         log.log_guard_failure(0);
         log.log_guard_failure(0);
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn test_compilation_timing() {
         // Parity with profiler.times: compilation and optimization timing
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_compile(
             1,
             50,
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_bridge_compile_tracking() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         assert_eq!(log.bridges_compiled(), 0);
         log.log_bridge_compile(0);
         log.log_bridge_compile(1);
@@ -469,7 +469,7 @@ mod tests {
     fn test_from_env_returns_none_when_disabled() {
         // In a normal test env without MAJIT_STATS=1, from_env returns None
         // (unless the test env happens to set it — that's fine too)
-        let result = JitLog::from_env();
+        let result = Logger::from_env();
         // Just verify it returns an Option, not that it's a specific value
         let _ = result;
     }
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn test_jitlog_summary_all_fields_present() {
         // Parity with profiler output: summary contains all tracked statistics
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_compile(
             1,
             200,
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_jitlog_loop_entries_accumulate() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         for _ in 0..10 {
             log.log_loop_entry(42);
         }
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_compiled_traces_accessor() {
-        let mut log = JitLog::new(false);
+        let mut log = Logger::new(false);
         log.log_compile(
             42,
             100,

@@ -6,7 +6,7 @@
 /// Uses LEB128 variable-length integer encoding for compactness.
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type, OPCODE_COUNT};
 
-use crate::trace::Trace;
+use crate::trace::TreeLoop;
 
 /// Encode a u64 as a variable-length integer (LEB128).
 pub fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
@@ -68,7 +68,7 @@ fn u16_to_opcode(v: u16) -> OpCode {
 }
 
 /// Encode a Trace into a compact byte buffer.
-pub fn encode_trace(trace: &Trace) -> Vec<u8> {
+pub fn encode_trace(trace: &TreeLoop) -> Vec<u8> {
     let mut buf = Vec::new();
 
     // Encode input args count and types
@@ -100,7 +100,7 @@ pub fn encode_trace(trace: &Trace) -> Vec<u8> {
 /// in the original trace will have `descr: None` after decoding, but
 /// the has-descriptor flag is still decoded (and could be used to
 /// reconstruct descriptors from a separate table).
-pub fn decode_trace(buf: &[u8]) -> Trace {
+pub fn decode_trace(buf: &[u8]) -> TreeLoop {
     let mut pos = 0;
 
     // Decode input args
@@ -143,7 +143,7 @@ pub fn decode_trace(buf: &[u8]) -> Trace {
         ops.push(Op::new(opcode, &args));
     }
 
-    Trace::new(inputargs, ops)
+    TreeLoop::new(inputargs, ops)
 }
 
 #[cfg(test)]
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_empty_trace_roundtrip() {
-        let trace = Trace::new(vec![], vec![]);
+        let trace = TreeLoop::new(vec![], vec![]);
         let encoded = encode_trace(&trace);
         let decoded = decode_trace(&encoded);
         assert_eq!(decoded.num_inputargs(), 0);
@@ -204,7 +204,7 @@ mod tests {
             Op::new(OpCode::GuardTrue, &[OpRef(1)]),
             Op::new(OpCode::Jump, &[OpRef(2)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
 
         let encoded = encode_trace(&trace);
         let decoded = decode_trace(&encoded);
@@ -239,7 +239,7 @@ mod tests {
         }
         ops.push(Op::new(OpCode::Jump, &[OpRef(100)]));
 
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
         let encoded = encode_trace(&trace);
         let decoded = decode_trace(&encoded);
 
@@ -260,7 +260,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
             Op::new(OpCode::Finish, &[OpRef(1)]),
         ];
-        let trace = Trace::new(inputargs, ops);
+        let trace = TreeLoop::new(inputargs, ops);
         let encoded = encode_trace(&trace);
         let decoded = decode_trace(&encoded);
 
@@ -273,7 +273,7 @@ mod tests {
         // Verify that the has-descr byte is encoded (even though we don't
         // reconstruct the descriptor on decode).
         let ops = vec![Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)])];
-        let trace = Trace::new(vec![InputArg::new_int(0)], ops);
+        let trace = TreeLoop::new(vec![InputArg::new_int(0)], ops);
 
         let encoded = encode_trace(&trace);
         // The last byte of the encoded op should be the descr flag (0 = no descr)

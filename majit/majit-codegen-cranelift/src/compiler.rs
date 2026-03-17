@@ -22,7 +22,7 @@ use cranelift_codegen::ir::Value as CValue;
 
 use majit_codegen::{
     AsmInfo, BackendError, CompiledTraceInfo, DeadFrame, ExitFrameLayout, ExitRecoveryLayout,
-    ExitValueSourceLayout, FailDescrLayout, LoopToken, TerminalExitLayout,
+    ExitValueSourceLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
@@ -1246,7 +1246,7 @@ fn install_call_assembler_expectations(
 }
 
 fn register_call_assembler_target(
-    token: &LoopToken,
+    token: &JitCellToken,
     compiled: &CompiledLoop,
 ) -> Result<(), BackendError> {
     invalidate_ca_thread_cache(token.number);
@@ -2423,12 +2423,61 @@ fn build_ref_root_slots(
 
 fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
     let num_inputs = inputargs.len() as u32;
+
+    // Build a remapping table: old OpRef → new dense OpRef.
+    // Input args keep their indices (0..num_inputs).
+    // Non-void ops get sequential indices starting at num_inputs.
+    let mut remap = std::collections::HashMap::<u32, u32>::new();
+    for i in 0..num_inputs {
+        remap.insert(i, i);
+    }
+    let mut next_idx = num_inputs;
+    for (op_idx, op) in ops.iter().enumerate() {
+        if op.result_type() != Type::Void {
+            let old_idx = if op.pos.is_none() {
+                num_inputs + op_idx as u32
+            } else {
+                op.pos.0
+            };
+            if !remap.contains_key(&old_idx) {
+                remap.insert(old_idx, next_idx);
+                next_idx += 1;
+            }
+        }
+    }
+
+    // Remap all OpRef references in ops.
     ops.iter()
         .enumerate()
         .map(|(op_idx, op)| {
             let mut normalized = op.clone();
-            if normalized.result_type() != Type::Void && normalized.pos.is_none() {
-                normalized.pos = OpRef(num_inputs + op_idx as u32);
+            // Remap pos
+            if normalized.result_type() != Type::Void {
+                let old_idx = if normalized.pos.is_none() {
+                    num_inputs + op_idx as u32
+                } else {
+                    normalized.pos.0
+                };
+                normalized.pos = OpRef(*remap.get(&old_idx).unwrap_or(&old_idx));
+            }
+            // Remap args
+            for i in 0..normalized.args.len() {
+                let old_arg = normalized.args[i];
+                if !old_arg.is_none() {
+                    if let Some(&new_arg) = remap.get(&old_arg.0) {
+                        normalized.args[i] = OpRef(new_arg);
+                    }
+                }
+            }
+            // Remap fail_args
+            if let Some(ref mut fa) = normalized.fail_args {
+                for arg in fa.iter_mut() {
+                    if !arg.is_none() {
+                        if let Some(&new_arg) = remap.get(&arg.0) {
+                            *arg = OpRef(new_arg);
+                        }
+                    }
+                }
             }
             normalized
         })
@@ -6953,7 +7002,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[Op],
-        token: &mut LoopToken,
+        token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
         token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
@@ -6981,7 +7030,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
         ops: &[Op],
-        original_token: &LoopToken,
+        original_token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
         // Compile the bridge trace as a standalone function using the same
         // code generation path as compile_loop.
@@ -7081,7 +7130,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         Ok(info)
     }
 
-    fn execute_token(&self, token: &LoopToken, args: &[Value]) -> DeadFrame {
+    fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
         let compiled = token
             .compiled
             .as_ref()
@@ -7102,7 +7151,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         Self::execute_with_inputs(compiled, &inputs)
     }
 
-    fn execute_token_ints(&self, token: &LoopToken, args: &[i64]) -> DeadFrame {
+    fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {
         let compiled = token
             .compiled
             .as_ref()
@@ -7115,7 +7164,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn execute_token_ints_raw(
         &self,
-        token: &LoopToken,
+        token: &JitCellToken,
         args: &[i64],
     ) -> majit_codegen::RawExecResult {
         let compiled = token
@@ -7283,7 +7332,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn compiled_fail_descr_layouts(
         &self,
-        token: &LoopToken,
+        token: &JitCellToken,
     ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
         let compiled = token
             .compiled
@@ -7300,7 +7349,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn compiled_bridge_fail_descr_layouts(
         &self,
-        original_token: &LoopToken,
+        original_token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
     ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
@@ -7324,7 +7373,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn compiled_trace_fail_descr_layouts(
         &self,
-        token: &LoopToken,
+        token: &JitCellToken,
         trace_id: u64,
     ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
         let compiled = token
@@ -7345,7 +7394,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn compiled_terminal_exit_layouts(
         &self,
-        token: &LoopToken,
+        token: &JitCellToken,
     ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
         let compiled = token
             .compiled
@@ -7356,7 +7405,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn compiled_bridge_terminal_exit_layouts(
         &self,
-        original_token: &LoopToken,
+        original_token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
     ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
@@ -7374,7 +7423,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn compiled_trace_terminal_exit_layouts(
         &self,
-        token: &LoopToken,
+        token: &JitCellToken,
         trace_id: u64,
     ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
         let compiled = token
@@ -7387,7 +7436,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         find_trace_terminal_exit_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
     }
 
-    fn compiled_trace_info(&self, token: &LoopToken, trace_id: u64) -> Option<CompiledTraceInfo> {
+    fn compiled_trace_info(&self, token: &JitCellToken, trace_id: u64) -> Option<CompiledTraceInfo> {
         let compiled = token
             .compiled
             .as_ref()
@@ -7405,7 +7454,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn compiled_guard_frame_stacks(
         &self,
-        token: &LoopToken,
+        token: &JitCellToken,
     ) -> Option<Vec<(u32, Vec<majit_codegen::ExitFrameLayout>)>> {
         let compiled = token
             .compiled
@@ -7427,7 +7476,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn update_fail_descr_recovery_layout(
         &mut self,
-        token: &LoopToken,
+        token: &JitCellToken,
         trace_id: u64,
         fail_index: u32,
         recovery_layout: ExitRecoveryLayout,
@@ -7449,7 +7498,7 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     fn update_terminal_exit_recovery_layout(
         &mut self,
-        token: &LoopToken,
+        token: &JitCellToken,
         trace_id: u64,
         op_index: usize,
         recovery_layout: ExitRecoveryLayout,
@@ -7517,19 +7566,19 @@ impl majit_codegen::Backend for CraneliftBackend {
         grab_exc_class_from_deadframe(frame).expect("grab_exc_class_from_deadframe failed")
     }
 
-    fn invalidate_loop(&self, token: &LoopToken) {
+    fn invalidate_loop(&self, token: &JitCellToken) {
         token.invalidate();
     }
 
     fn redirect_call_assembler(
         &self,
-        old: &LoopToken,
-        new: &LoopToken,
+        old: &JitCellToken,
+        new: &JitCellToken,
     ) -> Result<(), BackendError> {
         redirect_call_assembler_target(old.number, new.number)
     }
 
-    fn free_loop(&mut self, token: &LoopToken) {
+    fn free_loop(&mut self, token: &JitCellToken) {
         unregister_call_assembler_target(token.number);
         self.registered_call_assembler_tokens.remove(&token.number);
     }
@@ -7600,7 +7649,7 @@ mod tests {
     }
 
     fn make_call_assembler_descr(
-        target: &LoopToken,
+        target: &JitCellToken,
         arg_types: Vec<Type>,
         result_type: Type,
     ) -> majit_ir::DescrRef {
@@ -7848,7 +7897,7 @@ mod tests {
         expected_detail: &str,
     ) {
         let mut backend = CraneliftBackend::new();
-        let mut token = LoopToken::new(token_number);
+        let mut token = JitCellToken::new(token_number);
         let err = backend
             .compile_loop(&inputargs, &ops, &mut token)
             .unwrap_err();
@@ -7884,7 +7933,7 @@ mod tests {
         constants.insert(101, 1_000_000i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(0);
+        let mut token = JitCellToken::new(0);
         let info = backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
         assert!(info.code_addr != 0);
 
@@ -7903,7 +7952,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1);
+        let mut token = JitCellToken::new(1);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(40), Value::Int(2)]);
@@ -7920,7 +7969,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1000);
+        let mut token = JitCellToken::new(1000);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Float(3.5), Value::Ref(GcRef(0x1234))]);
@@ -7939,7 +7988,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(2);
+        let mut token = JitCellToken::new(2);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(100), Value::Int(58)]);
@@ -7957,7 +8006,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(3);
+        let mut token = JitCellToken::new(3);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
@@ -7975,7 +8024,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(3);
+        let mut token = JitCellToken::new(3);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42), Value::Int(6)]);
@@ -7999,7 +8048,7 @@ mod tests {
             ),
         ];
 
-        let mut token = LoopToken::new(4);
+        let mut token = JitCellToken::new(4);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0xFF00), Value::Int(0x0FF0)]);
@@ -8025,7 +8074,7 @@ mod tests {
             ),
         ];
 
-        let mut token = LoopToken::new(5);
+        let mut token = JitCellToken::new(5);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(-16), Value::Int(2)]);
@@ -8055,7 +8104,7 @@ mod tests {
             ),
         ];
 
-        let mut token = LoopToken::new(6);
+        let mut token = JitCellToken::new(6);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(5)]);
@@ -8085,7 +8134,7 @@ mod tests {
         constants.insert(101, 1i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(7);
+        let mut token = JitCellToken::new(7);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(10)]);
@@ -8102,7 +8151,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(8);
+        let mut token = JitCellToken::new(8);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
@@ -8126,7 +8175,7 @@ mod tests {
 
         backend.set_next_trace_id(76);
         backend.set_next_header_pc(1234);
-        let mut token = LoopToken::new(8008);
+        let mut token = JitCellToken::new(8008);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let layouts = backend
@@ -8167,7 +8216,7 @@ mod tests {
 
         backend.set_next_trace_id(77);
         backend.set_next_header_pc(1234);
-        let mut token = LoopToken::new(8009);
+        let mut token = JitCellToken::new(8009);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let layouts = backend
@@ -8215,7 +8264,7 @@ mod tests {
 
         backend.set_next_trace_id(79);
         backend.set_next_header_pc(5678);
-        let mut token = LoopToken::new(8011);
+        let mut token = JitCellToken::new(8011);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let layouts = backend
@@ -8263,7 +8312,7 @@ mod tests {
 
         backend.set_next_trace_id(78);
         backend.set_next_header_pc(1000);
-        let mut token = LoopToken::new(8010);
+        let mut token = JitCellToken::new(8010);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let patched = majit_codegen::ExitRecoveryLayout {
@@ -8302,7 +8351,7 @@ mod tests {
 
         backend.set_next_trace_id(90);
         backend.set_next_header_pc(1000);
-        let mut token = LoopToken::new(8012);
+        let mut token = JitCellToken::new(8012);
         backend
             .compile_loop(&inputargs, &root_ops, &mut token)
             .unwrap();
@@ -8384,7 +8433,7 @@ mod tests {
 
         backend.set_next_trace_id(190);
         backend.set_next_header_pc(1000);
-        let mut token = LoopToken::new(8013);
+        let mut token = JitCellToken::new(8013);
         backend
             .compile_loop(&inputargs, &root_ops, &mut token)
             .unwrap();
@@ -8513,7 +8562,7 @@ mod tests {
 
         backend.set_next_trace_id(300);
         backend.set_next_header_pc(1000);
-        let mut token = LoopToken::new(8015);
+        let mut token = JitCellToken::new(8015);
         backend
             .compile_loop(&inputargs, &root_ops, &mut token)
             .unwrap();
@@ -8558,7 +8607,7 @@ mod tests {
 
         backend.set_next_trace_id(290);
         backend.set_next_header_pc(1000);
-        let mut token = LoopToken::new(8014);
+        let mut token = JitCellToken::new(8014);
         backend
             .compile_loop(&inputargs, &root_ops, &mut token)
             .unwrap();
@@ -8775,7 +8824,7 @@ mod tests {
         constants.insert(101, 0i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(9);
+        let mut token = JitCellToken::new(9);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(100), Value::Int(0)]);
@@ -8799,7 +8848,7 @@ mod tests {
             ),
         ];
 
-        let mut token = LoopToken::new(10);
+        let mut token = JitCellToken::new(10);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(7)]);
@@ -8831,7 +8880,7 @@ mod tests {
         constants.insert(100, add_two as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(20);
+        let mut token = JitCellToken::new(20);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(40), Value::Int(2)]);
@@ -8863,7 +8912,7 @@ mod tests {
         constants.insert(100, multiply as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(21);
+        let mut token = JitCellToken::new(21);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
@@ -8898,7 +8947,7 @@ mod tests {
         constants.insert(100, increment_counter as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(22);
+        let mut token = JitCellToken::new(22);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(10)]);
@@ -8926,7 +8975,7 @@ mod tests {
         constants.insert(100, add_doubles as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(23);
+        let mut token = JitCellToken::new(23);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Float(1.5), Value::Float(2.5)]);
@@ -8957,7 +9006,7 @@ mod tests {
         constants.insert(101, 100i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(24);
+        let mut token = JitCellToken::new(24);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -9024,7 +9073,7 @@ mod tests {
         constants.insert(104, 3);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(24_001);
+        let mut token = JitCellToken::new(24_001);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -9060,7 +9109,7 @@ mod tests {
         constants.insert(102, 1);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(25);
+        let mut token = JitCellToken::new(25);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
@@ -9102,7 +9151,7 @@ mod tests {
         constants.insert(102, 1);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(26);
+        let mut token = JitCellToken::new(26);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
@@ -9138,7 +9187,7 @@ mod tests {
         constants.insert(103, 0);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(27);
+        let mut token = JitCellToken::new(27);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
@@ -9181,7 +9230,7 @@ mod tests {
         constants.insert(103, 0);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(27_001);
+        let mut token = JitCellToken::new(27_001);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let raw = backend.execute_token_ints_raw(&token, &[1]);
@@ -9245,7 +9294,7 @@ mod tests {
         constants.insert(103, 0);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(28);
+        let mut token = JitCellToken::new(28);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
@@ -9297,7 +9346,7 @@ mod tests {
         constants.insert(103, 0);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(29);
+        let mut token = JitCellToken::new(29);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
@@ -9336,7 +9385,7 @@ mod tests {
         constants.insert(101, 0i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(30);
+        let mut token = JitCellToken::new(30);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
@@ -9356,7 +9405,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(31);
+        let mut token = JitCellToken::new(31);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(0x1234))]);
@@ -9374,7 +9423,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(32);
+        let mut token = JitCellToken::new(32);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Float(3.14)]);
@@ -9395,7 +9444,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(50);
+        let mut token = JitCellToken::new(50);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let bridge_inputargs = vec![InputArg::new_int(0)];
@@ -9453,7 +9502,7 @@ mod tests {
         constants.insert(100, set_value as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(40);
+        let mut token = JitCellToken::new(40);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1), Value::Int(99)]);
@@ -9494,7 +9543,7 @@ mod tests {
         constants.insert(100, set_value2 as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(41);
+        let mut token = JitCellToken::new(41);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(99)]);
@@ -9527,7 +9576,7 @@ mod tests {
         constants.insert(100, compute as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(42);
+        let mut token = JitCellToken::new(42);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1), Value::Int(5)]);
@@ -9559,7 +9608,7 @@ mod tests {
         constants.insert(100, compute2 as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(43);
+        let mut token = JitCellToken::new(43);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(5)]);
@@ -9584,7 +9633,7 @@ mod tests {
         constants.insert(100, 1i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(44);
+        let mut token = JitCellToken::new(44);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // i0=5->i1=4, i0=4->i1=3, ..., i0=1->i1=0 (guard fails).
@@ -9604,7 +9653,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(45);
+        let mut token = JitCellToken::new(45);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -9622,7 +9671,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(46);
+        let mut token = JitCellToken::new(46);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
@@ -9645,7 +9694,7 @@ mod tests {
         constants.insert(100, 42i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(47);
+        let mut token = JitCellToken::new(47);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
@@ -9658,7 +9707,7 @@ mod tests {
         constants2.insert(100, 42i64);
         backend.set_constants(constants2);
 
-        let mut token2 = LoopToken::new(48);
+        let mut token2 = JitCellToken::new(48);
         backend.compile_loop(&inputargs, &ops, &mut token2).unwrap();
         let frame2 = backend.execute_token(&token2, &[Value::Int(99)]);
         let descr2 = backend.get_latest_descr(&frame2);
@@ -9899,7 +9948,7 @@ mod tests {
             ),
         ];
 
-        let mut token = LoopToken::new(60);
+        let mut token = JitCellToken::new(60);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // 1.5 < 2.5
@@ -9930,7 +9979,7 @@ mod tests {
             ),
         ];
 
-        let mut token = LoopToken::new(61);
+        let mut token = JitCellToken::new(61);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Float(3.14), Value::Float(3.14)]);
@@ -9957,7 +10006,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(70);
+        let mut token = JitCellToken::new(70);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Allocate a fake struct on the heap
@@ -9981,7 +10030,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(71);
+        let mut token = JitCellToken::new(71);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data: Vec<i64> = vec![0, 0];
@@ -10005,7 +10054,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(72);
+        let mut token = JitCellToken::new(72);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Write -1i32 into the buffer
@@ -10034,7 +10083,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(73);
+        let mut token = JitCellToken::new(73);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Layout: 16 bytes header + items
@@ -10073,7 +10122,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(74);
+        let mut token = JitCellToken::new(74);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data: Vec<i64> = vec![0, 0, 0, 0, 0]; // header(2) + items(3)
@@ -10101,7 +10150,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(75);
+        let mut token = JitCellToken::new(75);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // header: [type_id, length=5]
@@ -10125,7 +10174,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(76);
+        let mut token = JitCellToken::new(76);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(0x1000)), Value::Int(0x100)]);
@@ -10146,7 +10195,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(80);
+        let mut token = JitCellToken::new(80);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // 10 + 20 = 30 (no overflow)
@@ -10168,7 +10217,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(81);
+        let mut token = JitCellToken::new(81);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // i64::MAX + 1 overflows
@@ -10189,7 +10238,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(82);
+        let mut token = JitCellToken::new(82);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // i64::MIN - 1 overflows
@@ -10210,7 +10259,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(83);
+        let mut token = JitCellToken::new(83);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(100), Value::Int(58)]);
@@ -10231,7 +10280,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(84);
+        let mut token = JitCellToken::new(84);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
@@ -10252,7 +10301,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(85);
+        let mut token = JitCellToken::new(85);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // i64::MAX * 2 overflows
@@ -10273,7 +10322,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(86);
+        let mut token = JitCellToken::new(86);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // With overflow: guard_overflow passes (continues)
@@ -10282,7 +10331,7 @@ mod tests {
         assert_eq!(descr.fail_index(), 1); // Finish (overflow happened, guard passed)
 
         // Without overflow: guard_overflow fails (side-exits)
-        let mut token2 = LoopToken::new(87);
+        let mut token2 = JitCellToken::new(87);
         backend.compile_loop(&inputargs, &ops, &mut token2).unwrap();
         let frame2 = backend.execute_token(&token2, &[Value::Int(1), Value::Int(2)]);
         let descr2 = backend.get_latest_descr(&frame2);
@@ -10305,7 +10354,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(90);
+        let mut token = JitCellToken::new(90);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let val: f64 = 3.14;
@@ -10334,7 +10383,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(91);
+        let mut token = JitCellToken::new(91);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data: Vec<i64> = vec![0, 0x42424242];
@@ -10365,7 +10414,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(92);
+        let mut token = JitCellToken::new(92);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data: Vec<i64> = vec![0];
@@ -10404,7 +10453,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(93);
+        let mut token = JitCellToken::new(93);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data: Vec<i64> = vec![0, 0, 0, 0];
@@ -10433,7 +10482,7 @@ mod tests {
         constants.insert(101, -4);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(94);
+        let mut token = JitCellToken::new(94);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data = vec![0u8; 8];
@@ -10466,7 +10515,7 @@ mod tests {
         constants.insert(102, 8);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(95);
+        let mut token = JitCellToken::new(95);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data: Vec<u64> = vec![0xAAAA, 0xBBBB, 0x1111_1111, 0xDEAD_BEEF];
@@ -10496,7 +10545,7 @@ mod tests {
         constants.insert(101, 8);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(96);
+        let mut token = JitCellToken::new(96);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data: Vec<u64> = vec![0, 0];
@@ -10548,7 +10597,7 @@ mod tests {
         constants.insert(102, 4);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(97);
+        let mut token = JitCellToken::new(97);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data = vec![0u8; 24];
@@ -10581,7 +10630,7 @@ mod tests {
         constants.insert(100, 0);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(98);
+        let mut token = JitCellToken::new(98);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data = vec![0xFFu8];
@@ -10613,7 +10662,7 @@ mod tests {
         constants.insert(100, 2);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(99);
+        let mut token = JitCellToken::new(99);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data = vec![0u8; 8];
@@ -10651,7 +10700,7 @@ mod tests {
         constants.insert(101, 8);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(100);
+        let mut token = JitCellToken::new(100);
         let err = backend
             .compile_loop(&inputargs, &ops, &mut token)
             .unwrap_err();
@@ -10675,7 +10724,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(101);
+        let mut token = JitCellToken::new(101);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data = vec![0u8; 40];
@@ -10714,7 +10763,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(102);
+        let mut token = JitCellToken::new(102);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data = vec![0u8; 40];
@@ -10758,7 +10807,7 @@ mod tests {
         constants.insert(101, 2i64); // x * 2
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(200);
+        let mut token = JitCellToken::new(200);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // First: verify guard fails when x = -5
@@ -10823,7 +10872,7 @@ mod tests {
         constants.insert(101, 0);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(202);
+        let mut token = JitCellToken::new(202);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
@@ -10869,7 +10918,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(201);
+        let mut token = JitCellToken::new(201);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Execute with x = 0 (guard fails) multiple times
@@ -10920,7 +10969,7 @@ mod tests {
         constants.insert(101, 0i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(202);
+        let mut token = JitCellToken::new(202);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Without bridge: run with N=5, guard fails when counter=0
@@ -10974,7 +11023,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(203);
+        let mut token = JitCellToken::new(203);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Without bridge: guard fails on x=0, y=42
@@ -11032,7 +11081,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1001);
+        let mut token = JitCellToken::new(1001);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(
@@ -11072,7 +11121,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1005);
+        let mut token = JitCellToken::new(1005);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let compiled = token
@@ -11112,7 +11161,7 @@ mod tests {
         constants.insert(103, 1);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1002);
+        let mut token = JitCellToken::new(1002);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data: Vec<u8> = vec![
@@ -11157,7 +11206,7 @@ mod tests {
         constants.insert(101, 4);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1003);
+        let mut token = JitCellToken::new(1003);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut data = vec![
@@ -11190,7 +11239,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1004);
+        let mut token = JitCellToken::new(1004);
         let err = backend
             .compile_loop(&inputargs, &ops, &mut token)
             .unwrap_err();
@@ -11229,7 +11278,7 @@ mod tests {
         );
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1500_400);
+        let mut token = JitCellToken::new(1500_400);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
@@ -11274,7 +11323,7 @@ mod tests {
         );
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1500_404);
+        let mut token = JitCellToken::new(1500_404);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let raw = backend.execute_token_ints_raw(&token, &[10, 1]);
@@ -11331,7 +11380,7 @@ mod tests {
         );
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1500_410);
+        let mut token = JitCellToken::new(1500_410);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Not forced: reaches Finish with SameAsI result (== call result == 42)
@@ -11378,7 +11427,7 @@ mod tests {
         constants.insert(100, maybe_force_and_return_int as *const () as usize as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1500_401);
+        let mut token = JitCellToken::new(1500_401);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
@@ -11428,7 +11477,7 @@ mod tests {
         );
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1500_402);
+        let mut token = JitCellToken::new(1500_402);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
@@ -11500,7 +11549,7 @@ mod tests {
         constants.insert(101, runtime_id as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1500_403);
+        let mut token = JitCellToken::new(1500_403);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(
@@ -11550,7 +11599,7 @@ mod tests {
         constants.insert(100, 10);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1500_300);
+        let mut token = JitCellToken::new(1500_300);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20)]);
@@ -11592,7 +11641,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1500_301);
+        let mut token = JitCellToken::new(1500_301);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
@@ -11620,7 +11669,7 @@ mod tests {
         callee_constants.insert(100, 2);
         backend.set_constants(callee_constants);
 
-        let mut callee_token = LoopToken::new(1500_200);
+        let mut callee_token = JitCellToken::new(1500_200);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
@@ -11638,7 +11687,7 @@ mod tests {
         ];
         backend.set_constants(HashMap::new());
 
-        let mut caller_token = LoopToken::new(1500_201);
+        let mut caller_token = JitCellToken::new(1500_201);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
             .unwrap();
@@ -11660,7 +11709,7 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, 1);
         backend.set_constants(constants);
-        let mut callee1 = LoopToken::new(1500_210);
+        let mut callee1 = JitCellToken::new(1500_210);
         backend
             .compile_loop(&inputargs, &callee1_ops, &mut callee1)
             .unwrap();
@@ -11673,7 +11722,7 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, 100);
         backend.set_constants(constants);
-        let mut callee2 = LoopToken::new(1500_211);
+        let mut callee2 = JitCellToken::new(1500_211);
         backend
             .compile_loop(&inputargs, &callee2_ops, &mut callee2)
             .unwrap();
@@ -11689,7 +11738,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
         backend.set_constants(HashMap::new());
-        let mut caller = LoopToken::new(1500_212);
+        let mut caller = JitCellToken::new(1500_212);
         backend
             .compile_loop(&inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -11714,7 +11763,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_220);
+        let mut callee = JitCellToken::new(1500_220);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -11732,7 +11781,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut caller = LoopToken::new(1500_221);
+        let mut caller = JitCellToken::new(1500_221);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -11773,7 +11822,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        let mut grandchild = LoopToken::new(1500_280);
+        let mut grandchild = JitCellToken::new(1500_280);
         backend
             .compile_loop(&grandchild_inputargs, &grandchild_ops, &mut grandchild)
             .unwrap();
@@ -11792,7 +11841,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_281);
+        let mut callee = JitCellToken::new(1500_281);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -11810,7 +11859,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_282);
+        let mut caller = JitCellToken::new(1500_282);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -11871,7 +11920,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_230);
+        let mut callee = JitCellToken::new(1500_230);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -11916,7 +11965,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_232);
+        let mut caller = JitCellToken::new(1500_232);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -11939,7 +11988,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        let mut grandchild = LoopToken::new(1500_290);
+        let mut grandchild = JitCellToken::new(1500_290);
         backend
             .compile_loop(&grandchild_inputargs, &grandchild_ops, &mut grandchild)
             .unwrap();
@@ -11980,7 +12029,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_291);
+        let mut callee = JitCellToken::new(1500_291);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -12129,7 +12178,7 @@ mod tests {
     fn test_call_assembler_compiles_before_target_is_registered() {
         let mut backend = CraneliftBackend::new();
 
-        let mut deferred_target = LoopToken::new(1500_240);
+        let mut deferred_target = JitCellToken::new(1500_240);
         backend.set_next_trace_id(1500_241);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
@@ -12142,7 +12191,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_241);
+        let mut caller = JitCellToken::new(1500_241);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12178,7 +12227,7 @@ mod tests {
             mk_op(OpCode::FloatAdd, &[OpRef(0), OpRef(100)], 1),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_242);
+        let mut callee = JitCellToken::new(1500_242);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -12196,7 +12245,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_243);
+        let mut caller = JitCellToken::new(1500_243);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12229,7 +12278,7 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::Finish, &[], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_244);
+        let mut callee = JitCellToken::new(1500_244);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -12246,7 +12295,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_2441);
+        let mut caller = JitCellToken::new(1500_2441);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12273,7 +12322,7 @@ mod tests {
     fn test_call_assembler_late_bound_ref_result_supports_plain_ref_finish() {
         let mut backend = CraneliftBackend::new();
 
-        let mut deferred_target = LoopToken::new(1500_245);
+        let mut deferred_target = JitCellToken::new(1500_245);
         let caller_inputargs = vec![InputArg::new_ref(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
@@ -12285,7 +12334,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_246);
+        let mut caller = JitCellToken::new(1500_246);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12313,7 +12362,7 @@ mod tests {
     fn test_call_assembler_late_bound_ref_result_rejects_force_token_finish_shape() {
         let mut backend = CraneliftBackend::new();
 
-        let mut deferred_target = LoopToken::new(1500_247);
+        let mut deferred_target = JitCellToken::new(1500_247);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
@@ -12325,7 +12374,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_248);
+        let mut caller = JitCellToken::new(1500_248);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12363,7 +12412,7 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        let mut plain_ref_target = LoopToken::new(1500_349);
+        let mut plain_ref_target = JitCellToken::new(1500_349);
         backend
             .compile_loop(&ref_inputargs, &plain_ref_ops, &mut plain_ref_target)
             .unwrap();
@@ -12376,7 +12425,7 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut force_token_target = LoopToken::new(1500_350);
+        let mut force_token_target = JitCellToken::new(1500_350);
         backend
             .compile_loop(&ref_inputargs, &force_token_ops, &mut force_token_target)
             .unwrap();
@@ -12391,7 +12440,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_351);
+        let mut caller = JitCellToken::new(1500_351);
         backend
             .compile_loop(&ref_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12416,7 +12465,7 @@ mod tests {
         constants.insert(101, 0);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1500_250);
+        let mut token = JitCellToken::new(1500_250);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::IntGt, &[OpRef(0), OpRef(101)], 1),
@@ -12479,7 +12528,7 @@ mod tests {
         constants.insert(100, 10);
         backend.set_constants(constants);
 
-        let mut callee = LoopToken::new(1500_260);
+        let mut callee = JitCellToken::new(1500_260);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -12497,7 +12546,7 @@ mod tests {
         ];
         backend.set_constants(HashMap::new());
 
-        let mut caller = LoopToken::new(1500_261);
+        let mut caller = JitCellToken::new(1500_261);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12535,7 +12584,7 @@ mod tests {
         constants.insert(100, 10);
         backend.set_constants(constants);
 
-        let mut callee = LoopToken::new(1500_262);
+        let mut callee = JitCellToken::new(1500_262);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -12553,7 +12602,7 @@ mod tests {
         ];
         backend.set_constants(HashMap::new());
 
-        let mut caller = LoopToken::new(1500_263);
+        let mut caller = JitCellToken::new(1500_263);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12594,7 +12643,7 @@ mod tests {
         constants.insert(100, 10);
         backend.set_constants(constants);
 
-        let mut callee = LoopToken::new(1500_264);
+        let mut callee = JitCellToken::new(1500_264);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -12612,7 +12661,7 @@ mod tests {
         ];
         backend.set_constants(HashMap::new());
 
-        let mut caller = LoopToken::new(1500_265);
+        let mut caller = JitCellToken::new(1500_265);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -12705,7 +12754,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1500);
+        let mut token = JitCellToken::new(1500);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -12736,7 +12785,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1501);
+        let mut token = JitCellToken::new(1501);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -12768,7 +12817,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1502);
+        let mut token = JitCellToken::new(1502);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(3)]);
@@ -12788,7 +12837,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1503);
+        let mut token = JitCellToken::new(1503);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut raw = vec![0u64; 2];
@@ -12820,7 +12869,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1504);
+        let mut token = JitCellToken::new(1504);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(0x1234))]);
@@ -12868,7 +12917,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1505);
+        let mut token = JitCellToken::new(1505);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
@@ -12897,7 +12946,7 @@ mod tests {
             Op::new(OpCode::Finish, &[OpRef(2), OpRef(0)]),
         ];
 
-        let mut token = LoopToken::new(1510);
+        let mut token = JitCellToken::new(1510);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let input_ref = GcRef(0x1234);
@@ -12940,7 +12989,7 @@ mod tests {
         constants.insert(100, 2);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1511);
+        let mut token = JitCellToken::new(1511);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let input_ref = GcRef(0xABCD);
@@ -12985,7 +13034,7 @@ mod tests {
         constants.insert(202, b'c' as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1512);
+        let mut token = JitCellToken::new(1512);
         backend.compile_loop(&[], &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -13020,7 +13069,7 @@ mod tests {
         constants.insert(201, b'y' as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1513);
+        let mut token = JitCellToken::new(1513);
         backend.compile_loop(&[], &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -13047,7 +13096,7 @@ mod tests {
         constants.insert(200, 0x2603);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1514);
+        let mut token = JitCellToken::new(1514);
         backend.compile_loop(&[], &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -13072,7 +13121,7 @@ mod tests {
         constants.insert(100, 1);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1515);
+        let mut token = JitCellToken::new(1515);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut raw = vec![0usize; 3];
@@ -13108,7 +13157,7 @@ mod tests {
         constants.insert(100, 0);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1516);
+        let mut token = JitCellToken::new(1516);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let mut raw = vec![0usize; 3];
@@ -13160,7 +13209,7 @@ mod tests {
         constants.insert(101, runtime_id as i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1506);
+        let mut token = JitCellToken::new(1506);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
@@ -13214,7 +13263,7 @@ mod tests {
         constants.insert(102, 1);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(1507);
+        let mut token = JitCellToken::new(1507);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
@@ -13250,7 +13299,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1508);
+        let mut token = JitCellToken::new(1508);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
@@ -13279,7 +13328,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(1509);
+        let mut token = JitCellToken::new(1509);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
@@ -13302,7 +13351,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(100);
+        let mut token = JitCellToken::new(100);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Not invalidated -> guard passes -> Finish returns 10 + 32 = 42
@@ -13330,7 +13379,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(101);
+        let mut token = JitCellToken::new(101);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Before invalidation: guard passes, Finish is reached.
@@ -13378,7 +13427,7 @@ mod tests {
         constants.insert(101, 1_000_000i64);
         backend.set_constants(constants);
 
-        let mut token = LoopToken::new(102);
+        let mut token = JitCellToken::new(102);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Without invalidation: runs to completion (i reaches 1000000,
@@ -13417,7 +13466,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(103);
+        let mut token = JitCellToken::new(103);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Before invalidation
@@ -13459,7 +13508,7 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(101)], 3), // x + 10
             mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_300);
+        let mut callee = JitCellToken::new(1500_300);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -13478,7 +13527,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_301);
+        let mut caller = JitCellToken::new(1500_301);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -13543,7 +13592,7 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(102)], 5), // x + 1
             mk_op(OpCode::Finish, &[OpRef(5)], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_310);
+        let mut callee = JitCellToken::new(1500_310);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -13562,7 +13611,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_311);
+        let mut caller = JitCellToken::new(1500_311);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -13612,7 +13661,7 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
-        let mut callee = LoopToken::new(1500_320);
+        let mut callee = JitCellToken::new(1500_320);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee)
             .unwrap();
@@ -13631,7 +13680,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
-        let mut caller = LoopToken::new(1500_321);
+        let mut caller = JitCellToken::new(1500_321);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
             .unwrap();
@@ -13674,7 +13723,7 @@ mod tests {
 
         backend.set_next_trace_id(500);
         backend.set_next_header_pc(2000);
-        let mut token = LoopToken::new(9001);
+        let mut token = JitCellToken::new(9001);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let layouts = backend
@@ -13723,7 +13772,7 @@ mod tests {
 
         backend.set_next_trace_id(501);
         backend.set_next_header_pc(3000);
-        let mut token = LoopToken::new(9002);
+        let mut token = JitCellToken::new(9002);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let layouts = backend
@@ -13773,7 +13822,7 @@ mod tests {
 
         backend.set_next_trace_id(502);
         backend.set_next_header_pc(4000);
-        let mut token = LoopToken::new(9003);
+        let mut token = JitCellToken::new(9003);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame_stacks = backend
@@ -13825,7 +13874,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        let mut token = LoopToken::new(99_999);
+        let mut token = JitCellToken::new(99_999);
         let result = backend.compile_loop(&inputargs, &ops, &mut token);
         assert!(
             result.is_ok(),
