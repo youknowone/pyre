@@ -23,8 +23,15 @@ pub use classify::{FunctionInfo, HelperClassification};
 pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program};
 pub use graph::{BasicBlock, BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
 pub use parse::ParsedInterpreter;
-pub use passes::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
-pub use patterns::TracePattern;
+pub use passes::{
+    GraphTransformConfig, GraphTransformResult, rewrite_graph,
+    PipelineConfig, PipelineResult, ProgramPipelineResult,
+    analyze_function, analyze_program,
+    FlatOp, FlattenedFunction, Label,
+    AnnotationState, annotate_graph,
+    ConcreteType, TypeResolutionState, resolve_types,
+};
+pub use patterns::{TracePattern, classify_from_graph, classify_from_pattern};
 
 use serde::{Deserialize, Serialize};
 
