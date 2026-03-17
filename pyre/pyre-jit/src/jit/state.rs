@@ -20,8 +20,8 @@ use pyre_object::pyobject::{
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::strobject::is_str;
 use pyre_object::{
-    w_bool_from, w_int_get_value, w_int_new, w_list_can_append_without_realloc,
-    w_list_is_inline_storage, w_list_len, w_str_get_value, w_tuple_len, PY_NULL,
+    PY_NULL, w_bool_from, w_int_get_value, w_int_new, w_list_can_append_without_realloc,
+    w_list_is_inline_storage, w_list_len, w_str_get_value, w_tuple_len,
 };
 use pyre_objspace::truth_value as objspace_truth_value;
 use pyre_runtime::{
@@ -1550,8 +1550,7 @@ impl TraceFrameState {
                                 args,
                                 callee_nlocals,
                             );
-                            let result =
-                                ctx.call_assembler_int_by_number(token_number, &ca_args);
+                            let result = ctx.call_assembler_int_by_number(token_number, &ca_args);
                             ctx.call_void(
                                 crate::call_jit::jit_drop_callee_frame as *const (),
                                 &[callee_frame],
@@ -1629,7 +1628,8 @@ impl TraceFrameState {
                                     }
                                     a
                                 };
-                                let result = ctx.call_assembler_int_by_number(token_number, &ca_args);
+                                let result =
+                                    ctx.call_assembler_int_by_number(token_number, &ca_args);
                                 ctx.call_void(
                                     crate::call_jit::jit_drop_callee_frame as *const (),
                                     &[callee_frame],
@@ -1641,7 +1641,11 @@ impl TraceFrameState {
                     majit_meta::InlineDecision::Inline => {
                         if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                             return self.inline_function_call(
-                                callable, args, concrete_callable, callee_key, frame_helper,
+                                callable,
+                                args,
+                                concrete_callable,
+                                callee_key,
+                                frame_helper,
                             );
                         }
                     }
@@ -1691,14 +1695,12 @@ impl TraceFrameState {
 
             // Concrete: create callee frame
             unsafe {
-                let caller_frame =
-                    &*(this.concrete_frame as *const pyre_interp::frame::PyFrame);
+                let caller_frame = &*(this.concrete_frame as *const pyre_interp::frame::PyFrame);
                 let code_ptr = w_func_get_code_ptr(concrete_callable);
                 let globals = pyre_runtime::w_func_get_globals(concrete_callable);
                 let func_code = code_ptr as *const CodeObject;
-                let concrete_sd = (*(this.concrete_frame
-                    as *const pyre_interp::frame::PyFrame))
-                    .stack_depth;
+                let concrete_sd =
+                    (*(this.concrete_frame as *const pyre_interp::frame::PyFrame)).stack_depth;
                 let nargs = args.len();
                 let concrete_args: Vec<PyObjectRef> = (0..nargs)
                     .map(|i| {
@@ -1717,8 +1719,7 @@ impl TraceFrameState {
                 driver.enter_inline_frame(callee_key);
 
                 // Synchronously trace + execute callee
-                let inline_result =
-                    inline_trace_and_execute(ctx, callee_frame_opref, callee_frame);
+                let inline_result = inline_trace_and_execute(ctx, callee_frame_opref, callee_frame);
 
                 match inline_result {
                     Ok((result_opref, concrete_result)) => {
@@ -2840,7 +2841,11 @@ fn inline_trace_and_execute(
                 callee.next_instr = ni + 1;
                 let next = callee.next_instr;
                 match pyre_runtime::execute_opcode_step(
-                    &mut callee, code, instruction, op_arg, next,
+                    &mut callee,
+                    code,
+                    instruction,
+                    op_arg,
+                    next,
                 )? {
                     StepResult::Return(v) => return Ok((result_opref, v)),
                     _ => {
@@ -2867,9 +2872,7 @@ fn inline_trace_and_execute(
         let (instruction, op_arg) = arg_state.get(code_unit);
         callee.next_instr = ni + 1;
         let next = callee.next_instr;
-        match pyre_runtime::execute_opcode_step(
-            &mut callee, code, instruction, op_arg, next,
-        )? {
+        match pyre_runtime::execute_opcode_step(&mut callee, code, instruction, op_arg, next)? {
             StepResult::Continue => {}
             StepResult::Return(_) => {
                 return Err(pyre_runtime::PyError::type_error(

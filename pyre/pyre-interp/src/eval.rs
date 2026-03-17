@@ -20,7 +20,6 @@ use pyre_runtime::{
 use crate::call::call_callable;
 use crate::frame::PyFrame;
 
-
 /// Execute a frame — pure interpreter, no JIT.
 pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     frame.fix_array_ptrs();

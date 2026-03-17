@@ -12,12 +12,18 @@
 mod classify;
 mod codegen;
 pub mod codewriter;
+pub mod front;
+pub mod graph;
 pub mod interp_extract;
 mod parse;
+pub mod passes;
 mod patterns;
 
 pub use classify::{FunctionInfo, HelperClassification};
+pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program};
+pub use graph::{BasicBlock, BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
 pub use parse::ParsedInterpreter;
+pub use passes::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
 pub use patterns::TracePattern;
 
 use serde::{Deserialize, Serialize};
@@ -177,9 +183,32 @@ fn resolve_call_chain(
 
     arm.resolved_calls = resolved_calls;
 
-    // Try to classify the trace pattern from resolved calls
+    // Try to classify the trace pattern from resolved calls (string heuristic)
     if arm.trace_pattern.is_none() {
         arm.trace_pattern = patterns::classify_from_resolved(&arm.resolved_calls);
+    }
+
+    // Graph-based classification: parse resolved bodies into semantic graphs
+    // and classify from the graph ops. This progressively replaces the
+    // body_summary string heuristic with actual AST analysis.
+    if arm.trace_pattern.is_none() {
+        for call in &arm.resolved_calls {
+            if !call.body_summary.is_empty() {
+                // Wrap body in a function to make it parseable
+                let wrapped = format!("fn __body() {{ {} }}", call.body_summary);
+                if let Ok(parsed) = syn::parse_str::<syn::ItemFn>(&wrapped) {
+                    let mut graph = graph::MajitGraph::new(&call.name);
+                    let entry = graph.entry;
+                    for stmt in &parsed.block.stmts {
+                        front::ast::lower_stmt_pub(&mut graph, entry, stmt);
+                    }
+                    if let Some(pattern) = patterns::classify_from_graph(&graph) {
+                        arm.trace_pattern = Some(pattern);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // Fallback: classify from the opcode pattern text itself
@@ -351,5 +380,50 @@ mod tests {
         for (i, line) in code.lines().enumerate().take(50) {
             eprintln!("{:3}: {}", i + 1, line);
         }
+    }
+
+    #[test]
+    fn test_graph_pipeline_e2e() {
+        // E2E test: source → AST front-end → semantic graph → graph transform → classify
+        let parsed = parse::parse_source(
+            r#"
+            struct Frame { next_instr: usize, locals_w: Vec<i64> }
+            impl Frame {
+                fn load_fast(&mut self) -> i64 {
+                    let idx = self.next_instr;
+                    self.locals_w[idx]
+                }
+                fn store_fast(&mut self, val: i64) {
+                    let idx = self.next_instr;
+                    self.locals_w[idx] = val;
+                }
+            }
+        "#,
+        );
+
+        // Step 1: AST → semantic graph
+        let program = front::build_semantic_program(&parsed);
+        assert_eq!(program.functions.len(), 2, "should have load_fast + store_fast");
+
+        // Step 2: graph transform (with virtualizable config)
+        let config = passes::GraphTransformConfig {
+            vable_fields: vec![("next_instr".into(), 0)],
+            vable_arrays: vec![("locals_w".into(), 0)],
+            ..Default::default()
+        };
+
+        let load_fast_graph = &program.functions[0].graph;
+        let result = passes::rewrite_graph(load_fast_graph, &config);
+        assert!(
+            result.vable_rewrites > 0,
+            "load_fast should have vable rewrites, got notes: {:?}",
+            result.notes
+        );
+
+        // Step 3: graph-based classification
+        let pattern = patterns::classify_from_graph(load_fast_graph);
+        eprintln!("load_fast graph ops: {:?}", load_fast_graph.block(load_fast_graph.entry).ops);
+        eprintln!("load_fast classified as: {:?}", pattern);
+        // load_fast reads a field + reads array → should be detectable
     }
 }

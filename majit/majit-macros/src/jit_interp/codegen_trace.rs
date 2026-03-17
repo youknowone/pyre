@@ -218,6 +218,14 @@ fn find_match_in_expr(expr: &syn::Expr) -> Option<&syn::ExprMatch> {
             }
             None
         }
+        syn::Expr::Loop(l) => {
+            for stmt in &l.body.stmts {
+                if let Some(m) = find_match_in_stmt(stmt) {
+                    return Some(m);
+                }
+            }
+            None
+        }
         syn::Expr::Block(b) => {
             for stmt in &b.block.stmts {
                 if let Some(m) = find_match_in_stmt(stmt) {

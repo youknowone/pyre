@@ -49,7 +49,8 @@ fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
         regs: Vec::new(),
     };
 
-    while pc < program.len() {
+    // while True: — RPython tlr.py:22
+    loop {
         jit_merge_point!();
         let opcode = program[pc];
         pc += 1;
@@ -86,7 +87,9 @@ fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
                 pc += 1;
                 state.a = state.a + state.regs[n];
             }
-            RETURN_A => break,
+            RETURN_A => {
+                return state.a;
+            }
             ALLOCATE => {
                 let n = program[pc] as usize;
                 pc += 1;
@@ -98,8 +101,6 @@ fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
             _ => {}
         }
     }
-
-    state.a
 }
 
 // ── Public wrapper matching the old API ──
@@ -127,9 +128,9 @@ mod tests {
 
     fn square_bytecode() -> Vec<u8> {
         vec![
-            ALLOCATE, 3, MOV_A_R, 0, MOV_A_R, 1, SET_A, 0, MOV_A_R, 2, SET_A, 1, NEG_A,
-            ADD_R_TO_A, 0, MOV_A_R, 0, MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2, MOV_R_A, 0,
-            JUMP_IF_A, 10, MOV_R_A, 2, RETURN_A,
+            ALLOCATE, 3, MOV_A_R, 0, MOV_A_R, 1, SET_A, 0, MOV_A_R, 2, SET_A, 1, NEG_A, ADD_R_TO_A,
+            0, MOV_A_R, 0, MOV_R_A, 2, ADD_R_TO_A, 1, MOV_A_R, 2, MOV_R_A, 0, JUMP_IF_A, 10,
+            MOV_R_A, 2, RETURN_A,
         ]
     }
 

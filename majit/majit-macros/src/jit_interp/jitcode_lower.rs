@@ -407,11 +407,19 @@ impl<'c> Lowerer<'c> {
     /// Recognizes `state.field = expr` for scalar state fields.
     fn lower_state_field_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
-        let assign = match expr { Expr::Assign(a) => a, _ => return None };
-        let field = match &*assign.left { Expr::Field(f) => f, _ => return None };
+        let assign = match expr {
+            Expr::Assign(a) => a,
+            _ => return None,
+        };
+        let field = match &*assign.left {
+            Expr::Field(f) => f,
+            _ => return None,
+        };
         let base = &field.base;
         let receiver_str = normalize(&quote!(#base).to_string());
-        if receiver_str != "state" { return None; }
+        if receiver_str != "state" {
+            return None;
+        }
         let member_name = match &field.member {
             syn::Member::Named(ident) => ident.to_string(),
             _ => return None,
@@ -420,19 +428,31 @@ impl<'c> Lowerer<'c> {
         let fi = field_index as u16;
         let binding = self.lower_value_expr(&assign.right)?;
         let src = binding.reg;
-        self.statements.push(quote! { __builder.store_state_field(#fi, #src); });
+        self.statements
+            .push(quote! { __builder.store_state_field(#fi, #src); });
         Some(())
     }
 
     /// Recognizes `state.array[index] = expr` for array state fields.
     fn lower_state_array_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
-        let assign = match expr { Expr::Assign(a) => a, _ => return None };
-        let index_expr = match &*assign.left { Expr::Index(idx) => idx, _ => return None };
-        let field = match &*index_expr.expr { Expr::Field(f) => f, _ => return None };
+        let assign = match expr {
+            Expr::Assign(a) => a,
+            _ => return None,
+        };
+        let index_expr = match &*assign.left {
+            Expr::Index(idx) => idx,
+            _ => return None,
+        };
+        let field = match &*index_expr.expr {
+            Expr::Field(f) => f,
+            _ => return None,
+        };
         let base = &field.base;
         let receiver_str = normalize(&quote!(#base).to_string());
-        if receiver_str != "state" { return None; }
+        if receiver_str != "state" {
+            return None;
+        }
         let member_name = match &field.member {
             syn::Member::Named(ident) => ident.to_string(),
             _ => return None,
@@ -443,7 +463,8 @@ impl<'c> Lowerer<'c> {
         let idx_reg = idx_binding.reg;
         let val_binding = self.lower_value_expr(&assign.right)?;
         let val_reg = val_binding.reg;
-        self.statements.push(quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); });
+        self.statements
+            .push(quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); });
         Some(())
     }
 
@@ -521,8 +542,12 @@ impl<'c> Lowerer<'c> {
 
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
         // State field writes (register/tape machines).
-        if let Some(()) = self.lower_state_field_write(expr) { return Some(()); }
-        if let Some(()) = self.lower_state_array_write(expr) { return Some(()); }
+        if let Some(()) = self.lower_state_field_write(expr) {
+            return Some(());
+        }
+        if let Some(()) = self.lower_state_array_write(expr) {
+            return Some(());
+        }
         // RPython jtransform.py:923 — virtualizable field write rewrite.
         if let Some(()) = self.lower_vable_field_write(expr) {
             return Some(());
@@ -1622,7 +1647,9 @@ impl<'c> Lowerer<'c> {
         };
         let base = &field.base;
         let receiver_str = normalize(&quote!(#base).to_string());
-        if receiver_str != "state" { return None; }
+        if receiver_str != "state" {
+            return None;
+        }
         let member_name = match &field.member {
             syn::Member::Named(ident) => ident.to_string(),
             _ => return None,
@@ -1630,18 +1657,31 @@ impl<'c> Lowerer<'c> {
         let &(field_index, _) = config.state_scalars.get(&member_name)?;
         let fi = field_index as u16;
         let reg = self.alloc_reg();
-        self.statements.push(quote! { __builder.load_state_field(#fi, #reg); });
-        Some(Binding { reg, kind: BindingKind::Int, depends_on_stack: false })
+        self.statements
+            .push(quote! { __builder.load_state_field(#fi, #reg); });
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+        })
     }
 
     /// Recognizes `state.array[index]` for array state fields.
     fn lower_state_array_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
-        let index_expr = match expr { Expr::Index(idx) => idx, _ => return None };
-        let field = match &*index_expr.expr { Expr::Field(f) => f, _ => return None };
+        let index_expr = match expr {
+            Expr::Index(idx) => idx,
+            _ => return None,
+        };
+        let field = match &*index_expr.expr {
+            Expr::Field(f) => f,
+            _ => return None,
+        };
         let base = &field.base;
         let receiver_str = normalize(&quote!(#base).to_string());
-        if receiver_str != "state" { return None; }
+        if receiver_str != "state" {
+            return None;
+        }
         let member_name = match &field.member {
             syn::Member::Named(ident) => ident.to_string(),
             _ => return None,
@@ -1651,14 +1691,23 @@ impl<'c> Lowerer<'c> {
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let reg = self.alloc_reg();
-        self.statements.push(quote! { __builder.load_state_array(#ai, #idx_reg, #reg); });
-        Some(Binding { reg, kind: BindingKind::Int, depends_on_stack: false })
+        self.statements
+            .push(quote! { __builder.load_state_array(#ai, #idx_reg, #reg); });
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+        })
     }
 
     fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
         // State field read (register/tape machines).
-        if let Some(binding) = self.lower_state_field_read(expr) { return Some(binding); }
-        if let Some(binding) = self.lower_state_array_read(expr) { return Some(binding); }
+        if let Some(binding) = self.lower_state_field_read(expr) {
+            return Some(binding);
+        }
+        if let Some(binding) = self.lower_state_array_read(expr) {
+            return Some(binding);
+        }
         // RPython jtransform.py:832 — virtualizable field read rewrite.
         if let Some(binding) = self.lower_vable_field_read(expr) {
             return Some(binding);

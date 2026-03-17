@@ -504,11 +504,7 @@ impl TraceCtx {
             // Static fields: SETFIELD_GC(vable, field_value, descr=offset)
             for (i, field) in info.static_fields.iter().enumerate() {
                 if i < boxes.len() {
-                    ops.push((
-                        OpCode::SetfieldGc,
-                        vec![field.offset as i64],
-                        boxes[i],
-                    ));
+                    ops.push((OpCode::SetfieldGc, vec![field.offset as i64], boxes[i]));
                 }
             }
 
@@ -542,16 +538,11 @@ impl TraceCtx {
                 }
                 OpCode::SetarrayitemGc => {
                     let arr_offset_ref = self.const_int(metadata[0]);
-                    let arr_ptr = self.record_op(
-                        OpCode::GetfieldGcR,
-                        &[vable_opref, arr_offset_ref],
-                    );
+                    let arr_ptr =
+                        self.record_op(OpCode::GetfieldGcR, &[vable_opref, arr_offset_ref]);
                     let idx_ref = self.const_int(metadata[1]);
                     let zero = self.const_int(0);
-                    self.record_op(
-                        OpCode::SetarrayitemGc,
-                        &[arr_ptr, idx_ref, value, zero],
-                    );
+                    self.record_op(OpCode::SetarrayitemGc, &[arr_ptr, idx_ref, value, zero]);
                 }
                 _ => {}
             }
@@ -587,8 +578,7 @@ impl TraceCtx {
     /// Nonstandard (escaped/virtual): falls back to GETFIELD_GC.
     pub fn vable_getfield_int(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
         if !self.is_nonstandard_virtualizable(vable_opref) {
-            if let (Some(boxes), Some(info)) =
-                (&self.virtualizable_boxes, &self.virtualizable_info)
+            if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info)
             {
                 if let Some(index) = info.static_field_index(field_offset) {
                     return boxes[index];
@@ -636,8 +626,7 @@ impl TraceCtx {
     /// RPython pyjitpl.py:1168 `opimpl_getfield_vable_r`.
     pub fn vable_getfield_ref(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
         if !self.is_nonstandard_virtualizable(vable_opref) {
-            if let (Some(boxes), Some(info)) =
-                (&self.virtualizable_boxes, &self.virtualizable_info)
+            if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info)
             {
                 if let Some(index) = info.static_field_index(field_offset) {
                     return boxes[index];
@@ -658,8 +647,7 @@ impl TraceCtx {
     /// RPython pyjitpl.py:1175 `opimpl_getfield_vable_f`.
     pub fn vable_getfield_float(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
         if !self.is_nonstandard_virtualizable(vable_opref) {
-            if let (Some(boxes), Some(info)) =
-                (&self.virtualizable_boxes, &self.virtualizable_info)
+            if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info)
             {
                 if let Some(index) = info.static_field_index(field_offset) {
                     return boxes[index];
@@ -2170,7 +2158,10 @@ mod tests {
 
         // No heap ops should have been emitted
         let ops = take_all_ops(ctx);
-        assert!(ops.is_empty(), "standard vable getfield should not emit ops");
+        assert!(
+            ops.is_empty(),
+            "standard vable getfield should not emit ops"
+        );
     }
 
     #[test]
@@ -2197,7 +2188,10 @@ mod tests {
 
         // No heap ops should have been emitted
         let ops = take_all_ops(ctx);
-        assert!(ops.is_empty(), "standard vable setfield should not emit ops");
+        assert!(
+            ops.is_empty(),
+            "standard vable setfield should not emit ops"
+        );
     }
 
     #[test]
@@ -2315,7 +2309,10 @@ mod tests {
         assert_eq!(r2, box_arr2);
 
         let ops = take_all_ops(ctx);
-        assert!(ops.is_empty(), "standard vable getarrayitem should not emit ops");
+        assert!(
+            ops.is_empty(),
+            "standard vable getarrayitem should not emit ops"
+        );
     }
 
     #[test]

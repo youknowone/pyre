@@ -2,9 +2,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::jit::descr::{make_field_descr, make_size_descr};
     use majit_ir::{OpCode, OpRef};
     use majit_meta::TraceCtx;
-    use crate::jit::descr::{make_field_descr, make_size_descr};
 
     fn ob_type_descr() -> majit_ir::DescrRef {
         make_field_descr(0, 8, majit_ir::Type::Int, false)

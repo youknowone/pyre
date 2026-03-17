@@ -95,7 +95,10 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_vable_ptr(ptr);
     }
 
-
+    /// Register an interpreter boxing helper for the raw-int finish protocol.
+    pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
+        self.meta.register_raw_int_box_helper(helper);
+    }
 
     pub fn with_declarative<D: DeclarativeJitDriver>(
         threshold: u32,
@@ -861,6 +864,7 @@ impl<S: JitState> JitDriver<S> {
             return DetailedDriverRunOutcome::Finished {
                 typed_values: result.typed_values,
                 via_blackhole: false,
+                raw_int_result: self.meta.has_raw_int_finish(green_key),
             };
         }
 
@@ -937,6 +941,11 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.meta.has_compiled_loop(green_key)
+    }
+
+    /// Whether the compiled finish for this loop exits with a raw int.
+    pub fn has_raw_int_finish(&self, green_key: u64) -> bool {
+        self.meta.has_raw_int_finish(green_key)
     }
 
     /// Get the loop token number for a compiled loop.
@@ -1115,12 +1124,10 @@ impl<S: JitState> JitDriver<S> {
             .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
         if should_bridge {
             if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values) {
-                let started = self.start_bridge_tracing(
+                self.start_bridge_tracing(
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
                 );
-                if started {
-                    return Some(resume_pc);
-                }
+                return Some(resume_pc);
             }
             return None;
         }

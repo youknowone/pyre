@@ -42,30 +42,38 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     // ── Frame virtualizable (VirtualizableDecl) code generation ──
     let vable_info_fn = config.virtualizable_decl.as_ref().map(|decl| {
         let token_offset = &decl.token_offset;
-        let field_adds: Vec<TokenStream> = decl.fields.iter().map(|f| {
-            let name = f.name.to_string();
-            let offset = &f.offset;
-            let tp = match f.field_type.to_string().as_str() {
-                "ref" => quote! { majit_ir::Type::Ref },
-                "float" => quote! { majit_ir::Type::Float },
-                _ => quote! { majit_ir::Type::Int },
-            };
-            quote! {
-                __info.add_field(#name, #tp, #offset);
-            }
-        }).collect();
-        let array_adds: Vec<TokenStream> = decl.arrays.iter().map(|a| {
-            let name = a.name.to_string();
-            let offset = &a.offset;
-            let tp = match a.item_type.to_string().as_str() {
-                "ref" => quote! { majit_ir::Type::Ref },
-                "float" => quote! { majit_ir::Type::Float },
-                _ => quote! { majit_ir::Type::Int },
-            };
-            quote! {
-                __info.add_array_field(#name, #tp, #offset);
-            }
-        }).collect();
+        let field_adds: Vec<TokenStream> = decl
+            .fields
+            .iter()
+            .map(|f| {
+                let name = f.name.to_string();
+                let offset = &f.offset;
+                let tp = match f.field_type.to_string().as_str() {
+                    "ref" => quote! { majit_ir::Type::Ref },
+                    "float" => quote! { majit_ir::Type::Float },
+                    _ => quote! { majit_ir::Type::Int },
+                };
+                quote! {
+                    __info.add_field(#name, #tp, #offset);
+                }
+            })
+            .collect();
+        let array_adds: Vec<TokenStream> = decl
+            .arrays
+            .iter()
+            .map(|a| {
+                let name = a.name.to_string();
+                let offset = &a.offset;
+                let tp = match a.item_type.to_string().as_str() {
+                    "ref" => quote! { majit_ir::Type::Ref },
+                    "float" => quote! { majit_ir::Type::Float },
+                    _ => quote! { majit_ir::Type::Int },
+                };
+                quote! {
+                    __info.add_array_field(#name, #tp, #offset);
+                }
+            })
+            .collect();
         quote! {
             /// Build VirtualizableInfo for the interpreter frame.
             ///
@@ -491,10 +499,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
         })
         .collect();
-    let create_sym_scalar_names: Vec<&syn::Ident> =
-        scalars.iter().map(|(_, f)| &f.name).collect();
-    let create_sym_array_names: Vec<&syn::Ident> =
-        arrays.iter().map(|(_, f)| &f.name).collect();
+    let create_sym_scalar_names: Vec<&syn::Ident> = scalars.iter().map(|(_, f)| &f.name).collect();
+    let create_sym_array_names: Vec<&syn::Ident> = arrays.iter().map(|(_, f)| &f.name).collect();
 
     // ── is_compatible: check array lengths match meta ──
     let compat_checks: Vec<TokenStream> = arrays

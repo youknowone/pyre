@@ -3,6 +3,17 @@
 /// Greens: [pc, code]       (bytecode and position are loop constants)
 /// Reds:   [registers]      (register values are the live state)
 ///
+/// RPython correspondence (tinyframe.py):
+///   - JitDriver(greens=['i', 'code'], reds=['self'], virtualizables=['self'])
+///     — tinyframe.py:215
+///   - _virtualizable_ = ['registers[*]', 'code'] — tinyframe.py:219
+///     Implicit via TinyFrameState: regs vec serves as virtualizable array.
+///   - hint(self, access_directly=True, fresh_virtualizable=True) — tinyframe.py:222
+///     Implicit: state_fields / extract_live / restore handle this.
+///   - @dont_look_inside Frame.introspect() — tinyframe.py:272
+///     Not traced here; INTROSPECT would abort tracing.
+///   - CALL, LOAD_FUNCTION, PRINT — object/function ops, not traced (interpreter fallback).
+///
 /// JIT traces the integer-only path through the register machine.
 /// JUMP_IF_ABOVE is the back-edge that triggers tracing.
 ///
@@ -21,6 +32,8 @@ const DEFAULT_THRESHOLD: u32 = 3;
 // ── JitState types ──
 
 /// Red variables: all registers.
+/// Corresponds to _virtualizable_ = ['registers[*]', 'code'] in tinyframe.py:219.
+/// Registers are the virtualizable array — carried as JUMP args in compiled traces.
 pub struct TinyFrameState {
     regs: Vec<i64>,
 }
@@ -131,6 +144,8 @@ fn trace_instruction(
     } else if opcode == RETURN {
         return TraceAction::Abort;
     } else {
+        // INTROSPECT (@dont_look_inside in tinyframe.py:272),
+        // CALL, LOAD_FUNCTION, PRINT — not traced, abort to interpreter.
         return TraceAction::Abort;
     }
 
@@ -171,9 +186,8 @@ impl JitTinyFrameInterp {
                 .current_trace_green_key()
                 .map(|k| k as usize)
                 .unwrap_or(0);
-            self.driver.merge_point(|ctx, sym| {
-                trace_instruction(ctx, sym, bytecode, pc, header_pc)
-            });
+            self.driver
+                .merge_point(|ctx, sym| trace_instruction(ctx, sym, bytecode, pc, header_pc));
 
             let opcode = bytecode[pc];
 
