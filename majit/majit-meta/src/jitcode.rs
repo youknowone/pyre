@@ -62,6 +62,8 @@ const BC_CALL_ASSEMBLER_INT: u8 = 50;
 const BC_CALL_ASSEMBLER_REF: u8 = 51;
 const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;
 const BC_CALL_ASSEMBLER_VOID: u8 = 53;
+const BC_COPY_FROM_BOTTOM: u8 = 54;
+const BC_STORE_DOWN: u8 = 55;
 const MAX_HOST_CALL_ARITY: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -505,160 +507,100 @@ where
             BC_POP_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() {
-                    if let (Some(arr_ref), Some(len_ref)) =
-                        (sym.vable_array_ref(selected), sym.vable_len_ref(selected))
-                    {
-                        // Virtualizable: emit IR to read top element and decrement length
-                        let one = ctx.const_int(1);
-                        let idx = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
-                        let val = ctx.record_op(OpCode::GetarrayitemRawI, &[arr_ref, idx]);
-                        sym.set_vable_len_ref(selected, idx);
-                        let concrete = self.runtime_stack_mut(selected, runtime).pop();
-                        self.set_int_reg(dst, Some(val), concrete);
-                    } else {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    let symbolic = {
-                        let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                        stack.pop()
-                    };
-                    let concrete = self.runtime_stack_mut(selected, runtime).pop();
-                    self.set_int_reg(dst, symbolic, concrete);
-                }
+                // RPython parity: both standard and virtualizable storage use
+                // SymbolicStack (= virtualizable_boxes). Pop returns the box
+                // value directly — NO IR emitted. This matches pyjitpl.py:1213
+                // opimpl_getarrayitem_vable which returns boxes[index].
+                let symbolic = {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.pop()
+                };
+                let concrete = self.runtime_stack_mut(selected, runtime).pop();
+                self.set_int_reg(dst, symbolic, concrete);
             }
             BC_PEEK_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() {
-                    if let (Some(arr_ref), Some(len_ref)) =
-                        (sym.vable_array_ref(selected), sym.vable_len_ref(selected))
-                    {
-                        let one = ctx.const_int(1);
-                        let idx = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
-                        let val = ctx.record_op(OpCode::GetarrayitemRawI, &[arr_ref, idx]);
-                        let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
-                        self.set_int_reg(dst, Some(val), concrete);
-                    } else {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    let symbolic = {
-                        let stack = sym.stack(selected).expect("missing symbolic stack");
-                        stack.peek()
-                    };
-                    let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
-                    self.set_int_reg(dst, symbolic, concrete);
-                }
+                // RPython parity: peek from boxes (SymbolicStack), no IR.
+                let symbolic = {
+                    let stack = sym.stack(selected).expect("missing symbolic stack");
+                    stack.peek()
+                };
+                let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
+                self.set_int_reg(dst, symbolic, concrete);
             }
             BC_PUSH_I => {
+                // RPython parity: push to boxes (SymbolicStack), no IR.
                 let src = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 let (value, concrete) = self.read_int_reg(src);
-                if sym.is_virtualizable_storage() {
-                    if let (Some(arr_ref), Some(len_ref)) =
-                        (sym.vable_array_ref(selected), sym.vable_len_ref(selected))
-                    {
-                        // Virtualizable: emit SETARRAYITEM at current length, then increment
-                        ctx.record_op(OpCode::SetarrayitemRaw, &[arr_ref, len_ref, value]);
-                        let one = ctx.const_int(1);
-                        let new_len = ctx.record_op(OpCode::IntAdd, &[len_ref, one]);
-                        sym.set_vable_len_ref(selected, new_len);
-                        self.runtime_stack_mut(selected, runtime).push(concrete);
-                    } else {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.push(value);
-                    self.runtime_stack_mut(selected, runtime).push(concrete);
-                }
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.push(value);
+                self.runtime_stack_mut(selected, runtime).push(concrete);
             }
             BC_POP_DISCARD => {
+                // RPython parity: pop from boxes (SymbolicStack), no IR.
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() {
-                    if let Some(len_ref) = sym.vable_len_ref(selected) {
-                        let one = ctx.const_int(1);
-                        let new_len = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
-                        sym.set_vable_len_ref(selected, new_len);
-                        let _ = self.runtime_stack_mut(selected, runtime).pop();
-                    } else {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    let _ = stack.pop();
-                    let _ = self.runtime_stack_mut(selected, runtime).pop();
-                }
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                let _ = stack.pop();
+                let _ = self.runtime_stack_mut(selected, runtime).pop();
             }
             BC_DUP_STACK => {
+                // RPython parity: dup in boxes (SymbolicStack), no IR.
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() {
-                    if let (Some(arr_ref), Some(len_ref)) =
-                        (sym.vable_array_ref(selected), sym.vable_len_ref(selected))
-                    {
-                        // Read top element, write at len, increment len
-                        let one = ctx.const_int(1);
-                        let top_idx = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
-                        let val = ctx.record_op(OpCode::GetarrayitemRawI, &[arr_ref, top_idx]);
-                        ctx.record_op(OpCode::SetarrayitemRaw, &[arr_ref, len_ref, val]);
-                        let new_len = ctx.record_op(OpCode::IntAdd, &[len_ref, one]);
-                        sym.set_vable_len_ref(selected, new_len);
-                        let value = self
-                            .runtime_stack_mut(selected, runtime)
-                            .last()
-                            .copied()
-                            .expect("cannot dup from empty runtime stack");
-                        self.runtime_stack_mut(selected, runtime).push(value);
-                    } else {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.dup();
-                    let value = self
-                        .runtime_stack_mut(selected, runtime)
-                        .last()
-                        .copied()
-                        .expect("cannot dup from empty runtime stack");
-                    self.runtime_stack_mut(selected, runtime).push(value);
-                }
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.dup();
+                let value = self
+                    .runtime_stack_mut(selected, runtime)
+                    .last()
+                    .copied()
+                    .expect("cannot dup from empty runtime stack");
+                self.runtime_stack_mut(selected, runtime).push(value);
             }
             BC_SWAP_STACK => {
+                // RPython parity: swap in boxes (SymbolicStack), no IR.
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() {
-                    if let (Some(arr_ref), Some(len_ref)) =
-                        (sym.vable_array_ref(selected), sym.vable_len_ref(selected))
-                    {
-                        let one = ctx.const_int(1);
-                        let two = ctx.const_int(2);
-                        let idx_top = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
-                        let idx_sec = ctx.record_op(OpCode::IntSub, &[len_ref, two]);
-                        let val_top =
-                            ctx.record_op(OpCode::GetarrayitemRawI, &[arr_ref, idx_top]);
-                        let val_sec =
-                            ctx.record_op(OpCode::GetarrayitemRawI, &[arr_ref, idx_sec]);
-                        ctx.record_op(OpCode::SetarrayitemRaw, &[arr_ref, idx_top, val_sec]);
-                        ctx.record_op(OpCode::SetarrayitemRaw, &[arr_ref, idx_sec, val_top]);
-                        let stack = self.runtime_stack_mut(selected, runtime);
-                        let len = stack.len();
-                        assert!(len >= 2, "cannot swap with fewer than two values");
-                        stack.swap(len - 1, len - 2);
-                    } else {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.swap();
-                    let stack = self.runtime_stack_mut(selected, runtime);
-                    let len = stack.len();
-                    assert!(
-                        len >= 2,
-                        "cannot swap runtime stack with fewer than two values"
-                    );
-                    stack.swap(len - 1, len - 2);
-                }
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.swap();
+                let stack = self.runtime_stack_mut(selected, runtime);
+                let len = stack.len();
+                assert!(
+                    len >= 2,
+                    "cannot swap runtime stack with fewer than two values"
+                );
+                stack.swap(len - 1, len - 2);
+            }
+            BC_COPY_FROM_BOTTOM => {
+                // Copy element at index (from bottom) to top of stack.
+                let idx_reg = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let (idx_sym, idx_concrete) = self.read_int_reg(idx_reg);
+                let index = idx_concrete as usize;
+
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                let opref = stack.peek_at(index);
+                stack.push(opref);
+
+                let rt_stack = self.runtime_stack_mut(selected, runtime);
+                let val = rt_stack[index];
+                rt_stack.push(val);
+                let _ = idx_sym; // index is a trace-time constant; symbolic opref comes from stack
+            }
+            BC_STORE_DOWN => {
+                // Pop top of stack, store at index (from bottom).
+                let idx_reg = self.frames.current_mut().next_u16() as usize;
+                let selected = sym.current_selected();
+                let (idx_sym, idx_concrete) = self.read_int_reg(idx_reg);
+                let index = idx_concrete as usize;
+
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                let opref = stack.pop().expect("store_down on empty stack");
+                stack.set_at(index, opref);
+
+                let rt_stack = self.runtime_stack_mut(selected, runtime);
+                let val = rt_stack.pop().expect("store_down on empty runtime stack");
+                rt_stack[index] = val;
+                let _ = idx_sym;
             }
             BC_RECORD_BINOP_I => {
                 let (dst, lhs_idx, rhs_idx, opcode) = {
@@ -920,50 +862,15 @@ where
                         .get(const_idx)
                         .expect("jitcode const index out of bounds") as usize
                 };
-                if sym.is_virtualizable_storage() {
-                    // Virtualizable: if this storage isn't initialized yet,
-                    // load array pointer + length from the pool object.
-                    //
-                    // RPython parity: pyjitpl.py:1249 reads from the virtualizable
-                    // object via descriptors. We emit GETFIELD_RAW_I on the pool
-                    // object to load the data pointer at runtime, NOT as a trace
-                    // constant. This handles backing array reallocation correctly.
-                    if sym.vable_array_ref(new_selected).is_none() {
-                        let (arr_ref, len_ref) =
-                            if let (Some(pool_ref), Some(data_off), Some(len_off)) = (
-                                sym.vable_pool_ref(),
-                                sym.vable_storage_data_offset(new_selected),
-                                sym.vable_storage_len_offset(new_selected),
-                            ) {
-                                // Descriptor-based: GETFIELD from pool object
-                                let data_off_ref = ctx.const_int(data_off as i64);
-                                let arr = ctx.record_op(
-                                    OpCode::GetfieldRawI,
-                                    &[pool_ref, data_off_ref],
-                                );
-                                let len_off_ref = ctx.const_int(len_off as i64);
-                                let len = ctx.record_op(
-                                    OpCode::GetfieldRawI,
-                                    &[pool_ref, len_off_ref],
-                                );
-                                (arr, len)
-                            } else {
-                                // Fallback: trace-time constant (for interpreters
-                                // that don't expose pool layout descriptors yet).
-                                let data_ptr = runtime.stack_data_ptr(new_selected);
-                                let len = runtime.stack_len(new_selected);
-                                (ctx.const_int(data_ptr as i64), ctx.const_int(len as i64))
-                            };
-                        sym.init_vable_storage(new_selected, arr_ref, len_ref);
-                    }
-                } else {
-                    // Non-virtualizable: ensure SymbolicStack exists.
-                    if sym.stack(new_selected).is_none() {
-                        let len = runtime.stack_len(new_selected);
-                        let offset = sym.total_slots();
-                        sym.ensure_stack(new_selected, offset, len);
-                        let _ = self.runtime_stack_mut(new_selected, runtime);
-                    }
+                // RPython parity: ALL storage access uses SymbolicStack (boxes).
+                // No distinction between "virtualizable" and "non-virtualizable"
+                // at the JitCode level. Both use boxes. The preamble loads values
+                // from heap, and JUMP carries them as args.
+                if sym.stack(new_selected).is_none() {
+                    let len = runtime.stack_len(new_selected);
+                    let offset = sym.total_slots();
+                    sym.ensure_stack(new_selected, offset, len);
+                    let _ = self.runtime_stack_mut(new_selected, runtime);
                 }
                 let selected_value = ctx.const_int(new_selected as i64);
                 sym.set_current_selected_value(new_selected, selected_value);
@@ -1311,8 +1218,20 @@ where
                 let value = eval_unary_f(opcode, src_value);
                 self.set_float_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
             }
-            BC_ABORT => return TraceAction::Abort,
-            BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
+            BC_ABORT => {
+                if crate::majit_log_enabled() {
+                    let pc = self.frames.current_mut().pc;
+                    eprintln!("[jit] BC_ABORT at jitcode_pc={pc}");
+                }
+                return TraceAction::Abort;
+            }
+            BC_ABORT_PERMANENT => {
+                if crate::majit_log_enabled() {
+                    let pc = self.frames.current_mut().pc;
+                    eprintln!("[jit] BC_ABORT_PERMANENT at jitcode_pc={pc}");
+                }
+                return TraceAction::AbortPermanent;
+            }
             other => panic!("unknown jitcode bytecode {other}"),
         }
 
@@ -1461,6 +1380,20 @@ impl JitCodeBuilder {
 
     pub fn swap_stack(&mut self) {
         self.push_u8(BC_SWAP_STACK);
+    }
+
+    /// Copy the element at `index` (from bottom, 0-based) to top of stack.
+    pub fn copy_from_bottom(&mut self, idx_reg: u16) {
+        self.touch_reg(idx_reg);
+        self.push_u8(BC_COPY_FROM_BOTTOM);
+        self.push_u16(idx_reg);
+    }
+
+    /// Pop top of stack and store at `index` (from bottom, 0-based).
+    pub fn store_down(&mut self, idx_reg: u16) {
+        self.touch_reg(idx_reg);
+        self.push_u8(BC_STORE_DOWN);
+        self.push_u16(idx_reg);
     }
 
     pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
@@ -2310,6 +2243,19 @@ where
     let runtime = ClosureRuntime::with_data_ptr(
         runtime_stack_len, runtime_stack_peek, label_at, stack_data_ptr,
     );
+    // Virtualizable: lazy-init the current selected storage if not yet initialized.
+    // create_sym leaves vable_array_refs empty; BC_SET_SELECTED inits on storage switch,
+    // but the initial storage has no SET_SELECTED, so we must init here.
+    if sym.is_virtualizable_storage() {
+        let selected = sym.current_selected();
+        if sym.vable_array_ref(selected).is_none() {
+            let data_ptr = runtime.stack_data_ptr(selected);
+            let len = runtime.stack_len(selected);
+            let arr_ref = ctx.const_int(data_ptr as i64);
+            let len_ref = ctx.const_int(len as i64);
+            sym.init_vable_storage(selected, arr_ref, len_ref);
+        }
+    }
     let root = MIFrame::new(jitcode, pc);
     let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
     machine.run_to_end(ctx, sym, &runtime)
