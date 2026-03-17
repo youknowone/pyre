@@ -2421,33 +2421,62 @@ fn build_ref_root_slots(
     slots
 }
 
-fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
+/// Renumber sparse OpRef indices to dense sequential indices.
+/// Returns (remapped ops, remap table).
+fn normalize_ops_for_codegen(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+) -> (Vec<Op>, std::collections::HashMap<u32, u32>) {
     let num_inputs = inputargs.len() as u32;
 
-    // Build a remapping table: old OpRef → new dense OpRef.
-    // Input args keep their indices (0..num_inputs).
-    // Non-void ops get sequential indices starting at num_inputs.
-    let mut remap = std::collections::HashMap::<u32, u32>::new();
+    // Collect all referenced OpRef indices.
+    let mut all_refs = std::collections::HashSet::<u32>::new();
     for i in 0..num_inputs {
-        remap.insert(i, i);
+        all_refs.insert(i);
     }
-    let mut next_idx = num_inputs;
     for (op_idx, op) in ops.iter().enumerate() {
         if op.result_type() != Type::Void {
-            let old_idx = if op.pos.is_none() {
-                num_inputs + op_idx as u32
-            } else {
-                op.pos.0
-            };
-            if !remap.contains_key(&old_idx) {
-                remap.insert(old_idx, next_idx);
-                next_idx += 1;
-            }
+            let idx = if op.pos.is_none() { num_inputs + op_idx as u32 } else { op.pos.0 };
+            all_refs.insert(idx);
+        }
+        for arg in &op.args {
+            if !arg.is_none() { all_refs.insert(arg.0); }
+        }
+        if let Some(ref fa) = op.fail_args {
+            for arg in fa { if !arg.is_none() { all_refs.insert(arg.0); } }
         }
     }
+    for &k in constants.keys() { all_refs.insert(k); }
+
+    // Check if renumbering is needed (gap ratio > 2x)
+    let max_ref = all_refs.iter().copied().max().unwrap_or(0);
+    if (max_ref as usize) < all_refs.len() * 2 {
+        // Indices are already dense enough — skip renumbering.
+        let identity: std::collections::HashMap<u32, u32> =
+            all_refs.into_iter().map(|i| (i, i)).collect();
+        let normalized = ops.iter().enumerate().map(|(op_idx, op)| {
+            let mut n = op.clone();
+            if n.result_type() != Type::Void && n.pos.is_none() {
+                n.pos = OpRef(num_inputs + op_idx as u32);
+            }
+            n
+        }).collect();
+        return (normalized, identity);
+    }
+
+    // Build dense remapping: sort all refs and assign sequential indices.
+    let mut sorted_refs: Vec<u32> = all_refs.into_iter().collect();
+    sorted_refs.sort_unstable();
+    let remap: std::collections::HashMap<u32, u32> = sorted_refs
+        .iter()
+        .enumerate()
+        .map(|(new_idx, &old_idx)| (old_idx, new_idx as u32))
+        .collect();
 
     // Remap all OpRef references in ops.
-    ops.iter()
+    let remapped = ops
+        .iter()
         .enumerate()
         .map(|(op_idx, op)| {
             let mut normalized = op.clone();
@@ -2461,11 +2490,10 @@ fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
                 normalized.pos = OpRef(*remap.get(&old_idx).unwrap_or(&old_idx));
             }
             // Remap args
-            for i in 0..normalized.args.len() {
-                let old_arg = normalized.args[i];
-                if !old_arg.is_none() {
-                    if let Some(&new_arg) = remap.get(&old_arg.0) {
-                        normalized.args[i] = OpRef(new_arg);
+            for arg in normalized.args.iter_mut() {
+                if !arg.is_none() {
+                    if let Some(&new_arg) = remap.get(&arg.0) {
+                        *arg = OpRef(new_arg);
                     }
                 }
             }
@@ -2481,7 +2509,9 @@ fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
             }
             normalized
         })
-        .collect()
+        .collect();
+
+    (remapped, remap)
 }
 
 fn inject_builtin_string_descrs(ops: &mut [Op]) {
@@ -3352,8 +3382,25 @@ impl CraneliftBackend {
         }))
     }
 
-    fn prepare_ops_for_compile(&self, inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
-        let mut normalized = normalize_ops_for_codegen(inputargs, ops);
+    fn prepare_ops_for_compile(&mut self, inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
+        let (mut normalized, remap) = normalize_ops_for_codegen(inputargs, ops, &self.constants);
+        // Also remap constant keys. Constants may reference OpRefs that
+        // aren't op results (e.g., from SameAsI optimizations).
+        if !remap.is_empty() {
+            let old_constants = std::mem::take(&mut self.constants);
+            let mut new_constants = HashMap::with_capacity(old_constants.len());
+            for (k, v) in old_constants {
+                let new_k = if let Some(&mapped) = remap.get(&k) {
+                    mapped
+                } else {
+                    // This constant wasn't in the remap table — it might be
+                    // a dead reference. Keep its original index.
+                    k
+                };
+                new_constants.insert(new_k, v);
+            }
+            self.constants = new_constants;
+        }
         inject_builtin_string_descrs(&mut normalized);
         if let Some(rewriter) = self.gc_rewriter() {
             rewriter.rewrite_for_gc(&normalized)
