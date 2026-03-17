@@ -990,6 +990,7 @@ impl<M: Clone> MetaInterp<M> {
                             .collect();
                         ctx.init_virtualizable_boxes(
                             info,
+                            OpRef(0), // frame ref = first inputarg
                             &vable_oprefs,
                             &self.vable_array_lengths,
                         );
@@ -1063,6 +1064,7 @@ impl<M: Clone> MetaInterp<M> {
                             .collect();
                         ctx.init_virtualizable_boxes(
                             info,
+                            OpRef(0), // frame ref = first inputarg
                             &vable_oprefs,
                             &self.vable_array_lengths,
                         );

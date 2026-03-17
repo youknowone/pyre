@@ -141,7 +141,11 @@ pub struct TraceCtx {
     driver_descriptor: Option<JitDriverDescriptor>,
     /// Standard virtualizable boxes -- OpRefs for each static field + array element.
     /// When set, vable_getfield/setfield access these instead of emitting heap ops.
-    /// Layout: [static_field_0, ..., static_field_N, array_0_elem_0, ..., array_0_elem_M, ...]
+    /// Layout: [field_0, ..., field_N, arr_0[0], ..., arr_0[M], ..., vable_ref]
+    ///
+    /// The last element (`boxes[-1]`) is the standard virtualizable identity
+    /// (RPython parity: `virtualizable_boxes[-1]`). Used by gen_store_back_in_vable
+    /// to distinguish standard vs nonstandard virtualizable.
     virtualizable_boxes: Option<Vec<OpRef>>,
     /// VirtualizableInfo for the standard virtualizable (if any).
     virtualizable_info: Option<VirtualizableInfo>,
@@ -401,13 +405,19 @@ impl TraceCtx {
     ///
     /// `input_oprefs` contains one OpRef per static field + array element,
     /// in the same flat layout as `VirtualizableInfo::get_index_in_array`.
+    /// `vable_ref` is the OpRef of the virtualizable object (frame pointer).
+    /// Boxes layout: [field0, ..., fieldN, arr[0], ..., arr[M], vable_ref]
+    /// where `boxes[-1]` is the standard virtualizable identity (RPython parity).
     pub fn init_virtualizable_boxes(
         &mut self,
         info: &VirtualizableInfo,
+        vable_ref: OpRef,
         input_oprefs: &[OpRef],
         array_lengths: &[usize],
     ) {
-        self.virtualizable_boxes = Some(input_oprefs.to_vec());
+        let mut boxes = input_oprefs.to_vec();
+        boxes.push(vable_ref); // RPython: virtualizable_boxes[-1] = vable identity
+        self.virtualizable_boxes = Some(boxes);
         self.virtualizable_info = Some(info.clone());
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
     }
@@ -471,6 +481,14 @@ impl TraceCtx {
                 Some(boxes) => boxes,
                 None => return,
             };
+            // RPython parity: only force the standard virtualizable.
+            // virtualizable_boxes[-1] is the vable identity (frame ref).
+            // If vable_opref != boxes[-1], this is nonstandard/virtual — skip.
+            if let Some(&vbox) = boxes.last() {
+                if vbox != vable_opref {
+                    return;
+                }
+            }
 
             let mut ops = Vec::new();
 
@@ -2101,7 +2119,7 @@ mod tests {
         let box1 = recorder.record_input_arg(Type::Int); // sp
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, &[box0, box1], &[]);
+        ctx.init_virtualizable_boxes(&info, vable, &[box0, box1], &[]);
 
         // getfield with offset=8 → static field 0 → box0
         let result = ctx.vable_getfield_int(vable, 8);
@@ -2125,7 +2143,7 @@ mod tests {
         let new_val = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, &[box0, box1], &[]);
+        ctx.init_virtualizable_boxes(&info, vable, &[box0, box1], &[]);
 
         // setfield offset=8 → updates box0
         ctx.vable_setfield(vable, 8, new_val);
@@ -2179,7 +2197,7 @@ mod tests {
         let box1 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, &[box0, box1], &[]);
+        ctx.init_virtualizable_boxes(&info, vable, &[box0, box1], &[]);
 
         // Unknown offset (999) → fallback to heap op
         let _result = ctx.vable_getfield_int(vable, 999);
@@ -2199,7 +2217,7 @@ mod tests {
         let box0 = recorder.record_input_arg(Type::Ref);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, &[box0], &[]);
+        ctx.init_virtualizable_boxes(&info, vable, &[box0], &[]);
 
         let result = ctx.vable_getfield_ref(vable, 8);
         assert_eq!(result, box0);
@@ -2218,7 +2236,7 @@ mod tests {
         let box0 = recorder.record_input_arg(Type::Float);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, &[box0], &[]);
+        ctx.init_virtualizable_boxes(&info, vable, &[box0], &[]);
 
         let result = ctx.vable_getfield_float(vable, 8);
         assert_eq!(result, box0);
@@ -2241,6 +2259,7 @@ mod tests {
 
         ctx.init_virtualizable_boxes(
             &info,
+            vable,
             &[box_pc, box_arr0, box_arr1, box_arr2],
             &[3], // array has 3 elements
         );
@@ -2272,6 +2291,7 @@ mod tests {
 
         ctx.init_virtualizable_boxes(
             &info,
+            vable,
             &[box_pc, box_arr0, box_arr1],
             &[2], // array has 2 elements
         );
@@ -2298,7 +2318,7 @@ mod tests {
         let box_arr0 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, &[box_pc, box_arr0], &[1]);
+        ctx.init_virtualizable_boxes(&info, vable, &[box_pc, box_arr0], &[1]);
 
         // Unknown array field offset → fallback
         let _r = ctx.vable_getarrayitem_int_vable(vable, 999, 0);
@@ -2321,15 +2341,15 @@ mod tests {
         // Before init: None
         assert!(ctx.collect_virtualizable_boxes().is_none());
 
-        ctx.init_virtualizable_boxes(&info, &[box0, box1], &[]);
+        ctx.init_virtualizable_boxes(&info, vable, &[box0, box1], &[]);
 
-        // After init: has boxes
+        // After init: has boxes (field0, field1, vable_ref sentinel)
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
-        assert_eq!(boxes, vec![box0, box1]);
+        assert_eq!(boxes, vec![box0, box1, vable]);
 
         // After mutation
         ctx.vable_setfield(vable, 8, new_val);
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
-        assert_eq!(boxes, vec![new_val, box1]);
+        assert_eq!(boxes, vec![new_val, box1, vable]);
     }
 }
