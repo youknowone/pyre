@@ -120,6 +120,57 @@ pub fn green_key_hash(values: &[i64]) -> u64 {
 // Re-exported from majit-codegen so both meta and backend can access it.
 pub use majit_codegen::{set_jitted, we_are_jitted, JittedGuard};
 
+/// Generic guard state restore for storage-pool interpreters.
+///
+/// Decodes a flat `values` array produced by a guard failure back into
+/// per-storage arrays, plus a selected-storage index and resume PC.
+///
+/// Values layout: `[storage_0_vals..., storage_1_vals..., ...,
+///                  len_0, len_1, ..., selected, resume_pc]`
+///
+/// `storage_layout` lists `(storage_idx, num_traced)` in the same order
+/// that the tracer recorded them.
+///
+/// Returns `(resume_pc, selected_storage)` on success, or `None` if the
+/// values are malformed.
+pub fn restore_storage_pool_guard_state(
+    values: &[i64],
+    storage_layout: &[(usize, usize)],
+    max_selected: usize,
+    max_pc: usize,
+    mut push_fn: impl FnMut(usize, &[i64]),
+) -> Option<(usize, usize)> {
+    let storage_count = storage_layout.len();
+    let lengths_start = values.len().checked_sub(storage_count + 2)?;
+    let lengths = &values[lengths_start..values.len() - 2];
+    let selected = usize::try_from(values[values.len() - 2]).ok()?;
+    let resume_pc = usize::try_from(values[values.len() - 1]).ok()?;
+    if selected >= max_selected || resume_pc > max_pc {
+        return None;
+    }
+
+    let flat_values = &values[..lengths_start];
+    let mut offset = 0;
+    let mut total = 0usize;
+    let mut decoded_lengths = Vec::with_capacity(lengths.len());
+    for &len_raw in lengths {
+        let len = usize::try_from(len_raw).ok()?;
+        total += len;
+        decoded_lengths.push(len);
+    }
+    if total != flat_values.len() {
+        return None;
+    }
+
+    for (i, &len) in decoded_lengths.iter().enumerate() {
+        let end = offset + len;
+        let (storage_idx, _) = storage_layout[i];
+        push_fn(storage_idx, &flat_values[offset..end]);
+        offset = end;
+    }
+    Some((resume_pc, selected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +194,62 @@ mod tests {
         let hash = green_key_hash(&[42, 7]);
         let gk = majit_ir::GreenKey::new(vec![42, 7]);
         assert_eq!(hash, gk.hash_u64());
+    }
+
+    #[test]
+    fn test_restore_storage_pool_basic() {
+        // 2 storages: storage 0 has [10, 20], storage 1 has [30]
+        // layout: [(0, 2), (1, 1)]
+        // values: [10, 20, 30, 2, 1, 3, 42]
+        //          ^flat         ^lens ^sel ^pc
+        let values = [10, 20, 30, 2, 1, 3, 42];
+        let layout = [(0, 2), (1, 1)];
+        let mut result: Vec<(usize, Vec<i64>)> = Vec::new();
+
+        let outcome = restore_storage_pool_guard_state(
+            &values,
+            &layout,
+            10,
+            100,
+            |idx, vals| result.push((idx, vals.to_vec())),
+        );
+
+        assert_eq!(outcome, Some((42, 3)));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], (0, vec![10, 20]));
+        assert_eq!(result[1], (1, vec![30]));
+    }
+
+    #[test]
+    fn test_restore_storage_pool_invalid_selected() {
+        let values = [10, 20, 2, 5, 42];
+        let layout = [(0, 2)];
+
+        let outcome = restore_storage_pool_guard_state(
+            &values,
+            &layout,
+            5, // max_selected = 5, selected = 5 => out of range
+            100,
+            |_, _| {},
+        );
+
+        assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn test_restore_storage_pool_length_mismatch() {
+        // lengths say 3 total but flat area only has 2 values
+        let values = [10, 20, 3, 5, 42];
+        let layout = [(0, 2)];
+
+        let outcome = restore_storage_pool_guard_state(
+            &values,
+            &layout,
+            10,
+            100,
+            |_, _| panic!("should not be called"),
+        );
+
+        assert_eq!(outcome, None);
     }
 }
