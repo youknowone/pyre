@@ -11,8 +11,8 @@ use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 
 use pyre_interp::frame::PyFrame;
-use pyre_interp::jit::state::{PyreEnv, PyreJitState};
-use pyre_interp::jit::trace::trace_bytecode;
+use crate::jit::state::{PyreEnv, PyreJitState};
+use crate::jit::trace::trace_bytecode;
 use pyre_object::w_none;
 use pyre_bytecode::bytecode::OpArgState;
 use pyre_runtime::{
@@ -24,10 +24,28 @@ use majit_meta::DetailedDriverRunOutcome;
 /// Function-entry tracing threshold.
 const FUNC_ENTRY_THRESHOLD: u32 = 7;
 
-// Use pyre-interp's JIT_DRIVER TLS (transitional — until jit/ moves here).
+use crate::jit::frame_layout::build_pyframe_virtualizable_info;
+use majit_meta::JitDriver;
+
+const JIT_THRESHOLD: u32 = 1039;
+
+type JitDriverPair = (
+    JitDriver<PyreJitState>,
+    majit_meta::virtualizable::VirtualizableInfo,
+);
+
+thread_local! {
+    static JIT_DRIVER: UnsafeCell<JitDriverPair> = UnsafeCell::new({
+        let info = build_pyframe_virtualizable_info();
+        let mut d = JitDriver::new(JIT_THRESHOLD);
+        d.set_virtualizable_info(info.clone());
+        (d, info)
+    });
+}
+
 #[inline]
-fn driver_pair() -> &'static mut (majit_meta::JitDriver<PyreJitState>, majit_meta::virtualizable::VirtualizableInfo) {
-    pyre_interp::eval::driver_pair()
+pub fn driver_pair() -> &'static mut JitDriverPair {
+    JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
 
 thread_local! {
@@ -75,7 +93,7 @@ fn depth_bump_callback() -> Option<Box<dyn std::any::Any>> {
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     pyre_interp::call::register_eval_override(eval_with_jit);
     pyre_interp::call::register_depth_bump(depth_bump_callback);
-    pyre_interp::call::install_jit_call_bridge();
+    crate::call_jit::install_jit_call_bridge();
     frame.fix_array_ptrs();
 
     if let Some(result) = try_function_entry_jit(frame) {

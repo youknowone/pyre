@@ -1509,7 +1509,7 @@ impl TraceFrameState {
                     .or_else(|| driver.get_pending_token_number(callee_key));
 
                 if let Some(token_number) = token_number {
-                    if let Some(frame_helper) = crate::call::callee_frame_helper(args.len()) {
+                    if let Some(frame_helper) = crate::call_jit::callee_frame_helper(args.len()) {
                         // Get callee's num_locals from compiled meta or code object
                         let callee_meta = driver.get_compiled_meta(callee_key);
                         let callee_nlocals =
@@ -1554,7 +1554,7 @@ impl TraceFrameState {
                             }
                             let result = ctx.call_assembler_int_by_number(token_number, &ca_args);
                             ctx.call_void(
-                                crate::call::jit_drop_callee_frame as *const (),
+                                crate::call_jit::jit_drop_callee_frame as *const (),
                                 &[callee_frame],
                             );
                             Ok(result)
@@ -1564,7 +1564,7 @@ impl TraceFrameState {
 
                 // 2. Inline: trace through callee (meta-tracing default)
                 if driver.should_inline(callee_key) == majit_meta::InlineDecision::Inline {
-                    if let Some(frame_helper) = crate::call::callee_frame_helper(args.len()) {
+                    if let Some(frame_helper) = crate::call_jit::callee_frame_helper(args.len()) {
                         return self.inline_function_call(
                             callable,
                             args,
@@ -1851,7 +1851,7 @@ impl TraceFrameState {
             let callee_frame_opref = ctx.call_int(frame_helper, &helper_args);
 
             // Create the concrete callee frame (for trace-time execution)
-            let caller_frame_ptr = this.concrete_frame as *const crate::frame::PyFrame;
+            let caller_frame_ptr = this.concrete_frame as *const pyre_interp::frame::PyFrame;
             let caller_frame = unsafe { &*caller_frame_ptr };
             let code_ptr = unsafe { w_func_get_code_ptr(concrete_callable) };
             let globals = unsafe { pyre_runtime::w_func_get_globals(concrete_callable) };
@@ -1864,7 +1864,7 @@ impl TraceFrameState {
                         .unwrap_or(std::ptr::null_mut())
                 })
                 .collect();
-            let mut callee_frame = crate::frame::PyFrame::new_for_call(
+            let mut callee_frame = pyre_interp::frame::PyFrame::new_for_call(
                 func_code,
                 &concrete_args,
                 globals,
@@ -1886,12 +1886,12 @@ impl TraceFrameState {
 
                     // Drop callee frame (compiled-code runtime)
                     ctx.call_void(
-                        crate::call::jit_drop_callee_frame as *const (),
+                        crate::call_jit::jit_drop_callee_frame as *const (),
                         &[callee_frame_opref],
                     );
 
                     // Store result for concrete handler bypass
-                    crate::call::set_inline_handled_result(concrete_result);
+                    pyre_interp::call::set_inline_handled_result(concrete_result);
 
                     Ok(result_opref)
                 }
@@ -1918,7 +1918,7 @@ impl TraceFrameState {
 fn inline_trace_and_execute(
     ctx: &mut TraceCtx,
     callee_frame_opref: OpRef,
-    callee: &mut crate::frame::PyFrame,
+    callee: &mut pyre_interp::frame::PyFrame,
 ) -> Result<(OpRef, PyObjectRef), pyre_runtime::PyError> {
     use pyre_bytecode::bytecode::OpArgState;
     use pyre_runtime::StepResult;
