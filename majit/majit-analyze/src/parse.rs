@@ -179,26 +179,48 @@ pub fn extract_offset_constants(parsed: &ParsedInterpreter) -> Vec<(String, Stri
     constants
 }
 
-/// Collect all function definitions into a name → body_summary map.
+/// Collected function info with both body_summary and pre-built graph.
+pub struct CollectedFunction {
+    pub body_summary: String,
+    pub graph: crate::graph::MajitGraph,
+}
+
+/// Collect all function definitions with pre-built graphs.
 pub fn collect_functions(
     parsed: &ParsedInterpreter,
     functions: &mut std::collections::HashMap<String, String>,
+) {
+    collect_functions_with_graphs(parsed, functions, &mut std::collections::HashMap::new());
+}
+
+/// Collect functions with both body_summary and graph.
+pub fn collect_functions_with_graphs(
+    parsed: &ParsedInterpreter,
+    body_summaries: &mut std::collections::HashMap<String, String>,
+    graphs: &mut std::collections::HashMap<String, crate::graph::MajitGraph>,
 ) {
     for item in &parsed.file.items {
         match item {
             Item::Fn(func) => {
                 let name = func.sig.ident.to_string();
-                let body = summarize_block(&func.block);
-                functions.insert(name, body);
+                body_summaries.insert(name.clone(), summarize_block(&func.block));
+                let sf = crate::front::ast::build_function_graph_pub(func);
+                graphs.insert(name, sf.graph);
             }
             Item::Impl(impl_block) => {
-                // Also collect methods from inherent impls (no trait)
                 if impl_block.trait_.is_none() {
                     for item in &impl_block.items {
                         if let syn::ImplItem::Fn(method) = item {
                             let name = method.sig.ident.to_string();
-                            let body = summarize_block(&method.block);
-                            functions.insert(name, body);
+                            body_summaries.insert(name.clone(), summarize_block(&method.block));
+                            let fake_fn = syn::ItemFn {
+                                attrs: method.attrs.clone(),
+                                vis: syn::Visibility::Inherited,
+                                sig: method.sig.clone(),
+                                block: Box::new(method.block.clone()),
+                            };
+                            let sf = crate::front::ast::build_function_graph_pub(&fake_fn);
+                            graphs.insert(name, sf.graph);
                         }
                     }
                 }
