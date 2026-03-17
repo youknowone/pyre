@@ -1,90 +1,164 @@
-/// JIT-enabled tiny3 interpreter — port of rpython/jit/tl/tiny3_hotpath.py.
+/// JIT-enabled tiny3 interpreter using JitDriver + JitState.
 ///
-/// Greens: [pos, bytecode]   (bytecode and position are loop constants)
+/// Greens: [pos, bytecode]   (bytecode is constant per trace — not tracked)
 /// Reds:   [args]
 ///
 /// Identical JIT strategy to tiny2: trace the integer-only path.
 /// When all args are integers, the loop body compiles to pure i64 arithmetic.
 /// The difference from tiny2 is the interpreter: non-integer values are FloatBox
 /// (not StrBox), and mixed int/float arithmetic casts to float.
-use std::collections::HashMap;
-
-use majit_codegen::{Backend, LoopToken};
-use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{OpCode, OpRef, Type, Value};
-use majit_opt::optimizer::Optimizer;
-use majit_trace::recorder::TraceRecorder;
-use majit_trace::warmstate::{HotResult, WarmEnterState};
+use majit_ir::{OpCode, OpRef};
+use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};
 
 const DEFAULT_THRESHOLD: u32 = 3;
 
-struct CompiledLoop {
-    token: LoopToken,
+// ── JitState types ──
+
+/// Red variables: the args array (integer-only path).
+pub struct Tiny3State {
+    args: Vec<i64>,
+}
+
+/// Trace shape captured at trace start.
+#[derive(Clone)]
+pub struct Tiny3Meta {
     num_args: usize,
 }
 
-struct TracingState {
-    recorder: TraceRecorder,
-    loop_header_pos: usize,
-    /// args[i] → OpRef mapping (the live state).
+/// Symbolic state during tracing — OpRef for each arg + computation stack.
+pub struct Tiny3Sym {
+    /// args[i] → current OpRef mapping.
     trace_args: Vec<OpRef>,
-    /// Intermediate computation stack (maps to OpRef during tracing).
+    /// Intermediate computation stack during tracing.
     trace_stack: Vec<OpRef>,
-    num_args: usize,
-    constants: HashMap<u32, i64>,
-    next_const_ref: u32,
 }
 
-impl TracingState {
-    fn const_ref(&mut self, value: i64) -> OpRef {
-        for (&idx, &v) in &self.constants {
-            if v == value {
-                return OpRef(idx);
-            }
+impl JitState for Tiny3State {
+    type Meta = Tiny3Meta;
+    type Sym = Tiny3Sym;
+    type Env = [&'static str];
+
+    fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Tiny3Meta {
+        Tiny3Meta {
+            num_args: self.args.len(),
         }
-        let opref = OpRef(self.next_const_ref);
-        self.next_const_ref += 1;
-        self.constants.insert(opref.0, value);
-        opref
+    }
+
+    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        self.args.clone()
+    }
+
+    fn create_sym(meta: &Self::Meta, _header_pc: usize) -> Tiny3Sym {
+        let trace_args: Vec<OpRef> = (0..meta.num_args)
+            .map(|i| OpRef(i as u32))
+            .collect();
+        Tiny3Sym {
+            trace_args,
+            trace_stack: Vec::new(),
+        }
+    }
+
+    fn is_compatible(&self, meta: &Self::Meta) -> bool {
+        self.args.len() == meta.num_args
+    }
+
+    fn restore(&mut self, _meta: &Self::Meta, values: &[i64]) {
+        self.args.clear();
+        self.args.extend_from_slice(values);
+    }
+
+    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
+        sym.trace_args.clone()
+    }
+
+    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+        true
     }
 }
 
+/// Trace one instruction, recording IR into ctx.
+fn trace_instruction(
+    ctx: &mut TraceCtx,
+    sym: &mut Tiny3Sym,
+    bytecode: &[&str],
+    pos: usize,
+) -> TraceAction {
+    let opcode = bytecode[pos];
+
+    if opcode == "ADD" || opcode == "SUB" || opcode == "MUL" {
+        let b = sym.trace_stack.pop().unwrap();
+        let a = sym.trace_stack.pop().unwrap();
+        let ir_op = match opcode {
+            "ADD" => OpCode::IntAdd,
+            "SUB" => OpCode::IntSub,
+            "MUL" => OpCode::IntMul,
+            _ => unreachable!(),
+        };
+        let result = ctx.record_op(ir_op, &[a, b]);
+        sym.trace_stack.push(result);
+    } else if opcode.starts_with('#') {
+        let n = parse_int(opcode, 1) as usize;
+        let opref = sym.trace_args[n - 1];
+        sym.trace_stack.push(opref);
+    } else if opcode.starts_with("->#") {
+        let n = parse_int(opcode, 3) as usize;
+        let opref = sym.trace_stack.pop().unwrap();
+        sym.trace_args[n - 1] = opref;
+    } else if opcode == "{" {
+        return TraceAction::Abort;
+    } else if opcode == "}" {
+        let flag_ref = sym.trace_stack.pop().unwrap();
+        let zero = ctx.const_int(0);
+        let cond = ctx.record_op(OpCode::IntNe, &[flag_ref, zero]);
+        let num_live = sym.trace_args.len();
+        let fail_args: Vec<OpRef> = sym.trace_args.clone();
+        ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[cond], num_live, &fail_args);
+        return TraceAction::CloseLoop;
+    } else {
+        // Integer literal
+        let val = parse_int(opcode, 0);
+        let opref = ctx.const_int(val);
+        sym.trace_stack.push(opref);
+    }
+
+    TraceAction::Continue
+}
+
 pub struct JitTiny3Interp {
-    warm_state: WarmEnterState,
-    backend: CraneliftBackend,
-    compiled_loops: HashMap<usize, CompiledLoop>,
-    tracing: Option<TracingState>,
+    driver: JitDriver<Tiny3State>,
 }
 
 impl JitTiny3Interp {
     pub fn new() -> Self {
         JitTiny3Interp {
-            warm_state: WarmEnterState::new(DEFAULT_THRESHOLD),
-            backend: CraneliftBackend::new(),
-            compiled_loops: HashMap::new(),
-            tracing: None,
+            driver: JitDriver::new(DEFAULT_THRESHOLD),
         }
     }
 
     /// Run a word-based program with integer args.
     /// Returns the result: stack top if non-empty, else args[0].
     pub fn run(&mut self, bytecode: &[&str], args: &mut Vec<i64>) -> i64 {
+        // Safety: bytecode references are valid for the duration of run().
+        // We transmute to 'static to satisfy the Env bound; the driver
+        // never stores the env reference beyond back_edge.
+        let static_bytecode: &[&'static str] =
+            unsafe { std::mem::transmute::<&[&str], &[&'static str]>(bytecode) };
+
+        let mut state = Tiny3State {
+            args: args.clone(),
+        };
         let mut stack: Vec<i64> = Vec::new();
         let mut loops: Vec<usize> = Vec::new();
         let mut pos: usize = 0;
 
         while pos < bytecode.len() {
-            // --- tracing: record instruction ---
-            if self.tracing.is_some() {
-                match self.trace_instruction(bytecode, pos) {
-                    TraceAction::Continue => {}
-                    TraceAction::CloseLoop => {
-                        self.close_and_compile();
-                    }
-                    TraceAction::Abort => {
-                        self.abort_trace();
-                    }
-                }
+            // jit_merge_point
+            {
+                let bc = bytecode;
+                let p = pos;
+                self.driver.merge_point(|ctx, sym| {
+                    trace_instruction(ctx, sym, bc, p)
+                });
             }
 
             let opcode = bytecode[pos];
@@ -102,11 +176,11 @@ impl JitTiny3Interp {
                 stack.push(result);
             } else if opcode.starts_with('#') {
                 let n = parse_int(opcode, 1) as usize;
-                stack.push(args[n - 1]);
+                stack.push(state.args[n - 1]);
             } else if opcode.starts_with("->#") {
                 let n = parse_int(opcode, 3) as usize;
                 let val = stack.pop().unwrap();
-                args[n - 1] = val;
+                state.args[n - 1] = val;
             } else if opcode == "{" {
                 loops.push(pos);
             } else if opcode == "}" {
@@ -116,21 +190,17 @@ impl JitTiny3Interp {
                 } else {
                     let target = *loops.last().unwrap();
 
-                    if self.tracing.is_none() {
-                        match self.warm_state.maybe_compile(target as u64) {
-                            HotResult::NotHot => {}
-                            HotResult::StartTracing(recorder) => {
-                                self.start_tracing(recorder, target, args);
-                            }
-                            HotResult::AlreadyTracing => {}
-                            HotResult::RunCompiled => {
-                                if let Some(new_args) = self.run_compiled(target, args) {
-                                    *args = new_args;
-                                    loops.pop();
-                                    continue;
-                                }
-                            }
-                        }
+                    // can_enter_jit
+                    if target < pos
+                        && self
+                            .driver
+                            .back_edge(target, &mut state, static_bytecode, || {})
+                    {
+                        // Compiled code ran — state.args is restored.
+                        // The guard exits when flag == 0, so the loop is done.
+                        loops.pop();
+                        *args = state.args.clone();
+                        continue;
                     }
 
                     pos = target;
@@ -141,158 +211,14 @@ impl JitTiny3Interp {
             }
         }
 
+        // Sync final state back
+        *args = state.args.clone();
+
         if !stack.is_empty() {
             stack.pop().unwrap()
         } else {
-            args[0]
+            state.args[0]
         }
-    }
-
-    fn start_tracing(&mut self, recorder: TraceRecorder, loop_header_pos: usize, args: &[i64]) {
-        let num_args = args.len();
-        let mut state = TracingState {
-            recorder,
-            loop_header_pos,
-            trace_args: Vec::new(),
-            trace_stack: Vec::new(),
-            num_args,
-            constants: HashMap::new(),
-            next_const_ref: 10_000,
-        };
-
-        for _ in 0..num_args {
-            let opref = state.recorder.record_input_arg(Type::Int);
-            state.trace_args.push(opref);
-        }
-
-        self.tracing = Some(state);
-    }
-
-    fn trace_instruction(&mut self, bytecode: &[&str], pos: usize) -> TraceAction {
-        let state = self.tracing.as_mut().unwrap();
-        let opcode = bytecode[pos];
-
-        if opcode == "ADD" || opcode == "SUB" || opcode == "MUL" {
-            let b = state.trace_stack.pop().unwrap();
-            let a = state.trace_stack.pop().unwrap();
-            let ir_op = match opcode {
-                "ADD" => OpCode::IntAdd,
-                "SUB" => OpCode::IntSub,
-                "MUL" => OpCode::IntMul,
-                _ => unreachable!(),
-            };
-            let result = state.recorder.record_op(ir_op, &[a, b]);
-            state.trace_stack.push(result);
-        } else if opcode.starts_with('#') {
-            let n = parse_int(opcode, 1) as usize;
-            let opref = state.trace_args[n - 1];
-            state.trace_stack.push(opref);
-        } else if opcode.starts_with("->#") {
-            let n = parse_int(opcode, 3) as usize;
-            let opref = state.trace_stack.pop().unwrap();
-            state.trace_args[n - 1] = opref;
-        } else if opcode == "{" {
-            return TraceAction::Abort;
-        } else if opcode == "}" {
-            let flag_ref = state.trace_stack.pop().unwrap();
-
-            let zero = state.const_ref(0);
-            let cond = state.recorder.record_op(OpCode::IntNe, &[flag_ref, zero]);
-            let fail_descr = make_fail_descr(state.num_args);
-            let fail_args: Vec<OpRef> = state.trace_args.clone();
-            state.recorder.record_guard_with_fail_args(
-                OpCode::GuardTrue,
-                &[cond],
-                fail_descr,
-                &fail_args,
-            );
-
-            return TraceAction::CloseLoop;
-        } else {
-            let val = parse_int(opcode, 0);
-            let opref = state.const_ref(val);
-            state.trace_stack.push(opref);
-        }
-
-        if state.recorder.is_too_long() {
-            return TraceAction::Abort;
-        }
-        TraceAction::Continue
-    }
-
-    fn close_and_compile(&mut self) {
-        let state = self.tracing.take().unwrap();
-        let green_key = state.loop_header_pos as u64;
-
-        let jump_args: Vec<OpRef> = state.trace_args.clone();
-
-        let mut recorder = state.recorder;
-        recorder.close_loop(&jump_args);
-        let trace = recorder.get_trace();
-
-        let mut optimizer = Optimizer::default_pipeline();
-        let mut constants = state.constants;
-
-        if std::env::var("MAJIT_LOG").is_ok() {
-            eprintln!("--- trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
-        }
-
-        let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
-
-        if std::env::var("MAJIT_LOG").is_ok() {
-            eprintln!("--- trace (after opt) ---");
-            eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
-        }
-
-        self.backend.set_constants(constants);
-
-        let token_num = self.warm_state.alloc_token_number();
-        let mut token = LoopToken::new(token_num);
-
-        match self
-            .backend
-            .compile_loop(&trace.inputargs, &optimized_ops, &mut token)
-        {
-            Ok(_) => {
-                self.compiled_loops.insert(
-                    state.loop_header_pos,
-                    CompiledLoop {
-                        token,
-                        num_args: state.num_args,
-                    },
-                );
-                let install_num = self.warm_state.alloc_token_number();
-                let install_token = LoopToken::new(install_num);
-                self.warm_state.install_compiled(green_key, install_token);
-            }
-            Err(e) => {
-                eprintln!("JIT compilation failed: {e}");
-                self.warm_state.abort_tracing(green_key, true);
-            }
-        }
-    }
-
-    fn abort_trace(&mut self) {
-        if let Some(state) = self.tracing.take() {
-            state.recorder.abort();
-            self.warm_state
-                .abort_tracing(state.loop_header_pos as u64, false);
-        }
-    }
-
-    fn run_compiled(&mut self, loop_pos: usize, args: &[i64]) -> Option<Vec<i64>> {
-        let compiled = self.compiled_loops.get(&loop_pos)?;
-
-        let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
-        let frame = self.backend.execute_token(&compiled.token, &values);
-
-        let mut new_args = Vec::new();
-        for i in 0..compiled.num_args {
-            new_args.push(self.backend.get_int_value(&frame, i));
-        }
-
-        Some(new_args)
     }
 }
 
@@ -304,42 +230,6 @@ fn parse_int(s: &str, start: usize) -> i64 {
         res = res * 10 + d;
     }
     res
-}
-
-enum TraceAction {
-    Continue,
-    CloseLoop,
-    Abort,
-}
-
-fn make_fail_descr(num_live: usize) -> majit_ir::DescrRef {
-    use std::sync::Arc;
-    Arc::new(Tiny3FailDescr {
-        types: vec![Type::Int; num_live],
-    })
-}
-
-#[derive(Debug)]
-struct Tiny3FailDescr {
-    types: Vec<Type>,
-}
-
-impl majit_ir::Descr for Tiny3FailDescr {
-    fn index(&self) -> u32 {
-        0
-    }
-    fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
-        Some(self)
-    }
-}
-
-impl majit_ir::FailDescr for Tiny3FailDescr {
-    fn fail_index(&self) -> u32 {
-        0
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.types
-    }
 }
 
 #[cfg(test)]

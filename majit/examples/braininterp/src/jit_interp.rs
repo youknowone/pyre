@@ -1,4 +1,4 @@
-/// JIT-enabled Brainfuck interpreter — structural mirror of braininterp.py with JitDriver.
+/// JIT-enabled Brainfuck interpreter using JitDriver + JitState.
 ///
 /// Greens: [pc, code]    (code is constant per trace)
 /// Reds:   [pointer, tape]
@@ -15,96 +15,219 @@
 /// accessed cells, as required by the trace recorder.
 use std::collections::HashMap;
 
-use majit_codegen::{Backend, LoopToken};
-use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{OpCode, OpRef, Type, Value};
-use majit_opt::optimizer::Optimizer;
-use majit_trace::recorder::TraceRecorder;
-use majit_trace::warmstate::{HotResult, WarmEnterState};
+use majit_ir::{OpCode, OpRef};
+use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};
 
 const TAPE_SIZE: usize = 30000;
 const DEFAULT_THRESHOLD: u32 = 3;
 
-struct CompiledLoop {
-    token: LoopToken,
-    /// Sorted list of tape positions that are the input/output args.
+// ── JitState types ──
+
+/// Red variables: tape pointer + tape contents.
+pub struct BfState {
+    pointer: usize,
+    tape: Vec<u8>,
+}
+
+/// Trace shape captured at trace start.
+#[derive(Clone)]
+pub struct BfMeta {
+    /// Sorted absolute tape positions that are live at the loop header.
     tape_positions: Vec<usize>,
+    /// Tape pointer at trace start (initial trace_pointer for BfSym).
+    initial_pointer: usize,
 }
 
-struct TracingState {
-    recorder: TraceRecorder,
-    loop_header_pc: usize,
-    /// Maps absolute tape position -> OpRef for the current value.
-    trace_tape: HashMap<usize, OpRef>,
-    /// Sorted tape positions at loop entry (determines input arg order).
-    entry_positions: Vec<usize>,
-    /// Current tape pointer during tracing.
+/// Symbolic state during tracing — OpRef for each live tape cell.
+pub struct BfSym {
+    /// Maps absolute tape position → current OpRef.
+    tape: HashMap<usize, OpRef>,
+    /// Ordered list of tape positions (same order as inputargs).
+    tape_positions: Vec<usize>,
+    /// Current tape pointer during tracing (tracked symbolically as pointer moves).
     trace_pointer: usize,
-    constants: HashMap<u32, i64>,
-    next_const_ref: u32,
 }
 
-impl TracingState {
-    fn const_ref(&mut self, value: i64) -> OpRef {
-        for (&idx, &v) in &self.constants {
-            if v == value {
-                return OpRef(idx);
-            }
-        }
-        let opref = OpRef(self.next_const_ref);
-        self.next_const_ref += 1;
-        self.constants.insert(opref.0, value);
-        opref
-    }
-
+impl BfSym {
     fn get_tape_cell(&self, pos: usize) -> OpRef {
         *self
-            .trace_tape
+            .tape
             .get(&pos)
             .expect("tape cell should be pre-registered")
     }
 
     fn set_tape_cell(&mut self, pos: usize, opref: OpRef) {
-        self.trace_tape.insert(pos, opref);
+        self.tape.insert(pos, opref);
     }
 }
 
+impl JitState for BfState {
+    type Meta = BfMeta;
+    type Sym = BfSym;
+    type Env = [u8];
+
+    fn build_meta(&self, header_pc: usize, env: &Self::Env) -> BfMeta {
+        let offsets = scan_loop_offsets(env, header_pc);
+        let mut tape_positions: Vec<usize> = offsets
+            .iter()
+            .map(|&off| (self.pointer as isize + off) as usize)
+            .collect();
+        tape_positions.sort();
+        tape_positions.dedup();
+        BfMeta {
+            tape_positions,
+            initial_pointer: self.pointer,
+        }
+    }
+
+    fn extract_live(&self, meta: &Self::Meta) -> Vec<i64> {
+        meta.tape_positions
+            .iter()
+            .map(|&pos| self.tape[pos] as i64)
+            .collect()
+    }
+
+    fn create_sym(meta: &Self::Meta, _header_pc: usize) -> BfSym {
+        let mut tape = HashMap::new();
+        for (i, &pos) in meta.tape_positions.iter().enumerate() {
+            tape.insert(pos, OpRef(i as u32));
+        }
+        BfSym {
+            tape,
+            tape_positions: meta.tape_positions.clone(),
+            trace_pointer: meta.initial_pointer,
+        }
+    }
+
+    fn is_compatible(&self, meta: &Self::Meta) -> bool {
+        meta.tape_positions.iter().all(|&pos| pos < self.tape.len())
+    }
+
+    fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
+        for (i, &pos) in meta.tape_positions.iter().enumerate() {
+            self.tape[pos] = values[i] as u8;
+        }
+    }
+
+    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
+        sym.tape_positions
+            .iter()
+            .filter_map(|pos| sym.tape.get(pos).copied())
+            .collect()
+    }
+
+    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+        true
+    }
+}
+
+/// Trace one instruction, recording IR into ctx.
+fn trace_instruction(
+    ctx: &mut TraceCtx,
+    sym: &mut BfSym,
+    code: &[u8],
+    pc: usize,
+    tape: &[u8],
+    pointer: usize,
+    header_pc: usize,
+) -> TraceAction {
+    let ch = code[pc];
+
+    if ch == b'>' {
+        sym.trace_pointer += 1;
+    } else if ch == b'<' {
+        sym.trace_pointer -= 1;
+    } else if ch == b'+' {
+        let pos = sym.trace_pointer;
+        let cell = sym.get_tape_cell(pos);
+        let one = ctx.const_int(1);
+        let result = ctx.record_op(OpCode::IntAdd, &[cell, one]);
+        sym.set_tape_cell(pos, result);
+    } else if ch == b'-' {
+        let pos = sym.trace_pointer;
+        let cell = sym.get_tape_cell(pos);
+        let one = ctx.const_int(1);
+        let result = ctx.record_op(OpCode::IntSub, &[cell, one]);
+        sym.set_tape_cell(pos, result);
+    } else if ch == b'.' || ch == b',' {
+        // I/O during tracing — abort.
+        return TraceAction::Abort;
+    } else if ch == b'[' {
+        // Nested loop entry: guard the condition.
+        let pos = sym.trace_pointer;
+        let cell = sym.get_tape_cell(pos);
+        let runtime_val = tape[pointer];
+
+        let zero = ctx.const_int(0);
+        let num_live = sym.tape_positions.len();
+        if runtime_val == 0 {
+            let cmp = ctx.record_op(OpCode::IntEq, &[cell, zero]);
+            ctx.record_guard(OpCode::GuardTrue, &[cmp], num_live);
+        } else {
+            let cmp = ctx.record_op(OpCode::IntNe, &[cell, zero]);
+            ctx.record_guard(OpCode::GuardTrue, &[cmp], num_live);
+        }
+    } else if ch == b']' {
+        let pos = sym.trace_pointer;
+        let cell = sym.get_tape_cell(pos);
+        let runtime_val = tape[pointer];
+
+        let zero = ctx.const_int(0);
+        let num_live = sym.tape_positions.len();
+
+        if runtime_val != 0 {
+            let target = find_matching_open(code, pc);
+
+            let cmp = ctx.record_op(OpCode::IntNe, &[cell, zero]);
+            ctx.record_guard(OpCode::GuardTrue, &[cmp], num_live);
+
+            if target == header_pc {
+                return TraceAction::CloseLoop;
+            }
+            // Inner loop back-edge: guard emitted, continue tracing.
+        } else {
+            // Loop exit: guard that cell is zero.
+            let cmp = ctx.record_op(OpCode::IntEq, &[cell, zero]);
+            ctx.record_guard(OpCode::GuardTrue, &[cmp], num_live);
+        }
+    }
+
+    TraceAction::Continue
+}
+
 pub struct JitBrainInterp {
-    warm_state: WarmEnterState,
-    backend: CraneliftBackend,
-    compiled_loops: HashMap<usize, CompiledLoop>,
-    tracing: Option<TracingState>,
+    driver: JitDriver<BfState>,
 }
 
 impl JitBrainInterp {
     pub fn new() -> Self {
         JitBrainInterp {
-            warm_state: WarmEnterState::new(DEFAULT_THRESHOLD),
-            backend: CraneliftBackend::new(),
-            compiled_loops: HashMap::new(),
-            tracing: None,
+            driver: JitDriver::new(DEFAULT_THRESHOLD),
         }
     }
 
     pub fn run(&mut self, code: &[u8]) -> String {
-        let mut tape = vec![0u8; TAPE_SIZE];
-        let mut pointer: usize = 0;
+        let mut state = BfState {
+            pointer: 0,
+            tape: vec![0u8; TAPE_SIZE],
+        };
         let mut output = String::new();
         let mut pc: usize = 0;
 
         while pc < code.len() {
-            // --- tracing: record instruction ---
-            if self.tracing.is_some() {
-                match self.trace_instruction(code, pc, &tape, pointer) {
-                    TraceAction::Continue => {}
-                    TraceAction::CloseLoop => {
-                        self.close_and_compile();
-                    }
-                    TraceAction::Abort => {
-                        self.abort_trace();
-                    }
-                }
-            }
+            // jit_merge_point: trace instruction if tracing is active.
+            let header_pc = self
+                .driver
+                .current_trace_green_key()
+                .map(|k| k as usize)
+                .unwrap_or(0);
+            let pointer = state.pointer;
+            let tape_snapshot: *const [u8] = &*state.tape;
+            self.driver.merge_point(|ctx, sym| {
+                // Safety: tape is not modified during tracing — only symbolic ops are recorded.
+                let tape = unsafe { &*tape_snapshot };
+                trace_instruction(ctx, sym, code, pc, tape, pointer, header_pc)
+            });
 
             if pc >= code.len() {
                 break;
@@ -112,25 +235,25 @@ impl JitBrainInterp {
 
             let ch = code[pc];
             if ch == b'>' {
-                pointer += 1;
+                state.pointer += 1;
                 pc += 1;
             } else if ch == b'<' {
-                pointer -= 1;
+                state.pointer -= 1;
                 pc += 1;
             } else if ch == b'+' {
-                tape[pointer] = tape[pointer].wrapping_add(1);
+                state.tape[state.pointer] = state.tape[state.pointer].wrapping_add(1);
                 pc += 1;
             } else if ch == b'-' {
-                tape[pointer] = tape[pointer].wrapping_sub(1);
+                state.tape[state.pointer] = state.tape[state.pointer].wrapping_sub(1);
                 pc += 1;
             } else if ch == b'.' {
-                output.push(tape[pointer] as char);
+                output.push(state.tape[state.pointer] as char);
                 pc += 1;
             } else if ch == b',' {
-                tape[pointer] = 0;
+                state.tape[state.pointer] = 0;
                 pc += 1;
             } else if ch == b'[' {
-                if tape[pointer] == 0 {
+                if state.tape[state.pointer] == 0 {
                     let mut need: i32 = 1;
                     let mut p = pc + 1;
                     while need > 0 {
@@ -146,31 +269,16 @@ impl JitBrainInterp {
                     pc += 1;
                 }
             } else if ch == b']' {
-                if tape[pointer] != 0 {
-                    // Find matching '[' — this is the back-edge.
+                if state.tape[state.pointer] != 0 {
                     let target = find_matching_open(code, pc);
 
-                    if self.tracing.is_none() {
-                        // Back-edge: check hotness.
-                        match self.warm_state.maybe_compile(target as u64) {
-                            HotResult::NotHot => {}
-                            HotResult::StartTracing(recorder) => {
-                                self.start_tracing(recorder, code, target, &tape, pointer);
-                            }
-                            HotResult::AlreadyTracing => {}
-                            HotResult::RunCompiled => {
-                                if let Some(new_cells) = self.run_compiled(target, &tape) {
-                                    // Write results back to tape.
-                                    let compiled = self.compiled_loops.get(&target).unwrap();
-                                    for (i, &pos) in compiled.tape_positions.iter().enumerate() {
-                                        tape[pos] = new_cells[i] as u8;
-                                    }
-                                    // After compiled loop, the `[` condition is
-                                    // false (guard failed), so skip past `]`.
-                                    pc += 1;
-                                    continue;
-                                }
-                            }
+                    // can_enter_jit: back-edge detection.
+                    if !self.driver.is_tracing() && target < pc {
+                        if self.driver.back_edge(target, &mut state, code, || {}) {
+                            // Compiled loop ran to completion; guard failure means
+                            // the `[` condition is now false — skip past `]`.
+                            pc += 1;
+                            continue;
                         }
                     }
 
@@ -179,233 +287,12 @@ impl JitBrainInterp {
                     pc += 1;
                 }
             } else {
-                // Unknown character: skip.
                 pc += 1;
             }
         }
 
         output
     }
-
-    fn start_tracing(
-        &mut self,
-        mut recorder: TraceRecorder,
-        code: &[u8],
-        loop_header_pc: usize,
-        tape: &[u8],
-        pointer: usize,
-    ) {
-        // Pre-scan the loop body to find all tape offsets accessed.
-        let offsets = scan_loop_offsets(code, loop_header_pc);
-
-        // Convert relative offsets to absolute tape positions.
-        let mut entry_positions: Vec<usize> = offsets
-            .iter()
-            .map(|&off| (pointer as isize + off) as usize)
-            .collect();
-        entry_positions.sort();
-        entry_positions.dedup();
-
-        // Register input args for all accessed tape cells upfront.
-        let mut trace_tape = HashMap::new();
-        for &pos in &entry_positions {
-            let opref = recorder.record_input_arg(Type::Int);
-            trace_tape.insert(pos, opref);
-        }
-
-        let _ = tape;
-        let state = TracingState {
-            recorder,
-            loop_header_pc,
-            trace_tape,
-            entry_positions,
-            trace_pointer: pointer,
-            constants: HashMap::new(),
-            next_const_ref: 10_000,
-        };
-
-        self.tracing = Some(state);
-    }
-
-    fn trace_instruction(
-        &mut self,
-        code: &[u8],
-        pc: usize,
-        tape: &[u8],
-        pointer: usize,
-    ) -> TraceAction {
-        let state = self.tracing.as_mut().unwrap();
-        let ch = code[pc];
-
-        if ch == b'>' {
-            state.trace_pointer += 1;
-        } else if ch == b'<' {
-            state.trace_pointer -= 1;
-        } else if ch == b'+' {
-            let pos = state.trace_pointer;
-            let cell = state.get_tape_cell(pos);
-            let one = state.const_ref(1);
-            let result = state.recorder.record_op(OpCode::IntAdd, &[cell, one]);
-            state.set_tape_cell(pos, result);
-        } else if ch == b'-' {
-            let pos = state.trace_pointer;
-            let cell = state.get_tape_cell(pos);
-            let one = state.const_ref(1);
-            let result = state.recorder.record_op(OpCode::IntSub, &[cell, one]);
-            state.set_tape_cell(pos, result);
-        } else if ch == b'.' {
-            // Output during tracing — we cannot trace I/O, abort.
-            return TraceAction::Abort;
-        } else if ch == b',' {
-            return TraceAction::Abort;
-        } else if ch == b'[' {
-            // Nested loop entry: guard the condition.
-            let pos = state.trace_pointer;
-            let cell = state.get_tape_cell(pos);
-            let runtime_val = tape[pointer];
-
-            let zero = state.const_ref(0);
-            let fail_descr = make_fail_descr(state.entry_positions.len());
-            if runtime_val == 0 {
-                // Loop skipped: guard that cell is zero.
-                let cmp = state.recorder.record_op(OpCode::IntEq, &[cell, zero]);
-                state
-                    .recorder
-                    .record_guard(OpCode::GuardTrue, &[cmp], fail_descr);
-            } else {
-                // Loop entered: guard that cell is non-zero.
-                let cmp = state.recorder.record_op(OpCode::IntNe, &[cell, zero]);
-                state
-                    .recorder
-                    .record_guard(OpCode::GuardTrue, &[cmp], fail_descr);
-            }
-        } else if ch == b']' {
-            let pos = state.trace_pointer;
-            let cell = state.get_tape_cell(pos);
-            let runtime_val = tape[pointer];
-
-            let zero = state.const_ref(0);
-
-            if runtime_val != 0 {
-                let target = find_matching_open(code, pc);
-
-                let fail_descr = make_fail_descr(state.entry_positions.len());
-                let cmp = state.recorder.record_op(OpCode::IntNe, &[cell, zero]);
-                state
-                    .recorder
-                    .record_guard(OpCode::GuardTrue, &[cmp], fail_descr);
-
-                if target == state.loop_header_pc {
-                    // Back-edge to loop header: close loop.
-                    return TraceAction::CloseLoop;
-                }
-                // Inner loop back-edge: guard emitted, continue tracing.
-            } else {
-                // Loop exit: guard that cell is zero.
-                let fail_descr = make_fail_descr(state.entry_positions.len());
-                let cmp = state.recorder.record_op(OpCode::IntEq, &[cell, zero]);
-                state
-                    .recorder
-                    .record_guard(OpCode::GuardTrue, &[cmp], fail_descr);
-            }
-        }
-
-        if self.tracing.as_ref().unwrap().recorder.is_too_long() {
-            return TraceAction::Abort;
-        }
-        TraceAction::Continue
-    }
-
-    fn close_and_compile(&mut self) {
-        let state = self.tracing.take().unwrap();
-        let green_key = state.loop_header_pc as u64;
-
-        // Build jump args in the same order as entry_positions.
-        let jump_args: Vec<OpRef> = state
-            .entry_positions
-            .iter()
-            .map(|pos| state.trace_tape[pos])
-            .collect();
-
-        let mut recorder = state.recorder;
-        recorder.close_loop(&jump_args);
-        let trace = recorder.get_trace();
-
-        let mut optimizer = Optimizer::default_pipeline();
-        let mut constants = state.constants;
-
-        if std::env::var("MAJIT_LOG").is_ok() {
-            eprintln!("--- trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
-        }
-
-        let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
-
-        if std::env::var("MAJIT_LOG").is_ok() {
-            eprintln!("--- trace (after opt) ---");
-            eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
-        }
-
-        self.backend.set_constants(constants);
-
-        let token_num = self.warm_state.alloc_token_number();
-        let mut token = LoopToken::new(token_num);
-
-        match self
-            .backend
-            .compile_loop(&trace.inputargs, &optimized_ops, &mut token)
-        {
-            Ok(_) => {
-                self.compiled_loops.insert(
-                    state.loop_header_pc,
-                    CompiledLoop {
-                        token,
-                        tape_positions: state.entry_positions.clone(),
-                    },
-                );
-                let install_num = self.warm_state.alloc_token_number();
-                let install_token = LoopToken::new(install_num);
-                self.warm_state.install_compiled(green_key, install_token);
-            }
-            Err(e) => {
-                eprintln!("JIT compilation failed: {e}");
-                self.warm_state.abort_tracing(green_key, true);
-            }
-        }
-    }
-
-    fn abort_trace(&mut self) {
-        if let Some(state) = self.tracing.take() {
-            state.recorder.abort();
-            self.warm_state
-                .abort_tracing(state.loop_header_pc as u64, false);
-        }
-    }
-
-    fn run_compiled(&mut self, loop_pc: usize, tape: &[u8]) -> Option<Vec<i64>> {
-        let compiled = self.compiled_loops.get(&loop_pc)?;
-
-        let args: Vec<Value> = compiled
-            .tape_positions
-            .iter()
-            .map(|&pos| Value::Int(tape[pos] as i64))
-            .collect();
-
-        let frame = self.backend.execute_token(&compiled.token, &args);
-
-        let mut results = Vec::new();
-        for i in 0..compiled.tape_positions.len() {
-            results.push(self.backend.get_int_value(&frame, i));
-        }
-
-        Some(results)
-    }
-}
-
-enum TraceAction {
-    Continue,
-    CloseLoop,
-    Abort,
 }
 
 /// Find the matching '[' for a ']' at the given position.
@@ -458,36 +345,6 @@ fn scan_loop_offsets(code: &[u8], open_bracket: usize) -> Vec<isize> {
     offsets.sort();
     offsets.dedup();
     offsets
-}
-
-fn make_fail_descr(num_live: usize) -> majit_ir::DescrRef {
-    use std::sync::Arc;
-    Arc::new(BfFailDescr {
-        types: vec![Type::Int; num_live],
-    })
-}
-
-#[derive(Debug)]
-struct BfFailDescr {
-    types: Vec<Type>,
-}
-
-impl majit_ir::Descr for BfFailDescr {
-    fn index(&self) -> u32 {
-        0
-    }
-    fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
-        Some(self)
-    }
-}
-
-impl majit_ir::FailDescr for BfFailDescr {
-    fn fail_index(&self) -> u32 {
-        0
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.types
-    }
 }
 
 #[cfg(test)]

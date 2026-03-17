@@ -1,17 +1,11 @@
-/// JIT-enabled TLR interpreter — structural mirror of tlr.py with JitDriver.
+/// JIT-enabled TLR interpreter using JitDriver + JitState.
 ///
 /// Greens: [pc, bytecode]   (bytecode is constant per trace — not tracked)
 /// Reds:   [a, regs]
 ///
-/// At backward jumps (JUMP_IF_A where target < pc), triggers tracing.
-use std::collections::HashMap;
-
-use majit_codegen::{Backend, LoopToken};
-use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{OpCode, OpRef, Type, Value};
-use majit_opt::optimizer::Optimizer;
-use majit_trace::recorder::TraceRecorder;
-use majit_trace::warmstate::{HotResult, WarmEnterState};
+/// Mirrors rpython/jit/tl/tlr.py with jit_merge_point / can_enter_jit.
+use majit_ir::{OpCode, OpRef};
+use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};
 
 const MOV_A_R: u8 = 1;
 const MOV_R_A: u8 = 2;
@@ -27,76 +21,191 @@ const DEFAULT_THRESHOLD: u32 = 3;
 /// Virtual register index for the accumulator.
 const ACC: u8 = 255;
 
-struct CompiledLoop {
-    token: LoopToken,
+// ── JitState types ──
+
+/// Red variables: accumulator + registers.
+pub struct TlrState {
+    a: i64,
+    regs: Vec<i64>,
+}
+
+/// Trace shape captured at trace start.
+#[derive(Clone)]
+pub struct TlrMeta {
+    header_pc: usize,
+    /// Which registers (including ACC=255) are live at the loop header.
     live_regs: Vec<u8>,
 }
 
-struct TracingState {
-    recorder: TraceRecorder,
-    loop_header_pc: usize,
-    trace_regs: HashMap<u8, OpRef>,
+/// Symbolic state during tracing — OpRef for each live register.
+pub struct TlrSym {
+    /// Maps register index (or ACC) → current OpRef.
+    regs: std::collections::HashMap<u8, OpRef>,
+    /// Ordered list of live register indices (same order as inputargs).
     live_regs: Vec<u8>,
-    constants: HashMap<u32, i64>,
-    next_const_ref: u32,
 }
 
-impl TracingState {
-    fn const_ref(&mut self, value: i64) -> OpRef {
-        for (&idx, &v) in &self.constants {
-            if v == value {
-                return OpRef(idx);
-            }
-        }
-        let opref = OpRef(self.next_const_ref);
-        self.next_const_ref += 1;
-        self.constants.insert(opref.0, value);
-        opref
-    }
-
-    fn get_or_const(&mut self, reg: u8, runtime_val: i64) -> OpRef {
-        self.trace_regs
+impl TlrSym {
+    fn get_or_const(&self, ctx: &mut TraceCtx, reg: u8, runtime_val: i64) -> OpRef {
+        self.regs
             .get(&reg)
             .copied()
-            .unwrap_or_else(|| self.const_ref(runtime_val))
+            .unwrap_or_else(|| ctx.const_int(runtime_val))
     }
+}
+
+impl JitState for TlrState {
+    type Meta = TlrMeta;
+    type Sym = TlrSym;
+    type Env = [u8];
+
+    fn build_meta(&self, header_pc: usize, env: &Self::Env) -> TlrMeta {
+        let live_regs = scan_live(env, header_pc, self.regs.len());
+        TlrMeta {
+            header_pc,
+            live_regs,
+        }
+    }
+
+    fn extract_live(&self, meta: &Self::Meta) -> Vec<i64> {
+        meta.live_regs
+            .iter()
+            .map(|&r| {
+                if r == ACC {
+                    self.a
+                } else {
+                    self.regs[r as usize]
+                }
+            })
+            .collect()
+    }
+
+    fn create_sym(meta: &Self::Meta, _header_pc: usize) -> TlrSym {
+        // Inputargs OpRef(0), OpRef(1), ... correspond to live_regs in order.
+        let mut regs = std::collections::HashMap::new();
+        for (i, &r) in meta.live_regs.iter().enumerate() {
+            regs.insert(r, OpRef(i as u32));
+        }
+        TlrSym {
+            regs,
+            live_regs: meta.live_regs.clone(),
+        }
+    }
+
+    fn is_compatible(&self, meta: &Self::Meta) -> bool {
+        meta.live_regs.iter().all(|&r| {
+            r == ACC || (r as usize) < self.regs.len()
+        })
+    }
+
+    fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
+        for (i, &r) in meta.live_regs.iter().enumerate() {
+            if r == ACC {
+                self.a = values[i];
+            } else {
+                self.regs[r as usize] = values[i];
+            }
+        }
+    }
+
+    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
+        sym.live_regs
+            .iter()
+            .filter_map(|r| sym.regs.get(r).copied())
+            .collect()
+    }
+
+    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+        true
+    }
+}
+
+/// Scan bytecode to determine which registers are live at the loop header.
+/// All registers + accumulator are conservatively marked live.
+fn scan_live(_bytecode: &[u8], _header_pc: usize, num_regs: usize) -> Vec<u8> {
+    let mut live = vec![ACC];
+    for i in 0..num_regs.min(256) {
+        live.push(i as u8);
+    }
+    live
+}
+
+/// Trace one instruction, recording IR into ctx.
+fn trace_instruction(
+    ctx: &mut TraceCtx,
+    sym: &mut TlrSym,
+    bytecode: &[u8],
+    pc: usize,
+    state: &TlrState,
+    header_pc: usize,
+) -> TraceAction {
+    let opcode = bytecode[pc];
+
+    if opcode == SET_A {
+        let val = bytecode[pc + 1] as i64;
+        let opref = ctx.const_int(val);
+        sym.regs.insert(ACC, opref);
+    } else if opcode == MOV_A_R {
+        let n = bytecode[pc + 1];
+        let acc = sym.get_or_const(ctx, ACC, state.a);
+        sym.regs.insert(n, acc);
+    } else if opcode == MOV_R_A {
+        let n = bytecode[pc + 1];
+        let reg = sym.get_or_const(ctx, n, state.regs[n as usize]);
+        sym.regs.insert(ACC, reg);
+    } else if opcode == ADD_R_TO_A {
+        let n = bytecode[pc + 1];
+        let acc = sym.get_or_const(ctx, ACC, state.a);
+        let reg = sym.get_or_const(ctx, n, state.regs[n as usize]);
+        let result = ctx.record_op(OpCode::IntAdd, &[acc, reg]);
+        sym.regs.insert(ACC, result);
+    } else if opcode == NEG_A {
+        let acc = sym.get_or_const(ctx, ACC, state.a);
+        let result = ctx.record_op(OpCode::IntNeg, &[acc]);
+        sym.regs.insert(ACC, result);
+    } else if opcode == JUMP_IF_A {
+        let target = bytecode[pc + 1] as usize;
+        if target == header_pc {
+            // Back-edge to loop header: guard a != 0, close loop.
+            let acc = sym.get_or_const(ctx, ACC, state.a);
+            let num_live = sym.live_regs.len();
+            ctx.record_guard(OpCode::GuardTrue, &[acc], num_live);
+            return TraceAction::CloseLoop;
+        }
+    } else if opcode == RETURN_A {
+        return TraceAction::Abort;
+    }
+    // ALLOCATE: no-op during tracing (regs already exist)
+
+    TraceAction::Continue
 }
 
 pub struct JitTlrInterp {
-    warm_state: WarmEnterState,
-    backend: CraneliftBackend,
-    compiled_loops: HashMap<usize, CompiledLoop>,
-    tracing: Option<TracingState>,
+    driver: JitDriver<TlrState>,
 }
 
 impl JitTlrInterp {
     pub fn new() -> Self {
         JitTlrInterp {
-            warm_state: WarmEnterState::new(DEFAULT_THRESHOLD),
-            backend: CraneliftBackend::new(),
-            compiled_loops: HashMap::new(),
-            tracing: None,
+            driver: JitDriver::new(DEFAULT_THRESHOLD),
         }
     }
 
     pub fn run(&mut self, bytecode: &[u8], initial_a: i64) -> i64 {
-        let mut regs: Vec<i64> = Vec::new();
+        let mut state = TlrState {
+            a: initial_a,
+            regs: Vec::new(),
+        };
         let mut pc: usize = 0;
-        let mut a: i64 = initial_a;
 
         loop {
-            // --- tracing: record instruction ---
-            if self.tracing.is_some() {
-                match self.trace_instruction(bytecode, pc, a, &regs) {
-                    TraceAction::Continue => {}
-                    TraceAction::CloseLoop => {
-                        self.close_and_compile(a, &regs);
-                    }
-                    TraceAction::Abort => {
-                        self.abort_trace();
-                    }
-                }
-            }
+            // jit_merge_point(bytecode=bytecode, pc=pc, a=a, regs=regs)
+            let header_pc = self.driver.current_trace_green_key()
+                .map(|k| k as usize)
+                .unwrap_or(0);
+            self.driver.merge_point(|ctx, sym| {
+                trace_instruction(ctx, sym, bytecode, pc, &state, header_pc)
+            });
 
             let opcode = bytecode[pc];
             pc += 1;
@@ -104,286 +213,41 @@ impl JitTlrInterp {
             if opcode == MOV_A_R {
                 let n = bytecode[pc] as usize;
                 pc += 1;
-                regs[n] = a;
+                state.regs[n] = state.a;
             } else if opcode == MOV_R_A {
                 let n = bytecode[pc] as usize;
                 pc += 1;
-                a = regs[n];
+                state.a = state.regs[n];
             } else if opcode == JUMP_IF_A {
                 let target = bytecode[pc] as usize;
                 pc += 1;
-                if a != 0 {
-                    if target < pc && self.tracing.is_none() {
-                        // Back-edge: check hotness
-                        match self.warm_state.maybe_compile(target as u64) {
-                            HotResult::NotHot => {}
-                            HotResult::StartTracing(recorder) => {
-                                self.start_tracing(recorder, target, a, &regs);
-                            }
-                            HotResult::AlreadyTracing => {}
-                            HotResult::RunCompiled => {
-                                if let Some((new_a, new_regs)) = self.run_compiled(target, a, &regs)
-                                {
-                                    a = new_a;
-                                    regs = new_regs;
-                                    pc = target;
-                                    continue;
-                                }
-                            }
+                if state.a != 0 {
+                    // can_enter_jit(bytecode=bytecode, pc=target, a=a, regs=regs)
+                    if target < pc {
+                        if self.driver.back_edge(target, &mut state, bytecode, || {}) {
+                            pc = target;
+                            continue;
                         }
                     }
                     pc = target;
                 }
             } else if opcode == SET_A {
-                a = bytecode[pc] as i64;
+                state.a = bytecode[pc] as i64;
                 pc += 1;
             } else if opcode == ADD_R_TO_A {
                 let n = bytecode[pc] as usize;
                 pc += 1;
-                a += regs[n];
+                state.a += state.regs[n];
             } else if opcode == RETURN_A {
-                return a;
+                return state.a;
             } else if opcode == ALLOCATE {
                 let n = bytecode[pc] as usize;
                 pc += 1;
-                regs = vec![0; n];
+                state.regs = vec![0; n];
             } else if opcode == NEG_A {
-                a = -a;
+                state.a = -state.a;
             }
         }
-    }
-
-    fn start_tracing(
-        &mut self,
-        recorder: TraceRecorder,
-        loop_header_pc: usize,
-        a: i64,
-        regs: &[i64],
-    ) {
-        let mut state = TracingState {
-            recorder,
-            loop_header_pc,
-            trace_regs: HashMap::new(),
-            live_regs: Vec::new(),
-            constants: HashMap::new(),
-            next_const_ref: 10_000,
-        };
-
-        // Scan the loop to find live regs (read before written).
-        let live = self.scan_live(loop_header_pc, &state, regs.len());
-        state.live_regs = live.clone();
-
-        // Create input args for each live register.
-        for &r in &live {
-            let opref = state.recorder.record_input_arg(Type::Int);
-            state.trace_regs.insert(r, opref);
-        }
-        // Record constants for non-live but used regs.
-        let _ = a; // a is part of live_regs as ACC
-
-        self.tracing = Some(state);
-    }
-
-    fn scan_live(&self, header_pc: usize, _state: &TracingState, num_regs: usize) -> Vec<u8> {
-        // For the SQUARE program, the loop reads:
-        //   - accumulator (via NEG_A, ADD_R_TO_A, JUMP_IF_A)
-        //   - regs[0], regs[1], regs[2] (via MOV_R_A, ADD_R_TO_A)
-        // and writes:
-        //   - accumulator, regs[0], regs[2]
-        //
-        // All touched registers + accumulator are live at the loop header.
-        let mut live = vec![ACC];
-        for i in 0..num_regs.min(256) {
-            live.push(i as u8);
-        }
-        live
-    }
-
-    fn trace_instruction(
-        &mut self,
-        bytecode: &[u8],
-        pc: usize,
-        runtime_a: i64,
-        runtime_regs: &[i64],
-    ) -> TraceAction {
-        let state = self.tracing.as_mut().unwrap();
-        let opcode = bytecode[pc];
-
-        if opcode == SET_A {
-            let val = bytecode[pc + 1] as i64;
-            let opref = state.const_ref(val);
-            state.trace_regs.insert(ACC, opref);
-        } else if opcode == MOV_A_R {
-            let n = bytecode[pc + 1];
-            let acc = state.get_or_const(ACC, runtime_a);
-            state.trace_regs.insert(n, acc);
-        } else if opcode == MOV_R_A {
-            let n = bytecode[pc + 1];
-            let reg = state.get_or_const(n, runtime_regs[n as usize]);
-            state.trace_regs.insert(ACC, reg);
-        } else if opcode == ADD_R_TO_A {
-            let n = bytecode[pc + 1];
-            let acc = state.get_or_const(ACC, runtime_a);
-            let reg = state.get_or_const(n, runtime_regs[n as usize]);
-            let result = state.recorder.record_op(OpCode::IntAdd, &[acc, reg]);
-            state.trace_regs.insert(ACC, result);
-        } else if opcode == NEG_A {
-            let acc = state.get_or_const(ACC, runtime_a);
-            let result = state.recorder.record_op(OpCode::IntNeg, &[acc]);
-            state.trace_regs.insert(ACC, result);
-        } else if opcode == JUMP_IF_A {
-            let target = bytecode[pc + 1] as usize;
-            if target == state.loop_header_pc {
-                // Back-edge: guard that a != 0 and close the loop.
-                let acc = state.get_or_const(ACC, runtime_a);
-                let fail_descr = make_fail_descr(state.live_regs.len());
-                state
-                    .recorder
-                    .record_guard(OpCode::GuardTrue, &[acc], fail_descr);
-                return TraceAction::CloseLoop;
-            }
-        } else if opcode == RETURN_A {
-            return TraceAction::Abort;
-        } else if opcode == ALLOCATE {
-            // No-op for tracing (regs already exist).
-        }
-
-        if self.tracing.as_ref().unwrap().recorder.is_too_long() {
-            return TraceAction::Abort;
-        }
-        TraceAction::Continue
-    }
-
-    fn close_and_compile(&mut self, _a: i64, _regs: &[i64]) {
-        let state = self.tracing.take().unwrap();
-        let green_key = state.loop_header_pc as u64;
-
-        let jump_args: Vec<OpRef> = state
-            .live_regs
-            .iter()
-            .filter_map(|r| state.trace_regs.get(r).copied())
-            .collect();
-
-        let mut recorder = state.recorder;
-        recorder.close_loop(&jump_args);
-        let trace = recorder.get_trace();
-
-        let mut optimizer = Optimizer::default_pipeline();
-        let mut constants = state.constants;
-
-        if std::env::var("MAJIT_LOG").is_ok() {
-            eprintln!("--- trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
-        }
-
-        let optimized_ops = optimizer.optimize_with_constants(&trace.ops, &mut constants);
-
-        if std::env::var("MAJIT_LOG").is_ok() {
-            eprintln!("--- trace (after opt) ---");
-            eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
-        }
-
-        self.backend.set_constants(constants);
-
-        let token_num = self.warm_state.alloc_token_number();
-        let mut token = LoopToken::new(token_num);
-
-        match self
-            .backend
-            .compile_loop(&trace.inputargs, &optimized_ops, &mut token)
-        {
-            Ok(_) => {
-                self.compiled_loops.insert(
-                    state.loop_header_pc,
-                    CompiledLoop {
-                        token,
-                        live_regs: state.live_regs,
-                    },
-                );
-                let install_num = self.warm_state.alloc_token_number();
-                let install_token = LoopToken::new(install_num);
-                self.warm_state.install_compiled(green_key, install_token);
-            }
-            Err(e) => {
-                eprintln!("JIT compilation failed: {e}");
-                self.warm_state.abort_tracing(green_key, true);
-            }
-        }
-    }
-
-    fn abort_trace(&mut self) {
-        if let Some(state) = self.tracing.take() {
-            state.recorder.abort();
-            self.warm_state
-                .abort_tracing(state.loop_header_pc as u64, false);
-        }
-    }
-
-    fn run_compiled(&mut self, loop_pc: usize, a: i64, regs: &[i64]) -> Option<(i64, Vec<i64>)> {
-        let compiled = self.compiled_loops.get(&loop_pc)?;
-
-        let args: Vec<Value> = compiled
-            .live_regs
-            .iter()
-            .map(|&r| {
-                if r == ACC {
-                    Value::Int(a)
-                } else {
-                    Value::Int(regs[r as usize])
-                }
-            })
-            .collect();
-
-        let frame = self.backend.execute_token(&compiled.token, &args);
-
-        let mut new_a = a;
-        let mut new_regs = regs.to_vec();
-        for (i, &r) in compiled.live_regs.iter().enumerate() {
-            let val = self.backend.get_int_value(&frame, i);
-            if r == ACC {
-                new_a = val;
-            } else {
-                new_regs[r as usize] = val;
-            }
-        }
-
-        Some((new_a, new_regs))
-    }
-}
-
-enum TraceAction {
-    Continue,
-    CloseLoop,
-    Abort,
-}
-
-fn make_fail_descr(num_live: usize) -> majit_ir::DescrRef {
-    use std::sync::Arc;
-    Arc::new(TlrFailDescr {
-        types: vec![Type::Int; num_live],
-    })
-}
-
-#[derive(Debug)]
-struct TlrFailDescr {
-    types: Vec<Type>,
-}
-
-impl majit_ir::Descr for TlrFailDescr {
-    fn index(&self) -> u32 {
-        0
-    }
-    fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
-        Some(self)
-    }
-}
-
-impl majit_ir::FailDescr for TlrFailDescr {
-    fn fail_index(&self) -> u32 {
-        0
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.types
     }
 }
 
