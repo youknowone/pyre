@@ -143,16 +143,28 @@ pub enum LoweringRecipe {
 
     /// Virtualizable field read → bypasses heap, reads from JIT state.
     /// RPython `getfield_vable_*` from jtransform.py:760.
-    VableFieldRead { field_index: usize, field_type: String },
+    VableFieldRead {
+        field_index: usize,
+        field_type: String,
+    },
 
     /// Virtualizable field write → writes to JIT state, not heap.
-    VableFieldWrite { field_index: usize, field_type: String },
+    VableFieldWrite {
+        field_index: usize,
+        field_type: String,
+    },
 
     /// Virtualizable array item read → getarrayitem_vable.
-    VableArrayRead { array_index: usize, item_type: String },
+    VableArrayRead {
+        array_index: usize,
+        item_type: String,
+    },
 
     /// Virtualizable array item write → setarrayitem_vable.
-    VableArrayWrite { array_index: usize, item_type: String },
+    VableArrayWrite {
+        array_index: usize,
+        item_type: String,
+    },
 
     /// Virtualizable array length → arraylen_vable.
     VableArrayLen { array_index: usize },
@@ -244,6 +256,37 @@ pub fn transform_pattern(pattern: &TracePattern, config: &TransformConfig) -> Lo
         TracePattern::StackManip => LoweringRecipe::StackManip,
         TracePattern::IterCleanup => LoweringRecipe::IterCleanup,
         TracePattern::Noop => LoweringRecipe::Noop,
+        TracePattern::VableFieldRead {
+            field_index,
+            field_type,
+        } => LoweringRecipe::VableFieldRead {
+            field_index: *field_index,
+            field_type: field_type.clone(),
+        },
+        TracePattern::VableFieldWrite {
+            field_index,
+            field_type,
+        } => LoweringRecipe::VableFieldWrite {
+            field_index: *field_index,
+            field_type: field_type.clone(),
+        },
+        TracePattern::VableArrayRead {
+            array_index,
+            item_type,
+        } => LoweringRecipe::VableArrayRead {
+            array_index: *array_index,
+            item_type: item_type.clone(),
+        },
+        TracePattern::VableArrayWrite {
+            array_index,
+            item_type,
+        } => LoweringRecipe::VableArrayWrite {
+            array_index: *array_index,
+            item_type: item_type.clone(),
+        },
+        TracePattern::VableArrayLen { array_index } => LoweringRecipe::VableArrayLen {
+            array_index: *array_index,
+        },
         TracePattern::Residual { helper_name } => {
             match (config.classify_call_effect)(helper_name) {
                 "pure" => LoweringRecipe::PureCall {

@@ -83,6 +83,33 @@ pub enum TracePattern {
     /// Collection append (list_append).
     CollectionAppend,
 
+    /// Virtualizable field read (jtransform.py:760 getfield_vable).
+    VableFieldRead {
+        field_index: usize,
+        field_type: String,
+    },
+
+    /// Virtualizable field write (jtransform.py setfield_vable).
+    VableFieldWrite {
+        field_index: usize,
+        field_type: String,
+    },
+
+    /// Virtualizable array item read (jtransform.py getarrayitem_vable).
+    VableArrayRead {
+        array_index: usize,
+        item_type: String,
+    },
+
+    /// Virtualizable array item write (jtransform.py setarrayitem_vable).
+    VableArrayWrite {
+        array_index: usize,
+        item_type: String,
+    },
+
+    /// Virtualizable array length (jtransform.py arraylen_vable).
+    VableArrayLen { array_index: usize },
+
     /// Opaque — emit residual call.
     Residual { helper_name: String },
 

@@ -16,9 +16,20 @@
 
 use majit_ir::Type;
 
+/// Sentinel value for TOKEN_TRACING_RESCALL.
+///
+/// When the token equals this value, it means JIT tracing is active and
+/// a residual call is in progress. If the callee touches the virtualizable,
+/// it will force the token and clear it.
+///
+/// Any non-zero, non-RESCALL value is an active JIT frame pointer.
+pub const TOKEN_TRACING_RESCALL: u64 = u64::MAX;
+
 /// Token states for virtualizable objects.
 ///
-/// Mirrors RPython's TOKEN_NONE and TOKEN_TRACING_RESCALL.
+/// TOKEN_NONE (0): not in JIT.
+/// TOKEN_TRACING_RESCALL (u64::MAX): tracing + residual call in progress.
+/// Any other non-zero value: active JIT frame pointer (FORCE_TOKEN).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VableToken {
     /// No JIT code is currently using this virtualizable.
@@ -28,6 +39,26 @@ pub enum VableToken {
     /// JIT compiled code is executing with this virtualizable.
     /// The value is the force_token (address of the JIT frame).
     Active(u64),
+}
+
+impl VableToken {
+    /// Decode a raw u64 token value into the enum.
+    pub fn from_raw(raw: u64) -> Self {
+        match raw {
+            0 => VableToken::None,
+            TOKEN_TRACING_RESCALL => VableToken::TracingRescall,
+            other => VableToken::Active(other),
+        }
+    }
+
+    /// Encode the enum as a raw u64 value.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            VableToken::None => 0,
+            VableToken::TracingRescall => TOKEN_TRACING_RESCALL,
+            VableToken::Active(ptr) => ptr,
+        }
+    }
 }
 
 /// Describes a single field in a virtualizable object.
@@ -149,25 +180,97 @@ impl VirtualizableInfo {
         self.array_fields.len()
     }
 
+    /// Set token to TOKEN_TRACING_RESCALL before a residual call.
+    ///
+    /// The token tells the runtime that JIT tracing is active and a
+    /// residual call is about to happen. If the callee touches the
+    /// virtualizable, it will force the token and clear it.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn tracing_before_residual_call(&self, obj_ptr: *mut u8) {
+        let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+        assert_eq!(*token_ptr, 0, "token should be NONE before residual call");
+        *token_ptr = TOKEN_TRACING_RESCALL;
+    }
+
+    /// Check after residual call whether the virtualizable was forced.
+    ///
+    /// Returns `true` if forced (token was cleared by the callee).
+    /// Returns `false` if not forced (token is still TRACING_RESCALL; clear it).
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn tracing_after_residual_call(&self, obj_ptr: *mut u8) -> bool {
+        let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+        if *token_ptr != 0 {
+            // Not forced — still TOKEN_TRACING_RESCALL
+            assert_eq!(*token_ptr, TOKEN_TRACING_RESCALL);
+            *token_ptr = 0; // Clear back to TOKEN_NONE
+            false
+        } else {
+            // Was forced — token was cleared by the force path
+            true
+        }
+    }
+
+    /// Force the virtualizable now.
+    ///
+    /// If TOKEN_TRACING_RESCALL, just clear (tracing can reconstruct state).
+    /// If active JIT frame pointer, call `force_fn` to flush JIT state to heap.
+    /// If TOKEN_NONE, no-op.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn force_now(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
+        let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+        let token = *token_ptr;
+        if token == TOKEN_TRACING_RESCALL {
+            // During tracing — just clear the marker
+            *token_ptr = 0;
+        } else if token != 0 {
+            // Active JIT frame — force it, then verify it cleared the token
+            force_fn(token);
+            assert_eq!(*token_ptr, 0, "force_fn should have cleared the token");
+        }
+    }
+
+    /// Read the current token state from the heap.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn read_token(&self, obj_ptr: *const u8) -> VableToken {
+        let token_ptr = obj_ptr.add(self.token_offset) as *const u64;
+        VableToken::from_raw(*token_ptr)
+    }
+
+    /// Write a token state to the heap.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn write_token(&self, obj_ptr: *mut u8, token: VableToken) {
+        let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+        *token_ptr = token.to_raw();
+    }
+
     /// Convert to optimizer-level config (byte offsets only).
     /// Bridges the descriptor-driven model (majit-meta) with the
     /// optimizer's offset-based tracking (majit-opt).
-    /// RPython equivalent: jtransform → optimizer handoff.
     pub fn to_optimizer_config(&self) -> majit_opt::virtualize::VirtualizableConfig {
         majit_opt::virtualize::VirtualizableConfig {
             static_field_offsets: self.static_fields.iter().map(|f| f.offset).collect(),
+            static_field_types: self.static_fields.iter().map(|f| f.field_type).collect(),
             array_field_offsets: self.array_fields.iter().map(|a| a.field_offset).collect(),
+            array_item_types: self.array_fields.iter().map(|a| a.item_type).collect(),
         }
     }
 
     /// Get the index of a static field by its descriptor offset.
-    /// RPython equivalent: static_field_by_descrs
     pub fn static_field_index(&self, offset: usize) -> Option<usize> {
         self.static_fields.iter().position(|f| f.offset == offset)
     }
 
     /// Get the index of an array field by its field offset.
-    /// RPython equivalent: array_field_by_descrs
     pub fn array_field_index(&self, field_offset: usize) -> Option<usize> {
         self.array_fields
             .iter()
@@ -183,7 +286,6 @@ impl VirtualizableInfo {
     /// Get the index into the flat box array for a specific array element.
     /// `array_index` is the index of the array field, `item_index` is the
     /// element within that array.
-    /// RPython equivalent: get_index_in_array
     pub fn get_index_in_array(
         &self,
         array_index: usize,
@@ -197,29 +299,7 @@ impl VirtualizableInfo {
         idx + item_index
     }
 
-    /// Returns symbolic descriptions of SETFIELD_GC ops to emit before a
-    /// residual call during tracing, flushing JIT state to heap.
-    /// RPython equivalent: tracing_before_residual_call
-    pub fn tracing_before_residual_call_ops(&self, vable_ref: &str) -> Vec<String> {
-        self.static_fields
-            .iter()
-            .map(|f| format!("SetfieldGc({vable_ref}, field_{})", f.name))
-            .collect()
-    }
-
-    /// Returns symbolic descriptions of GETFIELD_GC ops to emit after a
-    /// residual call during tracing, re-reading fields the callee may have
-    /// modified.
-    /// RPython equivalent: tracing_after_residual_call
-    pub fn tracing_after_residual_call_ops(&self, vable_ref: &str) -> Vec<String> {
-        self.static_fields
-            .iter()
-            .map(|f| format!("GetfieldGc({vable_ref}, field_{})", f.name))
-            .collect()
-    }
-
     /// Check that box array has correct size for given array lengths.
-    /// RPython equivalent: check_boxes
     pub fn check_boxes(&self, boxes: &[i64], array_lengths: &[usize]) -> bool {
         boxes.len() == self.get_total_size(array_lengths)
     }
@@ -287,11 +367,10 @@ pub unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut 
     }
 }
 
-/// Clear the vable_token on a virtualizable object.
+/// Clear the vable_token on a virtualizable object (unconditional).
 ///
-/// This must be called before non-JIT code accesses the virtualizable.
-/// If the token indicates JIT code is active, this triggers a "force"
-/// to flush JIT-held values back to the heap.
+/// Sets the token to TOKEN_NONE without forcing. Use `force_virtualizable`
+/// or `VirtualizableInfo::force_now` if you need to flush JIT state first.
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
@@ -311,13 +390,11 @@ pub unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> 
 
 /// Force a virtualizable: flush JIT-held values back to the heap.
 ///
-/// This is the full force sequence:
-/// 1. Check if JIT code is active (token non-null and not tracing)
-/// 2. If so, force the JIT frame to write back its values
-/// 3. Clear the token
-///
-/// `force_fn` is called if the token indicates active JIT code,
-/// receiving the force_token value.
+/// Token semantics:
+/// - TOKEN_NONE (0): not in JIT, nothing to do.
+/// - TOKEN_TRACING_RESCALL (u64::MAX): tracing + residual call, just clear.
+/// - Any other non-zero value: active JIT frame pointer. Call `force_fn`
+///   with the frame pointer, which must clear the token itself.
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
@@ -326,18 +403,7 @@ pub unsafe fn force_virtualizable(
     obj_ptr: *mut u8,
     force_fn: impl FnOnce(u64),
 ) {
-    let token_ptr = obj_ptr.add(info.token_offset) as *mut u64;
-    let token_val = *token_ptr;
-
-    if token_val == 0 {
-        return; // TOKEN_NONE: not in JIT
-    }
-
-    // Token is non-zero: JIT code is active, force it
-    force_fn(token_val);
-
-    // Clear the token after forcing
-    *token_ptr = 0;
+    info.force_now(obj_ptr, force_fn);
 }
 
 /// Read array lengths from a virtualizable heap object.
@@ -663,7 +729,7 @@ mod tests {
         let mut obj = vec![0u8; 8];
         let obj_ptr = obj.as_mut_ptr();
 
-        // Simulate JIT setting the token
+        // Simulate JIT setting the token to a frame pointer
         unsafe {
             *(obj_ptr as *mut u64) = 0xBEEF;
         }
@@ -672,6 +738,8 @@ mod tests {
         unsafe {
             force_virtualizable(&info, obj_ptr, |token| {
                 force_token_received = token;
+                // force_fn must clear the token (RPython semantics)
+                *(obj_ptr as *mut u64) = 0;
             });
         }
         assert_eq!(force_token_received, 0xBEEF);
@@ -878,21 +946,24 @@ mod tests {
 
     #[test]
     fn test_force_virtualizable_triggers_callback() {
-        // RPython parity: test_force_virtualizable_by_hint
-        // Non-zero token → callback receives token value → token cleared.
+        // Non-zero token (active JIT frame) → callback receives token value
+        // → force_fn clears the token → verified.
 
         let info = VirtualizableInfo::new(0);
         let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
 
         // Set a non-zero token (simulating active JIT)
         unsafe {
-            *(obj.as_mut_ptr() as *mut u64) = 0xCAFE_BABE;
+            *(obj_ptr as *mut u64) = 0xCAFE_BABE;
         }
 
         let mut received_token = 0u64;
         unsafe {
-            force_virtualizable(&info, obj.as_mut_ptr(), |token| {
+            force_virtualizable(&info, obj_ptr, |token| {
                 received_token = token;
+                // force_fn must clear the token
+                *(obj_ptr as *mut u64) = 0;
             });
         }
 
@@ -978,7 +1049,143 @@ mod tests {
         let config = info.to_optimizer_config();
 
         assert_eq!(config.static_field_offsets, vec![8, 24, 40]);
+        assert_eq!(config.static_field_types, vec![Type::Int, Type::Float, Type::Ref]);
         assert_eq!(config.array_field_offsets, vec![48, 56]);
+        assert_eq!(config.array_item_types, vec![Type::Ref, Type::Int]);
+    }
+
+    #[test]
+    fn test_vable_token_roundtrip() {
+        assert_eq!(VableToken::from_raw(0), VableToken::None);
+        assert_eq!(VableToken::from_raw(TOKEN_TRACING_RESCALL), VableToken::TracingRescall);
+        assert_eq!(VableToken::from_raw(0xBEEF), VableToken::Active(0xBEEF));
+
+        assert_eq!(VableToken::None.to_raw(), 0);
+        assert_eq!(VableToken::TracingRescall.to_raw(), TOKEN_TRACING_RESCALL);
+        assert_eq!(VableToken::Active(0xBEEF).to_raw(), 0xBEEF);
+    }
+
+    #[test]
+    fn test_tracing_before_after_residual_call_not_forced() {
+        // Set RESCALL → callee does NOT touch the vable → after returns false → token cleared
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            // Before: token is NONE
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+
+            // Set RESCALL
+            info.tracing_before_residual_call(obj_ptr);
+            assert_eq!(info.read_token(obj_ptr), VableToken::TracingRescall);
+
+            // After: not forced (token still RESCALL) → returns false, clears token
+            let forced = info.tracing_after_residual_call(obj_ptr);
+            assert!(!forced);
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_tracing_after_residual_call_forced() {
+        // Set RESCALL → callee forces (clears token to 0) → after returns true
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            info.tracing_before_residual_call(obj_ptr);
+            assert_eq!(info.read_token(obj_ptr), VableToken::TracingRescall);
+
+            // Simulate callee forcing: clears token to NONE
+            *(obj_ptr as *mut u64) = 0;
+
+            // After: was forced → returns true
+            let forced = info.tracing_after_residual_call(obj_ptr);
+            assert!(forced);
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_force_now_tracing_rescall() {
+        // force_now during tracing (RESCALL) — just clears, no callback
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            *(obj_ptr as *mut u64) = TOKEN_TRACING_RESCALL;
+
+            let mut called = false;
+            info.force_now(obj_ptr, |_| {
+                called = true;
+            });
+
+            assert!(!called, "force_fn should NOT be called for TRACING_RESCALL");
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_force_now_active_jit() {
+        // force_now with active JIT frame pointer — calls force_fn, verifies token cleared
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            *(obj_ptr as *mut u64) = 0xDEAD_BEEF;
+
+            let mut received = 0u64;
+            info.force_now(obj_ptr, |token| {
+                received = token;
+                // force_fn must clear the token
+                *(obj_ptr as *mut u64) = 0;
+            });
+
+            assert_eq!(received, 0xDEAD_BEEF);
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_force_now_none() {
+        // force_now when token is NONE — no-op
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            let mut called = false;
+            info.force_now(obj_ptr, |_| {
+                called = true;
+            });
+
+            assert!(!called, "force_fn should NOT be called for TOKEN_NONE");
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_read_write_token() {
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+
+            info.write_token(obj_ptr, VableToken::TracingRescall);
+            assert_eq!(info.read_token(obj_ptr), VableToken::TracingRescall);
+
+            info.write_token(obj_ptr, VableToken::Active(0x1234));
+            assert_eq!(info.read_token(obj_ptr), VableToken::Active(0x1234));
+
+            info.write_token(obj_ptr, VableToken::None);
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
     }
 
     #[test]

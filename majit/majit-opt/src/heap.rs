@@ -577,9 +577,7 @@ impl OptimizationPass for OptHeap {
             | OpCode::GetarrayitemRawF => self.optimize_getarrayitem(op, ctx),
 
             // ── Array item writes ──
-            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                self.optimize_setarrayitem(op, ctx)
-            }
+            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => self.optimize_setarrayitem(op, ctx),
 
             // ── GUARD_NOT_INVALIDATED deduplication ──
             OpCode::GuardNotInvalidated => {
