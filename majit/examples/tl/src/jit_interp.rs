@@ -1,19 +1,130 @@
-/// JIT-enabled TL interpreter using JitDriver + JitState.
+/// JIT-enabled TL interpreter — auto-generated tracing via `#[jit_interp]`.
 ///
-/// Greens: [pc, code]    (code is constant per trace — not tracked)
-/// Reds:   [inputarg, stack]
+/// The `#[jit_interp]` proc macro transforms this interpreter function into
+/// a meta-tracing JIT: it auto-generates `trace_instruction` and `JitState`
+/// impl from the match dispatch arms. No manual IR recording needed.
 ///
-/// The stack is virtualizable: during tracing, stack slots are mapped to
-/// IR operations (OpRef), eliminating memory loads/stores in compiled code.
-/// In RPython's tl.py, this is declared as `_virtualizable_ = ['stackpos', 'stack[*]']`.
-/// Here, stack slots are passed directly as inputargs/jump_args to achieve
-/// the same optimization — stack contents stay in JIT registers across iterations.
-///
-/// This example hand-writes `trace_instruction` for educational purposes.
-/// In production, the `#[jit_interp]` proc macro auto-generates tracing
-/// code from the interpreter's match dispatch — see aheuijit for an example.
-use majit_ir::{OpCode, OpRef};
-use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};
+/// Greens: [pc]
+/// Reds:   [stack (via storage pool)]
+
+// ── Storage pool types ──
+
+/// Single i64 stack storage.
+pub struct TlStorage {
+    stack: Vec<i64>,
+}
+
+impl TlStorage {
+    fn new() -> Self {
+        TlStorage { stack: Vec::new() }
+    }
+    pub fn push(&mut self, val: i64) {
+        self.stack.push(val);
+    }
+    pub fn pop(&mut self) -> i64 {
+        self.stack.pop().unwrap()
+    }
+    pub fn dup(&mut self) {
+        let v = *self.stack.last().unwrap();
+        self.stack.push(v);
+    }
+    pub fn swap(&mut self) {
+        let len = self.stack.len();
+        self.stack.swap(len - 1, len - 2);
+    }
+    pub fn pick(&mut self, i: usize) {
+        let n = self.stack.len() - i - 1;
+        let val = self.stack[n];
+        self.stack.push(val);
+    }
+    pub fn put(&mut self, i: usize) {
+        let val = self.stack.pop().unwrap();
+        let n = self.stack.len() - i - 1;
+        self.stack[n] = val;
+    }
+    pub fn add(&mut self) {
+        let a = self.pop();
+        let b = self.pop();
+        self.push(b + a);
+    }
+    pub fn sub(&mut self) {
+        let a = self.pop();
+        let b = self.pop();
+        self.push(b - a);
+    }
+    pub fn mul(&mut self) {
+        let a = self.pop();
+        let b = self.pop();
+        self.push(b * a);
+    }
+    pub fn len(&self) -> usize {
+        self.stack.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+    pub fn peek_at(&self, idx: usize) -> i64 {
+        self.stack[self.stack.len() - 1 - idx]
+    }
+    pub fn clear(&mut self) {
+        self.stack.clear();
+    }
+    pub fn data_ptr(&self) -> usize {
+        self.stack.as_ptr() as usize
+    }
+    pub fn get_op(&self, _pc: usize) -> u8 {
+        0 // unused — opcode is read from env/program directly
+    }
+}
+
+/// Storage pool wrapping a single TlStorage.
+pub struct TlPool {
+    storages: Vec<TlStorage>,
+}
+
+impl TlPool {
+    fn new() -> Self {
+        TlPool {
+            storages: vec![TlStorage::new()],
+        }
+    }
+    pub fn get(&self, idx: usize) -> &TlStorage {
+        &self.storages[idx]
+    }
+    pub fn get_mut(&mut self, idx: usize) -> &mut TlStorage {
+        &mut self.storages[idx]
+    }
+    pub fn all_jit_compatible(&self) -> bool {
+        true
+    }
+}
+
+/// Interpreter state: storage pool + selected storage index.
+struct TlState {
+    pool: TlPool,
+    selected: usize,
+}
+
+fn find_used_storages(_program: &Bytecode, _header_pc: usize, _initial: usize) -> Vec<usize> {
+    vec![0]
+}
+
+/// Type alias for bytecode — the env type for `#[jit_interp]`.
+pub type Bytecode = [u8];
+
+/// Extension trait providing `get_op` for bytecode slices.
+/// Required by `#[jit_interp]` generated code.
+trait BytecodeExt {
+    fn get_op(&self, pc: usize) -> u8;
+}
+
+impl BytecodeExt for [u8] {
+    fn get_op(&self, pc: usize) -> u8 {
+        self[pc]
+    }
+}
+
+// ── Opcodes ──
 
 const NOP: u8 = 1;
 const PUSH: u8 = 2;
@@ -34,311 +145,145 @@ const BR_COND: u8 = 18;
 const RETURN: u8 = 21;
 const PUSHARG: u8 = 22;
 
-const DEFAULT_THRESHOLD: u32 = 3;
+// ── JIT mainloop ──
 
-// ── JitState types ──
+#[majit_macros::jit_interp(
+    state = TlState,
+    env = Bytecode,
+    storage = {
+        pool: state.pool,
+        pool_type: TlPool,
+        selector: state.selected,
+        untraceable: [],
+        scan: find_used_storages,
+        can_trace_guard: all_jit_compatible,
+    },
+    binops = {
+        add => IntAdd,
+        sub => IntSub,
+        mul => IntMul,
+    },
+)]
+pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
+    let mut driver: majit_meta::JitDriver<TlState> = majit_meta::JitDriver::new(threshold);
+    let mut pc: usize = 0;
+    let mut stacksize: i32 = 0;
+    let mut state = TlState {
+        pool: TlPool::new(),
+        selected: 0,
+    };
 
-/// Red variables: inputarg + stack slots.
-pub struct TlState {
-    inputarg: i64,
-    stack: Vec<i64>,
-}
+    while pc < program.len() {
+        jit_merge_point!();
+        let opcode = program[pc];
+        pc += 1;
 
-/// Trace shape captured at trace start.
-#[derive(Clone)]
-pub struct TlMeta {
-    header_pc: usize,
-    /// Number of stack slots live at the loop header.
-    num_stack_slots: usize,
-}
-
-/// Symbolic state during tracing — OpRef for each stack slot.
-pub struct TlSym {
-    /// Symbolic stack: each entry is an OpRef tracking the IR value.
-    trace_stack: Vec<OpRef>,
-    /// Number of stack slots at trace start (= number of inputargs).
-    num_stack_slots: usize,
-}
-
-impl JitState for TlState {
-    type Meta = TlMeta;
-    type Sym = TlSym;
-    type Env = [u8];
-
-    fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> TlMeta {
-        TlMeta {
-            header_pc,
-            num_stack_slots: self.stack.len(),
-        }
-    }
-
-    fn extract_live(&self, meta: &Self::Meta) -> Vec<i64> {
-        self.stack[..meta.num_stack_slots].to_vec()
-    }
-
-    fn create_sym(meta: &Self::Meta, _header_pc: usize) -> TlSym {
-        let trace_stack: Vec<OpRef> = (0..meta.num_stack_slots)
-            .map(|i| OpRef(i as u32))
-            .collect();
-        TlSym {
-            trace_stack,
-            num_stack_slots: meta.num_stack_slots,
-        }
-    }
-
-    fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        self.stack.len() >= meta.num_stack_slots
-    }
-
-    fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
-        self.stack.truncate(meta.num_stack_slots);
-        for (i, &v) in values.iter().enumerate() {
-            if i < self.stack.len() {
-                self.stack[i] = v;
+        match opcode {
+            NOP => {}
+            PUSH => {
+                let value = program[pc] as i8 as i64;
+                pc += 1;
+                state.pool.get_mut(state.selected).push(value);
+                stacksize += 1;
             }
+            POP => {
+                state.pool.get_mut(state.selected).pop();
+                stacksize -= 1;
+            }
+            SWAP => {
+                state.pool.get_mut(state.selected).swap();
+            }
+            PICK => {
+                let i = program[pc] as usize;
+                pc += 1;
+                state.pool.get_mut(state.selected).pick(i);
+                stacksize += 1;
+            }
+            PUT => {
+                let i = program[pc] as usize;
+                pc += 1;
+                state.pool.get_mut(state.selected).put(i);
+                stacksize -= 1;
+            }
+            ADD => state.pool.get_mut(state.selected).add(),
+            SUB => state.pool.get_mut(state.selected).sub(),
+            MUL => state.pool.get_mut(state.selected).mul(),
+            EQ => {
+                let a = state.pool.get_mut(state.selected).pop();
+                let b = state.pool.get_mut(state.selected).pop();
+                state.pool.get_mut(state.selected).push(if b == a { 1 } else { 0 });
+                stacksize -= 1;
+            }
+            NE => {
+                let a = state.pool.get_mut(state.selected).pop();
+                let b = state.pool.get_mut(state.selected).pop();
+                state.pool.get_mut(state.selected).push(if b != a { 1 } else { 0 });
+                stacksize -= 1;
+            }
+            LT => {
+                let a = state.pool.get_mut(state.selected).pop();
+                let b = state.pool.get_mut(state.selected).pop();
+                state.pool.get_mut(state.selected).push(if b < a { 1 } else { 0 });
+                stacksize -= 1;
+            }
+            LE => {
+                let a = state.pool.get_mut(state.selected).pop();
+                let b = state.pool.get_mut(state.selected).pop();
+                state.pool.get_mut(state.selected).push(if b <= a { 1 } else { 0 });
+                stacksize -= 1;
+            }
+            GT => {
+                let a = state.pool.get_mut(state.selected).pop();
+                let b = state.pool.get_mut(state.selected).pop();
+                state.pool.get_mut(state.selected).push(if b > a { 1 } else { 0 });
+                stacksize -= 1;
+            }
+            GE => {
+                let a = state.pool.get_mut(state.selected).pop();
+                let b = state.pool.get_mut(state.selected).pop();
+                state.pool.get_mut(state.selected).push(if b >= a { 1 } else { 0 });
+                stacksize -= 1;
+            }
+            BR_COND => {
+                let offset = program[pc] as i8 as i64;
+                let target = ((pc as i64) + offset + 1) as usize;
+                pc += 1;
+                let cond = state.pool.get_mut(state.selected).pop();
+                stacksize -= 1;
+                let jump = cond != 0;
+                if jump {
+                    if target <= pc {
+                        can_enter_jit!(driver, target, &mut state, program, || {});
+                    }
+                    pc = target;
+                    continue;
+                }
+            }
+            RETURN => break,
+            PUSHARG => {
+                state.pool.get_mut(state.selected).push(inputarg);
+                stacksize += 1;
+            }
+            _ => {}
         }
     }
 
-    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        sym.trace_stack.clone()
-    }
-
-    fn validate_close(sym: &Self::Sym, _meta: &Self::Meta) -> bool {
-        sym.trace_stack.len() == sym.num_stack_slots
-    }
+    state.pool.get_mut(state.selected).pop()
 }
 
-/// Trace one instruction, recording IR into ctx.
-fn trace_instruction(
-    ctx: &mut TraceCtx,
-    sym: &mut TlSym,
-    code: &[u8],
-    pc: usize,
-    state: &TlState,
-    header_pc: usize,
-) -> TraceAction {
-    let opcode = code[pc];
-
-    if opcode == NOP {
-        // no-op
-    } else if opcode == PUSH {
-        let val = code[pc + 1] as i8 as i64;
-        let opref = ctx.const_int(val);
-        sym.trace_stack.push(opref);
-    } else if opcode == POP {
-        sym.trace_stack.pop();
-    } else if opcode == SWAP {
-        let len = sym.trace_stack.len();
-        sym.trace_stack.swap(len - 1, len - 2);
-    } else if opcode == PICK {
-        let i = code[pc + 1] as usize;
-        let n = sym.trace_stack.len() - i - 1;
-        let opref = sym.trace_stack[n];
-        sym.trace_stack.push(opref);
-    } else if opcode == PUT {
-        let i = code[pc + 1] as usize;
-        let opref = sym.trace_stack.pop().unwrap();
-        let n = sym.trace_stack.len() - i - 1;
-        sym.trace_stack[n] = opref;
-    } else if opcode == ADD {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntAdd, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == SUB {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntSub, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == MUL {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntMul, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == EQ {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntEq, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == NE {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntNe, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == LT {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntLt, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == LE {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntLe, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == GT {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntGt, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == GE {
-        let a = sym.trace_stack.pop().unwrap();
-        let b = sym.trace_stack.pop().unwrap();
-        let result = ctx.record_op(OpCode::IntGe, &[b, a]);
-        sym.trace_stack.push(result);
-    } else if opcode == BR_COND {
-        let offset = code[pc + 1] as i8 as i64;
-        let target = ((pc + 1) as i64 + offset + 1) as usize;
-        let cond = sym.trace_stack.pop().unwrap();
-
-        // Check runtime condition to determine which path was taken.
-        let runtime_cond = *state.stack.last().unwrap();
-
-        if runtime_cond != 0 && target == header_pc {
-            // Back-edge to loop header: guard and close loop.
-            let num_live = sym.trace_stack.len();
-            ctx.record_guard(OpCode::GuardTrue, &[cond], num_live);
-            return TraceAction::CloseLoop;
-        } else if runtime_cond != 0 {
-            // Forward branch taken: guard that condition is true.
-            let num_live = sym.trace_stack.len();
-            ctx.record_guard(OpCode::GuardTrue, &[cond], num_live);
-        } else {
-            // Branch not taken: guard that condition is false.
-            let num_live = sym.trace_stack.len();
-            ctx.record_guard(OpCode::GuardFalse, &[cond], num_live);
-        }
-    } else if opcode == PUSHARG {
-        let opref = ctx.const_int(state.inputarg);
-        sym.trace_stack.push(opref);
-    } else if opcode == RETURN {
-        return TraceAction::Abort;
-    } else {
-        // Unsupported opcode during tracing (ROLL, CALL, BR_COND_STK, DIV, etc.)
-        return TraceAction::Abort;
-    }
-
-    TraceAction::Continue
-}
+// ── Public wrapper matching the old API ──
 
 pub struct JitTlInterp {
-    driver: JitDriver<TlState>,
+    threshold: u32,
 }
 
 impl JitTlInterp {
     pub fn new() -> Self {
-        JitTlInterp {
-            driver: JitDriver::new(DEFAULT_THRESHOLD),
-        }
+        JitTlInterp { threshold: 3 }
     }
 
-    pub fn run(&mut self, code: &[u8], inputarg: i64) -> i64 {
-        let mut state = TlState {
-            inputarg,
-            stack: Vec::with_capacity(code.len()),
-        };
-        let mut pc: usize = 0;
-
-        loop {
-            // jit_merge_point(code=code, pc=pc, inputarg=inputarg, stack=stack)
-            let header_pc = self.driver.current_trace_green_key()
-                .map(|k| k as usize)
-                .unwrap_or(0);
-            self.driver.merge_point(|ctx, sym| {
-                trace_instruction(ctx, sym, code, pc, &state, header_pc)
-            });
-
-            if pc >= code.len() {
-                break;
-            }
-
-            let opcode = code[pc];
-            pc += 1;
-
-            if opcode == NOP {
-                // no-op
-            } else if opcode == PUSH {
-                state.stack.push(code[pc] as i8 as i64);
-                pc += 1;
-            } else if opcode == POP {
-                state.stack.pop();
-            } else if opcode == SWAP {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(a);
-                state.stack.push(b);
-            } else if opcode == PICK {
-                let i = code[pc] as usize;
-                pc += 1;
-                let n = state.stack.len() - i - 1;
-                let val = state.stack[n];
-                state.stack.push(val);
-            } else if opcode == PUT {
-                let i = code[pc] as usize;
-                pc += 1;
-                let val = state.stack.pop().unwrap();
-                let n = state.stack.len() - i - 1;
-                state.stack[n] = val;
-            } else if opcode == ADD {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(b + a);
-            } else if opcode == SUB {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(b - a);
-            } else if opcode == MUL {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(b * a);
-            } else if opcode == EQ {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(if b == a { 1 } else { 0 });
-            } else if opcode == NE {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(if b != a { 1 } else { 0 });
-            } else if opcode == LT {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(if b < a { 1 } else { 0 });
-            } else if opcode == LE {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(if b <= a { 1 } else { 0 });
-            } else if opcode == GT {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(if b > a { 1 } else { 0 });
-            } else if opcode == GE {
-                let a = state.stack.pop().unwrap();
-                let b = state.stack.pop().unwrap();
-                state.stack.push(if b >= a { 1 } else { 0 });
-            } else if opcode == BR_COND {
-                let offset = code[pc] as i8 as i64;
-                let target = (pc as i64 + offset + 1) as usize;
-                let next_pc = pc + 1;
-                let cond = state.stack.pop().unwrap();
-                if cond != 0 {
-                    // can_enter_jit(code=code, pc=target, inputarg=inputarg, stack=stack)
-                    if target < next_pc {
-                        if self.driver.back_edge(target, &mut state, code, || {}) {
-                            pc = target;
-                            continue;
-                        }
-                    }
-                    pc = target;
-                } else {
-                    pc = next_pc;
-                }
-            } else if opcode == RETURN {
-                break;
-            } else if opcode == PUSHARG {
-                state.stack.push(inputarg);
-            }
-        }
-
-        state.stack.pop().unwrap()
+    pub fn run(&mut self, bytecode: &[u8], inputarg: i64) -> i64 {
+        mainloop(bytecode, inputarg, self.threshold)
     }
 }
 
@@ -349,15 +294,6 @@ mod tests {
 
     /// sum(N) = 1 + 2 + ... + N
     fn sum_bytecode() -> Vec<u8> {
-        const PUSH: u8 = 2;
-        const PUSHARG: u8 = 22;
-        const PICK: u8 = 6;
-        const BR_COND: u8 = 18;
-        const POP: u8 = 3;
-        const RETURN: u8 = 21;
-        const SWAP: u8 = 4;
-        const ADD: u8 = 8;
-        const SUB: u8 = 9;
         vec![
             PUSH, 0,       // acc = 0
             PUSHARG, // counter = N
@@ -407,15 +343,6 @@ mod tests {
         assert_eq!(jit.run(&prog, 0), 42);
     }
 
-    /// Exercises the JIT with many input sizes: small values stay interpreted,
-    /// larger values trigger trace compilation and run compiled code.
-    /// The guard exit path (counter == 0) is exercised on every input,
-    /// verifying that fallback from compiled code produces correct results.
-    ///
-    /// Bridge compilation is handled automatically by MetaInterp: when a guard
-    /// fails repeatedly, MetaInterp begins tracing a bridge from the guard's
-    /// fail point. No explicit test setup is needed — the mechanism activates
-    /// whenever guard failure count exceeds the bridge threshold.
     #[test]
     fn jit_various_sizes() {
         let bc = sum_bytecode();
@@ -427,12 +354,6 @@ mod tests {
         }
     }
 
-    /// Uses the sum program with a shared JitTlInterp instance across multiple
-    /// calls. The first few small inputs are interpreted; once the back-edge
-    /// counter reaches the threshold the loop compiles. Subsequent inputs run
-    /// compiled code and exit via the loop-exit guard (counter == 0).
-    /// This exercises the guard exit path with a persistent compiled trace,
-    /// which is the prerequisite for bridge compilation in MetaInterp.
     #[test]
     fn jit_bridge_exercise() {
         let bc = sum_bytecode();

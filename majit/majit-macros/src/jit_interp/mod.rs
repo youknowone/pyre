@@ -68,6 +68,12 @@ pub struct JitInterpConfig {
     /// When set, the proc macro rewrites field accesses on the virtualizable
     /// variable to use TraceCtx vable_* methods instead of heap operations.
     pub virtualizable_decl: Option<VirtualizableDecl>,
+    /// State field declarations for register/tape machines.
+    ///
+    /// When set, the macro tracks state struct fields as JIT-managed values
+    /// instead of requiring a storage pool. Enables `state.field` and
+    /// `state.array[index]` patterns in match arms.
+    pub state_fields: Option<StateFieldsConfig>,
 }
 
 /// Virtualizable frame field declaration for `#[jit_interp]`.
@@ -115,6 +121,29 @@ pub struct VableArrayDecl {
     pub offset: Path,
 }
 
+/// State field declaration for register/tape machines.
+///
+/// Syntax: `state_fields = { a: int, regs: [int], ... }`
+///
+/// Current implementation supports only `int` and `[int]`.
+pub struct StateFieldsConfig {
+    pub fields: Vec<StateFieldDecl>,
+}
+
+/// A single state field declaration.
+pub struct StateFieldDecl {
+    pub name: Ident,
+    pub kind: StateFieldKind,
+}
+
+/// Whether a state field is a scalar or an array.
+pub enum StateFieldKind {
+    /// Scalar value (e.g., `a: int`).
+    Scalar(Ident),
+    /// Array value (e.g., `regs: [int]`).
+    Array(Ident),
+}
+
 /// Multi-storage configuration parsed from `storage = { ... }`.
 pub struct StorageConfig {
     /// Expression to access the storage pool (e.g., `state.storage`).
@@ -147,6 +176,7 @@ impl Parse for JitInterpConfig {
         let mut auto_calls = None;
         let mut greens = None;
         let mut virtualizable_decl = None;
+        let mut state_fields = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -183,6 +213,9 @@ impl Parse for JitInterpConfig {
                 "virtualizable_fields" => {
                     virtualizable_decl = Some(parse_virtualizable_decl(input)?);
                 }
+                "state_fields" => {
+                    state_fields = Some(parse_state_fields(input)?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -198,8 +231,30 @@ impl Parse for JitInterpConfig {
             state_type.ok_or_else(|| syn::Error::new(input.span(), "missing `state` parameter"))?;
         let env_type =
             env_type.ok_or_else(|| syn::Error::new(input.span(), "missing `env` parameter"))?;
-        let storage =
-            storage.ok_or_else(|| syn::Error::new(input.span(), "missing `storage` parameter"))?;
+
+        // storage is required unless state_fields is provided.
+        let storage = match (storage, &state_fields) {
+            (Some(s), _) => s,
+            (None, Some(_)) => {
+                // Create a dummy StorageConfig for state_fields mode.
+                // __DummyPool is a unit struct auto-generated in codegen output.
+                StorageConfig {
+                    pool: syn::parse_quote!(__DummyPool),
+                    pool_type: syn::parse_quote!(__DummyPool),
+                    selector: syn::parse_quote!(0usize),
+                    untraceable: Vec::new(),
+                    scan_fn: syn::parse_str("__dummy_scan").unwrap(),
+                    can_trace_guard: None,
+                    virtualizable: false,
+                }
+            }
+            (None, None) => {
+                return Err(syn::Error::new(
+                    input.span(),
+                    "missing `storage` or `state_fields` parameter",
+                ));
+            }
+        };
 
         Ok(JitInterpConfig {
             state_type,
@@ -211,6 +266,7 @@ impl Parse for JitInterpConfig {
             auto_calls: auto_calls.unwrap_or(false),
             greens: greens.unwrap_or_default(),
             virtualizable_decl,
+            state_fields,
         })
     }
 }
@@ -298,6 +354,35 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
 
 /// Parse virtualizable_fields = { var: IDENT, token_offset: PATH, fields: { ... }, arrays: { ... } }
 ///
+/// Parse `state_fields = { name: type, ... }` where type is `int` or `[int]`.
+fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
+    let content;
+    braced!(content in input);
+    let mut fields = Vec::new();
+
+    while !content.is_empty() {
+        let name: Ident = content.parse()?;
+        content.parse::<Token![:]>()?;
+
+        let kind = if content.peek(syn::token::Bracket) {
+            // Array: [int], [ref], [float]
+            let inner;
+            bracketed!(inner in content);
+            let item_type: Ident = inner.parse()?;
+            StateFieldKind::Array(item_type)
+        } else {
+            // Scalar: int, ref, float
+            let field_type: Ident = content.parse()?;
+            StateFieldKind::Scalar(field_type)
+        };
+
+        fields.push(StateFieldDecl { name, kind });
+        let _ = content.parse::<Token![,]>();
+    }
+
+    Ok(StateFieldsConfig { fields })
+}
+
 /// RPython equivalent: VirtualizableInfo construction from virtualizable.py
 /// + jtransform.py's field-to-descriptor mapping.
 fn parse_virtualizable_decl(input: ParseStream) -> syn::Result<VirtualizableDecl> {
@@ -534,6 +619,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let pool_expr = &config.storage.pool;
     let sel_expr = &config.storage.selector;
 
+    let is_state_fields = config.state_fields.is_some();
+
     // Rewrite the function body, replacing marker macros
     let body = rewrite_body(
         &func.block,
@@ -542,6 +629,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         pool_expr,
         sel_expr,
         &config.greens,
+        is_state_fields,
     );
 
     quote! {
@@ -560,6 +648,7 @@ fn rewrite_body(
     pool_expr: &Expr,
     sel_expr: &Expr,
     default_greens: &[Expr],
+    is_state_fields: bool,
 ) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
@@ -666,6 +755,7 @@ fn rewrite_body(
         pool_expr: Expr,
         sel_expr: Expr,
         default_greens: Vec<Expr>,
+        is_state_fields: bool,
     }
 
     impl VisitMut for MarkerRewriter {
@@ -758,13 +848,20 @@ fn rewrite_body(
                             };
                             let pool = &pool_expr;
                             let sel = &sel_expr;
+                            let is_sf = self.is_state_fields;
+                            let stacksize_update: TokenStream = if is_sf {
+                                // state_fields mode: no storage pool
+                                quote! { #stacksize_expr = 0i32; }
+                            } else {
+                                quote! { #stacksize_expr = #pool.get(#sel).len() as i32; }
+                            };
                             let back_edge: TokenStream = if let Some(green_key) =
                                 green_key_expr(target_expr, &greens)
                             {
                                 quote! {
                                     if #driver_expr.back_edge_structured(#green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr) {
                                         #pc_expr = #target_expr;
-                                        #stacksize_expr = #pool.get(#sel).len() as i32;
+                                        #stacksize_update
                                         continue;
                                     }
                                 }
@@ -772,7 +869,7 @@ fn rewrite_body(
                                 quote! {
                                     if #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr) {
                                         #pc_expr = #target_expr;
-                                        #stacksize_expr = #pool.get(#sel).len() as i32;
+                                        #stacksize_update
                                         continue;
                                     }
                                 }
@@ -802,6 +899,7 @@ fn rewrite_body(
         pool_expr: pool_expr.clone(),
         sel_expr: sel_expr.clone(),
         default_greens: default_greens.to_vec(),
+        is_state_fields,
     };
     rewriter.visit_block_mut(&mut cloned_block);
 

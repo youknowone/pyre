@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 majit-ir = { path = "../../majit-ir" }
 majit-meta = { path = "../../majit-meta" }
+majit-macros = { path = "../../majit-macros" }

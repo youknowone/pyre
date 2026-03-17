@@ -19,6 +19,50 @@ use crate::interp_extract::BinopMapping;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+fn is_int_scalar_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+            | "bool"
+    )
+}
+
+fn infer_state_fields_attr(config: &JitDriverConfig) -> Option<TokenStream> {
+    if config.storage.is_some() {
+        return None;
+    }
+    if config.state_fields.is_empty() {
+        return None;
+    }
+
+    let field_entries: Vec<TokenStream> = config
+        .state_fields
+        .iter()
+        .map(|(name, ty)| {
+            let name = format_ident!("{}", name);
+            let compact = ty.replace(' ', "");
+            if let Some(inner) = compact
+                .strip_prefix("Vec<")
+                .and_then(|rest| rest.strip_suffix('>'))
+            {
+                if is_int_scalar_type(inner) {
+                    return quote! { #name: [int] };
+                }
+            }
+            if is_int_scalar_type(&compact) {
+                return quote! { #name: int };
+            }
+            panic!(
+                "state_fields codegen currently supports only int/[int] fields, got `{ty}` for `{name}`"
+            );
+        })
+        .collect();
+
+    Some(quote! {
+        state_fields = { #(#field_entries,)* },
+    })
+}
+
 /// Interpreter-specific match arm transformer.
 ///
 /// Each interpreter (aheui, pyre) implements this to rewrite opcode
@@ -238,6 +282,8 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
         }
     });
 
+    let state_fields_attr = infer_state_fields_attr(config);
+
     let io_shim_attr_entries: Vec<TokenStream> = config
         .io_shims
         .iter()
@@ -291,6 +337,7 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
             state = #state_name, env = #env_type,
             greens = [#(#greens),*],
             #storage_attr
+            #state_fields_attr
             #virtualizable_attr
             binops = { #(#binop_entries),* },
             io_shims = { #(#io_shim_attr_entries),* },
@@ -303,5 +350,47 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
         pub const JIT_THRESHOLD: u32 = DEFAULT_THRESHOLD;
 
         #(#extra_code)*
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> JitDriverConfig {
+        JitDriverConfig {
+            use_globs: vec![],
+            env_type: "Program".into(),
+            state_name: "State".into(),
+            state_fields: vec![],
+            greens: vec![],
+            binops: vec![],
+            storage: None,
+            io_shims: vec![],
+            virtualizable: None,
+            mainloop_body: "{}".into(),
+            fn_signature: "()".into(),
+            extra_code: vec![],
+        }
+    }
+
+    #[test]
+    fn generate_jitcode_emits_state_fields_attr_for_state_only_interpreters() {
+        let mut config = base_config();
+        config.state_fields = vec![
+            ("a".into(), "i64".into()),
+            ("regs".into(), "Vec<i64>".into()),
+        ];
+
+        let generated = generate_jitcode(&config).to_string();
+        assert!(generated.contains("state_fields = { a : int , regs : [int] , }"));
+    }
+
+    #[test]
+    #[should_panic(expected = "state_fields codegen currently supports only int/[int] fields")]
+    fn generate_jitcode_rejects_unsupported_state_field_types() {
+        let mut config = base_config();
+        config.state_fields = vec![("f".into(), "f64".into())];
+        let _ = generate_jitcode(&config);
     }
 }

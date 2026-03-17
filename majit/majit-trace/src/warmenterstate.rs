@@ -450,22 +450,26 @@ impl WarmEnterState {
     /// Mark that tracing was aborted for a green key.
     /// Optionally sets DONT_TRACE_HERE to prevent retrying.
     pub fn abort_tracing(&mut self, green_key_hash: u64, dont_trace_here: bool) {
+        let mut mark_dont_trace = dont_trace_here;
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
             if dont_trace_here {
-                cell.flags |= jc_flags::DONT_TRACE_HERE;
-                cell.state = JitCellState::DontTraceHere;
+                cell.state = JitCellState::NotHot;
             } else {
                 cell.abort_count += 1;
-                if cell.abort_count >= DEFAULT_RETRACE_LIMIT {
-                    // Too many retries — stop tracing this location entirely.
-                    // RPython equivalent: retrace_limit exceeded.
-                    cell.flags |= jc_flags::DONT_TRACE_HERE;
-                    cell.state = JitCellState::DontTraceHere;
-                } else {
+                if cell.abort_count < DEFAULT_RETRACE_LIMIT {
                     cell.state = JitCellState::NotHot;
+                } else {
+                    mark_dont_trace = true;
                 }
             }
+        }
+
+        if mark_dont_trace {
+            // Too many retries — or an explicit permanent abort — stop
+            // tracing this location entirely. RPython equivalent:
+            // retrace_limit exceeded / dont_trace_here().
+            self.dont_trace_here(green_key_hash);
         }
         if let Some(log) = &mut self.jitlog {
             log.log_abort();
@@ -600,9 +604,35 @@ impl WarmEnterState {
     /// and the current inline depth must not exceed `max_inline_depth`.
     /// Returns `true` if the function should be inlined.
     pub fn should_inline_function(&mut self, callee_key: u64) -> bool {
+        if !self.can_inline_callable(callee_key) {
+            return false;
+        }
         let count = self.function_call_counts.entry(callee_key).or_insert(0);
         *count += 1;
         *count >= self.function_threshold
+    }
+
+    /// Whether this callee is eligible for inlining at all.
+    ///
+    /// Mirrors PyPy's `can_inline_callable`: once a green key is marked
+    /// `DONT_TRACE_HERE`, callers must stop inlining it and instead let it
+    /// converge to a separate functrace / call_assembler path.
+    pub fn can_inline_callable(&self, callee_key: u64) -> bool {
+        self.cells
+            .get(&callee_key)
+            .map_or(true, |cell| cell.flags & jc_flags::DONT_TRACE_HERE == 0)
+    }
+
+    /// Mark a callee as a location that should no longer be inlined into
+    /// surrounding traces.
+    ///
+    /// This is the warm-state equivalent of PyPy's `dont_trace_here()`.
+    pub fn dont_trace_here(&mut self, callee_key: u64) {
+        let cell = self.cells.entry(callee_key).or_insert_with(JitCell::new);
+        cell.flags |= jc_flags::DONT_TRACE_HERE;
+        if cell.flags & jc_flags::TRACING == 0 {
+            cell.state = JitCellState::DontTraceHere;
+        }
     }
 
     /// Boost a function's entry counter to threshold - 1.
@@ -1179,6 +1209,22 @@ mod tests {
         // Future maybe_compile returns NotHot even though counter might tick.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
+    }
+
+    #[test]
+    fn test_dont_trace_here_blocks_inlining() {
+        let mut ws = WarmEnterState::new(3);
+        ws.set_function_threshold(2);
+
+        assert!(!ws.should_inline_function(42));
+        assert!(ws.should_inline_function(42));
+
+        ws.reset_function_counts();
+        ws.dont_trace_here(42);
+
+        assert!(!ws.can_inline_callable(42));
+        assert!(!ws.should_inline_function(42));
+        assert!(!ws.should_inline_function(42));
     }
 
     #[test]

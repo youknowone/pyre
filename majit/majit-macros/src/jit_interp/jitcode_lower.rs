@@ -39,6 +39,10 @@ pub struct LowererConfig {
     /// Array name → (array_index, item_type_str).
     /// RPython: `vinfo.array_field_counter[fieldname]` → index.
     vable_arrays: HashMap<String, (usize, String)>,
+    /// State field scalars: field_name → (global_field_index, type_str).
+    state_scalars: HashMap<String, (usize, String)>,
+    /// State field arrays: field_name → (global_array_index, item_type_str).
+    state_arrays: HashMap<String, (usize, String)>,
 }
 
 const MAX_HELPER_CALL_ARITY: usize = 16;
@@ -77,6 +81,7 @@ impl LowererConfig {
         calls: &[(Path, Option<Ident>)],
         auto_calls: bool,
         vable_decl: Option<&crate::jit_interp::VirtualizableDecl>,
+        state_fields_cfg: Option<&crate::jit_interp::StateFieldsConfig>,
     ) -> Self {
         let pool_str = normalize(&quote!(#pool_expr).to_string());
         let selector_str = normalize(&quote!(#selector_expr).to_string());
@@ -117,6 +122,28 @@ impl LowererConfig {
         } else {
             (None, HashMap::new(), HashMap::new())
         };
+        let (state_scalars, state_arrays) = if let Some(sf) = state_fields_cfg {
+            use crate::jit_interp::StateFieldKind;
+            let mut scalars = HashMap::new();
+            let mut arrays = HashMap::new();
+            let mut scalar_idx = 0usize;
+            let mut array_idx = 0usize;
+            for f in &sf.fields {
+                match &f.kind {
+                    StateFieldKind::Scalar(tp) => {
+                        scalars.insert(f.name.to_string(), (scalar_idx, tp.to_string()));
+                        scalar_idx += 1;
+                    }
+                    StateFieldKind::Array(tp) => {
+                        arrays.insert(f.name.to_string(), (array_idx, tp.to_string()));
+                        array_idx += 1;
+                    }
+                }
+            }
+            (scalars, arrays)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
         Self {
             pool_str,
             selector_str,
@@ -128,6 +155,8 @@ impl LowererConfig {
             vable_var,
             vable_fields,
             vable_arrays,
+            state_scalars,
+            state_arrays,
         }
     }
 }
@@ -375,6 +404,49 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
+    /// Recognizes `state.field = expr` for scalar state fields.
+    fn lower_state_field_write(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let assign = match expr { Expr::Assign(a) => a, _ => return None };
+        let field = match &*assign.left { Expr::Field(f) => f, _ => return None };
+        let base = &field.base;
+        let receiver_str = normalize(&quote!(#base).to_string());
+        if receiver_str != "state" { return None; }
+        let member_name = match &field.member {
+            syn::Member::Named(ident) => ident.to_string(),
+            _ => return None,
+        };
+        let &(field_index, _) = config.state_scalars.get(&member_name)?;
+        let fi = field_index as u16;
+        let binding = self.lower_value_expr(&assign.right)?;
+        let src = binding.reg;
+        self.statements.push(quote! { __builder.store_state_field(#fi, #src); });
+        Some(())
+    }
+
+    /// Recognizes `state.array[index] = expr` for array state fields.
+    fn lower_state_array_write(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let assign = match expr { Expr::Assign(a) => a, _ => return None };
+        let index_expr = match &*assign.left { Expr::Index(idx) => idx, _ => return None };
+        let field = match &*index_expr.expr { Expr::Field(f) => f, _ => return None };
+        let base = &field.base;
+        let receiver_str = normalize(&quote!(#base).to_string());
+        if receiver_str != "state" { return None; }
+        let member_name = match &field.member {
+            syn::Member::Named(ident) => ident.to_string(),
+            _ => return None,
+        };
+        let &(array_index, _) = config.state_arrays.get(&member_name)?;
+        let ai = array_index as u16;
+        let idx_binding = self.lower_value_expr(&index_expr.index)?;
+        let idx_reg = idx_binding.reg;
+        let val_binding = self.lower_value_expr(&assign.right)?;
+        let val_reg = val_binding.reg;
+        self.statements.push(quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); });
+        Some(())
+    }
+
     /// RPython jtransform.py:650 `hint_force_virtualizable`.
     ///
     /// Recognizes `hint_force_virtualizable!(frame)` macro invocation.
@@ -448,6 +520,9 @@ impl<'c> Lowerer<'c> {
     }
 
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
+        // State field writes (register/tape machines).
+        if let Some(()) = self.lower_state_field_write(expr) { return Some(()); }
+        if let Some(()) = self.lower_state_array_write(expr) { return Some(()); }
         // RPython jtransform.py:923 — virtualizable field write rewrite.
         if let Some(()) = self.lower_vable_field_write(expr) {
             return Some(());
@@ -852,17 +927,35 @@ impl<'c> Lowerer<'c> {
         };
         let s = normalize(&quote!(#stmt).to_string());
         // Storage mutation: pool.get_mut(...)
-        s.contains(&format!("{}.get_mut", config.pool_str))
+        if s.contains(&format!("{}.get_mut", config.pool_str)) {
+            return true;
+        }
+        // state_fields mode: any assignment to state.field modifies JIT state
+        if !config.state_scalars.is_empty() || !config.state_arrays.is_empty() {
+            if s.contains("state.") {
+                return true;
+            }
+        }
+        false
     }
 
-    /// Check if an expression touches the storage pool.
+    /// Check if an expression touches the storage pool or state fields.
     fn expr_touches_storage(&self, expr: &Expr) -> bool {
         let config = match self.config {
             Some(c) => c,
             None => return true,
         };
         let s = normalize(&quote!(#expr).to_string());
-        s.contains(&config.pool_str)
+        if s.contains(&config.pool_str) {
+            return true;
+        }
+        // state_fields mode: expressions referencing `state.` touch JIT state
+        if !config.state_scalars.is_empty() || !config.state_arrays.is_empty() {
+            if s.contains("state.") {
+                return true;
+            }
+        }
+        false
     }
 
     fn expr_uses_stack_bindings(&self, expr: &Expr) -> bool {
@@ -1520,7 +1613,52 @@ impl<'c> Lowerer<'c> {
         })
     }
 
+    /// Recognizes `state.field` for scalar state fields.
+    fn lower_state_field_read(&mut self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let field = match expr {
+            Expr::Field(f) => f,
+            _ => return None,
+        };
+        let base = &field.base;
+        let receiver_str = normalize(&quote!(#base).to_string());
+        if receiver_str != "state" { return None; }
+        let member_name = match &field.member {
+            syn::Member::Named(ident) => ident.to_string(),
+            _ => return None,
+        };
+        let &(field_index, _) = config.state_scalars.get(&member_name)?;
+        let fi = field_index as u16;
+        let reg = self.alloc_reg();
+        self.statements.push(quote! { __builder.load_state_field(#fi, #reg); });
+        Some(Binding { reg, kind: BindingKind::Int, depends_on_stack: false })
+    }
+
+    /// Recognizes `state.array[index]` for array state fields.
+    fn lower_state_array_read(&mut self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let index_expr = match expr { Expr::Index(idx) => idx, _ => return None };
+        let field = match &*index_expr.expr { Expr::Field(f) => f, _ => return None };
+        let base = &field.base;
+        let receiver_str = normalize(&quote!(#base).to_string());
+        if receiver_str != "state" { return None; }
+        let member_name = match &field.member {
+            syn::Member::Named(ident) => ident.to_string(),
+            _ => return None,
+        };
+        let &(array_index, _) = config.state_arrays.get(&member_name)?;
+        let ai = array_index as u16;
+        let idx_binding = self.lower_value_expr(&index_expr.index)?;
+        let idx_reg = idx_binding.reg;
+        let reg = self.alloc_reg();
+        self.statements.push(quote! { __builder.load_state_array(#ai, #idx_reg, #reg); });
+        Some(Binding { reg, kind: BindingKind::Int, depends_on_stack: false })
+    }
+
     fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
+        // State field read (register/tape machines).
+        if let Some(binding) = self.lower_state_field_read(expr) { return Some(binding); }
+        if let Some(binding) = self.lower_state_array_read(expr) { return Some(binding); }
         // RPython jtransform.py:832 — virtualizable field read rewrite.
         if let Some(binding) = self.lower_vable_field_read(expr) {
             return Some(binding);

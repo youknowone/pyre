@@ -4,7 +4,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::Expr;
 
-use super::JitInterpConfig;
+use super::{JitInterpConfig, StateFieldKind};
 
 /// Extract the member field name from a field access expression.
 /// e.g., `state.storage` → `storage`, `state.selected` → `selected`.
@@ -18,6 +18,14 @@ fn extract_field_member(expr: &Expr) -> &syn::Member {
 
 /// Generate the JitState types and implementation.
 pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
+    if config.state_fields.is_some() {
+        return generate_state_fields_jit_state(config);
+    }
+    generate_storage_pool_jit_state(config)
+}
+
+/// Generate JitState types for storage-pool mode (existing behaviour).
+fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     let state_type = &config.state_type;
     let env_type = &config.env_type;
     let pool_field = extract_field_member(&config.storage.pool);
@@ -31,8 +39,6 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
     } else {
         quote! {}
     };
-    let virtualizable = config.storage.virtualizable;
-
     // ── Frame virtualizable (VirtualizableDecl) code generation ──
     let vable_info_fn = config.virtualizable_decl.as_ref().map(|decl| {
         let token_offset = &decl.token_offset;
@@ -92,10 +98,6 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             current_selected_value: Option<majit_ir::OpRef>,
             storage_layout: Vec<(usize, usize)>,
             loop_header_pc: usize,
-            /// Virtualizable: OpRef of each storage's data array pointer.
-            vable_array_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
-            /// Virtualizable: OpRef tracking each storage's current length.
-            vable_len_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
         }
 
         #[allow(non_camel_case_types)]
@@ -106,31 +108,6 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
         }
 
         impl majit_meta::JitCodeSym for __JitSym {
-            fn is_virtualizable_storage(&self) -> bool {
-                #virtualizable
-            }
-
-            fn vable_array_ref(&self, selected: usize) -> Option<majit_ir::OpRef> {
-                self.vable_array_refs.get(&selected).copied()
-            }
-
-            fn vable_len_ref(&self, selected: usize) -> Option<majit_ir::OpRef> {
-                self.vable_len_refs.get(&selected).copied()
-            }
-
-            fn set_vable_len_ref(&mut self, selected: usize, len: majit_ir::OpRef) {
-                self.vable_len_refs.insert(selected, len);
-            }
-
-            fn set_vable_array_ref(&mut self, selected: usize, arr: majit_ir::OpRef) {
-                self.vable_array_refs.insert(selected, arr);
-            }
-
-            fn init_vable_storage(&mut self, selected: usize, arr_ref: majit_ir::OpRef, len_ref: majit_ir::OpRef) {
-                self.vable_array_refs.insert(selected, arr_ref);
-                self.vable_len_refs.insert(selected, len_ref);
-            }
-
             fn current_selected(&self) -> usize {
                 self.current_selected
             }
@@ -197,23 +174,15 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             type Env = #env_type;
 
             fn can_trace(&self) -> bool {
-                #( self.#sel_field != #untraceable )&&*
+                true #( && self.#sel_field != #untraceable )*
                 #extra_guard
             }
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
-                let layout = if #virtualizable {
-                    // Virtualizable: don't record depths (stacks stay on heap)
-                    #scan_fn(program, header_pc, self.#sel_field)
-                        .iter()
-                        .map(|&s| (s, 0usize))
-                        .collect()
-                } else {
-                    #scan_fn(program, header_pc, self.#sel_field)
-                        .iter()
-                        .map(|&s| (s, self.#pool_field.get(s).len()))
-                        .collect()
-                };
+                let layout = #scan_fn(program, header_pc, self.#sel_field)
+                    .iter()
+                    .map(|&s| (s, self.#pool_field.get(s).len()))
+                    .collect();
                 __JitMeta {
                     storage_layout: layout,
                     initial_selected: self.#sel_field,
@@ -221,10 +190,6 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
-                if #virtualizable {
-                    // Virtualizable: stacks stay on heap, nothing to extract
-                    return Vec::new();
-                }
                 let mut values = Vec::new();
                 for &(sidx, num_slots) in &meta.storage_layout {
                     let store = self.#pool_field.get(sidx);
@@ -238,33 +203,23 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                 let mut stacks = std::collections::HashMap::new();
                 let mut offset = 0;
-                if !#virtualizable {
-                    for &(sidx, num_slots) in &meta.storage_layout {
-                        stacks.insert(
-                            sidx,
-                            majit_meta::SymbolicStack::from_input_args(offset, num_slots),
-                        );
-                        offset += num_slots;
-                    }
+                for &(sidx, num_slots) in &meta.storage_layout {
+                    stacks.insert(
+                        sidx,
+                        majit_meta::SymbolicStack::from_input_args(offset, num_slots),
+                    );
+                    offset += num_slots;
                 }
-                // Virtualizable: stacks start empty, vable_array/len_refs
-                // are populated by the preamble or BC_SET_SELECTED.
                 __JitSym {
                     stacks,
                     current_selected: meta.initial_selected,
                     current_selected_value: None,
                     storage_layout: meta.storage_layout.clone(),
                     loop_header_pc: header_pc,
-                    vable_array_refs: std::collections::HashMap::new(),
-                    vable_len_refs: std::collections::HashMap::new(),
                 }
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
-                if #virtualizable {
-                    // Virtualizable: only check selected, depth is irrelevant
-                    return meta.initial_selected == self.#sel_field;
-                }
                 meta.initial_selected == self.#sel_field
                     && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
                         self.#pool_field.get(sidx).len() == expected_len
@@ -272,12 +227,6 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                if #virtualizable {
-                    // Virtualizable: stacks are on heap, nothing to restore.
-                    // Just restore the selected index.
-                    self.#sel_field = meta.initial_selected;
-                    return;
-                }
                 let mut offset = 0;
                 for &(sidx, num_slots) in &meta.storage_layout {
                     let end = offset + num_slots;
@@ -308,10 +257,6 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             #vable_info_fn
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
-                if #virtualizable {
-                    // Virtualizable: only check selected matches
-                    return sym.current_selected == meta.initial_selected;
-                }
                 sym.current_selected == meta.initial_selected
                     && sym.storage_layout.len() == meta.storage_layout.len()
                     && sym
@@ -324,6 +269,420 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
                             .get(&sidx)
                             .is_some_and(|stack| stack.len() == initial_depth)
                     })
+            }
+        }
+    }
+}
+
+/// Generate JitState types for state_fields mode (register/tape machines).
+///
+/// Instead of a storage pool with stacks, individual struct fields are tracked
+/// as JIT-managed values. Scalars become single OpRefs, arrays become Vec<OpRef>.
+fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
+    let state_type = &config.state_type;
+    let env_type = &config.env_type;
+    let sf = config.state_fields.as_ref().unwrap();
+
+    let unsupported_fields: Vec<String> = sf
+        .fields
+        .iter()
+        .filter_map(|f| {
+            let ty = match &f.kind {
+                StateFieldKind::Scalar(tp) | StateFieldKind::Array(tp) => tp.to_string(),
+            };
+            if ty == "int" {
+                None
+            } else {
+                Some(format!("{}: {}", f.name, ty))
+            }
+        })
+        .collect();
+    if !unsupported_fields.is_empty() {
+        let message = format!(
+            "state_fields currently supports only int/[int]; unsupported fields: {}",
+            unsupported_fields.join(", ")
+        );
+        return quote! {
+            compile_error!(#message);
+        };
+    }
+
+    // Separate scalars and arrays, preserving declaration order.
+    let scalars: Vec<_> = sf
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Scalar(_)))
+        .collect();
+    let arrays: Vec<_> = sf
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Array(_)))
+        .collect();
+
+    let num_scalars = scalars.len();
+
+    // ── __JitMeta fields: one `{name}_len: usize` per array ──
+    let meta_fields: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! { #len_name: usize, }
+        })
+        .collect();
+
+    // ── __JitSym fields: scalar → OpRef, array → Vec<OpRef> ──
+    let sym_scalar_fields: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { #fname: majit_ir::OpRef, }
+        })
+        .collect();
+    let sym_array_fields: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { #fname: Vec<majit_ir::OpRef>, }
+        })
+        .collect();
+
+    // ── JitCodeSym: total_slots ──
+    // num_scalars + sum of array lengths
+    let total_slots_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { + self.#fname.len() }
+        })
+        .collect();
+
+    // ── JitCodeSym: state_field_ref / set_state_field_ref ──
+    // Maps field_idx (0, 1, ...) to the scalar field names in declaration order.
+    let state_field_ref_arms: Vec<TokenStream> = scalars
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, f))| {
+            let fname = &f.name;
+            let idx_lit = idx;
+            quote! { #idx_lit => Some(self.#fname), }
+        })
+        .collect();
+    let set_state_field_ref_arms: Vec<TokenStream> = scalars
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, f))| {
+            let fname = &f.name;
+            let idx_lit = idx;
+            quote! { #idx_lit => { self.#fname = value; } }
+        })
+        .collect();
+
+    // ── JitCodeSym: state_array_ref / set_state_array_ref ──
+    let state_array_ref_arms: Vec<TokenStream> = arrays
+        .iter()
+        .enumerate()
+        .map(|(arr_idx, (_, f))| {
+            let fname = &f.name;
+            let arr_idx_lit = arr_idx;
+            quote! { #arr_idx_lit => self.#fname.get(elem_idx).copied(), }
+        })
+        .collect();
+    let set_state_array_ref_arms: Vec<TokenStream> = arrays
+        .iter()
+        .enumerate()
+        .map(|(arr_idx, (_, f))| {
+            let fname = &f.name;
+            let arr_idx_lit = arr_idx;
+            quote! { #arr_idx_lit => {
+                if elem_idx < self.#fname.len() {
+                    self.#fname[elem_idx] = value;
+                }
+            } }
+        })
+        .collect();
+
+    // ── collect_jump_args: scalars first, then arrays flattened ──
+    let collect_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.push(sym.#fname); }
+        })
+        .collect();
+    let collect_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.extend_from_slice(&sym.#fname); }
+        })
+        .collect();
+
+    // ── fail_args: same as collect_jump_args (with resume_pc appended) ──
+    let fail_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.push(self.#fname); }
+        })
+        .collect();
+    let fail_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.extend_from_slice(&self.#fname); }
+        })
+        .collect();
+
+    // ── build_meta: capture array lengths ──
+    let build_meta_fields: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! { #len_name: self.#fname.len(), }
+        })
+        .collect();
+
+    // ── extract_live: scalars then array elements ──
+    let extract_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { values.push(self.#fname as i64); }
+        })
+        .collect();
+    let extract_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                for elem in &self.#fname {
+                    values.push(*elem as i64);
+                }
+            }
+        })
+        .collect();
+
+    // ── create_sym: assign sequential OpRef(0), OpRef(1), ... ──
+    let create_sym_scalar_inits: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                let #fname = majit_ir::OpRef(__offset as u32);
+                __offset += 1;
+            }
+        })
+        .collect();
+    let create_sym_array_inits: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! {
+                let #fname: Vec<majit_ir::OpRef> = (0..meta.#len_name)
+                    .map(|i| {
+                        let r = majit_ir::OpRef((__offset + i) as u32);
+                        r
+                    })
+                    .collect();
+                __offset += meta.#len_name;
+            }
+        })
+        .collect();
+    let create_sym_scalar_names: Vec<&syn::Ident> =
+        scalars.iter().map(|(_, f)| &f.name).collect();
+    let create_sym_array_names: Vec<&syn::Ident> =
+        arrays.iter().map(|(_, f)| &f.name).collect();
+
+    // ── is_compatible: check array lengths match meta ──
+    let compat_checks: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! { && self.#fname.len() == meta.#len_name }
+        })
+        .collect();
+
+    // ── restore: write values back to state fields ──
+    let restore_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                self.#fname = values[__offset];
+                __offset += 1;
+            }
+        })
+        .collect();
+    let restore_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                let __arr_len = self.#fname.len();
+                for i in 0..__arr_len {
+                    self.#fname[i] = values[__offset + i];
+                }
+                __offset += __arr_len;
+            }
+        })
+        .collect();
+
+    // ── validate_close: array lengths in sym match meta ──
+    let validate_array_checks: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! { && sym.#fname.len() == meta.#len_name }
+        })
+        .collect();
+
+    quote! {
+        /// Dummy storage pool for state_fields mode.
+        /// The trace function signature requires a storage reference, but
+        /// state_fields mode uses load/store_state_field ops instead.
+        #[allow(non_camel_case_types)]
+        struct __DummyPool;
+
+        /// Compiled loop metadata for state_fields mode: array lengths at trace start.
+        #[derive(Clone)]
+        #[allow(non_camel_case_types)]
+        struct __JitMeta {
+            #(#meta_fields)*
+        }
+
+        /// Symbolic state during tracing: per-field OpRefs.
+        #[allow(non_camel_case_types)]
+        struct __JitSym {
+            #(#sym_scalar_fields)*
+            #(#sym_array_fields)*
+            loop_header_pc: usize,
+        }
+
+        impl majit_meta::JitCodeSym for __JitSym {
+            fn current_selected(&self) -> usize {
+                0
+            }
+
+            fn current_selected_value(&self) -> Option<majit_ir::OpRef> {
+                None
+            }
+
+            fn set_current_selected(&mut self, _selected: usize) {}
+
+            fn set_current_selected_value(&mut self, _selected: usize, _value: majit_ir::OpRef) {}
+
+            fn stack(&self, _selected: usize) -> Option<&majit_meta::SymbolicStack> {
+                None
+            }
+
+            fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+                None
+            }
+
+            fn total_slots(&self) -> usize {
+                #num_scalars #(#total_slots_array_parts)*
+            }
+
+            fn loop_header_pc(&self) -> usize {
+                self.loop_header_pc
+            }
+
+            fn ensure_stack(&mut self, _selected: usize, _offset: usize, _len: usize) {}
+
+            fn state_field_ref(&self, field_idx: usize) -> Option<majit_ir::OpRef> {
+                match field_idx {
+                    #(#state_field_ref_arms)*
+                    _ => None,
+                }
+            }
+
+            fn set_state_field_ref(&mut self, field_idx: usize, value: majit_ir::OpRef) {
+                match field_idx {
+                    #(#set_state_field_ref_arms)*
+                    _ => {}
+                }
+            }
+
+            fn state_array_ref(&self, array_idx: usize, elem_idx: usize) -> Option<majit_ir::OpRef> {
+                match array_idx {
+                    #(#state_array_ref_arms)*
+                    _ => None,
+                }
+            }
+
+            fn set_state_array_ref(&mut self, array_idx: usize, elem_idx: usize, value: majit_ir::OpRef) {
+                match array_idx {
+                    #(#set_state_array_ref_arms)*
+                    _ => {}
+                }
+            }
+
+            fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
+                let mut args = Vec::new();
+                #(#fail_scalar_parts)*
+                #(#fail_array_parts)*
+                Some(args)
+            }
+        }
+
+        impl majit_meta::JitState for #state_type {
+            type Meta = __JitMeta;
+            type Sym = __JitSym;
+            type Env = #env_type;
+
+            fn can_trace(&self) -> bool {
+                true
+            }
+
+            fn build_meta(&self, _header_pc: usize, _program: &#env_type) -> __JitMeta {
+                __JitMeta {
+                    #(#build_meta_fields)*
+                }
+            }
+
+            fn extract_live(&self, _meta: &__JitMeta) -> Vec<i64> {
+                let mut values = Vec::new();
+                #(#extract_scalar_parts)*
+                #(#extract_array_parts)*
+                values
+            }
+
+            fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
+                let mut __offset: usize = 0;
+                #(#create_sym_scalar_inits)*
+                #(#create_sym_array_inits)*
+                __JitSym {
+                    #(#create_sym_scalar_names,)*
+                    #(#create_sym_array_names,)*
+                    loop_header_pc: header_pc,
+                }
+            }
+
+            fn is_compatible(&self, meta: &__JitMeta) -> bool {
+                true #(#compat_checks)*
+            }
+
+            fn restore(&mut self, _meta: &__JitMeta, values: &[i64]) {
+                let mut __offset: usize = 0;
+                #(#restore_scalar_parts)*
+                #(#restore_array_parts)*
+            }
+
+            fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
+                let mut args = Vec::new();
+                #(#collect_scalar_parts)*
+                #(#collect_array_parts)*
+                args
+            }
+
+            fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
+                true #(#validate_array_checks)*
             }
         }
     }

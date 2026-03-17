@@ -83,9 +83,9 @@ impl TlaPool {
 }
 
 /// Interpreter state: storage pool + selected storage index.
-pub struct TlaState {
-    pub pool: TlaPool,
-    pub selected: usize,
+struct TlaState {
+    pool: TlaPool,
+    selected: usize,
 }
 
 fn find_used_storages(_program: &Bytecode, _header_pc: usize, _initial: usize) -> Vec<usize> {
@@ -130,6 +130,7 @@ const NEWSTR: u8 = 7;
         selector: state.selected,
         untraceable: [],
         scan: find_used_storages,
+        can_trace_guard: all_jit_compatible,
     },
     binops = {
         add => IntAdd,

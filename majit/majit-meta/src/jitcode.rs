@@ -64,6 +64,10 @@ const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;
 const BC_CALL_ASSEMBLER_VOID: u8 = 53;
 const BC_COPY_FROM_BOTTOM: u8 = 54;
 const BC_STORE_DOWN: u8 = 55;
+const BC_LOAD_STATE_FIELD: u8 = 56;
+const BC_STORE_STATE_FIELD: u8 = 57;
+const BC_LOAD_STATE_ARRAY: u8 = 58;
+const BC_STORE_STATE_ARRAY: u8 = 59;
 const MAX_HOST_CALL_ARITY: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -200,107 +204,55 @@ pub trait JitCodeSym {
         None
     }
 
-    // ── Virtualizable storage support ──────────────────────────────
+    // ── State field support (register/tape machines) ─────────────
     //
-    // When storage stacks are virtualizable, pop/push/peek emit IR ops
-    // (GETARRAYITEM/SETARRAYITEM) instead of manipulating SymbolicStack.
-    // The optimizer's OptVirtualize then eliminates the heap accesses.
+    // When state_fields is configured, scalar and array fields on the
+    // interpreter state are tracked as OpRefs in the Sym.
 
-    /// Whether the current storage is virtualizable (heap-backed arrays
-    /// instead of SymbolicStack). Default: false.
-    fn is_virtualizable_storage(&self) -> bool {
-        false
-    }
-
-    /// OpRef for the array data pointer of a virtualizable storage.
-    fn vable_array_ref(&self, _selected: usize) -> Option<OpRef> {
+    /// Read a scalar state field's current OpRef.
+    fn state_field_ref(&self, _field_idx: usize) -> Option<OpRef> {
         None
     }
 
-    /// OpRef tracking the current length of a virtualizable storage.
-    fn vable_len_ref(&self, _selected: usize) -> Option<OpRef> {
+    /// Update a scalar state field's OpRef.
+    fn set_state_field_ref(&mut self, _field_idx: usize, _value: OpRef) {}
+
+    /// Read an array state field element's current OpRef.
+    fn state_array_ref(&self, _array_idx: usize, _elem_idx: usize) -> Option<OpRef> {
         None
     }
 
-    /// Set the array data pointer OpRef for a virtualizable storage.
-    /// Called from BC_SET_SELECTED when the target storage is first accessed.
-    fn set_vable_array_ref(&mut self, _selected: usize, _arr: OpRef) {}
-
-    /// Update the length OpRef after push/pop on a virtualizable storage.
-    fn set_vable_len_ref(&mut self, _selected: usize, _len: OpRef) {}
-
-    /// Initialize virtualizable storage for a given index.
-    ///
-    /// Called from BC_SET_SELECTED when `is_virtualizable_storage()` is true
-    /// and the target storage hasn't been initialized yet.
-    ///
-    /// Default: no-op (override when is_virtualizable_storage returns true).
-    fn init_vable_storage(&mut self, _selected: usize, _arr_ref: OpRef, _len_ref: OpRef) {}
-
-    /// OpRef for the storage pool object (virtualizable).
-    ///
-    /// When set, BC_SET_SELECTED uses GETFIELD on this object to load
-    /// the array data pointer at runtime, instead of baking a raw pointer
-    /// constant. RPython parity: pyjitpl.py reads from the virtualizable
-    /// object via descriptors, never from raw pointers.
-    fn vable_pool_ref(&self) -> Option<OpRef> {
-        None
-    }
-
-    /// Byte offset of a storage's data pointer within the pool object.
-    ///
-    /// Used by BC_SET_SELECTED to emit GETFIELD_RAW_I(pool_ref, offset)
-    /// to load the data pointer at runtime.
-    fn vable_storage_data_offset(&self, _selected: usize) -> Option<usize> {
-        None
-    }
-
-    /// Byte offset of a storage's length field within the pool object.
-    fn vable_storage_len_offset(&self, _selected: usize) -> Option<usize> {
-        None
-    }
+    /// Update an array state field element's OpRef.
+    fn set_state_array_ref(&mut self, _array_idx: usize, _elem_idx: usize, _value: OpRef) {}
 }
 
 pub trait JitCodeRuntime {
     fn stack_len(&self, selected: usize) -> usize;
     fn stack_peek(&self, selected: usize, pos: usize) -> i64;
     fn label_at(&self, pc: usize) -> usize;
-    /// Raw data pointer of a storage's backing array (for virtualizable access).
-    fn stack_data_ptr(&self, _selected: usize) -> usize { 0 }
 }
 
-pub struct ClosureRuntime<FLen, FPeek, FLabel, FDataPtr = fn(usize) -> usize> {
+pub struct ClosureRuntime<FLen, FPeek, FLabel> {
     stack_len: FLen,
     stack_peek: FPeek,
     label_at: FLabel,
-    stack_data_ptr_fn: FDataPtr,
 }
 
-impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel, fn(usize) -> usize> {
+impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel> {
     pub fn new(stack_len: FLen, stack_peek: FPeek, label_at: FLabel) -> Self {
         Self {
             stack_len,
             stack_peek,
             label_at,
-            stack_data_ptr_fn: |_| 0,
         }
     }
 }
 
-impl<FLen, FPeek, FLabel, FDataPtr> ClosureRuntime<FLen, FPeek, FLabel, FDataPtr> {
-    pub fn with_data_ptr(
-        stack_len: FLen, stack_peek: FPeek, label_at: FLabel, stack_data_ptr: FDataPtr,
-    ) -> Self {
-        Self { stack_len, stack_peek, label_at, stack_data_ptr_fn: stack_data_ptr }
-    }
-}
-
-impl<FLen, FPeek, FLabel, FDataPtr> JitCodeRuntime for ClosureRuntime<FLen, FPeek, FLabel, FDataPtr>
+impl<FLen, FPeek, FLabel> JitCodeRuntime for ClosureRuntime<FLen, FPeek, FLabel>
 where
     FLen: Fn(usize) -> usize,
     FPeek: Fn(usize, usize) -> i64,
     FLabel: Fn(usize) -> usize,
-    FDataPtr: Fn(usize) -> usize,
 {
     fn stack_len(&self, selected: usize) -> usize {
         (self.stack_len)(selected)
@@ -312,10 +264,6 @@ where
 
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
-    }
-
-    fn stack_data_ptr(&self, selected: usize) -> usize {
-        (self.stack_data_ptr_fn)(selected)
     }
 }
 
@@ -602,6 +550,42 @@ where
                 rt_stack[index] = val;
                 let _ = idx_sym;
             }
+
+            // ── State field access (register/tape machines) ──
+            BC_LOAD_STATE_FIELD => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let opref = sym.state_field_ref(field_idx)
+                    .expect("state field not initialized");
+                // Runtime value not needed — we track symbolically.
+                self.set_int_reg(dest, Some(opref), Some(0));
+            }
+            BC_STORE_STATE_FIELD => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u16() as usize;
+                let (opref, _) = self.read_int_reg(src);
+                sym.set_state_field_ref(field_idx, opref);
+            }
+            BC_LOAD_STATE_ARRAY => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let (_, index_concrete) = self.read_int_reg(index_reg);
+                let elem_idx = index_concrete as usize;
+                let opref = sym.state_array_ref(array_idx, elem_idx)
+                    .expect("state array element not initialized");
+                self.set_int_reg(dest, Some(opref), Some(0));
+            }
+            BC_STORE_STATE_ARRAY => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u16() as usize;
+                let (_, index_concrete) = self.read_int_reg(index_reg);
+                let elem_idx = index_concrete as usize;
+                let (opref, _) = self.read_int_reg(src);
+                sym.set_state_array_ref(array_idx, elem_idx, opref);
+            }
+
             BC_RECORD_BINOP_I => {
                 let (dst, lhs_idx, rhs_idx, opcode) = {
                     let frame = self.frames.current_mut();
@@ -675,19 +659,7 @@ where
                 };
                 let pc = self.frames.current_mut().pc;
                 let close_loop = runtime.label_at(pc) == sym.loop_header_pc();
-                let cond = if sym.is_virtualizable_storage() {
-                    if let (Some(arr_ref), Some(len_ref)) =
-                        (sym.vable_array_ref(selected), sym.vable_len_ref(selected))
-                    {
-                        let one = ctx.const_int(1);
-                        let idx = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
-                        let val = ctx.record_op(OpCode::GetarrayitemRawI, &[arr_ref, idx]);
-                        sym.set_vable_len_ref(selected, idx);
-                        val
-                    } else {
-                        return TraceAction::Abort;
-                    }
-                } else {
+                let cond = {
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                     stack.pop().expect("branch_zero on empty symbolic stack")
                 };
@@ -1218,20 +1190,8 @@ where
                 let value = eval_unary_f(opcode, src_value);
                 self.set_float_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
             }
-            BC_ABORT => {
-                if crate::majit_log_enabled() {
-                    let pc = self.frames.current_mut().pc;
-                    eprintln!("[jit] BC_ABORT at jitcode_pc={pc}");
-                }
-                return TraceAction::Abort;
-            }
-            BC_ABORT_PERMANENT => {
-                if crate::majit_log_enabled() {
-                    let pc = self.frames.current_mut().pc;
-                    eprintln!("[jit] BC_ABORT_PERMANENT at jitcode_pc={pc}");
-                }
-                return TraceAction::AbortPermanent;
-            }
+            BC_ABORT => return TraceAction::Abort,
+            BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
             other => panic!("unknown jitcode bytecode {other}"),
         }
 
@@ -1383,6 +1343,46 @@ impl JitCodeBuilder {
     }
 
     /// Copy the element at `index` (from bottom, 0-based) to top of stack.
+    // ── State field access (register/tape machines) ──
+
+    /// Load a scalar state field value into an int register.
+    pub fn load_state_field(&mut self, field_idx: u16, dest: u16) {
+        self.touch_reg(dest);
+        self.push_u8(BC_LOAD_STATE_FIELD);
+        self.push_u16(field_idx);
+        self.push_u16(dest);
+    }
+
+    /// Store an int register value into a scalar state field.
+    pub fn store_state_field(&mut self, field_idx: u16, src: u16) {
+        self.touch_reg(src);
+        self.push_u8(BC_STORE_STATE_FIELD);
+        self.push_u16(field_idx);
+        self.push_u16(src);
+    }
+
+    /// Load an array state field element into an int register.
+    /// The element index comes from another int register.
+    pub fn load_state_array(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
+        self.touch_reg(index_reg);
+        self.touch_reg(dest);
+        self.push_u8(BC_LOAD_STATE_ARRAY);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        self.push_u16(dest);
+    }
+
+    /// Store an int register value into an array state field element.
+    /// The element index comes from another int register.
+    pub fn store_state_array(&mut self, array_idx: u16, index_reg: u16, src: u16) {
+        self.touch_reg(index_reg);
+        self.touch_reg(src);
+        self.push_u8(BC_STORE_STATE_ARRAY);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        self.push_u16(src);
+    }
+
     pub fn copy_from_bottom(&mut self, idx_reg: u16) {
         self.touch_reg(idx_reg);
         self.push_u8(BC_COPY_FROM_BOTTOM);
@@ -2223,43 +2223,6 @@ where
     machine.run_to_end(ctx, sym, &runtime)
 }
 
-pub fn trace_jitcode_with_data_ptr<S, FLen, FPeek, FLabel, FDataPtr>(
-    ctx: &mut TraceCtx,
-    sym: &mut S,
-    jitcode: &JitCode,
-    pc: usize,
-    runtime_stack_len: FLen,
-    runtime_stack_peek: FPeek,
-    label_at: FLabel,
-    stack_data_ptr: FDataPtr,
-) -> TraceAction
-where
-    S: JitCodeSym,
-    FLen: Fn(usize) -> usize,
-    FPeek: Fn(usize, usize) -> i64,
-    FLabel: Fn(usize) -> usize,
-    FDataPtr: Fn(usize) -> usize,
-{
-    let runtime = ClosureRuntime::with_data_ptr(
-        runtime_stack_len, runtime_stack_peek, label_at, stack_data_ptr,
-    );
-    // Virtualizable: lazy-init the current selected storage if not yet initialized.
-    // create_sym leaves vable_array_refs empty; BC_SET_SELECTED inits on storage switch,
-    // but the initial storage has no SET_SELECTED, so we must init here.
-    if sym.is_virtualizable_storage() {
-        let selected = sym.current_selected();
-        if sym.vable_array_ref(selected).is_none() {
-            let data_ptr = runtime.stack_data_ptr(selected);
-            let len = runtime.stack_len(selected);
-            let arr_ref = ctx.const_int(data_ptr as i64);
-            let len_ref = ctx.const_int(len as i64);
-            sym.init_vable_storage(selected, arr_ref, len_ref);
-        }
-    }
-    let root = MIFrame::new(jitcode, pc);
-    let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
-    machine.run_to_end(ctx, sym, &runtime)
-}
 
 fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
     let value = *code.get(*cursor).expect("truncated jitcode");

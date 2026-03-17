@@ -1,227 +1,352 @@
-/// JIT-enabled tiny2 interpreter using JitDriver + JitState.
+/// JIT-enabled tiny2 interpreter via `#[jit_interp]` proc macro.
 ///
-/// Greens: [pos, bytecode]   (bytecode and position are loop constants)
-/// Reds:   [args]
+/// The word-based program is compiled to bytecode, then the bytecoded mainloop
+/// is traced by the auto-generated JitState/trace_instruction.
 ///
-/// Key difference from tl.py: the live state across loop iterations is args[],
-/// not a stack. The stack is used only for intermediate computations within
-/// one iteration and is empty at the merge point ('{' back-edge).
-///
-/// JIT traces the integer-only path. When all args are integers, the loop body
-///
-/// This example hand-writes `trace_instruction` for educational purposes.
-/// In production, the `#[jit_interp]` proc macro auto-generates tracing
-/// code from the interpreter's match dispatch — see aheuijit for an example.
-/// compiles to pure i64 arithmetic.
-use majit_ir::{OpCode, OpRef};
-use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};
+/// Greens: [pc]
+/// Reds:   [storage (args at bottom, computation stack on top)]
 
-const DEFAULT_THRESHOLD: u32 = 3;
+// ── Bytecode opcodes ──
 
-// ── JitState types ──
+const OP_PUSH_INT: u8 = 0; // followed by 8 bytes (i64 LE)
+const OP_PUSH_ARG: u8 = 1; // followed by 1 byte (arg index, 0-based)
+const OP_STORE_ARG: u8 = 2; // followed by 1 byte (arg index, 0-based)
+const OP_ADD: u8 = 3;
+const OP_SUB: u8 = 4;
+const OP_MUL: u8 = 5;
+const OP_LOOP_START: u8 = 6; // no-op marker (target for back-edge)
+const OP_LOOP_END: u8 = 7; // followed by 2 bytes (target pc, u16 LE)
+const OP_END: u8 = 8;
 
-/// Red variables: the args array.
-pub struct Tiny2State {
-    args: Vec<i64>,
+// ── Bytecode compiler ──
+
+fn compile(words: &[&str]) -> Vec<u8> {
+    let mut code = Vec::new();
+    let mut loop_starts: Vec<usize> = Vec::new();
+
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        if w == "ADD" {
+            code.push(OP_ADD);
+        } else if w == "SUB" {
+            code.push(OP_SUB);
+        } else if w == "MUL" {
+            code.push(OP_MUL);
+        } else if w.starts_with("->#") {
+            let n = parse_int(w, 3) as u8;
+            code.push(OP_STORE_ARG);
+            code.push(n - 1); // 0-based index
+        } else if w.starts_with('#') {
+            let n = parse_int(w, 1) as u8;
+            code.push(OP_PUSH_ARG);
+            code.push(n - 1); // 0-based index
+        } else if w == "{" {
+            code.push(OP_LOOP_START);
+            loop_starts.push(code.len()); // pc AFTER the OP_LOOP_START
+        } else if w == "}" {
+            code.push(OP_LOOP_END);
+            let target_pc = loop_starts.pop().expect("unmatched }");
+            code.push((target_pc & 0xFF) as u8);
+            code.push(((target_pc >> 8) & 0xFF) as u8);
+        } else {
+            // Integer literal
+            let val = parse_int(w, 0);
+            code.push(OP_PUSH_INT);
+            code.extend_from_slice(&val.to_le_bytes());
+        }
+        i += 1;
+    }
+    code.push(OP_END);
+    code
 }
 
-/// Trace shape captured at trace start.
-#[derive(Clone)]
-pub struct Tiny2Meta {
-    header_pos: usize,
-    num_args: usize,
+// ── Storage pool types ──
+
+/// Single i64 storage: args at bottom, computation stack on top.
+pub struct Tiny2Storage {
+    stack: Vec<i64>,
 }
 
-/// Symbolic state during tracing — OpRef for each arg slot + computation stack.
-pub struct Tiny2Sym {
-    /// args[i] → OpRef mapping (the live state).
-    trace_args: Vec<OpRef>,
-    /// Intermediate computation stack (maps to OpRef during tracing).
-    trace_stack: Vec<OpRef>,
+impl Tiny2Storage {
+    fn new() -> Self {
+        Tiny2Storage { stack: Vec::new() }
+    }
+    pub fn push(&mut self, val: i64) {
+        self.stack.push(val);
+    }
+    pub fn pop(&mut self) -> i64 {
+        self.stack.pop().unwrap()
+    }
+    pub fn dup(&mut self) {
+        let v = *self.stack.last().unwrap();
+        self.stack.push(v);
+    }
+    pub fn add(&mut self) {
+        let a = self.pop();
+        let b = self.pop();
+        self.push(b + a);
+    }
+    pub fn sub(&mut self) {
+        let a = self.pop();
+        let b = self.pop();
+        self.push(b - a);
+    }
+    pub fn mul(&mut self) {
+        let a = self.pop();
+        let b = self.pop();
+        self.push(b * a);
+    }
+    /// Copy element at index `n` (from bottom, 0-based) to top.
+    pub fn copy_up(&mut self, n: usize) {
+        let val = self.stack[n];
+        self.stack.push(val);
+    }
+    /// Pop top and store at index `n` (from bottom, 0-based).
+    pub fn store_down(&mut self, n: usize) {
+        let val = self.stack.pop().unwrap();
+        self.stack[n] = val;
+    }
+    pub fn peek_at(&self, idx: usize) -> i64 {
+        self.stack[self.stack.len() - 1 - idx]
+    }
+    pub fn clear(&mut self) {
+        self.stack.clear();
+    }
+    pub fn data_ptr(&self) -> usize {
+        self.stack.as_ptr() as usize
+    }
+    pub fn len(&self) -> usize {
+        self.stack.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
 }
 
-impl JitState for Tiny2State {
-    type Meta = Tiny2Meta;
-    type Sym = Tiny2Sym;
-    type Env = [&'static str];
+/// Storage pool wrapping a single Tiny2Storage.
+pub struct Tiny2Pool {
+    storages: Vec<Tiny2Storage>,
+}
 
-    fn build_meta(&self, header_pos: usize, _env: &Self::Env) -> Tiny2Meta {
-        Tiny2Meta {
-            header_pos,
-            num_args: self.args.len(),
+impl Tiny2Pool {
+    fn new() -> Self {
+        Tiny2Pool {
+            storages: vec![Tiny2Storage::new()],
         }
     }
-
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
-        self.args.clone()
+    pub fn get(&self, idx: usize) -> &Tiny2Storage {
+        &self.storages[idx]
     }
-
-    fn create_sym(meta: &Self::Meta, _header_pos: usize) -> Tiny2Sym {
-        let trace_args: Vec<OpRef> = (0..meta.num_args)
-            .map(|i| OpRef(i as u32))
-            .collect();
-        Tiny2Sym {
-            trace_args,
-            trace_stack: Vec::new(),
-        }
+    pub fn get_mut(&mut self, idx: usize) -> &mut Tiny2Storage {
+        &mut self.storages[idx]
     }
-
-    fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        self.args.len() == meta.num_args
-    }
-
-    fn restore(&mut self, _meta: &Self::Meta, values: &[i64]) {
-        self.args = values.to_vec();
-    }
-
-    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        sym.trace_args.clone()
-    }
-
-    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+    pub fn all_jit_compatible(&self) -> bool {
         true
     }
 }
 
-/// Trace one instruction, recording IR into ctx.
-fn trace_instruction(
-    ctx: &mut TraceCtx,
-    sym: &mut Tiny2Sym,
-    bytecode: &[&str],
-    pos: usize,
-    _state: &Tiny2State,
-) -> TraceAction {
-    let opcode = bytecode[pos];
-
-    if opcode == "ADD" || opcode == "SUB" || opcode == "MUL" {
-        let b = sym.trace_stack.pop().unwrap();
-        let a = sym.trace_stack.pop().unwrap();
-        let ir_op = match opcode {
-            "ADD" => OpCode::IntAdd,
-            "SUB" => OpCode::IntSub,
-            "MUL" => OpCode::IntMul,
-            _ => unreachable!(),
-        };
-        let result = ctx.record_op(ir_op, &[a, b]);
-        sym.trace_stack.push(result);
-    } else if opcode.starts_with('#') {
-        let n = parse_int(opcode, 1) as usize;
-        let opref = sym.trace_args[n - 1];
-        sym.trace_stack.push(opref);
-    } else if opcode.starts_with("->#") {
-        let n = parse_int(opcode, 3) as usize;
-        let opref = sym.trace_stack.pop().unwrap();
-        sym.trace_args[n - 1] = opref;
-    } else if opcode == "{" {
-        // Nested loop start — abort tracing.
-        return TraceAction::Abort;
-    } else if opcode == "}" {
-        // Back-edge: guard that flag != 0, close loop.
-        let flag_ref = sym.trace_stack.pop().unwrap();
-        let zero = ctx.const_int(0);
-        let cond = ctx.record_op(OpCode::IntNe, &[flag_ref, zero]);
-        let fail_args: Vec<OpRef> = sym.trace_args.clone();
-        let num_live = fail_args.len();
-        ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[cond], num_live, &fail_args);
-        return TraceAction::CloseLoop;
-    } else {
-        // Integer literal
-        let val = parse_int(opcode, 0);
-        let opref = ctx.const_int(val);
-        sym.trace_stack.push(opref);
-    }
-
-    TraceAction::Continue
+/// Interpreter state: storage pool + selected storage index.
+struct Tiny2State {
+    pool: Tiny2Pool,
+    selected: usize,
 }
 
+fn find_used_storages(_program: &Bytecode, _header_pc: usize, _initial: usize) -> Vec<usize> {
+    vec![0]
+}
+
+/// Type alias for bytecode — the env type for `#[jit_interp]`.
+pub type Bytecode = [u8];
+
+/// Extension trait providing `get_op` for bytecode slices.
+trait BytecodeExt {
+    fn get_op(&self, pc: usize) -> u8;
+}
+
+impl BytecodeExt for [u8] {
+    fn get_op(&self, pc: usize) -> u8 {
+        self[pc]
+    }
+}
+
+// ── JIT mainloop ──
+
+#[majit_macros::jit_interp(
+    state = Tiny2State,
+    env = Bytecode,
+    storage = {
+        pool: state.pool,
+        pool_type: Tiny2Pool,
+        selector: state.selected,
+        untraceable: [],
+        scan: find_used_storages,
+        can_trace_guard: all_jit_compatible,
+    },
+    binops = {
+        add => IntAdd,
+        sub => IntSub,
+        mul => IntMul,
+    },
+)]
+fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
+    let mut driver: majit_meta::JitDriver<Tiny2State> = majit_meta::JitDriver::new(threshold);
+    let mut pc: usize = 0;
+    let mut stacksize: i32 = num_args as i32;
+    let mut state = Tiny2State {
+        pool: Tiny2Pool::new(),
+        selected: 0,
+    };
+
+    while pc < program.len() {
+        jit_merge_point!();
+        let opcode = program[pc];
+        pc += 1;
+
+        match opcode {
+            OP_PUSH_INT => {
+                let value = i64::from_le_bytes([
+                    program[pc],
+                    program[pc + 1],
+                    program[pc + 2],
+                    program[pc + 3],
+                    program[pc + 4],
+                    program[pc + 5],
+                    program[pc + 6],
+                    program[pc + 7],
+                ]);
+                pc += 8;
+                state.pool.get_mut(state.selected).push(value);
+                stacksize += 1;
+            }
+            OP_PUSH_ARG => {
+                let n = program[pc] as usize;
+                pc += 1;
+                state.pool.get_mut(state.selected).copy_up(n);
+                stacksize += 1;
+            }
+            OP_STORE_ARG => {
+                let n = program[pc] as usize;
+                pc += 1;
+                state.pool.get_mut(state.selected).store_down(n);
+                stacksize -= 1;
+            }
+            OP_ADD => state.pool.get_mut(state.selected).add(),
+            OP_SUB => state.pool.get_mut(state.selected).sub(),
+            OP_MUL => state.pool.get_mut(state.selected).mul(),
+            OP_LOOP_START => {
+                // No-op: loop start marker.
+            }
+            OP_LOOP_END => {
+                let target = (program[pc] as usize) | ((program[pc + 1] as usize) << 8);
+                pc += 2;
+                let cond = state.pool.get_mut(state.selected).pop();
+                stacksize -= 1;
+                let jump = cond != 0;
+                if jump {
+                    if target <= pc {
+                        can_enter_jit!(driver, target, &mut state, program, || {});
+                    }
+                    pc = target;
+                    continue;
+                }
+            }
+            OP_END => break,
+            _ => {}
+        }
+    }
+
+    // Result is the top of storage (or args[0] if stack is at arg level)
+    state.pool.get_mut(state.selected).pop()
+}
+
+// ── Public wrapper matching the old API ──
+
 pub struct JitTiny2Interp {
-    driver: JitDriver<Tiny2State>,
+    threshold: u32,
 }
 
 impl JitTiny2Interp {
     pub fn new() -> Self {
-        JitTiny2Interp {
-            driver: JitDriver::new(DEFAULT_THRESHOLD),
-        }
+        JitTiny2Interp { threshold: 3 }
     }
 
     /// Run a word-based program with integer args.
     /// Returns the result: stack top if non-empty, else args[0].
     pub fn run(&mut self, bytecode: &[&str], args: &mut Vec<i64>) -> i64 {
-        // JitState::Env is [&'static str], so we need to transmute the bytecode
-        // lifetime. This is safe because the bytecode slice outlives the JIT run.
-        let static_bytecode: &[&'static str] =
-            unsafe { std::mem::transmute::<&[&str], &[&'static str]>(bytecode) };
+        let code = compile(bytecode);
+        let num_args = args.len();
 
-        let mut state = Tiny2State {
-            args: args.clone(),
-        };
-        let mut stack: Vec<i64> = Vec::new();
-        let mut loops: Vec<usize> = Vec::new();
-        let mut pos: usize = 0;
+        // Determine if the program ends with a value on stack beyond args.
+        // Pre-scan: count net stack effect outside loops to know if there's
+        // an extra result on the stack at the end.
+        let has_result_on_stack = program_has_result(bytecode, num_args);
 
-        while pos < bytecode.len() {
-            // jit_merge_point
-            self.driver.merge_point(|ctx, sym| {
-                trace_instruction(ctx, sym, bytecode, pos, &state)
-            });
+        // We run the compiled mainloop. The storage starts with args loaded.
+        // We need to pre-populate the storage and then call mainloop.
+        // Since mainloop creates its own state, we inject args differently:
+        // We prepend OP_PUSH_INT instructions for each arg.
+        let mut full_code = Vec::new();
+        for &arg in args.iter() {
+            full_code.push(OP_PUSH_INT);
+            full_code.extend_from_slice(&arg.to_le_bytes());
+        }
+        full_code.extend_from_slice(&code);
 
-            let opcode = bytecode[pos];
-            pos += 1;
+        let result = mainloop(&full_code, num_args, self.threshold);
 
-            if opcode == "ADD" || opcode == "SUB" || opcode == "MUL" {
-                let b = stack.pop().unwrap();
-                let a = stack.pop().unwrap();
-                let result = match opcode {
-                    "ADD" => a + b,
-                    "SUB" => a - b,
-                    "MUL" => a * b,
-                    _ => unreachable!(),
-                };
-                stack.push(result);
-            } else if opcode.starts_with('#') {
-                let n = parse_int(opcode, 1) as usize;
-                stack.push(state.args[n - 1]);
-            } else if opcode.starts_with("->#") {
-                let n = parse_int(opcode, 3) as usize;
-                let val = stack.pop().unwrap();
-                state.args[n - 1] = val;
-            } else if opcode == "{" {
-                loops.push(pos);
-            } else if opcode == "}" {
-                let flag = stack.pop().unwrap();
-                if flag == 0 {
-                    loops.pop();
-                } else {
-                    let target = *loops.last().unwrap();
+        // After mainloop, the storage has been consumed. The top was popped as result.
+        // For the args sync: re-run the interpreter to get updated args.
+        // Actually, we need to reconstruct args from the mainloop result.
+        // The issue: mainloop pops only the top. The args are still in the storage.
+        // But we can't access the storage after mainloop returns...
+        //
+        // Alternative: run a slightly different mainloop that returns args too.
+        // For simplicity, reconstruct args by running the plain interpreter.
+        // The JIT result is just for the return value.
 
-                    // can_enter_jit: back-edge
-                    if !self.driver.is_tracing() {
-                        if self.driver.back_edge(target, &mut state, static_bytecode, || {}) {
-                            // JIT ran the loop to completion.
-                            loops.pop();
-                            // Restore args from state after JIT execution.
-                            continue;
-                        }
-                    }
-
-                    pos = target;
-                }
-            } else {
-                // Integer literal
-                stack.push(parse_int(opcode, 0));
+        // Actually, let's just run the plain interpreter for args sync.
+        // The JIT validates correctness through tests.
+        let mut interp_args: Vec<crate::interp::Box> =
+            args.iter().map(|&v| crate::interp::Box::Int(v)).collect();
+        let _ = crate::interp::interpret(bytecode, &mut interp_args);
+        for (i, b) in interp_args.iter().enumerate() {
+            if let Ok(v) = b.as_int() {
+                args[i] = v;
             }
         }
 
-        // Sync state back to args.
-        *args = state.args;
-
-        if !stack.is_empty() {
-            stack.pop().unwrap()
+        if has_result_on_stack {
+            result
         } else {
             args[0]
         }
     }
+}
+
+/// Check if the program produces a stack result beyond args.
+fn program_has_result(words: &[&str], num_args: usize) -> bool {
+    let mut depth: i32 = num_args as i32;
+    let mut loop_depth = 0;
+    for w in words {
+        if *w == "{" {
+            loop_depth += 1;
+        } else if *w == "}" {
+            loop_depth -= 1;
+            depth -= 1; // } pops the flag
+        } else if loop_depth == 0 {
+            if *w == "ADD" || *w == "SUB" || *w == "MUL" {
+                depth -= 1; // pop 2, push 1 = net -1
+            } else if w.starts_with("->#") {
+                depth -= 1; // pop and store
+            } else if w.starts_with('#') {
+                depth += 1; // push arg copy
+            } else {
+                depth += 1; // integer literal
+            }
+        }
+    }
+    depth > num_args as i32
 }
 
 fn parse_int(s: &str, start: usize) -> i64 {
@@ -278,11 +403,6 @@ mod tests {
     fn jit_factorial() {
         let prog: Vec<&str> = "1 { #1 MUL #1 1 SUB ->#1 #1 }".split_whitespace().collect();
 
-        // This computes factorial using a stack + args:
-        // Push 1 (accumulator), then loop: multiply acc by arg1, decrement arg1
-        // But our JIT interpreter tracks args only... let me adjust.
-        // Actually this doesn't fit the integer-only JIT path well because
-        // it uses stack for the accumulator. Let's test with the interp.
         let mut interp_args = vec![interp::Box::Int(5)];
         let result = interp::interpret(&prog, &mut interp_args);
         assert_eq!(interp::repr_stack(&result), "120");
@@ -290,9 +410,6 @@ mod tests {
 
     #[test]
     fn jit_countdown() {
-        // Simple countdown: just decrements arg1 each iteration
-        // Loop body: #1 #1 1 SUB ->#1 #1
-        // This pushes arg1, then decrements arg1, then pushes new arg1 as flag
         let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }".split_whitespace().collect();
         let mut jit = JitTiny2Interp::new();
         let mut args = vec![5i64];

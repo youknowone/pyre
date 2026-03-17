@@ -274,6 +274,7 @@ fn sync_jit_state_to_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pyre_runtime::{is_func, w_func_get_code_ptr};
 
     #[test]
     fn test_eval_simple_addition() {
@@ -301,6 +302,32 @@ while i < 100:
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 4950);
+        }
+    }
+
+    #[test]
+    fn test_eval_recursive_fib_compiles_function_entry_trace() {
+        let source = "\
+def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+result = fib(12)";
+        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let fib = *(*frame.namespace).get("fib").unwrap();
+            assert!(is_func(fib));
+            let fib_key = w_func_get_code_ptr(fib) as u64;
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(pyre_object::intobject::w_int_get_value(result), 144);
+            let (driver, _) = driver_pair();
+            assert!(
+                driver.has_compiled_loop(fib_key),
+                "recursive fib should compile a function-entry trace"
+            );
         }
     }
 }
