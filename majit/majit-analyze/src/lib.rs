@@ -372,6 +372,11 @@ pub fn generate_trace_code(result: &AnalysisResult) -> String {
     codegen::generate(result)
 }
 
+/// Generate code from graph pipeline results.
+pub fn generate_graph_code(result: &passes::ProgramPipelineResult) -> String {
+    codegen::generate_from_graph(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
