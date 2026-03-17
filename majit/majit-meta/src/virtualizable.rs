@@ -125,6 +125,70 @@ impl VirtualizableInfo {
     pub fn num_arrays(&self) -> usize {
         self.array_fields.len()
     }
+
+    /// Get the index of a static field by its descriptor offset.
+    /// RPython equivalent: static_field_by_descrs
+    pub fn static_field_index(&self, offset: usize) -> Option<usize> {
+        self.static_fields.iter().position(|f| f.offset == offset)
+    }
+
+    /// Get the index of an array field by its field offset.
+    /// RPython equivalent: array_field_by_descrs
+    pub fn array_field_index(&self, field_offset: usize) -> Option<usize> {
+        self.array_fields
+            .iter()
+            .position(|a| a.field_offset == field_offset)
+    }
+
+    /// Get total size: number of static fields + sum of all array lengths.
+    /// `array_lengths` must have one entry per array field.
+    pub fn get_total_size(&self, array_lengths: &[usize]) -> usize {
+        self.num_static_fields + array_lengths.iter().sum::<usize>()
+    }
+
+    /// Get the index into the flat box array for a specific array element.
+    /// `array_index` is the index of the array field, `item_index` is the
+    /// element within that array.
+    /// RPython equivalent: get_index_in_array
+    pub fn get_index_in_array(
+        &self,
+        array_index: usize,
+        item_index: usize,
+        array_lengths: &[usize],
+    ) -> usize {
+        let mut idx = self.num_static_fields;
+        for i in 0..array_index {
+            idx += array_lengths[i];
+        }
+        idx + item_index
+    }
+
+    /// Returns symbolic descriptions of SETFIELD_GC ops to emit before a
+    /// residual call during tracing, flushing JIT state to heap.
+    /// RPython equivalent: tracing_before_residual_call
+    pub fn tracing_before_residual_call_ops(&self, vable_ref: &str) -> Vec<String> {
+        self.static_fields
+            .iter()
+            .map(|f| format!("SetfieldGc({vable_ref}, field_{})", f.name))
+            .collect()
+    }
+
+    /// Returns symbolic descriptions of GETFIELD_GC ops to emit after a
+    /// residual call during tracing, re-reading fields the callee may have
+    /// modified.
+    /// RPython equivalent: tracing_after_residual_call
+    pub fn tracing_after_residual_call_ops(&self, vable_ref: &str) -> Vec<String> {
+        self.static_fields
+            .iter()
+            .map(|f| format!("GetfieldGc({vable_ref}, field_{})", f.name))
+            .collect()
+    }
+
+    /// Check that box array has correct size for given array lengths.
+    /// RPython equivalent: check_boxes
+    pub fn check_boxes(&self, boxes: &[i64], array_lengths: &[usize]) -> bool {
+        boxes.len() == self.get_total_size(array_lengths)
+    }
 }
 
 /// Reads virtualizable fields from a heap object into a flat value array.
@@ -451,6 +515,79 @@ mod tests {
             });
         }
         assert!(!forced, "should not force when token is zero");
+    }
+
+    #[test]
+    fn test_static_field_index_lookup() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_field("y", Type::Int, 16);
+        info.add_field("z", Type::Float, 24);
+
+        assert_eq!(info.static_field_index(8), Some(0));
+        assert_eq!(info.static_field_index(16), Some(1));
+        assert_eq!(info.static_field_index(24), Some(2));
+        assert_eq!(info.static_field_index(999), None);
+    }
+
+    #[test]
+    fn test_array_field_index_lookup() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_array_field("locals", Type::Ref, 32);
+        info.add_array_field("stack", Type::Int, 40);
+
+        assert_eq!(info.array_field_index(32), Some(0));
+        assert_eq!(info.array_field_index(40), Some(1));
+        assert_eq!(info.array_field_index(999), None);
+    }
+
+    #[test]
+    fn test_get_total_size() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_field("y", Type::Int, 16);
+        info.add_array_field("locals", Type::Ref, 24);
+        info.add_array_field("stack", Type::Int, 32);
+
+        // 2 static + 5 + 3 = 10
+        assert_eq!(info.get_total_size(&[5, 3]), 10);
+        // 2 static + 0 + 0 = 2
+        assert_eq!(info.get_total_size(&[0, 0]), 2);
+        // empty arrays
+        assert_eq!(info.get_total_size(&[]), 2);
+    }
+
+    #[test]
+    fn test_get_index_in_array() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_field("y", Type::Int, 16);
+        info.add_array_field("locals", Type::Ref, 24);
+        info.add_array_field("stack", Type::Int, 32);
+
+        let lens = &[5, 3];
+        // array 0, item 0 => 2 static + 0 = 2
+        assert_eq!(info.get_index_in_array(0, 0, lens), 2);
+        // array 0, item 4 => 2 + 4 = 6
+        assert_eq!(info.get_index_in_array(0, 4, lens), 6);
+        // array 1, item 0 => 2 + 5 + 0 = 7
+        assert_eq!(info.get_index_in_array(1, 0, lens), 7);
+        // array 1, item 2 => 2 + 5 + 2 = 9
+        assert_eq!(info.get_index_in_array(1, 2, lens), 9);
+    }
+
+    #[test]
+    fn test_check_boxes() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_field("y", Type::Int, 16);
+        info.add_array_field("locals", Type::Ref, 24);
+
+        let lens = &[3usize];
+        // total = 2 + 3 = 5
+        assert!(info.check_boxes(&[1, 2, 3, 4, 5], lens));
+        assert!(!info.check_boxes(&[1, 2, 3], lens));
+        assert!(!info.check_boxes(&[1, 2, 3, 4, 5, 6], lens));
     }
 
     #[test]
