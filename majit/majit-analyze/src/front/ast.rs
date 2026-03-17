@@ -69,7 +69,7 @@ pub fn build_semantic_program_with_options(
 
 fn build_function_graph(func: &ItemFn, options: &AstGraphOptions) -> SemanticFunction {
     let mut graph = MajitGraph::new(func.sig.ident.to_string());
-    let entry = graph.entry;
+    let mut entry = graph.entry;
 
     // Register function parameters as Input ops (RPython: Block.inputargs)
     for param in &func.sig.inputs {
@@ -88,7 +88,7 @@ fn build_function_graph(func: &ItemFn, options: &AstGraphOptions) -> SemanticFun
 
     // Lower function body
     for stmt in &func.block.stmts {
-        lower_stmt(&mut graph, entry, stmt, options);
+        lower_stmt(&mut graph, &mut entry, stmt, options);
     }
 
     // Default terminator if none was set
@@ -107,12 +107,13 @@ fn build_function_graph(func: &ItemFn, options: &AstGraphOptions) -> SemanticFun
 /// Public entry point for lowering a single statement into a graph.
 /// Used by the graph-based classifier in lib.rs to analyze resolved method bodies.
 pub fn lower_stmt_pub(graph: &mut MajitGraph, block: BasicBlockId, stmt: &syn::Stmt) {
-    lower_stmt(graph, block, stmt, &AstGraphOptions::default());
+    let mut block = block;
+    lower_stmt(graph, &mut block, stmt, &AstGraphOptions::default());
 }
 
 fn lower_stmt(
     graph: &mut MajitGraph,
-    block: BasicBlockId,
+    block: &mut BasicBlockId,
     stmt: &syn::Stmt,
     options: &AstGraphOptions,
 ) {
@@ -127,21 +128,23 @@ fn lower_stmt(
         }
         syn::Stmt::Macro(_) => {
             let summary = truncate(&quote!(#stmt).to_string(), options.max_summary_len);
-            graph.push_op(block, OpKind::Unknown { summary }, false);
+            graph.push_op(*block, OpKind::Unknown { summary }, false);
         }
         syn::Stmt::Item(_) => {}
     }
 }
 
-// ── Expression lowering (returns ValueId for data flow) ──────────
+// ── Expression lowering (block-splitting for control flow) ───────
 
-/// Lower an expression and return the ValueId of its result.
+/// Lower an expression, potentially splitting blocks for control flow.
 ///
-/// RPython equivalent: FlowContext recording SpaceOperations.
-/// Each expression becomes one or more ops with connected ValueIds.
+/// RPython equivalent: FlowContext.handle_bytecode() + guessbool().
+/// When `if`/`match` is encountered, the current block is terminated
+/// with a Branch, new blocks are created for each arm, and `block`
+/// is updated to the merge/continuation block.
 fn lower_expr(
     graph: &mut MajitGraph,
-    block: BasicBlockId,
+    block: &mut BasicBlockId,
     expr: &syn::Expr,
     options: &AstGraphOptions,
 ) -> Option<ValueId> {
@@ -152,7 +155,7 @@ fn lower_expr(
                 .unwrap_or_else(|| graph.alloc_value());
             let field_name = member_name(&field.member);
             graph.push_op(
-                block,
+                *block,
                 OpKind::FieldRead {
                     base,
                     field: field_name,
@@ -169,7 +172,7 @@ fn lower_expr(
             let index = lower_expr(graph, block, &idx.index, options)
                 .unwrap_or_else(|| graph.alloc_value());
             graph.push_op(
-                block,
+                *block,
                 OpKind::ArrayRead {
                     base,
                     index,
@@ -190,7 +193,7 @@ fn lower_expr(
                         .unwrap_or_else(|| graph.alloc_value());
                     let field_name = member_name(&field.member);
                     graph.push_op(
-                        block,
+                        *block,
                         OpKind::FieldWrite {
                             base,
                             field: field_name,
@@ -206,7 +209,7 @@ fn lower_expr(
                     let index = lower_expr(graph, block, &idx.index, options)
                         .unwrap_or_else(|| graph.alloc_value());
                     graph.push_op(
-                        block,
+                        *block,
                         OpKind::ArrayWrite {
                             base,
                             index,
@@ -232,7 +235,7 @@ fn lower_expr(
                 .collect();
             let target = truncate(&quote!(#call.func).to_string(), 80);
             graph.push_op(
-                block,
+                *block,
                 OpKind::Call {
                     target,
                     args,
@@ -254,7 +257,7 @@ fn lower_expr(
                 }
             }
             graph.push_op(
-                block,
+                *block,
                 OpKind::Call {
                     target: mc.method.to_string(),
                     args,
@@ -264,17 +267,52 @@ fn lower_expr(
             )
         }
 
-        // ── if/else ──
+        // ── if/else → block split (RPython FlowContext.guessbool) ──
         syn::Expr::If(if_expr) => {
             let cond = lower_expr(graph, block, &if_expr.cond, options)
                 .unwrap_or_else(|| graph.alloc_value());
-            graph.push_op(block, OpKind::GuardTrue { cond }, false);
+
+            // Create then/else/merge blocks
+            let mut then_block = graph.create_block();
+            let mut else_block = graph.create_block();
+            let merge_block = graph.create_block();
+
+            // Terminate current block with Branch
+            graph.set_terminator(
+                *block,
+                Terminator::Branch {
+                    cond,
+                    if_true: then_block,
+                    true_args: vec![],
+                    if_false: else_block,
+                    false_args: vec![],
+                },
+            );
+
+            // Lower then branch
             for stmt in &if_expr.then_branch.stmts {
-                lower_stmt(graph, block, stmt, options);
+                lower_stmt(graph, &mut then_block, stmt, options);
             }
+            if graph.block(then_block).terminator == Terminator::Unreachable {
+                graph.set_terminator(
+                    then_block,
+                    Terminator::Goto { target: merge_block, args: vec![] },
+                );
+            }
+
+            // Lower else branch (if present)
             if let Some((_, else_branch)) = &if_expr.else_branch {
-                lower_expr(graph, block, else_branch, options);
+                lower_expr(graph, &mut else_block, else_branch, options);
             }
+            if graph.block(else_block).terminator == Terminator::Unreachable {
+                graph.set_terminator(
+                    else_block,
+                    Terminator::Goto { target: merge_block, args: vec![] },
+                );
+            }
+
+            // Continue in merge block
+            *block = merge_block;
             None
         }
 
@@ -284,7 +322,7 @@ fn lower_expr(
                 .expr
                 .as_ref()
                 .and_then(|e| lower_expr(graph, block, e, options));
-            graph.set_terminator(block, Terminator::Return(val));
+            graph.set_terminator(*block, Terminator::Return(val));
             None
         }
 
@@ -304,18 +342,18 @@ fn lower_expr(
         syn::Expr::Lit(lit) => {
             if let syn::Lit::Int(int_lit) = &lit.lit {
                 if let Ok(v) = int_lit.base10_parse::<i64>() {
-                    return graph.push_op(block, OpKind::ConstInt(v), true);
+                    return graph.push_op(*block, OpKind::ConstInt(v), true);
                 }
             }
             let summary = truncate(&quote!(#expr).to_string(), options.max_summary_len);
-            graph.push_op(block, OpKind::Unknown { summary }, true)
+            graph.push_op(*block, OpKind::Unknown { summary }, true)
         }
 
         // ── path (variable reference) ──
         syn::Expr::Path(path) => {
             let name = quote!(#path).to_string().replace(' ', "");
             graph.push_op(
-                block,
+                *block,
                 OpKind::Input {
                     name,
                     ty: ValueType::Unknown,
@@ -346,7 +384,7 @@ fn lower_expr(
             }
             let op_name = quote!(#bin.op).to_string();
             graph.push_op(
-                block,
+                *block,
                 OpKind::Call {
                     target: op_name,
                     args,
@@ -368,25 +406,84 @@ fn lower_expr(
             None
         }
 
-        // ── while/loop ──
+        // ── while → header block + body block + exit block ──
         syn::Expr::While(w) => {
-            lower_expr(graph, block, &w.cond, options);
+            let mut header = graph.create_block();
+            let mut body = graph.create_block();
+            let exit = graph.create_block();
+
+            // Current block → header
+            graph.set_terminator(*block, Terminator::Goto { target: header, args: vec![] });
+
+            // Header: evaluate condition, branch to body or exit
+            let cond = lower_expr(graph, &mut header, &w.cond, options)
+                .unwrap_or_else(|| graph.alloc_value());
+            graph.set_terminator(
+                header,
+                Terminator::Branch {
+                    cond,
+                    if_true: body,
+                    true_args: vec![],
+                    if_false: exit,
+                    false_args: vec![],
+                },
+            );
+
+            // Body → back to header
             for stmt in &w.body.stmts {
-                lower_stmt(graph, block, stmt, options);
+                lower_stmt(graph, &mut body, stmt, options);
             }
+            if graph.block(body).terminator == Terminator::Unreachable {
+                graph.set_terminator(body, Terminator::Goto { target: header, args: vec![] });
+            }
+
+            *block = exit;
             None
         }
         syn::Expr::Loop(l) => {
+            let mut body = graph.create_block();
+            let exit = graph.create_block();
+
+            graph.set_terminator(*block, Terminator::Goto { target: body, args: vec![] });
+
             for stmt in &l.body.stmts {
-                lower_stmt(graph, block, stmt, options);
+                lower_stmt(graph, &mut body, stmt, options);
             }
+            if graph.block(body).terminator == Terminator::Unreachable {
+                graph.set_terminator(body, Terminator::Goto { target: body, args: vec![] });
+            }
+
+            *block = exit;
             None
         }
         syn::Expr::ForLoop(f) => {
-            lower_expr(graph, block, &f.expr, options);
+            let mut header = graph.create_block();
+            let mut body = graph.create_block();
+            let exit = graph.create_block();
+
+            graph.set_terminator(*block, Terminator::Goto { target: header, args: vec![] });
+
+            lower_expr(graph, &mut header, &f.expr, options);
+            let iter_cond = graph.alloc_value();
+            graph.set_terminator(
+                header,
+                Terminator::Branch {
+                    cond: iter_cond,
+                    if_true: body,
+                    true_args: vec![],
+                    if_false: exit,
+                    false_args: vec![],
+                },
+            );
+
             for stmt in &f.body.stmts {
-                lower_stmt(graph, block, stmt, options);
+                lower_stmt(graph, &mut body, stmt, options);
             }
+            if graph.block(body).terminator == Terminator::Unreachable {
+                graph.set_terminator(body, Terminator::Goto { target: header, args: vec![] });
+            }
+
+            *block = exit;
             None
         }
 
@@ -417,7 +514,7 @@ fn lower_expr(
         // ── fallback ──
         _ => {
             let summary = truncate(&quote!(#expr).to_string(), options.max_summary_len);
-            graph.push_op(block, OpKind::Unknown { summary }, true)
+            graph.push_op(*block, OpKind::Unknown { summary }, true)
         }
     }
 }
@@ -515,5 +612,53 @@ mod tests {
         assert_eq!(program.functions.len(), 2);
         assert_eq!(program.functions[0].name, "bar");
         assert_eq!(program.functions[1].name, "baz");
+    }
+
+    #[test]
+    fn if_creates_multiple_blocks() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn branch(x: bool) -> i64 {
+                if x { 1 } else { 2 }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        // entry + then + else + merge = at least 4 blocks
+        assert!(
+            graph.blocks.len() >= 4,
+            "if/else should create >=4 blocks, got {}",
+            graph.blocks.len()
+        );
+        // Entry block should have a Branch terminator
+        assert!(
+            matches!(
+                &graph.block(graph.entry).terminator,
+                Terminator::Branch { .. }
+            ),
+            "entry should end with Branch, got {:?}",
+            graph.block(graph.entry).terminator
+        );
+    }
+
+    #[test]
+    fn while_creates_header_body_exit() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn loop_fn(mut x: i64) -> i64 {
+                while x > 0 { x = x - 1; }
+                x
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        // entry + header + body + exit = at least 4 blocks
+        assert!(
+            graph.blocks.len() >= 4,
+            "while should create >=4 blocks, got {}",
+            graph.blocks.len()
+        );
     }
 }

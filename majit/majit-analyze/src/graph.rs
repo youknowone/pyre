@@ -72,13 +72,22 @@ pub struct Op {
     pub kind: OpKind,
 }
 
+/// How control flow leaves a basic block.
+///
+/// RPython equivalent: `Block.exitswitch` + `Block.exits` (Links).
+/// Each variant that targets another block carries `args` which map
+/// to the target block's `inputargs` (RPython `Link.args`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Terminator {
-    Goto(BasicBlockId),
+    /// Unconditional jump. `args` → target.inputargs.
+    Goto { target: BasicBlockId, args: Vec<ValueId> },
+    /// Conditional branch. Each arm carries its own args.
     Branch {
         cond: ValueId,
         if_true: BasicBlockId,
+        true_args: Vec<ValueId>,
         if_false: BasicBlockId,
+        false_args: Vec<ValueId>,
     },
     Return(Option<ValueId>),
     Abort {
@@ -87,9 +96,19 @@ pub enum Terminator {
     Unreachable,
 }
 
+/// A basic block in the control flow graph.
+///
+/// RPython equivalent: `flowspace/model.py Block`.
+/// - `inputargs`: Phi-node inputs from predecessor Links (RPython Block.inputargs)
+/// - `ops`: sequential operations within this block
+/// - `terminator`: how control leaves this block
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BasicBlock {
     pub id: BasicBlockId,
+    /// Phi-node inputs: values provided by incoming Links.
+    /// RPython: `Block.inputargs` — each predecessor Link carries
+    /// values that map 1:1 to these inputargs.
+    pub inputargs: Vec<ValueId>,
     pub ops: Vec<Op>,
     pub terminator: Terminator,
 }
@@ -112,6 +131,7 @@ impl MajitGraph {
             entry,
             blocks: vec![BasicBlock {
                 id: entry,
+                inputargs: Vec::new(),
                 ops: Vec::new(),
                 terminator: Terminator::Unreachable,
             }],
@@ -124,10 +144,24 @@ impl MajitGraph {
         let id = BasicBlockId(self.blocks.len());
         self.blocks.push(BasicBlock {
             id,
+            inputargs: Vec::new(),
             ops: Vec::new(),
             terminator: Terminator::Unreachable,
         });
         id
+    }
+
+    /// Create a block with explicit inputargs (Phi nodes).
+    pub fn create_block_with_args(&mut self, num_args: usize) -> (BasicBlockId, Vec<ValueId>) {
+        let id = BasicBlockId(self.blocks.len());
+        let args: Vec<ValueId> = (0..num_args).map(|_| self.alloc_value()).collect();
+        self.blocks.push(BasicBlock {
+            id,
+            inputargs: args.clone(),
+            ops: Vec::new(),
+            terminator: Terminator::Unreachable,
+        });
+        (id, args)
     }
 
     pub fn alloc_value(&mut self) -> ValueId {
@@ -180,7 +214,9 @@ mod tests {
             Terminator::Branch {
                 cond,
                 if_true: next,
+                true_args: vec![],
                 if_false: next,
+                false_args: vec![],
             },
         );
         assert_eq!(graph.blocks.len(), 2);
