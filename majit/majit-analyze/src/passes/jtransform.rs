@@ -80,6 +80,11 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
         .map(|(name, idx)| (name.as_str(), *idx))
         .collect();
 
+    // Track which ValueIds are results of reading a virtualizable array field.
+    // RPython jtransform.py tracks vable_array_vars for this purpose.
+    let mut vable_array_values: std::collections::HashMap<crate::graph::ValueId, usize> =
+        std::collections::HashMap::new();
+
     for block in &mut rewritten.blocks {
         let mut new_ops = Vec::with_capacity(block.ops.len());
 
@@ -88,6 +93,12 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                 // ── Virtualizable field read → VableFieldRead ──
                 // RPython jtransform.py:832 `rewrite_op_getfield`
                 OpKind::FieldRead { field, ty, .. } if config.lower_virtualizable => {
+                    // Track if this field read is on a virtualizable array
+                    if let Some(&arr_idx) = vable_array_set.get(field.as_str()) {
+                        if let Some(result) = op.result {
+                            vable_array_values.insert(result, arr_idx);
+                        }
+                    }
                     if let Some(&idx) = vable_field_set.get(field.as_str()) {
                         notes.push(GraphTransformNote {
                             function: graph.name.clone(),
@@ -126,18 +137,29 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                     }
                 }
 
-                // ── Virtualizable array read → tag ──
+                // ── Virtualizable array read → VableArrayRead ──
+                // RPython jtransform.py:760 `getarrayitem_vable`
                 OpKind::ArrayRead {
                     base,
                     index,
                     item_ty,
                 } if config.lower_virtualizable => {
-                    // Check if the base was produced by a FieldRead on a vable array
-                    // (simplified: check graph notes or field name heuristic)
-                    notes.push(GraphTransformNote {
-                        function: graph.name.clone(),
-                        detail: "array_read (potential vable)".into(),
-                    });
+                    if let Some(&arr_idx) = vable_array_values.get(base) {
+                        notes.push(GraphTransformNote {
+                            function: graph.name.clone(),
+                            detail: format!("rewrite: array[idx] → VableArrayRead[{arr_idx}]"),
+                        });
+                        vable_rewrites += 1;
+                        new_ops.push(Op {
+                            result: op.result,
+                            kind: OpKind::VableArrayRead {
+                                array_index: arr_idx,
+                                elem_index: *index,
+                                item_ty: item_ty.clone(),
+                            },
+                        });
+                        continue;
+                    }
                 }
 
                 // ── Call classification ──
