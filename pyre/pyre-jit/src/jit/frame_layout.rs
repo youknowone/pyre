@@ -51,7 +51,7 @@ pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
     let mut info = VirtualizableInfo::new(PYFRAME_VABLE_TOKEN_OFFSET);
     info.add_field("next_instr", Type::Int, PYFRAME_NEXT_INSTR_OFFSET);
     info.add_field("stack_depth", Type::Int, PYFRAME_STACK_DEPTH_OFFSET);
-    info.add_array_field("locals_w", Type::Int, PYFRAME_LOCALS_OFFSET);
-    info.add_array_field("value_stack_w", Type::Int, PYFRAME_STACK_OFFSET);
+    info.add_array_field("locals_w", Type::Ref, PYFRAME_LOCALS_OFFSET);
+    info.add_array_field("value_stack_w", Type::Ref, PYFRAME_STACK_OFFSET);
     info
 }
