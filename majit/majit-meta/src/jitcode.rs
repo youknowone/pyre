@@ -1051,14 +1051,12 @@ where
                 // at the JitCode level. Both use boxes. The preamble loads values
                 // from heap, and JUMP carries them as args.
                 if sym.is_virtualizable_storage() {
-                    // Virtualizable: init array ref for newly-selected storage.
-                    // Do NOT call ensure_stack — virtualizable doesn't use SymbolicStack.
+                    // Virtualizable: init array ref only.
+                    // len_ref was already set by create_sym from InputArgs.
                     if sym.vable_array_ref(new_selected).is_none() {
                         let data_ptr = runtime.stack_data_ptr(new_selected);
-                        let len = runtime.stack_len(new_selected);
                         let arr_ref = ctx.const_int(data_ptr as i64);
-                        let len_ref = ctx.const_int(len as i64);
-                        sym.init_vable_storage(new_selected, arr_ref, len_ref);
+                        sym.set_vable_array_ref(new_selected, arr_ref);
                     }
                 } else {
                     if sym.stack(new_selected).is_none() {
@@ -1079,12 +1077,11 @@ where
                 let (value, concrete) = self.read_int_reg(src_idx);
                 if sym.is_virtualizable_storage() {
                     // Ensure target has vable refs
+                    // Init array ref only — len_ref from InputArgs.
                     if sym.vable_array_ref(target).is_none() {
                         let data_ptr = runtime.stack_data_ptr(target);
-                        let len = runtime.stack_len(target);
                         let arr_ref = ctx.const_int(data_ptr as i64);
-                        let len_ref = ctx.const_int(len as i64);
-                        sym.init_vable_storage(target, arr_ref, len_ref);
+                        sym.set_vable_array_ref(target, arr_ref);
                     }
                     if let (Some(arr_ref), Some(len_ref)) = (sym.vable_array_ref(target), sym.vable_len_ref(target)) {
                         let tagged = vable_tag_write(ctx, value);
@@ -2512,15 +2509,14 @@ where
     let runtime = ClosureRuntime::with_data_ptr(
         runtime_stack_len, runtime_stack_peek, label_at, stack_data_ptr,
     );
-    // Virtualizable preamble: init array ref AND len ref for the initially-selected storage.
+    // Virtualizable preamble: init array ref for the initially-selected storage.
+    // len_ref is already set by create_sym from InputArg — do NOT overwrite it.
     if sym.is_virtualizable_storage() {
         let selected = sym.current_selected();
         if sym.vable_array_ref(selected).is_none() {
             let data_ptr = runtime.stack_data_ptr(selected);
-            let len = runtime.stack_len(selected);
             let arr_ref = ctx.const_int(data_ptr as i64);
-            let len_ref = ctx.const_int(len as i64);
-            sym.init_vable_storage(selected, arr_ref, len_ref);
+            sym.set_vable_array_ref(selected, arr_ref);
         }
     }
     let root = MIFrame::new(jitcode, pc);

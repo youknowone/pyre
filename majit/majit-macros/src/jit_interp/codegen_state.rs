@@ -228,8 +228,12 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
                 let layout = if #virtualizable {
+                    // Virtualizable: record actual depths — they become InputArgs.
+                    // (depth=0 marker was wrong; InputArgs must match extract_live.)
                     #scan_fn(program, header_pc, self.#sel_field)
-                        .iter().map(|&s| (s, 0usize)).collect()
+                        .iter()
+                        .map(|&s| (s, 1usize)) // 1 InputArg per storage (the length)
+                        .collect()
                 } else {
                     #scan_fn(program, header_pc, self.#sel_field)
                         .iter()

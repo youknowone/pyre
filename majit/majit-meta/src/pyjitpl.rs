@@ -1313,7 +1313,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
-                self.warm_state.install_compiled(green_key, install_token);
+                self.warm_state.attach_procedure_to_interp(green_key, install_token);
 
                 self.stats.loops_compiled += 1;
 
@@ -1510,7 +1510,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
-                self.warm_state.install_compiled(green_key, install_token);
+                self.warm_state.attach_procedure_to_interp(green_key, install_token);
                 self.warm_state.reset_function_counts();
                 self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
@@ -4452,7 +4452,7 @@ mod tests {
         });
     }
 
-    fn install_compiled_entry(
+    fn attach_procedure_to_interp_entry(
         meta: &mut MetaInterp<()>,
         green_key: u64,
         inputargs: &[InputArg],
@@ -4548,7 +4548,7 @@ mod tests {
             100,
             maybe_force_and_return_void as *const () as usize as i64,
         );
-        install_compiled_entry(meta, green_key, &inputargs, ops, constants);
+        attach_procedure_to_interp_entry(meta, green_key, &inputargs, ops, constants);
     }
 
     #[test]
@@ -4715,7 +4715,7 @@ mod tests {
             },
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
         let trace_id = meta
             .compiled_loops
             .get(&green_key)
@@ -4783,7 +4783,7 @@ mod tests {
             },
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
         let trace_id = meta
             .compiled_loops
             .get(&green_key)
@@ -5002,7 +5002,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
         match meta.run_and_recover(green_key, &[0]) {
             Some(RunResult::Finished { values, .. }) => assert_eq!(values, vec![0]),
@@ -5077,7 +5077,7 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, 1);
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);
 
         match meta.run_with_blackhole_fallback(green_key, &[1]) {
             Some(BlackholeRunResult::Finished {
@@ -5134,7 +5134,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
         match meta.run_with_blackhole_fallback(green_key, &[1]) {
             Some(BlackholeRunResult::Finished {
@@ -5173,7 +5173,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
         meta.attach_resume_data(
             green_key,
             1,
@@ -5255,7 +5255,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
         meta.attach_resume_data(
             green_key,
             1,
@@ -5322,7 +5322,7 @@ mod tests {
         ];
         let mut root_constants = HashMap::new();
         root_constants.insert(100, 99);
-        install_compiled_entry(&mut meta, green_key, &inputargs, root_ops, root_constants);
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, root_ops, root_constants);
 
         let detailed = meta
             .run_compiled_detailed(green_key, &[1])
@@ -5402,7 +5402,7 @@ mod tests {
         ];
         let mut root_constants = HashMap::new();
         root_constants.insert(100, 77);
-        install_compiled_entry(&mut meta, green_key, &inputargs, root_ops, root_constants);
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, root_ops, root_constants);
 
         let root_failure = meta
             .run_compiled_detailed(green_key, &[1])
@@ -5489,7 +5489,7 @@ mod tests {
             },
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        install_compiled_entry(&mut meta, green_key, &inputargs, root_ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, root_ops, HashMap::new());
         let root_trace_id = meta.compiled_loops[&green_key].root_trace_id;
         meta.attach_resume_data_to_trace(
             green_key,
@@ -5577,7 +5577,7 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, 7);
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);
 
         let result = meta
             .run_compiled_detailed(green_key, &[])
@@ -5603,7 +5603,7 @@ mod tests {
         constants.insert(100, 1);
         constants.insert(101, 7);
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);
 
         let (values, _) = meta
             .run_compiled_values(green_key, &[])
@@ -5656,7 +5656,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
         let (values, _) = meta
             .run_compiled_with_values(green_key, &[Value::Float(3.5)])
@@ -5674,7 +5674,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
         let result = meta
             .run_compiled_raw_detailed_with_values(green_key, &[Value::Float(3.5)])
@@ -5698,7 +5698,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef(1), OpRef(0)], OpRef::NONE.0),
         ];
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
         let trace_id = meta
             .compiled_loops
             .get(&green_key)
@@ -5802,7 +5802,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef(1), OpRef(0)], OpRef::NONE.0),
         ];
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
         let trace_id = meta
             .compiled_loops
             .get(&green_key)
@@ -5848,7 +5848,7 @@ mod tests {
         constants.insert(100, 1);
         constants.insert(101, 1);
 
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);
 
         let result = meta
             .run_compiled_detailed(green_key, &[])
@@ -6088,7 +6088,7 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
-        install_compiled_entry(&mut meta, green_key, &inputargs, ops, constants);
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);
 
         // The bridge hook is set. We verify the hook mechanism is correctly wired.
         if let Some(ref hook) = meta.hooks.on_compile_bridge {

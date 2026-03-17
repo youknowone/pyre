@@ -131,7 +131,7 @@ impl BaseJitCell {
 
     /// Whether this cell should be removed (for GC of dead cells).
     /// Mirrors BaseBaseJitCell.should_remove_jitcell.
-    pub fn should_remove(&self) -> bool {
+    pub fn should_remove_jitcell(&self) -> bool {
         if self.get_procedure_token().is_some() {
             return false; // has a valid procedure token
         }
@@ -270,7 +270,7 @@ pub struct JitStats {
     /// Number of cells in Invalidated state.
     pub num_invalidated: usize,
     /// Number of cells in DontTraceHere state.
-    pub num_dont_trace_here: usize,
+    pub num_disable_noninlinable_function: usize,
     /// Total number of BaseJitCells.
     pub num_cells: usize,
 }
@@ -439,21 +439,21 @@ impl WarmEnterState {
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
     /// The caller is responsible for compiling the trace and calling
-    /// `install_compiled` with the resulting JitCellToken.
+    /// `attach_procedure_to_interp` with the resulting JitCellToken.
     pub fn finish_tracing(&mut self, green_key_hash: u64) {
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
-            // State remains Tracing until install_compiled is called.
+            // State remains Tracing until attach_procedure_to_interp is called.
         }
     }
 
     /// Mark that tracing was aborted for a green key.
     /// Optionally sets DONT_TRACE_HERE to prevent retrying.
-    pub fn abort_tracing(&mut self, green_key_hash: u64, dont_trace_here: bool) {
-        let mut mark_dont_trace = dont_trace_here;
+    pub fn abort_tracing(&mut self, green_key_hash: u64, disable_noninlinable_function: bool) {
+        let mut mark_dont_trace = disable_noninlinable_function;
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
-            if dont_trace_here {
+            if disable_noninlinable_function {
                 cell.state = BaseJitCellState::NotHot;
             } else {
                 cell.abort_count += 1;
@@ -468,8 +468,8 @@ impl WarmEnterState {
         if mark_dont_trace {
             // Too many retries — or an explicit permanent abort — stop
             // tracing this location entirely. RPython equivalent:
-            // retrace_limit exceeded / dont_trace_here().
-            self.dont_trace_here(green_key_hash);
+            // retrace_limit exceeded / disable_noninlinable_function().
+            self.disable_noninlinable_function(green_key_hash);
         }
         if let Some(log) = &mut self.jitlog {
             log.log_abort();
@@ -480,7 +480,7 @@ impl WarmEnterState {
     ///
     /// The cell transitions to Compiled state and takes ownership of
     /// the procedure token.
-    pub fn install_compiled(&mut self, green_key_hash: u64, token: JitCellToken) {
+    pub fn attach_procedure_to_interp(&mut self, green_key_hash: u64, token: JitCellToken) {
         let cell = self
             .cells
             .entry(green_key_hash)
@@ -514,7 +514,7 @@ impl WarmEnterState {
 
     /// Decay all counters (e.g., periodically to avoid stale counts).
     pub fn decay_counters(&mut self) {
-        self.counter.decay_all();
+        self.counter.decay_all_counters();
     }
 
     /// Get a reference to the BaseJitCell for a green key, if it exists.
@@ -626,8 +626,8 @@ impl WarmEnterState {
     /// Mark a callee as a location that should no longer be inlined into
     /// surrounding traces.
     ///
-    /// This is the warm-state equivalent of PyPy's `dont_trace_here()`.
-    pub fn dont_trace_here(&mut self, callee_key: u64) {
+    /// This is the warm-state equivalent of PyPy's `disable_noninlinable_function()`.
+    pub fn disable_noninlinable_function(&mut self, callee_key: u64) {
         let cell = self.cells.entry(callee_key).or_insert_with(BaseJitCell::new);
         cell.flags |= jc_flags::DONT_TRACE_HERE;
         if cell.flags & jc_flags::TRACING == 0 {
@@ -751,7 +751,7 @@ impl WarmEnterState {
     ///
     /// This is the low-level state-machine driver. Most callers should use
     /// the higher-level methods (`maybe_compile`, `finish_tracing`,
-    /// `install_compiled`, `abort_tracing`) which call this internally.
+    /// `attach_procedure_to_interp`, `abort_tracing`) which call this internally.
     pub fn transition_cell(&mut self, green_key_hash: u64, new_state: BaseJitCellState) {
         let cell = self
             .cells
@@ -817,7 +817,7 @@ impl WarmEnterState {
                 BaseJitCellState::Compiled => stats.num_compiled += 1,
                 BaseJitCellState::Tracing => stats.num_tracing += 1,
                 BaseJitCellState::Invalidated => stats.num_invalidated += 1,
-                BaseJitCellState::DontTraceHere => stats.num_dont_trace_here += 1,
+                BaseJitCellState::DontTraceHere => stats.num_disable_noninlinable_function += 1,
                 BaseJitCellState::NotHot => {}
             }
         }
@@ -843,7 +843,7 @@ impl WarmEnterState {
     /// Returns the number of cells removed.
     pub fn gc_cells(&mut self) -> usize {
         let before = self.cells.len();
-        self.cells.retain(|_, cell| !cell.should_remove());
+        self.cells.retain(|_, cell| !cell.should_remove_jitcell());
         before - self.cells.len()
     }
 }
@@ -895,7 +895,7 @@ mod tests {
         let mut ws = WarmEnterState::new(1);
         let token_num = ws.alloc_token_number();
         let token = JitCellToken::new(token_num);
-        ws.install_compiled(42, token);
+        ws.attach_procedure_to_interp(42, token);
 
         match ws.maybe_compile(42) {
             HotResult::RunCompiled => {}
@@ -1001,7 +1001,7 @@ mod tests {
         assert!(ws.get_compiled(42).is_none());
 
         let token = JitCellToken::new(0);
-        ws.install_compiled(42, token);
+        ws.attach_procedure_to_interp(42, token);
 
         let compiled = ws.get_compiled(42);
         assert!(compiled.is_some());
@@ -1030,7 +1030,7 @@ mod tests {
         ws.finish_tracing(key);
         let token_num = ws.alloc_token_number();
         let token = JitCellToken::new(token_num);
-        ws.install_compiled(key, token);
+        ws.attach_procedure_to_interp(key, token);
 
         // Phase 5: Run compiled
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
@@ -1070,7 +1070,7 @@ mod tests {
         let qmut_key = 0xABCD;
 
         assert!(!token.is_invalidated());
-        ws.install_compiled(green_key, token);
+        ws.attach_procedure_to_interp(green_key, token);
         ws.register_quasiimmut_dependency(qmut_key, green_key);
 
         let count = ws.invalidate_quasiimmut(qmut_key);
@@ -1096,7 +1096,7 @@ mod tests {
         // Install two loops depending on the same quasi-immutable field.
         for green_key in [10, 20] {
             let token = JitCellToken::new(ws.alloc_token_number());
-            ws.install_compiled(green_key, token);
+            ws.attach_procedure_to_interp(green_key, token);
             ws.register_quasiimmut_dependency(qmut_key, green_key);
         }
 
@@ -1114,7 +1114,7 @@ mod tests {
         let mut ws = WarmEnterState::new(1);
         for green_key in [1, 2, 3] {
             let token = JitCellToken::new(ws.alloc_token_number());
-            ws.install_compiled(green_key, token);
+            ws.attach_procedure_to_interp(green_key, token);
         }
 
         ws.invalidate_all();
@@ -1212,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dont_trace_here_blocks_inlining() {
+    fn test_disable_noninlinable_function_blocks_inlining() {
         let mut ws = WarmEnterState::new(3);
         ws.set_function_threshold(2);
 
@@ -1220,7 +1220,7 @@ mod tests {
         assert!(ws.should_inline_function(42));
 
         ws.reset_function_counts();
-        ws.dont_trace_here(42);
+        ws.disable_noninlinable_function(42);
 
         assert!(!ws.can_inline_callable(42));
         assert!(!ws.should_inline_function(42));
@@ -1272,7 +1272,7 @@ mod tests {
                 // Phase 4: this time the trace succeeds.
                 ws.finish_tracing(key);
                 let token = JitCellToken::new(ws.alloc_token_number());
-                ws.install_compiled(key, token);
+                ws.attach_procedure_to_interp(key, token);
             }
             _ => panic!("expected StartTracing on retry"),
         }
@@ -1311,7 +1311,7 @@ mod tests {
             HotResult::StartTracing(_) => {
                 ws.finish_tracing(key);
                 let token = JitCellToken::new(ws.alloc_token_number());
-                ws.install_compiled(key, token);
+                ws.attach_procedure_to_interp(key, token);
             }
             _ => panic!("expected StartTracing (attempt 3)"),
         }
@@ -1349,7 +1349,7 @@ mod tests {
         let mut ws = WarmEnterState::new(1);
         let qmut_key = 0xABCD;
         let token = JitCellToken::new(ws.alloc_token_number());
-        ws.install_compiled(42, token);
+        ws.attach_procedure_to_interp(42, token);
         ws.register_quasiimmut_dependency(qmut_key, 42);
 
         ws.invalidate_quasiimmut(qmut_key);
@@ -1525,7 +1525,7 @@ mod tests {
         }
         ws.finish_tracing(key);
         let token = JitCellToken::new(ws.alloc_token_number());
-        ws.install_compiled(key, token);
+        ws.attach_procedure_to_interp(key, token);
         aging.register_loop(key);
 
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
@@ -1541,7 +1541,7 @@ mod tests {
         // the cell so the loop can be recompiled. Simulate by checking
         // that we can re-install.
         let token2 = JitCellToken::new(ws.alloc_token_number());
-        ws.install_compiled(key, token2);
+        ws.attach_procedure_to_interp(key, token2);
         aging.register_loop(key);
 
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
@@ -1689,7 +1689,7 @@ mod tests {
             HotResult::StartTracing(_) => {
                 ws.finish_tracing(key);
                 let token = JitCellToken::new(ws.alloc_token_number());
-                ws.install_compiled(key, token);
+                ws.attach_procedure_to_interp(key, token);
             }
             _ => panic!("expected StartTracing with lower threshold"),
         }
@@ -1743,7 +1743,7 @@ mod tests {
         // Finish tracing and install → Compiled
         ws.finish_tracing(key);
         let token = JitCellToken::new(ws.alloc_token_number());
-        ws.install_compiled(key, token);
+        ws.attach_procedure_to_interp(key, token);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
 
         // Invalidate via transition_cell → Invalidated
@@ -1772,7 +1772,7 @@ mod tests {
         ws.finish_tracing(key);
         let token_num = ws.alloc_token_number();
         let token = JitCellToken::new(token_num);
-        ws.install_compiled(key, token);
+        ws.attach_procedure_to_interp(key, token);
 
         // Cell owns the token
         let cell = ws.get_cell(key).unwrap();
@@ -1842,7 +1842,7 @@ mod tests {
         // Compile key 1
         ws.finish_tracing(1);
         let token = JitCellToken::new(ws.alloc_token_number());
-        ws.install_compiled(1, token);
+        ws.attach_procedure_to_interp(1, token);
 
         let stats = ws.get_stats();
         assert_eq!(stats.num_compiled, 1);
@@ -1854,7 +1854,7 @@ mod tests {
         let stats = ws.get_stats();
         assert_eq!(stats.num_compiled, 1);
         assert_eq!(stats.num_tracing, 0);
-        assert_eq!(stats.num_dont_trace_here, 1);
+        assert_eq!(stats.num_disable_noninlinable_function, 1);
 
         // Invalidate key 1
         ws.transition_cell(1, BaseJitCellState::Invalidated);
@@ -1862,12 +1862,12 @@ mod tests {
         let stats = ws.get_stats();
         assert_eq!(stats.num_compiled, 0);
         assert_eq!(stats.num_invalidated, 1);
-        assert_eq!(stats.num_dont_trace_here, 1);
+        assert_eq!(stats.num_disable_noninlinable_function, 1);
         assert_eq!(stats.num_cells, 2);
     }
 
     #[test]
-    fn test_jitcell_state_dont_trace_here() {
+    fn test_jitcell_state_disable_noninlinable_function() {
         let mut ws = WarmEnterState::new(2);
         let key = 0xC3;
 
@@ -1919,23 +1919,23 @@ mod tests {
     fn test_jitcell_should_remove() {
         // A freshly created cell with no token and no flags should be removable
         let cell = BaseJitCell::new();
-        assert!(cell.should_remove());
+        assert!(cell.should_remove_jitcell());
 
         // A cell that is tracing should NOT be removable
         let mut cell = BaseJitCell::new();
         cell.flags |= jc_flags::TRACING;
-        assert!(!cell.should_remove());
+        assert!(!cell.should_remove_jitcell());
 
         // A cell with DONT_TRACE_HERE but no token history is removable
         let mut cell = BaseJitCell::new();
         cell.flags |= jc_flags::DONT_TRACE_HERE;
-        assert!(!cell.should_remove()); // has_seen_a_procedure_token is false
+        assert!(!cell.should_remove_jitcell()); // has_seen_a_procedure_token is false
 
         // A cell with DONT_TRACE_HERE and a past token should be removable
         let mut cell = BaseJitCell::new();
         cell.flags |= jc_flags::DONT_TRACE_HERE;
         cell.token = Some(42); // historical record of past token
-        assert!(cell.should_remove());
+        assert!(cell.should_remove_jitcell());
     }
 
     #[test]
@@ -1948,7 +1948,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing(_)));
         ws.finish_tracing(1);
         let token = JitCellToken::new(ws.alloc_token_number());
-        ws.install_compiled(1, token);
+        ws.attach_procedure_to_interp(1, token);
 
         // Key 2: tracing (should NOT be removed)
         assert!(matches!(ws.maybe_compile(2), HotResult::NotHot));
@@ -1979,7 +1979,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing(_)));
         ws.finish_tracing(key);
         let token = JitCellToken::new(ws.alloc_token_number());
-        ws.install_compiled(key, token);
+        ws.attach_procedure_to_interp(key, token);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
 
         // Invalidate
@@ -1989,7 +1989,7 @@ mod tests {
         // Reset to NotHot and recompile
         ws.transition_cell(key, BaseJitCellState::NotHot);
         let token2 = JitCellToken::new(ws.alloc_token_number());
-        ws.install_compiled(key, token2);
+        ws.attach_procedure_to_interp(key, token2);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
     }
