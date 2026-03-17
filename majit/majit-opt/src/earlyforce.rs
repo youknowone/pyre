@@ -26,8 +26,8 @@ impl Default for OptEarlyForce {
     }
 }
 
-impl OptimizationPass for OptEarlyForce {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for OptEarlyForce {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             // CALL_MAY_FORCE / CALL_ASSEMBLER can force virtual references.
             // Ensure all VirtualRef arguments are forced (resolved) before

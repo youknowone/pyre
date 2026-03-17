@@ -265,7 +265,7 @@ impl OptHeap {
 
     // ── Handlers for specific opcodes ──
 
-    fn optimize_getfield(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_getfield(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
             None => return OptimizationResult::Emit(op.clone()),
@@ -315,7 +315,7 @@ impl OptHeap {
         OptimizationResult::Emit(op.clone())
     }
 
-    fn optimize_setfield(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_setfield(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
             None => return OptimizationResult::Emit(op.clone()),
@@ -353,7 +353,7 @@ impl OptHeap {
         OptimizationResult::Remove
     }
 
-    fn optimize_getarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_getarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let key = match Self::arrayitem_key(op, ctx) {
             Some(k) => k,
             None => return OptimizationResult::Emit(op.clone()),
@@ -378,7 +378,7 @@ impl OptHeap {
         OptimizationResult::Emit(op.clone())
     }
 
-    fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // The stored value escapes (becomes reachable via the heap).
         let stored_value = op.arg(2);
         self.unescaped.remove(&stored_value);
@@ -418,7 +418,7 @@ impl OptHeap {
     ///
     /// If the same call (same descriptor + same arguments) was already seen,
     /// replace with the cached result. Otherwise, emit and cache the result.
-    fn optimize_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let descr_idx = op.descr.as_ref().map(|d| d.index()).unwrap_or(0);
         let args_hash = hash_args(&op.args);
         let cache_key = (descr_idx, args_hash);
@@ -441,7 +441,7 @@ impl OptHeap {
     /// Handle operations that may have side effects.
     /// Forces lazy sets and invalidates caches as needed.
     /// Tracks allocations for aliasing analysis.
-    fn handle_side_effects(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn handle_side_effects(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let opcode = op.opcode;
 
         // Track allocations for aliasing analysis.
@@ -557,8 +557,8 @@ impl Default for OptHeap {
     }
 }
 
-impl OptimizationPass for OptHeap {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for OptHeap {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             // ── Field reads ──
             OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {

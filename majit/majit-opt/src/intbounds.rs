@@ -93,7 +93,7 @@ impl OptIntBounds {
 
     // ── Comparison optimizations ──
 
-    fn optimize_int_lt(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_lt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -110,7 +110,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_int_gt(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_gt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -127,7 +127,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_int_le(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_le(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -144,7 +144,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_int_ge(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_ge(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -161,7 +161,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_int_eq(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_eq(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -178,7 +178,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_int_ne(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_ne(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -197,7 +197,7 @@ impl OptIntBounds {
 
     // ── Unsigned comparison optimizations ──
 
-    fn optimize_uint_lt(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_uint_lt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -214,7 +214,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_uint_gt(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_uint_gt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -231,7 +231,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_uint_le(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_uint_le(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -248,7 +248,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_uint_ge(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_uint_ge(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.get_bound(arg0, ctx);
@@ -393,7 +393,7 @@ impl OptIntBounds {
 
     // ── INT_SIGNEXT optimization ──
 
-    fn optimize_int_signext(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_signext(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let b = self.get_bound(op.arg(0), ctx);
         let b1 = self.get_bound(op.arg(1), ctx);
         if b1.is_constant() {
@@ -424,7 +424,7 @@ impl OptIntBounds {
 
     // ── Overflow operations ──
 
-    fn optimize_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if let (Some(a), Some(b)) = (
             ctx.get_constant_int(op.arg(0)),
             ctx.get_constant_int(op.arg(1)),
@@ -466,7 +466,7 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
-    fn optimize_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if let (Some(a), Some(b)) = (
             ctx.get_constant_int(op.arg(0)),
             ctx.get_constant_int(op.arg(1)),
@@ -507,7 +507,7 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
-    fn optimize_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if let (Some(a), Some(b)) = (
             ctx.get_constant_int(op.arg(0)),
             ctx.get_constant_int(op.arg(1)),
@@ -547,7 +547,7 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
-    fn optimize_guard_no_overflow(&mut self, op: &Op) -> PassResult {
+    fn optimize_guard_no_overflow(&mut self, op: &Op) -> OptimizationResult {
         match self.pending_overflow_guard.take() {
             Some(PendingOverflowGuard::Present) => OptimizationResult::PassOn,
             Some(PendingOverflowGuard::ProvenSafeRemoved) | None => {
@@ -557,7 +557,7 @@ impl OptIntBounds {
         }
     }
 
-    fn optimize_guard_overflow(&mut self, op: &Op) -> PassResult {
+    fn optimize_guard_overflow(&mut self, op: &Op) -> OptimizationResult {
         self.pending_overflow_guard = None;
         let _ = op;
         OptimizationResult::PassOn
@@ -565,7 +565,7 @@ impl OptIntBounds {
 
     // ── Guard optimizations ──
 
-    fn optimize_guard_true(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_true(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let cond_ref = ctx.get_replacement(op.arg(0));
 
         // If the condition is a known constant, we can determine the guard outcome
@@ -590,7 +590,7 @@ impl OptIntBounds {
         OptimizationResult::PassOn
     }
 
-    fn optimize_guard_false(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_false(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let cond_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(val) = ctx.get_constant_int(cond_ref) {
@@ -1002,8 +1002,8 @@ impl Default for OptIntBounds {
     }
 }
 
-impl OptimizationPass for OptIntBounds {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for OptIntBounds {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),

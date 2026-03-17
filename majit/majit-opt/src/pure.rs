@@ -142,7 +142,7 @@ impl OptPure {
     }
 
     /// Handle CALL_PURE: demote to plain CALL since we can't constant-fold.
-    fn handle_call_pure(&self, op: &Op) -> PassResult {
+    fn handle_call_pure(&self, op: &Op) -> OptimizationResult {
         let call_opcode = match op.opcode {
             OpCode::CallPureI => OpCode::CallI,
             OpCode::CallPureR => OpCode::CallR,
@@ -160,7 +160,7 @@ impl OptPure {
     /// If the same call (same function + arguments) was already seen, replace
     /// with the cached result. Otherwise, emit and cache the result.
     /// The call is demoted to a plain CALL_* for the backend.
-    fn handle_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn handle_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let key = PureOpKey::from_op(op);
 
         // Check if we've already computed this loop-invariant call.
@@ -189,8 +189,8 @@ impl Default for OptPure {
     }
 }
 
-impl OptimizationPass for OptPure {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for OptPure {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.opcode.is_always_pure() {
             // Check if all arguments are constant -> could constant-fold.
             // (Actual constant folding is left to a dedicated pass; here we
