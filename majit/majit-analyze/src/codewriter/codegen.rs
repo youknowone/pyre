@@ -1,9 +1,8 @@
 //! JIT mainloop code generation from interpreter opcode match arms.
 //!
-//! This is majit's equivalent of RPython's `codewriter.py`: given an
-//! interpreter's opcode dispatch match expression and a configuration
-//! describing the interpreter's types/layout, it generates a complete
-//! JIT-annotated mainloop module.
+//! Combines the roles of RPython's `flatten.py` (control-flow graph →
+//! linear bytecode) and `assembler.py` (linear bytecode → JitCode) into
+//! a single codegen step that emits a Rust `TokenStream`.
 //!
 //! The generator is **interpreter-agnostic** — all interpreter-specific
 //! details (crate paths, state struct, storage pool, I/O shims) come
