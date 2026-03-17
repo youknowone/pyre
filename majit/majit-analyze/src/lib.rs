@@ -136,6 +136,7 @@ pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
     let mut all_types = Vec::new();
     let mut all_trait_impls = Vec::new();
     let mut all_functions = std::collections::HashMap::new();
+    let mut all_function_graphs = std::collections::HashMap::new();
     let mut all_offset_constants = Vec::new();
 
     // Phase 1: Parse all files and collect items
@@ -146,7 +147,7 @@ pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
         all_types.extend(parse::extract_type_layouts(parsed));
         all_trait_impls.extend(parse::extract_trait_impls(parsed));
         all_offset_constants.extend(parse::extract_offset_constants(parsed));
-        parse::collect_functions(parsed, &mut all_functions);
+        parse::collect_functions_with_graphs(parsed, &mut all_functions, &mut all_function_graphs);
     }
 
     // Phase 2: Extract opcode dispatch (needs cross-file trait resolution)
@@ -161,7 +162,7 @@ pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
 
     // Phase 3: Resolve call chains across files
     for arm in &mut opcodes {
-        resolve_call_chain(arm, &all_trait_impls, &all_functions);
+        resolve_call_chain(arm, &all_trait_impls, &all_functions, &all_function_graphs);
     }
 
     AnalysisResult {
@@ -178,6 +179,7 @@ fn resolve_call_chain(
     arm: &mut OpcodeArm,
     trait_impls: &[TraitImplInfo],
     functions: &std::collections::HashMap<String, String>,
+    function_graphs: &std::collections::HashMap<String, graph::MajitGraph>,
 ) {
     let mut resolved_calls = Vec::new();
 
@@ -197,14 +199,14 @@ fn resolve_call_chain(
             }
         }
 
-        // Check free functions
+        // Check free functions (with pre-built graph)
         if let Some(body) = functions.get(call_name) {
             resolved_calls.push(ResolvedCall {
                 name: call_name.clone(),
                 impl_type: None,
                 trait_name: None,
                 body_summary: body.clone(),
-                graph: None,
+                graph: function_graphs.get(call_name).cloned(),
             });
         }
     }
@@ -216,26 +218,10 @@ fn resolve_call_chain(
     // This is the RPython-parity path — the flow graph is the canonical IR.
     if arm.trace_pattern.is_none() {
         for call in &arm.resolved_calls {
-            // Use pre-built graph if available
             if let Some(ref graph) = call.graph {
                 if let Some(pattern) = patterns::classify_from_graph(graph) {
                     arm.trace_pattern = Some(pattern);
                     break;
-                }
-            }
-            // Fallback: build graph from body_summary (for free functions)
-            if !call.body_summary.is_empty() {
-                let wrapped = format!("fn __body() {{ {} }}", call.body_summary);
-                if let Ok(parsed) = syn::parse_str::<syn::ItemFn>(&wrapped) {
-                    let mut graph = graph::MajitGraph::new(&call.name);
-                    let entry = graph.entry;
-                    for stmt in &parsed.block.stmts {
-                        front::ast::lower_stmt_pub(&mut graph, entry, stmt);
-                    }
-                    if let Some(pattern) = patterns::classify_from_graph(&graph) {
-                        arm.trace_pattern = Some(pattern);
-                        break;
-                    }
                 }
             }
         }
