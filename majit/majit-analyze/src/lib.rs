@@ -12,7 +12,6 @@
 mod classify;
 mod codegen;
 pub mod codewriter;
-pub mod jtransform;
 pub mod interp_extract;
 mod parse;
 mod patterns;
