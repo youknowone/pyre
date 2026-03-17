@@ -18,12 +18,12 @@ use majit_ir::{OpRef, Type};
 pub mod blackhole;
 mod call_descr;
 mod constant_pool;
-mod driver;
 mod fail_descr;
+mod jitdriver;
 pub mod io_buffer;
 mod jit_state;
 mod jitcode;
-mod meta_interp;
+mod pyjitpl;
 pub mod parity;
 pub mod quasi_immut;
 pub mod resume;
@@ -34,7 +34,7 @@ pub mod virtualizable;
 
 pub use call_descr::{make_call_assembler_descr, make_call_descr};
 pub use constant_pool::ConstantPool;
-pub use driver::JitDriver;
+pub use jitdriver::JitDriver;
 pub use fail_descr::{make_fail_descr, make_fail_descr_typed};
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,
@@ -42,11 +42,12 @@ pub use io_buffer::{
 };
 pub use jit_state::{DeoptMaterializationCache, JitState, PendingFieldWriteLayout};
 pub use jitcode::{
-    trace_jitcode, ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
+    trace_jitcode, trace_jitcode_with_data_ptr, raw_i64_array_descr,
+    ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
     JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
 };
 pub use majit_codegen::CompiledTraceInfo;
-pub use meta_interp::{
+pub use pyjitpl::{
     BackEdgeAction, BlackholeRunResult, CompiledExitLayout, CompiledTerminalExitLayout,
     CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, DriverRunOutcome,
     GuardRecoveryAction, InlineDecision, JitHooks, JitStats, MetaInterp, RawCompileResult,

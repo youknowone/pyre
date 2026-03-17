@@ -41,8 +41,11 @@ pub struct LowererConfig {
     vable_arrays: HashMap<String, (usize, String)>,
     /// State field scalars: field_name → (global_field_index, type_str).
     state_scalars: HashMap<String, (usize, String)>,
-    /// State field arrays: field_name → (global_array_index, item_type_str).
+    /// State field arrays (flattened): field_name → (global_array_index, item_type_str).
     state_arrays: HashMap<String, (usize, String)>,
+    /// State field virtualizable arrays: field_name → (virt_array_index, item_type_str).
+    /// These emit GETARRAYITEM_RAW_I/SETARRAYITEM_RAW instead of element-level tracking.
+    state_virt_arrays: HashMap<String, (usize, String)>,
 }
 
 const MAX_HELPER_CALL_ARITY: usize = 16;
@@ -122,12 +125,14 @@ impl LowererConfig {
         } else {
             (None, HashMap::new(), HashMap::new())
         };
-        let (state_scalars, state_arrays) = if let Some(sf) = state_fields_cfg {
+        let (state_scalars, state_arrays, state_virt_arrays) = if let Some(sf) = state_fields_cfg {
             use crate::jit_interp::StateFieldKind;
             let mut scalars = HashMap::new();
             let mut arrays = HashMap::new();
+            let mut virt_arrays = HashMap::new();
             let mut scalar_idx = 0usize;
             let mut array_idx = 0usize;
+            let mut virt_array_idx = 0usize;
             for f in &sf.fields {
                 match &f.kind {
                     StateFieldKind::Scalar(tp) => {
@@ -138,11 +143,15 @@ impl LowererConfig {
                         arrays.insert(f.name.to_string(), (array_idx, tp.to_string()));
                         array_idx += 1;
                     }
+                    StateFieldKind::VirtArray(tp) => {
+                        virt_arrays.insert(f.name.to_string(), (virt_array_idx, tp.to_string()));
+                        virt_array_idx += 1;
+                    }
                 }
             }
-            (scalars, arrays)
+            (scalars, arrays, virt_arrays)
         } else {
-            (HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new())
         };
         Self {
             pool_str,
@@ -157,6 +166,7 @@ impl LowererConfig {
             vable_arrays,
             state_scalars,
             state_arrays,
+            state_virt_arrays,
         }
     }
 }
@@ -434,6 +444,7 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes `state.array[index] = expr` for array state fields.
+    /// Routes to `store_state_varray` for virtualizable arrays, `store_state_array` for flattened.
     fn lower_state_array_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
         let assign = match expr {
@@ -457,12 +468,20 @@ impl<'c> Lowerer<'c> {
             syn::Member::Named(ident) => ident.to_string(),
             _ => return None,
         };
-        let &(array_index, _) = config.state_arrays.get(&member_name)?;
-        let ai = array_index as u16;
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let val_binding = self.lower_value_expr(&assign.right)?;
         let val_reg = val_binding.reg;
+
+        // Check virtualizable arrays first, then flattened arrays.
+        if let Some(&(va_idx, _)) = config.state_virt_arrays.get(&member_name) {
+            let ai = va_idx as u16;
+            self.statements
+                .push(quote! { __builder.store_state_varray(#ai, #idx_reg, #val_reg); });
+            return Some(());
+        }
+        let &(array_index, _) = config.state_arrays.get(&member_name)?;
+        let ai = array_index as u16;
         self.statements
             .push(quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); });
         Some(())
@@ -956,7 +975,10 @@ impl<'c> Lowerer<'c> {
             return true;
         }
         // state_fields mode: any assignment to state.field modifies JIT state
-        if !config.state_scalars.is_empty() || !config.state_arrays.is_empty() {
+        if !config.state_scalars.is_empty()
+            || !config.state_arrays.is_empty()
+            || !config.state_virt_arrays.is_empty()
+        {
             if s.contains("state.") {
                 return true;
             }
@@ -975,7 +997,10 @@ impl<'c> Lowerer<'c> {
             return true;
         }
         // state_fields mode: expressions referencing `state.` touch JIT state
-        if !config.state_scalars.is_empty() || !config.state_arrays.is_empty() {
+        if !config.state_scalars.is_empty()
+            || !config.state_arrays.is_empty()
+            || !config.state_virt_arrays.is_empty()
+        {
             if s.contains("state.") {
                 return true;
             }
@@ -1667,6 +1692,7 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes `state.array[index]` for array state fields.
+    /// Routes to `load_state_varray` for virtualizable arrays, `load_state_array` for flattened.
     fn lower_state_array_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
         let index_expr = match expr {
@@ -1686,11 +1712,23 @@ impl<'c> Lowerer<'c> {
             syn::Member::Named(ident) => ident.to_string(),
             _ => return None,
         };
-        let &(array_index, _) = config.state_arrays.get(&member_name)?;
-        let ai = array_index as u16;
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let reg = self.alloc_reg();
+
+        // Check virtualizable arrays first, then flattened arrays.
+        if let Some(&(va_idx, _)) = config.state_virt_arrays.get(&member_name) {
+            let ai = va_idx as u16;
+            self.statements
+                .push(quote! { __builder.load_state_varray(#ai, #idx_reg, #reg); });
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+            });
+        }
+        let &(array_index, _) = config.state_arrays.get(&member_name)?;
+        let ai = array_index as u16;
         self.statements
             .push(quote! { __builder.load_state_array(#ai, #idx_reg, #reg); });
         Some(Binding {
