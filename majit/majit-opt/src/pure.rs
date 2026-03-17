@@ -47,16 +47,16 @@ impl PureOpKey {
 /// Translated from RecentPureOps in pure.py.
 /// Uses a HashMap for O(1) lookup instead of the Python linear-scan ring buffer,
 /// combined with an LRU eviction list capped at `limit` entries.
-struct PureOpCache {
+struct RecentPureOps {
     map: HashMap<PureOpKey, OpRef>,
     /// Ring buffer of keys for LRU eviction.
     order: Vec<Option<PureOpKey>>,
     next_index: usize,
 }
 
-impl PureOpCache {
+impl RecentPureOps {
     fn new(limit: usize) -> Self {
-        PureOpCache {
+        RecentPureOps {
             map: HashMap::with_capacity(limit),
             order: vec![None; limit],
             next_index: 0,
@@ -96,7 +96,7 @@ impl PureOpCache {
 ///   Translated from rpython/jit/metainterp/optimizeopt/pure.py
 ///   optimize_CALL_LOOPINVARIANT_I/R/F/N.
 pub struct OptPure {
-    cache: PureOpCache,
+    cache: RecentPureOps,
     /// Per-loop-iteration cache for CALL_LOOPINVARIANT_* results.
     /// Key: (func_ptr_opref, arg0, arg1, ...) → result OpRef.
     /// This cache persists across the whole loop body without eviction,
@@ -109,7 +109,7 @@ impl OptPure {
         OptPure {
             // Aheui traces routinely repeat the same comparisons hundreds of
             // ops apart; a tiny ring buffer misses most of those CSE wins.
-            cache: PureOpCache::new(4096),
+            cache: RecentPureOps::new(4096),
             loopinvariant_cache: HashMap::new(),
         }
     }
@@ -436,7 +436,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure {
-            cache: PureOpCache::new(16),
+            cache: RecentPureOps::new(16),
             loopinvariant_cache: HashMap::new(),
         }));
         let result = opt.optimize(&ops);

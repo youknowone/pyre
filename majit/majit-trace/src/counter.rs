@@ -69,7 +69,7 @@ impl JitCounter {
     }
 
     /// Decay all counters (halve them). Called periodically.
-    pub fn decay_all(&mut self) {
+    pub fn decay_all_counters(&mut self) {
         for entry in &mut self.table {
             entry.1 /= 2;
         }
@@ -125,7 +125,7 @@ mod tests {
         for _ in 0..8 {
             counter.tick(42);
         }
-        counter.decay_all();
+        counter.decay_all_counters();
         // Count should be halved (8 -> 4), so need 6 more to reach 10
         for _ in 0..5 {
             assert!(!counter.tick(42));
