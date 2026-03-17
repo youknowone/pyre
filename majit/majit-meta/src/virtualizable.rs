@@ -55,6 +55,12 @@ pub struct VableArrayInfo {
     pub item_type: Type,
     /// Byte offset of the array pointer in the heap object.
     pub field_offset: usize,
+    /// Offset of the length field within the array object.
+    /// Default: 0 (length stored at start of array).
+    pub length_offset: usize,
+    /// Offset of the first item within the array object.
+    /// Default: 8 (items start after the length field).
+    pub items_offset: usize,
 }
 
 /// Complete description of a virtualizable type.
@@ -102,17 +108,31 @@ impl VirtualizableInfo {
         self.num_static_fields = self.static_fields.len();
     }
 
-    /// Add an array field.
+    /// Add an array field with default layout (length at offset 0, items at offset 8).
     pub fn add_array_field(
         &mut self,
         name: impl Into<String>,
         item_type: Type,
         field_offset: usize,
     ) {
+        self.add_array_field_with_layout(name, item_type, field_offset, 0, 8);
+    }
+
+    /// Add an array field with explicit layout offsets.
+    pub fn add_array_field_with_layout(
+        &mut self,
+        name: impl Into<String>,
+        item_type: Type,
+        field_offset: usize,
+        length_offset: usize,
+        items_offset: usize,
+    ) {
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
             item_type,
             field_offset,
+            length_offset,
+            items_offset,
         });
     }
 
@@ -306,10 +326,33 @@ pub unsafe fn force_virtualizable(
     *token_ptr = 0;
 }
 
+/// Read array lengths from a virtualizable heap object.
+///
+/// For each array field, reads the array pointer, then reads its length
+/// from the configured `length_offset` within the array header.
+///
+/// # Safety
+/// The caller must ensure `obj_ptr` points to a valid virtualizable object.
+pub unsafe fn read_array_lengths(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<usize> {
+    info.array_fields
+        .iter()
+        .map(|array_info| {
+            let array_ptr_ptr = obj_ptr.add(array_info.field_offset) as *const *const u8;
+            let array_ptr = *array_ptr_ptr;
+            if array_ptr.is_null() {
+                0
+            } else {
+                let len_ptr = array_ptr.add(array_info.length_offset) as *const usize;
+                *len_ptr
+            }
+        })
+        .collect()
+}
+
 /// Read a virtualizable's array field contents from the heap.
 ///
 /// The array pointer is read from the virtualizable at `array_info.field_offset`,
-/// then `length` elements are read from the array.
+/// then `length` elements are read starting at `array_info.items_offset`.
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` is valid and the array has at least `length` elements.
@@ -320,16 +363,17 @@ pub unsafe fn read_virtualizable_array(
 ) -> Vec<i64> {
     let array_ptr_ptr = obj_ptr.add(array_info.field_offset) as *const *const u8;
     let array_ptr = *array_ptr_ptr;
+    let item_size = item_size_for_type(array_info.item_type);
 
     let mut values = Vec::with_capacity(length);
     for i in 0..length {
         let val = match array_info.item_type {
             Type::Int | Type::Ref => {
-                let ptr = array_ptr.add(i * 8) as *const i64;
+                let ptr = array_ptr.add(array_info.items_offset + i * item_size) as *const i64;
                 *ptr
             }
             Type::Float => {
-                let ptr = array_ptr.add(i * 8) as *const f64;
+                let ptr = array_ptr.add(array_info.items_offset + i * item_size) as *const f64;
                 f64::to_bits(*ptr) as i64
             }
             Type::Void => 0,
@@ -337,6 +381,14 @@ pub unsafe fn read_virtualizable_array(
         values.push(val);
     }
     values
+}
+
+/// Returns the byte size of a single item for the given type.
+fn item_size_for_type(ty: Type) -> usize {
+    match ty {
+        Type::Int | Type::Ref | Type::Float => 8,
+        Type::Void => 0,
+    }
 }
 
 /// Write values into a virtualizable's array field on the heap.
@@ -350,15 +402,16 @@ pub unsafe fn write_virtualizable_array(
 ) {
     let array_ptr_ptr = obj_ptr.add(array_info.field_offset) as *const *mut u8;
     let array_ptr = *array_ptr_ptr;
+    let item_size = item_size_for_type(array_info.item_type);
 
     for (i, &val) in values.iter().enumerate() {
         match array_info.item_type {
             Type::Int | Type::Ref => {
-                let ptr = array_ptr.add(i * 8) as *mut i64;
+                let ptr = array_ptr.add(array_info.items_offset + i * item_size) as *mut i64;
                 *ptr = val;
             }
             Type::Float => {
-                let ptr = array_ptr.add(i * 8) as *mut f64;
+                let ptr = array_ptr.add(array_info.items_offset + i * item_size) as *mut f64;
                 *ptr = f64::from_bits(val as u64);
             }
             Type::Void => {}
@@ -613,5 +666,140 @@ mod tests {
         unsafe {
             assert!(!is_token_nonnull(&info, obj_ptr));
         }
+    }
+
+    #[test]
+    fn test_read_array_lengths_from_heap() {
+        // Heap layout:
+        //   obj[0..8]:  vable_token
+        //   obj[8..16]: array_ptr for "locals" (pointer to array_data_0)
+        //   obj[16..24]: array_ptr for "stack" (pointer to array_data_1)
+        //
+        // array_data layout (default: length at 0, items at 8):
+        //   [0..8]: length (usize)
+        //   [8..]: items
+
+        let mut array_data_0 = vec![0u8; 8 + 3 * 8]; // length=3, 3 items
+        let mut array_data_1 = vec![0u8; 8 + 5 * 8]; // length=5, 5 items
+
+        unsafe {
+            *(array_data_0.as_mut_ptr() as *mut usize) = 3;
+            *(array_data_1.as_mut_ptr() as *mut usize) = 5;
+        }
+
+        // Build the virtualizable object
+        let mut obj = vec![0u8; 24]; // token + 2 array pointers
+        unsafe {
+            *(obj.as_mut_ptr().add(8) as *mut *const u8) = array_data_0.as_ptr();
+            *(obj.as_mut_ptr().add(16) as *mut *const u8) = array_data_1.as_ptr();
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_array_field("locals", Type::Ref, 8);
+        info.add_array_field("stack", Type::Int, 16);
+
+        let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
+        assert_eq!(lengths, vec![3, 5]);
+    }
+
+    #[test]
+    fn test_read_array_lengths_null_pointer() {
+        // If array pointer is null, length should be 0
+        let mut obj = vec![0u8; 16]; // token + 1 null array pointer
+        unsafe {
+            *(obj.as_mut_ptr().add(8) as *mut *const u8) = std::ptr::null();
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_array_field("locals", Type::Ref, 8);
+
+        let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
+        assert_eq!(lengths, vec![0]);
+    }
+
+    #[test]
+    fn test_auto_sync_reads_all_fields() {
+        // Build a complete virtualizable heap object with static fields + arrays.
+        //
+        // Layout:
+        //   obj[0..8]:   vable_token
+        //   obj[8..16]:  field "x" (i64)
+        //   obj[16..24]: field "y" (i64)
+        //   obj[24..32]: array_ptr for "stack"
+        //
+        // array_data (default layout):
+        //   [0..8]: length = 2
+        //   [8..24]: items [10, 20]
+
+        let mut array_data = vec![0u8; 8 + 2 * 8];
+        unsafe {
+            *(array_data.as_mut_ptr() as *mut usize) = 2;
+            *(array_data.as_mut_ptr().add(8) as *mut i64) = 10;
+            *(array_data.as_mut_ptr().add(16) as *mut i64) = 20;
+        }
+
+        let mut obj = vec![0u8; 32];
+        unsafe {
+            *(obj.as_mut_ptr().add(8) as *mut i64) = 42;
+            *(obj.as_mut_ptr().add(16) as *mut i64) = 99;
+            *(obj.as_mut_ptr().add(24) as *mut *const u8) = array_data.as_ptr();
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_field("y", Type::Int, 16);
+        info.add_array_field("stack", Type::Int, 24);
+
+        // Use read_array_lengths + read_all_virtualizable_boxes (the auto path)
+        let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
+        assert_eq!(lengths, vec![2]);
+
+        let (static_boxes, array_boxes) =
+            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+        assert_eq!(static_boxes, vec![42, 99]);
+        assert_eq!(array_boxes, vec![vec![10, 20]]);
+    }
+
+    #[test]
+    fn test_array_field_with_custom_layout() {
+        // Custom layout: length at offset 16, items at offset 24
+        // (e.g., array header has 16 bytes of metadata before length)
+
+        let mut array_data = vec![0u8; 24 + 3 * 8]; // header(24) + 3 items
+        unsafe {
+            *(array_data.as_mut_ptr().add(16) as *mut usize) = 3; // length at offset 16
+            *(array_data.as_mut_ptr().add(24) as *mut i64) = 100; // item 0 at offset 24
+            *(array_data.as_mut_ptr().add(32) as *mut i64) = 200;
+            *(array_data.as_mut_ptr().add(40) as *mut i64) = 300;
+        }
+
+        let mut obj = vec![0u8; 16]; // token + 1 array pointer
+        unsafe {
+            *(obj.as_mut_ptr().add(8) as *mut *const u8) = array_data.as_ptr();
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_array_field_with_layout("data", Type::Int, 8, 16, 24);
+
+        let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
+        assert_eq!(lengths, vec![3]);
+
+        let (_, array_boxes) =
+            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+        assert_eq!(array_boxes, vec![vec![100, 200, 300]]);
+
+        // Verify write roundtrip with custom layout
+        let mut obj_mut = obj.clone();
+        unsafe {
+            write_virtualizable_array(
+                &info.array_fields[0],
+                obj_mut.as_mut_ptr(),
+                &[111, 222, 333],
+            );
+        }
+        // Re-read from the actual array_data (obj_mut still points to array_data)
+        let (_, array_boxes2) =
+            unsafe { read_all_virtualizable_boxes(&info, obj_mut.as_ptr(), &lengths) };
+        assert_eq!(array_boxes2, vec![vec![111, 222, 333]]);
     }
 }
