@@ -3418,32 +3418,49 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `callee_key` identifies the called function's JitDriver.
     pub fn should_inline(&mut self, callee_key: u64) -> InlineDecision {
-        // If the callee already has compiled code, don't inline —
-        // use CALL_ASSEMBLER instead.
-        if self.compiled_loops.contains_key(&callee_key) {
-            return InlineDecision::CallAssembler;
-        }
-
-        // If we're already tracing, we can potentially inline.
+        // If we're already tracing, we can potentially inline —
+        // even if the callee has compiled code (recursive inlining).
+        // This matches PyPy's behavior where recursive calls are
+        // inlined up to MAX_INLINE_DEPTH before falling back to
+        // CALL_ASSEMBLER.
         if self.tracing.is_some() {
-            // Check recursion depth (max inlining depth = 10).
             if let Some(ref ctx) = self.tracing {
                 if ctx.inline_depth() >= MAX_INLINE_DEPTH {
+                    if self.compiled_loops.contains_key(&callee_key) {
+                        return InlineDecision::CallAssembler;
+                    }
                     return InlineDecision::ResidualCall;
+                }
+
+                // Self-recursion: use CALL_ASSEMBLER if compiled,
+                // otherwise residual. Recursive inlining requires
+                // non-recursive tracing (PyPy's meta-interpreter style)
+                // which we don't have yet — our tracing executes the
+                // callee concretely, causing exponential cost for fib.
+                if ctx.is_tracing_key(callee_key) {
+                    if self.compiled_loops.contains_key(&callee_key) {
+                        return InlineDecision::CallAssembler;
+                    }
+                    // Not compiled yet: this is the initial trace.
+                    // Fall through to function_threshold check.
                 }
             }
 
-            // Check function_threshold: has the function been called enough
-            // times to warrant inlining? This mirrors RPython's
-            // function_threshold heuristic in warmstate.py.
             if !self.warm_state.should_inline_function(callee_key) {
+                if self.compiled_loops.contains_key(&callee_key) {
+                    return InlineDecision::CallAssembler;
+                }
                 return InlineDecision::ResidualCall;
             }
 
             return InlineDecision::Inline;
         }
 
-        // Otherwise, emit a regular residual call.
+        // Not tracing — use CALL_ASSEMBLER if compiled.
+        if self.compiled_loops.contains_key(&callee_key) {
+            return InlineDecision::CallAssembler;
+        }
+
         InlineDecision::ResidualCall
     }
 

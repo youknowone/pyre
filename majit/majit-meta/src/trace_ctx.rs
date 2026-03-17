@@ -187,6 +187,12 @@ impl TraceCtx {
         self.inline_frames.len()
     }
 
+    /// Check if `key` matches the current trace's green_key or any
+    /// inlined frame's key. Used for self-recursion detection.
+    pub fn is_tracing_key(&self, key: u64) -> bool {
+        self.green_key == key || self.inline_frames.contains(&key)
+    }
+
     /// Push an inline frame (entering a callee).
     /// Returns false if the max inline depth has been exceeded.
     pub(crate) fn push_inline_frame(&mut self, callee_key: u64, max_depth: u32) -> bool {
