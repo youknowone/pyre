@@ -20,6 +20,10 @@ use pyre_runtime::PyResult;
 /// 3. If tracing active → JIT-enabled eval loop
 /// 4. Otherwise → plain interpreter loop
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
+    // Register this function as the eval callback for recursive calls.
+    // Like PyPy's __extend__(PyFrame).dispatch(), this replaces the
+    // plain interpreter with JIT-aware evaluation for all function calls.
+    pyre_interp::call::register_eval_override(eval_with_jit);
     pyre_interp::call::install_jit_call_bridge();
     frame.fix_array_ptrs();
 

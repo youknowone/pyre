@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use pyre_object::PyObjectRef;
 use pyre_object::intobject::w_int_get_value;
@@ -9,8 +9,22 @@ use pyre_runtime::{
     w_func_get_code_ptr, w_func_get_globals,
 };
 
-use crate::eval::{eval_frame, jit_call_depth_bump};
+use crate::eval::{eval_frame, eval_frame_plain, jit_call_depth_bump};
 use crate::frame::PyFrame;
+
+// ── Eval function injection ──────────────────────────────────────
+// PyPy's __extend__(PyFrame) replaces dispatch() at load time.
+// Rust equivalent: OnceLock<fn> set by pyre-mjit's generated code.
+// After initialization, get() is a single atomic load (branch-predicted).
+
+type EvalFn = fn(&mut PyFrame) -> PyResult;
+static EVAL_OVERRIDE: OnceLock<EvalFn> = OnceLock::new();
+
+/// Register the JIT-aware eval function. Called by pyre-mjit at startup.
+/// After this, all recursive function calls go through the JIT eval loop.
+pub fn register_eval_override(f: EvalFn) {
+    let _ = EVAL_OVERRIDE.set(f);
+}
 
 thread_local! {
     /// When trace inlining executes the callee synchronously inside the
@@ -132,9 +146,12 @@ pub fn call_user_function(
     // and try_function_entry_jit. This prevents inner instructions
     // from polluting the outer trace, and prevents infinite recursion
     // through compiled → residual → compiled call chains.
-    // Matches PyPy's residual call suspension.
     let _guard = jit_call_depth_bump();
-    eval_frame(&mut func_frame)
+
+    // Use JIT-aware eval if registered (by pyre-mjit), otherwise plain.
+    // OnceLock::get() is a single atomic load after initialization.
+    let eval_fn = EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain);
+    eval_fn(&mut func_frame)
 }
 
 extern "C" fn jit_call_user_function_from_frame(
