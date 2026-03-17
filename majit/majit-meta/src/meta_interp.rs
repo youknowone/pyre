@@ -1092,6 +1092,23 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing.as_mut()
     }
 
+    // ── RPython opimpl_* equivalents for virtualizable ──────────────
+
+    /// RPython equivalent: `opimpl_hint_force_virtualizable(box)`
+    ///
+    /// During tracing, emits SETFIELD_GC/SETARRAYITEM_GC ops to flush
+    /// all virtualizable boxes back to the heap. Call this when the
+    /// interpreter encounters `hint_force_virtualizable` during tracing.
+    ///
+    /// In RPython, jtransform generates a `hint_force_virtualizable`
+    /// bytecode, and the metainterp's opimpl calls `gen_store_back_in_vable`.
+    /// In majit (no translator), the interpreter calls this directly.
+    pub fn opimpl_hint_force_virtualizable(&mut self, vable_opref: OpRef) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.gen_store_back_in_vable(vable_opref);
+        }
+    }
+
     /// Whether the engine is currently tracing.
     #[inline]
     pub fn is_tracing(&self) -> bool {
