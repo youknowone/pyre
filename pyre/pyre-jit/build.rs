@@ -1,4 +1,4 @@
-/// Build script for pyre-mjit: runs majit-analyze on the ENTIRE pyre
+/// Build script for pyre-jit: runs majit-analyze on the ENTIRE pyre
 /// interpreter to auto-generate tracing code. This is the Rust
 /// equivalent of RPython's translation pipeline.
 ///
@@ -25,7 +25,7 @@ fn main() {
     }
 
     eprintln!(
-        "[pyre-mjit build.rs] reading {} source files from {} dirs: {:?}",
+        "[pyre-jit build.rs] reading {} source files from {} dirs: {:?}",
         sources.len(),
         source_dirs.len(),
         source_paths,
@@ -51,17 +51,19 @@ fn main() {
             if let Some(func) = find_function(&file, "execute_opcode_step") {
                 if let Some(opcode_match) = find_opcode_match(func) {
                     eprintln!(
-                        "[pyre-mjit build.rs] extracted opcode match: {} arms from execute_opcode_step",
+                        "[pyre-jit build.rs] extracted opcode match: {} arms from execute_opcode_step",
                         opcode_match.arms.len()
                     );
                     // TODO: construct JitDriverConfig for pyre and call
                     // codewriter::generate_jitcode(opcode_match, &binops, &config)
                     // to generate jit_mainloop_gen.rs
                 } else {
-                    eprintln!("[pyre-mjit build.rs] warning: no opcode match found in execute_opcode_step");
+                    eprintln!(
+                        "[pyre-jit build.rs] warning: no opcode match found in execute_opcode_step"
+                    );
                 }
             } else {
-                eprintln!("[pyre-mjit build.rs] warning: execute_opcode_step not found");
+                eprintln!("[pyre-jit build.rs] warning: execute_opcode_step not found");
             }
         }
     }
@@ -72,7 +74,7 @@ fn main() {
 
     // Report
     eprintln!(
-        "[pyre-mjit build.rs] analyzed {} opcodes ({} classified), {} helpers, {} types, {} trait impls, generated {} bytes",
+        "[pyre-jit build.rs] analyzed {} opcodes ({} classified), {} helpers, {} types, {} trait impls, generated {} bytes",
         result.opcodes.len(),
         result
             .opcodes
@@ -94,7 +96,7 @@ fn main() {
 /// Recursively collect all .rs files from a directory.
 fn collect_rs_files(dir: &str, sources: &mut Vec<String>, paths: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        eprintln!("[pyre-mjit build.rs] warning: cannot read {dir}");
+        eprintln!("[pyre-jit build.rs] warning: cannot read {dir}");
         return;
     };
     for entry in entries {
@@ -110,7 +112,7 @@ fn collect_rs_files(dir: &str, sources: &mut Vec<String>, paths: &mut Vec<String
                     sources.push(content);
                 }
                 Err(e) => {
-                    eprintln!("[pyre-mjit build.rs] warning: cannot read {path_str}: {e}");
+                    eprintln!("[pyre-jit build.rs] warning: cannot read {path_str}: {e}");
                 }
             }
         }

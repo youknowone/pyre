@@ -1,4 +1,4 @@
-//! pyre-mjit: Auto-generated JIT for pyre.
+//! pyre-jit: Auto-generated JIT for pyre.
 //!
 //! This crate is the Rust equivalent of RPython's `rpython/jit/` —
 //! it contains automatically generated tracing code produced by
@@ -14,7 +14,7 @@
 //!       ↓ (source analysis at build time)
 //! majit-analyze (RPython translator)
 //!       ↓ (code generation)
-//! pyre-mjit (this crate)
+//! pyre-jit (this crate)
 //!   ├── jit_trace_gen.rs (auto-generated trace functions)
 //!   ├── driver.rs (JIT driver integration)
 //!   └── lib.rs (public API)

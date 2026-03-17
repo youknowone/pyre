@@ -5,7 +5,7 @@
 //! the JIT compiler (majit) through auto-generated tracing code.
 //!
 //! Key principle: pyre-interp has zero JIT dependencies.
-//! All JIT logic lives here in pyre-mjit.
+//! All JIT logic lives here in pyre-jit.
 
 // Re-export the auto-generated tracing functions
 pub use crate::{
