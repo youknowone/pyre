@@ -288,19 +288,23 @@ pub fn generate_jitcode(
         quote! { #f(); }
     });
 
-    let stack_accounting = config.stack_accounting.as_ref().map(|sa| {
-        let req: TokenStream = sa.req_size_expr.parse().unwrap();
-        let del: TokenStream = sa.stackdel_table.parse().unwrap();
-        let add: TokenStream = sa.stackadd_table.parse().unwrap();
-        quote! {
-            let stackok = #req as i32 <= stacksize;
-            let op = #op_fetch;
-            stacksize += -#del[op as usize] + #add[op as usize];
-        }
-    }).unwrap_or_else(|| {
-        let fetch: TokenStream = config.op_fetch.parse().unwrap();
-        quote! { let op = #fetch; }
-    });
+    let stack_accounting = config
+        .stack_accounting
+        .as_ref()
+        .map(|sa| {
+            let req: TokenStream = sa.req_size_expr.parse().unwrap();
+            let del: TokenStream = sa.stackdel_table.parse().unwrap();
+            let add: TokenStream = sa.stackadd_table.parse().unwrap();
+            quote! {
+                let stackok = #req as i32 <= stacksize;
+                let op = #op_fetch;
+                stacksize += -#del[op as usize] + #add[op as usize];
+            }
+        })
+        .unwrap_or_else(|| {
+            let fetch: TokenStream = config.op_fetch.parse().unwrap();
+            quote! { let op = #fetch; }
+        });
 
     // Build the complete pool init and return logic based on state fields
     let state_init: Vec<TokenStream> = config
@@ -438,4 +442,3 @@ pub fn generate_jitcode(
         #(#extra_code)*
     }
 }
-
