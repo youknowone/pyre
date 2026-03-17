@@ -146,6 +146,17 @@ impl VirtualizableInfo {
         self.array_fields.len()
     }
 
+    /// Convert to optimizer-level config (byte offsets only).
+    /// Bridges the descriptor-driven model (majit-meta) with the
+    /// optimizer's offset-based tracking (majit-opt).
+    /// RPython equivalent: jtransform → optimizer handoff.
+    pub fn to_optimizer_config(&self) -> majit_opt::virtualize::VirtualizableConfig {
+        majit_opt::virtualize::VirtualizableConfig {
+            static_field_offsets: self.static_fields.iter().map(|f| f.offset).collect(),
+            array_field_offsets: self.array_fields.iter().map(|a| a.field_offset).collect(),
+        }
+    }
+
     /// Get the index of a static field by its descriptor offset.
     /// RPython equivalent: static_field_by_descrs
     pub fn static_field_index(&self, offset: usize) -> Option<usize> {
