@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::front::SemanticFunction;
 use crate::graph::MajitGraph;
 use crate::passes::annotate::{AnnotationState, annotate};
-use crate::passes::flatten::{FlattenedFunction, flatten};
+use crate::passes::flatten::{self, FlattenedFunction};
 use crate::passes::jtransform::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
 use crate::passes::rtype::{TypeResolutionState, resolve_types};
 
@@ -74,8 +74,8 @@ pub fn analyze_function(
     let calls_classified = transform_result.calls_classified;
     let transform_notes = transform_result.notes.clone();
 
-    // Pass 4: Flatten (RPython flatten)
-    let flattened = flatten(&transform_result.graph);
+    // Pass 4: Flatten with type info (RPython flatten + regalloc)
+    let flattened = flatten::flatten_with_types(&transform_result.graph, &types);
 
     PipelineResult {
         name: func.name.clone(),

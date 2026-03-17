@@ -33,6 +33,14 @@ pub enum FlatOp {
     Move { dst: ValueId, src: ValueId },
 }
 
+/// Register kind for a value (RPython regalloc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RegKind {
+    Int,
+    Ref,
+    Float,
+}
+
 /// Result of the flatten pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlattenedFunction {
@@ -40,6 +48,11 @@ pub struct FlattenedFunction {
     pub ops: Vec<FlatOp>,
     /// Total number of values used (for register allocation).
     pub num_values: usize,
+    /// Number of basic blocks in the source graph.
+    pub num_blocks: usize,
+    /// Value kinds inferred from the type resolution pass.
+    #[serde(default)]
+    pub value_kinds: std::collections::HashMap<ValueId, RegKind>,
 }
 
 /// Flatten a MajitGraph into a linear instruction sequence.
@@ -157,7 +170,29 @@ pub fn flatten(graph: &MajitGraph) -> FlattenedFunction {
         name: graph.name.clone(),
         ops,
         num_values: max_value,
+        num_blocks: graph.blocks.len(),
+        value_kinds: std::collections::HashMap::new(),
     }
+}
+
+/// Flatten with type information from rtype pass.
+///
+/// Like `flatten()` but populates `value_kinds` from the TypeResolutionState.
+pub fn flatten_with_types(
+    graph: &MajitGraph,
+    types: &super::rtype::TypeResolutionState,
+) -> FlattenedFunction {
+    let mut result = flatten(graph);
+    for (&vid, concrete) in &types.concrete_types {
+        let kind = match concrete {
+            super::rtype::ConcreteType::Signed => RegKind::Int,
+            super::rtype::ConcreteType::GcRef => RegKind::Ref,
+            super::rtype::ConcreteType::Float => RegKind::Float,
+            _ => continue,
+        };
+        result.value_kinds.insert(vid, kind);
+    }
+    result
 }
 
 /// Compute block ordering (entry first, then BFS).
