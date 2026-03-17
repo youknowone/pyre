@@ -9,7 +9,6 @@
 //! 5. Collects type layouts (struct fields, offsets)
 //! 6. Generates tracing code that mirrors the interpreter's execution
 
-pub mod ast_transform;
 mod classify;
 mod codegen;
 pub mod interp_extract;
