@@ -20,11 +20,13 @@
 //!   └── lib.rs (public API)
 //! ```
 
+pub mod call_jit;
 pub mod driver;
 pub mod eval;
+pub mod jit;
 mod trace_verify;
 
-// Include auto-generated trace dispatch table and helpers
+// Include auto-generated trace dispatch table and helpers (top-level access)
 include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));
 
 #[cfg(test)]
