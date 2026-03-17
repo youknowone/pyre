@@ -420,8 +420,15 @@ impl TraceFrameState {
             return Err(PyError::type_error("local index out of range in trace"));
         }
         if s.symbolic_locals[idx] == OpRef::NONE {
-            let idx_const = ctx.const_int(idx as i64);
-            s.symbolic_locals[idx] = trace_array_getitem_value(ctx, s.locals_array_ref, idx_const);
+            if let Some(base) = s.vable_locals_base {
+                // Virtualizable: locals[idx] was loaded in the preamble
+                // and carried as a JUMP arg. OpRef(base + idx) references it.
+                s.symbolic_locals[idx] = OpRef(base + idx as u32);
+            } else {
+                let idx_const = ctx.const_int(idx as i64);
+                s.symbolic_locals[idx] =
+                    trace_array_getitem_value(ctx, s.locals_array_ref, idx_const);
+            }
         }
         Ok(s.symbolic_locals[idx])
     }
