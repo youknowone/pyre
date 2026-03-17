@@ -47,6 +47,9 @@ pub struct JitDriver<S: JitState> {
     bridge_info: Option<(u64, u64, u32)>,
     /// Additional entry points sharing this driver's compiled loops.
     entry_points: Vec<EntryPoint>,
+    /// Key of the loop just compiled — skip first execution to avoid
+    /// re-entering in the same back-edge iteration (RPython compiled_new).
+    just_compiled_key: Option<u64>,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -59,6 +62,7 @@ impl<S: JitState> JitDriver<S> {
             descriptor: None,
             bridge_info: None,
             entry_points: Vec::new(),
+            just_compiled_key: None,
         }
     }
 
@@ -999,11 +1003,24 @@ impl<S: JitState> JitDriver<S> {
 
         let key_hash = crate::green_key_hash(green_values);
 
+        // Skip first execution after compilation to avoid re-entering
+        // the loop we just compiled in the same back-edge iteration.
+        // RPython equivalent: warmstate.py compiled_new flag.
+        if self.just_compiled_key == Some(key_hash) {
+            self.just_compiled_key = None;
+            return None;
+        }
+
         if !self.has_compiled_loop(key_hash) {
             let green_key = GreenKey::new(green_values.to_vec());
-            return self
-                .back_edge_structured(green_key, target_pc, state, env, pre_run)
-                .then_some(target_pc);
+            let ran = self
+                .back_edge_structured(green_key, target_pc, state, env, pre_run);
+            // If tracing just finished and compiled a loop, mark it so the
+            // next back_edge_generic call skips the first execution.
+            if self.has_compiled_loop(key_hash) {
+                self.just_compiled_key = Some(key_hash);
+            }
+            return ran.then_some(target_pc);
         }
 
         let meta = self.meta.get_compiled_meta(key_hash)?;
@@ -1035,13 +1052,7 @@ impl<S: JitState> JitDriver<S> {
         if should_bridge {
             if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values) {
                 let started = self.start_bridge_tracing(
-                    key_hash,
-                    trace_id,
-                    fail_index,
-                    state,
-                    env,
-                    resume_pc,
-                    target_pc,
+                    key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
                 );
                 if started {
                     return Some(resume_pc);
