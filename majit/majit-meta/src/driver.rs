@@ -95,13 +95,7 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_vable_ptr(ptr);
     }
 
-    /// Internal: set virtualizable array lengths.
-    /// Called by sync_before from JitState::virtualizable_array_lengths().
-    /// Not intended for direct consumer use.
-    #[doc(hidden)]
-    pub(crate) fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
-        self.meta.set_vable_array_lengths(lengths);
-    }
+
 
     pub fn with_declarative<D: DeclarativeJitDriver>(
         threshold: u32,
