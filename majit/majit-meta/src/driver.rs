@@ -928,6 +928,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.should_inline(callee_key)
     }
 
+    /// Inline decision with externally-held ctx (merge_point callback).
+    pub fn should_inline_with_ctx(
+        &mut self,
+        callee_key: u64,
+        ctx: &crate::trace_ctx::TraceCtx,
+    ) -> InlineDecision {
+        self.meta.should_inline_with_ctx(callee_key, ctx)
+    }
+
     /// Begin inlining a function call during tracing.
     ///
     /// Records EnterPortalFrame and pushes an inline frame.

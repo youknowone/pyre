@@ -208,6 +208,12 @@ impl TraceCtx {
         self.green_key == key || self.inline_frames.contains(&key)
     }
 
+    /// Count how many times `key` appears in the frame stack (recursive depth).
+    pub fn recursive_depth(&self, key: u64) -> usize {
+        let root = if self.green_key == key { 1 } else { 0 };
+        root + self.inline_frames.iter().filter(|&&k| k == key).count()
+    }
+
     /// Push an inline frame (entering a callee).
     /// Returns false if the max inline depth has been exceeded.
     pub(crate) fn push_inline_frame(&mut self, callee_key: u64, max_depth: u32) -> bool {
@@ -424,12 +430,18 @@ impl TraceCtx {
 
     /// Consume `hint(frame, force_virtualizable=True)` during tracing.
     ///
-    /// Emits SETFIELD_GC ops to flush all virtualizable boxes back to the
-    /// heap object. After this, the heap object has up-to-date field values
-    /// and can be safely passed to non-JIT code (e.g., `sys._getframe()`).
-    pub fn hint_force_virtualizable(&mut self, vable_opref: OpRef) {
-        // Flush standard boxes to heap via SETFIELD_GC
-        let fields_to_flush: Vec<(usize, OpRef, Type)> = {
+    /// RPython equivalent: `MetaInterp.gen_store_back_in_vable(box)`
+    ///
+    /// Emits SETFIELD_GC for each static field + SETARRAYITEM_GC for each
+    /// array element to flush virtualizable boxes back to the heap.
+    /// Finally emits SETFIELD_GC(vable_token, NULL) to clear the token.
+    ///
+    /// Only operates on the standard virtualizable (identified by
+    /// `vable_opref` matching the frame reference in boxes). Nonstandard
+    /// or virtual virtualizables are ignored (RPython parity).
+    pub fn gen_store_back_in_vable(&mut self, vable_opref: OpRef) {
+        // Collect data to emit without holding borrows on self
+        let ops_to_emit: Vec<(OpCode, Vec<i64>, OpRef)> = {
             let info = match &self.virtualizable_info {
                 Some(info) => info,
                 None => return,
@@ -438,21 +450,70 @@ impl TraceCtx {
                 Some(boxes) => boxes,
                 None => return,
             };
-            info.static_fields
-                .iter()
-                .enumerate()
-                .map(|(i, f)| (f.offset, boxes[i], f.field_type))
-                .collect()
+
+            let mut ops = Vec::new();
+
+            // Static fields: SETFIELD_GC(vable, field_value, descr=offset)
+            for (i, field) in info.static_fields.iter().enumerate() {
+                if i < boxes.len() {
+                    ops.push((
+                        OpCode::SetfieldGc,
+                        vec![field.offset as i64],
+                        boxes[i],
+                    ));
+                }
+            }
+
+            // Array fields: GETFIELD_GC_R to get array ptr, then SETARRAYITEM_GC
+            let mut box_idx = info.static_fields.len();
+            if let Some(ref lengths) = self.virtualizable_array_lengths {
+                for (ai, afield) in info.array_fields.iter().enumerate() {
+                    let len = lengths.get(ai).copied().unwrap_or(0);
+                    for ei in 0..len {
+                        if box_idx < boxes.len() {
+                            ops.push((
+                                OpCode::SetarrayitemGc,
+                                vec![afield.field_offset as i64, ei as i64],
+                                boxes[box_idx],
+                            ));
+                        }
+                        box_idx += 1;
+                    }
+                }
+            }
+
+            ops
         };
-        for (offset, value, _tp) in fields_to_flush {
-            let offset_ref = self.const_int(offset as i64);
-            self.record_op(OpCode::SetfieldGc, &[vable_opref, offset_ref, value]);
+
+        // Emit all collected operations
+        for (opcode, metadata, value) in ops_to_emit {
+            match opcode {
+                OpCode::SetfieldGc => {
+                    let offset_ref = self.const_int(metadata[0]);
+                    self.record_op(OpCode::SetfieldGc, &[vable_opref, value, offset_ref]);
+                }
+                OpCode::SetarrayitemGc => {
+                    let arr_offset_ref = self.const_int(metadata[0]);
+                    let arr_ptr = self.record_op(
+                        OpCode::GetfieldGcR,
+                        &[vable_opref, arr_offset_ref],
+                    );
+                    let idx_ref = self.const_int(metadata[1]);
+                    let zero = self.const_int(0);
+                    self.record_op(
+                        OpCode::SetarrayitemGc,
+                        &[arr_ptr, idx_ref, value, zero],
+                    );
+                }
+                _ => {}
+            }
         }
-        // Write TOKEN_NONE to clear the virtualizable
+
+        // SETFIELD_GC(vable, NULL, vable_token_descr) — clear token
         if let Some(ref info) = self.virtualizable_info {
             let token_offset = self.const_int(info.token_offset as i64);
-            let zero = self.const_int(0);
-            self.record_op(OpCode::SetfieldRaw, &[vable_opref, zero, token_offset]);
+            let null = self.const_int(0);
+            self.record_op(OpCode::SetfieldGc, &[vable_opref, null, token_offset]);
         }
     }
 

@@ -478,9 +478,10 @@ pub struct MetaInterp<M: Clone> {
     pending_token: Option<(u64, u64)>,
     /// Cumulative statistics counters.
     stats: JitStatsCounters,
-    /// Array field lengths for the current trace's virtualizable layout.
-    /// Set by the driver/tracer before compilation; used by preamble patching
-    /// to correctly split [locals..., stack...] in the inputargs.
+    /// Pointer to the actual virtualizable object at compile time.
+    /// Used by preamble patching to read array lengths from the object.
+    vable_ptr: *const u8,
+    /// Fallback array lengths (for tests without real objects).
     vable_array_lengths: Vec<usize>,
 }
 
@@ -826,11 +827,17 @@ impl<M: Clone> MetaInterp<M> {
             hooks: JitHooks::default(),
             pending_token: None,
             stats: JitStatsCounters::default(),
+            vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
         }
     }
 
-    /// Set virtualizable array lengths for preamble patching.
+    /// Set the virtualizable object pointer for compile-time array length reading.
+    pub fn set_vable_ptr(&mut self, ptr: *const u8) {
+        self.vable_ptr = ptr;
+    }
+
+    /// Set virtualizable array lengths as fallback (for tests without real objects).
     pub fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
         self.vable_array_lengths = lengths;
     }
@@ -3416,47 +3423,56 @@ impl<M: Clone> MetaInterp<M> {
     /// 5. Otherwise → inline
     ///
     /// `callee_key` identifies the called function's JitDriver.
-    /// Inline decision using an externally-held TraceCtx.
-    ///
-    /// During merge_point callbacks, `self.tracing` is temporarily None
-    /// (the ctx is passed to the callback). This method accepts the ctx
-    /// directly so inline decisions work inside inline_trace_and_execute.
+    pub fn should_inline(&mut self, callee_key: u64) -> InlineDecision {
+        // Extract inline-relevant info from ctx before calling impl
+        // (avoids borrow conflict between self.tracing and &mut self).
+        let ctx_info = self.tracing.as_ref().map(|ctx| {
+            (
+                ctx.inline_depth(),
+                ctx.is_tracing_key(callee_key),
+                ctx.recursive_depth(callee_key),
+            )
+        });
+        self.should_inline_core(callee_key, ctx_info)
+    }
+
     pub fn should_inline_with_ctx(
         &mut self,
         callee_key: u64,
         ctx: &crate::trace_ctx::TraceCtx,
     ) -> InlineDecision {
-        self.should_inline_impl(callee_key, Some(ctx))
+        let ctx_info = Some((
+            ctx.inline_depth(),
+            ctx.is_tracing_key(callee_key),
+            ctx.recursive_depth(callee_key),
+        ));
+        self.should_inline_core(callee_key, ctx_info)
     }
 
-    pub fn should_inline(&mut self, callee_key: u64) -> InlineDecision {
-        let ctx_ref = self.tracing.as_ref();
-        self.should_inline_impl(callee_key, ctx_ref)
-    }
-
-    fn should_inline_impl(
+    /// Core inline decision logic.
+    /// ctx_info: Option<(inline_depth, is_tracing_key, recursive_depth)>
+    fn should_inline_core(
         &mut self,
         callee_key: u64,
-        ctx: Option<&crate::trace_ctx::TraceCtx>,
+        ctx_info: Option<(usize, bool, usize)>,
     ) -> InlineDecision {
-        if let Some(ctx) = ctx {
-                if ctx.inline_depth() >= MAX_INLINE_DEPTH {
+        if let Some((inline_depth, is_self_recursive, recursive_depth)) = ctx_info {
+            if inline_depth >= MAX_INLINE_DEPTH {
+                if self.compiled_loops.contains_key(&callee_key) {
+                    return InlineDecision::CallAssembler;
+                }
+                return InlineDecision::ResidualCall;
+            }
+
+            // Self-recursion: inline up to MAX_RECURSIVE_UNROLL.
+            if is_self_recursive {
+                if recursive_depth >= MAX_RECURSIVE_UNROLL {
                     if self.compiled_loops.contains_key(&callee_key) {
                         return InlineDecision::CallAssembler;
                     }
                     return InlineDecision::ResidualCall;
                 }
-
-                // Self-recursion: inline up to MAX_INLINE_DEPTH.
-                // The iterative meta-interpreter (Phase 3) handles this
-                // without Rust stack growth via pending_inline side-channel.
-                if ctx.is_tracing_key(callee_key) {
-                    // Already at depth limit — use CallAssembler if compiled
-                    if self.compiled_loops.contains_key(&callee_key) {
-                        return InlineDecision::CallAssembler;
-                    }
-                    return InlineDecision::Inline;
-                }
+                return InlineDecision::Inline;
             }
 
             if !self.warm_state.should_inline_function(callee_key) {
@@ -3531,6 +3547,10 @@ impl<M: Clone> MetaInterp<M> {
 /// Default maximum inlining depth during tracing.
 /// Configurable via WarmEnterState::set_max_inline_depth().
 const MAX_INLINE_DEPTH: usize = 10;
+
+/// Maximum recursive unrolling depth for self-recursive functions.
+/// fib with depth N → ~2^N inlined calls. depth 2 → ~4 calls per point.
+const MAX_RECURSIVE_UNROLL: usize = 2;
 
 /// Describes the recovery state after a guard failure.
 #[derive(Debug, Clone)]
