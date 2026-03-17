@@ -114,10 +114,27 @@ pub struct MethodInfo {
 /// string-based analysis (for backward compatibility) and the new
 /// graph-based pipeline (for RPython-parity classification).
 pub fn analyze_full(source: &str) -> (AnalysisResult, passes::ProgramPipelineResult) {
-    let legacy = analyze(source);
+    let mut legacy = analyze(source);
     let parsed = parse::parse_source(source);
     let program = front::build_semantic_program(&parsed);
     let pipeline = passes::analyze_program(&program, &passes::PipelineConfig::default());
+
+    // Enrich: if graph pipeline classified a function that matches an
+    // unclassified opcode arm handler, propagate the graph classification.
+    for arm in &mut legacy.opcodes {
+        if arm.trace_pattern.is_some() {
+            continue;
+        }
+        for call in &arm.resolved_calls {
+            if let Some(ref graph) = call.graph {
+                if let Some(pattern) = patterns::classify_from_graph(graph) {
+                    arm.trace_pattern = Some(pattern);
+                    break;
+                }
+            }
+        }
+    }
+
     (legacy, pipeline)
 }
 
