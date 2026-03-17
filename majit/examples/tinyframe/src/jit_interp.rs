@@ -5,6 +5,10 @@
 ///
 /// JIT traces the integer-only path through the register machine.
 /// JUMP_IF_ABOVE is the back-edge that triggers tracing.
+///
+/// This example hand-writes `trace_instruction` for educational purposes.
+/// In production, the `#[jit_interp]` proc macro auto-generates tracing
+/// code from the interpreter's match dispatch — see aheuijit for an example.
 use std::collections::HashMap;
 
 use majit_ir::{OpCode, OpRef};

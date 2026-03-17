@@ -119,6 +119,8 @@ pub struct StorageConfig {
     pub untraceable: Vec<String>,
     pub scan_fn: String,
     pub can_trace_guard: Option<String>,
+    /// When true, storage stacks are virtualizable (variable depth allowed).
+    pub virtualizable: bool,
 }
 
 /// Generate a complete JIT mainloop module.
@@ -186,6 +188,11 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
                 quote! { can_trace_guard: #g, }
             })
             .unwrap_or_default();
+        let vable = if s.virtualizable {
+            quote! { virtualizable: true, }
+        } else {
+            quote! {}
+        };
         quote! {
             storage = {
                 pool: #pool, pool_type: #pool_type,
@@ -193,6 +200,7 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
                 untraceable: [#(#untraceable),*],
                 scan: #scan,
                 #guard
+                #vable
             },
         }
     });

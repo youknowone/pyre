@@ -245,27 +245,38 @@ pub trait JitCodeRuntime {
     fn stack_data_ptr(&self, _selected: usize) -> usize { 0 }
 }
 
-pub struct ClosureRuntime<FLen, FPeek, FLabel> {
+pub struct ClosureRuntime<FLen, FPeek, FLabel, FDataPtr = fn(usize) -> usize> {
     stack_len: FLen,
     stack_peek: FPeek,
     label_at: FLabel,
+    stack_data_ptr_fn: FDataPtr,
 }
 
-impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel> {
+impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel, fn(usize) -> usize> {
     pub fn new(stack_len: FLen, stack_peek: FPeek, label_at: FLabel) -> Self {
         Self {
             stack_len,
             stack_peek,
             label_at,
+            stack_data_ptr_fn: |_| 0,
         }
     }
 }
 
-impl<FLen, FPeek, FLabel> JitCodeRuntime for ClosureRuntime<FLen, FPeek, FLabel>
+impl<FLen, FPeek, FLabel, FDataPtr> ClosureRuntime<FLen, FPeek, FLabel, FDataPtr> {
+    pub fn with_data_ptr(
+        stack_len: FLen, stack_peek: FPeek, label_at: FLabel, stack_data_ptr: FDataPtr,
+    ) -> Self {
+        Self { stack_len, stack_peek, label_at, stack_data_ptr_fn: stack_data_ptr }
+    }
+}
+
+impl<FLen, FPeek, FLabel, FDataPtr> JitCodeRuntime for ClosureRuntime<FLen, FPeek, FLabel, FDataPtr>
 where
     FLen: Fn(usize) -> usize,
     FPeek: Fn(usize, usize) -> i64,
     FLabel: Fn(usize) -> usize,
+    FDataPtr: Fn(usize) -> usize,
 {
     fn stack_len(&self, selected: usize) -> usize {
         (self.stack_len)(selected)
@@ -277,6 +288,10 @@ where
 
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
+    }
+
+    fn stack_data_ptr(&self, selected: usize) -> usize {
+        (self.stack_data_ptr_fn)(selected)
     }
 }
 
@@ -696,7 +711,19 @@ where
                 };
                 let pc = self.frames.current_mut().pc;
                 let close_loop = runtime.label_at(pc) == sym.loop_header_pc();
-                let cond = {
+                let cond = if sym.is_virtualizable_storage() {
+                    if let (Some(arr_ref), Some(len_ref)) =
+                        (sym.vable_array_ref(selected), sym.vable_len_ref(selected))
+                    {
+                        let one = ctx.const_int(1);
+                        let idx = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
+                        let val = ctx.record_op(OpCode::GetarrayitemRawI, &[arr_ref, idx]);
+                        sym.set_vable_len_ref(selected, idx);
+                        val
+                    } else {
+                        return TraceAction::Abort;
+                    }
+                } else {
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                     stack.pop().expect("branch_zero on empty symbolic stack")
                 };
@@ -2213,6 +2240,31 @@ where
     FLabel: Fn(usize) -> usize,
 {
     let runtime = ClosureRuntime::new(runtime_stack_len, runtime_stack_peek, label_at);
+    let root = MIFrame::new(jitcode, pc);
+    let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
+    machine.run_to_end(ctx, sym, &runtime)
+}
+
+pub fn trace_jitcode_with_data_ptr<S, FLen, FPeek, FLabel, FDataPtr>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    pc: usize,
+    runtime_stack_len: FLen,
+    runtime_stack_peek: FPeek,
+    label_at: FLabel,
+    stack_data_ptr: FDataPtr,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    FLen: Fn(usize) -> usize,
+    FPeek: Fn(usize, usize) -> i64,
+    FLabel: Fn(usize) -> usize,
+    FDataPtr: Fn(usize) -> usize,
+{
+    let runtime = ClosureRuntime::with_data_ptr(
+        runtime_stack_len, runtime_stack_peek, label_at, stack_data_ptr,
+    );
     let root = MIFrame::new(jitcode, pc);
     let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
     machine.run_to_end(ctx, sym, &runtime)

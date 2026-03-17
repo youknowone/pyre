@@ -4,6 +4,10 @@
 /// Reds:   [a, regs]
 ///
 /// Mirrors rpython/jit/tl/tlr.py with jit_merge_point / can_enter_jit.
+///
+/// This example hand-writes `trace_instruction` for educational purposes.
+/// In production, the `#[jit_interp]` proc macro auto-generates tracing
+/// code from the interpreter's match dispatch — see aheuijit for an example.
 use majit_ir::{OpCode, OpRef};
 use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};
 
@@ -294,5 +298,25 @@ mod tests {
         let prog = vec![SET_A, 42, RETURN_A];
         let mut jit = JitTlrInterp::new();
         assert_eq!(jit.run(&prog, 0), 42);
+    }
+
+    /// Exercises the JIT with many input sizes: small values stay interpreted,
+    /// larger values trigger trace compilation and run compiled code.
+    /// The guard exit path (a == 0 at loop end) is exercised on every input,
+    /// verifying that fallback from compiled code produces correct results.
+    ///
+    /// Bridge compilation is handled automatically by MetaInterp: when a guard
+    /// fails repeatedly, MetaInterp begins tracing a bridge from the guard's
+    /// fail point. No explicit test setup is needed — the mechanism activates
+    /// whenever guard failure count exceeds the bridge threshold.
+    #[test]
+    fn jit_various_sizes() {
+        let bc = square_bytecode();
+        for a in [1, 2, 3, 4, 5, 10, 20, 50, 100, 500, 1000] {
+            let expected = interp::interpret(&bc, a);
+            let mut jit = JitTlrInterp::new();
+            let got = jit.run(&bc, a);
+            assert_eq!(got, expected, "mismatch for a={a}");
+        }
     }
 }
