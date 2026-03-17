@@ -217,11 +217,8 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
         #(#use_decls)*
 
         use majit_meta::JitDriver;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         const DEFAULT_THRESHOLD: u32 = 0;
-        static JUST_COMPILED_KEY: AtomicU64 = AtomicU64::new(0);
-        static JUST_COMPILED_PENDING: AtomicBool = AtomicBool::new(false);
 
         #(#io_shim_wrappers)*
 
