@@ -135,7 +135,26 @@ pub enum LoweringRecipe {
     Noop,
 
     /// Residual call — emit opaque CALL_I/CALL_R.
+    /// RPython `handle_residual_call` with `EffectInfo.OS_NONE`.
     ResidualCall {
+        helper_name: String,
+    },
+
+    /// Pure residual call — emit CALL_PURE (no side effects, elidable).
+    /// RPython `handle_residual_call` with `EF_ELIDABLE`.
+    PureCall {
+        helper_name: String,
+    },
+
+    /// May-force residual call — emit CALL_MAY_FORCE (can trigger GC).
+    /// RPython `handle_residual_call` with `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`.
+    MayForceCall {
+        helper_name: String,
+    },
+
+    /// Loop-invariant call — result cached across loop iterations.
+    /// RPython `handle_residual_call` with `EF_LOOPINVARIANT`.
+    LoopInvariantCall {
         helper_name: String,
     },
 
@@ -231,9 +250,14 @@ pub fn transform_pattern(pattern: &TracePattern, config: &TransformConfig) -> Lo
         TracePattern::StackManip => LoweringRecipe::StackManip,
         TracePattern::IterCleanup => LoweringRecipe::IterCleanup,
         TracePattern::Noop => LoweringRecipe::Noop,
-        TracePattern::Residual { helper_name } => LoweringRecipe::ResidualCall {
-            helper_name: helper_name.clone(),
-        },
+        TracePattern::Residual { helper_name } => {
+            match (config.classify_call_effect)(helper_name) {
+                "pure" => LoweringRecipe::PureCall { helper_name: helper_name.clone() },
+                "may_force" => LoweringRecipe::MayForceCall { helper_name: helper_name.clone() },
+                "loop_invariant" => LoweringRecipe::LoopInvariantCall { helper_name: helper_name.clone() },
+                _ => LoweringRecipe::ResidualCall { helper_name: helper_name.clone() },
+            }
+        }
         TracePattern::Unknown => LoweringRecipe::Abort,
     }
 }
@@ -250,6 +274,12 @@ pub struct TransformConfig {
     pub locals_field: String,
     pub consts_field: String,
     pub use_call_assembler: bool,
+
+    /// Classify a residual call's effect kind based on helper name.
+    /// Returns "pure", "may_force", "loop_invariant", or "residual" (default).
+    /// This is majit's equivalent of RPython's EffectInfo classification
+    /// in `handle_residual_call` (jtransform.py:456).
+    pub classify_call_effect: fn(&str) -> &'static str,
 }
 
 impl Default for TransformConfig {
@@ -263,8 +293,14 @@ impl Default for TransformConfig {
             locals_field: "locals_w".into(),
             consts_field: "co_consts".into(),
             use_call_assembler: true,
+            classify_call_effect: default_classify_call_effect,
         }
     }
+}
+
+/// Default effect classifier: everything is a plain residual call.
+fn default_classify_call_effect(_name: &str) -> &'static str {
+    "residual"
 }
 
 /// Transform all opcodes in an analysis result.
