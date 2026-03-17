@@ -1,45 +1,251 @@
-//! JIT-enabled evaluation entry point.
+//! JIT-enabled evaluation — the sole entry point for JIT execution.
 //!
-//! This module is the sole entry point for JIT execution.
-//! It orchestrates JIT function-entry checks, tracing, and
-//! compiled-code execution, delegating pure interpretation
-//! to pyre-interp's eval_frame_plain.
+//! This module owns the JitDriver, tracing hooks, and compiled-code
+//! execution. pyre-interp provides the pure interpreter (eval_frame_plain)
+//! and the opcode trait implementations on PyFrame.
+//!
+//! Equivalent to PyPy's `pypyjit/interp_jit.py` — the JIT is injected
+//! from outside the interpreter.
 
-use pyre_interp::eval;
+use std::cell::{Cell, UnsafeCell};
+use std::collections::HashMap;
+
 use pyre_interp::frame::PyFrame;
-use pyre_runtime::PyResult;
+use pyre_interp::jit::state::{PyreEnv, PyreJitState};
+use pyre_interp::jit::trace::trace_bytecode;
+use pyre_object::w_none;
+use pyre_bytecode::bytecode::OpArgState;
+use pyre_runtime::{
+    PyResult, StepResult, execute_opcode_step,
+};
+
+use majit_meta::DetailedDriverRunOutcome;
+
+/// Function-entry tracing threshold.
+const FUNC_ENTRY_THRESHOLD: u32 = 7;
+
+// Use pyre-interp's JIT_DRIVER TLS (transitional — until jit/ moves here).
+#[inline]
+fn driver_pair() -> &'static mut (majit_meta::JitDriver<PyreJitState>, majit_meta::virtualizable::VirtualizableInfo) {
+    pyre_interp::eval::driver_pair()
+}
+
+thread_local! {
+    static FUNC_ENTRY_COUNTS: UnsafeCell<HashMap<u64, u32>> =
+        UnsafeCell::new(HashMap::new());
+
+    static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
+    static JIT_TRACING: Cell<bool> = Cell::new(false);
+}
+
+#[inline]
+fn func_entry_counts() -> &'static mut HashMap<u64, u32> {
+    FUNC_ENTRY_COUNTS.with(|cell| unsafe { &mut *cell.get() })
+}
+
+/// RAII guard that decrements `JIT_CALL_DEPTH` on drop.
+pub struct JitCallDepthGuard;
+
+impl Drop for JitCallDepthGuard {
+    fn drop(&mut self) {
+        JIT_CALL_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// Bump the JIT call depth. Returns a guard that restores the
+/// depth when dropped.
+#[inline]
+pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
+    let depth = JIT_CALL_DEPTH.with(|d| d.get());
+    if depth > 0 || JIT_TRACING.with(|t| t.get()) {
+        JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
+        Some(JitCallDepthGuard)
+    } else {
+        None
+    }
+}
 
 /// Evaluate a Python frame with JIT compilation.
 ///
-/// This is the main entry point for pyre-jit. It replaces
-/// pyre-interp's eval_frame for JIT-enabled execution.
-///
-/// Flow:
-/// 1. Install JIT call bridges (force/bridge callbacks)
-/// 2. Try function-entry JIT (compiled code or start tracing)
-/// 3. If tracing active → JIT-enabled eval loop
-/// 4. Otherwise → plain interpreter loop
+/// This is the main entry point for pyre-jit.
+fn depth_bump_callback() -> Option<Box<dyn std::any::Any>> {
+    jit_call_depth_bump().map(|g| Box::new(g) as Box<dyn std::any::Any>)
+}
+
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
-    // Register this function as the eval callback for recursive calls.
-    // Like PyPy's __extend__(PyFrame).dispatch(), this replaces the
-    // plain interpreter with JIT-aware evaluation for all function calls.
     pyre_interp::call::register_eval_override(eval_with_jit);
+    pyre_interp::call::register_depth_bump(depth_bump_callback);
     pyre_interp::call::install_jit_call_bridge();
     frame.fix_array_ptrs();
 
-    // Try running compiled code or start tracing for this function
-    if let Some(result) = eval::try_function_entry_jit(frame) {
+    if let Some(result) = try_function_entry_jit(frame) {
         return result;
     }
 
-    // If function-entry triggered tracing, use JIT-enabled loop
-    let (driver, _) = eval::driver_pair();
-    if driver.is_tracing() {
-        return eval::eval_loop_jit(frame);
+    // Always use JIT-enabled loop — it handles back-edges, merge
+    // points, and compiled-code execution. eval_frame_plain (no JIT)
+    // is only used for residual calls (jit_call_depth > 0).
+    eval_loop_jit(frame)
+}
+
+/// JIT-enabled evaluation loop, entered after the first back-edge.
+pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
+    let env = PyreEnv;
+    let mut arg_state = OpArgState::default();
+    let code = unsafe { &*frame.code };
+    let (driver, info) = driver_pair();
+
+    loop {
+        if frame.next_instr >= code.instructions.len() {
+            return Ok(w_none());
+        }
+
+        if driver.is_tracing() {
+            JIT_TRACING.with(|t| t.set(true));
+            if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
+                let pc = frame.next_instr;
+                let concrete_frame = frame as *mut PyFrame as usize;
+                driver.merge_point(|ctx, sym| trace_bytecode(ctx, sym, code, pc, concrete_frame));
+            }
+            if !driver.is_tracing() {
+                JIT_TRACING.with(|t| t.set(false));
+            }
+        }
+
+        let code_unit = code.instructions[frame.next_instr];
+        let (instruction, op_arg) = arg_state.get(code_unit);
+        frame.next_instr += 1;
+        let next_instr = frame.next_instr;
+        match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
+            StepResult::Continue => {}
+            StepResult::CloseLoop(_) => {
+                let mut jit_state = build_jit_state(frame, info);
+                driver
+                    .set_vable_array_lengths(vec![jit_state.local_count(), jit_state.stack_depth]);
+                if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
+                    frame.code as u64,
+                    frame.next_instr,
+                    &mut jit_state,
+                    &env,
+                    || {},
+                ) {
+                    if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
+                        return result;
+                    }
+                }
+            }
+            StepResult::Return(result) => return Ok(result),
+        }
+    }
+}
+
+/// Try running compiled code or count function entry.
+pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
+    if JIT_CALL_DEPTH.with(|d| d.get()) > 0 {
+        return None;
     }
 
-    // No JIT activity → pure interpreter
-    eval::eval_frame_plain(frame)
+    let green_key = frame.code as u64;
+    let (driver, info) = driver_pair();
+
+    if driver.has_compiled_loop(green_key) {
+        let env = PyreEnv;
+        let mut jit_state = build_jit_state(frame, info);
+        driver.set_vable_array_lengths(vec![jit_state.local_count(), jit_state.stack_depth]);
+        if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
+            green_key,
+            frame.next_instr,
+            &mut jit_state,
+            &env,
+            || {},
+        ) {
+            if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
+                return Some(result);
+            }
+        }
+        return None;
+    }
+
+    if driver.is_tracing() {
+        return None;
+    }
+
+    let counts = func_entry_counts();
+    let count = counts.entry(green_key).or_insert(0);
+    *count += 1;
+    if *count != FUNC_ENTRY_THRESHOLD {
+        return None;
+    }
+
+    let env = PyreEnv;
+    let mut jit_state = build_jit_state(frame, info);
+    driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
+    None
+}
+
+fn handle_jit_outcome(
+    outcome: DetailedDriverRunOutcome,
+    jit_state: &PyreJitState,
+    frame: &mut PyFrame,
+    info: &majit_meta::virtualizable::VirtualizableInfo,
+) -> Option<PyResult> {
+    match outcome {
+        DetailedDriverRunOutcome::Finished { typed_values, .. } => {
+            let [value] = typed_values.as_slice() else {
+                return Some(Err(pyre_runtime::PyError::type_error(
+                    "compiled finish did not produce a single object return value",
+                )));
+            };
+            let value = match value {
+                majit_ir::Value::Int(raw) => *raw as pyre_object::PyObjectRef,
+                majit_ir::Value::Ref(value) => value.as_usize() as pyre_object::PyObjectRef,
+                _ => {
+                    return Some(Err(pyre_runtime::PyError::type_error(
+                        "compiled finish produced a non-object return value",
+                    )));
+                }
+            };
+            Some(Ok(value))
+        }
+        DetailedDriverRunOutcome::Jump { .. }
+        | DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
+            sync_jit_state_to_frame(jit_state, frame, info);
+            None
+        }
+        DetailedDriverRunOutcome::GuardFailure {
+            restored: false, ..
+        }
+        | DetailedDriverRunOutcome::Abort { .. } => None,
+    }
+}
+
+fn build_jit_state(
+    frame: &PyFrame,
+    virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
+) -> PyreJitState {
+    let mut jit_state = PyreJitState {
+        frame: frame as *const PyFrame as usize,
+        next_instr: frame.next_instr,
+        stack_depth: frame.stack_depth,
+    };
+    if !jit_state.sync_from_virtualizable(virtualizable_info) {
+        jit_state.next_instr = frame.next_instr;
+        jit_state.stack_depth = frame.stack_depth;
+    }
+    jit_state
+}
+
+fn sync_jit_state_to_frame(
+    jit_state: &PyreJitState,
+    frame: &mut PyFrame,
+    virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
+) {
+    if !jit_state.sync_to_virtualizable(virtualizable_info) {
+        frame.next_instr = jit_state.next_instr;
+        frame.stack_depth = jit_state.stack_depth;
+    }
+    frame.next_instr = jit_state.next_instr;
+    frame.stack_depth = jit_state.stack_depth;
 }
 
 #[cfg(test)]

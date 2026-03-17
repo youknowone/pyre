@@ -9,7 +9,7 @@ use pyre_runtime::{
     w_func_get_code_ptr, w_func_get_globals,
 };
 
-use crate::eval::{eval_frame, eval_frame_plain, jit_call_depth_bump};
+use crate::eval::eval_frame_plain;
 use crate::frame::PyFrame;
 
 // ── Eval function injection ──────────────────────────────────────
@@ -20,10 +20,17 @@ use crate::frame::PyFrame;
 type EvalFn = fn(&mut PyFrame) -> PyResult;
 static EVAL_OVERRIDE: OnceLock<EvalFn> = OnceLock::new();
 
-/// Register the JIT-aware eval function. Called by pyre-mjit at startup.
-/// After this, all recursive function calls go through the JIT eval loop.
+type DepthBumpFn = fn() -> Option<Box<dyn std::any::Any>>;
+static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn> = OnceLock::new();
+
+/// Register the JIT-aware eval function. Called by pyre-jit at startup.
 pub fn register_eval_override(f: EvalFn) {
     let _ = EVAL_OVERRIDE.set(f);
+}
+
+/// Register the JIT call-depth bump function. Called by pyre-jit at startup.
+pub fn register_depth_bump(f: DepthBumpFn) {
+    let _ = DEPTH_BUMP_OVERRIDE.set(f);
 }
 
 thread_local! {
@@ -141,12 +148,9 @@ pub fn call_user_function(
     let mut func_frame = PyFrame::new_for_call(func_code, args, globals, frame.execution_context);
     func_frame.fix_array_ptrs();
 
-    // When inside a JIT context (tracing or compiled code), bump the
-    // call depth so that the callee's eval_loop skips merge_points
-    // and try_function_entry_jit. This prevents inner instructions
-    // from polluting the outer trace, and prevents infinite recursion
-    // through compiled → residual → compiled call chains.
-    let _guard = jit_call_depth_bump();
+    // When inside a JIT context, bump call depth so callee's eval
+    // skips merge_points. The bump function is injected by pyre-jit.
+    let _guard = DEPTH_BUMP_OVERRIDE.get().and_then(|f| f());
 
     // Use JIT-aware eval if registered (by pyre-mjit), otherwise plain.
     // OnceLock::get() is a single atomic load after initialization.
