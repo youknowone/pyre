@@ -1503,7 +1503,7 @@ impl TraceFrameState {
                 let callee_key = w_func_get_code_ptr(concrete_callable) as u64;
                 let (driver, _) = crate::eval::driver_pair();
 
-                // 1. CallAssembler: callee has compiled code (or pending self-recursion)
+                // 1. CallAssembler: callee has compiled code
                 let token_number = driver
                     .get_loop_token_number(callee_key)
                     .or_else(|| driver.get_pending_token_number(callee_key));
@@ -1562,7 +1562,7 @@ impl TraceFrameState {
                     }
                 }
 
-                // 2. Inline: trace through callee (meta-tracing default)
+                // 2. Inline: trace through callee (non-recursive only)
                 if driver.should_inline(callee_key) == majit_meta::InlineDecision::Inline {
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(args.len()) {
                         return self.inline_function_call(
