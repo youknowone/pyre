@@ -77,6 +77,27 @@ pub fn hint_virtual_ref<T>(val: T) -> T {
 #[inline(always)]
 pub fn hint_virtual_ref_finish() {}
 
+/// Hint: access the virtualizable directly as a struct, bypassing JIT tracking.
+/// RPython equivalent: `jit.hint(frame, access_directly=True)`
+#[inline(always)]
+pub fn hint_access_directly<T>(x: T) -> T {
+    x
+}
+
+/// Hint: this virtualizable was freshly allocated, so direct access is safe.
+/// RPython equivalent: `jit.hint(frame, access_directly=True, fresh_virtualizable=True)`
+#[inline(always)]
+pub fn hint_fresh_virtualizable<T>(x: T) -> T {
+    x
+}
+
+/// Hint: force the virtualizable now (performance hint for generators etc).
+/// RPython equivalent: `jit.hint(frame, force_virtualizable=True)`
+#[inline(always)]
+pub fn hint_force_virtualizable<T>(x: T) -> T {
+    x
+}
+
 /// Hint that a value is expected to be a compile-time constant.
 ///
 /// Unlike `hint_promote`, this doesn't generate a guard — it's a
