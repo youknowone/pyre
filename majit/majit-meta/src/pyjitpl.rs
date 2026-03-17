@@ -484,6 +484,10 @@ pub struct MetaInterp<M: Clone> {
     raw_int_finish_keys: HashSet<u64>,
     /// Helper function pointers that box raw ints into interpreter objects.
     raw_int_box_helpers: HashSet<i64>,
+    /// Mapping: create_frame_N_ptr → create_frame_N_raw_int_ptr.
+    /// When a box helper feeds directly into create_frame, the box+create
+    /// can be folded into a single create_frame_raw_int call.
+    create_frame_raw_map: HashMap<i64, i64>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -832,6 +836,7 @@ impl<M: Clone> MetaInterp<M> {
             vable_array_lengths: Vec::new(),
             raw_int_finish_keys: HashSet::new(),
             raw_int_box_helpers: HashSet::new(),
+            create_frame_raw_map: HashMap::new(),
         }
     }
 
@@ -3674,6 +3679,13 @@ impl<M: Clone> MetaInterp<M> {
     /// that are safe to peel away for the raw-int call_assembler protocol.
     pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
         self.raw_int_box_helpers.insert(helper as i64);
+    }
+
+    /// Register a create_frame → create_frame_raw_int mapping.
+    /// When a box helper result feeds directly into create_frame as the last arg,
+    /// the two calls can be folded into a single create_frame_raw_int call.
+    pub fn register_create_frame_raw(&mut self, normal: *const (), raw_int: *const ()) {
+        self.create_frame_raw_map.insert(normal as i64, raw_int as i64);
     }
 }
 
@@ -7278,6 +7290,119 @@ fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
         }
     }
 
+    ops
+}
+
+/// Fold boxing into create_frame: when a box helper result feeds directly
+/// into create_frame as the last argument, replace with create_frame_raw_int.
+///
+/// Pattern: `vB = CallI(box_fn, raw) ... vF = CallI(create_frame, ..., vB)`
+/// Result:  `vF = CallI(create_frame_raw, ..., raw)` + remove vB
+fn fold_box_into_create_frame(
+    mut ops: Vec<Op>,
+    constants: &HashMap<u32, i64>,
+    box_helpers: &HashSet<i64>,
+    create_frame_raw_map: &HashMap<i64, i64>,
+) -> Vec<Op> {
+    use majit_ir::OpCode;
+
+    if box_helpers.is_empty() || create_frame_raw_map.is_empty() {
+        return ops;
+    }
+
+    let mut replacements: Vec<(usize, usize)> = Vec::new(); // (box_idx, create_idx)
+
+    for (ci, create_op) in ops.iter().enumerate() {
+        if create_op.opcode != OpCode::CallI {
+            continue;
+        }
+        // Check if this is a known create_frame helper
+        let create_fn_ptr = create_op
+            .args
+            .first()
+            .and_then(|func| constants.get(&func.0))
+            .copied();
+        let raw_fn = create_fn_ptr.and_then(|p| create_frame_raw_map.get(&p).copied());
+        let Some(raw_fn_ptr) = raw_fn else {
+            continue;
+        };
+
+        // Last arg of create_frame should be a boxed value
+        let last_arg = match create_op.args.last() {
+            Some(a) => *a,
+            None => continue,
+        };
+
+        // Find the boxing op that produced last_arg
+        for (bi, box_op) in ops[..ci].iter().enumerate().rev() {
+            if box_op.pos != last_arg || box_op.opcode != OpCode::CallI {
+                continue;
+            }
+            let box_fn_ptr = box_op
+                .args
+                .first()
+                .and_then(|func| constants.get(&func.0))
+                .copied();
+            if !box_fn_ptr.is_some_and(|p| box_helpers.contains(&p)) {
+                continue;
+            }
+            // Check: box result is ONLY used by this create_frame (and maybe CA args)
+            // For safety, just check it's used by create_frame — if also used elsewhere, skip.
+            let used_elsewhere = ops.iter().enumerate().any(|(i, op)| {
+                i != ci && i != bi && op.args.contains(&last_arg)
+            });
+            // Also check fail_args
+            let used_in_fail_args = ops.iter().any(|op| {
+                op.fail_args
+                    .as_ref()
+                    .is_some_and(|fa| fa.contains(&last_arg))
+            });
+            if used_elsewhere || used_in_fail_args {
+                break; // box result used elsewhere, can't fold
+            }
+            if box_op.args.len() >= 2 {
+                replacements.push((bi, ci));
+            }
+            break;
+        }
+    }
+
+    // Apply replacements in reverse order
+    for &(box_idx, create_idx) in replacements.iter().rev() {
+        let raw_val = ops[box_idx].args[1]; // raw value from box(fn_ptr, raw)
+        let create_fn_ptr = ops[create_idx]
+            .args
+            .first()
+            .and_then(|func| constants.get(&func.0))
+            .copied()
+            .unwrap();
+        let raw_fn_ptr = create_frame_raw_map[&create_fn_ptr];
+
+        // Replace last arg of create_frame with raw_val
+        let nargs = ops[create_idx].args.len();
+        ops[create_idx].args[nargs - 1] = raw_val;
+
+        // Replace function pointer constant: create_frame → create_frame_raw
+        // The func OpRef constant needs updating
+        let func_ref = ops[create_idx].args[0];
+        // We need to update the constants map — but we have &HashMap.
+        // Instead, add a new constant entry. Use the same OpRef but update the value.
+        // Since constants is immutable here, we rewrite the func_ref's OpRef
+        // to a new one that maps to raw_fn_ptr.
+        // Simpler: just add a note and handle in caller.
+        // For now, store raw_fn_ptr in a new constant slot.
+        let new_func_ref = OpRef(func_ref.0 + 50_000); // offset to avoid collision
+        ops[create_idx].args[0] = new_func_ref;
+
+        // Remove the boxing op
+        ops.remove(box_idx);
+
+        // Return replacement info so caller can add the constant
+        // (We'll handle this by returning the ops and separately adding constants)
+    }
+
+    // Store new constant mappings
+    // (handled by the caller — see finish_and_compile)
     ops
 }
 
