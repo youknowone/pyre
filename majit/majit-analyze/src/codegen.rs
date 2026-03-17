@@ -180,9 +180,11 @@ pub fn trace_unbox_int(
     ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], intval_descr)
 }
 
-/// Box a raw i64 into a Python int object: emit New + SetfieldRaw.
+/// Box a raw i64 into a Python int object.
 ///
 /// Auto-generated equivalent of PyPy's int_box annotation.
+/// The helper route preserves pyre's small-int cache instead of always
+/// materializing a fresh heap object in the trace.
 pub fn trace_box_int(
     ctx: &mut majit_meta::TraceCtx,
     value: majit_ir::OpRef,
@@ -191,12 +193,8 @@ pub fn trace_box_int(
     intval_descr: majit_ir::DescrRef,
     int_type_addr: i64,
 ) -> majit_ir::OpRef {
-    use majit_ir::OpCode;
-    let obj = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
-    let type_ptr = ctx.const_int(int_type_addr);
-    ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, type_ptr], ob_type_descr);
-    ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, value], intval_descr);
-    obj
+    let _ = (size_descr, ob_type_descr, intval_descr, int_type_addr);
+    ctx.call_int(pyre_object::intobject::jit_w_int_new as *const (), &[value])
 }
 
 /// Emit an overflow-checked binary int operation.

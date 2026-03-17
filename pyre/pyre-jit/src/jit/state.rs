@@ -21,7 +21,7 @@ use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::strobject::is_str;
 use pyre_object::{
     w_bool_from, w_int_get_value, w_int_new, w_list_can_append_without_realloc,
-    w_list_is_inline_storage, w_list_len, w_str_get_value, w_tuple_len,
+    w_list_is_inline_storage, w_list_len, w_str_get_value, w_tuple_len, PY_NULL,
 };
 use pyre_objspace::truth_value as objspace_truth_value;
 use pyre_runtime::{
@@ -101,19 +101,6 @@ pub struct PyreSym {
     /// Base OpRef index for virtualizable stack slots.
     /// When set, symbolic_stack[i] = OpRef(vable_stack_base + i).
     pub(crate) vable_stack_base: Option<u32>,
-    pub(crate) pending_inline: Option<PendingInlineCall>,
-}
-
-pub(crate) struct PendingInlineCall {
-    pub callee_key: u64,
-    pub callee_frame_opref: OpRef,
-    pub concrete_callee_frame: Box<pyre_interp::frame::PyFrame>,
-    pub code: *const pyre_bytecode::CodeObject,
-    pub nargs: usize,
-    /// Placeholder OpRef on caller's symbolic stack. When callee returns,
-    /// ALL references to this placeholder in the trace are replaced with
-    /// the actual result OpRef via ctx.replace_op().
-    pub placeholder: OpRef,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -257,6 +244,21 @@ pub(crate) fn record_current_state_guard(
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
 
+fn synthesize_fresh_callee_entry_args(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    args: &[OpRef],
+    callee_nlocals: usize,
+) -> Vec<OpRef> {
+    let mut ca_args = vec![callee_frame, ctx.const_int(0), ctx.const_int(0)];
+    ca_args.extend(args.iter().copied().take(callee_nlocals));
+    let null = ctx.const_int(PY_NULL as i64);
+    while ca_args.len() < 3 + callee_nlocals {
+        ca_args.push(null);
+    }
+    ca_args
+}
+
 impl PyreSym {
     pub(crate) fn new_uninit(frame: OpRef) -> Self {
         Self {
@@ -272,7 +274,6 @@ impl PyreSym {
             vable_stack_depth: OpRef::NONE,
             vable_locals_base: None,
             vable_stack_base: None,
-            pending_inline: None,
         }
     }
 
@@ -1532,70 +1533,25 @@ impl TraceFrameState {
                 let (driver, _) = crate::eval::driver_pair();
                 let nargs = args.len();
 
-                // 1. CallAssembler: callee has compiled or pending code.
-                // For pending self-recursion, target_num_inputs is unknown
-                // so we use the current trace's num_inputs (=1 after preamble).
-                let token_number = driver
-                    .get_loop_token_number(callee_key)
-                    .or_else(|| driver.get_pending_token_number(callee_key));
-
-                if let Some(token_number) = token_number {
+                if let Some(token_number) = driver.get_pending_token_number(callee_key) {
+                    let callee_nlocals = {
+                        let code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
+                        (&*code_ptr).varnames.len()
+                    };
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
-                        // Check target's actual inputarg count.
-                        // For compiled targets: use stored num_inputs (may be 1
-                        // after preamble patching). For pending self-recursion:
-                        // target will have same shape as current trace — use
-                        // the original num_inputs (frame + ni + sd + locals).
-                        let callee_meta = driver.get_compiled_meta(callee_key);
-                        let callee_nlocals = callee_meta
-                            .map(|m| m.num_locals)
-                            .unwrap_or_else(|| {
-                                let code_ptr = w_func_get_code_ptr(concrete_callable)
-                                    as *const pyre_bytecode::CodeObject;
-                                if code_ptr.is_null() {
-                                    0
-                                } else {
-                                    (&(*code_ptr).varnames).len()
-                                }
-                            });
-                        let callee_sdepth =
-                            callee_meta.map(|m| m.stack_depth).unwrap_or(0);
-                        let target_num_inputs = driver
-                            .get_compiled_num_inputs(callee_key)
-                            .unwrap_or(3 + callee_nlocals + callee_sdepth);
-
                         return self.with_ctx(|this, ctx| {
                             this.guard_value(ctx, callable, concrete_callable as i64);
                             let mut helper_args = vec![this.frame(), callable];
                             helper_args.extend_from_slice(args);
                             let callee_frame = ctx.call_int(frame_helper, &helper_args);
-
-                            // Build ca_args to match target's inputarg count.
-                            // After preamble patching the target may only take [frame].
-                            let ca_args = if target_num_inputs <= 1 {
-                                // Preamble-patched: target loads fields from frame itself
-                                vec![callee_frame]
-                            } else {
-                                // Unpatched: target expects frame + static fields + array elements
-                                let callee_ni = frame_get_next_instr(ctx, callee_frame);
-                                let callee_sd = frame_get_stack_depth(ctx, callee_frame);
-                                let mut a = vec![callee_frame, callee_ni, callee_sd];
-                                let remaining = target_num_inputs.saturating_sub(3);
-                                if remaining > 0 {
-                                    let callee_locals_ptr = frame_locals_array(ctx, callee_frame);
-                                    for i in 0..remaining {
-                                        let idx = ctx.const_int(i as i64);
-                                        let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemRawI,
-                                            &[callee_locals_ptr, idx],
-                                            pyobject_array_descr(),
-                                        );
-                                        a.push(val);
-                                    }
-                                }
-                                a
-                            };
-                            let result = ctx.call_assembler_int_by_number(token_number, &ca_args);
+                            let ca_args = synthesize_fresh_callee_entry_args(
+                                ctx,
+                                callee_frame,
+                                args,
+                                callee_nlocals,
+                            );
+                            let result =
+                                ctx.call_assembler_int_by_number(token_number, &ca_args);
                             ctx.call_void(
                                 crate::call_jit::jit_drop_callee_frame as *const (),
                                 &[callee_frame],
@@ -1605,19 +1561,93 @@ impl TraceFrameState {
                     }
                 }
 
-                // 2. Inline: trace through callee (non-recursive only).
-                // should_inline returns Inline only for non-self-recursive
-                // calls (self-recursion gets ResidualCall + boost).
-                let inline_decision = driver.should_inline(callee_key);
-                if inline_decision == majit_meta::InlineDecision::Inline {
-                    if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
-                        return self.inline_function_call(
-                            callable, args, concrete_callable, callee_key, frame_helper,
-                        );
+                match driver.should_inline(callee_key) {
+                    majit_meta::InlineDecision::CallAssembler => {
+                        let Some(token_number) = driver.get_loop_token_number(callee_key) else {
+                            return self.with_ctx(|this, ctx| {
+                                this.guard_value(ctx, callable, concrete_callable as i64);
+                                let result = crate::jit::helpers::emit_trace_call_known_function(
+                                    ctx,
+                                    this.frame(),
+                                    callable,
+                                    args,
+                                )?;
+                                this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                                Ok(result)
+                            });
+                        };
+
+                        if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
+                            let callee_meta = driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
+                                panic!(
+                                    "compiled loop for callee_key={callee_key} is missing compiled meta"
+                                )
+                            });
+                            let callee_nlocals = callee_meta.num_locals;
+                            let callee_sdepth = callee_meta.stack_depth;
+                            let target_num_inputs =
+                                driver.get_compiled_num_inputs(callee_key).unwrap_or(1);
+
+                            return self.with_ctx(|this, ctx| {
+                                this.guard_value(ctx, callable, concrete_callable as i64);
+                                let mut helper_args = vec![this.frame(), callable];
+                                helper_args.extend_from_slice(args);
+                                let callee_frame = ctx.call_int(frame_helper, &helper_args);
+
+                                let ca_args = if target_num_inputs <= 1 {
+                                    vec![callee_frame]
+                                } else if callee_sdepth == 0 {
+                                    synthesize_fresh_callee_entry_args(
+                                        ctx,
+                                        callee_frame,
+                                        args,
+                                        callee_nlocals,
+                                    )
+                                } else {
+                                    let callee_ni = frame_get_next_instr(ctx, callee_frame);
+                                    let callee_sd = frame_get_stack_depth(ctx, callee_frame);
+                                    let mut a = vec![callee_frame, callee_ni, callee_sd];
+                                    let callee_locals_ptr = frame_locals_array(ctx, callee_frame);
+                                    for i in 0..callee_nlocals {
+                                        let idx = ctx.const_int(i as i64);
+                                        let val = ctx.record_op_with_descr(
+                                            OpCode::GetarrayitemRawI,
+                                            &[callee_locals_ptr, idx],
+                                            pyobject_array_descr(),
+                                        );
+                                        a.push(val);
+                                    }
+                                    let callee_stack_ptr = frame_stack_array(ctx, callee_frame);
+                                    for i in 0..callee_sdepth {
+                                        let idx = ctx.const_int(i as i64);
+                                        let val = ctx.record_op_with_descr(
+                                            OpCode::GetarrayitemRawI,
+                                            &[callee_stack_ptr, idx],
+                                            pyobject_array_descr(),
+                                        );
+                                        a.push(val);
+                                    }
+                                    a
+                                };
+                                let result = ctx.call_assembler_int_by_number(token_number, &ca_args);
+                                ctx.call_void(
+                                    crate::call_jit::jit_drop_callee_frame as *const (),
+                                    &[callee_frame],
+                                );
+                                Ok(result)
+                            });
+                        }
                     }
+                    majit_meta::InlineDecision::Inline => {
+                        if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
+                            return self.inline_function_call(
+                                callable, args, concrete_callable, callee_key, frame_helper,
+                            );
+                        }
+                    }
+                    majit_meta::InlineDecision::ResidualCall => {}
                 }
 
-                // 3. ResidualCall: opaque call to interpreter
                 return self.with_ctx(|this, ctx| {
                     this.guard_value(ctx, callable, concrete_callable as i64);
                     let result = crate::jit::helpers::emit_trace_call_known_function(

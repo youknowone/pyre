@@ -3549,9 +3549,17 @@ impl<M: Clone> MetaInterp<M> {
         callee_key: u64,
         ctx_info: Option<(usize, bool, usize)>,
     ) -> InlineDecision {
+        let callee_compiled = self.compiled_loops.contains_key(&callee_key);
+        if !self.warm_state.can_inline_callable(callee_key) {
+            if callee_compiled {
+                return InlineDecision::CallAssembler;
+            }
+            return InlineDecision::ResidualCall;
+        }
+
         if let Some((inline_depth, is_self_recursive, recursive_depth)) = ctx_info {
             if inline_depth >= MAX_INLINE_DEPTH {
-                if self.compiled_loops.contains_key(&callee_key) {
+                if callee_compiled {
                     return InlineDecision::CallAssembler;
                 }
                 return InlineDecision::ResidualCall;
@@ -3563,7 +3571,8 @@ impl<M: Clone> MetaInterp<M> {
             // the runtime path yet — using it causes SIGSEGV from
             // unresolved placeholder OpRefs in the compiled trace.)
             if is_self_recursive {
-                if self.compiled_loops.contains_key(&callee_key) {
+                let _recursive_depth = recursive_depth;
+                if callee_compiled {
                     return InlineDecision::CallAssembler;
                 }
                 // Boost callee's entry counter so it gets traced quickly.
@@ -3574,7 +3583,7 @@ impl<M: Clone> MetaInterp<M> {
             }
 
             if !self.warm_state.should_inline_function(callee_key) {
-                if self.compiled_loops.contains_key(&callee_key) {
+                if callee_compiled {
                     return InlineDecision::CallAssembler;
                 }
                 return InlineDecision::ResidualCall;
@@ -3584,7 +3593,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Not tracing — use CALL_ASSEMBLER if compiled.
-        if self.compiled_loops.contains_key(&callee_key) {
+        if callee_compiled {
             return InlineDecision::CallAssembler;
         }
 
@@ -3645,10 +3654,6 @@ impl<M: Clone> MetaInterp<M> {
 /// Default maximum inlining depth during tracing.
 /// Configurable via WarmEnterState::set_max_inline_depth().
 const MAX_INLINE_DEPTH: usize = 10;
-
-/// Maximum recursive unrolling depth for self-recursive functions.
-/// fib with depth N → ~2^N inlined calls. depth 2 → ~4 calls per point.
-const MAX_RECURSIVE_UNROLL: usize = 2;
 
 /// Describes the recovery state after a guard failure.
 #[derive(Debug, Clone)]

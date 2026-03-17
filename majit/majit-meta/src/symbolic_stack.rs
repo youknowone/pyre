@@ -77,6 +77,12 @@ impl SymbolicStack {
         self.entries[index]
     }
 
+    /// Set the OpRef at a given position from the bottom (index 0 = bottom).
+    /// Preserves the existing type tag.
+    pub fn set_at(&mut self, index: usize, opref: OpRef) {
+        self.entries[index].0 = opref;
+    }
+
     pub fn swap(&mut self) {
         let len = self.entries.len();
         assert!(len >= 2, "swap requires at least 2 elements");

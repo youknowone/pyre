@@ -228,6 +228,23 @@ Current status:
   operand stack. Those live values are now read from and restored into the
   virtualizable `PyFrame` arrays directly, so the heap frame is the only
   runtime source of truth for locals/stack state.
+
+## Recursive Call Status
+
+- Done: self-recursive `CallAssembler` now uses the same fresh function-entry
+  ABI shape as separately traced function-entry loops:
+  `[frame, next_instr, stack_depth, locals...]`.
+- Done: `trace_box_int` now boxes traced integer results through
+  `jit_w_int_new`, so recursive traces reuse the same small-int cache policy as
+  the interpreter instead of open-coding `New + Setfield`.
+- Done: `DONT_TRACE_HERE` now participates in the actual inlining decision, so
+  `pyre` follows the same broad PyPy strategy for recursive traces:
+  trace-too-long aborts converge toward separate function-entry traces and then
+  `call_assembler`, instead of retrying the same inlining decision forever.
+- Remaining: recursive compiled calls still cross the boundary as boxed Python
+  ints. The largest remaining `fib_recursive` gap versus PyPy is therefore the
+  `call_assembler -> boxed int -> caller unbox` round-trip, not the recursive
+  trace-compile path itself.
 - Done: module-level `namespace` values no longer travel as a parallel JIT
   live-value vector. `LoadName` / `StoreName` now go through frame-namespace
   helpers, and the heap frame namespace is the only runtime source of truth

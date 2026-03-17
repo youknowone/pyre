@@ -27,6 +27,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         &config.calls,
         config.auto_calls,
         config.virtualizable_decl.as_ref(),
+        config.state_fields.as_ref(),
     );
 
     let classified = classify_arms(&match_expr.arms);
@@ -46,6 +47,69 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         quote! { |_unused_pc| 0usize }
     };
 
+    let trace_fn_body = if config.state_fields.is_some() {
+        // state_fields mode: no storage pool, use dummy closures.
+        // State field operations use load_state_field/store_state_field JitCode ops
+        // which don't call the runtime stack closures.
+        quote! {
+            #[allow(non_snake_case, unused_variables, unused_mut)]
+            fn #trace_fn_name(
+                __ctx: &mut majit_meta::TraceCtx,
+                __sym: &mut __JitSym,
+                program: &#env_type,
+                pc: usize,
+                __storage: &#pool_type,
+                __selected: usize,
+            ) -> majit_meta::TraceAction {
+                use majit_meta::TraceAction;
+
+                let __op = program.get_op(pc);
+                let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
+                    return TraceAction::AbortPermanent;
+                };
+
+                majit_meta::trace_jitcode(
+                    __ctx,
+                    __sym,
+                    &__jitcode,
+                    pc,
+                    |_| 0usize,
+                    |_, _| 0i64,
+                    #label_closure,
+                )
+            }
+        }
+    } else {
+        quote! {
+            #[allow(non_snake_case, unused_variables, unused_mut)]
+            fn #trace_fn_name(
+                __ctx: &mut majit_meta::TraceCtx,
+                __sym: &mut __JitSym,
+                program: &#env_type,
+                pc: usize,
+                __storage: &#pool_type,
+                __selected: usize,
+            ) -> majit_meta::TraceAction {
+                use majit_meta::TraceAction;
+
+                let __op = program.get_op(pc);
+                let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
+                    return TraceAction::AbortPermanent;
+                };
+
+                majit_meta::trace_jitcode(
+                    __ctx,
+                    __sym,
+                    &__jitcode,
+                    pc,
+                    |__stack_index| __storage.get(__stack_index).len(),
+                    |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
+                    #label_closure,
+                )
+            }
+        }
+    };
+
     quote! {
         #[allow(non_snake_case, unused_variables, unused_mut)]
         fn #jitcode_fn_name(
@@ -58,33 +122,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             }
         }
 
-        #[allow(non_snake_case, unused_variables, unused_mut)]
-        fn #trace_fn_name(
-            __ctx: &mut majit_meta::TraceCtx,
-            __sym: &mut __JitSym,
-            program: &#env_type,
-            pc: usize,
-            __storage: &#pool_type,
-            __selected: usize,
-        ) -> majit_meta::TraceAction {
-            use majit_meta::TraceAction;
-
-            let __op = program.get_op(pc);
-            let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
-                return TraceAction::AbortPermanent;
-            };
-
-            majit_meta::trace_jitcode_with_data_ptr(
-                __ctx,
-                __sym,
-                &__jitcode,
-                pc,
-                |__stack_index| __storage.get(__stack_index).len(),
-                |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
-                #label_closure,
-                |__stack_index| __storage.get(__stack_index).data_ptr(),
-            )
-        }
+        #trace_fn_body
     }
 }
 

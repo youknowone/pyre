@@ -27,8 +27,9 @@ pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 // for the most common integer values — constants, loop counters, and
 // small arithmetic results.
 
-const SMALL_INT_MIN: i64 = -5;
-const SMALL_INT_MAX: i64 = 256;
+pub const SMALL_INT_MIN: i64 = -5;
+pub const SMALL_INT_MAX: i64 = 256;
+pub const W_INT_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObject>();
 
 static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
     (SMALL_INT_MIN..=SMALL_INT_MAX)
@@ -72,6 +73,16 @@ pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
 
 pub extern "C" fn jit_w_int_new(value: i64) -> i64 {
     w_int_new(value) as i64
+}
+
+#[inline]
+pub fn w_int_small_cached(value: i64) -> bool {
+    (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&value)
+}
+
+#[inline]
+pub fn w_int_small_cache_base_ptr() -> PyObjectRef {
+    SMALL_INTS.as_ptr().cast_mut() as PyObjectRef
 }
 
 #[cfg(test)]
