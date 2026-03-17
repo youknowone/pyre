@@ -978,6 +978,23 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor);
                 }
+                // Init virtualizable boxes (same as on_back_edge_typed)
+                if let Some(ref info) = self.virtualizable_info {
+                    let num_static = info.num_static_fields;
+                    let num_array_elems: usize =
+                        self.vable_array_lengths.iter().sum();
+                    let total_vable = num_static + num_array_elems;
+                    if total_vable > 0 && live_values.len() >= 1 + total_vable {
+                        let vable_oprefs: Vec<OpRef> = (0..total_vable)
+                            .map(|i| OpRef((1 + i) as u32))
+                            .collect();
+                        ctx.init_virtualizable_boxes(
+                            info,
+                            &vable_oprefs,
+                            &self.vable_array_lengths,
+                        );
+                    }
+                }
                 self.tracing = Some(ctx);
                 let pending_num = self.warm_state.alloc_token_number();
                 self.pending_token = Some((green_key, pending_num));
@@ -1025,6 +1042,33 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor);
                 }
+                // Initialize standard virtualizable boxes if VirtualizableInfo is set.
+                //
+                // RPython equivalent: MetaInterp._init_virtualizable_state()
+                //
+                // The inputargs are laid out as: [frame_ref, field0, field1, ...,
+                // array0_elem0, ..., array0_elemN, ...]. We extract the OpRef
+                // indices corresponding to static fields + array elements and
+                // pass them to init_virtualizable_boxes so that subsequent
+                // vable_getfield/setfield calls use boxes instead of heap ops.
+                if let Some(ref info) = self.virtualizable_info {
+                    let num_static = info.num_static_fields;
+                    let num_array_elems: usize =
+                        self.vable_array_lengths.iter().sum();
+                    let total_vable = num_static + num_array_elems;
+
+                    if total_vable > 0 && live_values.len() >= 1 + total_vable {
+                        let vable_oprefs: Vec<OpRef> = (0..total_vable)
+                            .map(|i| OpRef((1 + i) as u32))
+                            .collect();
+                        ctx.init_virtualizable_boxes(
+                            info,
+                            &vable_oprefs,
+                            &self.vable_array_lengths,
+                        );
+                    }
+                }
+
                 self.tracing = Some(ctx);
                 // Pre-allocate a token number for this trace so that
                 // self-recursive calls can emit call_assembler targeting
