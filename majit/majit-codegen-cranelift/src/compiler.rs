@@ -890,8 +890,13 @@ static CALL_ASSEMBLER_TARGETS: OnceLock<Mutex<HashMap<u64, RegisteredLoopTarget>
 static CALL_ASSEMBLER_EXPECTATIONS: OnceLock<
     Mutex<HashMap<u64, HashMap<CallAssemblerCallerId, u64>>>,
 > = OnceLock::new();
-static CALL_ASSEMBLER_DEADFRAMES: OnceLock<Mutex<HashMap<u64, DeadFrame>>> = OnceLock::new();
-static NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    /// Thread-local deadframe storage for call_assembler results.
+    /// Each test thread gets its own isolated registry, preventing
+    /// non-deterministic failures from shared global state.
+    static CALL_ASSEMBLER_DEADFRAMES: RefCell<HashMap<u64, DeadFrame>> = RefCell::new(HashMap::new());
+    static NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE: Cell<u64> = const { Cell::new(1) };
+}
 
 const CALL_ASSEMBLER_OUTCOME_FINISH: i64 = 0;
 const CALL_ASSEMBLER_OUTCOME_DEADFRAME: i64 = 1;
@@ -1057,10 +1062,6 @@ fn call_assembler_registry() -> &'static Mutex<HashMap<u64, RegisteredLoopTarget
 fn call_assembler_expectation_registry()
 -> &'static Mutex<HashMap<u64, HashMap<CallAssemblerCallerId, u64>>> {
     CALL_ASSEMBLER_EXPECTATIONS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn call_assembler_deadframe_registry() -> &'static Mutex<HashMap<u64, DeadFrame>> {
-    CALL_ASSEMBLER_DEADFRAMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn call_assembler_result_kind_name(kind: u64) -> &'static str {
@@ -1323,20 +1324,20 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
 }
 
 fn store_call_assembler_deadframe(frame: DeadFrame) -> u64 {
-    let handle = NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let handle = NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.with(|cell| {
+        let h = cell.get();
+        cell.set(h + 1);
+        h
+    });
     assert!(handle != 0, "call_assembler deadframe handle overflowed");
-    call_assembler_deadframe_registry()
-        .lock()
-        .unwrap()
-        .insert(handle, frame);
+    CALL_ASSEMBLER_DEADFRAMES.with(|map| {
+        map.borrow_mut().insert(handle, frame);
+    });
     handle
 }
 
 fn take_call_assembler_deadframe(handle: u64) -> Option<DeadFrame> {
-    call_assembler_deadframe_registry()
-        .lock()
-        .unwrap()
-        .remove(&handle)
+    CALL_ASSEMBLER_DEADFRAMES.with(|map| map.borrow_mut().remove(&handle))
 }
 
 fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendError> {
@@ -6788,8 +6789,8 @@ impl Drop for CraneliftBackend {
         for trace_id in std::mem::take(&mut self.registered_call_assembler_bridge_traces) {
             unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(trace_id));
         }
-        call_assembler_deadframe_registry().lock().unwrap().clear();
-        NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.store(1, Ordering::Relaxed);
+        CALL_ASSEMBLER_DEADFRAMES.with(|map| map.borrow_mut().clear());
+        NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.with(|cell| cell.set(1));
         if let Some(runtime_id) = self.gc_runtime_id.take() {
             unregister_gc_runtime(runtime_id);
         }
