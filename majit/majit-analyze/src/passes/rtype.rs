@@ -52,8 +52,18 @@ pub fn resolve_types(graph: &MajitGraph, annotations: &AnnotationState) -> TypeR
         state.concrete_types.insert(vid, concrete);
     }
 
-    // Additionally resolve from ops that have explicit type info
+    // Resolve from ops with explicit type info
     for block in &graph.blocks {
+        // Resolve inputargs (Phi nodes) from annotations
+        for &vid in &block.inputargs {
+            if state.get(vid) == &ConcreteType::Unknown {
+                let vtype = annotations.types.get(&vid).unwrap_or(&ValueType::Unknown);
+                let concrete = valuetype_to_concrete(vtype);
+                if concrete != ConcreteType::Unknown {
+                    state.concrete_types.insert(vid, concrete);
+                }
+            }
+        }
         for op in &block.ops {
             if let Some(result) = op.result {
                 if state.get(result) == &ConcreteType::Unknown {
@@ -63,6 +73,39 @@ pub fn resolve_types(graph: &MajitGraph, annotations: &AnnotationState) -> TypeR
                     }
                 }
             }
+        }
+    }
+
+    // Cross-block: propagate through Link args → target inputargs
+    for block in &graph.blocks {
+        match &block.terminator {
+            crate::graph::Terminator::Goto { target, args } => {
+                let target_block = graph.block(*target);
+                for (dst, src) in target_block.inputargs.iter().zip(args.iter()) {
+                    if state.get(*dst) == &ConcreteType::Unknown {
+                        let src_ty = state.get(*src).clone();
+                        if src_ty != ConcreteType::Unknown {
+                            state.concrete_types.insert(*dst, src_ty);
+                        }
+                    }
+                }
+            }
+            crate::graph::Terminator::Branch {
+                if_true, true_args, if_false, false_args, ..
+            } => {
+                for (target, args) in [(*if_true, true_args), (*if_false, false_args)] {
+                    let target_block = graph.block(target);
+                    for (dst, src) in target_block.inputargs.iter().zip(args.iter()) {
+                        if state.get(*dst) == &ConcreteType::Unknown {
+                            let src_ty = state.get(*src).clone();
+                            if src_ty != ConcreteType::Unknown {
+                                state.concrete_types.insert(*dst, src_ty);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -128,5 +171,26 @@ mod tests {
         let annotations = annotate::annotate(&graph);
         let types = resolve_types(&graph, &annotations);
         assert_eq!(types.get(v), &ConcreteType::GcRef);
+    }
+
+    #[test]
+    fn resolves_phi_through_link_args() {
+        let mut graph = MajitGraph::new("phi");
+        let entry = graph.entry;
+        let val = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let (target, phi_args) = graph.create_block_with_args(1);
+        let phi = phi_args[0];
+        graph.set_terminator(
+            entry,
+            Terminator::Goto {
+                target,
+                args: vec![val],
+            },
+        );
+        graph.set_terminator(target, Terminator::Return(Some(phi)));
+
+        let annotations = annotate::annotate(&graph);
+        let types = resolve_types(&graph, &annotations);
+        assert_eq!(types.get(phi), &ConcreteType::Signed);
     }
 }
