@@ -62,6 +62,57 @@ pub struct JitInterpConfig {
     pub auto_calls: bool,
     /// Optional structured green-key expressions for marker rewrite.
     pub greens: Vec<Expr>,
+    /// Virtualizable frame field declaration.
+    ///
+    /// RPython equivalent: jtransform.py's `is_virtualizable_getset()`.
+    /// When set, the proc macro rewrites field accesses on the virtualizable
+    /// variable to use TraceCtx vable_* methods instead of heap operations.
+    pub virtualizable_decl: Option<VirtualizableDecl>,
+}
+
+/// Virtualizable frame field declaration for `#[jit_interp]`.
+///
+/// RPython equivalent: VirtualizableInfo from virtualizable.py, combined
+/// with jtransform.py's field-to-descriptor mapping.
+///
+/// Syntax in attribute:
+/// ```ignore
+/// virtualizable_fields = {
+///     var: frame,
+///     token_offset: PYFRAME_VABLE_TOKEN_OFFSET,
+///     fields: { next_instr: int @ NEXT_INSTR_OFFSET, ... },
+///     arrays: { locals_w: ref @ LOCALS_OFFSET, ... },
+/// }
+/// ```
+pub struct VirtualizableDecl {
+    /// Expression for the virtualizable variable in the mainloop body.
+    pub var_name: Ident,
+    /// Constant path for the vable_token field offset.
+    pub token_offset: Path,
+    /// Static fields: name, type (int/ref/float), byte offset constant.
+    pub fields: Vec<VableFieldDecl>,
+    /// Array fields: name, item type (int/ref/float), byte offset constant.
+    pub arrays: Vec<VableArrayDecl>,
+}
+
+/// A single virtualizable static field declaration.
+pub struct VableFieldDecl {
+    /// Field name as it appears in the struct.
+    pub name: Ident,
+    /// Field type: `int`, `ref`, or `float`.
+    pub field_type: Ident,
+    /// Constant path for the byte offset (e.g., `PYFRAME_NEXT_INSTR_OFFSET`).
+    pub offset: Path,
+}
+
+/// A single virtualizable array field declaration.
+pub struct VableArrayDecl {
+    /// Array field name as it appears in the struct.
+    pub name: Ident,
+    /// Item type: `int`, `ref`, or `float`.
+    pub item_type: Ident,
+    /// Constant path for the byte offset of the array pointer field.
+    pub offset: Path,
 }
 
 /// Multi-storage configuration parsed from `storage = { ... }`.
@@ -79,6 +130,10 @@ pub struct StorageConfig {
     /// Optional method on StoragePool to check JIT compatibility of all values.
     /// When set, `can_trace` additionally calls `pool.method()`.
     pub can_trace_guard: Option<Ident>,
+    /// When true, storage stacks are virtualizable — not flattened into
+    /// inputargs. The JIT accesses elements via GETARRAYITEM/SETARRAYITEM,
+    /// allowing variable stack depths across loop iterations.
+    pub virtualizable: bool,
 }
 
 impl Parse for JitInterpConfig {
@@ -91,6 +146,7 @@ impl Parse for JitInterpConfig {
         let mut calls: Vec<(Path, Option<Ident>)> = Vec::new();
         let mut auto_calls = None;
         let mut greens = None;
+        let mut virtualizable_decl = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -124,6 +180,9 @@ impl Parse for JitInterpConfig {
                 "greens" => {
                     greens = Some(parse_expr_list(input)?);
                 }
+                "virtualizable_fields" => {
+                    virtualizable_decl = Some(parse_virtualizable_decl(input)?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -151,6 +210,7 @@ impl Parse for JitInterpConfig {
             calls,
             auto_calls: auto_calls.unwrap_or(false),
             greens: greens.unwrap_or_default(),
+            virtualizable_decl,
         })
     }
 }
@@ -173,6 +233,7 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut untraceable = Vec::new();
     let mut scan_fn = None;
     let mut can_trace_guard = None;
+    let mut virtualizable = false;
 
     while !content.is_empty() {
         let key: Ident = content.parse()?;
@@ -201,6 +262,9 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             "can_trace_guard" => {
                 can_trace_guard = Some(content.parse::<Ident>()?);
             }
+            "virtualizable" => {
+                virtualizable = content.parse::<LitBool>()?.value;
+            }
             other => {
                 return Err(syn::Error::new(
                     key.span(),
@@ -228,6 +292,93 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         untraceable,
         scan_fn,
         can_trace_guard,
+        virtualizable,
+    })
+}
+
+/// Parse virtualizable_fields = { var: IDENT, token_offset: PATH, fields: { ... }, arrays: { ... } }
+///
+/// RPython equivalent: VirtualizableInfo construction from virtualizable.py
+/// + jtransform.py's field-to-descriptor mapping.
+fn parse_virtualizable_decl(input: ParseStream) -> syn::Result<VirtualizableDecl> {
+    let content;
+    braced!(content in input);
+
+    let mut var_name = None;
+    let mut token_offset = None;
+    let mut fields = Vec::new();
+    let mut arrays = Vec::new();
+
+    while !content.is_empty() {
+        let key: Ident = content.parse()?;
+        content.parse::<Token![:]>()?;
+
+        match key.to_string().as_str() {
+            "var" => {
+                var_name = Some(content.parse::<Ident>()?);
+            }
+            "token_offset" => {
+                token_offset = Some(content.parse::<Path>()?);
+            }
+            "fields" => {
+                let inner;
+                braced!(inner in content);
+                while !inner.is_empty() {
+                    let name: Ident = inner.parse()?;
+                    inner.parse::<Token![:]>()?;
+                    let field_type: Ident = inner.parse()?;
+                    inner.parse::<Token![@]>()?;
+                    let offset: Path = inner.parse()?;
+                    fields.push(VableFieldDecl {
+                        name,
+                        field_type,
+                        offset,
+                    });
+                    let _ = inner.parse::<Token![,]>();
+                }
+            }
+            "arrays" => {
+                let inner;
+                braced!(inner in content);
+                while !inner.is_empty() {
+                    let name: Ident = inner.parse()?;
+                    inner.parse::<Token![:]>()?;
+                    let item_type: Ident = inner.parse()?;
+                    inner.parse::<Token![@]>()?;
+                    let offset: Path = inner.parse()?;
+                    arrays.push(VableArrayDecl {
+                        name,
+                        item_type,
+                        offset,
+                    });
+                    let _ = inner.parse::<Token![,]>();
+                }
+            }
+            other => {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!("unknown virtualizable_fields parameter: `{other}`"),
+                ));
+            }
+        }
+        let _ = content.parse::<Token![,]>();
+    }
+
+    let var_name = var_name.ok_or_else(|| {
+        syn::Error::new(content.span(), "missing `var` in virtualizable_fields")
+    })?;
+    let token_offset = token_offset.ok_or_else(|| {
+        syn::Error::new(
+            content.span(),
+            "missing `token_offset` in virtualizable_fields",
+        )
+    })?;
+
+    Ok(VirtualizableDecl {
+        var_name,
+        token_offset,
+        fields,
+        arrays,
     })
 }
 
