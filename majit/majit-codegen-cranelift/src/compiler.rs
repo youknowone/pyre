@@ -2421,8 +2421,24 @@ fn build_ref_root_slots(
     slots
 }
 
-/// Renumber sparse OpRef indices to dense sequential indices.
-/// Returns (remapped ops, remap table).
+/// Simple normalization: assign sequential pos to ops without pos.
+fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
+    let num_inputs = inputargs.len() as u32;
+    ops.iter()
+        .enumerate()
+        .map(|(op_idx, op)| {
+            let mut normalized = op.clone();
+            if normalized.result_type() != Type::Void && normalized.pos.is_none() {
+                normalized.pos = OpRef(num_inputs + op_idx as u32);
+            }
+            normalized
+        })
+        .collect()
+}
+
+/// Renumber sparse OpRef indices to dense sequential form.
+/// (Currently unused — kept for future use when renumbering is safe.)
+#[allow(dead_code)]
 fn normalize_ops_for_codegen(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -2430,70 +2446,51 @@ fn normalize_ops_for_codegen(
 ) -> (Vec<Op>, std::collections::HashMap<u32, u32>) {
     let num_inputs = inputargs.len() as u32;
 
-    // Collect all referenced OpRef indices.
-    let mut all_refs = std::collections::HashSet::<u32>::new();
+    // Collect every unique OpRef index used anywhere.
+    let mut all_indices = std::collections::BTreeSet::<u32>::new();
     for i in 0..num_inputs {
-        all_refs.insert(i);
+        all_indices.insert(i);
     }
+    // Note: constants keys are NOT added to all_indices.
+    // They are remapped separately in prepare_ops_for_compile.
+    // Dead constants (not referenced by any op) should not inflate the index space.
     for (op_idx, op) in ops.iter().enumerate() {
         if op.result_type() != Type::Void {
             let idx = if op.pos.is_none() { num_inputs + op_idx as u32 } else { op.pos.0 };
-            all_refs.insert(idx);
+            all_indices.insert(idx);
         }
         for arg in &op.args {
-            if !arg.is_none() { all_refs.insert(arg.0); }
+            if !arg.is_none() { all_indices.insert(arg.0); }
         }
         if let Some(ref fa) = op.fail_args {
-            for arg in fa { if !arg.is_none() { all_refs.insert(arg.0); } }
+            for arg in fa { if !arg.is_none() { all_indices.insert(arg.0); } }
         }
     }
-    for &k in constants.keys() { all_refs.insert(k); }
 
-    // Build dense remapping: sort all refs and assign sequential indices.
-    let mut sorted_refs: Vec<u32> = all_refs.into_iter().collect();
-    sorted_refs.sort_unstable();
-    let remap: std::collections::HashMap<u32, u32> = sorted_refs
+    // Build dense remap: sorted old → sequential new.
+    let remap: std::collections::HashMap<u32, u32> = all_indices
         .iter()
         .enumerate()
-        .map(|(new_idx, &old_idx)| (old_idx, new_idx as u32))
+        .map(|(new, &old)| (old, new as u32))
         .collect();
 
-    // Remap all OpRef references in ops.
-    let remapped = ops
-        .iter()
-        .enumerate()
-        .map(|(op_idx, op)| {
-            let mut normalized = op.clone();
-            // Remap pos
-            if normalized.result_type() != Type::Void {
-                let old_idx = if normalized.pos.is_none() {
-                    num_inputs + op_idx as u32
-                } else {
-                    normalized.pos.0
-                };
-                normalized.pos = OpRef(*remap.get(&old_idx).unwrap_or(&old_idx));
+    // Apply remap to all ops.
+    let remapped = ops.iter().enumerate().map(|(op_idx, op)| {
+        let mut n = op.clone();
+        if n.result_type() != Type::Void {
+            let old = if n.pos.is_none() { num_inputs + op_idx as u32 } else { n.pos.0 };
+            n.pos = OpRef(remap[&old]);
+        }
+        for arg in n.args.iter_mut() {
+            if !arg.is_none() { *arg = OpRef(remap[&arg.0]); }
+        }
+        if let Some(ref mut fa) = n.fail_args {
+            for arg in fa.iter_mut() {
+                if !arg.is_none() { *arg = OpRef(remap[&arg.0]); }
             }
-            // Remap args
-            for arg in normalized.args.iter_mut() {
-                if !arg.is_none() {
-                    if let Some(&new_arg) = remap.get(&arg.0) {
-                        *arg = OpRef(new_arg);
-                    }
-                }
-            }
-            // Remap fail_args
-            if let Some(ref mut fa) = normalized.fail_args {
-                for arg in fa.iter_mut() {
-                    if !arg.is_none() {
-                        if let Some(&new_arg) = remap.get(&arg.0) {
-                            *arg = OpRef(new_arg);
-                        }
-                    }
-                }
-            }
-            normalized
-        })
-        .collect();
+        }
+        n
+    }).collect();
 
     (remapped, remap)
 }
@@ -3367,30 +3364,14 @@ impl CraneliftBackend {
     }
 
     fn prepare_ops_for_compile(&mut self, inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
-        let (mut normalized, remap) = normalize_ops_for_codegen(inputargs, ops, &self.constants);
-        // Also remap constant keys. Constants may reference OpRefs that
-        // aren't op results (e.g., from SameAsI optimizations).
-        if !remap.is_empty() {
-            let old_constants = std::mem::take(&mut self.constants);
-            let mut new_constants = HashMap::with_capacity(old_constants.len());
-            for (k, v) in old_constants {
-                let new_k = if let Some(&mapped) = remap.get(&k) {
-                    mapped
-                } else {
-                    // This constant wasn't in the remap table — it might be
-                    // a dead reference. Keep its original index.
-                    k
-                };
-                new_constants.insert(new_k, v);
-            }
-            self.constants = new_constants;
-        }
+        let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
-        if let Some(rewriter) = self.gc_rewriter() {
+        let result = if let Some(rewriter) = self.gc_rewriter() {
             rewriter.rewrite_for_gc(&normalized)
         } else {
             normalized
-        }
+        };
+        result
     }
 
     /// Execute a compiled bridge, returning the DeadFrame from the bridge's
@@ -3632,6 +3613,21 @@ impl CraneliftBackend {
             declared_vars.insert(i as u32);
         }
         for (op_idx, op) in ops.iter().enumerate() {
+            // Declare all OpRefs referenced in args (they may be resolved via use_var).
+            for arg in &op.args {
+                if !arg.is_none() && !declared_vars.contains(&arg.0) && !constants.contains_key(&arg.0) {
+                    declared_vars.insert(arg.0);
+                    builder.declare_var(var(arg.0), cl_types::I64);
+                }
+            }
+            if let Some(ref fa) = op.fail_args {
+                for arg in fa {
+                    if !arg.is_none() && !declared_vars.contains(&arg.0) && !constants.contains_key(&arg.0) {
+                        declared_vars.insert(arg.0);
+                        builder.declare_var(var(arg.0), cl_types::I64);
+                    }
+                }
+            }
             if op.result_type() != Type::Void {
                 let vi = op_var_index(op, op_idx, num_inputs);
                 if declared_vars.contains(&(vi as u32)) {
