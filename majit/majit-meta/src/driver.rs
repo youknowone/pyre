@@ -373,16 +373,16 @@ impl<S: JitState> JitDriver<S> {
         }
 
         if self.meta.has_compiled_loop(green_key) {
-            let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap();
-            let descriptor = self.driver_descriptor_for(state, compiled_meta);
+            let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap().clone();
+            let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             let live_values = {
-                if !state.is_compatible(compiled_meta) {
+                if !state.is_compatible(&compiled_meta) {
                     return false;
                 }
-                if !self.sync_before(state, compiled_meta, descriptor.as_ref()) {
+                if !self.sync_before(state, &compiled_meta, descriptor.as_ref()) {
                     return false;
                 }
-                let live_values = state.extract_live_values(compiled_meta);
+                let live_values = state.extract_live_values(&compiled_meta);
                 if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
                     return false;
                 }
@@ -517,7 +517,7 @@ impl<S: JitState> JitDriver<S> {
     }
 
     fn sync_before(
-        &self,
+        &mut self,
         state: &mut S,
         meta: &S::Meta,
         descriptor: Option<&JitDriverDescriptor>,
@@ -528,11 +528,36 @@ impl<S: JitState> JitDriver<S> {
         let Some(virtualizable) = descriptor.virtualizable() else {
             return true;
         };
-        state.sync_named_virtualizable_before_jit(
+        let ok = state.sync_named_virtualizable_before_jit(
             meta,
             &virtualizable.name,
             self.meta.virtualizable_info(),
-        )
+        );
+        if !ok {
+            return false;
+        }
+        // Auto-set vable_ptr + array_lengths from state.
+        //
+        // RPython compile.py reads lengths from the actual virtualizable
+        // object via vinfo.get_array_length(). Here we use two sources:
+        // 1. Primary: JitState::virtualizable_array_lengths() (interpreter knows)
+        // 2. Fallback: VirtualizableInfo::get_array_length() (from object header)
+        //
+        // This eliminates the need for callers to manually call
+        // driver.set_vable_array_lengths().
+        let vable_name = virtualizable.name.clone();
+        let info_clone = self.meta.virtualizable_info().cloned();
+        if let Some(ref info) = info_clone {
+            if let Some(ptr) = state.virtualizable_heap_ptr(meta, &vable_name, info) {
+                self.meta.set_vable_ptr(ptr.cast_const());
+            }
+            // Prefer JitState-provided lengths (interpreter always knows).
+            // Fall back to reading from object header if available.
+            if let Some(lengths) = state.virtualizable_array_lengths(meta, &vable_name, info) {
+                self.meta.set_vable_array_lengths(lengths);
+            }
+        }
+        true
     }
 
     fn sync_after(&self, state: &mut S, meta: &S::Meta, descriptor: Option<&JitDriverDescriptor>) {
