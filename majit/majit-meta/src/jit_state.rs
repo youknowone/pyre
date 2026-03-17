@@ -163,11 +163,8 @@ pub trait JitState: Sized {
         let Some(obj_ptr) = self.virtualizable_heap_ptr(meta, virtualizable, info) else {
             return true;
         };
-        // If interpreter provides array lengths explicitly, use manual path.
-        // Otherwise, read lengths from the heap using descriptors (auto path).
-        let lengths = match self.virtualizable_array_lengths(meta, virtualizable, info) {
-            Some(lengths) => lengths,
-            None => unsafe { read_array_lengths(info, obj_ptr.cast_const()) },
+        let Some(lengths) = self.virtualizable_array_lengths(meta, virtualizable, info) else {
+            return true;
         };
         let (static_boxes, array_boxes) =
             unsafe { read_all_virtualizable_boxes(info, obj_ptr.cast_const(), &lengths) };

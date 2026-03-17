@@ -108,14 +108,17 @@ impl VirtualizableInfo {
         self.num_static_fields = self.static_fields.len();
     }
 
-    /// Add an array field with default layout (length at offset 0, items at offset 8).
+    /// Add an array field with default layout (no header — items start at offset 0).
+    ///
+    /// Use `add_array_field_with_layout` for arrays with a length header.
+    /// RPython uses translator-known descriptors for array layout, not defaults.
     pub fn add_array_field(
         &mut self,
         name: impl Into<String>,
         item_type: Type,
         field_offset: usize,
     ) {
-        self.add_array_field_with_layout(name, item_type, field_offset, 0, 8);
+        self.add_array_field_with_layout(name, item_type, field_offset, 0, 0);
     }
 
     /// Add an array field with explicit layout offsets.
@@ -707,7 +710,7 @@ mod tests {
 
         let mut info = VirtualizableInfo::new(0);
         info.add_array_field("locals", Type::Ref, 8);
-        info.add_array_field("stack", Type::Int, 16);
+        info.add_array_field_with_layout("stack", Type::Int, 16, 0, 8);
 
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3, 5]);
@@ -759,7 +762,7 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("x", Type::Int, 8);
         info.add_field("y", Type::Int, 16);
-        info.add_array_field("stack", Type::Int, 24);
+        info.add_array_field_with_layout("stack", Type::Int, 24, 0, 8);
 
         // Use read_array_lengths + read_all_virtualizable_boxes (the auto path)
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
@@ -812,5 +815,198 @@ mod tests {
         let (_, array_boxes2) =
             unsafe { read_all_virtualizable_boxes(&info, obj_mut.as_ptr(), &lengths) };
         assert_eq!(array_boxes2, vec![vec![111, 222, 333]]);
+    }
+
+    #[test]
+    fn test_virtualizable_with_array_read_write() {
+        // RPython parity: test_virtualizable_with_array
+        // VirtualizableInfo with 1 static field + 1 array field.
+        // read_all → modify → write_all → verify heap updated.
+
+        // Heap layout:
+        //   obj[0..8]:   vable_token
+        //   obj[8..16]:  field "pc" (i64)
+        //   obj[16..24]: array_ptr for "stack"
+        //
+        // array layout (default):
+        //   [0..8]: length = 3
+        //   [8..32]: items [10, 20, 30]
+
+        let mut array_data = vec![0u8; 8 + 3 * 8];
+        unsafe {
+            *(array_data.as_mut_ptr() as *mut usize) = 3;
+            *(array_data.as_mut_ptr().add(8) as *mut i64) = 10;
+            *(array_data.as_mut_ptr().add(16) as *mut i64) = 20;
+            *(array_data.as_mut_ptr().add(24) as *mut i64) = 30;
+        }
+
+        let mut obj = vec![0u8; 24];
+        unsafe {
+            *(obj.as_mut_ptr().add(8) as *mut i64) = 7; // pc = 7
+            *(obj.as_mut_ptr().add(16) as *mut *const u8) = array_data.as_ptr();
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field_with_layout("stack", Type::Int, 16, 0, 8);
+
+        // Read all boxes
+        let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
+        assert_eq!(lengths, vec![3]);
+
+        let (static_boxes, array_boxes) =
+            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+        assert_eq!(static_boxes, vec![7]);
+        assert_eq!(array_boxes, vec![vec![10, 20, 30]]);
+
+        // Modify and write back
+        let new_static = vec![42i64];
+        let new_arrays = vec![vec![100i64, 200, 300]];
+        unsafe {
+            write_all_virtualizable_boxes(&info, obj.as_mut_ptr(), &new_static, &new_arrays);
+        }
+
+        // Verify heap was updated
+        unsafe {
+            assert_eq!(*(obj.as_ptr().add(8) as *const i64), 42);
+            // Array items via raw pointer (array_data is still alive)
+            assert_eq!(*(array_data.as_ptr().add(8) as *const i64), 100);
+            assert_eq!(*(array_data.as_ptr().add(16) as *const i64), 200);
+            assert_eq!(*(array_data.as_ptr().add(24) as *const i64), 300);
+        }
+    }
+
+    #[test]
+    fn test_force_virtualizable_triggers_callback() {
+        // RPython parity: test_force_virtualizable_by_hint
+        // Non-zero token → callback receives token value → token cleared.
+
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+
+        // Set a non-zero token (simulating active JIT)
+        unsafe {
+            *(obj.as_mut_ptr() as *mut u64) = 0xCAFE_BABE;
+        }
+
+        let mut received_token = 0u64;
+        unsafe {
+            force_virtualizable(&info, obj.as_mut_ptr(), |token| {
+                received_token = token;
+            });
+        }
+
+        assert_eq!(received_token, 0xCAFE_BABE);
+        // Token must be cleared after force
+        unsafe {
+            assert_eq!(*(obj.as_ptr() as *const u64), 0);
+            assert!(!is_token_nonnull(&info, obj.as_ptr()));
+        }
+    }
+
+    #[test]
+    fn test_sync_round_trip() {
+        // RPython parity: test_sync_before_after_jit
+        // Write known values to heap → read boxes → modify → write back → verify.
+
+        // Heap layout:
+        //   obj[0..8]:   vable_token
+        //   obj[8..16]:  field "a" (i64)
+        //   obj[16..24]: field "b" (i64)
+        //   obj[24..32]: array_ptr for "vals"
+        //
+        // array: length=2, items=[50, 60]
+
+        let mut array_data = vec![0u8; 8 + 2 * 8];
+        unsafe {
+            *(array_data.as_mut_ptr() as *mut usize) = 2;
+            *(array_data.as_mut_ptr().add(8) as *mut i64) = 50;
+            *(array_data.as_mut_ptr().add(16) as *mut i64) = 60;
+        }
+
+        let mut obj = vec![0u8; 32];
+        unsafe {
+            *(obj.as_mut_ptr().add(8) as *mut i64) = 11;
+            *(obj.as_mut_ptr().add(16) as *mut i64) = 22;
+            *(obj.as_mut_ptr().add(24) as *mut *const u8) = array_data.as_ptr();
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("a", Type::Int, 8);
+        info.add_field("b", Type::Int, 16);
+        info.add_array_field_with_layout("vals", Type::Int, 24, 0, 8);
+
+        // sync_before_jit: read from heap
+        let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
+        let (mut statics, mut arrays) =
+            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+        assert_eq!(statics, vec![11, 22]);
+        assert_eq!(arrays, vec![vec![50, 60]]);
+
+        // Simulate JIT execution modifying values
+        statics[0] = 111;
+        statics[1] = 222;
+        arrays[0][0] = 500;
+        arrays[0][1] = 600;
+
+        // sync_after_jit: write back to heap
+        unsafe {
+            write_all_virtualizable_boxes(&info, obj.as_mut_ptr(), &statics, &arrays);
+        }
+
+        // Verify heap has new values
+        unsafe {
+            assert_eq!(*(obj.as_ptr().add(8) as *const i64), 111);
+            assert_eq!(*(obj.as_ptr().add(16) as *const i64), 222);
+            assert_eq!(*(array_data.as_ptr().add(8) as *const i64), 500);
+            assert_eq!(*(array_data.as_ptr().add(16) as *const i64), 600);
+        }
+    }
+
+    #[test]
+    fn test_to_optimizer_config_preserves_offsets() {
+        // RPython parity: test_to_optimizer_config
+        // VirtualizableInfo → VirtualizableConfig, verify offsets match.
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_field("y", Type::Float, 24);
+        info.add_field("z", Type::Ref, 40);
+        info.add_array_field("locals", Type::Ref, 48);
+        info.add_array_field("stack", Type::Int, 56);
+
+        let config = info.to_optimizer_config();
+
+        assert_eq!(config.static_field_offsets, vec![8, 24, 40]);
+        assert_eq!(config.array_field_offsets, vec![48, 56]);
+    }
+
+    #[test]
+    fn test_get_index_in_array_multiple_arrays() {
+        // RPython parity: test_get_index_in_array with 2 static + 2 array fields.
+        // Flat layout: [static0, static1, array0[0..3], array1[0..5]]
+        //   index 0..1 = static fields
+        //   index 2..4 = array0 (length 3)
+        //   index 5..9 = array1 (length 5)
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("a", Type::Int, 8);
+        info.add_field("b", Type::Int, 16);
+        info.add_array_field("arr0", Type::Int, 24);
+        info.add_array_field("arr1", Type::Int, 32);
+
+        let lens = &[3usize, 5];
+
+        // Total size = 2 + 3 + 5 = 10
+        assert_eq!(info.get_total_size(lens), 10);
+
+        // array0, item 2 → 2 (statics) + 2 = 4
+        assert_eq!(info.get_index_in_array(0, 2, lens), 4);
+
+        // array1, item 0 → 2 (statics) + 3 (array0 len) + 0 = 5
+        assert_eq!(info.get_index_in_array(1, 0, lens), 5);
+
+        // array1, item 4 → 2 + 3 + 4 = 9
+        assert_eq!(info.get_index_in_array(1, 4, lens), 9);
     }
 }
