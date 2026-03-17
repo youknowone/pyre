@@ -69,6 +69,10 @@ pub struct JitCell {
     pub tracing_generation: u64,
     /// Compiled loop token, if compilation has completed.
     pub loop_token: Option<LoopToken>,
+    /// Number of times tracing was aborted (non-permanent) for this key.
+    /// After `retrace_limit` aborts, the cell becomes DONT_TRACE_HERE.
+    /// RPython equivalent: retrace_limit parameter.
+    pub abort_count: u32,
 }
 
 impl JitCell {
@@ -80,6 +84,7 @@ impl JitCell {
             token: None,
             tracing_generation: 0,
             loop_token: None,
+            abort_count: 0,
         }
     }
 
@@ -246,6 +251,12 @@ const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
 
 /// PyPy default: trace_limit = 6000
 const DEFAULT_TRACE_LIMIT: u32 = 6000;
+
+/// Maximum number of non-permanent trace aborts before giving up on a green key.
+/// RPython equivalent: retrace_limit parameter (default 0 in PyPy, meaning no retrace).
+/// We allow a few retries (e.g., for stack depth variations) before marking
+/// the key as DONT_TRACE_HERE.
+const DEFAULT_RETRACE_LIMIT: u32 = 5;
 
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
 
@@ -445,7 +456,15 @@ impl WarmEnterState {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
                 cell.state = JitCellState::DontTraceHere;
             } else {
-                cell.state = JitCellState::NotHot;
+                cell.abort_count += 1;
+                if cell.abort_count >= DEFAULT_RETRACE_LIMIT {
+                    // Too many retries — stop tracing this location entirely.
+                    // RPython equivalent: retrace_limit exceeded.
+                    cell.flags |= jc_flags::DONT_TRACE_HERE;
+                    cell.state = JitCellState::DontTraceHere;
+                } else {
+                    cell.state = JitCellState::NotHot;
+                }
             }
         }
         if let Some(log) = &mut self.jitlog {
