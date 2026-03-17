@@ -231,10 +231,32 @@ pub trait JitCodeSym {
     ///
     /// Called from BC_SET_SELECTED when `is_virtualizable_storage()` is true
     /// and the target storage hasn't been initialized yet.
-    /// `ctx` emits GETFIELD ops to load array pointer and length from the heap.
     ///
     /// Default: no-op (override when is_virtualizable_storage returns true).
     fn init_vable_storage(&mut self, _selected: usize, _arr_ref: OpRef, _len_ref: OpRef) {}
+
+    /// OpRef for the storage pool object (virtualizable).
+    ///
+    /// When set, BC_SET_SELECTED uses GETFIELD on this object to load
+    /// the array data pointer at runtime, instead of baking a raw pointer
+    /// constant. RPython parity: pyjitpl.py reads from the virtualizable
+    /// object via descriptors, never from raw pointers.
+    fn vable_pool_ref(&self) -> Option<OpRef> {
+        None
+    }
+
+    /// Byte offset of a storage's data pointer within the pool object.
+    ///
+    /// Used by BC_SET_SELECTED to emit GETFIELD_RAW_I(pool_ref, offset)
+    /// to load the data pointer at runtime.
+    fn vable_storage_data_offset(&self, _selected: usize) -> Option<usize> {
+        None
+    }
+
+    /// Byte offset of a storage's length field within the pool object.
+    fn vable_storage_len_offset(&self, _selected: usize) -> Option<usize> {
+        None
+    }
 }
 
 pub trait JitCodeRuntime {
@@ -900,15 +922,38 @@ where
                 };
                 if sym.is_virtualizable_storage() {
                     // Virtualizable: if this storage isn't initialized yet,
-                    // load array pointer + length as traced constants.
-                    // RPython parity: PyPy's value_stack_w is a virtualizable
-                    // array field — first access loads via GETFIELD_GC_R.
+                    // load array pointer + length from the pool object.
+                    //
+                    // RPython parity: pyjitpl.py:1249 reads from the virtualizable
+                    // object via descriptors. We emit GETFIELD_RAW_I on the pool
+                    // object to load the data pointer at runtime, NOT as a trace
+                    // constant. This handles backing array reallocation correctly.
                     if sym.vable_array_ref(new_selected).is_none() {
-                        let len = runtime.stack_len(new_selected);
-                        let len_ref = ctx.const_int(len as i64);
-                        // Load actual array data pointer from runtime.
-                        let data_ptr = runtime.stack_data_ptr(new_selected);
-                        let arr_ref = ctx.const_int(data_ptr as i64);
+                        let (arr_ref, len_ref) =
+                            if let (Some(pool_ref), Some(data_off), Some(len_off)) = (
+                                sym.vable_pool_ref(),
+                                sym.vable_storage_data_offset(new_selected),
+                                sym.vable_storage_len_offset(new_selected),
+                            ) {
+                                // Descriptor-based: GETFIELD from pool object
+                                let data_off_ref = ctx.const_int(data_off as i64);
+                                let arr = ctx.record_op(
+                                    OpCode::GetfieldRawI,
+                                    &[pool_ref, data_off_ref],
+                                );
+                                let len_off_ref = ctx.const_int(len_off as i64);
+                                let len = ctx.record_op(
+                                    OpCode::GetfieldRawI,
+                                    &[pool_ref, len_off_ref],
+                                );
+                                (arr, len)
+                            } else {
+                                // Fallback: trace-time constant (for interpreters
+                                // that don't expose pool layout descriptors yet).
+                                let data_ptr = runtime.stack_data_ptr(new_selected);
+                                let len = runtime.stack_len(new_selected);
+                                (ctx.const_int(data_ptr as i64), ctx.const_int(len as i64))
+                            };
                         sym.init_vable_storage(new_selected, arr_ref, len_ref);
                     }
                 } else {
