@@ -159,6 +159,9 @@ pub struct MajitGraph {
     #[serde(default)]
     pub notes: Vec<String>,
     next_value: usize,
+    /// Variable names for debugging (RPython Variable._name).
+    #[serde(default)]
+    pub value_names: std::collections::HashMap<ValueId, String>,
 }
 
 impl MajitGraph {
@@ -175,6 +178,7 @@ impl MajitGraph {
             }],
             notes: Vec::new(),
             next_value: 0,
+            value_names: std::collections::HashMap::new(),
         }
     }
 
@@ -225,6 +229,16 @@ impl MajitGraph {
 
     pub fn block(&self, block: BasicBlockId) -> &BasicBlock {
         &self.blocks[block.0]
+    }
+
+    /// Name a value (RPython Variable._name).
+    pub fn name_value(&mut self, id: ValueId, name: impl Into<String>) {
+        self.value_names.insert(id, name.into());
+    }
+
+    /// Get the name of a value, if any.
+    pub fn value_name(&self, id: ValueId) -> Option<&str> {
+        self.value_names.get(&id).map(|s| s.as_str())
     }
 
     pub fn block_mut(&mut self, block: BasicBlockId) -> &mut BasicBlock {
