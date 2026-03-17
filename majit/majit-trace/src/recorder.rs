@@ -7,13 +7,13 @@
 /// Reference: rpython/jit/metainterp/pyjitpl.py MetaInterp.record()
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 
-use crate::trace::Trace;
+use crate::trace::TreeLoop;
 
 /// Maximum number of operations before the trace is considered too long.
 const TRACE_LIMIT: usize = 50000;
 
 /// The trace recorder: accumulates operations during tracing.
-pub struct TraceRecorder {
+pub struct Trace {
     /// Recorded operations.
     ops: Vec<Op>,
     /// Input arguments to the trace (live variables at the loop header).
@@ -26,10 +26,10 @@ pub struct TraceRecorder {
     aborted: bool,
 }
 
-impl TraceRecorder {
+impl Trace {
     /// Create a new, empty trace recorder.
     pub fn new() -> Self {
-        TraceRecorder {
+        Trace {
             ops: Vec::with_capacity(256),
             inputargs: Vec::new(),
             op_count: 0,
@@ -183,13 +183,13 @@ impl TraceRecorder {
 
     /// Return the completed trace.
     /// The recorder is consumed; no further operations can be recorded.
-    pub fn get_trace(self) -> Trace {
+    pub fn get_trace(self) -> TreeLoop {
         assert!(
             self.finalized,
             "trace must be finalized with close_loop() or finish() before calling get_trace()"
         );
         assert!(!self.aborted, "cannot get trace from aborted recorder");
-        Trace::new(self.inputargs, self.ops)
+        TreeLoop::new(self.inputargs, self.ops)
     }
 
     /// Abort the current trace, discarding all recorded operations.
@@ -220,7 +220,7 @@ impl TraceRecorder {
     }
 }
 
-impl Default for TraceRecorder {
+impl Default for Trace {
     fn default() -> Self {
         Self::new()
     }
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn test_record_simple_loop() {
         // Trace: i0 -> i1 = int_add(i0, i0) -> jump(i1)
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         assert_eq!(i0, OpRef(0));
 
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn test_record_with_guard() {
         // i0 -> guard_true(i0) -> i1 = int_add(i0, i0) -> jump(i1)
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let descr = make_fail_descr(0);
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_record_finish() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
 
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_record_multiple_inputargs() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let r0 = rec.record_input_arg(Type::Ref);
         let f0 = rec.record_input_arg(Type::Float);
@@ -338,7 +338,7 @@ mod tests {
     fn test_opref_assignment() {
         // OpRef indices are monotonically increasing, with input args taking
         // the first slots.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
         assert_eq!(i0, OpRef(0));
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_abort() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         rec.record_input_arg(Type::Int);
         rec.record_op(OpCode::IntAdd, &[OpRef(0), OpRef(0)]);
         assert_eq!(rec.num_ops(), 1);
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "recorder already finalized")]
     fn test_record_after_finalize() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         rec.close_loop(&[i0]);
         // This should panic
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "JUMP must have the same number of args")]
     fn test_close_loop_arg_mismatch() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let _i1 = rec.record_input_arg(Type::Int);
         // Should panic: 2 input args but only 1 jump arg
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "use record_guard")]
     fn test_record_op_with_guard_opcode() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         rec.record_input_arg(Type::Int);
         // Should panic: guard opcodes must use record_guard
         rec.record_op(OpCode::GuardTrue, &[OpRef(0)]);
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_is_too_long() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         assert!(!rec.is_too_long());
 
@@ -422,7 +422,7 @@ mod tests {
     fn test_is_too_long_boundary() {
         // Verify exact boundary: TRACE_LIMIT-1 ops is not too long,
         // TRACE_LIMIT ops is too long.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
@@ -443,7 +443,7 @@ mod tests {
     fn test_trace_abort_on_too_long() {
         // Simulate what the meta-interpreter does when a trace is too long:
         // check is_too_long() then call abort().
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
@@ -462,7 +462,7 @@ mod tests {
         // Even after exceeding the limit, the recorder still accepts ops.
         // The meta-interpreter is responsible for checking is_too_long()
         // and aborting. This mirrors RPython's non-exception trace limit.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn test_fresh_recorder_not_too_long() {
         // A freshly created recorder should never be too long.
-        let rec = TraceRecorder::new();
+        let rec = Trace::new();
         assert!(!rec.is_too_long());
         assert_eq!(rec.num_ops(), 0);
     }
@@ -491,7 +491,7 @@ mod tests {
     fn test_retrace_recorder_not_too_long() {
         // A recorder created for retracing (with_num_inputs) starts with
         // no operations, so it should not be too long.
-        let rec = TraceRecorder::with_num_inputs(5);
+        let rec = Trace::with_num_inputs(5);
         assert!(!rec.is_too_long());
         assert_eq!(rec.num_ops(), 0);
         assert_eq!(rec.num_inputargs(), 5);
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_record_op_with_descr() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let descr = make_fail_descr(42);
         let i1 = rec.record_op_with_descr(OpCode::CallI, &[i0], descr);
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_complex_trace() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -542,7 +542,7 @@ mod tests {
     fn test_simple_iterator() {
         // Parity: test_simple_iterator
         // Record two INT_ADD ops and verify trace structure matches.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn test_inputargs_preserved() {
         // Parity: Trace([i0, i1], ...) preserves input args.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
         assert_eq!(rec.num_inputargs(), 2);
@@ -589,7 +589,7 @@ mod tests {
     fn test_op_references_chain() {
         // Parity: ops that reference previous ops form correct chains.
         // i0 -> add = int_add(i0, i0) -> sub = int_sub(add, i0) -> jump(sub)
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn test_guard_with_fail_args() {
         // Parity: guards can carry fail_args describing live values at guard.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn test_multiple_guards() {
         // Parity: multiple guards in one trace.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn test_close_loop_jump_targets_inputargs() {
         // Parity: close_loop produces a JUMP whose args correspond to inputargs.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn test_finish_produces_finish_op() {
         // Parity: finish() produces a FINISH op with the given args.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
 
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn test_trace_length_tracking() {
         // Parity: num_ops() tracks the count accurately.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         assert_eq!(rec.num_ops(), 0);
 
@@ -732,8 +732,8 @@ mod tests {
 
     #[test]
     fn test_with_num_inputs_creates_inputargs() {
-        // Parity: TraceRecorder::with_num_inputs pre-creates input args.
-        let rec = TraceRecorder::with_num_inputs(3);
+        // Parity: Trace::with_num_inputs pre-creates input args.
+        let rec = Trace::with_num_inputs(3);
         assert_eq!(rec.num_inputargs(), 3);
         assert_eq!(rec.num_ops(), 0);
     }
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn test_with_num_inputs_oprefs() {
         // Input args from with_num_inputs get OpRef(0), OpRef(1), ...
-        let mut rec = TraceRecorder::with_num_inputs(3);
+        let mut rec = Trace::with_num_inputs(3);
 
         // The input args consumed OpRef(0..2), so next op gets OpRef(3).
         let add = rec.record_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn test_guard_descr_preserved() {
         // Parity: guard descriptors are preserved through get_trace().
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let descr = make_fail_descr(77);
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn test_op_with_descr_preserved() {
         // Parity: op descriptors (e.g., for calls) are preserved.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let call_descr = make_fail_descr(55);
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn test_empty_fail_args() {
         // Parity: guard with empty fail_args is valid.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let descr = make_fail_descr(0);
@@ -807,7 +807,7 @@ mod tests {
     #[should_panic(expected = "opcode")]
     fn test_record_guard_with_non_guard_opcode() {
         // Parity: record_guard rejects non-guard opcodes.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         rec.record_input_arg(Type::Int);
         let descr = make_fail_descr(0);
         rec.record_guard(OpCode::IntAdd, &[OpRef(0)], descr);
@@ -817,7 +817,7 @@ mod tests {
     #[should_panic(expected = "input args must be registered before any operations")]
     fn test_inputarg_after_ops() {
         // Parity: input args must come before any operations.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         rec.record_op(OpCode::IntAdd, &[i0, i0]);
         // This should panic.
@@ -832,7 +832,7 @@ mod tests {
     #[test]
     fn test_trace_has_inputargs_ops_structure() {
         // Parity: TreeLoop has inputargs and operations.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn test_trace_guards_have_fail_args() {
         // Parity: guards in a trace carry fail_args.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -881,7 +881,7 @@ mod tests {
     #[test]
     fn test_trace_iter_ops() {
         // Parity: can iterate over all ops.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         rec.record_op(OpCode::IntAdd, &[i0, i0]);
         rec.record_op(OpCode::IntSub, &[OpRef(1), i0]);
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn test_trace_mixed_types() {
         // Parity: traces can have mixed-type inputargs (int, ref, float).
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let r0 = rec.record_input_arg(Type::Ref);
         let f0 = rec.record_input_arg(Type::Float);
@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn test_trace_pos_matches_opref() {
         // Parity: each op's .pos matches the OpRef returned by record_op.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -937,7 +937,7 @@ mod tests {
     fn test_recorder_const_int_via_constant_oprefs() {
         // Constants in majit use OpRef indices >= 10_000.
         // Recording ops that reference constants should preserve them.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         // Simulate constant references: OpRef(10_000) is a const
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn test_recorder_const_deduplication_by_opref() {
         // Two ops referencing the same constant OpRef share the same value.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let const_ref = OpRef(10_001);
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     fn test_recorder_descriptors_preserved_on_ops() {
         // Descriptors on non-guard ops should survive through get_trace().
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -993,7 +993,7 @@ mod tests {
     #[test]
     fn test_recorder_100_plus_ops_stress() {
         // Recording 200 ops should work without issue.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut prev = i0;
@@ -1023,7 +1023,7 @@ mod tests {
     #[test]
     fn test_recorder_mixed_type_input_args() {
         // Mixed-type inputs (Int, Float, Ref) produce correct types.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let f0 = rec.record_input_arg(Type::Float);
         let r0 = rec.record_input_arg(Type::Ref);
@@ -1047,7 +1047,7 @@ mod tests {
     #[test]
     fn test_recorder_abort_clears_state() {
         // After abort(), the recorder's ops and inputargs are cleared.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         rec.record_op(OpCode::IntAdd, &[i0, i0]);
         rec.record_op(OpCode::IntSub, &[OpRef(1), i0]);
@@ -1057,7 +1057,7 @@ mod tests {
         rec.abort();
         // After abort, the recorder is consumed; create a fresh one to verify
         // independent state.
-        let fresh = TraceRecorder::new();
+        let fresh = Trace::new();
         assert_eq!(fresh.num_ops(), 0);
         assert_eq!(fresh.num_inputargs(), 0);
     }
@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot get trace from aborted recorder")]
     fn test_recorder_abort_prevents_get_trace() {
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         rec.record_op(OpCode::IntAdd, &[i0, i0]);
         // Manually mark as finalized+aborted to trigger panic
@@ -1075,11 +1075,11 @@ mod tests {
         // path by constructing a finalized-then-aborted scenario.
         // Since abort() consumes self, this test verifies that the assertion
         // text is correct by using a different flow:
-        let mut rec2 = TraceRecorder::new();
+        let mut rec2 = Trace::new();
         let i0 = rec2.record_input_arg(Type::Int);
         rec2.close_loop(&[i0]);
         // Manually break the invariant for testing the assertion message
-        let mut rec3 = TraceRecorder {
+        let mut rec3 = Trace {
             ops: vec![],
             inputargs: vec![InputArg::from_type(Type::Int, 0)],
             op_count: 1,
@@ -1092,7 +1092,7 @@ mod tests {
     #[test]
     fn test_recorder_guard_with_many_fail_args() {
         // Guard with 10+ fail_args.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let mut inputs = Vec::new();
         for _ in 0..12 {
             inputs.push(rec.record_input_arg(Type::Int));
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn test_recorder_guard_descr_index_survives() {
         // Each guard's descriptor index must survive through get_trace().
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let d0 = make_fail_descr(100);
@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn test_recorder_ops_interleaved_with_guards() {
         // Interleaved ops and guards: verify ordering is correct.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn test_recorder_finish_with_descr() {
         // finish() records a FINISH op with the given descriptor.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
 
@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn test_recorder_no_ops_just_inputargs_and_jump() {
         // Minimal trace: input args directly jump back.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
 
@@ -1217,12 +1217,12 @@ mod tests {
 
     #[test]
     fn test_trace_limit_independent_per_recorder() {
-        // Each TraceRecorder has its own independent op count.
+        // Each Trace has its own independent op count.
         // Two recorders can be at different fill levels simultaneously.
-        let mut rec_a = TraceRecorder::new();
+        let mut rec_a = Trace::new();
         let a0 = rec_a.record_input_arg(Type::Int);
 
-        let mut rec_b = TraceRecorder::new();
+        let mut rec_b = Trace::new();
         let b0 = rec_b.record_input_arg(Type::Int);
 
         // Fill rec_a to 100 ops
@@ -1256,7 +1256,7 @@ mod tests {
     #[test]
     fn test_trace_limit_guards_count_toward_limit() {
         // Guards count toward the trace limit just like regular ops.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
@@ -1279,7 +1279,7 @@ mod tests {
         // A retrace recorder (from guard failure) starts fresh and has
         // its own independent trace limit, simulating RPython's behavior
         // where a bridge trace has its own length budget.
-        let mut rec = TraceRecorder::with_num_inputs(3);
+        let mut rec = Trace::with_num_inputs(3);
         assert!(!rec.is_too_long());
         assert_eq!(rec.num_ops(), 0);
 
@@ -1304,7 +1304,7 @@ mod tests {
     fn test_trace_limit_abort_preserves_inputargs_count() {
         // After abort, the recorder is consumed. The caller should be
         // able to create a new recorder with the same number of inputs.
-        let mut rec = TraceRecorder::new();
+        let mut rec = Trace::new();
         rec.record_input_arg(Type::Int);
         rec.record_input_arg(Type::Float);
         let input_count = rec.num_inputargs();
@@ -1319,7 +1319,7 @@ mod tests {
 
         // Abort and create fresh recorder with same inputs
         rec.abort();
-        let new_rec = TraceRecorder::with_num_inputs(input_count);
+        let new_rec = Trace::with_num_inputs(input_count);
         assert_eq!(new_rec.num_inputargs(), input_count);
         assert!(!new_rec.is_too_long());
         assert_eq!(new_rec.num_ops(), 0);

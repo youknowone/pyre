@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use majit_codegen::LoopToken;
+use majit_codegen::JitCellToken;
 use majit_ir::{GcRef, OpCode, Type};
 use majit_meta::{
     assert_trace_parity, trace_jitcode, BackEdgeAction, JitCallArg, JitCodeBuilder, JitCodeMachine,
@@ -484,7 +484,7 @@ fn jitcode_call_assembler_typed_preserves_target_token_and_arg_types() {
     root.load_const_r_value(0, 101);
     root.load_const_f_value(0, 2.5f64.to_bits() as i64);
     root.load_const_i_value(0, 7);
-    let token = LoopToken::new(777);
+    let token = JitCellToken::new(777);
     let target_idx =
         root.add_call_assembler_target(&token, concrete_make_ref_from_mixed as *const ());
     root.call_assembler_ref_typed(
@@ -525,7 +525,7 @@ fn jitcode_call_assembler_float_preserves_target_token_and_arg_types() {
     root.load_const_r_value(0, 101);
     root.load_const_f_value(0, 2.5f64.to_bits() as i64);
     root.load_const_i_value(0, 7);
-    let token = LoopToken::new(778);
+    let token = JitCellToken::new(778);
     let target_idx =
         root.add_call_assembler_target(&token, concrete_make_float_from_mixed as *const ());
     root.call_assembler_float_typed(
@@ -566,7 +566,7 @@ fn jitcode_call_assembler_void_preserves_target_token_and_arg_types() {
     root.load_const_r_value(0, 101);
     root.load_const_f_value(0, 2.5f64.to_bits() as i64);
     root.load_const_i_value(0, 7);
-    let token = LoopToken::new(779);
+    let token = JitCellToken::new(779);
     let target_idx = root.add_call_assembler_target(&token, sink_sum4 as *const ());
     root.call_assembler_void_typed_args(
         target_idx,

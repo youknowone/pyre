@@ -1,7 +1,7 @@
 use majit_ir::{DescrRef, GreenKey, JitDriverVar, OpCode, OpRef, Type, VarKind};
-use majit_trace::recorder::TraceRecorder;
+use majit_trace::recorder::Trace;
 
-use majit_codegen::LoopToken;
+use majit_codegen::JitCellToken;
 
 use crate::call_descr::{make_call_assembler_descr, make_call_descr};
 use crate::constant_pool::ConstantPool;
@@ -19,14 +19,14 @@ use crate::TraceAction;
 /// The interpreter declares this once per JitDriver and passes it to
 /// MetaInterp for structured green/red handling.
 #[derive(Clone, Debug)]
-pub struct JitDriverDescriptor {
+pub struct JitDriverStaticData {
     /// All variables in declaration order.
     pub vars: Vec<JitDriverVar>,
     /// Optional name of the virtualizable red variable.
     pub virtualizable: Option<String>,
 }
 
-impl JitDriverDescriptor {
+impl JitDriverStaticData {
     /// Create a descriptor from green and red variable lists.
     pub fn new(greens: Vec<(&str, Type)>, reds: Vec<(&str, Type)>) -> Self {
         Self::with_virtualizable(greens, reds, None)
@@ -45,7 +45,7 @@ impl JitDriverDescriptor {
         for (name, tp) in reds {
             vars.push(JitDriverVar::red(name, tp));
         }
-        JitDriverDescriptor {
+        JitDriverStaticData {
             vars,
             virtualizable: virtualizable.map(str::to_string),
         }
@@ -102,7 +102,7 @@ pub trait DeclarativeJitDriver {
     fn descriptor(
         green_types: &[Type],
         red_types: &[Type],
-    ) -> Result<JitDriverDescriptor, &'static str>;
+    ) -> Result<JitDriverStaticData, &'static str>;
 
     fn green_key(values: &[i64]) -> Result<GreenKey, &'static str>;
 }
@@ -122,7 +122,7 @@ pub struct VableSyncField {
     pub field_type: Type,
 }
 
-/// Tracing context: wraps TraceRecorder + ConstantPool with convenience API.
+/// Tracing context: wraps Trace + ConstantPool with convenience API.
 ///
 /// The interpreter uses this during trace recording to:
 /// - Record IR operations
@@ -130,7 +130,7 @@ pub struct VableSyncField {
 /// - Record guards (with auto-generated FailDescr)
 /// - Record function calls (with auto-generated CallDescr)
 pub struct TraceCtx {
-    pub(crate) recorder: TraceRecorder,
+    pub(crate) recorder: Trace,
     pub(crate) green_key: u64,
     pub(crate) constants: ConstantPool,
     /// Stack of inlined function frames (callee green_keys).
@@ -138,7 +138,7 @@ pub struct TraceCtx {
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
-    driver_descriptor: Option<JitDriverDescriptor>,
+    driver_descriptor: Option<JitDriverStaticData>,
     /// Standard virtualizable boxes -- OpRefs for each static field + array element.
     /// When set, vable_getfield/setfield access these instead of emitting heap ops.
     /// Layout: [field_0, ..., field_N, arr_0[0], ..., arr_0[M], ..., vable_ref]
@@ -159,7 +159,7 @@ pub struct TraceCtx {
 impl TraceCtx {
     /// Create a standalone TraceCtx for testing or external use.
     pub fn for_test(num_inputs: usize) -> Self {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         for _ in 0..num_inputs {
             recorder.record_input_arg(majit_ir::Type::Int);
         }
@@ -167,11 +167,11 @@ impl TraceCtx {
     }
 
     /// Take the recorder out of this context (consumes self).
-    pub fn into_recorder(self) -> TraceRecorder {
+    pub fn into_recorder(self) -> Trace {
         self.recorder
     }
 
-    pub(crate) fn new(recorder: TraceRecorder, green_key: u64) -> Self {
+    pub(crate) fn new(recorder: Trace, green_key: u64) -> Self {
         TraceCtx {
             recorder,
             green_key,
@@ -188,7 +188,7 @@ impl TraceCtx {
 
     /// Create a TraceCtx with a structured green key.
     pub(crate) fn with_green_key(
-        recorder: TraceRecorder,
+        recorder: Trace,
         green_key: u64,
         green_key_values: GreenKey,
     ) -> Self {
@@ -356,12 +356,12 @@ impl TraceCtx {
     }
 
     /// The declarative JitDriver descriptor, if provided.
-    pub fn driver_descriptor(&self) -> Option<&JitDriverDescriptor> {
+    pub fn driver_descriptor(&self) -> Option<&JitDriverStaticData> {
         self.driver_descriptor.as_ref()
     }
 
     /// Attach declarative JitDriver metadata to the active trace.
-    pub fn set_driver_descriptor(&mut self, descriptor: JitDriverDescriptor) {
+    pub fn set_driver_descriptor(&mut self, descriptor: JitDriverStaticData) {
         self.driver_descriptor = Some(descriptor);
     }
 
@@ -1396,7 +1396,7 @@ impl TraceCtx {
     fn call_assembler_typed(
         &mut self,
         opcode: OpCode,
-        target: &LoopToken,
+        target: &JitCellToken,
         args: &[OpRef],
         arg_types: &[Type],
         ret_type: Type,
@@ -1405,7 +1405,7 @@ impl TraceCtx {
         self.record_op_with_descr(opcode, args, descr)
     }
 
-    /// Emit CALL_ASSEMBLER_I by token number, without needing a `&LoopToken`.
+    /// Emit CALL_ASSEMBLER_I by token number, without needing a `&JitCellToken`.
     ///
     /// Assumes all args are `Type::Int`. For mixed-type args, use
     /// `call_assembler_int_by_number_typed` instead.
@@ -1428,35 +1428,35 @@ impl TraceCtx {
 
     /// Emit CALL_ASSEMBLER_N (void). Assumes all args are `Type::Int`.
     /// For mixed-type args, use `call_assembler_void_typed`.
-    pub fn call_assembler_void(&mut self, target: &LoopToken, args: &[OpRef]) {
+    pub fn call_assembler_void(&mut self, target: &JitCellToken, args: &[OpRef]) {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         self.call_assembler_void_typed(target, args, &arg_types);
     }
 
     /// Emit CALL_ASSEMBLER_I. Assumes all args are `Type::Int`.
     /// For mixed-type args, use `call_assembler_int_typed`.
-    pub fn call_assembler_int(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
+    pub fn call_assembler_int(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         self.call_assembler_int_typed(target, args, &arg_types)
     }
 
     /// Emit CALL_ASSEMBLER_R. Assumes all args are `Type::Int`.
     /// For mixed-type args, use `call_assembler_ref_typed`.
-    pub fn call_assembler_ref(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
+    pub fn call_assembler_ref(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         self.call_assembler_ref_typed(target, args, &arg_types)
     }
 
     /// Emit CALL_ASSEMBLER_F. Assumes all args are `Type::Int`.
     /// For mixed-type args, use `call_assembler_float_typed`.
-    pub fn call_assembler_float(&mut self, target: &LoopToken, args: &[OpRef]) -> OpRef {
+    pub fn call_assembler_float(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
         self.call_assembler_float_typed(target, args, &arg_types)
     }
 
     pub fn call_assembler_void_typed(
         &mut self,
-        target: &LoopToken,
+        target: &JitCellToken,
         args: &[OpRef],
         arg_types: &[Type],
     ) {
@@ -1471,7 +1471,7 @@ impl TraceCtx {
 
     pub fn call_assembler_int_typed(
         &mut self,
-        target: &LoopToken,
+        target: &JitCellToken,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -1486,7 +1486,7 @@ impl TraceCtx {
 
     pub fn call_assembler_ref_typed(
         &mut self,
-        target: &LoopToken,
+        target: &JitCellToken,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -1501,7 +1501,7 @@ impl TraceCtx {
 
     pub fn call_assembler_float_typed(
         &mut self,
-        target: &LoopToken,
+        target: &JitCellToken,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -1718,13 +1718,13 @@ impl TraceCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_codegen::LoopToken;
+    use majit_codegen::JitCellToken;
     use majit_ir::Type;
 
     extern "C" fn dummy_call_target() {}
 
     fn make_ctx_with_mixed_inputs() -> (TraceCtx, [OpRef; 3]) {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let r = recorder.record_input_arg(Type::Ref);
         let f = recorder.record_input_arg(Type::Float);
         let i = recorder.record_input_arg(Type::Int);
@@ -1795,7 +1795,7 @@ mod tests {
     #[test]
     fn call_assembler_typed_preserves_mixed_arg_types_and_target_token() {
         let (mut ctx, args) = make_ctx_with_mixed_inputs();
-        let token = LoopToken::new(777);
+        let token = JitCellToken::new(777);
         let _ = ctx.call_assembler_ref_typed(&token, &args, &[Type::Ref, Type::Float, Type::Int]);
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
@@ -1826,7 +1826,7 @@ mod tests {
 
     #[test]
     fn call_may_force_with_vable_sync_emits_setfield_before_and_getfield_after() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -1869,7 +1869,7 @@ mod tests {
 
     #[test]
     fn call_may_force_with_vable_sync_void_emits_correct_sequence() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -1900,7 +1900,7 @@ mod tests {
 
     #[test]
     fn call_may_force_with_vable_sync_multiple_fields() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let int_val = recorder.record_input_arg(Type::Int);
         let ref_val = recorder.record_input_arg(Type::Ref);
@@ -1943,7 +1943,7 @@ mod tests {
 
     #[test]
     fn call_may_force_with_empty_vable_sync_behaves_like_plain_call() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let val = recorder.record_input_arg(Type::Int);
         let vable = recorder.record_input_arg(Type::Ref);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -1968,7 +1968,7 @@ mod tests {
 
     #[test]
     fn call_may_force_with_vable_sync_float_field() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let float_val = recorder.record_input_arg(Type::Float);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -2026,7 +2026,7 @@ mod tests {
             }
         }
 
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let val = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
         let state = NoVableState;
@@ -2093,7 +2093,7 @@ mod tests {
             }
         }
 
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -2141,7 +2141,7 @@ mod tests {
     #[test]
     fn standard_vable_getfield_reads_from_boxes() {
         let info = make_test_vable_info();
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Int); // pc
         let box1 = recorder.record_input_arg(Type::Int); // sp
@@ -2167,7 +2167,7 @@ mod tests {
     #[test]
     fn standard_vable_setfield_writes_to_boxes() {
         let info = make_test_vable_info();
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Int);
         let box1 = recorder.record_input_arg(Type::Int);
@@ -2197,7 +2197,7 @@ mod tests {
     #[test]
     fn nonstandard_vable_getfield_emits_heap_op() {
         // Without init_virtualizable_boxes, falls back to GETFIELD_GC_I
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let mut ctx = TraceCtx::new(recorder, 0);
 
@@ -2210,7 +2210,7 @@ mod tests {
 
     #[test]
     fn nonstandard_vable_setfield_emits_heap_op() {
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let val = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -2225,7 +2225,7 @@ mod tests {
     #[test]
     fn standard_vable_getfield_unknown_offset_emits_heap_op() {
         let info = make_test_vable_info();
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Int);
         let box1 = recorder.record_input_arg(Type::Int);
@@ -2246,7 +2246,7 @@ mod tests {
         let mut info = crate::virtualizable::VirtualizableInfo::new(0);
         info.add_field("obj", Type::Ref, 8);
 
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Ref);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -2265,7 +2265,7 @@ mod tests {
         let mut info = crate::virtualizable::VirtualizableInfo::new(0);
         info.add_field("val", Type::Float, 8);
 
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Float);
         let mut ctx = TraceCtx::new(recorder, 0);
@@ -2283,7 +2283,7 @@ mod tests {
     fn vable_getarrayitem_reads_from_boxes() {
         let info = make_test_vable_info_with_array();
         // 1 static field (pc) + 3 array elements
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box_pc = recorder.record_input_arg(Type::Int);
         let box_arr0 = recorder.record_input_arg(Type::Int);
@@ -2318,7 +2318,7 @@ mod tests {
     #[test]
     fn vable_setarrayitem_writes_to_boxes() {
         let info = make_test_vable_info_with_array();
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box_pc = recorder.record_input_arg(Type::Int);
         let box_arr0 = recorder.record_input_arg(Type::Int);
@@ -2349,7 +2349,7 @@ mod tests {
     #[test]
     fn vable_getarrayitem_unknown_array_emits_heap_op() {
         let info = make_test_vable_info_with_array();
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box_pc = recorder.record_input_arg(Type::Int);
         let box_arr0 = recorder.record_input_arg(Type::Int);
@@ -2368,7 +2368,7 @@ mod tests {
     #[test]
     fn collect_virtualizable_boxes_returns_current_state() {
         let info = make_test_vable_info();
-        let mut recorder = TraceRecorder::new();
+        let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Int);
         let box1 = recorder.record_input_arg(Type::Int);

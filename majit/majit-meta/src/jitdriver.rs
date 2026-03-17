@@ -1,11 +1,11 @@
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
-use crate::meta_interp::{
+use crate::pyjitpl::{
     BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision, JitStats,
     MetaInterp,
 };
 use crate::resume::ResumeLayoutSummary;
-use crate::trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx};
+use crate::trace_ctx::{DeclarativeJitDriver, JitDriverStaticData, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 use crate::TraceAction;
 use majit_ir::OpRef;
@@ -43,7 +43,7 @@ pub struct JitDriver<S: JitState> {
     meta: MetaInterp<S::Meta>,
     sym: Option<S::Sym>,
     trace_meta: Option<S::Meta>,
-    descriptor: Option<JitDriverDescriptor>,
+    descriptor: Option<JitDriverStaticData>,
     /// Bridge tracing state: (green_key, trace_id, fail_index).
     bridge_info: Option<(u64, u64, u32)>,
     /// Additional entry points sharing this driver's compiled loops.
@@ -67,7 +67,7 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
-    pub fn with_descriptor(threshold: u32, descriptor: JitDriverDescriptor) -> Self {
+    pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
         let mut driver = Self::new(threshold);
         let greens: Vec<Type> = descriptor.greens().iter().map(|v| v.tp).collect();
         driver.descriptor = Some(descriptor);
@@ -501,14 +501,14 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
-    fn driver_descriptor_for(&self, state: &S, meta: &S::Meta) -> Option<JitDriverDescriptor> {
+    fn driver_descriptor_for(&self, state: &S, meta: &S::Meta) -> Option<JitDriverStaticData> {
         self.descriptor
             .clone()
             .or_else(|| state.driver_descriptor(meta))
     }
 
     fn live_values_match_descriptor(
-        descriptor: Option<&JitDriverDescriptor>,
+        descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
     ) -> bool {
         let Some(descriptor) = descriptor else {
@@ -526,7 +526,7 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         state: &mut S,
         meta: &S::Meta,
-        descriptor: Option<&JitDriverDescriptor>,
+        descriptor: Option<&JitDriverStaticData>,
     ) -> bool {
         let Some(descriptor) = descriptor else {
             return true;
@@ -566,7 +566,7 @@ impl<S: JitState> JitDriver<S> {
         true
     }
 
-    fn sync_after(&self, state: &mut S, meta: &S::Meta, descriptor: Option<&JitDriverDescriptor>) {
+    fn sync_after(&self, state: &mut S, meta: &S::Meta, descriptor: Option<&JitDriverStaticData>) {
         let Some(descriptor) = descriptor else {
             return;
         };
@@ -676,23 +676,23 @@ impl<S: JitState> JitDriver<S> {
         green_key: u64,
         state: &mut S,
         pre_run: impl FnOnce(),
-    ) -> crate::meta_interp::DriverRunOutcome {
+    ) -> crate::pyjitpl::DriverRunOutcome {
         let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
-            return crate::meta_interp::DriverRunOutcome::Abort {
+            return crate::pyjitpl::DriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
         if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
-            return crate::meta_interp::DriverRunOutcome::Abort {
+            return crate::pyjitpl::DriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         }
         let live_values = state.extract_live_values(&meta);
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
-            return crate::meta_interp::DriverRunOutcome::Abort {
+            return crate::pyjitpl::DriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
@@ -702,14 +702,14 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .run_with_blackhole_fallback_with_values(green_key, &live_values)
         else {
-            return crate::meta_interp::DriverRunOutcome::Abort {
+            return crate::pyjitpl::DriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         };
 
         match result {
-            crate::meta_interp::BlackholeRunResult::Finished {
+            crate::pyjitpl::BlackholeRunResult::Finished {
                 values,
                 typed_values,
                 meta,
@@ -722,9 +722,9 @@ impl<S: JitState> JitDriver<S> {
                     state.restore(&meta, &values);
                 }
                 self.sync_after(state, &meta, descriptor.as_ref());
-                crate::meta_interp::DriverRunOutcome::Finished { via_blackhole }
+                crate::pyjitpl::DriverRunOutcome::Finished { via_blackhole }
             }
-            crate::meta_interp::BlackholeRunResult::Jump {
+            crate::pyjitpl::BlackholeRunResult::Jump {
                 values,
                 typed_values,
                 exit_layout,
@@ -744,9 +744,9 @@ impl<S: JitState> JitDriver<S> {
                     state.restore(&meta, &values);
                 }
                 self.sync_after(state, &meta, descriptor.as_ref());
-                crate::meta_interp::DriverRunOutcome::Jump { via_blackhole }
+                crate::pyjitpl::DriverRunOutcome::Jump { via_blackhole }
             }
-            crate::meta_interp::BlackholeRunResult::GuardFailure {
+            crate::pyjitpl::BlackholeRunResult::GuardFailure {
                 fail_values,
                 typed_fail_values,
                 exit_layout,
@@ -799,13 +799,13 @@ impl<S: JitState> JitDriver<S> {
                 if restored {
                     self.sync_after(state, &meta, descriptor.as_ref());
                 }
-                crate::meta_interp::DriverRunOutcome::GuardFailure {
+                crate::pyjitpl::DriverRunOutcome::GuardFailure {
                     restored,
                     via_blackhole,
                 }
             }
-            crate::meta_interp::BlackholeRunResult::Abort { .. } => {
-                crate::meta_interp::DriverRunOutcome::Abort {
+            crate::pyjitpl::BlackholeRunResult::Abort { .. } => {
+                crate::pyjitpl::DriverRunOutcome::Abort {
                     restored: false,
                     via_blackhole: true,
                 }
@@ -818,7 +818,7 @@ impl<S: JitState> JitDriver<S> {
         green_values: &[i64],
         state: &mut S,
         pre_run: impl FnOnce(),
-    ) -> Result<crate::meta_interp::DriverRunOutcome, &'static str> {
+    ) -> Result<crate::pyjitpl::DriverRunOutcome, &'static str> {
         let green_key = D::green_key(green_values)?;
         Ok(self.run_compiled_with_blackhole_fallback_keyed(green_key.hash_u64(), state, pre_run))
     }
@@ -877,7 +877,7 @@ impl<S: JitState> JitDriver<S> {
     }
 
     fn decode_descriptor_values(
-        descriptor: Option<&JitDriverDescriptor>,
+        descriptor: Option<&JitDriverStaticData>,
         raw_values: &[i64],
     ) -> Option<Vec<Value>> {
         let descriptor = descriptor?;
@@ -916,7 +916,7 @@ impl<S: JitState> JitDriver<S> {
     }
 
     fn resume_layout_with_descriptor_slot_types(
-        descriptor: Option<&JitDriverDescriptor>,
+        descriptor: Option<&JitDriverStaticData>,
         resume_layout: &ResumeLayoutSummary,
     ) -> Option<ResumeLayoutSummary> {
         let descriptor = descriptor?;
@@ -1344,7 +1344,7 @@ mod tests {
             ..Default::default()
         };
         match driver.run_compiled_with_blackhole_fallback_keyed(key, &mut state, || {}) {
-            crate::meta_interp::DriverRunOutcome::Jump { via_blackhole } => {
+            crate::pyjitpl::DriverRunOutcome::Jump { via_blackhole } => {
                 assert!(via_blackhole);
             }
             other => panic!("expected Jump outcome, got {other:?}"),
@@ -1432,7 +1432,7 @@ mod tests {
             ..Default::default()
         };
         match driver.run_compiled_with_blackhole_fallback_keyed(key, &mut state, || {}) {
-            crate::meta_interp::DriverRunOutcome::Jump { via_blackhole } => {
+            crate::pyjitpl::DriverRunOutcome::Jump { via_blackhole } => {
                 assert!(via_blackhole);
             }
             other => panic!("expected Jump outcome, got {other:?}"),

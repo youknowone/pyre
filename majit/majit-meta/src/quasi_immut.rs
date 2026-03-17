@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 /// The next time a `GuardNotInvalidated` check runs in those loops,
 /// it will fail and execution will fall back to the interpreter.
 pub struct QuasiImmut {
-    /// Weak references to LoopToken invalidation flags.
+    /// Weak references to JitCellToken invalidation flags.
     watchers: Vec<Weak<AtomicBool>>,
 }
 

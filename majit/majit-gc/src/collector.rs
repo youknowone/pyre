@@ -986,7 +986,7 @@ pub struct CompiledCodeRegion {
     pub safepoint_map: SafepointMap,
     /// Frame size in slots (each slot = 8 bytes).
     pub frame_size_slots: u32,
-    /// LoopToken number for identification.
+    /// JitCellToken number for identification.
     pub loop_token: u64,
 }
 

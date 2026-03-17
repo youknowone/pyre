@@ -423,7 +423,7 @@ impl std::fmt::Debug for LoopVersionInfo {
 }
 
 /// Token identifying a compiled loop. Bridges are attached to this.
-pub struct LoopToken {
+pub struct JitCellToken {
     /// Unique number for this token.
     pub number: u64,
     /// Types of the input arguments.
@@ -438,9 +438,9 @@ pub struct LoopToken {
     pub version_info: Option<LoopVersionInfo>,
 }
 
-impl LoopToken {
+impl JitCellToken {
     pub fn new(number: u64) -> Self {
-        LoopToken {
+        JitCellToken {
             number,
             inputarg_types: Vec::new(),
             compiled: None,
@@ -461,9 +461,9 @@ impl LoopToken {
     }
 }
 
-impl std::fmt::Debug for LoopToken {
+impl std::fmt::Debug for JitCellToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoopToken")
+        f.debug_struct("JitCellToken")
             .field("number", &self.number)
             .finish()
     }
@@ -486,7 +486,7 @@ pub trait Backend: Send {
         &mut self,
         inputargs: &[InputArg],
         ops: &[Op],
-        token: &mut LoopToken,
+        token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
 
     /// Compile a bridge (side exit path) and attach it to the loop.
@@ -495,7 +495,7 @@ pub trait Backend: Send {
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
         ops: &[Op],
-        original_token: &LoopToken,
+        original_token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
 
     /// Compile all registered loop versions as bridges.
@@ -503,7 +503,7 @@ pub trait Backend: Send {
     /// Called after `compile_loop()` succeeds. For each version registered
     /// in the token's `version_info`, finds the corresponding version guard
     /// descriptor and compiles the alternative trace as a bridge.
-    fn compile_versions(&mut self, token: &LoopToken) -> Result<Vec<AsmInfo>, BackendError> {
+    fn compile_versions(&mut self, token: &JitCellToken) -> Result<Vec<AsmInfo>, BackendError> {
         let versions = match &token.version_info {
             Some(info) => info
                 .versions
@@ -526,13 +526,13 @@ pub trait Backend: Send {
     }
 
     /// Execute compiled code starting at the given token.
-    fn execute_token(&self, token: &LoopToken, args: &[Value]) -> DeadFrame;
+    fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame;
 
     /// Execute compiled code with integer-only arguments.
     ///
     /// Avoids the `Value::Int` wrapping/unwrapping overhead when all
     /// arguments are known to be integers (the common case for loop entry).
-    fn execute_token_ints(&self, token: &LoopToken, args: &[i64]) -> DeadFrame {
+    fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {
         let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
         self.execute_token(token, &values)
     }
@@ -541,7 +541,7 @@ pub trait Backend: Send {
     ///
     /// This preserves mixed `Int` / `Ref` / `Float` arguments while still
     /// avoiding explicit deadframe decoding in the caller.
-    fn execute_token_raw(&self, token: &LoopToken, args: &[Value]) -> RawExecResult {
+    fn execute_token_raw(&self, token: &JitCellToken, args: &[Value]) -> RawExecResult {
         let frame = self.execute_token(token, args);
         let descr = self.get_latest_descr(&frame);
         let exit_layout = self.describe_deadframe(&frame);
@@ -592,20 +592,20 @@ pub trait Backend: Send {
     ///
     /// Returns the output values directly, avoiding the intermediate
     /// DeadFrame heap allocation and the per-value downcast extraction loop.
-    fn execute_token_ints_raw(&self, token: &LoopToken, args: &[i64]) -> RawExecResult {
+    fn execute_token_ints_raw(&self, token: &JitCellToken, args: &[i64]) -> RawExecResult {
         let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
         self.execute_token_raw(token, &values)
     }
 
     /// Inspect static exit layouts for a compiled loop token.
-    fn compiled_fail_descr_layouts(&self, _token: &LoopToken) -> Option<Vec<FailDescrLayout>> {
+    fn compiled_fail_descr_layouts(&self, _token: &JitCellToken) -> Option<Vec<FailDescrLayout>> {
         None
     }
 
     /// Inspect static exit layouts for a bridge attached to a source guard.
     fn compiled_bridge_fail_descr_layouts(
         &self,
-        _original_token: &LoopToken,
+        _original_token: &JitCellToken,
         _source_trace_id: u64,
         _source_fail_index: u32,
     ) -> Option<Vec<FailDescrLayout>> {
@@ -618,7 +618,7 @@ pub trait Backend: Send {
     /// inspection APIs above.
     fn compiled_trace_fail_descr_layouts(
         &self,
-        _token: &LoopToken,
+        _token: &JitCellToken,
         _trace_id: u64,
     ) -> Option<Vec<FailDescrLayout>> {
         None
@@ -627,7 +627,7 @@ pub trait Backend: Send {
     /// Inspect static terminal-exit layouts for a compiled loop token.
     fn compiled_terminal_exit_layouts(
         &self,
-        _token: &LoopToken,
+        _token: &JitCellToken,
     ) -> Option<Vec<TerminalExitLayout>> {
         None
     }
@@ -635,7 +635,7 @@ pub trait Backend: Send {
     /// Inspect static terminal-exit layouts for a bridge attached to a source guard.
     fn compiled_bridge_terminal_exit_layouts(
         &self,
-        _original_token: &LoopToken,
+        _original_token: &JitCellToken,
         _source_trace_id: u64,
         _source_fail_index: u32,
     ) -> Option<Vec<TerminalExitLayout>> {
@@ -645,14 +645,14 @@ pub trait Backend: Send {
     /// Inspect static terminal-exit layouts for any compiled trace owned by this token.
     fn compiled_trace_terminal_exit_layouts(
         &self,
-        _token: &LoopToken,
+        _token: &JitCellToken,
         _trace_id: u64,
     ) -> Option<Vec<TerminalExitLayout>> {
         None
     }
 
     /// Inspect static metadata for any compiled trace owned by this token.
-    fn compiled_trace_info(&self, _token: &LoopToken, _trace_id: u64) -> Option<CompiledTraceInfo> {
+    fn compiled_trace_info(&self, _token: &JitCellToken, _trace_id: u64) -> Option<CompiledTraceInfo> {
         None
     }
 
@@ -663,7 +663,7 @@ pub trait Backend: Send {
     /// at compile time can override this to expose the frame stacks.
     fn compiled_guard_frame_stacks(
         &self,
-        _token: &LoopToken,
+        _token: &JitCellToken,
     ) -> Option<Vec<(u32, Vec<ExitFrameLayout>)>> {
         None
     }
@@ -671,7 +671,7 @@ pub trait Backend: Send {
     /// Patch backend-owned recovery metadata for a specific compiled terminal exit.
     fn update_terminal_exit_recovery_layout(
         &mut self,
-        _token: &LoopToken,
+        _token: &JitCellToken,
         _trace_id: u64,
         _op_index: usize,
         _recovery_layout: ExitRecoveryLayout,
@@ -707,7 +707,7 @@ pub trait Backend: Send {
     /// Patch backend-owned recovery metadata for a specific compiled exit.
     fn update_fail_descr_recovery_layout(
         &mut self,
-        _token: &LoopToken,
+        _token: &JitCellToken,
         _trace_id: u64,
         _fail_index: u32,
         _recovery_layout: ExitRecoveryLayout,
@@ -763,19 +763,19 @@ pub trait Backend: Send {
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> majit_ir::GcRef;
 
     /// Invalidate a compiled loop (e.g., due to GUARD_NOT_INVALIDATED).
-    fn invalidate_loop(&self, token: &LoopToken);
+    fn invalidate_loop(&self, token: &JitCellToken);
 
     /// Redirect calls from one loop token to another (for CALL_ASSEMBLER).
     fn redirect_call_assembler(
         &self,
-        _old: &LoopToken,
-        _new: &LoopToken,
+        _old: &JitCellToken,
+        _new: &JitCellToken,
     ) -> Result<(), BackendError> {
         Ok(())
     }
 
     /// Free resources associated with a compiled loop.
-    fn free_loop(&mut self, _token: &LoopToken) {
+    fn free_loop(&mut self, _token: &JitCellToken) {
         // Default: no-op
     }
 }
@@ -906,13 +906,13 @@ mod tests {
 
     #[test]
     fn loop_token_version_info_none_by_default() {
-        let token = LoopToken::new(1);
+        let token = JitCellToken::new(1);
         assert!(token.version_info.is_none());
     }
 
     #[test]
     fn loop_token_with_version_info() {
-        let mut token = LoopToken::new(1);
+        let mut token = JitCellToken::new(1);
         let mut info = LoopVersionInfo::new();
         info.add_version(
             5,

@@ -2009,7 +2009,7 @@ impl MaterializedVirtual {
 }
 
 /// Builder for constructing ResumeData during trace compilation.
-pub struct ResumeDataBuilder {
+pub struct ResumeDataVirtualAdder {
     frames: Vec<FrameInfoBuilder>,
     virtuals: Vec<VirtualInfo>,
     pending_fields: Vec<PendingFieldInfo>,
@@ -2020,10 +2020,10 @@ struct FrameInfoBuilder {
     slot_map: Vec<FrameSlotSource>,
 }
 
-impl ResumeDataBuilder {
+impl ResumeDataVirtualAdder {
     /// Create a new builder.
     pub fn new() -> Self {
-        ResumeDataBuilder {
+        ResumeDataVirtualAdder {
             frames: Vec::new(),
             virtuals: Vec::new(),
             pending_fields: Vec::new(),
@@ -2181,7 +2181,7 @@ impl ResumeDataBuilder {
     }
 }
 
-impl Default for ResumeDataBuilder {
+impl Default for ResumeDataVirtualAdder {
     fn default() -> Self {
         Self::new()
     }
@@ -2375,7 +2375,7 @@ mod tests {
 
     #[test]
     fn test_builder() {
-        let mut builder = ResumeDataBuilder::new();
+        let mut builder = ResumeDataVirtualAdder::new();
         builder.push_frame(42);
         builder.map_slot(0, 0);
         builder.map_slot(2, 1); // gap at slot 1
@@ -2787,7 +2787,7 @@ mod tests {
 
     #[test]
     fn test_builder_add_virtual_convenience() {
-        let mut builder = ResumeDataBuilder::new();
+        let mut builder = ResumeDataVirtualAdder::new();
         builder.push_frame(0);
         let v0 = builder.add_virtual_obj(1, 10, vec![(0, VirtualFieldSource::FailArg(0))]);
         let v1 = builder.add_virtual_array(

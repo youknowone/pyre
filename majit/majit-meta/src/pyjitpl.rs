@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use majit_codegen::{
-    Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, LoopToken,
+    Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
     TerminalExitLayout,
 };
 use majit_codegen_cranelift::CraneliftBackend;
@@ -9,18 +9,18 @@ use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
 };
 use majit_opt::optimizer::Optimizer;
-use majit_trace::trace::Trace;
-use majit_trace::warmenterstate::{HotResult, WarmEnterState};
+use majit_trace::trace::TreeLoop;
+use majit_trace::warmstate::{HotResult, WarmEnterState};
 use std::sync::Arc;
 
 use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionState};
 use crate::io_buffer;
 use crate::resume::{
     EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
-    ResumeData, ResumeDataBuilder, ResumeDataLoopMemo, ResumeFrameLayoutSummary,
+    ResumeData, ResumeDataVirtualAdder, ResumeDataLoopMemo, ResumeFrameLayoutSummary,
     ResumeLayoutSummary,
 };
-use crate::trace_ctx::{JitDriverDescriptor, TraceCtx};
+use crate::trace_ctx::{JitDriverStaticData, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 
 // ── Preamble descriptors for virtualizable field loads ────────────────
@@ -432,7 +432,7 @@ impl StoredExitLayout {
 }
 
 struct CompiledEntry<M> {
-    token: LoopToken,
+    token: JitCellToken,
     num_inputs: usize,
     meta: M,
     /// Trace id of the root compiled loop.
@@ -771,7 +771,7 @@ impl<M: Clone> MetaInterp<M> {
 
     fn patch_backend_guard_recovery_layouts_for_trace(
         backend: &mut CraneliftBackend,
-        token: &LoopToken,
+        token: &JitCellToken,
         trace_id: u64,
         exit_layouts: &mut HashMap<u32, StoredExitLayout>,
     ) {
@@ -794,7 +794,7 @@ impl<M: Clone> MetaInterp<M> {
 
     fn patch_backend_terminal_recovery_layouts_for_trace(
         backend: &mut CraneliftBackend,
-        token: &LoopToken,
+        token: &JitCellToken,
         trace_id: u64,
         terminal_exit_layouts: &mut HashMap<usize, StoredExitLayout>,
     ) {
@@ -868,7 +868,7 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state.set_function_threshold(threshold);
     }
 
-    pub fn warm_state_ref(&self) -> &majit_trace::warmenterstate::WarmEnterState {
+    pub fn warm_state_ref(&self) -> &majit_trace::warmstate::WarmEnterState {
         &self.warm_state
     }
 
@@ -968,7 +968,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn force_start_tracing(
         &mut self,
         green_key: u64,
-        driver_descriptor: Option<JitDriverDescriptor>,
+        driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         if self.tracing.is_some() {
@@ -1027,7 +1027,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_values: Option<majit_ir::GreenKey>,
-        driver_descriptor: Option<JitDriverDescriptor>,
+        driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         if self.tracing.is_some() {
@@ -1135,7 +1135,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn finish_trace_for_parity(
         &mut self,
         finish_args: &[OpRef],
-    ) -> Option<(Trace, HashMap<u32, i64>)> {
+    ) -> Option<(TreeLoop, HashMap<u32, i64>)> {
         let ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
         let mut recorder = ctx.recorder;
@@ -1224,7 +1224,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             self.warm_state.alloc_token_number()
         };
-        let mut token = LoopToken::new(token_num);
+        let mut token = JitCellToken::new(token_num);
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
 
@@ -1312,7 +1312,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 let install_num = self.warm_state.alloc_token_number();
-                let install_token = LoopToken::new(install_num);
+                let install_token = JitCellToken::new(install_num);
                 self.warm_state.install_compiled(green_key, install_token);
 
                 self.stats.loops_compiled += 1;
@@ -1424,7 +1424,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             self.warm_state.alloc_token_number()
         };
-        let mut token = LoopToken::new(token_num);
+        let mut token = JitCellToken::new(token_num);
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
 
@@ -1509,7 +1509,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 let install_num = self.warm_state.alloc_token_number();
-                let install_token = LoopToken::new(install_num);
+                let install_token = JitCellToken::new(install_num);
                 self.warm_state.install_compiled(green_key, install_token);
                 self.warm_state.reset_function_counts();
                 self.stats.loops_compiled += 1;
@@ -2349,12 +2349,12 @@ impl<M: Clone> MetaInterp<M> {
 
     // ── Call Assembler Support ──────────────────────────────────
 
-    /// Get the LoopToken for a compiled loop (for CALL_ASSEMBLER).
+    /// Get the JitCellToken for a compiled loop (for CALL_ASSEMBLER).
     ///
     /// In RPython, `call_assembler` allows JIT code for one function
     /// to directly call JIT code for another function. The caller needs
-    /// the target's LoopToken to set up the call.
-    pub fn get_loop_token(&self, green_key: u64) -> Option<&LoopToken> {
+    /// the target's JitCellToken to set up the call.
+    pub fn get_loop_token(&self, green_key: u64) -> Option<&JitCellToken> {
         self.compiled_loops.get(&green_key).map(|c| &c.token)
     }
 
@@ -3504,7 +3504,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Create a new trace recorder for the bridge
-        let mut recorder = majit_trace::recorder::TraceRecorder::new();
+        let mut recorder = majit_trace::recorder::Trace::new();
         for _ in live_values {
             recorder.record_input_arg(Type::Int);
         }
@@ -3879,7 +3879,7 @@ fn build_guard_metadata(
         let mut resume_layout = None;
         if is_guard {
             if let Some(ref fail_args) = op.fail_args {
-                let mut builder = ResumeDataBuilder::new();
+                let mut builder = ResumeDataVirtualAdder::new();
                 builder.push_frame(pc);
 
                 for (slot_idx, _) in fail_args.iter().enumerate() {
@@ -4460,7 +4460,7 @@ mod tests {
         constants: HashMap<u32, i64>,
     ) {
         meta.backend.set_constants(constants.clone());
-        let mut token = LoopToken::new(green_key + 1000);
+        let mut token = JitCellToken::new(green_key + 1000);
         let trace_id = meta.alloc_trace_id();
         meta.backend.set_next_trace_id(trace_id);
         meta.backend
@@ -4576,7 +4576,7 @@ mod tests {
         meta.compiled_loops.insert(
             green_key,
             CompiledEntry {
-                token: LoopToken::new(1),
+                token: JitCellToken::new(1),
                 num_inputs: 2,
                 meta: (),
                 root_trace_id: trace_id,
@@ -4674,7 +4674,7 @@ mod tests {
         meta.compiled_loops.insert(
             green_key,
             CompiledEntry {
-                token: LoopToken::new(100),
+                token: JitCellToken::new(100),
                 num_inputs: 2,
                 meta: (),
                 root_trace_id: trace_id,
@@ -4959,7 +4959,7 @@ mod tests {
         meta.compiled_loops.insert(
             green_key,
             CompiledEntry {
-                token: LoopToken::new(2),
+                token: JitCellToken::new(2),
                 num_inputs: 1,
                 meta: (),
                 root_trace_id: trace_id,
@@ -5764,7 +5764,7 @@ mod tests {
         meta.compiled_loops.insert(
             green_key,
             CompiledEntry {
-                token: LoopToken::new(700),
+                token: JitCellToken::new(700),
                 num_inputs: 0,
                 meta: (),
                 root_trace_id: trace_id,

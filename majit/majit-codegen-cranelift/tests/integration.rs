@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use majit_codegen::{
-    Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, LoopToken,
+    Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
 };
 use majit_codegen_cranelift::guard::CraneliftFailDescr;
 use majit_codegen_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
@@ -19,7 +19,7 @@ use majit_opt::optimizer::Optimizer;
 use majit_opt::pure::OptPure;
 use majit_opt::rewrite::OptRewrite;
 use majit_opt::simplify::OptSimplify;
-use majit_trace::recorder::TraceRecorder;
+use majit_trace::recorder::Trace;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -69,7 +69,7 @@ fn new_optimizer() -> Optimizer {
 fn test_simple_arithmetic() {
     // Record: input(i) -> result = i + CONST_1 -> finish(result)
     // Execute with i=41, expect 42.
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let i0 = rec.record_input_arg(Type::Int);
 
     // Use a high OpRef index for the constant so it doesn't collide with
@@ -89,7 +89,7 @@ fn test_simple_arithmetic() {
     constants.insert(1000, 1i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(0);
+    let mut token = JitCellToken::new(0);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -109,7 +109,7 @@ fn test_sum_loop() {
     //   -> cmp = i2 > 0 -> guard_true(cmp) -> jump(i2, sum2)
     // Execute with i=100, sum=0. Guard fails when i2=0, at which point
     // the accumulated sum in the frame should be 5050.
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
@@ -134,7 +134,7 @@ fn test_sum_loop() {
     constants.insert(1001, 0i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(1);
+    let mut token = JitCellToken::new(1);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -190,7 +190,7 @@ fn test_identity_operations() {
     // when it knows the constant values. Since the optimizer doesn't have
     // access to backend constants, we verify correctness through execution.
     // The backend handles constants at codegen time regardless.
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     let const_zero = OpRef(1000);
@@ -215,7 +215,7 @@ fn test_identity_operations() {
     constants.insert(1001, 1i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(2);
+    let mut token = JitCellToken::new(2);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -240,7 +240,7 @@ fn test_identity_operations() {
 fn test_guard_failure_path() {
     // Record: input(x) -> cmp = x > 0 -> guard_true(cmp)
     //   -> result = x * 2 -> finish(result)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     let const_zero = OpRef(1000);
@@ -263,7 +263,7 @@ fn test_guard_failure_path() {
     constants.insert(1001, 2i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(3);
+    let mut token = JitCellToken::new(3);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -305,7 +305,7 @@ fn test_multiple_optimization_passes() {
     //
     // After OptPure CSE, d is replaced by c, so e = c * c.
     // The duplicate IntAdd is removed, reducing the trace by 1 op.
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
 
@@ -333,7 +333,7 @@ fn test_multiple_optimization_passes() {
 
     // Compile and execute to verify correctness
     let mut backend = CraneliftBackend::new();
-    let mut token = LoopToken::new(4);
+    let mut token = JitCellToken::new(4);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -362,7 +362,7 @@ fn test_bridge_end_to_end() {
     //   -> cmp = i2 > 0 -> guard_true(cmp) -> jump(i2, sum2)
     //
     // When guard fails (i2 <= 0), compile a bridge that doubles the sum.
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
@@ -387,7 +387,7 @@ fn test_bridge_end_to_end() {
     constants.insert(1001, 0i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(10);
+    let mut token = JitCellToken::new(10);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -409,7 +409,7 @@ fn test_bridge_end_to_end() {
 
     // Now compile a bridge for the guard failure.
     // Bridge takes (i, sum) and returns sum * 2.
-    let mut bridge_rec = TraceRecorder::new();
+    let mut bridge_rec = Trace::new();
     let bi = bridge_rec.record_input_arg(Type::Int);
     let bsum = bridge_rec.record_input_arg(Type::Int);
     let _ = bi; // bridge ignores i
@@ -482,12 +482,12 @@ fn floor_mod(a: i64, b: i64) -> i64 {
 ///   sh = UINT_RSHIFT(mul, i)
 ///   result = sh ^ t
 ///   finish(result)
-fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, LoopToken) {
+fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellToken) {
     let (k, i) = magic_numbers(m);
 
-    // Record the magic-number division sequence using TraceRecorder
+    // Record the magic-number division sequence using Trace
     // so that OpRef indexing is handled correctly.
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     // Constants via high OpRef indices.
@@ -516,7 +516,7 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, LoopToken)
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(token_id);
+    let mut token = JitCellToken::new(token_id);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -525,10 +525,10 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, LoopToken)
 }
 
 /// Build a magic-number modulo trace: result = n - (n // m) * m.
-fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, LoopToken) {
+fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellToken) {
     let (k, i) = magic_numbers(m);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     let const_k = OpRef(1000);
@@ -557,7 +557,7 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, LoopToken)
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(token_id);
+    let mut token = JitCellToken::new(token_id);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -571,11 +571,11 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, LoopToken)
 ///   adjusted = x + correction
 ///   result = adjusted >> shift
 ///   finish(result)
-fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBackend, LoopToken) {
+fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBackend, JitCellToken) {
     assert!(divisor > 1 && divisor.count_ones() == 1);
     let shift = divisor.trailing_zeros();
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     let const_63 = OpRef(1000);
@@ -597,7 +597,7 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(token_id);
+    let mut token = JitCellToken::new(token_id);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -760,7 +760,7 @@ fn test_vec_int_add_simd() {
     // r0 = VecUnpackI(vec6, 0, 2)
     // r1 = VecUnpackI(vec6, 1, 2)
     // finish(r0, r1)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
     let c = rec.record_input_arg(Type::Int);
@@ -789,7 +789,7 @@ fn test_vec_int_add_simd() {
     constants.insert(1002, 2i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(300);
+    let mut token = JitCellToken::new(300);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -822,7 +822,7 @@ fn test_vec_int_add_simd() {
 
 #[test]
 fn test_vec_int_sub_simd() {
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
     let c = rec.record_input_arg(Type::Int);
@@ -851,7 +851,7 @@ fn test_vec_int_sub_simd() {
     constants.insert(1002, 2i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(301);
+    let mut token = JitCellToken::new(301);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -871,7 +871,7 @@ fn test_vec_int_sub_simd() {
 
 #[test]
 fn test_vec_int_mul_simd() {
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
     let c = rec.record_input_arg(Type::Int);
@@ -900,7 +900,7 @@ fn test_vec_int_mul_simd() {
     constants.insert(1002, 2i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(302);
+    let mut token = JitCellToken::new(302);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -927,7 +927,7 @@ fn test_vec_expand_add_simd() {
     // r0 = unpack(vec_r, 0)
     // r1 = unpack(vec_r, 1)
     // finish(r0, r1)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
     let s = rec.record_input_arg(Type::Int);
@@ -953,7 +953,7 @@ fn test_vec_expand_add_simd() {
     constants.insert(1002, 2i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(303);
+    let mut token = JitCellToken::new(303);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -982,7 +982,7 @@ fn test_vec_float_add_simd() {
     // Simpler: just use Int paths throughout, packing f64 bit patterns
     // into I64X2 via VecPackI, then use VecFloatAdd (which handles the
     // bitcast internally), then VecUnpackI to get scalar i64 back.
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
     let c = rec.record_input_arg(Type::Int);
@@ -1014,7 +1014,7 @@ fn test_vec_float_add_simd() {
     constants.insert(1002, 2i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(304);
+    let mut token = JitCellToken::new(304);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -1055,7 +1055,7 @@ fn test_vec_chained_add_mul_simd() {
     // r0 = unpack(vec_result, 0)
     // r1 = unpack(vec_result, 1)
     // finish(r0, r1)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
     let c = rec.record_input_arg(Type::Int);
@@ -1093,7 +1093,7 @@ fn test_vec_chained_add_mul_simd() {
     constants.insert(1002, 2i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(305);
+    let mut token = JitCellToken::new(305);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -1353,7 +1353,7 @@ fn test_stress_intdiv_intbounds_interaction() {
     // === Part B: E2E magic number division with guards ===
     let (k, i_shift) = magic_numbers(7);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     let const_0 = OpRef(1000);
@@ -1387,7 +1387,7 @@ fn test_stress_intdiv_intbounds_interaction() {
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants_b);
 
-    let mut token = LoopToken::new(400);
+    let mut token = JitCellToken::new(400);
     backend
         .compile_loop(&trace.inputargs, &optimized_b, &mut token)
         .expect("compilation should succeed");
@@ -1437,13 +1437,13 @@ fn test_stress_intdiv_intbounds_interaction() {
 //
 // Expected after optimization:
 //   - cmp2 eliminated by CSE (OptPure)
-//   - second guard_true eliminated (duplicate by OptGuard)
+//   - second guard_true eliminated (duplicate by GuardStrengthenOpt)
 //   - sq2 eliminated by CSE (OptPure), forwarded to sq
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_stress_loop_multi_pass() {
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let i = rec.record_input_arg(Type::Int);
     let acc = rec.record_input_arg(Type::Int);
 
@@ -1517,7 +1517,7 @@ fn test_stress_loop_multi_pass() {
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(401);
+    let mut token = JitCellToken::new(401);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -1763,7 +1763,7 @@ fn test_stress_string_virtualization() {
 
 #[test]
 fn test_stress_loop_intbounds_guard_cse() {
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
     let acc = rec.record_input_arg(Type::Int);
 
@@ -1832,7 +1832,7 @@ fn test_stress_loop_intbounds_guard_cse() {
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(402);
+    let mut token = JitCellToken::new(402);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -1886,7 +1886,7 @@ fn test_stress_loop_intbounds_guard_cse() {
 
 #[test]
 fn test_stress_cse_chain() {
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
 
@@ -1918,7 +1918,7 @@ fn test_stress_cse_chain() {
 
     // Compile and execute.
     let mut backend = CraneliftBackend::new();
-    let mut token = LoopToken::new(403);
+    let mut token = JitCellToken::new(403);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -1958,7 +1958,7 @@ fn test_threadlocalref_get_basic() {
     jit_threadlocalref_set(0, 0x544C);
 
     // Build trace: ThreadlocalrefGet(offset=0) -> finish(result)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int); // need at least one input
 
     let const_offset = OpRef(1000); // offset = 0 bytes
@@ -1971,7 +1971,7 @@ fn test_threadlocalref_get_basic() {
     constants.insert(1000, 0i64); // offset 0
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(500);
+    let mut token = JitCellToken::new(500);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -2006,7 +2006,7 @@ fn test_threadlocalref_get_multiple_slots() {
     //   r1 = ThreadlocalrefGet(offset=8)
     //   result = r0 + r1
     //   finish(result)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int);
 
     let const_off0 = OpRef(1000);
@@ -2024,7 +2024,7 @@ fn test_threadlocalref_get_multiple_slots() {
     constants.insert(1001, 8i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(501);
+    let mut token = JitCellToken::new(501);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -2050,7 +2050,7 @@ fn test_threadlocalref_set_and_read_roundtrip() {
     use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
 
     // Build trace once: ThreadlocalrefGet(offset=16) -> finish(result)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int);
 
     let const_offset = OpRef(1000);
@@ -2063,7 +2063,7 @@ fn test_threadlocalref_set_and_read_roundtrip() {
     constants.insert(1000, 16i64); // offset 16 -> slot index 2
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(502);
+    let mut token = JitCellToken::new(502);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
@@ -2103,7 +2103,7 @@ fn test_threadlocalref_thread_isolation() {
         b2.wait(); // synchronize so main can check its own value
         // Read back to confirm child's slot is 0x2222.
         // We can't easily run compiled code on the child thread
-        // (LoopToken/backend not Send), but we can verify via the shim.
+        // (JitCellToken/backend not Send), but we can verify via the shim.
         let base = majit_codegen_cranelift::compiler::jit_threadlocalref_base();
         let val = if base.is_null() { 0 } else { unsafe { *base } };
         val
@@ -2173,7 +2173,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
     // Trace: input(a, b) -> result = call_release_gil_i(ffi_add, a, b) -> finish(result)
     let cd = call_descr_release_gil_i(60, vec![Type::Int, Type::Int]);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
 
@@ -2189,7 +2189,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
     constants.insert(1000, ffi_add as *const () as usize as i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(600);
+    let mut token = JitCellToken::new(600);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("CallReleaseGilI should compile");
@@ -2216,7 +2216,7 @@ fn test_call_release_gil_i_no_args() {
     // CallReleaseGilI with no arguments (like ffi_constant() -> 42).
     let cd = call_descr_release_gil_i(61, vec![]);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int); // need at least one input
     let fn_ptr = OpRef(1000);
 
@@ -2229,7 +2229,7 @@ fn test_call_release_gil_i_no_args() {
     constants.insert(1000, ffi_constant as *const () as usize as i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(601);
+    let mut token = JitCellToken::new(601);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("CallReleaseGilI with no args should compile");
@@ -2254,7 +2254,7 @@ fn test_call_release_gil_n_void_return() {
     // Parity with test_fficall: CallReleaseGilN for void-returning FFI calls.
     let cd = call_descr_release_gil_n(62, vec![Type::Int]);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let input = rec.record_input_arg(Type::Int);
     let fn_ptr = OpRef(1000);
 
@@ -2267,7 +2267,7 @@ fn test_call_release_gil_n_void_return() {
     constants.insert(1000, ffi_sink as *const () as usize as i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(602);
+    let mut token = JitCellToken::new(602);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("CallReleaseGilN should compile");
@@ -2287,7 +2287,7 @@ fn test_call_release_gil_result_flows_through_trace() {
     // Trace: input(x) -> tmp = ffi_add(x, CONST_10) -> result = int_add(tmp, CONST_5) -> finish
     let cd = call_descr_release_gil_i(63, vec![Type::Int, Type::Int]);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
     let fn_ptr = OpRef(1000);
     let const_10 = OpRef(1001);
@@ -2305,7 +2305,7 @@ fn test_call_release_gil_result_flows_through_trace() {
     constants.insert(1002, 5i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(603);
+    let mut token = JitCellToken::new(603);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("trace with CallReleaseGilI + IntAdd should compile");
@@ -2404,7 +2404,7 @@ fn test_raw_store_load_int_roundtrip() {
     let ad = raw_descr_int(8);
     let const_offset = OpRef(1000);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
     let i0 = rec.record_input_arg(Type::Int);
 
@@ -2418,7 +2418,7 @@ fn test_raw_store_load_int_roundtrip() {
     constants.insert(1000, 0i64); // offset 0
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(600);
+    let mut token = JitCellToken::new(600);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("raw int roundtrip compilation should succeed");
@@ -2446,7 +2446,7 @@ fn test_raw_store_load_float_roundtrip() {
     let ad = raw_descr_float();
     let const_offset = OpRef(1000);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
     let f0 = rec.record_input_arg(Type::Float);
 
@@ -2460,7 +2460,7 @@ fn test_raw_store_load_float_roundtrip() {
     constants.insert(1000, 0i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(601);
+    let mut token = JitCellToken::new(601);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("raw float roundtrip compilation should succeed");
@@ -2488,7 +2488,7 @@ fn test_raw_ops_different_offsets_no_interference() {
     let off0 = OpRef(1000);
     let off8 = OpRef(1001);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
     let i0 = rec.record_input_arg(Type::Int);
     let i1 = rec.record_input_arg(Type::Int);
@@ -2510,7 +2510,7 @@ fn test_raw_ops_different_offsets_no_interference() {
     constants.insert(1001, 8i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(602);
+    let mut token = JitCellToken::new(602);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("multi-offset raw ops should compile");
@@ -2545,7 +2545,7 @@ fn test_raw_load_unsigned_byte() {
     });
     let const_offset = OpRef(1000);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
 
     let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, const_offset], ad);
@@ -2557,7 +2557,7 @@ fn test_raw_load_unsigned_byte() {
     constants.insert(1000, 0i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(603);
+    let mut token = JitCellToken::new(603);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("unsigned byte raw load should compile");
@@ -2629,7 +2629,7 @@ fn test_call_release_gil_with_guard_not_forced() {
     // Finish returns the call result.
     let cd = call_descr_may_force_i(70, vec![Type::Ref, Type::Int]);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     // ForceToken produces a Ref-typed value (the current frame handle)
@@ -2652,7 +2652,7 @@ fn test_call_release_gil_with_guard_not_forced() {
     constants.insert(1000, ffi_add_no_force as *const () as usize as i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(700);
+    let mut token = JitCellToken::new(700);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("CallMayForceI + GuardNotForced should compile");
@@ -2691,7 +2691,7 @@ fn test_call_may_force_with_forcing_semantics() {
     // so GuardNotForced fails and we exit through the guard's fail path.
     let cd = call_descr_may_force_i(71, vec![Type::Ref, Type::Int]);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let flag = rec.record_input_arg(Type::Int);
 
     let token_ref = rec.record_op(OpCode::ForceToken, &[]);
@@ -2709,7 +2709,7 @@ fn test_call_may_force_with_forcing_semantics() {
     constants.insert(1000, ffi_maybe_force as *const () as usize as i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(701);
+    let mut token = JitCellToken::new(701);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("CallMayForceI + GuardNotForced (forced) should compile");
@@ -2754,7 +2754,7 @@ fn test_ffi_call_exception_propagation() {
     // jit_exc_raise, so GuardNoException fails and exits through the guard.
     let cd = call_descr_release_gil_i(72, vec![Type::Int]);
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let val = rec.record_input_arg(Type::Int);
 
     let fn_ptr = OpRef(1000);
@@ -2771,7 +2771,7 @@ fn test_ffi_call_exception_propagation() {
     constants.insert(1000, ffi_raise_exception as *const () as usize as i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(702);
+    let mut token = JitCellToken::new(702);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("CallReleaseGilI + GuardNoException should compile");
@@ -2814,7 +2814,7 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     // Execute with x=50: guard passes, finish returns 55.
     // Execute with x=200: result=205, 205 < 100 is false, guard fails.
     // Verify the DeadFrame carries frame_stack metadata.
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     let const_5 = OpRef(1000);
@@ -2835,7 +2835,7 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     constants.insert(1001, 100i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(900);
+    let mut token = JitCellToken::new(900);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -2886,7 +2886,7 @@ fn test_compiled_trace_multi_guard_frame_stacks_query() {
     // Trace: input(x) -> cmp1 = x > 0 -> guard_true(cmp1)
     //        -> result = x + 1 -> cmp2 = result < 1000
     //        -> guard_true(cmp2) -> finish(result)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
     let const_0 = OpRef(1000);
@@ -2911,7 +2911,7 @@ fn test_compiled_trace_multi_guard_frame_stacks_query() {
     constants.insert(1002, 1000i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(901);
+    let mut token = JitCellToken::new(901);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -2961,7 +2961,7 @@ fn test_compiled_trace_multi_guard_frame_stacks_query() {
 fn test_compiled_bridge_guard_failure_has_frame_stack() {
     // Main loop: input(i, sum) -> sum2 = sum + i -> i2 = i - 1
     //            -> cmp = i2 > 0 -> guard_true(cmp) -> jump(i2, sum2)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
@@ -2986,7 +2986,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
 
     backend.set_next_trace_id(910);
     backend.set_next_header_pc(1000);
-    let mut token = LoopToken::new(902);
+    let mut token = JitCellToken::new(902);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("main loop compilation should succeed");
@@ -3023,7 +3023,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     assert!(backend.update_fail_descr_recovery_layout(&token, 910, 0, source_layout));
 
     // Bridge: takes (i, sum), checks sum > 0, returns sum * 2
-    let mut bridge_rec = TraceRecorder::new();
+    let mut bridge_rec = Trace::new();
     let _bi = bridge_rec.record_input_arg(Type::Int);
     let bsum = bridge_rec.record_input_arg(Type::Int);
 
@@ -3118,7 +3118,7 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
 
     backend.set_next_trace_id(920);
     backend.set_next_header_pc(3000);
-    let mut callee_token = LoopToken::new(903);
+    let mut callee_token = JitCellToken::new(903);
     backend
         .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
         .expect("callee compilation should succeed");
@@ -3165,7 +3165,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     // Trace with mixed Int and Float fail args:
     //   input(x_int, x_float) -> cmp = x_int > 0 -> guard_true(cmp, fail_args=[x_int, x_float])
     //   -> finish(x_int)
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     let x_int = rec.record_input_arg(Type::Int);
     let x_float = rec.record_input_arg(Type::Float);
 
@@ -3186,7 +3186,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
 
     backend.set_next_trace_id(930);
     backend.set_next_header_pc(5000);
-    let mut token = LoopToken::new(904);
+    let mut token = JitCellToken::new(904);
     backend
         .compile_loop(&trace.inputargs, &optimized, &mut token)
         .expect("compilation should succeed");
@@ -3278,7 +3278,7 @@ fn test_ffi_exchange_buffer_pattern() {
     let off_result = OpRef(1001); // offset 32
     let fn_ptr = OpRef(1002); // ffi_exchange_buffer_fn
 
-    let mut rec = TraceRecorder::new();
+    let mut rec = Trace::new();
     // Inputs: r0 = exchange buffer pointer, i0 = argument value
     let r0 = rec.record_input_arg(Type::Ref);
     let i0 = rec.record_input_arg(Type::Int);
@@ -3302,7 +3302,7 @@ fn test_ffi_exchange_buffer_pattern() {
     constants.insert(1002, ffi_exchange_buffer_fn as *const () as usize as i64);
     backend.set_constants(constants);
 
-    let mut token = LoopToken::new(950);
+    let mut token = JitCellToken::new(950);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("FFI exchange buffer pattern should compile");

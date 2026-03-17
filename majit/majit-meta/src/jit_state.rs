@@ -5,7 +5,7 @@ use crate::resume::{
     MaterializedValue, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
     ResumeFrameLayoutSummary,
 };
-use crate::trace_ctx::JitDriverDescriptor;
+use crate::trace_ctx::JitDriverStaticData;
 use crate::virtualizable::{
     clear_vable_token, read_all_virtualizable_boxes, write_all_virtualizable_boxes,
     VirtualizableInfo,
@@ -123,7 +123,7 @@ pub trait JitState: Sized {
 
     fn create_sym(meta: &Self::Meta, header_pc: usize) -> Self::Sym;
 
-    fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverDescriptor> {
+    fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverStaticData> {
         None
     }
 

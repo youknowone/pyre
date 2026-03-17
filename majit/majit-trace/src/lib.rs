@@ -7,11 +7,9 @@
 ///
 /// Reference: rpython/jit/metainterp/pyjitpl.py, warmstate.py, counter.py
 pub mod counter;
-pub mod encoding;
 pub mod heapcache;
-pub mod jitlog;
+pub mod logger;
+pub mod opencoder;
 pub mod recorder;
 pub mod trace;
-pub mod warmenterstate;
-/// Backward-compat alias — examples still import `warmstate::*`.
-pub use warmenterstate as warmstate;
+pub mod warmstate;
