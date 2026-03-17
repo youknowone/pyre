@@ -127,7 +127,10 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         OpKind::ConstInt(_) => ConcreteType::Signed,
         OpKind::FieldRead { ty, .. } => valuetype_to_concrete(ty),
         OpKind::ArrayRead { item_ty, .. } => valuetype_to_concrete(item_ty),
-        OpKind::Call { result_ty, .. } => valuetype_to_concrete(result_ty),
+        OpKind::Call { result_ty, .. }
+        | OpKind::CallElidable { result_ty, .. }
+        | OpKind::CallResidual { result_ty, .. }
+        | OpKind::CallMayForce { result_ty, .. } => valuetype_to_concrete(result_ty),
         _ => ConcreteType::Unknown,
     }
 }

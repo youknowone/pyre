@@ -189,7 +189,8 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                     }
                 }
 
-                // ── Call classification ──
+                // ── Call classification → rewrite to typed call ──
+                // RPython jtransform.py: classify calls by effect info
                 OpKind::Call {
                     target,
                     args,
@@ -199,9 +200,32 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                     if effect != "unknown" {
                         notes.push(GraphTransformNote {
                             function: graph.name.clone(),
-                            detail: format!("call {target} classified as {effect}"),
+                            detail: format!("call {target} → {effect}"),
                         });
                         calls_classified += 1;
+                        let rewritten_kind = match effect {
+                            "elidable" => OpKind::CallElidable {
+                                target: target.clone(),
+                                args: args.clone(),
+                                result_ty: result_ty.clone(),
+                            },
+                            "residual" => OpKind::CallResidual {
+                                target: target.clone(),
+                                args: args.clone(),
+                                result_ty: result_ty.clone(),
+                            },
+                            "io" => OpKind::CallMayForce {
+                                target: target.clone(),
+                                args: args.clone(),
+                                result_ty: result_ty.clone(),
+                            },
+                            _ => op.kind.clone(),
+                        };
+                        new_ops.push(Op {
+                            result: op.result,
+                            kind: rewritten_kind,
+                        });
+                        continue;
                     }
                 }
 

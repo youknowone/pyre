@@ -151,6 +151,9 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         OpKind::VableArrayRead { item_ty, .. } => item_ty.clone(),
         OpKind::VableArrayWrite { .. } => ValueType::Void,
         OpKind::VableForce => ValueType::Void,
+        OpKind::CallElidable { result_ty, .. }
+        | OpKind::CallResidual { result_ty, .. }
+        | OpKind::CallMayForce { result_ty, .. } => result_ty.clone(),
         OpKind::Unknown { .. } => ValueType::Unknown,
     }
 }
