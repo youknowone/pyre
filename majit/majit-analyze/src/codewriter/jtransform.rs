@@ -27,10 +27,10 @@ use serde::{Deserialize, Serialize};
 pub enum LoweringRecipe {
     /// Unbox two operands → binary IR op → guard overflow → box result.
     IntBinopWithOverflow {
-        ir_opcode: String,       // e.g., "IntAddOvf"
-        guard: String,           // e.g., "GuardNoOverflow"
-        unbox_fn: String,        // e.g., "trace_unbox_int"
-        box_fn: String,          // e.g., "trace_box_int"
+        ir_opcode: String, // e.g., "IntAddOvf"
+        guard: String,     // e.g., "GuardNoOverflow"
+        unbox_fn: String,  // e.g., "trace_unbox_int"
+        box_fn: String,    // e.g., "trace_box_int"
     },
 
     /// Unbox two operands → binary IR op (no overflow) → box result.
@@ -63,8 +63,8 @@ pub enum LoweringRecipe {
 
     /// Read from frame locals array → getarrayitem_raw.
     LocalRead {
-        array_field: String,     // e.g., "locals_w"
-        index_source: String,    // e.g., "oparg"
+        array_field: String,  // e.g., "locals_w"
+        index_source: String, // e.g., "oparg"
     },
 
     /// Write to frame locals array → setarrayitem_raw.
@@ -75,13 +75,11 @@ pub enum LoweringRecipe {
 
     /// Load a constant from the code object's constant pool.
     ConstLoad {
-        pool_field: String,      // e.g., "co_consts"
+        pool_field: String, // e.g., "co_consts"
     },
 
     /// Guard on truth value → GuardTrue/GuardFalse.
-    TruthCheck {
-        unbox_fn: String,
-    },
+    TruthCheck { unbox_fn: String },
 
     /// Function call → call_assembler or residual call.
     FunctionCall {
@@ -90,31 +88,24 @@ pub enum LoweringRecipe {
     },
 
     /// Iterator protocol: get next value, guard not exhausted.
-    IterNext {
-        step_fn: String,
-    },
+    IterNext { step_fn: String },
 
     /// Jump (unconditional).
     Jump,
 
     /// Conditional jump with guard.
     ConditionalJump {
-        guard_kind: String,      // "GuardTrue" or "GuardFalse"
+        guard_kind: String, // "GuardTrue" or "GuardFalse"
     },
 
     /// Return value from function.
     Return,
 
     /// Namespace access (load/store global/name).
-    NamespaceAccess {
-        is_load: bool,
-        is_global: bool,
-    },
+    NamespaceAccess { is_load: bool, is_global: bool },
 
     /// Collection construction → NEW_ARRAY + setitems.
-    BuildCollection {
-        kind: String,
-    },
+    BuildCollection { kind: String },
 
     /// Unpack sequence → multiple getarrayitems.
     UnpackSequence,
@@ -136,27 +127,35 @@ pub enum LoweringRecipe {
 
     /// Residual call — emit opaque CALL_I/CALL_R.
     /// RPython `handle_residual_call` with `EffectInfo.OS_NONE`.
-    ResidualCall {
-        helper_name: String,
-    },
+    ResidualCall { helper_name: String },
 
     /// Pure residual call — emit CALL_PURE (no side effects, elidable).
     /// RPython `handle_residual_call` with `EF_ELIDABLE`.
-    PureCall {
-        helper_name: String,
-    },
+    PureCall { helper_name: String },
 
     /// May-force residual call — emit CALL_MAY_FORCE (can trigger GC).
     /// RPython `handle_residual_call` with `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`.
-    MayForceCall {
-        helper_name: String,
-    },
+    MayForceCall { helper_name: String },
 
     /// Loop-invariant call — result cached across loop iterations.
     /// RPython `handle_residual_call` with `EF_LOOPINVARIANT`.
-    LoopInvariantCall {
-        helper_name: String,
-    },
+    LoopInvariantCall { helper_name: String },
+
+    /// Virtualizable field read → bypasses heap, reads from JIT state.
+    /// RPython `getfield_vable_*` from jtransform.py:760.
+    VableFieldRead { field_index: usize, field_type: String },
+
+    /// Virtualizable field write → writes to JIT state, not heap.
+    VableFieldWrite { field_index: usize, field_type: String },
+
+    /// Virtualizable array item read → getarrayitem_vable.
+    VableArrayRead { array_index: usize, item_type: String },
+
+    /// Virtualizable array item write → setarrayitem_vable.
+    VableArrayWrite { array_index: usize, item_type: String },
+
+    /// Virtualizable array length → arraylen_vable.
+    VableArrayLen { array_index: usize },
 
     /// Abort — interpreter fallback.
     Abort,
@@ -169,7 +168,10 @@ pub enum LoweringRecipe {
 /// optional configuration.
 pub fn transform_pattern(pattern: &TracePattern, config: &TransformConfig) -> LoweringRecipe {
     match pattern {
-        TracePattern::UnboxIntBinop { op_name, has_overflow_guard } => {
+        TracePattern::UnboxIntBinop {
+            op_name,
+            has_overflow_guard,
+        } => {
             let ir_opcode = map_binop_name(op_name);
             if *has_overflow_guard {
                 LoweringRecipe::IntBinopWithOverflow {
@@ -186,27 +188,21 @@ pub fn transform_pattern(pattern: &TracePattern, config: &TransformConfig) -> Lo
                 }
             }
         }
-        TracePattern::UnboxFloatBinop { op_name } => {
-            LoweringRecipe::FloatBinop {
-                ir_opcode: map_float_binop_name(op_name),
-                unbox_fn: config.float_unbox_fn.clone(),
-                box_fn: config.float_box_fn.clone(),
-            }
-        }
-        TracePattern::UnboxIntCompare { op_name } => {
-            LoweringRecipe::IntCompare {
-                ir_opcode: map_compare_name(op_name),
-                unbox_fn: config.int_unbox_fn.clone(),
-                box_fn: config.bool_box_fn.clone(),
-            }
-        }
-        TracePattern::UnboxIntUnary { op_name } => {
-            LoweringRecipe::IntUnary {
-                ir_opcode: map_unary_name(op_name),
-                unbox_fn: config.int_unbox_fn.clone(),
-                box_fn: config.int_box_fn.clone(),
-            }
-        }
+        TracePattern::UnboxFloatBinop { op_name } => LoweringRecipe::FloatBinop {
+            ir_opcode: map_float_binop_name(op_name),
+            unbox_fn: config.float_unbox_fn.clone(),
+            box_fn: config.float_box_fn.clone(),
+        },
+        TracePattern::UnboxIntCompare { op_name } => LoweringRecipe::IntCompare {
+            ir_opcode: map_compare_name(op_name),
+            unbox_fn: config.int_unbox_fn.clone(),
+            box_fn: config.bool_box_fn.clone(),
+        },
+        TracePattern::UnboxIntUnary { op_name } => LoweringRecipe::IntUnary {
+            ir_opcode: map_unary_name(op_name),
+            unbox_fn: config.int_unbox_fn.clone(),
+            box_fn: config.int_box_fn.clone(),
+        },
         TracePattern::LocalRead => LoweringRecipe::LocalRead {
             array_field: config.locals_field.clone(),
             index_source: "oparg".into(),
@@ -235,15 +231,13 @@ pub fn transform_pattern(pattern: &TracePattern, config: &TransformConfig) -> Lo
             guard_kind: "GuardTrue".into(),
         },
         TracePattern::Return => LoweringRecipe::Return,
-        TracePattern::NamespaceAccess { is_load, is_global } => {
-            LoweringRecipe::NamespaceAccess {
-                is_load: *is_load,
-                is_global: *is_global,
-            }
-        }
-        TracePattern::BuildCollection { kind } => LoweringRecipe::BuildCollection {
-            kind: kind.clone(),
+        TracePattern::NamespaceAccess { is_load, is_global } => LoweringRecipe::NamespaceAccess {
+            is_load: *is_load,
+            is_global: *is_global,
         },
+        TracePattern::BuildCollection { kind } => {
+            LoweringRecipe::BuildCollection { kind: kind.clone() }
+        }
         TracePattern::UnpackSequence => LoweringRecipe::UnpackSequence,
         TracePattern::SequenceSetitem => LoweringRecipe::SequenceSetitem,
         TracePattern::CollectionAppend => LoweringRecipe::CollectionAppend,
@@ -252,10 +246,18 @@ pub fn transform_pattern(pattern: &TracePattern, config: &TransformConfig) -> Lo
         TracePattern::Noop => LoweringRecipe::Noop,
         TracePattern::Residual { helper_name } => {
             match (config.classify_call_effect)(helper_name) {
-                "pure" => LoweringRecipe::PureCall { helper_name: helper_name.clone() },
-                "may_force" => LoweringRecipe::MayForceCall { helper_name: helper_name.clone() },
-                "loop_invariant" => LoweringRecipe::LoopInvariantCall { helper_name: helper_name.clone() },
-                _ => LoweringRecipe::ResidualCall { helper_name: helper_name.clone() },
+                "pure" => LoweringRecipe::PureCall {
+                    helper_name: helper_name.clone(),
+                },
+                "may_force" => LoweringRecipe::MayForceCall {
+                    helper_name: helper_name.clone(),
+                },
+                "loop_invariant" => LoweringRecipe::LoopInvariantCall {
+                    helper_name: helper_name.clone(),
+                },
+                _ => LoweringRecipe::ResidualCall {
+                    helper_name: helper_name.clone(),
+                },
             }
         }
         TracePattern::Unknown => LoweringRecipe::Abort,
@@ -385,7 +387,9 @@ mod tests {
         let config = TransformConfig::default();
         let recipe = transform_pattern(&pattern, &config);
         match recipe {
-            LoweringRecipe::IntBinopWithOverflow { ir_opcode, guard, .. } => {
+            LoweringRecipe::IntBinopWithOverflow {
+                ir_opcode, guard, ..
+            } => {
                 assert_eq!(ir_opcode, "IntAddOvf");
                 assert_eq!(guard, "GuardNoOverflow");
             }
@@ -457,7 +461,10 @@ mod tests {
         let config = TransformConfig::default();
         let recipes = transform_all(&arms, &config);
         assert_eq!(recipes.len(), 3);
-        assert!(matches!(recipes[0].1, LoweringRecipe::IntBinopNoOverflow { .. }));
+        assert!(matches!(
+            recipes[0].1,
+            LoweringRecipe::IntBinopNoOverflow { .. }
+        ));
         assert!(matches!(recipes[1].1, LoweringRecipe::LocalRead { .. }));
         assert!(matches!(recipes[2].1, LoweringRecipe::Abort));
     }
