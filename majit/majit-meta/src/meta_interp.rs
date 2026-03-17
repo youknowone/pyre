@@ -865,6 +865,10 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state.set_function_threshold(threshold);
     }
 
+    pub fn warm_state_ref(&self) -> &majit_trace::warmenterstate::WarmEnterState {
+        &self.warm_state
+    }
+
     /// Decay all counters to avoid stale hotness data.
     pub fn decay_counters(&mut self) {
         self.warm_state.decay_counters();
