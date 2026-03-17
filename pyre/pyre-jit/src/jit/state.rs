@@ -1518,73 +1518,7 @@ impl TraceFrameState {
                 let (driver, _) = crate::eval::driver_pair();
                 let nargs = args.len();
 
-                // 1. Inline: check first via should_inline_with_ctx
-                let inline_decision = self.with_ctx(|_this, ctx| {
-                    driver.should_inline_with_ctx(callee_key, ctx)
-                });
-                if inline_decision == majit_meta::InlineDecision::Inline {
-                    if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
-                        return self.with_ctx(|this, ctx| {
-                            this.guard_value(ctx, callable, concrete_callable as i64);
-
-                            // Emit IR to create callee frame at compiled-code runtime
-                            let mut helper_args = vec![this.frame(), callable];
-                            helper_args.extend_from_slice(args);
-                            let callee_frame_opref = ctx.call_int(frame_helper, &helper_args);
-
-                            // Create the concrete callee frame (for trace-time execution)
-                            let caller_frame_ptr =
-                                this.concrete_frame as *const pyre_interp::frame::PyFrame;
-                            let caller_frame = &*caller_frame_ptr;
-                            let code_ptr = w_func_get_code_ptr(concrete_callable);
-                            let globals = pyre_runtime::w_func_get_globals(concrete_callable);
-                            let func_code = code_ptr as *const CodeObject;
-
-                            let concrete_sd =
-                                (*(this.concrete_frame
-                                    as *const pyre_interp::frame::PyFrame))
-                                    .stack_depth;
-                            let concrete_args: Vec<PyObjectRef> = (0..nargs)
-                                .map(|i| {
-                                    concrete_stack_value(
-                                        this.concrete_frame,
-                                        concrete_sd - nargs + i,
-                                    )
-                                    .unwrap_or(std::ptr::null_mut())
-                                })
-                                .collect();
-                            let mut callee_frame = pyre_interp::frame::PyFrame::new_for_call(
-                                func_code,
-                                &concrete_args,
-                                globals,
-                                caller_frame.execution_context,
-                            );
-                            callee_frame.fix_array_ptrs();
-
-                            // Record EnterPortalFrame
-                            driver.enter_inline_frame(callee_key);
-
-                            // Store pending inline call in sym for iterative processing
-                            // Allocate a valid placeholder OpRef. When the callee
-                            // returns, ctx.replace_op() replaces ALL trace
-                            // references to this with the actual result.
-                            let placeholder = ctx.const_int(0);
-
-                            this.sym_mut().pending_inline = Some(PendingInlineCall {
-                                callee_key,
-                                callee_frame_opref,
-                                concrete_callee_frame: Box::new(callee_frame),
-                                code: func_code,
-                                nargs,
-                                placeholder,
-                            });
-
-                            Ok(placeholder)
-                        });
-                    }
-                }
-
-                // 2. CallAssembler: callee has compiled code
+                // 1. CallAssembler: callee has compiled code
                 let token_number = driver
                     .get_loop_token_number(callee_key)
                     .or_else(|| driver.get_pending_token_number(callee_key));

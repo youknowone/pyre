@@ -605,6 +605,17 @@ impl WarmEnterState {
         *count >= self.function_threshold
     }
 
+    /// Boost a function's entry counter to threshold - 1.
+    /// Next call through eval_with_jit will trigger tracing.
+    /// PyPy equivalent: mark for separate functrace after recursive depth limit.
+    pub fn boost_function_entry(&mut self, callee_key: u64) {
+        let threshold = self.function_threshold;
+        let count = self.function_call_counts.entry(callee_key).or_insert(0);
+        if *count < threshold.saturating_sub(1) {
+            *count = threshold.saturating_sub(1);
+        }
+    }
+
     /// Check if inlining is allowed at the given depth.
     pub fn can_inline_at_depth(&self, current_depth: usize) -> bool {
         (current_depth as u32) < self.max_inline_depth
