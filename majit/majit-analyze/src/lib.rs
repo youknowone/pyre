@@ -595,4 +595,24 @@ mod tests {
             "should produce flat ops from real source"
         );
     }
+
+    #[test]
+    fn test_analyze_full_runs_both_pipelines() {
+        let source = read_pyre_file("pyre-runtime/src/opcode_step.rs");
+        let (legacy, graph_result) = analyze_full(&source);
+
+        // Legacy pipeline should produce opcodes
+        assert!(legacy.opcodes.len() >= 30);
+
+        // Graph pipeline should analyze functions
+        assert!(graph_result.functions.len() >= 5);
+
+        eprintln!(
+            "analyze_full: legacy {} opcodes, graph {} functions / {} blocks / {} ops",
+            legacy.opcodes.len(),
+            graph_result.functions.len(),
+            graph_result.total_blocks,
+            graph_result.total_ops,
+        );
+    }
 }
