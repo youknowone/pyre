@@ -410,7 +410,7 @@ mod tests {
 
         // Record operations up to the limit
         let mut last = i0;
-        for _ in 0..6000 {
+        for _ in 0..TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(rec.is_too_long());
