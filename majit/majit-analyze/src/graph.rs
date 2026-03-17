@@ -284,6 +284,33 @@ impl MajitGraph {
     pub fn is_loop_header(&self, block: BasicBlockId) -> bool {
         self.predecessors(block).iter().any(|&pred| pred.0 >= block.0)
     }
+
+    /// Pretty-print the graph (RPython `graph.show()`).
+    pub fn dump(&self) -> String {
+        let mut out = format!("=== {} ({} blocks, {} ops) ===\n", self.name, self.blocks.len(), self.num_ops());
+        for block in &self.blocks {
+            let args: Vec<String> = block.inputargs.iter().map(|v| self.fmt_value(*v)).collect();
+            if args.is_empty() {
+                out.push_str(&format!("  Block {}:\n", block.id.0));
+            } else {
+                out.push_str(&format!("  Block {}({}):\n", block.id.0, args.join(", ")));
+            }
+            for op in &block.ops {
+                let result = op.result.map(|v| format!("{} = ", self.fmt_value(v))).unwrap_or_default();
+                out.push_str(&format!("    {}{:?}\n", result, op.kind));
+            }
+            out.push_str(&format!("    → {:?}\n", block.terminator));
+        }
+        out
+    }
+
+    fn fmt_value(&self, id: ValueId) -> String {
+        if let Some(name) = self.value_name(id) {
+            format!("v{}:{}", id.0, name)
+        } else {
+            format!("v{}", id.0)
+        }
+    }
 }
 
 #[cfg(test)]
