@@ -102,7 +102,20 @@ pub struct MethodInfo {
     pub body_summary: String,
 }
 
-/// Analyze a single source file.
+/// Full analysis: parse + build graph + run pipeline + classify.
+///
+/// This is the recommended entry point. It runs both the legacy
+/// string-based analysis (for backward compatibility) and the new
+/// graph-based pipeline (for RPython-parity classification).
+pub fn analyze_full(source: &str) -> (AnalysisResult, passes::ProgramPipelineResult) {
+    let legacy = analyze(source);
+    let parsed = parse::parse_source(source);
+    let program = front::build_semantic_program(&parsed);
+    let pipeline = passes::analyze_program(&program, &passes::PipelineConfig::default());
+    (legacy, pipeline)
+}
+
+/// Analyze a single source file (legacy string-based path).
 pub fn analyze(source: &str) -> AnalysisResult {
     analyze_multiple(&[source])
 }
