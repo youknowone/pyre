@@ -565,15 +565,34 @@ impl TraceCtx {
         }
     }
 
+    /// RPython pyjitpl.py:1114 `_nonstandard_virtualizable()`.
+    ///
+    /// Returns true if `vable_opref` is NOT the standard virtualizable
+    /// (i.e., `vable_opref != virtualizable_boxes[-1]`). Nonstandard
+    /// virtualizables must fall back to heap operations.
+    fn is_nonstandard_virtualizable(&self, vable_opref: OpRef) -> bool {
+        if let Some(ref boxes) = self.virtualizable_boxes {
+            if let Some(&vbox) = boxes.last() {
+                return vbox != vable_opref;
+            }
+        }
+        true // No boxes → treat as nonstandard
+    }
+
     /// Record a virtualizable field read (GETFIELD_GC_I/R/F).
     ///
-    /// If standard virtualizable boxes are initialized and the field offset
-    /// matches a known static field, returns the box value directly without
-    /// emitting a heap operation. Otherwise falls back to GETFIELD_GC.
+    /// RPython pyjitpl.py:1161 `opimpl_getfield_vable_i`.
+    ///
+    /// Standard virtualizable: returns box value directly (no heap op).
+    /// Nonstandard (escaped/virtual): falls back to GETFIELD_GC.
     pub fn vable_getfield_int(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
-        if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info) {
-            if let Some(index) = info.static_field_index(field_offset) {
-                return boxes[index];
+        if !self.is_nonstandard_virtualizable(vable_opref) {
+            if let (Some(boxes), Some(info)) =
+                (&self.virtualizable_boxes, &self.virtualizable_info)
+            {
+                if let Some(index) = info.static_field_index(field_offset) {
+                    return boxes[index];
+                }
             }
         }
         let offset_ref = self.const_int(field_offset as i64);
@@ -587,20 +606,20 @@ impl TraceCtx {
 
     /// Record a virtualizable field write (SETFIELD_GC).
     ///
-    /// If standard virtualizable boxes are initialized and the field offset
-    /// matches a known static field, updates the box directly without
-    /// emitting a heap operation. Otherwise falls back to SETFIELD_GC.
+    /// RPython pyjitpl.py:1183 `_opimpl_setfield_vable`.
+    ///
+    /// Standard: updates box directly. Nonstandard: falls back to SETFIELD_GC.
     pub fn vable_setfield(&mut self, vable_opref: OpRef, field_offset: usize, value: OpRef) {
-        // Check standard virtualizable path. We need to borrow info immutably
-        // before mutably borrowing boxes, so look up the index first.
-        let index = self
-            .virtualizable_info
-            .as_ref()
-            .and_then(|info| info.static_field_index(field_offset));
-        if let Some(idx) = index {
-            if let Some(boxes) = &mut self.virtualizable_boxes {
-                boxes[idx] = value;
-                return;
+        if !self.is_nonstandard_virtualizable(vable_opref) {
+            let index = self
+                .virtualizable_info
+                .as_ref()
+                .and_then(|info| info.static_field_index(field_offset));
+            if let Some(idx) = index {
+                if let Some(boxes) = &mut self.virtualizable_boxes {
+                    boxes[idx] = value;
+                    return;
+                }
             }
         }
         let offset_ref = self.const_int(field_offset as i64);
@@ -613,10 +632,16 @@ impl TraceCtx {
     }
 
     /// Record a virtualizable ref field read (GETFIELD_GC_R).
+    ///
+    /// RPython pyjitpl.py:1168 `opimpl_getfield_vable_r`.
     pub fn vable_getfield_ref(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
-        if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info) {
-            if let Some(index) = info.static_field_index(field_offset) {
-                return boxes[index];
+        if !self.is_nonstandard_virtualizable(vable_opref) {
+            if let (Some(boxes), Some(info)) =
+                (&self.virtualizable_boxes, &self.virtualizable_info)
+            {
+                if let Some(index) = info.static_field_index(field_offset) {
+                    return boxes[index];
+                }
             }
         }
         let offset_ref = self.const_int(field_offset as i64);
@@ -629,10 +654,16 @@ impl TraceCtx {
     }
 
     /// Record a virtualizable float field read (GETFIELD_GC_F).
+    ///
+    /// RPython pyjitpl.py:1175 `opimpl_getfield_vable_f`.
     pub fn vable_getfield_float(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
-        if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info) {
-            if let Some(index) = info.static_field_index(field_offset) {
-                return boxes[index];
+        if !self.is_nonstandard_virtualizable(vable_opref) {
+            if let (Some(boxes), Some(info)) =
+                (&self.virtualizable_boxes, &self.virtualizable_info)
+            {
+                if let Some(index) = info.static_field_index(field_offset) {
+                    return boxes[index];
+                }
             }
         }
         let offset_ref = self.const_int(field_offset as i64);
