@@ -231,6 +231,57 @@ pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePatt
     None
 }
 
+/// Configuration for virtualizable-aware classification.
+///
+/// When provided, the classifier rewrites field/array accesses on
+/// virtualizable fields to VableFieldRead/VableArrayRead patterns
+/// instead of LocalRead/LocalWrite.
+pub struct VirtualizableClassifyConfig {
+    /// Static field names on the virtualizable.
+    pub field_names: Vec<(String, usize, String)>, // (name, index, type)
+    /// Array field names on the virtualizable.
+    pub array_names: Vec<(String, usize, String)>, // (name, index, item_type)
+}
+
+/// Classify a method body with optional virtualizable config.
+pub fn classify_method_body_with_vable(
+    body_summary: &str,
+    vable: Option<&VirtualizableClassifyConfig>,
+) -> Option<TracePattern> {
+    // Check virtualizable array access first (before generic LocalRead/Write)
+    if let Some(config) = vable {
+        for (name, index, item_type) in &config.array_names {
+            if body_summary.contains(name) {
+                if body_summary.contains("push") || body_summary.contains("store") {
+                    return Some(TracePattern::VableArrayWrite {
+                        array_index: *index,
+                        item_type: item_type.clone(),
+                    });
+                }
+                return Some(TracePattern::VableArrayRead {
+                    array_index: *index,
+                    item_type: item_type.clone(),
+                });
+            }
+        }
+        for (name, index, field_type) in &config.field_names {
+            if body_summary.contains(name) {
+                if body_summary.contains("=") || body_summary.contains("set") {
+                    return Some(TracePattern::VableFieldWrite {
+                        field_index: *index,
+                        field_type: field_type.clone(),
+                    });
+                }
+                return Some(TracePattern::VableFieldRead {
+                    field_index: *index,
+                    field_type: field_type.clone(),
+                });
+            }
+        }
+    }
+    classify_method_body(body_summary)
+}
+
 /// Classify a method body summary into a trace pattern.
 pub fn classify_method_body(body_summary: &str) -> Option<TracePattern> {
     // Heuristic pattern matching on the body text
