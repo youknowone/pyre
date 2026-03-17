@@ -2449,22 +2449,6 @@ fn normalize_ops_for_codegen(
     }
     for &k in constants.keys() { all_refs.insert(k); }
 
-    // Check if renumbering is needed (gap ratio > 2x)
-    let max_ref = all_refs.iter().copied().max().unwrap_or(0);
-    if (max_ref as usize) < all_refs.len() * 2 {
-        // Indices are already dense enough — skip renumbering.
-        let identity: std::collections::HashMap<u32, u32> =
-            all_refs.into_iter().map(|i| (i, i)).collect();
-        let normalized = ops.iter().enumerate().map(|(op_idx, op)| {
-            let mut n = op.clone();
-            if n.result_type() != Type::Void && n.pos.is_none() {
-                n.pos = OpRef(num_inputs + op_idx as u32);
-            }
-            n
-        }).collect();
-        return (normalized, identity);
-    }
-
     // Build dense remapping: sort all refs and assign sequential indices.
     let mut sorted_refs: Vec<u32> = all_refs.into_iter().collect();
     sorted_refs.sort_unstable();
