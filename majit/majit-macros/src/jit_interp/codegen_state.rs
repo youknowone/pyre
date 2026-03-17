@@ -31,6 +31,49 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
     } else {
         quote! {}
     };
+    let virtualizable = config.storage.virtualizable;
+
+    // ── Frame virtualizable (VirtualizableDecl) code generation ──
+    let vable_info_fn = config.virtualizable_decl.as_ref().map(|decl| {
+        let token_offset = &decl.token_offset;
+        let field_adds: Vec<TokenStream> = decl.fields.iter().map(|f| {
+            let name = f.name.to_string();
+            let offset = &f.offset;
+            let tp = match f.field_type.to_string().as_str() {
+                "ref" => quote! { majit_ir::Type::Ref },
+                "float" => quote! { majit_ir::Type::Float },
+                _ => quote! { majit_ir::Type::Int },
+            };
+            quote! {
+                __info.add_field(#name, #tp, #offset);
+            }
+        }).collect();
+        let array_adds: Vec<TokenStream> = decl.arrays.iter().map(|a| {
+            let name = a.name.to_string();
+            let offset = &a.offset;
+            let tp = match a.item_type.to_string().as_str() {
+                "ref" => quote! { majit_ir::Type::Ref },
+                "float" => quote! { majit_ir::Type::Float },
+                _ => quote! { majit_ir::Type::Int },
+            };
+            quote! {
+                __info.add_array_field(#name, #tp, #offset);
+            }
+        }).collect();
+        quote! {
+            /// Build VirtualizableInfo for the interpreter frame.
+            ///
+            /// Auto-generated from `virtualizable_fields` declaration.
+            /// RPython equivalent: VirtualizableInfo.__init__() in virtualizable.py.
+            #[allow(non_snake_case)]
+            fn __build_virtualizable_info() -> majit_meta::virtualizable::VirtualizableInfo {
+                let mut __info = majit_meta::virtualizable::VirtualizableInfo::new(#token_offset);
+                #(#field_adds)*
+                #(#array_adds)*
+                __info
+            }
+        }
+    });
 
     quote! {
         /// Compiled loop metadata: which storages and how many slots each had.
@@ -130,10 +173,18 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
-                let layout = #scan_fn(program, header_pc, self.#sel_field)
-                    .iter()
-                    .map(|&s| (s, self.#pool_field.get(s).len()))
-                    .collect();
+                let layout = if #virtualizable {
+                    // Virtualizable: don't record depths (stacks stay on heap)
+                    #scan_fn(program, header_pc, self.#sel_field)
+                        .iter()
+                        .map(|&s| (s, 0usize))
+                        .collect()
+                } else {
+                    #scan_fn(program, header_pc, self.#sel_field)
+                        .iter()
+                        .map(|&s| (s, self.#pool_field.get(s).len()))
+                        .collect()
+                };
                 __JitMeta {
                     storage_layout: layout,
                     initial_selected: self.#sel_field,
@@ -141,6 +192,10 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
+                if #virtualizable {
+                    // Virtualizable: stacks stay on heap, nothing to extract
+                    return Vec::new();
+                }
                 let mut values = Vec::new();
                 for &(sidx, num_slots) in &meta.storage_layout {
                     let store = self.#pool_field.get(sidx);
@@ -171,6 +226,10 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
+                if #virtualizable {
+                    // Virtualizable: only check selected, depth is irrelevant
+                    return meta.initial_selected == self.#sel_field;
+                }
                 meta.initial_selected == self.#sel_field
                     && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
                         self.#pool_field.get(sidx).len() == expected_len
@@ -178,6 +237,12 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
+                if #virtualizable {
+                    // Virtualizable: stacks are on heap, nothing to restore.
+                    // Just restore the selected index.
+                    self.#sel_field = meta.initial_selected;
+                    return;
+                }
                 let mut offset = 0;
                 for &(sidx, num_slots) in &meta.storage_layout {
                     let end = offset + num_slots;
@@ -205,7 +270,13 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
                 args
             }
 
+            #vable_info_fn
+
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
+                if #virtualizable {
+                    // Virtualizable: only check selected matches
+                    return sym.current_selected == meta.initial_selected;
+                }
                 sym.current_selected == meta.initial_selected
                     && sym.storage_layout.len() == meta.storage_layout.len()
                     && sym
