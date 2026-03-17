@@ -543,4 +543,42 @@ mod tests {
         eprintln!("load_fast classified as: {:?}", pattern);
         // load_fast reads a field + reads array → should be detectable
     }
+
+    #[test]
+    fn test_graph_pipeline_on_pyre_source() {
+        // Run the full graph pipeline on actual pyre interpreter source.
+        // This validates that the pipeline handles real-world Rust code.
+        let source = read_pyre_file("pyre-runtime/src/opcode_step.rs");
+        let parsed = parse::parse_source(&source);
+        let program = front::build_semantic_program(&parsed);
+
+        let config = passes::PipelineConfig::default();
+        let result = passes::analyze_program(&program, &config);
+
+        eprintln!("=== Graph Pipeline on pyre-runtime ===");
+        eprintln!("Functions analyzed: {}", result.functions.len());
+        eprintln!("Total blocks: {}", result.total_blocks);
+        eprintln!("Total flat ops: {}", result.total_ops);
+
+        // Should analyze many functions from the real source
+        assert!(
+            result.functions.len() >= 5,
+            "expected >=5 functions from opcode_step.rs, got {}",
+            result.functions.len()
+        );
+
+        // Should produce multi-block CFGs for functions with control flow
+        let multi_block = result
+            .functions
+            .iter()
+            .filter(|f| f.original_blocks > 1)
+            .count();
+        eprintln!("Functions with multi-block CFG: {multi_block}");
+
+        // Should produce flat ops
+        assert!(
+            result.total_ops > 0,
+            "should produce flat ops from real source"
+        );
+    }
 }
