@@ -67,6 +67,11 @@ pub fn build_semantic_program_with_options(
     SemanticProgram { functions }
 }
 
+/// Public entry for building a graph from a single function AST node.
+pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
+    build_function_graph(func, &AstGraphOptions::default())
+}
+
 fn build_function_graph(func: &ItemFn, options: &AstGraphOptions) -> SemanticFunction {
     let mut graph = MajitGraph::new(func.sig.ident.to_string());
     let mut entry = graph.entry;

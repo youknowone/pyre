@@ -72,6 +72,9 @@ pub struct ResolvedCall {
     pub impl_type: Option<String>,
     pub trait_name: Option<String>,
     pub body_summary: String,
+    /// Pre-built semantic graph (avoids re-parsing body_summary).
+    #[serde(default)]
+    pub graph: Option<graph::MajitGraph>,
 }
 
 /// Struct field layout information
@@ -100,6 +103,9 @@ pub struct TraitImplInfo {
 pub struct MethodInfo {
     pub name: String,
     pub body_summary: String,
+    /// Pre-built semantic graph (avoids re-parsing body_summary).
+    #[serde(default)]
+    pub graph: Option<graph::MajitGraph>,
 }
 
 /// Full analysis: parse + build graph + run pipeline + classify.
@@ -185,6 +191,7 @@ fn resolve_call_chain(
                         impl_type: Some(impl_info.for_type.clone()),
                         trait_name: Some(impl_info.trait_name.clone()),
                         body_summary: method.body_summary.clone(),
+                        graph: method.graph.clone(),
                     });
                 }
             }
@@ -197,6 +204,7 @@ fn resolve_call_chain(
                 impl_type: None,
                 trait_name: None,
                 body_summary: body.clone(),
+                graph: None,
             });
         }
     }
@@ -204,11 +212,18 @@ fn resolve_call_chain(
     arm.resolved_calls = resolved_calls;
 
     // PRIMARY: Graph-based classification.
-    // Parse resolved method bodies into semantic graphs and classify
-    // from graph ops. This is the RPython-parity path — the flow graph
-    // is the canonical intermediate representation for classification.
+    // Use pre-built semantic graphs from parse time (no body_summary re-parse).
+    // This is the RPython-parity path — the flow graph is the canonical IR.
     if arm.trace_pattern.is_none() {
         for call in &arm.resolved_calls {
+            // Use pre-built graph if available
+            if let Some(ref graph) = call.graph {
+                if let Some(pattern) = patterns::classify_from_graph(graph) {
+                    arm.trace_pattern = Some(pattern);
+                    break;
+                }
+            }
+            // Fallback: build graph from body_summary (for free functions)
             if !call.body_summary.is_empty() {
                 let wrapped = format!("fn __body() {{ {} }}", call.body_summary);
                 if let Ok(parsed) = syn::parse_str::<syn::ItemFn>(&wrapped) {
