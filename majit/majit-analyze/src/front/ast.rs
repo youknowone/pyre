@@ -418,25 +418,34 @@ fn lower_expr(
         syn::Expr::Paren(p) => lower_expr(graph, block, &p.expr, options),
 
         // ── unary !x, -x ──
-        syn::Expr::Unary(u) => lower_expr(graph, block, &u.expr, options),
+        syn::Expr::Unary(u) => {
+            let operand = lower_expr(graph, block, &u.expr, options)
+                .unwrap_or_else(|| graph.alloc_value());
+            let op_name = quote!(#u.op).to_string();
+            graph.push_op(
+                *block,
+                OpKind::UnaryOp {
+                    op: op_name,
+                    operand,
+                    result_ty: ValueType::Unknown,
+                },
+                true,
+            )
+        }
 
         // ── binary a + b ──
         syn::Expr::Binary(bin) => {
-            let lhs = lower_expr(graph, block, &bin.left, options);
-            let rhs = lower_expr(graph, block, &bin.right, options);
-            let mut args = Vec::new();
-            if let Some(l) = lhs {
-                args.push(l);
-            }
-            if let Some(r) = rhs {
-                args.push(r);
-            }
+            let lhs = lower_expr(graph, block, &bin.left, options)
+                .unwrap_or_else(|| graph.alloc_value());
+            let rhs = lower_expr(graph, block, &bin.right, options)
+                .unwrap_or_else(|| graph.alloc_value());
             let op_name = quote!(#bin.op).to_string();
             graph.push_op(
                 *block,
-                OpKind::Call {
-                    target: op_name,
-                    args,
+                OpKind::BinOp {
+                    op: op_name,
+                    lhs,
+                    rhs,
                     result_ty: ValueType::Unknown,
                 },
                 true,

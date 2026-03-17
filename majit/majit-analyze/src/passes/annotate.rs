@@ -150,6 +150,13 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         OpKind::VableFieldWrite { .. } => ValueType::Void,
         OpKind::VableArrayRead { item_ty, .. } => item_ty.clone(),
         OpKind::VableArrayWrite { .. } => ValueType::Void,
+        OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
+            if result_ty != &ValueType::Unknown {
+                result_ty.clone()
+            } else {
+                ValueType::Int // Arithmetic defaults to Int
+            }
+        }
         OpKind::VableForce => ValueType::Void,
         OpKind::CallElidable { result_ty, .. }
         | OpKind::CallResidual { result_ty, .. }

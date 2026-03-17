@@ -95,6 +95,22 @@ pub enum OpKind {
         value: ValueId,
         item_ty: ValueType,
     },
+    /// Binary arithmetic/comparison operation.
+    /// RPython: `int_add`, `int_lt`, etc.
+    BinOp {
+        op: String,
+        lhs: ValueId,
+        rhs: ValueId,
+        result_ty: ValueType,
+    },
+    /// Unary operation.
+    /// RPython: `int_neg`, `bool_not`, etc.
+    UnaryOp {
+        op: String,
+        operand: ValueId,
+        result_ty: ValueType,
+    },
+
     /// Force virtualizable: flush boxes to heap.
     /// RPython: `hint_force_virtualizable`
     VableForce,
