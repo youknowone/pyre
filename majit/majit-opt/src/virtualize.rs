@@ -445,7 +445,7 @@ impl OptVirtualize {
 
     // ── Per-opcode handlers ──
 
-    fn optimize_new_with_vtable(&mut self, op: &Op, _ctx: &mut OptContext) -> PassResult {
+    fn optimize_new_with_vtable(&mut self, op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
         let descr = op.descr.clone().expect("NEW_WITH_VTABLE needs descr");
         let vinfo = VirtualInfo {
             descr,
@@ -457,7 +457,7 @@ impl OptVirtualize {
         OptimizationResult::Remove
     }
 
-    fn optimize_new(&mut self, op: &Op, _ctx: &mut OptContext) -> PassResult {
+    fn optimize_new(&mut self, op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
         let descr = op.descr.clone().expect("NEW needs descr");
         let vinfo = VirtualStructInfo {
             descr,
@@ -468,7 +468,7 @@ impl OptVirtualize {
         OptimizationResult::Remove
     }
 
-    fn optimize_new_array(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_new_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let size_ref = op.arg(0);
         if let Some(size) = ctx.get_constant_int(size_ref) {
             if size >= 0 && size <= 1024 {
@@ -483,11 +483,11 @@ impl OptVirtualize {
     }
 
     #[allow(dead_code)]
-    fn optimize_new_array_clear(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_new_array_clear(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         self.optimize_new_array(op, ctx)
     }
 
-    fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_replacement(op.arg(0));
         let value_ref = ctx.get_replacement(op.arg(1));
         let field_idx = descr_index(&op.descr);
@@ -524,7 +524,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_replacement(op.arg(0));
         let field_idx = descr_index(&op.descr);
 
@@ -562,7 +562,7 @@ impl OptVirtualize {
         frame_ref: OpRef,
         field_idx: u32,
         ctx: &mut OptContext,
-    ) -> PassResult {
+    ) -> OptimizationResult {
         let offset = extract_field_offset(field_idx);
         if let Some(ref config) = self.vable_config {
             // Static field with a virtual input → replace with input arg, no load
@@ -597,7 +597,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_replacement(op.arg(2));
@@ -642,7 +642,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_replacement(op.arg(0));
         let index_ref = op.arg(1);
 
@@ -684,7 +684,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(PtrInfo::VirtualArray(vinfo)) = self.get_info(array_ref) {
@@ -695,7 +695,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let str_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(PtrInfo::VirtualArray(vinfo)) = self.get_info(str_ref) {
@@ -706,7 +706,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_getinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_getinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let field_idx = descr_index(&op.descr);
@@ -725,7 +725,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_setinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_setinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_replacement(op.arg(2));
@@ -745,7 +745,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let buf_ref = ctx.get_replacement(op.arg(0));
         let offset_ref = op.arg(1);
 
@@ -763,7 +763,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let buf_ref = ctx.get_replacement(op.arg(0));
         let offset_ref = op.arg(1);
         let value_ref = ctx.get_replacement(op.arg(2));
@@ -788,7 +788,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_guard_class(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_class(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let obj_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(info) = self.get_info(obj_ref) {
@@ -822,7 +822,7 @@ impl OptVirtualize {
 
     /// Force virtual references in guard fail_args and re-resolve all args.
     /// Must be called for any guard that PassOn instead of Remove.
-    fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if let Some(ref fail_args) = op.fail_args {
             for &fa in fail_args {
                 let resolved = ctx.get_replacement(fa);
@@ -841,7 +841,7 @@ impl OptVirtualize {
         OptimizationResult::Replace(guard_op)
     }
 
-    fn optimize_guard_nonnull(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_nonnull(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let obj_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(info) = self.get_info(obj_ref) {
@@ -854,7 +854,7 @@ impl OptVirtualize {
         self.force_guard_fail_args(op, ctx)
     }
 
-    fn optimize_guard_nonnull_class(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_nonnull_class(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let obj_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(info) = self.get_info(obj_ref) {
@@ -885,7 +885,7 @@ impl OptVirtualize {
         self.force_guard_fail_args(op, ctx)
     }
 
-    fn optimize_guard_value(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_value(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let obj_ref = ctx.get_replacement(op.arg(0));
 
         // If the object is already a known constant matching the guard value, remove
@@ -910,7 +910,7 @@ impl OptVirtualize {
     /// This way the vref itself becomes virtual. If it never escapes, the
     /// allocation is eliminated entirely. If it does escape, the forcing
     /// mechanism emits the struct allocation + field writes.
-    fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let vref_descr = make_field_index_descr(VREF_SIZE_DESCR_INDEX);
 
         // Emit a FORCE_TOKEN to capture the JIT frame address.
@@ -955,7 +955,7 @@ impl OptVirtualize {
     /// If the vref is still virtual, these writes are absorbed into the
     /// virtual struct's field tracking and nothing is emitted.
     /// If the vref was already forced (escaped), we emit SETFIELD_GC ops.
-    fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let vref_ref = ctx.get_replacement(op.arg(0));
         let obj_ref = ctx.get_replacement(op.arg(1));
 
@@ -1000,7 +1000,7 @@ impl OptVirtualize {
     }
 
     /// Handle operations that may cause virtuals to escape.
-    fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let forced = self.force_all_args(op, ctx);
         OptimizationResult::Replace(forced)
     }
@@ -1111,8 +1111,8 @@ impl Default for OptVirtualize {
     }
 }
 
-impl OptimizationPass for OptVirtualize {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for OptVirtualize {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // Lazily create virtual input args for virtualizable fields
         if !self.vable_initialized {
             self.init_virtualizable(ctx);

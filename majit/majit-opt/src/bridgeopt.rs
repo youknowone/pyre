@@ -142,8 +142,8 @@ impl Default for OptBridgeOpt {
     }
 }
 
-impl OptimizationPass for OptBridgeOpt {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for OptBridgeOpt {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // Track comparison operations so we can look them up from guards.
         match op.opcode {
             OpCode::IntLt | OpCode::IntLe | OpCode::IntGt | OpCode::IntGe => {

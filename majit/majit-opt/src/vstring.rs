@@ -228,7 +228,7 @@ impl OptString {
     }
 
     /// Handle NEWSTR: virtualize if length is a small constant.
-    fn optimize_newstr(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_newstr(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let len_ref = op.arg(0);
         if let Some(len) = ctx.get_constant_int(len_ref) {
             if len >= 0 && (len as usize) <= MAX_CONST_LEN {
@@ -244,7 +244,7 @@ impl OptString {
     }
 
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
-    fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let str_ref = ctx.get_replacement(op.arg(0));
         let idx_ref = op.arg(1);
         let char_ref = op.arg(2);
@@ -266,7 +266,7 @@ impl OptString {
     }
 
     /// Handle STRGETITEM: if source is virtual, resolve the character.
-    fn optimize_strgetitem(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_strgetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let str_ref = ctx.get_replacement(op.arg(0));
         let idx_ref = op.arg(1);
 
@@ -283,7 +283,7 @@ impl OptString {
     }
 
     /// Handle STRLEN: if source is virtual, return known length.
-    fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let str_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(len) = self.get_known_length(str_ref, ctx) {
@@ -295,7 +295,7 @@ impl OptString {
     }
 
     /// Handle COPYSTRCONTENT: if destination is virtual Plain, track characters.
-    fn optimize_copystrcontent(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_copystrcontent(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // copystrcontent(src, dst, src_start, dst_start, length)
         let src_ref = ctx.get_replacement(op.arg(0));
         let dst_ref = ctx.get_replacement(op.arg(1));
@@ -375,8 +375,8 @@ impl Default for OptString {
     }
 }
 
-impl OptimizationPass for OptString {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for OptString {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             OpCode::Newstr => self.optimize_newstr(op, ctx),
             OpCode::Strsetitem => self.optimize_strsetitem(op, ctx),

@@ -110,7 +110,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_ADD.
     /// `x + 0 -> x`, `0 + x -> x`, `x + x -> x << 1`
-    fn optimize_int_add(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_add(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -143,7 +143,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_SUB.
     /// `x - 0 -> x`, `x - x -> 0`
-    fn optimize_int_sub(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_sub(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -171,7 +171,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_MUL.
     /// `x * 0 -> 0`, `x * 1 -> x`, `0 * x -> 0`, `1 * x -> x`
-    fn optimize_int_mul(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_mul(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -224,7 +224,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_FLOORDIV.
     /// `x // 1 -> x`, constant fold when both operands are known.
-    fn optimize_int_floor_div(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_floor_div(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -287,7 +287,7 @@ impl OptRewrite {
     /// Try algebraic simplification for INT_MOD.
     ///
     /// Strength reduction from rpython/jit/metainterp/optimizeopt/intdiv.py.
-    fn optimize_int_mod(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_mod(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -337,7 +337,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_AND.
     /// `x & 0 -> 0`, `x & -1 -> x`
-    fn optimize_int_and(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_and(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -378,7 +378,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_OR.
     /// `x | 0 -> x`, `x | -1 -> -1`
-    fn optimize_int_or(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_or(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -419,7 +419,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_XOR.
     /// `x ^ 0 -> x`, `x ^ x -> 0`
-    fn optimize_int_xor(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_xor(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -458,7 +458,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_LSHIFT.
     /// `x << 0 -> x`
-    fn optimize_int_lshift(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_lshift(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -486,7 +486,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_RSHIFT.
     /// `x >> 0 -> x`
-    fn optimize_int_rshift(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_rshift(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -514,7 +514,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for UINT_RSHIFT.
     /// `x >>> 0 -> x`
-    fn optimize_uint_rshift(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_uint_rshift(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -543,7 +543,7 @@ impl OptRewrite {
     // ── Unary operations ──
 
     /// Constant fold or simplify INT_NEG.
-    fn optimize_int_neg(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_neg(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_int(arg0) {
@@ -557,7 +557,7 @@ impl OptRewrite {
     }
 
     /// Constant fold or simplify INT_INVERT.
-    fn optimize_int_invert(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_invert(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_int(arg0) {
@@ -572,7 +572,7 @@ impl OptRewrite {
 
     /// Constant fold INT_IS_ZERO. Also handles INT_IS_ZERO(INT_IS_ZERO(x)) -> INT_IS_TRUE(x)
     /// and INT_IS_ZERO(INT_IS_TRUE(x)) -> INT_IS_ZERO(x).
-    fn optimize_int_is_zero(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_is_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_int(arg0) {
@@ -584,7 +584,7 @@ impl OptRewrite {
     }
 
     /// Constant fold INT_IS_TRUE.
-    fn optimize_int_is_true(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_is_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_int(arg0) {
@@ -596,7 +596,7 @@ impl OptRewrite {
     }
 
     /// Constant fold INT_FORCE_GE_ZERO.
-    fn optimize_int_force_ge_zero(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_force_ge_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_int(arg0) {
@@ -608,7 +608,7 @@ impl OptRewrite {
     }
 
     /// Constant fold int_between(a, b, c) => a <= b < c.
-    fn optimize_int_between(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_int_between(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
         let arg2 = op.arg(2);
@@ -629,7 +629,7 @@ impl OptRewrite {
     // ── Comparisons ──
 
     /// Constant fold binary comparisons.
-    fn optimize_comparison(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_comparison(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -647,7 +647,7 @@ impl OptRewrite {
 
     /// Optimize GUARD_TRUE: if arg is known constant 1 -> remove,
     /// if known constant 0 -> always fails (leave as-is for now, backend handles it).
-    fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(val) = ctx.get_constant_int(arg0) {
@@ -663,7 +663,7 @@ impl OptRewrite {
 
     /// Optimize GUARD_FALSE: if arg is known constant 0 -> remove,
     /// if known constant nonzero -> always fails.
-    fn optimize_guard_false(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_false(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(val) = ctx.get_constant_int(arg0) {
@@ -678,7 +678,7 @@ impl OptRewrite {
     }
 
     /// Optimize GUARD_VALUE: if the guarded value equals the expected constant -> remove.
-    fn optimize_guard_value(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_guard_value(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
         }
@@ -700,7 +700,7 @@ impl OptRewrite {
     // ── SAME_AS identity ──
 
     /// SAME_AS_I/R/F(x) -> x
-    fn optimize_same_as(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_same_as(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() == 0 {
             return OptimizationResult::PassOn;
         }
@@ -717,7 +717,7 @@ impl OptRewrite {
     /// This mirrors `find_rewritable_bool` from rewrite.py: if we see INT_LT(a, b)
     /// and we previously computed INT_GE(a, b) = K (a constant 0 or 1), then
     /// INT_LT(a, b) = 1 - K.
-    fn find_rewritable_bool(&self, _op: &Op, _ctx: &mut OptContext) -> Option<PassResult> {
+    fn find_rewritable_bool(&self, _op: &Op, _ctx: &mut OptContext) -> Option<OptimizationResult> {
         // This requires a pure-result cache (get_pure_result), which is part
         // of the Pure optimization pass. For now, we skip this rewrite.
         // The algebraic simplifications and constant folding above cover
@@ -759,7 +759,7 @@ impl OptRewrite {
     }
 
     /// `FloatAdd(x, 0.0) -> x`, `FloatAdd(0.0, x) -> x`, constant fold.
-    fn optimize_float_add(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_float_add(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -789,7 +789,7 @@ impl OptRewrite {
     }
 
     /// `FloatSub(x, 0.0) -> x`, constant fold.
-    fn optimize_float_sub(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_float_sub(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -812,7 +812,7 @@ impl OptRewrite {
     }
 
     /// `FloatMul(x, 1.0) -> x`, `FloatMul(1.0, x) -> x`, constant fold.
-    fn optimize_float_mul(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_float_mul(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -842,7 +842,7 @@ impl OptRewrite {
     }
 
     /// `FloatTrueDiv(x, 1.0) -> x`, constant fold.
-    fn optimize_float_truediv(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_float_truediv(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -865,7 +865,7 @@ impl OptRewrite {
     }
 
     /// `FloatNeg(FloatNeg(x)) -> x`, constant fold.
-    fn optimize_float_neg(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_float_neg(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_float(arg0) {
@@ -886,7 +886,7 @@ impl OptRewrite {
     }
 
     /// Constant fold FloatFloorDiv.
-    fn optimize_float_floordiv(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_float_floordiv(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -901,7 +901,7 @@ impl OptRewrite {
     }
 
     /// Constant fold FloatMod.
-    fn optimize_float_mod(&self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    fn optimize_float_mod(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -926,8 +926,8 @@ impl OptRewrite {
     }
 }
 
-impl OptimizationPass for OptRewrite {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for OptRewrite {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // Track last_op_removed for GuardNoException optimization.
         // Reset for non-guard ops (guards don't count as "the last op").
         if !op.opcode.is_guard() {

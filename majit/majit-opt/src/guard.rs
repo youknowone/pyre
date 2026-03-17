@@ -152,8 +152,8 @@ impl Default for GuardStrengthenOpt {
     }
 }
 
-impl OptimizationPass for GuardStrengthenOpt {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for GuardStrengthenOpt {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if !op.opcode.is_guard() {
             // Non-guard operations invalidate the last-guard descriptor
             // tracking (no longer consecutive).

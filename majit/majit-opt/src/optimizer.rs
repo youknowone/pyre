@@ -17,7 +17,7 @@ use majit_ir::Op;
 
 /// The optimizer: chains passes and runs them over a trace.
 pub struct Optimizer {
-    passes: Vec<Box<dyn OptimizationPass>>,
+    passes: Vec<Box<dyn Optimization>>,
     /// Final num_inputs after optimization (may increase if virtualizable
     /// adds virtual input args).
     final_num_inputs: usize,
@@ -38,7 +38,7 @@ impl Optimizer {
     }
 
     /// Add an optimization pass to the chain.
-    pub fn add_pass(&mut self, pass: Box<dyn OptimizationPass>) {
+    pub fn add_pass(&mut self, pass: Box<dyn Optimization>) {
         self.passes.push(pass);
     }
 
@@ -266,8 +266,8 @@ mod tests {
     /// A trivial pass that removes INT_ADD(x, 0) -> x
     struct AddZeroElimination;
 
-    impl OptimizationPass for AddZeroElimination {
-        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+    impl Optimization for AddZeroElimination {
+        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
                 // Check if second arg is constant 0
                 if let Some(0) = ctx.get_constant_int(op.arg(1)) {

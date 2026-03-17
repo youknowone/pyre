@@ -316,7 +316,7 @@ impl Default for CostModel {
 ///
 /// Analyzes loop bodies to find independent scalar operations that can be
 /// packed into SIMD vector instructions.
-pub struct OptVectorize {
+pub struct VectorizingOptimizer {
     /// Operations in the current loop body (between Label and Jump).
     body_ops: Vec<Op>,
     /// Whether we're inside a loop body.
@@ -325,9 +325,9 @@ pub struct OptVectorize {
     cost_model: CostModel,
 }
 
-impl OptVectorize {
+impl VectorizingOptimizer {
     pub fn new() -> Self {
-        OptVectorize {
+        VectorizingOptimizer {
             body_ops: Vec::new(),
             in_loop: false,
             cost_model: CostModel::new(),
@@ -417,14 +417,14 @@ impl OptVectorize {
     }
 }
 
-impl Default for OptVectorize {
+impl Default for VectorizingOptimizer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl OptimizationPass for OptVectorize {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult {
+impl Optimization for VectorizingOptimizer {
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             OpCode::Label => {
                 self.in_loop = true;
@@ -663,7 +663,7 @@ mod tests {
         assert!(!OpCode::GuardTrue.is_memory_access());
     }
 
-    // ── OptVectorize pass tests ──
+    // ── VectorizingOptimizer pass tests ──
 
     #[test]
     fn test_vectorize_pass_no_loop() {

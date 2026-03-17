@@ -2,7 +2,7 @@
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/.
 ///
-/// The optimizer chains multiple passes, each implementing the OptimizationPass trait.
+/// The optimizer chains multiple passes, each implementing the Optimization trait.
 /// Operations flow through the chain: IntBounds → Rewrite → Virtualize → String →
 /// Pure → Guard → Simplify → Heap (configurable).
 pub mod bridgeopt;
@@ -29,7 +29,7 @@ use majit_ir::{Op, OpRef, Value};
 
 /// Result of an optimization pass processing an operation.
 #[derive(Debug)]
-pub enum PassResult {
+pub enum OptimizationResult {
     /// Emit this operation (possibly modified).
     Emit(Op),
     /// Replace with a different operation.
@@ -151,9 +151,9 @@ impl OptContext {
 /// An optimization pass.
 ///
 /// Mirrors rpython/jit/metainterp/optimizeopt/optimizer.py Optimization.
-pub trait OptimizationPass {
+pub trait Optimization {
     /// Process an operation. Called for each operation in the trace.
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> PassResult;
+    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult;
 
     /// Called once before optimization starts.
     fn setup(&mut self) {}
