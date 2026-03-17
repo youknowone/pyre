@@ -152,12 +152,8 @@ pub fn extract_opcode_dispatch(
                                     crate::patterns::classify_from_graph(&graph);
                             }
                         }
-                        // Fallback to string heuristic if graph didn't classify
-                        if arm.trace_pattern.is_none() {
-                            arm.trace_pattern = crate::patterns::classify_method_body(
-                                &method.body_summary,
-                            );
-                        }
+                        // String heuristic fallback is deprecated.
+                        // Graph-based classifier should handle all cases.
                         break;
                     }
                 }
