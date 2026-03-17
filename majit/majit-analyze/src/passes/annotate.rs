@@ -6,7 +6,7 @@
 //! each op's inputs and computing the output type. Iterates to
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
-use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, ValueId, ValueType};
+use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
 use std::collections::HashMap;
 
 /// Annotation state: maps ValueId → inferred ValueType.
@@ -48,9 +48,7 @@ pub fn annotate(graph: &MajitGraph) -> AnnotationState {
         iterations += 1;
 
         for block in &graph.blocks {
-            // Annotate inputargs from predecessor Link args
-            // (simplified: inputargs keep their current annotation)
-
+            // Propagate annotations through ops in this block
             for op in &block.ops {
                 if let Some(result) = op.result {
                     let inferred = infer_op_type(&op.kind, &state);
@@ -61,6 +59,48 @@ pub fn annotate(graph: &MajitGraph) -> AnnotationState {
                         changed = true;
                     }
                 }
+            }
+
+            // Cross-block propagation: Link args → target inputargs (RPython)
+            // Terminator carries values to successor block's inputargs.
+            match &block.terminator {
+                Terminator::Goto { target, args } => {
+                    let target_block = graph.block(*target);
+                    for (dst, src) in target_block.inputargs.iter().zip(args.iter()) {
+                        let src_ty = state.get(*src).clone();
+                        let current = state.get(*dst).clone();
+                        let merged = union_type(&current, &src_ty);
+                        if merged != current {
+                            state.set(*dst, merged);
+                            changed = true;
+                        }
+                    }
+                }
+                Terminator::Branch {
+                    if_true, true_args, if_false, false_args, ..
+                } => {
+                    let true_block = graph.block(*if_true);
+                    for (dst, src) in true_block.inputargs.iter().zip(true_args.iter()) {
+                        let src_ty = state.get(*src).clone();
+                        let current = state.get(*dst).clone();
+                        let merged = union_type(&current, &src_ty);
+                        if merged != current {
+                            state.set(*dst, merged);
+                            changed = true;
+                        }
+                    }
+                    let false_block = graph.block(*if_false);
+                    for (dst, src) in false_block.inputargs.iter().zip(false_args.iter()) {
+                        let src_ty = state.get(*src).clone();
+                        let current = state.get(*dst).clone();
+                        let merged = union_type(&current, &src_ty);
+                        if merged != current {
+                            state.set(*dst, merged);
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -199,5 +239,37 @@ mod tests {
         assert_eq!(state.get(a), &ValueType::Int);
         assert_eq!(state.get(b), &ValueType::Int);
         assert_eq!(state.get(result), &ValueType::Int);
+    }
+
+    #[test]
+    fn propagates_across_blocks_via_phi() {
+        // Test cross-block annotation propagation through Link args → inputargs
+        let mut graph = MajitGraph::new("phi_test");
+        let entry = graph.entry;
+
+        // Entry: produce an Int value
+        let val = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
+
+        // Create target block with one inputarg (Phi node)
+        let (target, phi_args) = graph.create_block_with_args(1);
+        let phi = phi_args[0];
+
+        // Link: entry → target, passing val as the Phi arg
+        graph.set_terminator(
+            entry,
+            Terminator::Goto {
+                target,
+                args: vec![val],
+            },
+        );
+        graph.set_terminator(target, Terminator::Return(Some(phi)));
+
+        let state = annotate(&graph);
+        // Phi should inherit Int from val via Link propagation
+        assert_eq!(
+            state.get(phi),
+            &ValueType::Int,
+            "Phi node should receive Int annotation from Link args"
+        );
     }
 }

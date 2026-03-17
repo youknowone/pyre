@@ -268,16 +268,17 @@ fn lower_expr(
         }
 
         // ── if/else → block split (RPython FlowContext.guessbool) ──
+        //
+        // Creates: then_block, else_block, merge_block
+        // If both branches produce a value, merge_block gets an inputarg
+        // (Phi node) that receives the value from each branch via Link args.
         syn::Expr::If(if_expr) => {
             let cond = lower_expr(graph, block, &if_expr.cond, options)
                 .unwrap_or_else(|| graph.alloc_value());
 
-            // Create then/else/merge blocks
             let mut then_block = graph.create_block();
             let mut else_block = graph.create_block();
-            let merge_block = graph.create_block();
 
-            // Terminate current block with Branch
             graph.set_terminator(
                 *block,
                 Terminator::Branch {
@@ -289,31 +290,66 @@ fn lower_expr(
                 },
             );
 
-            // Lower then branch
+            // Lower then branch — collect result value
+            let mut then_result = None;
             for stmt in &if_expr.then_branch.stmts {
                 lower_stmt(graph, &mut then_block, stmt, options);
             }
-            if graph.block(then_block).terminator == Terminator::Unreachable {
-                graph.set_terminator(
-                    then_block,
-                    Terminator::Goto { target: merge_block, args: vec![] },
-                );
+            // Last expression in then_branch is the result (if no explicit return)
+            if let Some(last) = if_expr.then_branch.stmts.last() {
+                if let syn::Stmt::Expr(e, None) = last {
+                    then_result = lower_expr(graph, &mut then_block, e, options);
+                }
             }
 
-            // Lower else branch (if present)
+            // Lower else branch
+            let mut else_result = None;
             if let Some((_, else_branch)) = &if_expr.else_branch {
-                lower_expr(graph, &mut else_block, else_branch, options);
-            }
-            if graph.block(else_block).terminator == Terminator::Unreachable {
-                graph.set_terminator(
-                    else_block,
-                    Terminator::Goto { target: merge_block, args: vec![] },
-                );
+                else_result = lower_expr(graph, &mut else_block, else_branch, options);
             }
 
-            // Continue in merge block
+            // Create merge block with Phi if both branches have values
+            let (merge_block, phi_result) = if then_result.is_some() && else_result.is_some() {
+                let (merge, phi_args) = graph.create_block_with_args(1);
+                // Link args: then → merge(then_result), else → merge(else_result)
+                if graph.block(then_block).terminator == Terminator::Unreachable {
+                    graph.set_terminator(
+                        then_block,
+                        Terminator::Goto {
+                            target: merge,
+                            args: vec![then_result.unwrap()],
+                        },
+                    );
+                }
+                if graph.block(else_block).terminator == Terminator::Unreachable {
+                    graph.set_terminator(
+                        else_block,
+                        Terminator::Goto {
+                            target: merge,
+                            args: vec![else_result.unwrap()],
+                        },
+                    );
+                }
+                (merge, Some(phi_args[0]))
+            } else {
+                let merge = graph.create_block();
+                if graph.block(then_block).terminator == Terminator::Unreachable {
+                    graph.set_terminator(
+                        then_block,
+                        Terminator::Goto { target: merge, args: vec![] },
+                    );
+                }
+                if graph.block(else_block).terminator == Terminator::Unreachable {
+                    graph.set_terminator(
+                        else_block,
+                        Terminator::Goto { target: merge, args: vec![] },
+                    );
+                }
+                (merge, None)
+            };
+
             *block = merge_block;
-            None
+            phi_result
         }
 
         // ── return ──
@@ -397,12 +433,61 @@ fn lower_expr(
         // ── cast: expr as T ──
         syn::Expr::Cast(cast) => lower_expr(graph, block, &cast.expr, options),
 
-        // ── match expr { arms } ──
+        // ── match expr { arms } → multi-block (RPython switch) ──
         syn::Expr::Match(m) => {
-            lower_expr(graph, block, &m.expr, options);
-            for arm in &m.arms {
-                lower_expr(graph, block, &arm.body, options);
+            let scrutinee = lower_expr(graph, block, &m.expr, options)
+                .unwrap_or_else(|| graph.alloc_value());
+
+            if m.arms.is_empty() {
+                return None;
             }
+
+            let merge = graph.create_block();
+            let mut arm_results = Vec::new();
+
+            for arm in &m.arms {
+                let mut arm_block = graph.create_block();
+                // Each arm gets its own block (simplified: no pattern matching guards)
+                let result = lower_expr(graph, &mut arm_block, &arm.body, options);
+                arm_results.push((arm_block, result));
+                if graph.block(arm_block).terminator == Terminator::Unreachable {
+                    let goto_args = result.map_or(vec![], |v| vec![v]);
+                    graph.set_terminator(
+                        arm_block,
+                        Terminator::Goto { target: merge, args: goto_args },
+                    );
+                }
+            }
+
+            // First arm as default branch (simplified)
+            if m.arms.len() == 1 {
+                graph.set_terminator(
+                    *block,
+                    Terminator::Goto { target: arm_results[0].0, args: vec![] },
+                );
+            } else {
+                // Binary branch on scrutinee for first arm, else second
+                let first_block = arm_results[0].0;
+                let second_block = arm_results.get(1).map(|a| a.0).unwrap_or(merge);
+                graph.set_terminator(
+                    *block,
+                    Terminator::Branch {
+                        cond: scrutinee,
+                        if_true: first_block,
+                        true_args: vec![],
+                        if_false: second_block,
+                        false_args: vec![],
+                    },
+                );
+                // Chain remaining arms as fallthrough branches
+                for i in 1..arm_results.len().saturating_sub(1) {
+                    let next = arm_results.get(i + 1).map(|a| a.0).unwrap_or(merge);
+                    // Each arm could branch to next or fall to merge
+                    // (simplified: all goto merge)
+                }
+            }
+
+            *block = merge;
             None
         }
 
