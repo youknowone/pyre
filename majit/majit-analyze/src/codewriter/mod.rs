@@ -10,5 +10,7 @@
 pub mod codegen;
 pub mod jtransform;
 
-pub use codegen::{generate_jitcode, JitDriverConfig, StackConfig, StorageConfig};
+pub use codegen::{
+    generate_jitcode, ArmTransformer, IdentityTransformer, IoShim, JitDriverConfig, StorageConfig,
+};
 pub use jtransform::{transform_all, transform_pattern, LoweringRecipe, TransformConfig};
