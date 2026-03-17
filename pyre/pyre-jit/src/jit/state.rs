@@ -1541,11 +1541,28 @@ impl TraceFrameState {
 
                 if let Some(token_number) = token_number {
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
-                        // Check target's actual inputarg count (may be 1 after
-                        // preamble patching: just [frame]).
+                        // Check target's actual inputarg count.
+                        // For compiled targets: use stored num_inputs (may be 1
+                        // after preamble patching). For pending self-recursion:
+                        // target will have same shape as current trace — use
+                        // the original num_inputs (frame + ni + sd + locals).
+                        let callee_meta = driver.get_compiled_meta(callee_key);
+                        let callee_nlocals = callee_meta
+                            .map(|m| m.num_locals)
+                            .unwrap_or_else(|| {
+                                let code_ptr = w_func_get_code_ptr(concrete_callable)
+                                    as *const pyre_bytecode::CodeObject;
+                                if code_ptr.is_null() {
+                                    0
+                                } else {
+                                    (&(*code_ptr).varnames).len()
+                                }
+                            });
+                        let callee_sdepth =
+                            callee_meta.map(|m| m.stack_depth).unwrap_or(0);
                         let target_num_inputs = driver
                             .get_compiled_num_inputs(callee_key)
-                            .unwrap_or(0);
+                            .unwrap_or(3 + callee_nlocals + callee_sdepth);
 
                         return self.with_ctx(|this, ctx| {
                             this.guard_value(ctx, callable, concrete_callable as i64);
