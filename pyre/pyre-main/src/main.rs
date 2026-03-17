@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use pyre_bytecode::*;
 use pyre_interp::frame::PyFrame;
-use pyre_mjit::eval::eval_with_jit;
+use pyre_jit::eval::eval_with_jit;
 use pyre_runtime::{PyDisplay, PyExecutionContext};
 
 fn main() {

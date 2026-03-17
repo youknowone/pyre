@@ -1,5 +1,5 @@
 [package]
-name = "pyre-mjit"
+name = "pyre-jit"
 version.workspace = true
 edition.workspace = true
 description = "Auto-generated JIT for pyre — rpython/jit/ equivalent"

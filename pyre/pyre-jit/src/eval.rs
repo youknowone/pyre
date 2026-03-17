@@ -11,7 +11,7 @@ use pyre_runtime::PyResult;
 
 /// Evaluate a Python frame with JIT compilation.
 ///
-/// This is the main entry point for pyre-mjit. It replaces
+/// This is the main entry point for pyre-jit. It replaces
 /// pyre-interp's eval_frame for JIT-enabled execution.
 ///
 /// Flow:
