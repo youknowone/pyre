@@ -664,6 +664,11 @@ impl<S: JitState> JitDriver<S> {
         &mut self.meta
     }
 
+    /// Check if a function was boosted for fast tracing.
+    pub fn is_function_boosted(&self, callee_key: u64) -> bool {
+        self.meta.warm_state_ref().is_boosted(callee_key)
+    }
+
     pub fn run_compiled_with_blackhole_fallback_keyed(
         &mut self,
         green_key: u64,

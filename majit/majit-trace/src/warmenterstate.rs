@@ -616,6 +616,13 @@ impl WarmEnterState {
         }
     }
 
+    /// Check if a function was boosted (counter >= threshold - 1).
+    pub fn is_boosted(&self, callee_key: u64) -> bool {
+        self.function_call_counts
+            .get(&callee_key)
+            .map_or(false, |&c| c >= self.function_threshold.saturating_sub(1))
+    }
+
     /// Check if inlining is allowed at the given depth.
     pub fn can_inline_at_depth(&self, current_depth: usize) -> bool {
         (current_depth as u32) < self.max_inline_depth

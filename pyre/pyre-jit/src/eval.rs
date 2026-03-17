@@ -191,7 +191,12 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let counts = func_entry_counts();
     let count = counts.entry(green_key).or_insert(0);
     *count += 1;
-    if *count != FUNC_ENTRY_THRESHOLD {
+
+    // Also check if the warm state boosted this function (e.g., from
+    // recursive inline depth limit). If so, fast-track to tracing.
+    let boosted = driver.is_function_boosted(green_key);
+
+    if *count < FUNC_ENTRY_THRESHOLD && !boosted {
         return None;
     }
 
