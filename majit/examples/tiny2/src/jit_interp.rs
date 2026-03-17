@@ -3,8 +3,14 @@
 /// The word-based program is compiled to bytecode, then the bytecoded mainloop
 /// is traced by the auto-generated JitState/trace_instruction.
 ///
-/// Greens: [pc]
+/// Greens: [bytecode (env), pc]
 /// Reds:   [storage (args at bottom, computation stack on top)]
+///
+/// RPython correspondence (tiny2_hotpath.py):
+///   promote(opcode)         — implicit: opcode is constant at each trace position
+///   hint(bytecode, deepfreeze=True) — implicit: &[u8] is immutable
+///   compute_invariants      — implicit: storage pool auto-captures loop state
+///   on_enter_jit            — implicit: storage pool virtualizes args
 
 // ── Bytecode opcodes ──
 
@@ -122,6 +128,11 @@ impl Tiny2Storage {
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
     }
+    /// Copy the bottom `n` elements (arg slots) into `out`.
+    pub fn read_args(&self, out: &mut [i64]) {
+        let n = out.len().min(self.stack.len());
+        out[..n].copy_from_slice(&self.stack[..n]);
+    }
 }
 
 /// Storage pool wrapping a single Tiny2Storage.
@@ -189,9 +200,11 @@ impl BytecodeExt for [u8] {
         mul => IntMul,
     },
 )]
-fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
+#[allow(unused_assignments, unused_variables)]
+fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold: u32) -> i64 {
     let mut driver: majit_meta::JitDriver<Tiny2State> = majit_meta::JitDriver::new(threshold);
     let mut pc: usize = 0;
+    // stacksize is updated by macro-generated code in can_enter_jit! expansion.
     let mut stacksize: i32 = num_args as i32;
     let mut state = Tiny2State {
         pool: Tiny2Pool::new(),
@@ -199,7 +212,11 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     };
 
     while pc < program.len() {
+        // RPython: tinyjitdriver.jit_merge_point(args=args, loops=loops,
+        //          stack=stack, bytecode=bytecode, pos=pos)
         jit_merge_point!();
+        // RPython: hint(bytecode, deepfreeze=True) — implicit: &[u8] is immutable
+        // RPython: hint(opcode, concrete=True) — implicit: opcode is constant at each pc
         let opcode = program[pc];
         pc += 1;
 
@@ -220,30 +237,37 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
                 stacksize += 1;
             }
             OP_PUSH_ARG => {
+                // RPython: stack = Stack(args[n-1], stack)
                 let n = program[pc] as usize;
                 pc += 1;
                 state.pool.get_mut(state.selected).copy_up(n);
                 stacksize += 1;
             }
             OP_STORE_ARG => {
+                // RPython: stack, args[n-1] = stack.pop()
                 let n = program[pc] as usize;
                 pc += 1;
                 state.pool.get_mut(state.selected).store_down(n);
                 stacksize -= 1;
             }
+            // RPython: op2(stack, func_add_int, func_add_str)
+            // Integer-only path; promote(y.__class__) is implicit (no StrBox in bytecoded form).
             OP_ADD => state.pool.get_mut(state.selected).add(),
             OP_SUB => state.pool.get_mut(state.selected).sub(),
             OP_MUL => state.pool.get_mut(state.selected).mul(),
             OP_LOOP_START => {
-                // No-op: loop start marker.
+                // RPython: loops.append(pos) — loop targets are compiled into bytecode offsets.
             }
             OP_LOOP_END => {
+                // RPython: flag = stack.pop(); if flag.as_int() != 0: pos = loops[-1]; promote(pos)
                 let target = (program[pc] as usize) | ((program[pc + 1] as usize) << 8);
                 pc += 2;
                 let cond = state.pool.get_mut(state.selected).pop();
                 stacksize -= 1;
                 let jump = cond != 0;
                 if jump {
+                    // RPython: promote(pos); can_enter_jit(...)
+                    // promote(pos) is implicit: target is a bytecode literal, already constant.
                     if target <= pc {
                         can_enter_jit!(driver, target, &mut state, program, || {});
                     }
@@ -256,7 +280,10 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
         }
     }
 
-    // Result is the top of storage (or args[0] if stack is at arg level)
+    // Write modified args back (RPython mutates args[] in-place).
+    state.pool.get(state.selected).read_args(args_out);
+
+    // Result is the top of storage.
     state.pool.get_mut(state.selected).pop()
 }
 
@@ -273,54 +300,50 @@ impl JitTiny2Interp {
 
     /// Run a word-based program with integer args.
     /// Returns the result: stack top if non-empty, else args[0].
+    ///
+    /// RPython: interpret(bytecode, args) — args are mutated in-place during execution.
+    /// Here, args occupy storage slots 0..num_args and are written back via args_out.
     pub fn run(&mut self, bytecode: &[&str], args: &mut Vec<i64>) -> i64 {
         let code = compile(bytecode);
         let num_args = args.len();
 
         // Determine if the program ends with a value on stack beyond args.
-        // Pre-scan: count net stack effect outside loops to know if there's
-        // an extra result on the stack at the end.
         let has_result_on_stack = program_has_result(bytecode, num_args);
 
-        // We run the compiled mainloop. The storage starts with args loaded.
-        // We need to pre-populate the storage and then call mainloop.
-        // Since mainloop creates its own state, we inject args differently:
-        // We prepend OP_PUSH_INT instructions for each arg.
-        let mut full_code = Vec::new();
+        // Prepend OP_PUSH_INT instructions for each arg to pre-populate the storage.
+        // The prepended prefix shifts all bytecode offsets, so loop targets in `code`
+        // must be adjusted by the prefix length.
+        let prefix_len = num_args * 9; // 1 opcode byte + 8 value bytes per arg
+        let mut full_code = Vec::with_capacity(prefix_len + code.len());
         for &arg in args.iter() {
             full_code.push(OP_PUSH_INT);
             full_code.extend_from_slice(&arg.to_le_bytes());
         }
-        full_code.extend_from_slice(&code);
-
-        let result = mainloop(&full_code, num_args, self.threshold);
-
-        // After mainloop, the storage has been consumed. The top was popped as result.
-        // For the args sync: re-run the interpreter to get updated args.
-        // Actually, we need to reconstruct args from the mainloop result.
-        // The issue: mainloop pops only the top. The args are still in the storage.
-        // But we can't access the storage after mainloop returns...
-        //
-        // Alternative: run a slightly different mainloop that returns args too.
-        // For simplicity, reconstruct args by running the plain interpreter.
-        // The JIT result is just for the return value.
-
-        // Actually, let's just run the plain interpreter for args sync.
-        // The JIT validates correctness through tests.
-        let mut interp_args: Vec<crate::interp::Box> =
-            args.iter().map(|&v| crate::interp::Box::Int(v)).collect();
-        let _ = crate::interp::interpret(bytecode, &mut interp_args);
-        for (i, b) in interp_args.iter().enumerate() {
-            if let Ok(v) = b.as_int() {
-                args[i] = v;
+        // Patch loop targets: scan code for OP_LOOP_END and adjust the 2-byte target.
+        let mut patched_code = code.clone();
+        let mut ci = 0;
+        while ci < patched_code.len() {
+            match patched_code[ci] {
+                OP_PUSH_INT => ci += 9,
+                OP_PUSH_ARG | OP_STORE_ARG => ci += 2,
+                OP_LOOP_END => {
+                    ci += 1;
+                    let old_target =
+                        (patched_code[ci] as usize) | ((patched_code[ci + 1] as usize) << 8);
+                    let new_target = old_target + prefix_len;
+                    patched_code[ci] = (new_target & 0xFF) as u8;
+                    patched_code[ci + 1] = ((new_target >> 8) & 0xFF) as u8;
+                    ci += 2;
+                }
+                _ => ci += 1,
             }
         }
+        full_code.extend_from_slice(&patched_code);
 
-        if has_result_on_stack {
-            result
-        } else {
-            args[0]
-        }
+        // mainloop writes modified args back into args_out before returning.
+        let result = mainloop(&full_code, num_args, args.as_mut_slice(), self.threshold);
+
+        if has_result_on_stack { result } else { args[0] }
     }
 }
 

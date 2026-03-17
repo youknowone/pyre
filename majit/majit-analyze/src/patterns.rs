@@ -497,3 +497,110 @@ pub fn classify_from_pattern(pattern: &str) -> Option<TracePattern> {
 
     None
 }
+
+// ── Graph-based classification ──────────────────────────────────
+//
+// Replaces body_summary string heuristics with semantic graph analysis.
+// RPython equivalent: annotator + jtransform working on the flow graph
+// rather than string matching.
+
+/// Classify a function from its semantic graph.
+///
+/// This is the graph-based replacement for `classify_method_body()`.
+/// Instead of matching substrings in body_summary, it analyzes the
+/// actual ops in the MajitGraph.
+pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
+    use crate::graph::OpKind;
+
+    let entry = graph.block(graph.entry);
+    let ops = &entry.ops;
+
+    // Count op kinds
+    let mut field_reads: Vec<String> = Vec::new();
+    let mut field_writes: Vec<String> = Vec::new();
+    let mut array_reads = 0usize;
+    let mut array_writes = 0usize;
+    let mut calls: Vec<String> = Vec::new();
+    let mut has_guard = false;
+
+    for op in ops {
+        match &op.kind {
+            OpKind::FieldRead { field, .. } => field_reads.push(field.clone()),
+            OpKind::FieldWrite { field, .. } => field_writes.push(field.clone()),
+            OpKind::ArrayRead { .. } => array_reads += 1,
+            OpKind::ArrayWrite { .. } => array_writes += 1,
+            OpKind::Call { target, .. } => calls.push(target.clone()),
+            OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => has_guard = true,
+            _ => {}
+        }
+    }
+
+    // Classify based on op patterns (RPython jtransform-level analysis)
+
+    // Integer binary operations
+    if calls.iter().any(|c| {
+        c.contains("w_int_add") || c.contains("w_int_sub") || c.contains("w_int_mul")
+    }) {
+        return Some(TracePattern::UnboxIntBinop {
+            op_name: "dispatch".into(),
+            has_overflow_guard: true,
+        });
+    }
+
+    // Float binary operations
+    if calls
+        .iter()
+        .any(|c| c.contains("w_float_add") || c.contains("w_float_sub"))
+    {
+        return Some(TracePattern::UnboxFloatBinop {
+            op_name: "FloatAdd".into(),
+        });
+    }
+
+    // Local read: reads from locals_w array (field read + array read, or push call)
+    if (field_reads.iter().any(|f| f == "locals_w") && array_reads > 0)
+        || (array_reads > 0 && calls.iter().any(|c| c == "push" || c == "push_value"))
+    {
+        return Some(TracePattern::LocalRead);
+    }
+
+    // Local write: writes to locals_w array (field write + array write, or pop call)
+    if (field_writes.iter().any(|f| f == "locals_w") && array_writes > 0)
+        || field_writes.iter().any(|f| f == "locals_w")
+        || (array_writes > 0 && calls.iter().any(|c| c == "pop" || c == "pop_value"))
+    {
+        return Some(TracePattern::LocalWrite);
+    }
+
+    // Function call
+    if calls
+        .iter()
+        .any(|c| c.contains("call_function") || c.contains("invoke"))
+    {
+        return Some(TracePattern::FunctionCall);
+    }
+
+    // Truth check
+    if calls
+        .iter()
+        .any(|c| c.contains("truth") || c.contains("bool"))
+    {
+        return Some(TracePattern::TruthCheck);
+    }
+
+    // Return
+    if matches!(
+        &entry.terminator,
+        crate::graph::Terminator::Return(Some(_))
+    ) && ops.len() <= 3
+    {
+        return Some(TracePattern::Return);
+    }
+
+    // Jump (guard + few ops)
+    if has_guard && field_writes.iter().any(|f| f.contains("next_instr") || f.contains("pc")) {
+        return Some(TracePattern::ConditionalJump);
+    }
+
+    None
+}

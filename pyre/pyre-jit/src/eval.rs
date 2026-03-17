@@ -10,14 +10,12 @@
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 
-use pyre_interp::frame::PyFrame;
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
-use pyre_object::w_none;
 use pyre_bytecode::bytecode::OpArgState;
-use pyre_runtime::{
-    PyResult, StepResult, execute_opcode_step,
-};
+use pyre_interp::frame::PyFrame;
+use pyre_object::w_none;
+use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
 
 use majit_meta::DetailedDriverRunOutcome;
 
@@ -39,6 +37,7 @@ thread_local! {
         let info = build_pyframe_virtualizable_info();
         let mut d = JitDriver::new(JIT_THRESHOLD);
         d.set_virtualizable_info(info.clone());
+        d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
         (d, info)
     });
 }
@@ -212,14 +211,26 @@ fn handle_jit_outcome(
     info: &majit_meta::virtualizable::VirtualizableInfo,
 ) -> Option<PyResult> {
     match outcome {
-        DetailedDriverRunOutcome::Finished { typed_values, .. } => {
+        DetailedDriverRunOutcome::Finished {
+            typed_values,
+            raw_int_result,
+            ..
+        } => {
             let [value] = typed_values.as_slice() else {
                 return Some(Err(pyre_runtime::PyError::type_error(
                     "compiled finish did not produce a single object return value",
                 )));
             };
             let value = match value {
-                majit_ir::Value::Int(raw) => *raw as pyre_object::PyObjectRef,
+                majit_ir::Value::Int(raw) => {
+                    if raw_int_result {
+                        // Re-box: the Finish was unboxed for the raw-int
+                        // CallAssembler protocol. Top-level exit must re-box.
+                        pyre_object::intobject::w_int_new(*raw)
+                    } else {
+                        *raw as pyre_object::PyObjectRef
+                    }
+                }
                 majit_ir::Value::Ref(value) => value.as_usize() as pyre_object::PyObjectRef,
                 _ => {
                     return Some(Err(pyre_runtime::PyError::type_error(
@@ -326,6 +337,10 @@ result = fib(12)";
             assert!(
                 driver.has_compiled_loop(fib_key),
                 "recursive fib should compile a function-entry trace"
+            );
+            assert!(
+                driver.has_raw_int_finish(fib_key),
+                "recursive fib compiled finish should use the raw-int call_assembler protocol"
             );
         }
     }

@@ -555,7 +555,8 @@ where
             BC_LOAD_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let opref = sym.state_field_ref(field_idx)
+                let opref = sym
+                    .state_field_ref(field_idx)
                     .expect("state field not initialized");
                 // Runtime value not needed — we track symbolically.
                 self.set_int_reg(dest, Some(opref), Some(0));
@@ -679,11 +680,6 @@ where
                     runtime.label_at(pc) as i64
                 };
                 let resume_pc = ctx.const_int(resume_pc);
-                if crate::majit_log_enabled() {
-                    if let Some(fa) = sym.fail_args() {
-                        eprintln!("[jit] BC_BRANCH_ZERO guard: stack_vals={}, selected={}", fa.len(), selected);
-                    }
-                }
                 Self::record_state_guard(ctx, sym, opcode, &[cond], &[resume_pc]);
                 if runtime_cond == 0 && close_loop {
                     return TraceAction::CloseLoop;
@@ -2232,7 +2228,6 @@ where
     let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
     machine.run_to_end(ctx, sym, &runtime)
 }
-
 
 fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
     let value = *code.get(*cursor).expect("truncated jitcode");

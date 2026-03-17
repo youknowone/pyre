@@ -28,7 +28,12 @@ fn classify_scalar_type(ty: &str) -> Option<&'static str> {
         | "bool" => Some("int"),
         "f32" | "f64" => Some("float"),
         // Pointer-like / GC ref types
-        _ if ty.contains("Ref") || ty.contains("Ptr") || ty.starts_with('&') || ty == "*const u8" || ty == "*mut u8" => {
+        _ if ty.contains("Ref")
+            || ty.contains("Ptr")
+            || ty.starts_with('&')
+            || ty == "*const u8"
+            || ty == "*mut u8" =>
+        {
             Some("ref")
         }
         _ => None,

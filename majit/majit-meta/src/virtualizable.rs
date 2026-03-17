@@ -1263,7 +1263,10 @@ mod tests {
         let config = info.to_optimizer_config();
 
         assert_eq!(config.static_field_offsets, vec![8, 24, 40]);
-        assert_eq!(config.static_field_types, vec![Type::Int, Type::Float, Type::Ref]);
+        assert_eq!(
+            config.static_field_types,
+            vec![Type::Int, Type::Float, Type::Ref]
+        );
         assert_eq!(config.array_field_offsets, vec![48, 56]);
         assert_eq!(config.array_item_types, vec![Type::Ref, Type::Int]);
     }
@@ -1396,7 +1399,10 @@ mod tests {
     #[test]
     fn test_vable_token_roundtrip() {
         assert_eq!(VableToken::from_raw(0), VableToken::None);
-        assert_eq!(VableToken::from_raw(TOKEN_TRACING_RESCALL), VableToken::TracingRescall);
+        assert_eq!(
+            VableToken::from_raw(TOKEN_TRACING_RESCALL),
+            VableToken::TracingRescall
+        );
         assert_eq!(VableToken::from_raw(0xBEEF), VableToken::Active(0xBEEF));
 
         assert_eq!(VableToken::None.to_raw(), 0);

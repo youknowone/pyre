@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use majit_codegen::{
     Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, LoopToken,
@@ -215,11 +215,8 @@ fn patch_with_array_lengths(
             constants.insert(idx_const_key, ei as i64);
             let idx_ref = OpRef(idx_const_key);
 
-            let mut elem_op = Op::with_descr(
-                elem_opcode,
-                &[array_ptr_pos, idx_ref],
-                array_descr.clone(),
-            );
+            let mut elem_op =
+                Op::with_descr(elem_opcode, &[array_ptr_pos, idx_ref], array_descr.clone());
             elem_op.pos = elem_pos;
             preamble.push(elem_op);
             label_args.push(elem_pos);
@@ -483,6 +480,10 @@ pub struct MetaInterp<M: Clone> {
     vable_ptr: *const u8,
     /// Fallback array lengths (for tests without real objects).
     vable_array_lengths: Vec<usize>,
+    /// Green keys whose compiled Finish returns a raw int (not a boxed pointer).
+    raw_int_finish_keys: HashSet<u64>,
+    /// Helper function pointers that box raw ints into interpreter objects.
+    raw_int_box_helpers: HashSet<i64>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -829,6 +830,8 @@ impl<M: Clone> MetaInterp<M> {
             stats: JitStatsCounters::default(),
             vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
+            raw_int_finish_keys: HashSet::new(),
+            raw_int_box_helpers: HashSet::new(),
         }
     }
 
@@ -902,9 +905,7 @@ impl<M: Clone> MetaInterp<M> {
             .is_some_and(|ctx| ctx.has_virtualizable_boxes());
         if has_vable_boxes {
             if let Some(ref info) = self.virtualizable_info {
-                return Optimizer::default_pipeline_with_virtualizable(
-                    info.to_optimizer_config(),
-                );
+                return Optimizer::default_pipeline_with_virtualizable(info.to_optimizer_config());
             }
         }
         Optimizer::default_pipeline()
@@ -996,13 +997,11 @@ impl<M: Clone> MetaInterp<M> {
                 // Init virtualizable boxes (same as on_back_edge_typed)
                 if let Some(ref info) = self.virtualizable_info {
                     let num_static = info.num_static_fields;
-                    let num_array_elems: usize =
-                        self.vable_array_lengths.iter().sum();
+                    let num_array_elems: usize = self.vable_array_lengths.iter().sum();
                     let total_vable = num_static + num_array_elems;
                     if total_vable > 0 && live_values.len() >= 1 + total_vable {
-                        let vable_oprefs: Vec<OpRef> = (0..total_vable)
-                            .map(|i| OpRef((1 + i) as u32))
-                            .collect();
+                        let vable_oprefs: Vec<OpRef> =
+                            (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
                         ctx.init_virtualizable_boxes(
                             info,
                             OpRef(0), // frame ref = first inputarg
@@ -1069,14 +1068,12 @@ impl<M: Clone> MetaInterp<M> {
                 // vable_getfield/setfield calls use boxes instead of heap ops.
                 if let Some(ref info) = self.virtualizable_info {
                     let num_static = info.num_static_fields;
-                    let num_array_elems: usize =
-                        self.vable_array_lengths.iter().sum();
+                    let num_array_elems: usize = self.vable_array_lengths.iter().sum();
                     let total_vable = num_static + num_array_elems;
 
                     if total_vable > 0 && live_values.len() >= 1 + total_vable {
-                        let vable_oprefs: Vec<OpRef> = (0..total_vable)
-                            .map(|i| OpRef((1 + i) as u32))
-                            .collect();
+                        let vable_oprefs: Vec<OpRef> =
+                            (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
                         ctx.init_virtualizable_boxes(
                             info,
                             OpRef(0), // frame ref = first inputarg
@@ -1397,7 +1394,22 @@ impl<M: Clone> MetaInterp<M> {
             );
             eprintln!("--- finish trace (before opt) ---");
             eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
-            eprintln!("--- finish trace (after opt) ---");
+            eprintln!("--- finish trace (after opt, before unbox) ---");
+            eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
+        }
+
+        // Post-process: raw-int protocol for CallAssembler boundary.
+        let (optimized_ops, finish_unboxed) =
+            unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers);
+        if finish_unboxed {
+            self.raw_int_finish_keys.insert(green_key);
+        } else {
+            self.raw_int_finish_keys.remove(&green_key);
+        }
+        let optimized_ops = unbox_call_assembler_results(optimized_ops);
+
+        if crate::majit_log_enabled() {
+            eprintln!("--- finish trace (after unbox) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
@@ -2319,6 +2331,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn invalidate_loop(&mut self, green_key: u64) {
         if let Some(compiled) = self.compiled_loops.get(&green_key) {
             compiled.token.invalidate();
+            self.raw_int_finish_keys.remove(&green_key);
             if crate::majit_log_enabled() {
                 eprintln!("[jit] invalidated loop at key={}", green_key);
             }
@@ -2373,6 +2386,11 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.compiled_loops.contains_key(&green_key)
+    }
+
+    /// Whether the compiled Finish for this green_key returns a raw int.
+    pub fn has_raw_int_finish(&self, green_key: u64) -> bool {
+        self.raw_int_finish_keys.contains(&green_key)
     }
 
     /// Check whether a guard in a specific compiled trace should get a bridge.
@@ -3649,6 +3667,14 @@ impl<M: Clone> MetaInterp<M> {
     pub fn backend_mut(&mut self) -> &mut CraneliftBackend {
         &mut self.backend
     }
+
+    /// Register a helper that boxes a raw integer into an interpreter object.
+    ///
+    /// Compiled finish post-processing uses this to recognize boxing helpers
+    /// that are safe to peel away for the raw-int call_assembler protocol.
+    pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
+        self.raw_int_box_helpers.insert(helper as i64);
+    }
 }
 
 /// Default maximum inlining depth during tracing.
@@ -3783,6 +3809,8 @@ pub enum DetailedDriverRunOutcome {
     Finished {
         typed_values: Vec<Value>,
         via_blackhole: bool,
+        /// When true, Int-typed values are raw integers (not boxed pointers).
+        raw_int_result: bool,
     },
     Jump {
         via_blackhole: bool,
@@ -7098,5 +7126,299 @@ mod tests {
             state.restored_frames[2].2,
             vec![Value::Int(10), Value::Int(20)]
         );
+    }
+}
+
+// ── Post-process: raw-int CallAssembler protocol ─────────────────────
+
+/// Strip boxing from Finish result: Finish(CallI(w_int_new, raw)) → Finish(raw).
+fn unbox_finish_result(
+    mut ops: Vec<Op>,
+    constants: &HashMap<u32, i64>,
+    raw_int_box_helpers: &HashSet<i64>,
+) -> (Vec<Op>, bool) {
+    use majit_ir::OpCode;
+
+    let finish_idx = match ops.iter().rposition(|op| op.opcode == OpCode::Finish) {
+        Some(i) => i,
+        None => return (ops, false),
+    };
+    let finish_arg = match ops[finish_idx].args.first().copied() {
+        Some(a) => a,
+        None => return (ops, false),
+    };
+
+    // Pattern 1: CallI(box_int_helper, raw_int)
+    for idx in (0..finish_idx).rev() {
+        let op = &ops[idx];
+        if op.pos == finish_arg && op.opcode == OpCode::CallI {
+            let helper_ptr = op
+                .args
+                .first()
+                .and_then(|func| constants.get(&func.0))
+                .copied();
+            if op.args.len() >= 2
+                && helper_ptr.is_some_and(|ptr| raw_int_box_helpers.contains(&ptr))
+            {
+                let raw_int = op.args[1];
+                ops[finish_idx].args[0] = raw_int;
+                ops.remove(idx);
+                return (ops, true);
+            }
+        }
+    }
+
+    // Pattern 2: New() + SetfieldGc chain
+    let new_idx = match ops[..finish_idx]
+        .iter()
+        .rposition(|op| op.pos == finish_arg && op.opcode == OpCode::New)
+    {
+        Some(i) => i,
+        None => return (ops, false),
+    };
+
+    let mut raw_int = None;
+    for op in &ops[new_idx + 1..finish_idx] {
+        if op.opcode == OpCode::SetfieldGc && op.args.first() == Some(&finish_arg) {
+            if let Some(ref d) = op.descr {
+                let ds = format!("{d:?}");
+                if ds.contains("offset: 8") && ds.contains("signed: true") {
+                    raw_int = op.args.get(1).copied();
+                }
+            }
+        }
+    }
+    if let Some(raw_int) = raw_int {
+        ops[finish_idx].args[0] = raw_int;
+        let mut to_remove = vec![new_idx];
+        for (i, op) in ops[new_idx + 1..finish_idx].iter().enumerate() {
+            if op.opcode == OpCode::SetfieldGc && op.args.first() == Some(&finish_arg) {
+                to_remove.push(new_idx + 1 + i);
+            }
+        }
+        for &idx in to_remove.iter().rev() {
+            ops.remove(idx);
+        }
+        return (ops, true);
+    }
+    (ops, false)
+}
+
+/// Strip caller-side unboxing after CallAssemblerI results.
+fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
+    use majit_ir::OpCode;
+
+    let ca_results: Vec<OpRef> = ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::CallAssemblerI)
+        .map(|op| op.pos)
+        .collect();
+
+    if ca_results.is_empty() {
+        return ops;
+    }
+
+    for ca_ref in &ca_results {
+        let mut intval_refs: Vec<(usize, OpRef)> = Vec::new();
+        let mut ops_to_remove: Vec<usize> = Vec::new();
+        let mut ob_type_refs: Vec<(usize, OpRef)> = Vec::new();
+
+        for (idx, op) in ops.iter().enumerate() {
+            if op.opcode != OpCode::GetfieldRawI || op.args.first() != Some(ca_ref) {
+                continue;
+            }
+            if let Some(ref d) = op.descr {
+                let ds = format!("{d:?}");
+                if ds.contains("offset: 8")
+                    && ds.contains("field_size: 8")
+                    && ds.contains("signed: true")
+                {
+                    intval_refs.push((idx, op.pos));
+                    ops_to_remove.push(idx);
+                } else if ds.contains("offset: 0") {
+                    ob_type_refs.push((idx, op.pos));
+                }
+            }
+        }
+
+        if !intval_refs.is_empty() {
+            for (idx, ob_type_ref) in ob_type_refs {
+                ops_to_remove.push(idx);
+                for (idx2, op2) in ops.iter().enumerate() {
+                    if op2.opcode == OpCode::GuardClass && op2.args.first() == Some(&ob_type_ref) {
+                        ops_to_remove.push(idx2);
+                    }
+                }
+            }
+        }
+
+        for &(_, intval_ref) in &intval_refs {
+            for op in ops.iter_mut() {
+                for arg in op.args.iter_mut() {
+                    if *arg == intval_ref {
+                        *arg = *ca_ref;
+                    }
+                }
+                if let Some(ref mut fa) = op.fail_args {
+                    for arg in fa.iter_mut() {
+                        if *arg == intval_ref {
+                            *arg = *ca_ref;
+                        }
+                    }
+                }
+            }
+        }
+
+        ops_to_remove.sort_unstable();
+        ops_to_remove.dedup();
+        for &idx in ops_to_remove.iter().rev() {
+            if idx < ops.len() {
+                ops.remove(idx);
+            }
+        }
+    }
+
+    ops
+}
+
+#[cfg(test)]
+mod raw_int_postprocess_tests {
+    use super::{unbox_call_assembler_results, unbox_finish_result};
+    use std::collections::{HashMap, HashSet};
+
+    use majit_ir::{make_field_descr, Op, OpCode, OpRef, Type};
+
+    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
+        let mut op = Op::new(opcode, args);
+        op.pos = OpRef(pos);
+        op
+    }
+
+    fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: majit_ir::DescrRef) -> Op {
+        let mut op = Op::with_descr(opcode, args, descr);
+        op.pos = OpRef(pos);
+        op
+    }
+
+    extern "C" fn dummy_box_helper(_value: i64) -> i64 {
+        0
+    }
+
+    #[test]
+    fn unbox_finish_result_requires_jit_w_int_new_target() {
+        let func_const = OpRef(dummy_box_helper as *const () as usize as u32);
+        let raw = OpRef(0);
+        let call = mk_op_with_descr(
+            OpCode::CallI,
+            &[func_const, raw],
+            1,
+            crate::make_call_descr(&[Type::Int], Type::Int),
+        );
+        let finish = Op::with_descr(
+            OpCode::Finish,
+            &[OpRef(1)],
+            crate::make_fail_descr_typed(vec![Type::Int]),
+        );
+        let helpers = HashSet::new();
+        let mut constants = HashMap::new();
+        constants.insert(func_const.0, 0xDEAD_BEEF_i64);
+
+        let (ops, changed) = unbox_finish_result(vec![call, finish], &constants, &helpers);
+
+        assert!(!changed);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::CallI);
+        assert_eq!(ops[1].opcode, OpCode::Finish);
+        assert_eq!(ops[1].args.as_slice(), &[OpRef(1)]);
+    }
+
+    #[test]
+    fn unbox_finish_result_rewrites_jit_w_int_new_finish() {
+        let func_const = OpRef(dummy_box_helper as *const () as usize as u32);
+        let raw = OpRef(0);
+        let call = mk_op_with_descr(
+            OpCode::CallI,
+            &[func_const, raw],
+            1,
+            crate::make_call_descr(&[Type::Int], Type::Int),
+        );
+        let finish = Op::with_descr(
+            OpCode::Finish,
+            &[OpRef(1)],
+            crate::make_fail_descr_typed(vec![Type::Int]),
+        );
+        let mut helpers = HashSet::new();
+        helpers.insert(dummy_box_helper as *const () as i64);
+        let mut constants = HashMap::new();
+        constants.insert(func_const.0, dummy_box_helper as *const () as i64);
+
+        let (ops, changed) = unbox_finish_result(vec![call, finish], &constants, &helpers);
+
+        assert!(changed);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::Finish);
+        assert_eq!(ops[0].args.as_slice(), &[raw]);
+    }
+
+    #[test]
+    fn unbox_call_assembler_results_rewrites_only_int_payload_unboxing() {
+        let ca = mk_op_with_descr(
+            OpCode::CallAssemblerI,
+            &[OpRef(0)],
+            1,
+            crate::make_call_assembler_descr(1, &[Type::Int], Type::Int),
+        );
+        let get_type = mk_op_with_descr(
+            OpCode::GetfieldRawI,
+            &[OpRef(1)],
+            2,
+            make_field_descr(0, 8, Type::Int, false),
+        );
+        let guard = Op::new(OpCode::GuardClass, &[OpRef(2), OpRef(99_999)]);
+        let get_int = mk_op_with_descr(
+            OpCode::GetfieldRawI,
+            &[OpRef(1)],
+            3,
+            make_field_descr(8, 8, Type::Int, true),
+        );
+        let add = mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(0)], 4);
+
+        let ops = unbox_call_assembler_results(vec![ca, get_type, guard, get_int, add]);
+
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::CallAssemblerI);
+        assert_eq!(ops[1].opcode, OpCode::IntAdd);
+        assert_eq!(ops[1].args[0], OpRef(1));
+    }
+
+    #[test]
+    fn unbox_call_assembler_results_preserves_bool_payload_unboxing() {
+        let ca = mk_op_with_descr(
+            OpCode::CallAssemblerI,
+            &[OpRef(0)],
+            1,
+            crate::make_call_assembler_descr(1, &[Type::Int], Type::Int),
+        );
+        let get_type = mk_op_with_descr(
+            OpCode::GetfieldRawI,
+            &[OpRef(1)],
+            2,
+            make_field_descr(0, 8, Type::Int, false),
+        );
+        let guard = Op::new(OpCode::GuardClass, &[OpRef(2), OpRef(99_999)]);
+        let get_bool = mk_op_with_descr(
+            OpCode::GetfieldRawI,
+            &[OpRef(1)],
+            3,
+            make_field_descr(8, 1, Type::Int, false),
+        );
+        let test = mk_op(OpCode::IntNe, &[OpRef(3), OpRef(0)], 4);
+
+        let ops = unbox_call_assembler_results(vec![ca, get_type, guard, get_bool, test]);
+
+        assert_eq!(ops.len(), 5);
+        assert_eq!(ops[3].opcode, OpCode::GetfieldRawI);
+        assert_eq!(ops[4].opcode, OpCode::IntNe);
+        assert_eq!(ops[4].args[0], OpRef(3));
     }
 }

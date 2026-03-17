@@ -110,11 +110,19 @@ extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 
     match pyre_interp::eval::eval_loop_for_force(frame) {
         Ok(result) => {
+            // Return raw int value (not boxed pointer) to match the
+            // CallAssembler raw-int protocol. Finish stores raw int,
+            // so force_fn must also return raw int for consistency.
+            let raw = if !result.is_null() && unsafe { is_int(result) } {
+                unsafe { w_int_get_value(result) }
+            } else {
+                result as i64
+            };
             unsafe {
                 FORCE_CACHE_1 = FORCE_CACHE_0;
-                FORCE_CACHE_0 = (code_key, arg_key, result as i64);
+                FORCE_CACHE_0 = (code_key, arg_key, raw);
             }
-            result as i64
+            raw
         }
         Err(err) => panic!("jit force callee frame failed: {err}"),
     }
@@ -140,7 +148,14 @@ extern "C" fn jit_bridge_compile_callee(
 
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
     let result = match pyre_interp::eval::eval_loop_for_force(frame) {
-        Ok(r) => r as i64,
+        Ok(r) => {
+            // Raw-int protocol: unbox int result to match Finish(raw_int)
+            if !r.is_null() && unsafe { is_int(r) } {
+                unsafe { w_int_get_value(r) }
+            } else {
+                r as i64
+            }
+        }
         Err(e) => panic!("bridge force failed: {e}"),
     };
 
@@ -203,7 +218,10 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let raw = pool_take();
     let frame_ptr = if raw.is_null() {
         Box::into_raw(Box::new(PyFrame::new_for_call(
-            func_code, args, globals, frame.execution_context,
+            func_code,
+            args,
+            globals,
+            frame.execution_context,
         )))
     } else {
         unsafe {
@@ -228,26 +246,53 @@ pub extern "C" fn jit_create_callee_frame_1(caller_frame: i64, callable: i64, ar
 }
 
 pub extern "C" fn jit_create_callee_frame_2(
-    caller_frame: i64, callable: i64, arg0: i64, arg1: i64,
+    caller_frame: i64,
+    callable: i64,
+    arg0: i64,
+    arg1: i64,
 ) -> i64 {
-    create_callee_frame_impl(caller_frame, callable, &[arg0 as PyObjectRef, arg1 as PyObjectRef])
+    create_callee_frame_impl(
+        caller_frame,
+        callable,
+        &[arg0 as PyObjectRef, arg1 as PyObjectRef],
+    )
 }
 
 pub extern "C" fn jit_create_callee_frame_3(
-    caller_frame: i64, callable: i64, arg0: i64, arg1: i64, arg2: i64,
+    caller_frame: i64,
+    callable: i64,
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
 ) -> i64 {
     create_callee_frame_impl(
-        caller_frame, callable,
-        &[arg0 as PyObjectRef, arg1 as PyObjectRef, arg2 as PyObjectRef],
+        caller_frame,
+        callable,
+        &[
+            arg0 as PyObjectRef,
+            arg1 as PyObjectRef,
+            arg2 as PyObjectRef,
+        ],
     )
 }
 
 pub extern "C" fn jit_create_callee_frame_4(
-    caller_frame: i64, callable: i64, arg0: i64, arg1: i64, arg2: i64, arg3: i64,
+    caller_frame: i64,
+    callable: i64,
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+    arg3: i64,
 ) -> i64 {
     create_callee_frame_impl(
-        caller_frame, callable,
-        &[arg0 as PyObjectRef, arg1 as PyObjectRef, arg2 as PyObjectRef, arg3 as PyObjectRef],
+        caller_frame,
+        callable,
+        &[
+            arg0 as PyObjectRef,
+            arg1 as PyObjectRef,
+            arg2 as PyObjectRef,
+            arg3 as PyObjectRef,
+        ],
     )
 }
 

@@ -449,9 +449,8 @@ fn parse_virtualizable_decl(input: ParseStream) -> syn::Result<VirtualizableDecl
         let _ = content.parse::<Token![,]>();
     }
 
-    let var_name = var_name.ok_or_else(|| {
-        syn::Error::new(content.span(), "missing `var` in virtualizable_fields")
-    })?;
+    let var_name = var_name
+        .ok_or_else(|| syn::Error::new(content.span(), "missing `var` in virtualizable_fields"))?;
     let token_offset = token_offset.ok_or_else(|| {
         syn::Error::new(
             content.span(),

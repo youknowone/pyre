@@ -12,6 +12,7 @@
 // ── Storage pool types ──
 
 /// Single i64 stack storage.
+/// Frame._virtualizable_ = ['stackpos', 'stack[*]'] — tla.py:98
 pub struct TlaStorage {
     stack: Vec<i64>,
 }
@@ -83,6 +84,7 @@ impl TlaPool {
 }
 
 /// Interpreter state: storage pool + selected storage index.
+/// Matches RPython Frame with pc, bytecode as greens, self as red — tla.py:92-95
 struct TlaState {
     pool: TlaPool,
     selected: usize,
@@ -116,8 +118,9 @@ const RETURN: u8 = 3;
 const JUMP_IF: u8 = 4;
 const DUP: u8 = 5;
 const SUB: u8 = 6;
-#[allow(dead_code)]
 const NEWSTR: u8 = 7;
+
+// get_printable_location — tla.py:83 (no Rust equivalent needed)
 
 // ── JIT mainloop ──
 
@@ -186,6 +189,12 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
                     continue;
                 }
             }
+            NEWSTR => {
+                // String operations cause trace abort — RPython would
+                // guard-fail on non-int type (W_StringObject vs W_IntObject).
+                pc += 1;
+                break;
+            }
             RETURN => break,
             _ => {}
         }
@@ -205,7 +214,11 @@ impl JitTlaInterp {
         JitTlaInterp { threshold: 3 }
     }
 
-    pub fn run(&mut self, bytecode: &[u8], w_arg: crate::interp::WObject) -> crate::interp::WObject {
+    pub fn run(
+        &mut self,
+        bytecode: &[u8],
+        w_arg: crate::interp::WObject,
+    ) -> crate::interp::WObject {
         let val = match &w_arg {
             crate::interp::WObject::Int(v) => *v,
             _ => panic!("JIT only supports integer args"),
@@ -221,9 +234,7 @@ mod tests {
     use crate::interp;
 
     fn countdown_bytecode() -> Vec<u8> {
-        vec![
-            DUP, CONST_INT, 1, SUB, DUP, JUMP_IF, 1, POP, RETURN,
-        ]
+        vec![DUP, CONST_INT, 1, SUB, DUP, JUMP_IF, 1, POP, RETURN]
     }
 
     #[test]
@@ -249,11 +260,7 @@ mod tests {
             let expected = interp::run(&bc, interp::WObject::Int(n));
             let mut jit = JitTlaInterp::new();
             let got = jit.run(&bc, interp::WObject::Int(n));
-            assert_eq!(
-                got.int_value(),
-                expected.int_value(),
-                "mismatch for n={n}"
-            );
+            assert_eq!(got.int_value(), expected.int_value(), "mismatch for n={n}");
         }
     }
 

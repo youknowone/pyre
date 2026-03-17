@@ -6,7 +6,14 @@
 ///
 /// Greens: [pc]
 /// Reds:   [stack (via storage pool)]
-
+///
+/// RPython correspondence (tlc.py):
+///   - JitDriver(greens=['pc', 'code'], reds=['frame', 'pool']) — tlc.py:231
+///   - @elidable Class.get() — tlc.py:76 (class descriptor lookup cached as pure)
+///     Not yet implemented: requires extracting a helper and jitcode lowerer support.
+///   - Object opcodes (NIL, CONS, CAR, CDR, NEW, etc.) are not handled here —
+///     they cause guard failure in RPython, effectively breaking out of the trace.
+///   - Integer-only loop opcodes map directly to IR via #[jit_interp] binops.
 use crate::interp::{self, ConstantPool};
 
 // ── Storage pool types ──
@@ -178,6 +185,10 @@ const PUT: u8 = interp::PUT;
 const ADD: u8 = interp::ADD;
 const SUB: u8 = interp::SUB;
 const MUL: u8 = interp::MUL;
+// DIV not traced: IntObj.div() in tlc.py:144 uses Python 2 floor division (//),
+// which differs from Rust's truncating division for negative operands.
+// Object opcodes (NIL, CONS, CAR, CDR, NEW, GETATTR, SETATTR, SEND) are also
+// not traced — they cause guard failure, breaking out of the compiled trace.
 const EQ: u8 = interp::EQ;
 const NE: u8 = interp::NE;
 const LT: u8 = interp::LT;
@@ -193,6 +204,10 @@ const DEFAULT_THRESHOLD: u32 = 3;
 
 // ── JIT mainloop ──
 
+// #[jit_interp] generates trace_instruction + JitState from the match arms below.
+// Only integer-stack opcodes are traced; object opcodes (NIL, CONS, NEW, SEND, etc.)
+// are absent from this function, so reaching them would abort tracing — matching
+// RPython's behavior where polymorphic dispatch on Obj causes guard failure.
 #[majit_macros::jit_interp(
     state = TlcState,
     env = Bytecode,

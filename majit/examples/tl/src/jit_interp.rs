@@ -6,10 +6,12 @@
 ///
 /// Greens: [pc]
 /// Reds:   [stack (via storage pool)]
+use majit_runtime::hint_promote;
 
 // ── Storage pool types ──
 
 /// Single i64 stack storage.
+/// _virtualizable_ = ['stackpos', 'stack[*]'] — tl.py:14 (implicit via state_fields)
 pub struct TlStorage {
     stack: Vec<i64>,
 }
@@ -57,6 +59,31 @@ impl TlStorage {
         let b = self.pop();
         self.push(b * a);
     }
+    pub fn div(&mut self) {
+        let a = self.pop();
+        let b = self.pop();
+        self.push(b / a);
+    }
+    /// Stack rotation — @dont_look_inside in RPython (tl.py:43).
+    /// The JIT does not trace into it; in tracing mode, break exits trace.
+    pub fn roll(&mut self, r: i64) {
+        let len = self.stack.len();
+        if r < -1 {
+            let i = (len as i64 + r) as usize;
+            let elem = self.stack[len - 1];
+            for j in (i..len - 1).rev() {
+                self.stack[j + 1] = self.stack[j];
+            }
+            self.stack[i] = elem;
+        } else if r > 1 {
+            let i = len - r as usize;
+            let elem = self.stack[i];
+            for j in i..len - 1 {
+                self.stack[j] = self.stack[j + 1];
+            }
+            self.stack[len - 1] = elem;
+        }
+    }
     pub fn len(&self) -> usize {
         self.stack.len()
     }
@@ -100,6 +127,7 @@ impl TlPool {
 }
 
 /// Interpreter state: storage pool + selected storage index.
+/// hint(stack, access_directly=True) — tl.py:78 (implicit via state_fields)
 struct TlState {
     pool: TlPool,
     selected: usize,
@@ -130,11 +158,13 @@ const NOP: u8 = 1;
 const PUSH: u8 = 2;
 const POP: u8 = 3;
 const SWAP: u8 = 4;
+const ROLL: u8 = 5;
 const PICK: u8 = 6;
 const PUT: u8 = 7;
 const ADD: u8 = 8;
 const SUB: u8 = 9;
 const MUL: u8 = 10;
+const DIV: u8 = 11;
 const EQ: u8 = 12;
 const NE: u8 = 13;
 const LT: u8 = 14;
@@ -142,6 +172,8 @@ const LE: u8 = 15;
 const GT: u8 = 16;
 const GE: u8 = 17;
 const BR_COND: u8 = 18;
+const BR_COND_STK: u8 = 19;
+const CALL: u8 = 20;
 const RETURN: u8 = 21;
 const PUSHARG: u8 = 22;
 
@@ -175,6 +207,9 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
 
     while pc < program.len() {
         jit_merge_point!();
+        // promote(stack.stackpos) — tl.py:88
+        // Makes stackpos a compile-time constant via GUARD_VALUE.
+        stacksize = hint_promote(stacksize);
         let opcode = program[pc];
         pc += 1;
 
@@ -193,6 +228,13 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             SWAP => {
                 state.pool.get_mut(state.selected).swap();
             }
+            ROLL => {
+                // Stack.roll() is @dont_look_inside in RPython — the JIT does
+                // not trace into it. We delegate to TlStorage::roll().
+                let r = program[pc] as i8 as i64;
+                pc += 1;
+                state.pool.get_mut(state.selected).roll(r);
+            }
             PICK => {
                 let i = program[pc] as usize;
                 pc += 1;
@@ -208,40 +250,59 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             ADD => state.pool.get_mut(state.selected).add(),
             SUB => state.pool.get_mut(state.selected).sub(),
             MUL => state.pool.get_mut(state.selected).mul(),
+            DIV => state.pool.get_mut(state.selected).div(),
             EQ => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                state.pool.get_mut(state.selected).push(if b == a { 1 } else { 0 });
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b == a { 1 } else { 0 });
                 stacksize -= 1;
             }
             NE => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                state.pool.get_mut(state.selected).push(if b != a { 1 } else { 0 });
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b != a { 1 } else { 0 });
                 stacksize -= 1;
             }
             LT => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                state.pool.get_mut(state.selected).push(if b < a { 1 } else { 0 });
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b < a { 1 } else { 0 });
                 stacksize -= 1;
             }
             LE => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                state.pool.get_mut(state.selected).push(if b <= a { 1 } else { 0 });
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b <= a { 1 } else { 0 });
                 stacksize -= 1;
             }
             GT => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                state.pool.get_mut(state.selected).push(if b > a { 1 } else { 0 });
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b > a { 1 } else { 0 });
                 stacksize -= 1;
             }
             GE => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                state.pool.get_mut(state.selected).push(if b >= a { 1 } else { 0 });
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b >= a { 1 } else { 0 });
                 stacksize -= 1;
             }
             BR_COND => {
@@ -258,6 +319,31 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                     pc = target;
                     continue;
                 }
+            }
+            BR_COND_STK => {
+                // Pops TWO values: offset (top), then condition.
+                let stk = state.pool.get_mut(state.selected);
+                let offset = stk.pop();
+                let cond = stk.pop();
+                stacksize -= 2;
+                if cond != 0 {
+                    let target = (pc as i64 + offset) as usize;
+                    if target <= pc {
+                        can_enter_jit!(driver, target, &mut state, program, || {});
+                    }
+                    pc = target;
+                    continue;
+                }
+            }
+            CALL => {
+                // Recursive function call. Reads offset from bytecode, calls
+                // the pure interpreter at (pc + offset). The JIT does not
+                // trace into recursive calls.
+                let offset = program[pc] as i8 as i64;
+                pc += 1;
+                let res = crate::interp::interpret_at(program, (pc as i64 + offset) as usize, 0);
+                state.pool.get_mut(state.selected).push(res);
+                stacksize += 1;
             }
             RETURN => break,
             PUSHARG => {

@@ -22,6 +22,7 @@ Input:
 
 Output:
 - extracted opcode dispatch metadata, helper classifications, trait/type info, generated tracing helpers
+- long-term: semantic graph and graph rewrite artifacts for codewriter-style lowering
 
 Current majit owners:
 - [majit-analyze/src/lib.rs](/Users/al03219714/Projects/pypy/majit/majit-analyze/src/lib.rs)
@@ -31,6 +32,22 @@ Current majit owners:
 Rule:
 - parity is checked by extracted dispatch shape, resolved helper classifications, and generated helper code behavior
 - unclassified patterns must stay explicit residual/unclassified; they must not silently become optimized tracing paths
+- source-string heuristics are acceptable only as a bootstrap seam; the target
+  seam is a narrow semantic graph plus graph rewrite passes closer to
+  `rpython/jit/codewriter/`
+
+Target translation stack:
+
+1. `syn` AST
+2. semantic graph (`MajitGraph`)
+3. graph rewrite passes (`jtransform`-style)
+4. emission into proc-macro/codegen output
+
+Current note:
+
+- `majit-analyze` still uses `quote!(...).to_string()` and `contains(...)`
+  heuristics in several places
+- that is a temporary implementation strategy, not the long-term parity target
 
 ### 1. Macro Lowering Seam
 

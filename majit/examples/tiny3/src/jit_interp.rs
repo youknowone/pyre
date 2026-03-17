@@ -316,11 +316,7 @@ impl JitTiny3Interp {
             args[i] = b.as_int();
         }
 
-        if has_result_on_stack {
-            result
-        } else {
-            args[0]
-        }
+        if has_result_on_stack { result } else { args[0] }
     }
 
     /// Run a word-based program with typed (Int/Float) args.
@@ -462,10 +458,7 @@ mod tests {
         ];
         jit.run_typed(&prog, &mut args);
         let result = args[0].as_float();
-        assert!(
-            (result - 11.5).abs() < 1e-10,
-            "expected 11.5, got {result}"
-        );
+        assert!((result - 11.5).abs() < 1e-10, "expected 11.5, got {result}");
         assert_eq!(args[2].as_int(), 0);
     }
 }

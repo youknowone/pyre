@@ -8,8 +8,7 @@ use std::sync::OnceLock;
 
 use pyre_object::PyObjectRef;
 use pyre_runtime::{
-    PyResult, dispatch_callable, w_builtin_func_get,
-    w_func_get_code_ptr, w_func_get_globals,
+    PyResult, dispatch_callable, w_builtin_func_get, w_func_get_code_ptr, w_func_get_globals,
 };
 
 use crate::eval::eval_frame_plain;

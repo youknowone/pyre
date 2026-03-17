@@ -1,55 +1,126 @@
-/// Rust port of rpython/jit/tl/braininterp.py — Brainfuck interpreter.
-///
-/// Tape-based interpreter with 30000 cells, byte-sized values.
-/// Includes both a plain interpreter and a JIT-enabled interpreter.
+/// Brainfuck interpreter benchmarks — interpreter vs JIT.
 pub mod interp;
 pub mod jit_interp;
 
 use std::time::Instant;
 
-fn main() {
-    let n: u32 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+/// Mandelbrot set in Brainfuck (compact version).
+/// Source: https://github.com/erikdubbelboer/brainfuck-jit
+const MANDELBROT: &[u8] = b"+++++++++++++[->++>>>+++++>++>+<<<<<<]>>>>>++++++>--->>>>>>>\
+++++++++[->+++++++++<]>[->+>+>+>+<<<<]+++>>+>+>+++++[>++>++++++<<-]+>>+>+>>>>>++>++>++>+\
++>++>++>++>++>++>++<<<<<<<<<<<<<<<[>[->+<]>[-<+>>>>+<<<]>>>>>[->>>>>>>>>+<<<<<<<<<]>>>>>>\
+>>>[->+>+<<]>[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->[-]>+>+<<[->+<[->+<[->+<\
+[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<\
+[->+<[->+<]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]>[>+>+<<[->>-<<]]>>[-<<+>>]<[->>++++++++[-<\
+++++++>]<.[-]<]<[>+>+<<[->>-<<]]>>[-<<+>>]<[->>++++[-<++++++++>]<.[-]<]<<<<<<<]>>>>>>>>>>>\
+<<<<<<<<<<<<[>[->+<]>[-<+>>>>+<<<]>>>>>[->>>>>>+<<<<<<]>>>>>>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+\
+>[-<+>[-<+>[-<+>[-<[-]>>[-]+>+<<<[->+<[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>\
+[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]>>\
+[->+>+<<]>[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->[-]>+>+<<[->+<[->+<[->+<[->+\
+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<\
+[->+<]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]>[>+>+<<[->>-<<]]>>[-<<+>>]>[-<<<<<<<+>>>>>>>]<<<[\
+->>++++++++[-<++++++>]<.[-]<]<[>+>+<<[->>-<<]]>>[-<<+>>]<[->>++++[-<++++++++>]<.[-]<]<<<<<\
+<<<<<<<<<<]>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<[>[->+<]>[-<+>>>>+<<<]>>>>>[->>>>>>>>>+<<<<<<<<<]\
+>>>>>>>>>-[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<[-]>>[-]+>+<<<[->+<[-<+>[-<+>[\
+-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<+>[-<\
++>[-<+>]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]>>[->+>+<<]>[->+<[->+<[->+<[->+<[->+<[->+<[->+<[\
+->+<[->+<[->[-]>+>+<<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<\
+[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<[->+<]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]>[>+>+<\
+<[->>-<<]]>>[-<<+>>]<[->>++++++++[-<++++++>]<.[-]<]<[>+>+<<[->>-<<]]>>[-<<+>>]<[->>++++[\
+-<++++++++>]<.[-]<]<<<<<<<<<<<<<<<]>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<[<]>[-]>[-]>[-]>[-]>[-]\
+>>>>>>>>>>>>>[>[-]>[-]>[-]>[-]>[-]>[-]>[-]>[-]>[-]>[-]>[-]>[-]>[-]>[-]>[-]<<<<<<<<<<<<<<\
+<]<<<<<<<<<<++++++++++.[-]";
 
-    // Simple loop benchmark: add N to cell 0 by incrementing
-    // This creates a BF program: set cell0=N, then loop cell0 times adding to cell1
-    // Program: put N in cell0, [- > + <] (moves cell0 to cell1)
-    let mut prog = String::new();
+/// Simple but long-running: count from N to 0.
+/// BF: set cell0=N via repeated +, then loop: [-]
+fn countdown_bf(n: usize) -> Vec<u8> {
+    let mut prog = Vec::with_capacity(n + 3);
     for _ in 0..n {
-        prog.push('+');
+        prog.push(b'+');
     }
-    prog.push_str("[->+<]");
+    prog.extend_from_slice(b"[-]");
+    prog
+}
 
-    println!("--- braininterp [interpreter] ---");
+/// Multiply: cell1 = a * b via nested loop.
+fn multiply_bf(a: u8, b: u8) -> Vec<u8> {
+    let mut prog = Vec::new();
+    for _ in 0..a {
+        prog.push(b'+');
+    }
+    prog.push(b'[');
+    prog.push(b'>');
+    for _ in 0..b {
+        prog.push(b'+');
+    }
+    prog.extend_from_slice(b"<-]");
+    prog
+}
+
+fn main() {
+    // Benchmark 1: countdown (hot tight loop)
+    let n = 100_000;
+    let countdown = countdown_bf(n);
+    println!("=== countdown({n}) ===");
     {
         let start = Instant::now();
-        let output = interp::interpret(prog.as_bytes());
-        let elapsed = start.elapsed();
-        println!("output len = {}", output.len());
-        println!("time       = {elapsed:?}");
+        interp::interpret(&countdown);
+        println!("  interp: {:?}", start.elapsed());
     }
-
-    // Larger benchmark: nested loop
-    // +++++++++[>+++++++++<-] sets cell1 = 81
-    let big_prog = "+++++++++[>+++++++++<-]";
-    println!("\n--- braininterp multiply [interpreter] ---");
-    {
-        let start = Instant::now();
-        let output = interp::interpret(big_prog.as_bytes());
-        let elapsed = start.elapsed();
-        println!("output len = {}", output.len());
-        println!("time       = {elapsed:?}");
-    }
-
-    println!("\n--- braininterp multiply [JIT] ---");
     {
         let mut jit = jit_interp::JitBrainInterp::new();
         let start = Instant::now();
-        let output = jit.run(big_prog.as_bytes());
-        let elapsed = start.elapsed();
-        println!("output len = {}", output.len());
-        println!("time       = {elapsed:?}");
+        jit.run(&countdown);
+        println!("  JIT:    {:?}", start.elapsed());
+    }
+
+    // Benchmark 2: multiply (nested loop)
+    let mul = multiply_bf(255, 255);
+    println!("\n=== multiply(255*255) ===");
+    {
+        let start = Instant::now();
+        interp::interpret(&mul);
+        println!("  interp: {:?}", start.elapsed());
+    }
+    {
+        let mut jit = jit_interp::JitBrainInterp::new();
+        let start = Instant::now();
+        jit.run(&mul);
+        println!("  JIT:    {:?}", start.elapsed());
+    }
+
+    // Benchmark 3: large multiply (stresses nested loop JIT)
+    let large_mul = multiply_bf(200, 200);
+    println!("\n=== multiply(200*200) x100 ===");
+    {
+        let start = Instant::now();
+        for _ in 0..100 {
+            interp::interpret(&large_mul);
+        }
+        println!("  interp: {:?}", start.elapsed());
+    }
+    {
+        let mut jit = jit_interp::JitBrainInterp::new();
+        let start = Instant::now();
+        for _ in 0..100 {
+            jit.run(&large_mul);
+        }
+        println!("  JIT:    {:?}", start.elapsed());
+    }
+
+    // Benchmark 4: very large countdown
+    let big_n = 1_000_000;
+    let big_countdown = countdown_bf(big_n);
+    println!("\n=== countdown({big_n}) ===");
+    {
+        let start = Instant::now();
+        interp::interpret(&big_countdown);
+        println!("  interp: {:?}", start.elapsed());
+    }
+    {
+        let mut jit = jit_interp::JitBrainInterp::new();
+        let start = Instant::now();
+        jit.run(&big_countdown);
+        println!("  JIT:    {:?}", start.elapsed());
     }
 }
