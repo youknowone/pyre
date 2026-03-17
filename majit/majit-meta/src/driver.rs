@@ -82,7 +82,14 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_compiled_meta(green_key)
     }
 
-    /// Set virtualizable array lengths for the current trace's preamble patching.
+    /// Set the virtualizable object pointer for compile-time array length reading.
+    ///
+    /// RPython parity: compile.py reads array lengths from the actual object.
+    pub fn set_vable_ptr(&mut self, ptr: *const u8) {
+        self.meta.set_vable_ptr(ptr);
+    }
+
+    /// Set virtualizable array lengths as fallback (for tests without real objects).
     pub fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
         self.meta.set_vable_array_lengths(lengths);
     }

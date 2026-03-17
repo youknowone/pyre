@@ -3416,14 +3416,30 @@ impl<M: Clone> MetaInterp<M> {
     /// 5. Otherwise → inline
     ///
     /// `callee_key` identifies the called function's JitDriver.
+    /// Inline decision using an externally-held TraceCtx.
+    ///
+    /// During merge_point callbacks, `self.tracing` is temporarily None
+    /// (the ctx is passed to the callback). This method accepts the ctx
+    /// directly so inline decisions work inside inline_trace_and_execute.
+    pub fn should_inline_with_ctx(
+        &mut self,
+        callee_key: u64,
+        ctx: &crate::trace_ctx::TraceCtx,
+    ) -> InlineDecision {
+        self.should_inline_impl(callee_key, Some(ctx))
+    }
+
     pub fn should_inline(&mut self, callee_key: u64) -> InlineDecision {
-        // If we're already tracing, we can potentially inline —
-        // even if the callee has compiled code (recursive inlining).
-        // This matches PyPy's behavior where recursive calls are
-        // inlined up to MAX_INLINE_DEPTH before falling back to
-        // CALL_ASSEMBLER.
-        if self.tracing.is_some() {
-            if let Some(ref ctx) = self.tracing {
+        let ctx_ref = self.tracing.as_ref();
+        self.should_inline_impl(callee_key, ctx_ref)
+    }
+
+    fn should_inline_impl(
+        &mut self,
+        callee_key: u64,
+        ctx: Option<&crate::trace_ctx::TraceCtx>,
+    ) -> InlineDecision {
+        if let Some(ctx) = ctx {
                 if ctx.inline_depth() >= MAX_INLINE_DEPTH {
                     if self.compiled_loops.contains_key(&callee_key) {
                         return InlineDecision::CallAssembler;

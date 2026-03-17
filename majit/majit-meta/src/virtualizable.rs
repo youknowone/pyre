@@ -303,6 +303,199 @@ impl VirtualizableInfo {
     pub fn check_boxes(&self, boxes: &[i64], array_lengths: &[usize]) -> bool {
         boxes.len() == self.get_total_size(array_lengths)
     }
+
+    // ── RPython virtualizable.py parity: heap I/O via descriptor ──
+
+    /// Read a static field value from the heap object.
+    ///
+    /// RPython equivalent: `vinfo.read_from_field(virtualizable, field_index)`
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn read_field(&self, obj_ptr: *const u8, field_index: usize) -> i64 {
+        let field = &self.static_fields[field_index];
+        match field.field_type {
+            Type::Float => {
+                let ptr = obj_ptr.add(field.offset) as *const f64;
+                f64::to_bits(*ptr) as i64
+            }
+            _ => {
+                let ptr = obj_ptr.add(field.offset) as *const i64;
+                *ptr
+            }
+        }
+    }
+
+    /// Write a static field value to the heap object.
+    ///
+    /// RPython equivalent: `vinfo.write_to_field(virtualizable, field_index, value)`
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn write_field(&self, obj_ptr: *mut u8, field_index: usize, value: i64) {
+        let field = &self.static_fields[field_index];
+        match field.field_type {
+            Type::Float => {
+                let ptr = obj_ptr.add(field.offset) as *mut f64;
+                *ptr = f64::from_bits(value as u64);
+            }
+            _ => {
+                let ptr = obj_ptr.add(field.offset) as *mut i64;
+                *ptr = value;
+            }
+        }
+    }
+
+    /// Read the length of an array field from the heap object.
+    ///
+    /// RPython equivalent: `vinfo.get_array_length(virtualizable, array_index)`
+    ///
+    /// Reads the array pointer from the virtualizable, then reads the length
+    /// from the array header at `length_offset`.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn get_array_length(&self, obj_ptr: *const u8, array_index: usize) -> usize {
+        let ai = &self.array_fields[array_index];
+        let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *const u8);
+        if array_ptr.is_null() {
+            0
+        } else {
+            *(array_ptr.add(ai.length_offset) as *const usize)
+        }
+    }
+
+    /// Read an array element from the heap object.
+    ///
+    /// RPython equivalent: `vinfo.read_from_array(virtualizable, array_index, item_index)`
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn read_array_item(
+        &self,
+        obj_ptr: *const u8,
+        array_index: usize,
+        item_index: usize,
+    ) -> i64 {
+        let ai = &self.array_fields[array_index];
+        let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *const u8);
+        let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
+        match ai.item_type {
+            Type::Float => {
+                let ptr = array_ptr.add(item_offset) as *const f64;
+                f64::to_bits(*ptr) as i64
+            }
+            _ => {
+                let ptr = array_ptr.add(item_offset) as *const i64;
+                *ptr
+            }
+        }
+    }
+
+    /// Write an array element to the heap object.
+    ///
+    /// RPython equivalent: `vinfo.write_to_array(virtualizable, array_index, item_index, value)`
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn write_array_item(
+        &self,
+        obj_ptr: *mut u8,
+        array_index: usize,
+        item_index: usize,
+        value: i64,
+    ) {
+        let ai = &self.array_fields[array_index];
+        let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *mut u8);
+        let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
+        match ai.item_type {
+            Type::Float => {
+                let ptr = array_ptr.add(item_offset) as *mut f64;
+                *ptr = f64::from_bits(value as u64);
+            }
+            _ => {
+                let ptr = array_ptr.add(item_offset) as *mut i64;
+                *ptr = value;
+            }
+        }
+    }
+
+    /// Load all virtualizable boxes from the heap object.
+    ///
+    /// RPython equivalent: `vinfo.load_list_of_boxes(virtualizable)`
+    ///
+    /// Returns a flat array: [field0, field1, ..., array0[0], ..., array0[N], ...]
+    /// Array lengths are read from the actual object (not from a side-channel).
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn load_list_of_boxes(&self, obj_ptr: *const u8) -> (Vec<i64>, Vec<usize>) {
+        let mut boxes = Vec::new();
+        let mut array_lengths = Vec::new();
+
+        // Static fields
+        for i in 0..self.static_fields.len() {
+            boxes.push(self.read_field(obj_ptr, i));
+        }
+
+        // Array fields — read lengths from actual object
+        for ai in 0..self.array_fields.len() {
+            let len = self.get_array_length(obj_ptr, ai);
+            array_lengths.push(len);
+            for ei in 0..len {
+                boxes.push(self.read_array_item(obj_ptr, ai, ei));
+            }
+        }
+
+        (boxes, array_lengths)
+    }
+
+    /// Write all boxes back to the heap object (force direction).
+    ///
+    /// RPython equivalent: `vinfo.write_from_resume_data_partial(virtualizable, ...)`
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn write_boxes_to_heap(
+        &self,
+        obj_ptr: *mut u8,
+        boxes: &[i64],
+        array_lengths: &[usize],
+    ) {
+        // Static fields
+        for i in 0..self.static_fields.len() {
+            if i < boxes.len() {
+                self.write_field(obj_ptr, i, boxes[i]);
+            }
+        }
+
+        // Array elements
+        let mut idx = self.static_fields.len();
+        for (ai, &len) in array_lengths.iter().enumerate() {
+            for ei in 0..len {
+                if idx < boxes.len() {
+                    self.write_array_item(obj_ptr, ai, ei, boxes[idx]);
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    /// Force virtualizable: write boxes to heap and clear token.
+    ///
+    /// RPython equivalent: the combined force_now + write_from_resume_data flow.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn force_from_boxes(
+        &self,
+        obj_ptr: *mut u8,
+        boxes: &[i64],
+        array_lengths: &[usize],
+    ) {
+        self.write_boxes_to_heap(obj_ptr, boxes, array_lengths);
+        self.write_token(obj_ptr, VableToken::None);
+    }
 }
 
 /// Reads virtualizable fields from a heap object into a flat value array.
@@ -1052,6 +1245,131 @@ mod tests {
         assert_eq!(config.static_field_types, vec![Type::Int, Type::Float, Type::Ref]);
         assert_eq!(config.array_field_offsets, vec![48, 56]);
         assert_eq!(config.array_item_types, vec![Type::Ref, Type::Int]);
+    }
+
+    #[test]
+    fn test_load_list_of_boxes_reads_from_object() {
+        // RPython parity: vinfo.load_list_of_boxes() reads from actual object.
+        #[repr(C)]
+        struct Frame {
+            token: u64,
+            x: i64,
+            y: i64,
+            arr_ptr: *const u8,
+        }
+
+        let arr_data: Vec<i64> = vec![100, 200, 300];
+        let mut frame = Frame {
+            token: 0,
+            x: 42,
+            y: 99,
+            arr_ptr: arr_data.as_ptr() as *const u8,
+        };
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_field("y", Type::Int, 16);
+        // Array: pointer at offset 24, no length header (items_offset=0)
+        // For this test, we won't call get_array_length since there's no header.
+        // Instead we test read_field/write_field directly.
+
+        let obj = &mut frame as *mut Frame as *mut u8;
+        unsafe {
+            assert_eq!(info.read_field(obj, 0), 42);
+            assert_eq!(info.read_field(obj, 1), 99);
+
+            info.write_field(obj, 0, 111);
+            info.write_field(obj, 1, 222);
+            assert_eq!(frame.x, 111);
+            assert_eq!(frame.y, 222);
+        }
+    }
+
+    #[test]
+    fn test_load_list_of_boxes_with_array() {
+        // RPython parity: vinfo.load_list_of_boxes() with array fields.
+        #[repr(C)]
+        struct ArrayHeader {
+            length: usize,
+            items: [i64; 3],
+        }
+
+        #[repr(C)]
+        struct Frame {
+            token: u64,
+            x: i64,
+            arr_ptr: *const u8,
+        }
+
+        let arr = ArrayHeader {
+            length: 3,
+            items: [10, 20, 30],
+        };
+        let frame = Frame {
+            token: 0,
+            x: 42,
+            arr_ptr: &arr as *const ArrayHeader as *const u8,
+        };
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        // Array at offset 16, length at offset 0, items at offset 8 (after length)
+        info.add_array_field_with_layout("arr", Type::Int, 16, 0, 8);
+
+        let obj = &frame as *const Frame as *const u8;
+        unsafe {
+            assert_eq!(info.get_array_length(obj, 0), 3);
+            assert_eq!(info.read_array_item(obj, 0, 0), 10);
+            assert_eq!(info.read_array_item(obj, 0, 1), 20);
+            assert_eq!(info.read_array_item(obj, 0, 2), 30);
+
+            let (boxes, lengths) = info.load_list_of_boxes(obj);
+            assert_eq!(lengths, vec![3]);
+            assert_eq!(boxes, vec![42, 10, 20, 30]);
+        }
+    }
+
+    #[test]
+    fn test_force_from_boxes_writes_back() {
+        #[repr(C)]
+        struct ArrayHeader {
+            length: usize,
+            items: [i64; 2],
+        }
+
+        #[repr(C)]
+        struct Frame {
+            token: u64,
+            x: i64,
+            arr_ptr: *mut u8,
+        }
+
+        let mut arr = ArrayHeader {
+            length: 2,
+            items: [0, 0],
+        };
+        let mut frame = Frame {
+            token: 999,
+            x: 0,
+            arr_ptr: &mut arr as *mut ArrayHeader as *mut u8,
+        };
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_array_field_with_layout("arr", Type::Int, 16, 0, 8);
+
+        let obj = &mut frame as *mut Frame as *mut u8;
+        let boxes = vec![42, 100, 200]; // x=42, arr=[100, 200]
+        let lengths = vec![2];
+
+        unsafe {
+            info.force_from_boxes(obj, &boxes, &lengths);
+
+            assert_eq!(frame.x, 42);
+            assert_eq!(arr.items[0], 100);
+            assert_eq!(arr.items[1], 200);
+            assert_eq!(frame.token, 0); // token cleared
+        }
     }
 
     #[test]
