@@ -331,9 +331,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 if #virtualizable {
                     let mut args = Vec::new();
                     for &(sidx, _) in &sym.storage_layout {
-                        if let Some(&len_ref) = sym.vable_len_refs.get(&sidx) {
-                            args.push(len_ref);
-                        }
+                        let len_ref = sym.vable_len_refs.get(&sidx).copied()
+                            .expect("vable_len_ref missing at close_loop");
+                        args.push(len_ref);
                     }
                     return args;
                 }
