@@ -10,7 +10,7 @@ use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 use crate::trace::Trace;
 
 /// Maximum number of operations before the trace is considered too long.
-const TRACE_LIMIT: usize = 6000;
+const TRACE_LIMIT: usize = 50000;
 
 /// The trace recorder: accumulates operations during tracing.
 pub struct TraceRecorder {
