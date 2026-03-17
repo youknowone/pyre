@@ -61,9 +61,22 @@ pub fn extract_trait_impls(parsed: &ParsedInterpreter) -> Vec<TraitImplInfo> {
                         .iter()
                         .filter_map(|item| {
                             if let syn::ImplItem::Fn(method) = item {
+                                let body_summary = summarize_block(&method.block);
+                                // Build semantic graph directly from AST (no re-parse needed)
+                                let graph = {
+                                    let fake_fn = syn::ItemFn {
+                                        attrs: method.attrs.clone(),
+                                        vis: syn::Visibility::Inherited,
+                                        sig: method.sig.clone(),
+                                        block: Box::new(method.block.clone()),
+                                    };
+                                    let sf = crate::front::ast::build_function_graph_pub(&fake_fn);
+                                    Some(sf.graph)
+                                };
                                 Some(MethodInfo {
                                     name: method.sig.ident.to_string(),
-                                    body_summary: summarize_block(&method.block),
+                                    body_summary,
+                                    graph,
                                 })
                             } else {
                                 None
@@ -91,6 +104,7 @@ pub fn extract_trait_impls(parsed: &ParsedInterpreter) -> Vec<TraitImplInfo> {
                             method.default.as_ref().map(|block| MethodInfo {
                                 name: method.sig.ident.to_string(),
                                 body_summary: summarize_block(block),
+                                graph: None,
                             })
                         } else {
                             None
