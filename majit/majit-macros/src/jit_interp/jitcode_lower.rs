@@ -299,7 +299,45 @@ impl<'c> Lowerer<'c> {
         None
     }
 
+    /// RPython jtransform.py:923 `_rewrite_op_setfield` for virtualizable.
+    ///
+    /// Recognizes `frame.field_name = value` and emits vable_setfield JitCode.
+    fn lower_vable_field_write(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let vable_var = config.vable_var.as_ref()?;
+
+        let assign = match expr {
+            Expr::Assign(a) => a,
+            _ => return None,
+        };
+        let field = match &*assign.left {
+            Expr::Field(f) => f,
+            _ => return None,
+        };
+        let receiver_str = normalize(&quote!(#field.base).to_string());
+        if receiver_str != *vable_var {
+            return None;
+        }
+        let member_name = match &field.member {
+            syn::Member::Named(ident) => ident.to_string(),
+            _ => return None,
+        };
+        let &(field_index, _) = config.vable_fields.get(&member_name)?;
+        let fi = field_index as u16;
+        let binding = self.lower_value_expr(&assign.right)?;
+        let src = binding.reg;
+        self.statements.push(quote! {
+            __builder.vable_setfield(#fi, #src);
+        });
+        Some(())
+    }
+
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
+        // RPython jtransform.py:923 — virtualizable field write rewrite.
+        if let Some(()) = self.lower_vable_field_write(expr) {
+            return Some(());
+        }
+
         // Config-aware: push_to (non-current storage) BEFORE regular push
         if self.config.is_some() {
             if let Some(()) = self.lower_push_to_stmt(expr) {
@@ -1243,7 +1281,64 @@ impl<'c> Lowerer<'c> {
         })
     }
 
+    /// RPython jtransform.py:832 `rewrite_op_getfield` for virtualizable.
+    ///
+    /// Recognizes `frame.field_name` where `frame` is the virtualizable variable
+    /// and `field_name` is a declared virtualizable field. Emits a vable_getfield
+    /// JitCode instruction that will read from virtualizable_boxes at trace time.
+    fn lower_vable_field_read(&mut self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let vable_var = config.vable_var.as_ref()?;
+
+        if let Expr::Field(field) = expr {
+            let receiver_str = normalize(&quote!(#field.base).to_string());
+            if receiver_str != *vable_var {
+                return None;
+            }
+            let member_name = match &field.member {
+                syn::Member::Named(ident) => ident.to_string(),
+                _ => return None,
+            };
+
+            if let Some(&(field_index, ref field_type)) = config.vable_fields.get(&member_name) {
+                let reg = self.alloc_reg();
+                let fi = field_index as u16;
+                let kind = match field_type.as_str() {
+                    "ref" => {
+                        self.statements.push(quote! {
+                            __builder.vable_getfield_ref(#reg, #fi);
+                        });
+                        BindingKind::Ref
+                    }
+                    "float" => {
+                        self.statements.push(quote! {
+                            __builder.vable_getfield_float(#reg, #fi);
+                        });
+                        BindingKind::Float
+                    }
+                    _ => {
+                        self.statements.push(quote! {
+                            __builder.vable_getfield_int(#reg, #fi);
+                        });
+                        BindingKind::Int
+                    }
+                };
+                return Some(Binding {
+                    reg,
+                    kind,
+                    depends_on_stack: false,
+                });
+            }
+        }
+        None
+    }
+
     fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
+        // RPython jtransform.py:832 — virtualizable field read rewrite.
+        if let Some(binding) = self.lower_vable_field_read(expr) {
+            return Some(binding);
+        }
+
         if is_pop_value(expr) {
             let reg = self.alloc_reg();
             self.statements.push(quote! {
