@@ -234,6 +234,15 @@ impl TraceCtx {
         if self.replacements.is_empty() {
             return;
         }
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] apply_replacements: {} entries",
+                self.replacements.len()
+            );
+            for (old, new) in &self.replacements {
+                eprintln!("  {:?} → {:?}", old, new);
+            }
+        }
         let replacements: std::collections::HashMap<OpRef, OpRef> =
             self.replacements.drain(..).collect();
         self.recorder.apply_replacements(&replacements);

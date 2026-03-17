@@ -77,22 +77,47 @@ pub fn hint_virtual_ref<T>(val: T) -> T {
 #[inline(always)]
 pub fn hint_virtual_ref_finish() {}
 
-/// Hint: access the virtualizable directly as a struct, bypassing JIT tracking.
+/// Hint: access the virtualizable directly, bypassing JIT tracking.
+///
 /// RPython equivalent: `jit.hint(frame, access_directly=True)`
+///
+/// In RPython, the annotator consumes this hint and generates JitCode
+/// that routes field accesses through virtualizable_boxes. In majit,
+/// this is consumed at the framework level: `init_virtualizable_boxes`
+/// is called at trace start, routing vable_getfield/setfield through boxes.
+///
+/// Outside JIT (non-tracing): identity (no runtime effect needed).
 #[inline(always)]
 pub fn hint_access_directly<T>(x: T) -> T {
     x
 }
 
-/// Hint: this virtualizable was freshly allocated, so direct access is safe.
-/// RPython equivalent: `jit.hint(frame, access_directly=True, fresh_virtualizable=True)`
+/// Hint: this virtualizable was freshly allocated, direct access is safe.
+///
+/// RPython equivalent: `jit.hint(frame, fresh_virtualizable=True)`
+///
+/// In RPython, the annotator skips the initial token sync for fresh objects.
+/// In majit, `sync_virtualizable_before_jit` handles fresh-vs-existing.
+///
+/// Outside JIT (non-tracing): identity (no runtime effect needed).
 #[inline(always)]
 pub fn hint_fresh_virtualizable<T>(x: T) -> T {
     x
 }
 
-/// Hint: force the virtualizable now (performance hint for generators etc).
+/// Hint: force the virtualizable now.
+///
 /// RPython equivalent: `jit.hint(frame, force_virtualizable=True)`
+///
+/// Two modes of consumption:
+/// 1. During tracing: interpreter calls `ctx.gen_store_back_in_vable(vable_opref)`
+///    which emits SETFIELD_GC/SETARRAYITEM_GC ops (RPython parity).
+/// 2. Outside JIT: this is a no-op because the heap is the canonical state
+///    (no JIT boxes to flush). RPython's blackhole similarly checks the token
+///    and only forces if JIT code is active.
+///
+/// For explicit forcing with a known VirtualizableInfo, use
+/// `VirtualizableInfo::force_now()` directly.
 #[inline(always)]
 pub fn hint_force_virtualizable<T>(x: T) -> T {
     x
