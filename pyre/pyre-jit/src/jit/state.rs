@@ -1875,9 +1875,10 @@ impl TraceFrameState {
             // Record EnterPortalFrame and push inline frame
             driver.enter_inline_frame(callee_key);
 
-            // Trace AND execute the callee synchronously
+            // Trace AND execute the callee synchronously.
+            // callee_frame is moved to the heap inside inline_trace_and_execute.
             let inline_result =
-                inline_trace_and_execute(ctx, callee_frame_opref, &mut callee_frame);
+                inline_trace_and_execute(ctx, callee_frame_opref, callee_frame);
 
             match inline_result {
                 Ok((result_opref, concrete_result)) => {
@@ -1913,22 +1914,40 @@ impl TraceFrameState {
     }
 }
 
+/// One frame on the inline tracing stack.
+struct InlineFrame {
+    sym: PyreSym,
+    concrete_frame: Box<pyre_interp::frame::PyFrame>,
+    code: *const CodeObject,
+    callee_frame_opref: OpRef,
+    arg_state: pyre_bytecode::bytecode::OpArgState,
+}
+
 /// Mini eval loop that traces AND executes callee bytecodes on the
 /// same TraceCtx as the caller, implementing trace-through inlining.
+///
+/// The callee's PyFrame is heap-allocated (Box) to minimize Rust stack
+/// usage. Phase 3 will extend this to a multi-frame iterative stack
+/// for recursive inlining.
 fn inline_trace_and_execute(
     ctx: &mut TraceCtx,
     callee_frame_opref: OpRef,
-    callee: &mut pyre_interp::frame::PyFrame,
+    callee: pyre_interp::frame::PyFrame, // takes ownership, boxed internally
 ) -> Result<(OpRef, PyObjectRef), pyre_runtime::PyError> {
-    use pyre_bytecode::bytecode::OpArgState;
     use pyre_runtime::StepResult;
 
-    let code = unsafe { &*callee.code };
-    let mut arg_state = OpArgState::default();
-    let mut callee_sym = PyreSym::new_uninit(callee_frame_opref);
+    let mut frame = InlineFrame {
+        sym: PyreSym::new_uninit(callee_frame_opref),
+        concrete_frame: Box::new(callee),
+        code: std::ptr::null(),
+        callee_frame_opref,
+        arg_state: pyre_bytecode::bytecode::OpArgState::default(),
+    };
+    frame.code = frame.concrete_frame.code;
 
     loop {
-        let pc = callee.next_instr;
+        let pc = frame.concrete_frame.next_instr;
+        let code = unsafe { &*frame.code };
         if pc >= code.instructions.len() {
             return Err(pyre_runtime::PyError::type_error(
                 "inline callee fell off end of bytecode",
@@ -1936,20 +1955,30 @@ fn inline_trace_and_execute(
         }
 
         // ── TRACE: record IR for this instruction ──
-        let mut frame_state =
-            TraceFrameState::from_sym(ctx, &mut callee_sym, callee as *const _ as usize, pc + 1);
-        let trace_action = frame_state.trace_code_step(code, pc);
+        let concrete_addr = &*frame.concrete_frame as *const _ as usize;
+        let trace_action = {
+            let mut frame_state =
+                TraceFrameState::from_sym(ctx, &mut frame.sym, concrete_addr, pc + 1);
+            frame_state.trace_code_step(code, pc)
+        };
 
         match trace_action {
             TraceAction::Continue => {}
             TraceAction::Finish { finish_args, .. } => {
-                // Callee hit RETURN_VALUE — finish_args[0] is the result OpRef
                 let result_opref = finish_args[0];
-                // Execute the concrete RETURN_VALUE
-                let code_unit = code.instructions[callee.next_instr];
-                let (instruction, op_arg) = arg_state.get(code_unit);
-                callee.next_instr += 1;
-                match execute_opcode_step(callee, code, instruction, op_arg, callee.next_instr)? {
+                let code = unsafe { &*frame.code };
+                let ni = frame.concrete_frame.next_instr;
+                let code_unit = code.instructions[ni];
+                let (instruction, op_arg) = frame.arg_state.get(code_unit);
+                frame.concrete_frame.next_instr = ni + 1;
+                let next = frame.concrete_frame.next_instr;
+                match execute_opcode_step(
+                    &mut *frame.concrete_frame,
+                    code,
+                    instruction,
+                    op_arg,
+                    next,
+                )? {
                     StepResult::Return(v) => return Ok((result_opref, v)),
                     _ => {
                         return Err(pyre_runtime::PyError::type_error(
@@ -1969,10 +1998,19 @@ fn inline_trace_and_execute(
         }
 
         // ── EXECUTE: run the concrete instruction ──
-        let code_unit = code.instructions[callee.next_instr];
-        let (instruction, op_arg) = arg_state.get(code_unit);
-        callee.next_instr += 1;
-        match execute_opcode_step(callee, code, instruction, op_arg, callee.next_instr)? {
+        let code = unsafe { &*frame.code };
+        let ni = frame.concrete_frame.next_instr;
+        let code_unit = code.instructions[ni];
+        let (instruction, op_arg) = frame.arg_state.get(code_unit);
+        frame.concrete_frame.next_instr = ni + 1;
+        let next = frame.concrete_frame.next_instr;
+        match execute_opcode_step(
+            &mut *frame.concrete_frame,
+            code,
+            instruction,
+            op_arg,
+            next,
+        )? {
             StepResult::Continue => {}
             StepResult::Return(_) => {
                 return Err(pyre_runtime::PyError::type_error(
