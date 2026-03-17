@@ -332,9 +332,82 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
+    /// RPython jtransform.py:794 `setarrayitem_vable_*`.
+    ///
+    /// Recognizes `frame.locals_w[i] = val` and emits vable_setarrayitem.
+    fn lower_vable_array_write(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let vable_var = config.vable_var.as_ref()?;
+
+        let assign = match expr {
+            Expr::Assign(a) => a,
+            _ => return None,
+        };
+        // LHS: frame.array_field[index]
+        let index_expr = match &*assign.left {
+            Expr::Index(idx) => idx,
+            _ => return None,
+        };
+        let field = match &*index_expr.expr {
+            Expr::Field(f) => f,
+            _ => return None,
+        };
+        let receiver_str = normalize(&quote!(#field.base).to_string());
+        if receiver_str != *vable_var {
+            return None;
+        }
+        let member_name = match &field.member {
+            syn::Member::Named(ident) => ident.to_string(),
+            _ => return None,
+        };
+        let &(array_index, _) = config.vable_arrays.get(&member_name)?;
+        let ai = array_index as u16;
+
+        // Lower index and value
+        let idx_binding = self.lower_value_expr(&index_expr.index)?;
+        let idx_reg = idx_binding.reg;
+        let val_binding = self.lower_value_expr(&assign.right)?;
+        let val_reg = val_binding.reg;
+
+        self.statements.push(quote! {
+            __builder.vable_setarrayitem(#ai, #idx_reg, #val_reg);
+        });
+        Some(())
+    }
+
+    /// RPython jtransform.py:650 `hint_force_virtualizable`.
+    ///
+    /// Recognizes `hint_force_virtualizable!(frame)` macro invocation.
+    fn lower_vable_force(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let _vable_var = config.vable_var.as_ref()?;
+
+        // Pattern: Expr::Macro with path ending in "hint_force_virtualizable"
+        let mac = match expr {
+            Expr::Macro(m) => m,
+            _ => return None,
+        };
+        let seg = mac.mac.path.segments.last()?;
+        if seg.ident != "hint_force_virtualizable" {
+            return None;
+        }
+        self.statements.push(quote! {
+            __builder.vable_force();
+        });
+        Some(())
+    }
+
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
         // RPython jtransform.py:923 — virtualizable field write rewrite.
         if let Some(()) = self.lower_vable_field_write(expr) {
+            return Some(());
+        }
+        // RPython jtransform.py:794 — virtualizable array write rewrite.
+        if let Some(()) = self.lower_vable_array_write(expr) {
+            return Some(());
+        }
+        // RPython jtransform.py:650 — hint_force_virtualizable rewrite.
+        if let Some(()) = self.lower_vable_force(expr) {
             return Some(());
         }
 
@@ -1333,9 +1406,73 @@ impl<'c> Lowerer<'c> {
         None
     }
 
+    /// RPython jtransform.py:760 `getarrayitem_vable_*`.
+    ///
+    /// Recognizes `frame.locals_w[i]` where `frame` is the virtualizable
+    /// variable and `locals_w` is a declared virtualizable array field.
+    fn lower_vable_array_read(&mut self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let vable_var = config.vable_var.as_ref()?;
+
+        // Pattern: Expr::Index where base is Expr::Field on vable_var
+        let index_expr = match expr {
+            Expr::Index(idx) => idx,
+            _ => return None,
+        };
+        let field = match &*index_expr.expr {
+            Expr::Field(f) => f,
+            _ => return None,
+        };
+        let receiver_str = normalize(&quote!(#field.base).to_string());
+        if receiver_str != *vable_var {
+            return None;
+        }
+        let member_name = match &field.member {
+            syn::Member::Named(ident) => ident.to_string(),
+            _ => return None,
+        };
+        let &(array_index, ref item_type) = config.vable_arrays.get(&member_name)?;
+
+        // Lower the index expression to a register
+        let idx_binding = self.lower_value_expr(&index_expr.index)?;
+        let idx_reg = idx_binding.reg;
+
+        let reg = self.alloc_reg();
+        let ai = array_index as u16;
+        let kind = match item_type.as_str() {
+            "ref" => {
+                self.statements.push(quote! {
+                    __builder.vable_getarrayitem_ref(#reg, #ai, #idx_reg);
+                });
+                BindingKind::Ref
+            }
+            "float" => {
+                self.statements.push(quote! {
+                    __builder.vable_getarrayitem_float(#reg, #ai, #idx_reg);
+                });
+                BindingKind::Float
+            }
+            _ => {
+                self.statements.push(quote! {
+                    __builder.vable_getarrayitem_int(#reg, #ai, #idx_reg);
+                });
+                BindingKind::Int
+            }
+        };
+        Some(Binding {
+            reg,
+            kind,
+            depends_on_stack: false,
+        })
+    }
+
     fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
         // RPython jtransform.py:832 — virtualizable field read rewrite.
         if let Some(binding) = self.lower_vable_field_read(expr) {
+            return Some(binding);
+        }
+        // RPython jtransform.py:760 — virtualizable array read rewrite.
+        if let Some(binding) = self.lower_vable_array_read(expr) {
             return Some(binding);
         }
 
