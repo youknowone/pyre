@@ -118,7 +118,7 @@ fn patch_new_loop_to_load_virtualizable_fields(
     constants: &mut HashMap<u32, i64>,
     array_lengths: &[usize],
 ) -> (Vec<InputArg>, Vec<Op>) {
-    let num_static = info.num_static_fields;
+    let num_static = info.num_static_extra_boxes;
 
     // No virtualizable fields at all → skip preamble patching entirely.
     if num_static == 0 && info.array_fields.is_empty() {
@@ -167,7 +167,7 @@ fn patch_with_array_lengths(
     }
 
     // Array fields - use temporary positions for array pointers
-    let mut arg_idx = (1 + info.num_static_fields) as u32;
+    let mut arg_idx = (1 + info.num_static_extra_boxes) as u32;
     // Use constant range that won't conflict with existing constants.
     // Pick a base above 10_000 but separate from user constants.
     let mut next_const_key = 20_000u32;
@@ -1001,7 +1001,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // Init virtualizable boxes (same as on_back_edge_typed)
                 if let Some(ref info) = self.virtualizable_info {
-                    let num_static = info.num_static_fields;
+                    let num_static = info.num_static_extra_boxes;
                     let num_array_elems: usize = self.vable_array_lengths.iter().sum();
                     let total_vable = num_static + num_array_elems;
                     if total_vable > 0 && live_values.len() >= 1 + total_vable {
@@ -1072,7 +1072,7 @@ impl<M: Clone> MetaInterp<M> {
                 // pass them to init_virtualizable_boxes so that subsequent
                 // vable_getfield/setfield calls use boxes instead of heap ops.
                 if let Some(ref info) = self.virtualizable_info {
-                    let num_static = info.num_static_fields;
+                    let num_static = info.num_static_extra_boxes;
                     let num_array_elems: usize = self.vable_array_lengths.iter().sum();
                     let total_vable = num_static + num_array_elems;
 

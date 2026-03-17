@@ -114,7 +114,7 @@ pub struct VirtualizableInfo {
     /// For `n` static fields and arrays of sizes `s1, s2, ...`:
     /// `num_boxes = n + s1 + s2 + ...`
     /// (array sizes are known at trace time after a promote).
-    pub num_static_fields: usize,
+    pub num_static_extra_boxes: usize,
 }
 
 impl VirtualizableInfo {
@@ -124,7 +124,7 @@ impl VirtualizableInfo {
             static_fields: Vec::new(),
             array_fields: Vec::new(),
             token_offset,
-            num_static_fields: 0,
+            num_static_extra_boxes: 0,
         }
     }
 
@@ -136,7 +136,7 @@ impl VirtualizableInfo {
             offset,
             is_immutable: false,
         });
-        self.num_static_fields = self.static_fields.len();
+        self.num_static_extra_boxes = self.static_fields.len();
     }
 
     /// Add an array field with default layout (no header — items start at offset 0).
@@ -295,13 +295,13 @@ impl VirtualizableInfo {
     ///
     /// RPython equivalent: `vinfo.num_static_extra_boxes`
     pub fn minimum_size(&self) -> usize {
-        self.num_static_fields
+        self.num_static_extra_boxes
     }
 
     /// Get total size: number of static fields + sum of all array lengths.
     /// `array_lengths` must have one entry per array field.
     pub fn get_total_size(&self, array_lengths: &[usize]) -> usize {
-        self.num_static_fields + array_lengths.iter().sum::<usize>()
+        self.num_static_extra_boxes + array_lengths.iter().sum::<usize>()
     }
 
     /// Get the index into the flat box array for a specific array element.
@@ -313,7 +313,7 @@ impl VirtualizableInfo {
         item_index: usize,
         array_lengths: &[usize],
     ) -> usize {
-        let mut idx = self.num_static_fields;
+        let mut idx = self.num_static_extra_boxes;
         for i in 0..array_index {
             idx += array_lengths[i];
         }
@@ -530,7 +530,7 @@ impl VirtualizableInfo {
 /// The caller must ensure `obj_ptr` points to a valid object with the
 /// layout described by `info`.
 pub unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<i64> {
-    let mut boxes = Vec::with_capacity(info.num_static_fields);
+    let mut boxes = Vec::with_capacity(info.num_static_extra_boxes);
 
     // Read static fields
     for field in &info.static_fields {
@@ -801,7 +801,7 @@ mod tests {
 
         assert_eq!(info.num_fields(), 2);
         assert_eq!(info.num_arrays(), 1);
-        assert_eq!(info.num_static_fields, 2);
+        assert_eq!(info.num_static_extra_boxes, 2);
     }
 
     #[test]
