@@ -189,40 +189,4 @@ impl PyFrame {
     }
 }
 
-// ── Virtualizable configuration ──────────────────────────────────────
-
-use majit_ir::Type;
-use majit_meta::virtualizable::VirtualizableInfo;
-
-/// Build a `VirtualizableInfo` describing PyFrame's layout.
-///
-/// ```text
-///     _virtualizable_ = ['locals_stack_w[*]', 'valuestackdepth',
-///                         'last_instr', ...]
-/// ```
-///
-/// We use explicit byte offsets instead of name-based introspection.
-/// The JIT optimizer's Virtualize pass uses this to keep frame fields
-/// in CPU registers, eliminating heap accesses for LoadFast/StoreFast
-/// and stack push/pop during compiled code.
-///
-/// Static integer fields:
-/// - `next_instr` — instruction pointer
-/// - `stack_depth` — number of live stack values
-///
-/// Array fields:
-/// - `locals_w` — fast local variables
-/// - `value_stack_w` — operand stack
-pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
-    let mut info = VirtualizableInfo::new(PYFRAME_VABLE_TOKEN_OFFSET);
-
-    // Static fields (scalars kept in registers)
-    info.add_field("next_instr", Type::Int, PYFRAME_NEXT_INSTR_OFFSET);
-    info.add_field("stack_depth", Type::Int, PYFRAME_STACK_DEPTH_OFFSET);
-
-    // Array fields (element-wise virtualization)
-    info.add_array_field("locals_w", Type::Int, PYFRAME_LOCALS_OFFSET);
-    info.add_array_field("value_stack_w", Type::Int, PYFRAME_STACK_OFFSET);
-
-    info
-}
+// Virtualizable configuration is in jit/frame_layout.rs

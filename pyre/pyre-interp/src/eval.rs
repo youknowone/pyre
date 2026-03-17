@@ -29,7 +29,8 @@ use crate::jit::trace::trace_bytecode;
 use majit_meta::{DetailedDriverRunOutcome, JitDriver};
 
 use crate::call::{call_callable, install_jit_call_bridge};
-use crate::frame::{PyFrame, build_pyframe_virtualizable_info};
+use crate::frame::PyFrame;
+use crate::jit::frame_layout::build_pyframe_virtualizable_info;
 
 /// JIT hot-count threshold for back-edge (loop) detection.
 const JIT_THRESHOLD: u32 = 1039;
@@ -99,7 +100,7 @@ thread_local! {
 /// driver is being actively used (suspended references on the call
 /// stack from re-entrant compiled-code execution are acceptable).
 #[inline]
-pub(crate) fn driver_pair() -> &'static mut JitDriverPair {
+pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
 
@@ -152,6 +153,15 @@ pub fn eval_frame(frame: &mut PyFrame) -> PyResult {
     eval_loop(frame)
 }
 
+/// Execute a frame without JIT — pure interpreter only.
+///
+/// Used by pyre-mjit as the fallback when JIT hasn't kicked in,
+/// and by force callbacks when compiled code hits a guard failure.
+pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
+    frame.fix_array_ptrs();
+    eval_loop(frame)
+}
+
 /// Run the interpreter on a frame whose state was partially updated by
 /// compiled code (call_assembler guard failure forcing).
 ///
@@ -198,7 +208,7 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
 /// as a local variable. Recursive calls through `call_callable`
 /// re-enter `eval_frame` → `eval_loop` (the deferred variant),
 /// creating a new `&mut` alias only if they also hit a back-edge.
-fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
+pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     let env = PyreEnv;
     let mut arg_state = OpArgState::default();
     let code = unsafe { &*frame.code };
@@ -263,7 +273,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 /// the expensive driver path when the counter reaches the threshold
 /// or when compiled code already exists for this key.
 ///
-fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
+pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // Residual calls (from tracing or compiled code) run in pure
     // interpreter — no JIT hooks. Matches PyPy's blackhole model.
     if JIT_CALL_DEPTH.with(|d| d.get()) > 0 {
