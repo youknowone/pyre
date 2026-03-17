@@ -423,7 +423,7 @@ impl<S: JitState> JitDriver<S> {
 
     /// Force-start tracing for a function entry.
     ///
-    /// Bypasses the WarmState hot counter (the caller already did its own
+    /// Bypasses the WarmEnterState hot counter (the caller already did its own
     /// counting). Used for function-entry JIT where the threshold is
     /// controlled externally.
     pub fn force_start_tracing(
@@ -1013,8 +1013,7 @@ impl<S: JitState> JitDriver<S> {
 
         if !self.has_compiled_loop(key_hash) {
             let green_key = GreenKey::new(green_values.to_vec());
-            let ran = self
-                .back_edge_structured(green_key, target_pc, state, env, pre_run);
+            let ran = self.back_edge_structured(green_key, target_pc, state, env, pre_run);
             // If tracing just finished and compiled a loop, mark it so the
             // next back_edge_generic call skips the first execution.
             if self.has_compiled_loop(key_hash) {

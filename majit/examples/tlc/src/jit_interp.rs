@@ -13,7 +13,7 @@ use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
 use majit_trace::recorder::TraceRecorder;
-use majit_trace::warmstate::{HotResult, WarmState};
+use majit_trace::warmstate::{HotResult, WarmEnterState};
 
 use crate::interp::{self, ConstantPool, Obj};
 
@@ -69,7 +69,7 @@ impl TracingState {
 }
 
 pub struct JitTlcInterp {
-    warm_state: WarmState,
+    warm_state: WarmEnterState,
     backend: CraneliftBackend,
     compiled_loops: HashMap<usize, CompiledLoop>,
     tracing: Option<TracingState>,
@@ -78,7 +78,7 @@ pub struct JitTlcInterp {
 impl JitTlcInterp {
     pub fn new() -> Self {
         JitTlcInterp {
-            warm_state: WarmState::new(DEFAULT_THRESHOLD),
+            warm_state: WarmEnterState::new(DEFAULT_THRESHOLD),
             backend: CraneliftBackend::new(),
             compiled_loops: HashMap::new(),
             tracing: None,

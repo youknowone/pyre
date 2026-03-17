@@ -12,4 +12,4 @@ pub mod heapcache;
 pub mod jitlog;
 pub mod recorder;
 pub mod trace;
-pub mod warmstate;
+pub mod warmenterstate;

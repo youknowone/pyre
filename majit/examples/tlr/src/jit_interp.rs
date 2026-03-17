@@ -11,7 +11,7 @@ use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
 use majit_trace::recorder::TraceRecorder;
-use majit_trace::warmstate::{HotResult, WarmState};
+use majit_trace::warmstate::{HotResult, WarmEnterState};
 
 const MOV_A_R: u8 = 1;
 const MOV_R_A: u8 = 2;
@@ -63,7 +63,7 @@ impl TracingState {
 }
 
 pub struct JitTlrInterp {
-    warm_state: WarmState,
+    warm_state: WarmEnterState,
     backend: CraneliftBackend,
     compiled_loops: HashMap<usize, CompiledLoop>,
     tracing: Option<TracingState>,
@@ -72,7 +72,7 @@ pub struct JitTlrInterp {
 impl JitTlrInterp {
     pub fn new() -> Self {
         JitTlrInterp {
-            warm_state: WarmState::new(DEFAULT_THRESHOLD),
+            warm_state: WarmEnterState::new(DEFAULT_THRESHOLD),
             backend: CraneliftBackend::new(),
             compiled_loops: HashMap::new(),
             tracing: None,
