@@ -161,6 +161,26 @@ impl TraceRecorder {
         self.finalized = true;
     }
 
+    /// Apply OpRef replacements to all recorded ops.
+    /// Used by inline callee returns to replace placeholder OpRefs
+    /// with actual result OpRefs throughout the trace.
+    pub fn apply_replacements(&mut self, replacements: &std::collections::HashMap<OpRef, OpRef>) {
+        for op in &mut self.ops {
+            for arg in &mut op.args {
+                if let Some(&new) = replacements.get(arg) {
+                    *arg = new;
+                }
+            }
+            if let Some(ref mut fa) = op.fail_args {
+                for arg in fa.iter_mut() {
+                    if let Some(&new) = replacements.get(arg) {
+                        *arg = new;
+                    }
+                }
+            }
+        }
+    }
+
     /// Return the completed trace.
     /// The recorder is consumed; no further operations can be recorded.
     pub fn get_trace(self) -> Trace {
