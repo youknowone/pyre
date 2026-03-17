@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Recognized trace patterns for automatic IR generation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TracePattern {
     /// Unbox two int operands → binary IR op → box result.
     /// Example: a + b where a, b are W_IntObject
@@ -437,4 +437,99 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{MajitGraph, OpKind, Terminator, ValueType};
+
+    #[test]
+    fn classify_int_binop_from_graph() {
+        let mut graph = MajitGraph::new("binary_op");
+        let entry = graph.entry;
+        graph.push_op(
+            entry,
+            OpKind::Call {
+                target: "w_int_add".into(),
+                args: vec![],
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_terminator(entry, Terminator::Return(None));
+
+        let pattern = classify_from_graph(&graph);
+        assert!(
+            matches!(pattern, Some(TracePattern::UnboxIntBinop { .. })),
+            "w_int_add call should classify as UnboxIntBinop, got {:?}",
+            pattern
+        );
+    }
+
+    #[test]
+    fn classify_local_read_from_graph() {
+        let mut graph = MajitGraph::new("load_fast");
+        let entry = graph.entry;
+        let base = graph.alloc_value();
+        graph.push_op(
+            entry,
+            OpKind::FieldRead {
+                base,
+                field: "locals_w".into(),
+                ty: ValueType::Unknown,
+            },
+            true,
+        );
+        let arr = graph.alloc_value();
+        let idx = graph.alloc_value();
+        graph.push_op(
+            entry,
+            OpKind::ArrayRead {
+                base: arr,
+                index: idx,
+                item_ty: ValueType::Unknown,
+            },
+            true,
+        );
+        graph.set_terminator(entry, Terminator::Return(None));
+
+        let pattern = classify_from_graph(&graph);
+        assert_eq!(pattern, Some(TracePattern::LocalRead));
+    }
+
+    #[test]
+    fn classify_truth_check_from_graph() {
+        let mut graph = MajitGraph::new("unary_not");
+        let entry = graph.entry;
+        graph.push_op(
+            entry,
+            OpKind::Call {
+                target: "is_true".into(),
+                args: vec![],
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_terminator(entry, Terminator::Return(None));
+
+        assert_eq!(classify_from_graph(&graph), Some(TracePattern::TruthCheck));
+    }
+
+    #[test]
+    fn classify_noop_from_graph() {
+        let mut graph = MajitGraph::new("nop");
+        let entry = graph.entry;
+        graph.push_op(
+            entry,
+            OpKind::Input {
+                name: "self".into(),
+                ty: ValueType::Unknown,
+            },
+            true,
+        );
+        graph.set_terminator(entry, Terminator::Return(None));
+
+        assert_eq!(classify_from_graph(&graph), Some(TracePattern::Noop));
+    }
 }

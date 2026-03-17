@@ -360,3 +360,29 @@ pub fn trace_float_compare(
 }
 "#);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_from_graph_produces_function_table() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn add(a: i64, b: i64) -> i64 { a + b }
+            fn sub(a: i64, b: i64) -> i64 { a - b }
+        "#,
+        );
+        let program = crate::front::build_semantic_program(&parsed);
+        let pipeline = crate::passes::analyze_program(
+            &program,
+            &crate::passes::PipelineConfig::default(),
+        );
+        let code = generate_from_graph(&pipeline);
+
+        assert!(code.contains("GRAPH_FUNCTIONS"), "should contain GRAPH_FUNCTIONS table");
+        assert!(code.contains("add"), "should list 'add' function");
+        assert!(code.contains("sub"), "should list 'sub' function");
+        assert!(code.contains("graph pipeline"), "should have graph pipeline header");
+    }
+}
