@@ -149,25 +149,11 @@ pub fn extract_opcode_dispatch(
             for impl_info in trait_impls {
                 for method in &impl_info.methods {
                     if method.name == *call {
-                        // Graph-based classification (primary)
-                        if !method.body_summary.is_empty() {
-                            let wrapped =
-                                format!("fn __body() {{ {} }}", method.body_summary);
-                            if let Ok(parsed) = syn::parse_str::<syn::ItemFn>(&wrapped) {
-                                let mut graph =
-                                    crate::graph::MajitGraph::new(&method.name);
-                                let entry = graph.entry;
-                                for stmt in &parsed.block.stmts {
-                                    crate::front::ast::lower_stmt_pub(
-                                        &mut graph, entry, stmt,
-                                    );
-                                }
-                                arm.trace_pattern =
-                                    crate::patterns::classify_from_graph(&graph);
-                            }
+                        // Use pre-built graph (primary)
+                        if let Some(ref graph) = method.graph {
+                            arm.trace_pattern =
+                                crate::patterns::classify_from_graph(graph);
                         }
-                        // String heuristic fallback is deprecated.
-                        // Graph-based classifier should handle all cases.
                         break;
                     }
                 }
