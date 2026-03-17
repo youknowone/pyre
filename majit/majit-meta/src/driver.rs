@@ -8,6 +8,7 @@ use crate::resume::ResumeLayoutSummary;
 use crate::trace_ctx::{DeclarativeJitDriver, JitDriverDescriptor, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 use crate::TraceAction;
+use majit_ir::OpRef;
 use majit_ir::{GreenKey, Type, Value};
 
 /// A named entry point registered with a [`JitDriver`].
@@ -983,6 +984,15 @@ impl<S: JitState> JitDriver<S> {
     /// Get the current inlining depth.
     pub fn inline_depth(&self) -> usize {
         self.meta.inline_depth()
+    }
+
+    /// RPython equivalent: `opimpl_hint_force_virtualizable(box)`
+    ///
+    /// Call during tracing when the interpreter encounters
+    /// `hint_force_virtualizable`. Emits IR to flush virtualizable
+    /// boxes back to the heap.
+    pub fn opimpl_hint_force_virtualizable(&mut self, vable_opref: OpRef) {
+        self.meta.opimpl_hint_force_virtualizable(vable_opref);
     }
 
     /// Start bridge tracing from a guard failure point.

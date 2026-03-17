@@ -266,15 +266,36 @@ impl VirtualizableInfo {
     }
 
     /// Get the index of a static field by its descriptor offset.
+    ///
+    /// RPython equivalent: `vinfo.static_field_by_descrs[descr]`
     pub fn static_field_index(&self, offset: usize) -> Option<usize> {
         self.static_fields.iter().position(|f| f.offset == offset)
     }
 
+    /// Get the index of a static field by name.
+    pub fn static_field_index_by_name(&self, name: &str) -> Option<usize> {
+        self.static_fields.iter().position(|f| f.name == name)
+    }
+
     /// Get the index of an array field by its field offset.
+    ///
+    /// RPython equivalent: `vinfo.array_field_by_descrs[descr]`
     pub fn array_field_index(&self, field_offset: usize) -> Option<usize> {
         self.array_fields
             .iter()
             .position(|a| a.field_offset == field_offset)
+    }
+
+    /// Get the index of an array field by name.
+    pub fn array_field_index_by_name(&self, name: &str) -> Option<usize> {
+        self.array_fields.iter().position(|a| a.name == name)
+    }
+
+    /// Minimum number of boxes needed (static fields only, no arrays).
+    ///
+    /// RPython equivalent: `vinfo.num_static_extra_boxes`
+    pub fn minimum_size(&self) -> usize {
+        self.num_static_fields
     }
 
     /// Get total size: number of static fields + sum of all array lengths.
