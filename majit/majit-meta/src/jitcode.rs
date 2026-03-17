@@ -224,18 +224,65 @@ pub trait JitCodeSym {
 
     /// Update an array state field element's OpRef.
     fn set_state_array_ref(&mut self, _array_idx: usize, _elem_idx: usize, _value: OpRef) {}
+
+    // ── Virtualizable storage support ─────────────────────────────
+    //
+    // When true, stack values stay on heap. The JIT accesses them via
+    // GetarrayitemRawI/SetarrayitemRaw IR ops instead of SymbolicStack.
+
+    /// Whether this interpreter uses virtualizable (heap-resident) storage.
+    fn is_virtualizable_storage(&self) -> bool { false }
+
+    /// Get the array data pointer OpRef for a virtualizable storage.
+    fn vable_array_ref(&self, _selected: usize) -> Option<OpRef> { None }
+
+    /// Get the current length OpRef for a virtualizable storage.
+    fn vable_len_ref(&self, _selected: usize) -> Option<OpRef> { None }
+
+    /// Update the array data pointer OpRef.
+    fn set_vable_array_ref(&mut self, _selected: usize, _arr: OpRef) {}
+
+    /// Update the length OpRef.
+    fn set_vable_len_ref(&mut self, _selected: usize, _len: OpRef) {}
+
+    /// Initialize both array ref and length ref for a virtualizable storage.
+    fn init_vable_storage(&mut self, _selected: usize, _arr_ref: OpRef, _len_ref: OpRef) {}
 }
 
 pub trait JitCodeRuntime {
     fn stack_len(&self, selected: usize) -> usize;
     fn stack_peek(&self, selected: usize, pos: usize) -> i64;
     fn label_at(&self, pc: usize) -> usize;
+    /// Raw data pointer for virtualizable storage access.
+    fn stack_data_ptr(&self, _selected: usize) -> usize { 0 }
 }
 
-pub struct ClosureRuntime<FLen, FPeek, FLabel> {
+/// Descriptor for raw i64 arrays (Vec<i64> data pointer).
+/// base_size=0 (pointer to first element), item_size=8, signed i64.
+#[derive(Debug)]
+pub struct RawI64ArrayDescr;
+
+impl majit_ir::Descr for RawI64ArrayDescr {
+    fn as_array_descr(&self) -> Option<&dyn majit_ir::ArrayDescr> { Some(self) }
+}
+
+impl majit_ir::ArrayDescr for RawI64ArrayDescr {
+    fn base_size(&self) -> usize { 0 }
+    fn item_size(&self) -> usize { 8 }
+    fn type_id(&self) -> u32 { 0 }
+    fn item_type(&self) -> majit_ir::Type { majit_ir::Type::Int }
+    fn is_item_signed(&self) -> bool { true }
+}
+
+pub fn raw_i64_array_descr() -> majit_ir::DescrRef {
+    std::sync::Arc::new(RawI64ArrayDescr)
+}
+
+pub struct ClosureRuntime<FLen, FPeek, FLabel, FDataPtr = fn(usize) -> usize> {
     stack_len: FLen,
     stack_peek: FPeek,
     label_at: FLabel,
+    stack_data_ptr: FDataPtr,
 }
 
 impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel> {
@@ -244,15 +291,25 @@ impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel> {
             stack_len,
             stack_peek,
             label_at,
+            stack_data_ptr: (|_| 0usize) as fn(usize) -> usize,
         }
     }
 }
 
-impl<FLen, FPeek, FLabel> JitCodeRuntime for ClosureRuntime<FLen, FPeek, FLabel>
+impl<FLen, FPeek, FLabel, FDataPtr> ClosureRuntime<FLen, FPeek, FLabel, FDataPtr> {
+    pub fn with_data_ptr(
+        stack_len: FLen, stack_peek: FPeek, label_at: FLabel, stack_data_ptr: FDataPtr,
+    ) -> Self {
+        Self { stack_len, stack_peek, label_at, stack_data_ptr }
+    }
+}
+
+impl<FLen, FPeek, FLabel, FDataPtr> JitCodeRuntime for ClosureRuntime<FLen, FPeek, FLabel, FDataPtr>
 where
     FLen: Fn(usize) -> usize,
     FPeek: Fn(usize, usize) -> i64,
     FLabel: Fn(usize) -> usize,
+    FDataPtr: Fn(usize) -> usize,
 {
     fn stack_len(&self, selected: usize) -> usize {
         (self.stack_len)(selected)
@@ -264,6 +321,10 @@ where
 
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
+    }
+
+    fn stack_data_ptr(&self, selected: usize) -> usize {
+        (self.stack_data_ptr)(selected)
     }
 }
 
@@ -2224,6 +2285,42 @@ where
     FLabel: Fn(usize) -> usize,
 {
     let runtime = ClosureRuntime::new(runtime_stack_len, runtime_stack_peek, label_at);
+    let root = MIFrame::new(jitcode, pc);
+    let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
+    machine.run_to_end(ctx, sym, &runtime)
+}
+
+/// Like `trace_jitcode` but with an additional `stack_data_ptr` closure
+/// for virtualizable storage access (raw array pointer).
+pub fn trace_jitcode_with_data_ptr<S, FLen, FPeek, FLabel, FDataPtr>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    pc: usize,
+    runtime_stack_len: FLen,
+    runtime_stack_peek: FPeek,
+    label_at: FLabel,
+    stack_data_ptr: FDataPtr,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    FLen: Fn(usize) -> usize,
+    FPeek: Fn(usize, usize) -> i64,
+    FLabel: Fn(usize) -> usize,
+    FDataPtr: Fn(usize) -> usize,
+{
+    let runtime = ClosureRuntime::with_data_ptr(
+        runtime_stack_len, runtime_stack_peek, label_at, stack_data_ptr,
+    );
+    // Virtualizable preamble: init array ref for the initially-selected storage.
+    if sym.is_virtualizable_storage() {
+        let selected = sym.current_selected();
+        if sym.vable_array_ref(selected).is_none() {
+            let data_ptr = runtime.stack_data_ptr(selected);
+            let arr_ref = ctx.const_int(data_ptr as i64);
+            sym.set_vable_array_ref(selected, arr_ref);
+        }
+    }
     let root = MIFrame::new(jitcode, pc);
     let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
     machine.run_to_end(ctx, sym, &runtime)

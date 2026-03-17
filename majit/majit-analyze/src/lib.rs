@@ -183,18 +183,13 @@ fn resolve_call_chain(
 
     arm.resolved_calls = resolved_calls;
 
-    // Try to classify the trace pattern from resolved calls (string heuristic)
-    if arm.trace_pattern.is_none() {
-        arm.trace_pattern = patterns::classify_from_resolved(&arm.resolved_calls);
-    }
-
-    // Graph-based classification: parse resolved bodies into semantic graphs
-    // and classify from the graph ops. This progressively replaces the
-    // body_summary string heuristic with actual AST analysis.
+    // PRIMARY: Graph-based classification.
+    // Parse resolved method bodies into semantic graphs and classify
+    // from graph ops. This is the RPython-parity path — the flow graph
+    // is the canonical intermediate representation for classification.
     if arm.trace_pattern.is_none() {
         for call in &arm.resolved_calls {
             if !call.body_summary.is_empty() {
-                // Wrap body in a function to make it parseable
                 let wrapped = format!("fn __body() {{ {} }}", call.body_summary);
                 if let Ok(parsed) = syn::parse_str::<syn::ItemFn>(&wrapped) {
                     let mut graph = graph::MajitGraph::new(&call.name);
@@ -211,10 +206,125 @@ fn resolve_call_chain(
         }
     }
 
-    // Fallback: classify from the opcode pattern text itself
+    // SECONDARY: Method name heuristic (for cases where body parsing fails
+    // or the graph classifier doesn't recognize the pattern yet).
+    if arm.trace_pattern.is_none() {
+        arm.trace_pattern = classify_from_method_names(&arm.resolved_calls, &arm.handler_calls);
+    }
+
+    // TERTIARY: Opcode pattern text (for arms without resolved calls).
     if arm.trace_pattern.is_none() {
         arm.trace_pattern = patterns::classify_from_pattern(&arm.pattern);
     }
+}
+
+/// Classify from method names only (no body_summary heuristic).
+///
+/// This is the secondary fallback after graph-based classification.
+/// It only looks at the handler method name (e.g., "binary_op",
+/// "load_fast") without parsing the body.
+fn classify_from_method_names(
+    resolved: &[ResolvedCall],
+    handler_calls: &[String],
+) -> Option<TracePattern> {
+    // Try method name matching from resolved calls
+    for call in resolved {
+        match call.name.as_str() {
+            "binary_op" => {
+                return Some(TracePattern::UnboxIntBinop {
+                    op_name: "dispatch".into(),
+                    has_overflow_guard: true,
+                });
+            }
+            "compare_op" => {
+                return Some(TracePattern::UnboxIntCompare {
+                    op_name: "dispatch".into(),
+                });
+            }
+            "unary_negative" | "unary_invert" => {
+                return Some(TracePattern::UnboxIntUnary {
+                    op_name: call.name.clone(),
+                });
+            }
+            "unary_not" => return Some(TracePattern::TruthCheck),
+            "load_fast" | "load_fast_checked" | "load_fast_load_fast" => {
+                return Some(TracePattern::LocalRead);
+            }
+            "store_fast" | "store_fast_checked" | "store_fast_store_fast"
+            | "store_fast_load_fast" => {
+                return Some(TracePattern::LocalWrite);
+            }
+            "load_const" | "load_small_int" => return Some(TracePattern::ConstLoad),
+            "call" => return Some(TracePattern::FunctionCall),
+            "for_iter" => return Some(TracePattern::RangeIterNext),
+            "end_for" | "pop_iter" => return Some(TracePattern::IterCleanup),
+            "pop_top" | "copy_value" | "swap" | "push_null" => {
+                return Some(TracePattern::StackManip);
+            }
+            "jump_forward" | "jump_backward" => return Some(TracePattern::Jump),
+            "pop_jump_if_false" | "pop_jump_if_true" => {
+                return Some(TracePattern::ConditionalJump);
+            }
+            "return_value" => return Some(TracePattern::Return),
+            "store_name" => {
+                return Some(TracePattern::NamespaceAccess {
+                    is_load: false,
+                    is_global: false,
+                });
+            }
+            "load_name" => {
+                return Some(TracePattern::NamespaceAccess {
+                    is_load: true,
+                    is_global: false,
+                });
+            }
+            "load_global" => {
+                return Some(TracePattern::NamespaceAccess {
+                    is_load: true,
+                    is_global: true,
+                });
+            }
+            "build_list" => {
+                return Some(TracePattern::BuildCollection {
+                    kind: "list".into(),
+                });
+            }
+            "build_tuple" => {
+                return Some(TracePattern::BuildCollection {
+                    kind: "tuple".into(),
+                });
+            }
+            "build_map" => {
+                return Some(TracePattern::BuildCollection { kind: "map".into() });
+            }
+            "unpack_sequence" => return Some(TracePattern::UnpackSequence),
+            "store_subscr" => return Some(TracePattern::SequenceSetitem),
+            "list_append" => return Some(TracePattern::CollectionAppend),
+            "get_iter" | "make_function" => {
+                return Some(TracePattern::Residual {
+                    helper_name: call.name.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Also check handler_calls (from arm body analysis)
+    for name in handler_calls {
+        match name.as_str() {
+            "binary_op" => {
+                return Some(TracePattern::UnboxIntBinop {
+                    op_name: "dispatch".into(),
+                    has_overflow_guard: true,
+                });
+            }
+            "load_fast" | "load_fast_checked" => return Some(TracePattern::LocalRead),
+            "store_fast" | "store_fast_checked" => return Some(TracePattern::LocalWrite),
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Generate tracing code from analysis results.

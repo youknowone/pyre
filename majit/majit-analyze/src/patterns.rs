@@ -117,10 +117,12 @@ pub enum TracePattern {
     Unknown,
 }
 
-/// Classify an opcode from its resolved call chain.
+/// Classify an opcode from its resolved call chain (string heuristic).
 ///
-/// When `vable_config` is provided, body heuristics check for virtualizable
-/// field/array access patterns before generic LocalRead/LocalWrite.
+/// **Deprecated**: Use `classify_from_graph()` with a `MajitGraph` built by
+/// `front::ast::lower_stmt_pub()` instead. This function uses body_summary
+/// string matching which is fragile. The graph-based path is now primary
+/// in `lib.rs::resolve_call_chain()`.
 pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePattern> {
     classify_from_resolved_with_vable(calls, None)
 }
@@ -293,9 +295,13 @@ pub fn classify_method_body_with_vable(
     classify_method_body(body_summary)
 }
 
-/// Classify a method body summary into a trace pattern.
+/// Classify a method body summary into a trace pattern (string heuristic).
+///
+/// **Deprecated**: Use `classify_from_graph()` instead. This function
+/// matches substrings in body_summary which is fragile. The graph-based
+/// classifier analyzes actual AST ops and is the primary path.
 pub fn classify_method_body(body_summary: &str) -> Option<TracePattern> {
-    // Heuristic pattern matching on the body text
+    // Legacy heuristic pattern matching on the body text
     if body_summary.contains("w_int_add")
         || body_summary.contains("w_int_sub")
         || body_summary.contains("w_int_mul")
@@ -572,6 +578,14 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
         return Some(TracePattern::LocalWrite);
     }
 
+    // Constant load (reads from constants/co_consts)
+    if field_reads
+        .iter()
+        .any(|f| f.contains("constants") || f.contains("co_consts"))
+    {
+        return Some(TracePattern::ConstLoad);
+    }
+
     // Function call
     if calls
         .iter()
@@ -583,23 +597,93 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Truth check
     if calls
         .iter()
-        .any(|c| c.contains("truth") || c.contains("bool"))
+        .any(|c| c.contains("truth") || c.contains("bool") || c.contains("is_true"))
     {
         return Some(TracePattern::TruthCheck);
     }
 
-    // Return
+    // Stack manipulation (pop/swap/peek without array access)
+    if calls
+        .iter()
+        .any(|c| c == "pop_value" || c == "swap_values" || c == "peek_at" || c == "copy_value")
+        && array_reads == 0
+        && array_writes == 0
+    {
+        return Some(TracePattern::StackManip);
+    }
+
+    // Namespace access (load/store name/global)
+    if calls
+        .iter()
+        .any(|c| c.contains("load_name") || c.contains("store_name"))
+    {
+        return Some(TracePattern::NamespaceAccess {
+            is_load: calls.iter().any(|c| c.contains("load")),
+            is_global: calls.iter().any(|c| c.contains("global")),
+        });
+    }
+
+    // Iterator
+    if calls.iter().any(|c| c.contains("iter_next") || c.contains("for_iter")) {
+        return Some(TracePattern::RangeIterNext);
+    }
+    if calls.iter().any(|c| c.contains("end_for") || c.contains("pop_iter")) {
+        return Some(TracePattern::IterCleanup);
+    }
+
+    // Return (few ops ending in Return terminator)
     if matches!(
         &entry.terminator,
         crate::graph::Terminator::Return(Some(_))
-    ) && ops.len() <= 3
+    ) && ops.len() <= 5
     {
-        return Some(TracePattern::Return);
+        if calls.iter().any(|c| c.contains("finish") || c.contains("return")) {
+            return Some(TracePattern::Return);
+        }
     }
 
-    // Jump (guard + few ops)
-    if has_guard && field_writes.iter().any(|f| f.contains("next_instr") || f.contains("pc")) {
+    // Conditional jump (guard + pc/next_instr write)
+    if has_guard
+        && field_writes
+            .iter()
+            .any(|f| f.contains("next_instr") || f.contains("pc"))
+    {
         return Some(TracePattern::ConditionalJump);
+    }
+
+    // Unconditional jump (pc write without guard)
+    if !has_guard
+        && field_writes
+            .iter()
+            .any(|f| f.contains("next_instr") || f.contains("pc"))
+    {
+        return Some(TracePattern::Jump);
+    }
+
+    // Build collection
+    if calls.iter().any(|c| c.contains("build_list") || c.contains("new_list")) {
+        return Some(TracePattern::BuildCollection { kind: "list".into() });
+    }
+    if calls.iter().any(|c| c.contains("build_tuple") || c.contains("new_tuple")) {
+        return Some(TracePattern::BuildCollection { kind: "tuple".into() });
+    }
+
+    // Sequence operations
+    if calls.iter().any(|c| c.contains("unpack")) {
+        return Some(TracePattern::UnpackSequence);
+    }
+    if calls.iter().any(|c| c.contains("store_subscr") || c.contains("setitem")) {
+        return Some(TracePattern::SequenceSetitem);
+    }
+    if calls.iter().any(|c| c.contains("list_append") || c.contains("append")) {
+        return Some(TracePattern::CollectionAppend);
+    }
+
+    // Noop (empty or trivial ops only)
+    if ops.iter().all(|op| matches!(&op.kind, OpKind::Input { .. } | OpKind::Unknown { .. }))
+        && ops.len() <= 2
+    {
+        return Some(TracePattern::Noop);
     }
 
     None

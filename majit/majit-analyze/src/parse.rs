@@ -135,8 +135,29 @@ pub fn extract_opcode_dispatch(
             for impl_info in trait_impls {
                 for method in &impl_info.methods {
                     if method.name == *call {
-                        arm.trace_pattern =
-                            crate::patterns::classify_method_body(&method.body_summary);
+                        // Graph-based classification (primary)
+                        if !method.body_summary.is_empty() {
+                            let wrapped =
+                                format!("fn __body() {{ {} }}", method.body_summary);
+                            if let Ok(parsed) = syn::parse_str::<syn::ItemFn>(&wrapped) {
+                                let mut graph =
+                                    crate::graph::MajitGraph::new(&method.name);
+                                let entry = graph.entry;
+                                for stmt in &parsed.block.stmts {
+                                    crate::front::ast::lower_stmt_pub(
+                                        &mut graph, entry, stmt,
+                                    );
+                                }
+                                arm.trace_pattern =
+                                    crate::patterns::classify_from_graph(&graph);
+                            }
+                        }
+                        // Fallback to string heuristic if graph didn't classify
+                        if arm.trace_pattern.is_none() {
+                            arm.trace_pattern = crate::patterns::classify_method_body(
+                                &method.body_summary,
+                            );
+                        }
                         break;
                     }
                 }
