@@ -358,4 +358,33 @@ mod tests {
             "loop should have >=2 jumps (entry→header, body→header)"
         );
     }
+
+    #[test]
+    fn flatten_phi_produces_move_ops() {
+        // When a Goto carries Link args to a target with inputargs,
+        // flatten should emit Move ops for Phi resolution.
+        let mut graph = MajitGraph::new("phi");
+        let entry = graph.entry;
+        let val = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
+
+        let (target, phi_args) = graph.create_block_with_args(1);
+        let _phi = phi_args[0];
+
+        graph.set_terminator(
+            entry,
+            Terminator::Goto {
+                target,
+                args: vec![val],
+            },
+        );
+        graph.set_terminator(target, Terminator::Return(None));
+
+        let flat = flatten(&graph);
+        let moves: Vec<_> = flat
+            .ops
+            .iter()
+            .filter(|op| matches!(op, FlatOp::Move { .. }))
+            .collect();
+        assert_eq!(moves.len(), 1, "should have 1 Move for Phi resolution");
+    }
 }
