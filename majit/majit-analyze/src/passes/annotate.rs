@@ -106,6 +106,11 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
             ValueType::Unknown
         }
         OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => ValueType::Void,
+        OpKind::VableFieldRead { ty, .. } => ty.clone(),
+        OpKind::VableFieldWrite { .. } => ValueType::Void,
+        OpKind::VableArrayRead { item_ty, .. } => item_ty.clone(),
+        OpKind::VableArrayWrite { .. } => ValueType::Void,
+        OpKind::VableForce => ValueType::Void,
         OpKind::Unknown { .. } => ValueType::Unknown,
     }
 }

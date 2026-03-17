@@ -85,20 +85,19 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
 
         for op in &block.ops {
             match &op.kind {
-                // ── Virtualizable field read → tag ──
-                OpKind::FieldRead { field, base, ty } if config.lower_virtualizable => {
+                // ── Virtualizable field read → VableFieldRead ──
+                // RPython jtransform.py:832 `rewrite_op_getfield`
+                OpKind::FieldRead { field, ty, .. } if config.lower_virtualizable => {
                     if let Some(&idx) = vable_field_set.get(field.as_str()) {
                         notes.push(GraphTransformNote {
                             function: graph.name.clone(),
-                            detail: format!("rewrite: {field} → vable_field_read[{idx}]"),
+                            detail: format!("rewrite: {field} → VableFieldRead[{idx}]"),
                         });
                         vable_rewrites += 1;
-                        // Tag the op as a virtualizable read (downstream can use this)
                         new_ops.push(Op {
                             result: op.result,
-                            kind: OpKind::FieldRead {
-                                base: *base,
-                                field: format!("__vable_field_{idx}_{field}"),
+                            kind: OpKind::VableFieldRead {
+                                field_index: idx,
                                 ty: ty.clone(),
                             },
                         });
@@ -106,24 +105,19 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                     }
                 }
 
-                // ── Virtualizable field write → tag ──
-                OpKind::FieldWrite {
-                    field,
-                    base,
-                    value,
-                    ty,
-                } if config.lower_virtualizable => {
+                // ── Virtualizable field write → VableFieldWrite ──
+                // RPython jtransform.py:923 `_rewrite_op_setfield`
+                OpKind::FieldWrite { field, value, ty, .. } if config.lower_virtualizable => {
                     if let Some(&idx) = vable_field_set.get(field.as_str()) {
                         notes.push(GraphTransformNote {
                             function: graph.name.clone(),
-                            detail: format!("rewrite: {field} = ... → vable_field_write[{idx}]"),
+                            detail: format!("rewrite: {field} = ... → VableFieldWrite[{idx}]"),
                         });
                         vable_rewrites += 1;
                         new_ops.push(Op {
                             result: op.result,
-                            kind: OpKind::FieldWrite {
-                                base: *base,
-                                field: format!("__vable_field_{idx}_{field}"),
+                            kind: OpKind::VableFieldWrite {
+                                field_index: idx,
                                 value: *value,
                                 ty: ty.clone(),
                             },
@@ -255,16 +249,13 @@ mod tests {
         };
         let result = rewrite_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
-        // Rewritten field name should contain __vable_field_ prefix
+        // Should be rewritten to VableFieldRead
         let rewritten_op = &result.graph.block(graph.entry).ops[0];
-        if let OpKind::FieldRead { field, .. } = &rewritten_op.kind {
-            assert!(
-                field.starts_with("__vable_field_"),
-                "expected tagged field, got {field}"
-            );
-        } else {
-            panic!("expected FieldRead");
-        }
+        assert!(
+            matches!(&rewritten_op.kind, OpKind::VableFieldRead { field_index: 0, .. }),
+            "expected VableFieldRead, got {:?}",
+            rewritten_op.kind
+        );
     }
 
     #[test]
