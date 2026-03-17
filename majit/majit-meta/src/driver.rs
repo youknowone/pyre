@@ -95,11 +95,11 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_vable_ptr(ptr);
     }
 
-    /// Set virtualizable array lengths as fallback (for tests without real objects).
-    /// Prefer JitState::virtualizable_array_lengths() — sync_before sets this
-    /// automatically from the interpreter state.
+    /// Internal: set virtualizable array lengths.
+    /// Called by sync_before from JitState::virtualizable_array_lengths().
+    /// Not intended for direct consumer use.
     #[doc(hidden)]
-    pub fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
+    pub(crate) fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
         self.meta.set_vable_array_lengths(lengths);
     }
 
