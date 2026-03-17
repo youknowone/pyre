@@ -6,6 +6,10 @@
 /// Traces integer-only loops. Back-edges on BR, BR_COND.
 /// Aborts on object operations (NIL, CONS, CAR, CDR, NEW, GETATTR, SETATTR,
 /// SEND, CALL, DIV on cons, BR_COND_STK, PUSHARGN).
+///
+/// This example hand-writes `trace_instruction` for educational purposes.
+/// In production, the `#[jit_interp]` proc macro auto-generates tracing
+/// code from the interpreter's match dispatch — see aheuijit for an example.
 use majit_ir::{OpCode, OpRef};
 use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};
 

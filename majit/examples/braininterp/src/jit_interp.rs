@@ -7,6 +7,10 @@
 /// positions are mapped to IR operations (OpRef), eliminating memory
 /// loads/stores in compiled code.
 ///
+/// This example hand-writes `trace_instruction` for educational purposes.
+/// In production, the `#[jit_interp]` proc macro auto-generates tracing
+/// code from the interpreter's match dispatch — see aheuijit for an example.
+///
 /// Back-edge detection: `]` that jumps backward to matching `[` is the
 /// loop back-edge. When it becomes hot, tracing starts at the `[` header.
 ///

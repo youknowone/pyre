@@ -8,6 +8,10 @@
 /// one iteration and is empty at the merge point ('{' back-edge).
 ///
 /// JIT traces the integer-only path. When all args are integers, the loop body
+///
+/// This example hand-writes `trace_instruction` for educational purposes.
+/// In production, the `#[jit_interp]` proc macro auto-generates tracing
+/// code from the interpreter's match dispatch — see aheuijit for an example.
 /// compiles to pure i64 arithmetic.
 use majit_ir::{OpCode, OpRef};
 use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};

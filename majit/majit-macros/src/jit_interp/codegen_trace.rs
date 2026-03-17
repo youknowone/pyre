@@ -74,7 +74,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 return TraceAction::AbortPermanent;
             };
 
-            majit_meta::trace_jitcode(
+            majit_meta::trace_jitcode_with_data_ptr(
                 __ctx,
                 __sym,
                 &__jitcode,
@@ -82,6 +82,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 |__stack_index| __storage.get(__stack_index).len(),
                 |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
                 #label_closure,
+                |__stack_index| __storage.get(__stack_index).data_ptr(),
             )
         }
     }

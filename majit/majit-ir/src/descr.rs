@@ -757,3 +757,51 @@ mod tests {
         assert!(repr.contains("depth=0"));
     }
 }
+
+// ── Helper constructors ──
+
+/// A simple concrete FieldDescr for use in meta-interpreter preamble patching
+/// and other contexts that need a field descriptor without a full backend.
+#[derive(Debug)]
+struct SimpleFieldDescr {
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+}
+
+impl Descr for SimpleFieldDescr {
+    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+        Some(self)
+    }
+}
+
+impl FieldDescr for SimpleFieldDescr {
+    fn offset(&self) -> usize {
+        self.offset
+    }
+    fn field_size(&self) -> usize {
+        self.field_size
+    }
+    fn field_type(&self) -> Type {
+        self.field_type
+    }
+    fn is_field_signed(&self) -> bool {
+        self.signed
+    }
+}
+
+/// Create a field descriptor with the given layout.
+pub fn make_field_descr(
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleFieldDescr {
+        offset,
+        field_size,
+        field_type,
+        signed,
+    })
+}

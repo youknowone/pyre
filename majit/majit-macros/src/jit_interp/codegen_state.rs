@@ -92,6 +92,10 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             current_selected_value: Option<majit_ir::OpRef>,
             storage_layout: Vec<(usize, usize)>,
             loop_header_pc: usize,
+            /// Virtualizable: OpRef of each storage's data array pointer.
+            vable_array_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
+            /// Virtualizable: OpRef tracking each storage's current length.
+            vable_len_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
         }
 
         #[allow(non_camel_case_types)]
@@ -102,6 +106,31 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
         }
 
         impl majit_meta::JitCodeSym for __JitSym {
+            fn is_virtualizable_storage(&self) -> bool {
+                #virtualizable
+            }
+
+            fn vable_array_ref(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                self.vable_array_refs.get(&selected).copied()
+            }
+
+            fn vable_len_ref(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                self.vable_len_refs.get(&selected).copied()
+            }
+
+            fn set_vable_len_ref(&mut self, selected: usize, len: majit_ir::OpRef) {
+                self.vable_len_refs.insert(selected, len);
+            }
+
+            fn set_vable_array_ref(&mut self, selected: usize, arr: majit_ir::OpRef) {
+                self.vable_array_refs.insert(selected, arr);
+            }
+
+            fn init_vable_storage(&mut self, selected: usize, arr_ref: majit_ir::OpRef, len_ref: majit_ir::OpRef) {
+                self.vable_array_refs.insert(selected, arr_ref);
+                self.vable_len_refs.insert(selected, len_ref);
+            }
+
             fn current_selected(&self) -> usize {
                 self.current_selected
             }
@@ -209,19 +238,25 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
             fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                 let mut stacks = std::collections::HashMap::new();
                 let mut offset = 0;
-                for &(sidx, num_slots) in &meta.storage_layout {
-                    stacks.insert(
-                        sidx,
-                        majit_meta::SymbolicStack::from_input_args(offset, num_slots),
-                    );
-                    offset += num_slots;
+                if !#virtualizable {
+                    for &(sidx, num_slots) in &meta.storage_layout {
+                        stacks.insert(
+                            sidx,
+                            majit_meta::SymbolicStack::from_input_args(offset, num_slots),
+                        );
+                        offset += num_slots;
+                    }
                 }
+                // Virtualizable: stacks start empty, vable_array/len_refs
+                // are populated by the preamble or BC_SET_SELECTED.
                 __JitSym {
                     stacks,
                     current_selected: meta.initial_selected,
                     current_selected_value: None,
                     storage_layout: meta.storage_layout.clone(),
                     loop_header_pc: header_pc,
+                    vable_array_refs: std::collections::HashMap::new(),
+                    vable_len_refs: std::collections::HashMap::new(),
                 }
             }
 

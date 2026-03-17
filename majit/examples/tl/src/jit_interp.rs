@@ -5,6 +5,13 @@
 ///
 /// The stack is virtualizable: during tracing, stack slots are mapped to
 /// IR operations (OpRef), eliminating memory loads/stores in compiled code.
+/// In RPython's tl.py, this is declared as `_virtualizable_ = ['stackpos', 'stack[*]']`.
+/// Here, stack slots are passed directly as inputargs/jump_args to achieve
+/// the same optimization — stack contents stay in JIT registers across iterations.
+///
+/// This example hand-writes `trace_instruction` for educational purposes.
+/// In production, the `#[jit_interp]` proc macro auto-generates tracing
+/// code from the interpreter's match dispatch — see aheuijit for an example.
 use majit_ir::{OpCode, OpRef};
 use majit_meta::{JitDriver, JitState, TraceAction, TraceCtx};
 
@@ -398,5 +405,42 @@ mod tests {
         let prog = vec![PUSH, 42, RETURN];
         let mut jit = JitTlInterp::new();
         assert_eq!(jit.run(&prog, 0), 42);
+    }
+
+    /// Exercises the JIT with many input sizes: small values stay interpreted,
+    /// larger values trigger trace compilation and run compiled code.
+    /// The guard exit path (counter == 0) is exercised on every input,
+    /// verifying that fallback from compiled code produces correct results.
+    ///
+    /// Bridge compilation is handled automatically by MetaInterp: when a guard
+    /// fails repeatedly, MetaInterp begins tracing a bridge from the guard's
+    /// fail point. No explicit test setup is needed — the mechanism activates
+    /// whenever guard failure count exceeds the bridge threshold.
+    #[test]
+    fn jit_various_sizes() {
+        let bc = sum_bytecode();
+        for a in [1, 2, 3, 4, 5, 10, 20, 50, 100, 500, 1000] {
+            let expected = interp::interpret(&bc, a);
+            let mut jit = JitTlInterp::new();
+            let got = jit.run(&bc, a);
+            assert_eq!(got, expected, "mismatch for a={a}");
+        }
+    }
+
+    /// Uses the sum program with a shared JitTlInterp instance across multiple
+    /// calls. The first few small inputs are interpreted; once the back-edge
+    /// counter reaches the threshold the loop compiles. Subsequent inputs run
+    /// compiled code and exit via the loop-exit guard (counter == 0).
+    /// This exercises the guard exit path with a persistent compiled trace,
+    /// which is the prerequisite for bridge compilation in MetaInterp.
+    #[test]
+    fn jit_bridge_exercise() {
+        let bc = sum_bytecode();
+        let mut jit = JitTlInterp::new();
+        for a in [3, 5, 10, 20, 50, 100] {
+            let expected = interp::interpret(&bc, a);
+            let got = jit.run(&bc, a);
+            assert_eq!(got, expected, "mismatch for a={a}");
+        }
     }
 }
