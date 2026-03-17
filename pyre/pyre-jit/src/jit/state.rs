@@ -1532,55 +1532,52 @@ impl TraceFrameState {
                 let (driver, _) = crate::eval::driver_pair();
                 let nargs = args.len();
 
-                // 1. CallAssembler: callee has compiled code
+                // 1. CallAssembler: callee has compiled or pending code.
+                // For pending self-recursion, target_num_inputs is unknown
+                // so we use the current trace's num_inputs (=1 after preamble).
                 let token_number = driver
                     .get_loop_token_number(callee_key)
                     .or_else(|| driver.get_pending_token_number(callee_key));
 
                 if let Some(token_number) = token_number {
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
-                        // Get callee's num_locals from compiled meta or code object
-                        let callee_meta = driver.get_compiled_meta(callee_key);
-                        let callee_nlocals =
-                            callee_meta.map(|m| m.num_locals).unwrap_or_else(|| {
-                                let code_ptr = w_func_get_code_ptr(concrete_callable)
-                                    as *const pyre_bytecode::CodeObject;
-                                if code_ptr.is_null() {
-                                    0
-                                } else {
-                                    (&(*code_ptr).varnames).len()
-                                }
-                            });
-                        let callee_sdepth = callee_meta.map(|m| m.stack_depth).unwrap_or(0);
+                        // Check target's actual inputarg count (may be 1 after
+                        // preamble patching: just [frame]).
+                        let target_num_inputs = driver
+                            .get_compiled_num_inputs(callee_key)
+                            .unwrap_or(0);
 
                         return self.with_ctx(|this, ctx| {
                             this.guard_value(ctx, callable, concrete_callable as i64);
                             let mut helper_args = vec![this.frame(), callable];
                             helper_args.extend_from_slice(args);
                             let callee_frame = ctx.call_int(frame_helper, &helper_args);
-                            let callee_ni = frame_get_next_instr(ctx, callee_frame);
-                            let callee_sd = frame_get_stack_depth(ctx, callee_frame);
-                            let mut ca_args = vec![callee_frame, callee_ni, callee_sd];
-                            let callee_locals_ptr = frame_locals_array(ctx, callee_frame);
-                            for i in 0..callee_nlocals {
-                                let idx = ctx.const_int(i as i64);
-                                let val = ctx.record_op_with_descr(
-                                    OpCode::GetarrayitemRawI,
-                                    &[callee_locals_ptr, idx],
-                                    pyobject_array_descr(),
-                                );
-                                ca_args.push(val);
-                            }
-                            let callee_stack_ptr = frame_stack_array(ctx, callee_frame);
-                            for i in 0..callee_sdepth {
-                                let idx = ctx.const_int(i as i64);
-                                let val = ctx.record_op_with_descr(
-                                    OpCode::GetarrayitemRawI,
-                                    &[callee_stack_ptr, idx],
-                                    pyobject_array_descr(),
-                                );
-                                ca_args.push(val);
-                            }
+
+                            // Build ca_args to match target's inputarg count.
+                            // After preamble patching the target may only take [frame].
+                            let ca_args = if target_num_inputs <= 1 {
+                                // Preamble-patched: target loads fields from frame itself
+                                vec![callee_frame]
+                            } else {
+                                // Unpatched: target expects frame + static fields + array elements
+                                let callee_ni = frame_get_next_instr(ctx, callee_frame);
+                                let callee_sd = frame_get_stack_depth(ctx, callee_frame);
+                                let mut a = vec![callee_frame, callee_ni, callee_sd];
+                                let remaining = target_num_inputs.saturating_sub(3);
+                                if remaining > 0 {
+                                    let callee_locals_ptr = frame_locals_array(ctx, callee_frame);
+                                    for i in 0..remaining {
+                                        let idx = ctx.const_int(i as i64);
+                                        let val = ctx.record_op_with_descr(
+                                            OpCode::GetarrayitemRawI,
+                                            &[callee_locals_ptr, idx],
+                                            pyobject_array_descr(),
+                                        );
+                                        a.push(val);
+                                    }
+                                }
+                                a
+                            };
                             let result = ctx.call_assembler_int_by_number(token_number, &ca_args);
                             ctx.call_void(
                                 crate::call_jit::jit_drop_callee_frame as *const (),

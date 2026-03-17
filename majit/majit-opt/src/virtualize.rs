@@ -1192,15 +1192,12 @@ impl OptimizationPass for OptVirtualize {
                         }
                     }
                     if self.is_virtual(resolved, ctx) {
-                        // Try to extract the int payload field from the virtual.
-                        // If successful, carry the raw int instead of the boxed object.
-                        // This eliminates New+SetfieldGc for loop-carried locals.
-                        if let Some(int_val) = self.extract_virtual_int_field(resolved) {
-                            *arg = ctx.get_replacement(int_val);
-                        } else {
-                            let forced = self.force_virtual(resolved, ctx);
-                            *arg = ctx.get_replacement(forced);
-                        }
+                        // TODO: extract_virtual_int_field works correctly but
+                        // causes SIGSEGV because JUMP carries raw Int while
+                        // Label expects boxed Ref. Enabling this requires
+                        // preamble/Label type coordination (peel loop).
+                        let forced = self.force_virtual(resolved, ctx);
+                        *arg = ctx.get_replacement(forced);
                     } else {
                         *arg = resolved;
                     }
