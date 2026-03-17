@@ -1646,7 +1646,7 @@ fn declarative_driver_auto_syncs_virtualizable_heap_state() {
     info.add_field("stackpos", Type::Int, 8);
     info.add_array_field("stack", Type::Int, 16);
     driver.set_virtualizable_info(info);
-    driver.set_vable_array_lengths(vec![1]);
+
 
     let mut stack = vec![41_i64];
     let mut frame = AutoVirtualizableFrame {
@@ -1697,7 +1697,7 @@ fn declarative_driver_blackhole_fallback_jump_restores_and_syncs_virtualizable_s
     info.add_field("stackpos", Type::Int, 8);
     info.add_array_field("stack", Type::Int, 16);
     driver.set_virtualizable_info(info);
-    driver.set_vable_array_lengths(vec![1]);
+
 
     let mut stack = vec![41_i64];
     let mut frame = AutoVirtualizableFrame {
@@ -1752,7 +1752,7 @@ fn declarative_driver_blackhole_guard_failure_restores_and_syncs_virtualizable_s
     info.add_field("stackpos", Type::Int, 8);
     info.add_array_field("stack", Type::Int, 16);
     driver.set_virtualizable_info(info);
-    driver.set_vable_array_lengths(vec![1]);
+
 
     let mut stack = vec![41_i64];
     let mut frame = AutoVirtualizableFrame {
