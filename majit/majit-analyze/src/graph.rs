@@ -226,6 +226,50 @@ impl MajitGraph {
     pub fn block(&self, block: BasicBlockId) -> &BasicBlock {
         &self.blocks[block.0]
     }
+
+    pub fn block_mut(&mut self, block: BasicBlockId) -> &mut BasicBlock {
+        &mut self.blocks[block.0]
+    }
+
+    // ── RPython FunctionGraph iteration methods ──────────────────
+
+    /// Iterate all blocks. RPython: `graph.iterblocks()`.
+    pub fn iter_blocks(&self) -> impl Iterator<Item = &BasicBlock> {
+        self.blocks.iter()
+    }
+
+    /// Iterate all (block, op) pairs. RPython: `graph.iterblockops()`.
+    pub fn iter_block_ops(&self) -> impl Iterator<Item = (&BasicBlock, &Op)> {
+        self.blocks.iter().flat_map(|b| b.ops.iter().map(move |op| (b, op)))
+    }
+
+    /// Get successor block IDs for a block.
+    pub fn successors(&self, block: BasicBlockId) -> Vec<BasicBlockId> {
+        match &self.block(block).terminator {
+            Terminator::Goto { target, .. } => vec![*target],
+            Terminator::Branch { if_true, if_false, .. } => vec![*if_true, *if_false],
+            _ => vec![],
+        }
+    }
+
+    /// Get predecessor block IDs for a block.
+    pub fn predecessors(&self, target: BasicBlockId) -> Vec<BasicBlockId> {
+        self.blocks
+            .iter()
+            .filter(|b| self.successors(b.id).contains(&target))
+            .map(|b| b.id)
+            .collect()
+    }
+
+    /// Count total operations across all blocks.
+    pub fn num_ops(&self) -> usize {
+        self.blocks.iter().map(|b| b.ops.len()).sum()
+    }
+
+    /// Check if a block is a loop header (has a back-edge predecessor).
+    pub fn is_loop_header(&self, block: BasicBlockId) -> bool {
+        self.predecessors(block).iter().any(|&pred| pred.0 >= block.0)
+    }
 }
 
 #[cfg(test)]

@@ -165,7 +165,18 @@ mod tests {
         assert_eq!(result.functions.len(), 1);
         assert!(
             result.total_vable_rewrites > 0,
-            "should rewrite next_instr to VableFieldRead"
+            "should rewrite next_instr to VableFieldRead, notes: {:?}",
+            result.functions[0].transform_notes
+        );
+        // Should rewrite BOTH the field read (next_instr) AND the array read (locals_w[idx])
+        let notes_str = format!("{:?}", result.functions[0].transform_notes);
+        assert!(
+            notes_str.contains("VableFieldRead"),
+            "should contain VableFieldRead rewrite note"
+        );
+        assert!(
+            notes_str.contains("VableArrayRead"),
+            "should contain VableArrayRead rewrite note, got: {notes_str}"
         );
     }
 
