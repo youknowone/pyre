@@ -19,12 +19,20 @@ use crate::interp_extract::BinopMapping;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-fn is_int_scalar_type(ty: &str) -> bool {
-    matches!(
-        ty,
+/// Classify a Rust type name into a JIT state field kind.
+///
+/// Returns "int", "ref", or "float" for scalars, or None if unrecognized.
+fn classify_scalar_type(ty: &str) -> Option<&'static str> {
+    match ty {
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-            | "bool"
-    )
+        | "bool" => Some("int"),
+        "f32" | "f64" => Some("float"),
+        // Pointer-like / GC ref types
+        _ if ty.contains("Ref") || ty.contains("Ptr") || ty.starts_with('&') || ty == "*const u8" || ty == "*mut u8" => {
+            Some("ref")
+        }
+        _ => None,
+    }
 }
 
 fn infer_state_fields_attr(config: &JitDriverConfig) -> Option<TokenStream> {
@@ -41,19 +49,25 @@ fn infer_state_fields_attr(config: &JitDriverConfig) -> Option<TokenStream> {
         .map(|(name, ty)| {
             let name = format_ident!("{}", name);
             let compact = ty.replace(' ', "");
+            // Check Vec<T> → [kind]
             if let Some(inner) = compact
                 .strip_prefix("Vec<")
                 .and_then(|rest| rest.strip_suffix('>'))
             {
-                if is_int_scalar_type(inner) {
-                    return quote! { #name: [int] };
+                if let Some(kind) = classify_scalar_type(inner) {
+                    let kind_ident = format_ident!("{}", kind);
+                    return quote! { #name: [#kind_ident] };
                 }
             }
-            if is_int_scalar_type(&compact) {
-                return quote! { #name: int };
+            // Check scalar T → kind
+            if let Some(kind) = classify_scalar_type(&compact) {
+                let kind_ident = format_ident!("{}", kind);
+                return quote! { #name: #kind_ident };
             }
             panic!(
-                "state_fields codegen currently supports only int/[int] fields, got `{ty}` for `{name}`"
+                "state_fields codegen: unsupported type `{ty}` for `{name}`. \
+                 Supported: int types (i64, usize, ...), float (f64), \
+                 ref types (*Ref, *Ptr), Vec<T> for arrays."
             );
         })
         .collect();
@@ -163,8 +177,6 @@ pub struct StorageConfig {
     pub untraceable: Vec<String>,
     pub scan_fn: String,
     pub can_trace_guard: Option<String>,
-    /// When true, storage stacks are virtualizable (variable depth allowed).
-    pub virtualizable: bool,
 }
 
 /// Generate a complete JIT mainloop module.
@@ -232,11 +244,6 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
                 quote! { can_trace_guard: #g, }
             })
             .unwrap_or_default();
-        let vable = if s.virtualizable {
-            quote! { virtualizable: true, }
-        } else {
-            quote! {}
-        };
         quote! {
             storage = {
                 pool: #pool, pool_type: #pool_type,
@@ -244,7 +251,6 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
                 untraceable: [#(#untraceable),*],
                 scan: #scan,
                 #guard
-                #vable
             },
         }
     });
@@ -387,10 +393,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "state_fields codegen currently supports only int/[int] fields")]
+    #[should_panic(expected = "state_fields codegen: unsupported type")]
     fn generate_jitcode_rejects_unsupported_state_field_types() {
         let mut config = base_config();
-        config.state_fields = vec![("f".into(), "f64".into())];
+        config.state_fields = vec![("x".into(), "HashMap<String, i64>".into())];
         let _ = generate_jitcode(&config);
+    }
+
+    #[test]
+    fn generate_jitcode_accepts_float_state_fields() {
+        let mut config = base_config();
+        config.state_fields = vec![("f".into(), "f64".into())];
+        let generated = generate_jitcode(&config).to_string();
+        assert!(generated.contains("state_fields = { f : float , }"));
     }
 }

@@ -118,7 +118,18 @@ pub enum TracePattern {
 }
 
 /// Classify an opcode from its resolved call chain.
+///
+/// When `vable_config` is provided, body heuristics check for virtualizable
+/// field/array access patterns before generic LocalRead/LocalWrite.
 pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePattern> {
+    classify_from_resolved_with_vable(calls, None)
+}
+
+/// Classify with optional virtualizable config.
+pub fn classify_from_resolved_with_vable(
+    calls: &[crate::ResolvedCall],
+    vable_config: Option<&VirtualizableClassifyConfig>,
+) -> Option<TracePattern> {
     for call in calls {
         // Check the handler method name and its body
         let name = &call.name;
@@ -221,8 +232,8 @@ pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePatt
                 });
             }
             _ => {
-                // Try body heuristics
-                if let Some(p) = classify_method_body(body) {
+                // Try body heuristics (with optional virtualizable config)
+                if let Some(p) = classify_method_body_with_vable(body, vable_config) {
                     return Some(p);
                 }
             }
