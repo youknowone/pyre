@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use majit_ir::{Op, OpCode, OpRef};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 /// Key for looking up a previously computed pure operation.
 ///
@@ -152,7 +152,7 @@ impl OptPure {
         };
         let mut new_op = op.clone();
         new_op.opcode = call_opcode;
-        PassResult::Emit(new_op)
+        OptimizationResult::Emit(new_op)
     }
 
     /// Handle CALL_LOOPINVARIANT_*: cache the result for the loop iteration.
@@ -167,7 +167,7 @@ impl OptPure {
         if let Some(cached_ref) = self.loopinvariant_cache.get(&key).copied() {
             let cached_ref = ctx.get_replacement(cached_ref);
             ctx.replace_op(op.pos, cached_ref);
-            return PassResult::Remove;
+            return OptimizationResult::Remove;
         }
 
         // Also check the commutative case (unlikely for calls, but consistent).
@@ -179,7 +179,7 @@ impl OptPure {
         let call_opcode = OpCode::call_for_type(op.result_type());
         let mut new_op = op.clone();
         new_op.opcode = call_opcode;
-        PassResult::Emit(new_op)
+        OptimizationResult::Emit(new_op)
     }
 }
 
@@ -202,12 +202,12 @@ impl OptimizationPass for OptPure {
             if let Some(cached_ref) = self.lookup_pure(&key) {
                 let cached_ref = ctx.get_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
-                return PassResult::Remove;
+                return OptimizationResult::Remove;
             }
 
             // Record this operation for future lookups.
             self.cache.insert(key, op.pos);
-            return PassResult::PassOn;
+            return OptimizationResult::PassOn;
         }
 
         // CALL_PURE_* -> demote to plain CALL_*
@@ -220,7 +220,7 @@ impl OptimizationPass for OptPure {
             return self.handle_call_loopinvariant(op, ctx);
         }
 
-        PassResult::PassOn
+        OptimizationResult::PassOn
     }
 
     fn name(&self) -> &'static str {
@@ -457,14 +457,14 @@ mod tests {
         let mut op0 = op0;
         op0.pos = OpRef(2);
         let result0 = pass.propagate_forward(&op0, &mut ctx);
-        assert!(matches!(result0, PassResult::PassOn));
+        assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         let mut op1 = op1;
         op1.pos = OpRef(3);
         let result1 = pass.propagate_forward(&op1, &mut ctx);
-        assert!(matches!(result1, PassResult::Remove));
+        assert!(matches!(result1, OptimizationResult::Remove));
     }
 
     #[test]

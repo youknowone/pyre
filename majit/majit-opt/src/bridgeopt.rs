@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
-use crate::{OptContext, OptimizationPass, PassResult};
+use crate::{OptContext, Optimization, OptimizationResult};
 
 /// Known facts about values at bridge entry.
 #[derive(Clone, Debug)]
@@ -162,10 +162,10 @@ impl OptimizationPass for OptBridgeOpt {
                     (ctx.get_constant_int(obj), ctx.get_constant_int(expected))
                 {
                     if a == b {
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                 }
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
             // If we know the value is non-null from bridge knowledge,
@@ -173,18 +173,18 @@ impl OptimizationPass for OptBridgeOpt {
             OpCode::GuardNonnull => {
                 let obj = ctx.get_replacement(op.arg(0));
                 if self.knowledge.known_nonnull.contains(&obj) {
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
             // If we know the class from bridge knowledge, class guard is redundant.
             OpCode::GuardClass | OpCode::GuardNonnullClass => {
                 let obj = ctx.get_replacement(op.arg(0));
                 if self.knowledge.known_classes.contains_key(&obj) {
-                    return PassResult::Remove;
+                    return OptimizationResult::Remove;
                 }
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
             // Bounds-based guard elimination: if the comparison operands
@@ -195,13 +195,13 @@ impl OptimizationPass for OptBridgeOpt {
                 if let Some(cond_op) = self.produced_by.get(&cond_ref) {
                     let guard_true = op.opcode == OpCode::GuardTrue;
                     if self.can_eliminate_comparison_guard(cond_op, guard_true, ctx) {
-                        return PassResult::Remove;
+                        return OptimizationResult::Remove;
                     }
                 }
-                PassResult::PassOn
+                OptimizationResult::PassOn
             }
 
-            _ => PassResult::PassOn,
+            _ => OptimizationResult::PassOn,
         }
     }
 
@@ -461,11 +461,11 @@ mod tests {
         let mut pass = OptBridgeOpt::with_knowledge(bridge.knowledge.clone());
         // Process IntLt first so produced_by is populated.
         let r1 = pass.propagate_forward(&ops[0], &mut ctx);
-        assert!(matches!(r1, PassResult::PassOn));
+        assert!(matches!(r1, OptimizationResult::PassOn));
         // Now process GuardTrue.
         let r2 = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(
-            matches!(r2, PassResult::Remove),
+            matches!(r2, OptimizationResult::Remove),
             "GuardTrue should be removed with one constant operand"
         );
     }
@@ -508,13 +508,13 @@ mod tests {
         let mut pass = OptBridgeOpt::new();
         let result = pass.propagate_forward(&ops[0], &mut ctx);
         match result {
-            PassResult::Remove => {} // expected
+            OptimizationResult::Remove => {} // expected
             other => panic!(
                 "expected Remove, got {:?}",
                 match other {
-                    PassResult::PassOn => "PassOn",
-                    PassResult::Emit(_) => "Emit",
-                    PassResult::Replace(_) => "Replace",
+                    OptimizationResult::PassOn => "PassOn",
+                    OptimizationResult::Emit(_) => "Emit",
+                    OptimizationResult::Replace(_) => "Replace",
                     _ => "other",
                 }
             ),
