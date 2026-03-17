@@ -161,13 +161,12 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 
 /// Try running compiled code or count function entry.
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
-    if JIT_CALL_DEPTH.with(|d| d.get()) > 0 {
-        return None;
-    }
-
     let green_key = frame.code as u64;
     let (driver, info) = driver_pair();
 
+    // If compiled code exists for this function, run it regardless of
+    // call depth. This matches PyPy's call_assembler: compiled code
+    // calls compiled code directly, not through the interpreter.
     if driver.has_compiled_loop(green_key) {
         let env = PyreEnv;
         let mut jit_state = build_jit_state(frame, info);
