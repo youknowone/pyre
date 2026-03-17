@@ -147,6 +147,9 @@ pub struct TraceCtx {
     virtualizable_info: Option<VirtualizableInfo>,
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
+    /// Pending OpRef replacements from inline callee returns.
+    /// Applied when the trace is finalized (close_loop/compile).
+    replacements: Vec<(OpRef, OpRef)>,
 }
 
 impl TraceCtx {
@@ -175,6 +178,7 @@ impl TraceCtx {
             virtualizable_boxes: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
+            replacements: Vec::new(),
         }
     }
 
@@ -194,6 +198,7 @@ impl TraceCtx {
             virtualizable_boxes: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
+            replacements: Vec::new(),
         }
     }
 
@@ -212,6 +217,22 @@ impl TraceCtx {
     pub fn recursive_depth(&self, key: u64) -> usize {
         let root = if self.green_key == key { 1 } else { 0 };
         root + self.inline_frames.iter().filter(|&&k| k == key).count()
+    }
+
+    /// Register a deferred OpRef replacement. When the trace is finalized,
+    /// all ops referencing `old` in their args will use `new` instead.
+    pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
+        self.replacements.push((old, new));
+    }
+
+    /// Apply all pending replacements to the trace ops.
+    pub fn apply_replacements(&mut self) {
+        if self.replacements.is_empty() {
+            return;
+        }
+        let replacements: std::collections::HashMap<OpRef, OpRef> =
+            self.replacements.drain(..).collect();
+        self.recorder.apply_replacements(&replacements);
     }
 
     /// Push an inline frame (entering a callee).

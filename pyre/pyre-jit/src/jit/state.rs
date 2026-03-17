@@ -110,6 +110,10 @@ pub(crate) struct PendingInlineCall {
     pub concrete_callee_frame: Box<pyre_interp::frame::PyFrame>,
     pub code: *const pyre_bytecode::CodeObject,
     pub nargs: usize,
+    /// Placeholder OpRef on caller's symbolic stack. When callee returns,
+    /// ALL references to this placeholder in the trace are replaced with
+    /// the actual result OpRef via ctx.replace_op().
+    pub placeholder: OpRef,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1561,18 +1565,20 @@ impl TraceFrameState {
                             driver.enter_inline_frame(callee_key);
 
                             // Store pending inline call in sym for iterative processing
+                            // Allocate a valid placeholder OpRef. When the callee
+                            // returns, ctx.replace_op() replaces ALL trace
+                            // references to this with the actual result.
+                            let placeholder = ctx.const_int(0);
+
                             this.sym_mut().pending_inline = Some(PendingInlineCall {
                                 callee_key,
                                 callee_frame_opref,
                                 concrete_callee_frame: Box::new(callee_frame),
                                 code: func_code,
                                 nargs,
+                                placeholder,
                             });
 
-                            // Return a valid placeholder OpRef (not NONE — that
-                            // would poison fail_args). The placeholder will be
-                            // replaced with the actual result when callee returns.
-                            let placeholder = ctx.const_int(0);
                             Ok(placeholder)
                         });
                     }
@@ -1900,6 +1906,10 @@ struct InlineFrame {
     code: *const CodeObject,
     callee_frame_opref: OpRef,
     arg_state: pyre_bytecode::bytecode::OpArgState,
+    /// The placeholder OpRef on the CALLER's symbolic stack. When this
+    /// frame returns, ctx.replace_op(placeholder, result) updates
+    /// all trace references. OpRef::NONE for root frame (no caller).
+    caller_placeholder: OpRef,
 }
 
 /// Multi-frame iterative eval loop that traces AND executes callee
@@ -1922,6 +1932,7 @@ fn inline_trace_and_execute(
         code: std::ptr::null(),
         callee_frame_opref,
         arg_state: pyre_bytecode::bytecode::OpArgState::default(),
+        caller_placeholder: OpRef::NONE, // root frame has no caller
     };
     first.code = first.concrete_frame.code;
     let mut stack: Vec<InlineFrame> = vec![first];
@@ -1956,6 +1967,7 @@ fn inline_trace_and_execute(
                 code: pending.code,
                 callee_frame_opref: pending.callee_frame_opref,
                 arg_state: pyre_bytecode::bytecode::OpArgState::default(),
+                caller_placeholder: pending.placeholder,
             };
             callee_inline.code = callee_inline.concrete_frame.code;
             stack.push(callee_inline);
@@ -1989,6 +2001,7 @@ fn inline_trace_and_execute(
                 };
 
                 let finished_opref = frame.callee_frame_opref;
+                let caller_placeholder = frame.caller_placeholder;
 
                 // LeavePortalFrame + drop callee frame IR
                 driver.leave_inline_frame();
@@ -2005,17 +2018,28 @@ fn inline_trace_and_execute(
                     return Ok((result_opref, concrete_result));
                 }
 
-                // Propagate result to caller frame
+                // Replace ALL trace references to the placeholder with
+                // the actual result. This is the correct way to propagate
+                // the callee's return value through the IR — any op that
+                // used the placeholder now uses result_opref.
+                if caller_placeholder != OpRef::NONE {
+                    ctx.replace_op(caller_placeholder, result_opref);
+                }
+
+                // Also update caller's symbolic stack top
                 let caller = stack.last_mut().unwrap();
-                // Replace placeholder on caller's symbolic stack with actual result
                 if let Some(last) = caller.sym.symbolic_stack.last_mut() {
-                    if *last != result_opref {
+                    if *last == caller_placeholder {
                         *last = result_opref;
                     }
                 }
+
                 // Push concrete result onto caller's concrete stack
-                let sd = caller.concrete_frame.stack_depth;
-                caller.concrete_frame.value_stack_w[sd - 1] = concrete_result;
+                pyre_interp::frame::PyFrame::push(
+                    &mut *caller.concrete_frame,
+                    concrete_result,
+                );
+                pyre_interp::call::set_inline_handled_result(concrete_result);
                 continue;
             }
             TraceAction::Abort | TraceAction::AbortPermanent => {

@@ -1077,7 +1077,8 @@ impl<M: Clone> MetaInterp<M> {
     /// in the same order as the InputArgs registered during `on_back_edge`.
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
     pub fn close_and_compile(&mut self, jump_args: &[OpRef], meta: M) {
-        let ctx = self.tracing.take().unwrap();
+        let mut ctx = self.tracing.take().unwrap();
+        ctx.apply_replacements();
         let green_key = ctx.green_key;
 
         let mut recorder = ctx.recorder;
@@ -1292,7 +1293,8 @@ impl<M: Clone> MetaInterp<M> {
         finish_arg_types: Vec<Type>,
         meta: M,
     ) {
-        let ctx = self.tracing.take().unwrap();
+        let mut ctx = self.tracing.take().unwrap();
+        ctx.apply_replacements();
         let green_key = ctx.green_key;
 
         let mut recorder = ctx.recorder;
@@ -2291,6 +2293,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Check whether a guard in a specific compiled trace should get a bridge.
+    ///
+    /// Only root-loop guards are eligible for bridge compilation.
+    /// Bridge guard failures (trace_id != root_trace_id) fall back to
+    /// the interpreter to avoid infinite bridge-of-bridge recompilation.
     pub fn should_compile_bridge_in_trace(
         &self,
         green_key: u64,
@@ -2301,6 +2307,10 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        // Only compile bridges for root-loop guards, not bridge guards.
+        if trace_id != compiled.root_trace_id {
+            return false;
+        }
         compiled
             .guard_failures
             .get(&(trace_id, fail_index))
