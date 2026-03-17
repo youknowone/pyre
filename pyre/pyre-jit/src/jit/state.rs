@@ -529,7 +529,14 @@ impl TraceFrameState {
     pub(crate) fn current_fail_args(&self, _ctx: &mut TraceCtx) -> Vec<OpRef> {
         let s = self.sym();
         let mut fa = vec![s.frame, s.vable_next_instr, s.vable_stack_depth];
-        fa.extend_from_slice(&s.symbolic_locals);
+        // When virtualizable locals are active (vable_locals_base is set),
+        // DON'T include symbolic_locals in fail_args — they are recovered
+        // from the virtualizable frame via augment_guard_with_virtualizable.
+        // Including them would force virtual New objects to materialize,
+        // preventing boxing elimination.
+        if s.vable_locals_base.is_none() {
+            fa.extend_from_slice(&s.symbolic_locals);
+        }
         fa.extend_from_slice(&s.symbolic_stack[..s.stack_depth.min(s.symbolic_stack.len())]);
         fa
     }
