@@ -390,6 +390,25 @@ impl OptVirtualize {
     }
 
     /// Force all arguments that are virtual.
+    /// Extract the int payload from a VirtualStruct (e.g., W_IntObject's intval field).
+    /// Returns the OpRef of the raw int if the virtual has exactly one int field
+    /// (the common case for boxed integers).
+    /// Extract the int payload from a VirtualStruct (e.g., W_IntObject).
+    /// Returns the OpRef of the raw int if the virtual has a field at offset 8.
+    fn extract_virtual_int_field(&self, opref: OpRef) -> Option<OpRef> {
+        match self.get_info(opref)? {
+            PtrInfo::VirtualStruct(vinfo) => {
+                // Standard layout: [type_ptr@0, intval@8]
+                vinfo
+                    .fields
+                    .iter()
+                    .find(|(idx, _)| extract_field_offset(*idx) == Some(8))
+                    .map(|(_, opref)| *opref)
+            }
+            _ => None,
+        }
+    }
+
     fn has_any_virtual_arg(&self, op: &Op, ctx: &OptContext) -> bool {
         op.args.iter().any(|arg| {
             let resolved = ctx.get_replacement(*arg);
@@ -1173,8 +1192,15 @@ impl OptimizationPass for OptVirtualize {
                         }
                     }
                     if self.is_virtual(resolved, ctx) {
-                        let forced = self.force_virtual(resolved, ctx);
-                        *arg = ctx.get_replacement(forced);
+                        // Try to extract the int payload field from the virtual.
+                        // If successful, carry the raw int instead of the boxed object.
+                        // This eliminates New+SetfieldGc for loop-carried locals.
+                        if let Some(int_val) = self.extract_virtual_int_field(resolved) {
+                            *arg = ctx.get_replacement(int_val);
+                        } else {
+                            let forced = self.force_virtual(resolved, ctx);
+                            *arg = ctx.get_replacement(forced);
+                        }
                     } else {
                         *arg = resolved;
                     }
