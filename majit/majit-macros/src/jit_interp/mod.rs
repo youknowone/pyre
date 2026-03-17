@@ -136,12 +136,16 @@ pub struct StateFieldDecl {
     pub kind: StateFieldKind,
 }
 
-/// Whether a state field is a scalar or an array.
+/// Whether a state field is a scalar, array, or virtualizable array.
 pub enum StateFieldKind {
     /// Scalar value (e.g., `a: int`).
     Scalar(Ident),
-    /// Array value (e.g., `regs: [int]`).
+    /// Array value (e.g., `regs: [int]`) — flattened into inputargs.
     Array(Ident),
+    /// Virtualizable array (e.g., `tape: [int; virt]`) — NOT flattened.
+    /// Only the data pointer and length are tracked as inputargs.
+    /// Element access emits GETARRAYITEM_RAW_I / SETARRAYITEM_RAW IR ops.
+    VirtArray(Ident),
 }
 
 /// Multi-storage configuration parsed from `storage = { ... }`.
@@ -365,11 +369,24 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
         content.parse::<Token![:]>()?;
 
         let kind = if content.peek(syn::token::Bracket) {
-            // Array: [int], [ref], [float]
+            // Array: [int], [ref], [float] or virtualizable: [int; virt]
             let inner;
             bracketed!(inner in content);
             let item_type: Ident = inner.parse()?;
-            StateFieldKind::Array(item_type)
+            if inner.peek(Token![;]) {
+                inner.parse::<Token![;]>()?;
+                let flag: Ident = inner.parse()?;
+                if flag == "virt" {
+                    StateFieldKind::VirtArray(item_type)
+                } else {
+                    return Err(syn::Error::new(
+                        flag.span(),
+                        format!("unknown array modifier `{flag}`, expected `virt`"),
+                    ));
+                }
+            } else {
+                StateFieldKind::Array(item_type)
+            }
         } else {
             // Scalar: int, ref, float
             let field_type: Ident = content.parse()?;

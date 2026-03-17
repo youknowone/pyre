@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_call_release_gil_opcodes_exist() {
-        use crate::op::OpCode;
+        use crate::resoperation::OpCode;
         // Parity with test_fficall.py: CallReleaseGil opcodes for all return types
         let int_op = OpCode::call_release_gil_for_type(Type::Int);
         assert_eq!(int_op, OpCode::CallReleaseGilI);

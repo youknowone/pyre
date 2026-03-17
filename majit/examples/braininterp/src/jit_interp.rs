@@ -33,7 +33,7 @@ struct BfState {
     env = Bytecode,
     state_fields = {
         pointer: int,
-        tape: [int],
+        tape: [int; virt],
     },
 )]
 fn mainloop(program: &Bytecode, threshold: u32) -> String {
