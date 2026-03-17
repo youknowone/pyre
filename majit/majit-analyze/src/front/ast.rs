@@ -75,14 +75,16 @@ fn build_function_graph(func: &ItemFn, options: &AstGraphOptions) -> SemanticFun
     for param in &func.sig.inputs {
         if let syn::FnArg::Typed(pat_type) = param {
             let name = quote!(#pat_type.pat).to_string().replace(' ', "");
-            graph.push_op(
+            if let Some(vid) = graph.push_op(
                 entry,
                 OpKind::Input {
-                    name,
+                    name: name.clone(),
                     ty: ValueType::Unknown,
                 },
                 true,
-            );
+            ) {
+                graph.name_value(vid, name);
+            }
         }
     }
 
@@ -123,7 +125,13 @@ fn lower_stmt(
         }
         syn::Stmt::Local(local) => {
             if let Some(init) = &local.init {
-                lower_expr(graph, block, &init.expr, options);
+                let result = lower_expr(graph, block, &init.expr, options);
+                // Record variable name (RPython Variable._name)
+                if let Some(vid) = result {
+                    if let syn::Pat::Ident(pat_ident) = &local.pat {
+                        graph.name_value(vid, pat_ident.ident.to_string());
+                    }
+                }
             }
         }
         syn::Stmt::Macro(_) => {
