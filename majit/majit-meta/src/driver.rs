@@ -83,6 +83,11 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_compiled_meta(green_key)
     }
 
+    /// Get the compiled loop's num_inputs (after preamble patching).
+    pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
+        self.meta.get_compiled_num_inputs(green_key)
+    }
+
     /// Set the virtualizable object pointer for compile-time array length reading.
     ///
     /// RPython parity: compile.py reads array lengths from the actual object.

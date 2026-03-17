@@ -436,7 +436,7 @@ impl StoredExitLayout {
 
 struct CompiledEntry<M> {
     token: LoopToken,
-    _num_inputs: usize,
+    num_inputs: usize,
     meta: M,
     /// Trace id of the root compiled loop.
     root_trace_id: u64,
@@ -893,9 +893,20 @@ impl<M: Clone> MetaInterp<M> {
     /// replaced with input references and values flow through JUMP args.
     /// No heap access for these fields on the hot path.
     fn make_optimizer(&self) -> Optimizer {
-        // Virtualizable optimization is handled at the tracer level (pyre's
-        // JitState adds static field values as input args and JUMP args).
-        // The optimizer pass handles array field virtualization when enabled.
+        // Only pass virtualizable config to optimizer when the trace
+        // actually uses virtualizable boxes (init_virtualizable_boxes called).
+        // Without boxes, the optimizer should not treat OpRef(0) as virtualizable.
+        let has_vable_boxes = self
+            .tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.has_virtualizable_boxes());
+        if has_vable_boxes {
+            if let Some(ref info) = self.virtualizable_info {
+                return Optimizer::default_pipeline_with_virtualizable(
+                    info.to_optimizer_config(),
+                );
+            }
+        }
         Optimizer::default_pipeline()
     }
 
@@ -1296,7 +1307,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         token,
-                        _num_inputs: trace.inputargs.len(),
+                        num_inputs: inputargs.len(),
                         meta,
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
@@ -1478,7 +1489,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         token,
-                        _num_inputs: trace.inputargs.len(),
+                        num_inputs: inputargs.len(),
                         meta,
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
@@ -1522,6 +1533,11 @@ impl<M: Clone> MetaInterp<M> {
     /// `run_compiled`.
     pub fn get_compiled_meta(&self, green_key: u64) -> Option<&M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
+    }
+
+    /// Get num_inputs of the compiled loop (after preamble patching).
+    pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
+        self.compiled_loops.get(&green_key).map(|e| e.num_inputs)
     }
 
     /// Run the compiled loop for the given green key.
