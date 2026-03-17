@@ -66,6 +66,13 @@ pub struct JitDriverConfig {
     /// I/O shim pairs: `(original_fn_path, shim_fn_name)`.
     pub io_shims: Vec<IoShim>,
 
+    /// Virtualizable frame field declaration.
+    ///
+    /// RPython equivalent: VirtualizableInfo from virtualizable.py.
+    /// When set, the proc macro rewrites field accesses on the virtualizable
+    /// variable to use TraceCtx vable_* methods (jtransform.py:832 parity).
+    pub virtualizable: Option<VirtualizableCodegenConfig>,
+
     /// The complete mainloop function body — loop structure, state init,
     /// opcode dispatch, and return logic. Provided verbatim by the
     /// interpreter; the codewriter does NOT generate or modify it.
@@ -77,6 +84,21 @@ pub struct JitDriverConfig {
 
     /// Additional code after the mainloop (helper functions).
     pub extra_code: Vec<String>,
+}
+
+/// Virtualizable frame configuration for build-time code generation.
+///
+/// Passed through JitDriverConfig to generate the `virtualizable_fields = { ... }`
+/// block in the `#[jit_interp]` attribute.
+pub struct VirtualizableCodegenConfig {
+    /// Variable name in the mainloop body (e.g., "frame").
+    pub var: String,
+    /// Constant path for vable_token offset (e.g., "PYFRAME_VABLE_TOKEN_OFFSET").
+    pub token_offset: String,
+    /// Static fields: (name, type "int"/"ref"/"float", offset constant path).
+    pub fields: Vec<(String, String, String)>,
+    /// Array fields: (name, item type, offset constant path).
+    pub arrays: Vec<(String, String, String)>,
 }
 
 /// A single I/O shim declaration.
@@ -175,6 +197,39 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
         }
     });
 
+    let virtualizable_attr = config.virtualizable.as_ref().map(|v| {
+        let var = format_ident!("{}", v.var);
+        let token_offset: TokenStream = v.token_offset.parse().unwrap();
+        let field_entries: Vec<TokenStream> = v
+            .fields
+            .iter()
+            .map(|(name, tp, offset)| {
+                let name = format_ident!("{}", name);
+                let tp = format_ident!("{}", tp);
+                let offset: TokenStream = offset.parse().unwrap();
+                quote! { #name: #tp @ #offset }
+            })
+            .collect();
+        let array_entries: Vec<TokenStream> = v
+            .arrays
+            .iter()
+            .map(|(name, tp, offset)| {
+                let name = format_ident!("{}", name);
+                let tp = format_ident!("{}", tp);
+                let offset: TokenStream = offset.parse().unwrap();
+                quote! { #name: #tp @ #offset }
+            })
+            .collect();
+        quote! {
+            virtualizable_fields = {
+                var: #var,
+                token_offset: #token_offset,
+                fields: { #(#field_entries,)* },
+                arrays: { #(#array_entries,)* },
+            },
+        }
+    });
+
     let io_shim_attr_entries: Vec<TokenStream> = config
         .io_shims
         .iter()
@@ -228,6 +283,7 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
             state = #state_name, env = #env_type,
             greens = [#(#greens),*],
             #storage_attr
+            #virtualizable_attr
             binops = { #(#binop_entries),* },
             io_shims = { #(#io_shim_attr_entries),* },
         )]
