@@ -280,6 +280,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
                 | OpKind::CallResidual { target, .. }
                 | OpKind::CallMayForce { target, .. } => calls.push(target.clone()),
                 OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => has_guard = true,
+                OpKind::BinOp { .. } | OpKind::UnaryOp { .. } => {}
                 OpKind::VableFieldRead { .. } | OpKind::VableFieldWrite { .. } => {
                     has_vable_field = true;
                 }
