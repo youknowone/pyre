@@ -127,7 +127,9 @@ pub fn classify_from_resolved(calls: &[crate::ResolvedCall]) -> Option<TracePatt
     classify_from_resolved_with_vable(calls, None)
 }
 
-/// Classify with optional virtualizable config.
+/// Classify with optional virtualizable config (string heuristic).
+///
+/// **Deprecated**: Use `classify_from_graph()` instead.
 pub fn classify_from_resolved_with_vable(
     calls: &[crate::ResolvedCall],
     vable_config: Option<&VirtualizableClassifyConfig>,
