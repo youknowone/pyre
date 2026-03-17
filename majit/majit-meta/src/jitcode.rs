@@ -220,8 +220,21 @@ pub trait JitCodeSym {
         None
     }
 
+    /// Set the array data pointer OpRef for a virtualizable storage.
+    /// Called from BC_SET_SELECTED when the target storage is first accessed.
+    fn set_vable_array_ref(&mut self, _selected: usize, _arr: OpRef) {}
+
     /// Update the length OpRef after push/pop on a virtualizable storage.
     fn set_vable_len_ref(&mut self, _selected: usize, _len: OpRef) {}
+
+    /// Initialize virtualizable storage for a given index.
+    ///
+    /// Called from BC_SET_SELECTED when `is_virtualizable_storage()` is true
+    /// and the target storage hasn't been initialized yet.
+    /// `ctx` emits GETFIELD ops to load array pointer and length from the heap.
+    ///
+    /// Default: no-op (override when is_virtualizable_storage returns true).
+    fn init_vable_storage(&mut self, _selected: usize, _arr_ref: OpRef, _len_ref: OpRef) {}
 }
 
 pub trait JitCodeRuntime {
@@ -856,12 +869,28 @@ where
                         .get(const_idx)
                         .expect("jitcode const index out of bounds") as usize
                 };
-                // Ensure the target storage has a symbolic stack and runtime mirror.
-                if sym.stack(new_selected).is_none() {
-                    let len = runtime.stack_len(new_selected);
-                    let offset = sym.total_slots();
-                    sym.ensure_stack(new_selected, offset, len);
-                    let _ = self.runtime_stack_mut(new_selected, runtime);
+                if sym.is_virtualizable_storage() {
+                    // Virtualizable: if this storage isn't initialized yet,
+                    // emit IR to load array pointer + length from the heap.
+                    // RPython parity: PyPy's value_stack_w is a virtualizable
+                    // array field — first access loads via GETFIELD_GC_R.
+                    if sym.vable_array_ref(new_selected).is_none() {
+                        let len = runtime.stack_len(new_selected);
+                        let len_ref = ctx.const_int(len as i64);
+                        // Array data pointer: loaded from storage pool at runtime.
+                        // For now, use a const placeholder that the preamble will
+                        // replace with the actual GETFIELD load.
+                        let arr_ref = ctx.const_int(0); // placeholder
+                        sym.init_vable_storage(new_selected, arr_ref, len_ref);
+                    }
+                } else {
+                    // Non-virtualizable: ensure SymbolicStack exists.
+                    if sym.stack(new_selected).is_none() {
+                        let len = runtime.stack_len(new_selected);
+                        let offset = sym.total_slots();
+                        sym.ensure_stack(new_selected, offset, len);
+                        let _ = self.runtime_stack_mut(new_selected, runtime);
+                    }
                 }
                 let selected_value = ctx.const_int(new_selected as i64);
                 sym.set_current_selected_value(new_selected, selected_value);

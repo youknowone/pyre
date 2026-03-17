@@ -4480,7 +4480,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token,
-                _num_inputs: inputargs.len(),
+                num_inputs: inputargs.len(),
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
@@ -4544,7 +4544,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: LoopToken::new(1),
-                _num_inputs: 2,
+                num_inputs: 2,
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
@@ -4642,7 +4642,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: LoopToken::new(100),
-                _num_inputs: 2,
+                num_inputs: 2,
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
@@ -4927,7 +4927,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: LoopToken::new(2),
-                _num_inputs: 1,
+                num_inputs: 1,
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
@@ -5732,7 +5732,7 @@ mod tests {
             green_key,
             CompiledEntry {
                 token: LoopToken::new(700),
-                _num_inputs: 0,
+                num_inputs: 0,
                 meta: (),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
