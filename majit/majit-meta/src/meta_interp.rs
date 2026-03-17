@@ -3437,12 +3437,15 @@ impl<M: Clone> MetaInterp<M> {
                 // non-recursive tracing (PyPy's meta-interpreter style)
                 // which we don't have yet — our tracing executes the
                 // callee concretely, causing exponential cost for fib.
+                // Self-recursion: never inline during tracing.
+                // Our tracing executes callees concretely, so recursive
+                // inlining causes exponential cost. Phase 3 (iterative
+                // meta-interpreter) will enable this safely.
                 if ctx.is_tracing_key(callee_key) {
                     if self.compiled_loops.contains_key(&callee_key) {
                         return InlineDecision::CallAssembler;
                     }
-                    // Not compiled yet: this is the initial trace.
-                    // Fall through to function_threshold check.
+                    return InlineDecision::ResidualCall;
                 }
             }
 
