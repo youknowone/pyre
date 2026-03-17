@@ -290,16 +290,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             let ty = match &f.kind {
                 StateFieldKind::Scalar(tp) | StateFieldKind::Array(tp) => tp.to_string(),
             };
-            if ty == "int" {
-                None
-            } else {
-                Some(format!("{}: {}", f.name, ty))
+            match ty.as_str() {
+                "int" | "ref" | "float" => None,
+                _ => Some(format!("{}: {}", f.name, ty)),
             }
         })
         .collect();
     if !unsupported_fields.is_empty() {
         let message = format!(
-            "state_fields currently supports only int/[int]; unsupported fields: {}",
+            "state_fields supports int/ref/float and [int]/[ref]/[float]; unsupported: {}",
             unsupported_fields.join(", ")
         );
         return quote! {

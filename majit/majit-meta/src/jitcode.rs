@@ -572,9 +572,14 @@ where
                 let dest = self.frames.current_mut().next_u16() as usize;
                 let (_, index_concrete) = self.read_int_reg(index_reg);
                 let elem_idx = index_concrete as usize;
-                let opref = sym.state_array_ref(array_idx, elem_idx)
-                    .expect("state array element not initialized");
-                self.set_int_reg(dest, Some(opref), Some(0));
+                let opref = sym.state_array_ref(array_idx, elem_idx);
+                if let Some(opref) = opref {
+                    self.set_int_reg(dest, Some(opref), Some(0));
+                } else {
+                    // Array element beyond initialized range (e.g., push expanded).
+                    // Abort trace — this path needs dynamic array support.
+                    return TraceAction::Abort;
+                }
             }
             BC_STORE_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -674,6 +679,11 @@ where
                     runtime.label_at(pc) as i64
                 };
                 let resume_pc = ctx.const_int(resume_pc);
+                if crate::majit_log_enabled() {
+                    if let Some(fa) = sym.fail_args() {
+                        eprintln!("[jit] BC_BRANCH_ZERO guard: stack_vals={}, selected={}", fa.len(), selected);
+                    }
+                }
                 Self::record_state_guard(ctx, sym, opcode, &[cond], &[resume_pc]);
                 if runtime_cond == 0 && close_loop {
                     return TraceAction::CloseLoop;
