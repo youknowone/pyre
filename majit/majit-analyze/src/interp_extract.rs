@@ -14,11 +14,14 @@ pub struct BinopMapping {
     pub opcode: String,
 }
 
-/// Find a function named `mainloop` in a parsed AST.
-pub fn find_mainloop(file: &File) -> Option<&ItemFn> {
+/// Find a function by name in a parsed AST.
+///
+/// For aheui: `find_function(file, "mainloop")`
+/// For pyre: `find_function(file, "execute_opcode_step")`
+pub fn find_function<'a>(file: &'a File, name: &str) -> Option<&'a ItemFn> {
     file.items.iter().find_map(|item| {
         if let syn::Item::Fn(f) = item {
-            if f.sig.ident == "mainloop" {
+            if f.sig.ident == name {
                 return Some(f);
             }
         }
@@ -26,23 +29,34 @@ pub fn find_mainloop(file: &File) -> Option<&ItemFn> {
     })
 }
 
+/// Find a function named `mainloop` in a parsed AST.
+pub fn find_mainloop(file: &File) -> Option<&ItemFn> {
+    find_function(file, "mainloop")
+}
+
+/// Check if a match arm pattern looks like an opcode dispatch.
+///
+/// Recognizes two conventions:
+/// - `OP_ADD` / `OP_SUB` — aheui-style constant patterns
+/// - `Instruction::LoadConst { .. }` — pyre-style enum variant patterns
+fn is_opcode_pattern(arm: &syn::Arm) -> bool {
+    let pat_str = quote!(#arm.pat).to_string();
+    pat_str.contains("OP_") || pat_str.contains("Instruction ::")
+}
+
 /// Find the opcode dispatch `match` expression within a function.
 ///
-/// Looks for a match whose first arm pattern contains `OP_` — this is the
-/// standard convention for interpreter opcode dispatch.
+/// Looks for a match whose first arm pattern looks like an opcode —
+/// either `OP_*` constants (aheui) or `Instruction::*` enum variants (pyre).
 pub fn find_opcode_match(func: &ItemFn) -> Option<&ExprMatch> {
     struct Finder<'a> {
         result: Option<&'a ExprMatch>,
     }
     impl<'ast> Visit<'ast> for Finder<'ast> {
         fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
-            // The opcode match is `match op { OP_ADD => ... }`
-            if self.result.is_none() {
-                let first_arm = node.arms.first().map(|a| quote!(#a.pat).to_string());
-                if first_arm.as_deref().is_some_and(|s| s.contains("OP_")) {
-                    self.result = Some(node);
-                    return;
-                }
+            if self.result.is_none() && node.arms.first().is_some_and(is_opcode_pattern) {
+                self.result = Some(node);
+                return;
             }
             syn::visit::visit_expr_match(self, node);
         }
@@ -244,6 +258,38 @@ mod tests {
         "#;
         let file: File = syn::parse_str(src).unwrap();
         assert!(function_uses_checked_ops(&file, "val_add"));
+    }
+
+    #[test]
+    fn test_find_function_by_name() {
+        let src = r#"
+            fn helper() {}
+            fn execute_opcode_step() { loop {} }
+        "#;
+        let file: File = syn::parse_str(src).unwrap();
+        assert!(find_function(&file, "execute_opcode_step").is_some());
+        assert!(find_function(&file, "helper").is_some());
+        assert!(find_function(&file, "missing").is_none());
+    }
+
+    #[test]
+    fn test_find_opcode_match_instruction_enum() {
+        // pyre-style: Instruction::* enum variant patterns
+        let src = r#"
+            fn execute_opcode_step() {
+                match instruction {
+                    Instruction::LoadConst { consti } => {},
+                    Instruction::StoreFast { var_num } => {},
+                    Instruction::BinaryAdd => {},
+                    _ => {},
+                }
+            }
+        "#;
+        let file: File = syn::parse_str(src).unwrap();
+        let func = find_function(&file, "execute_opcode_step").unwrap();
+        let m = find_opcode_match(func);
+        assert!(m.is_some(), "should find Instruction:: opcode match");
+        assert_eq!(m.unwrap().arms.len(), 4);
     }
 
     #[test]
