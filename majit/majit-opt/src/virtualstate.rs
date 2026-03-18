@@ -283,10 +283,24 @@ impl VirtualState {
     }
 
     /// Number of non-virtual values (need concrete OpRefs at loop entry).
-    ///
-    /// RPython: `VirtualState.make_inputargs()` counts non-virtual entries.
+    /// virtualstate.py: num_boxes()
     pub fn num_boxes(&self) -> usize {
         self.state.iter().filter(|s| !s.is_virtual()).count()
+    }
+
+    /// Total number of entries (virtual + non-virtual).
+    pub fn num_entries(&self) -> usize {
+        self.state.len()
+    }
+
+    /// Number of virtual entries.
+    pub fn num_virtuals(&self) -> usize {
+        self.state.iter().filter(|s| s.is_virtual()).count()
+    }
+
+    /// Whether this state has any virtual objects.
+    pub fn has_virtuals(&self) -> bool {
+        self.state.iter().any(|s| s.is_virtual())
     }
 
     /// Generate input argument OpRefs from this state.

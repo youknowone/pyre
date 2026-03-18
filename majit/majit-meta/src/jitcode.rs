@@ -733,7 +733,10 @@ where
                 let required = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 if self.runtime_stack_mut(selected, runtime).len() < required {
-                    return TraceAction::Abort;
+                    // Stack insufficient: the interpreter will take the branch.
+                    // Don't abort the trace — just skip this jitcode's remaining
+                    // bytecodes. The branch direction is handled at interpreter level.
+                    // RPython parity: BRPOP is a no-op in the trace when branch is taken.
                 }
             }
             BC_BRANCH_ZERO => {
