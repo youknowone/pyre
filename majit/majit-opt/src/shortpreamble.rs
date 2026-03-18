@@ -843,4 +843,25 @@ mod tests {
         // Guard + pure IntAdd
         assert_eq!(sp.len(), 2);
     }
+
+    #[test]
+    fn test_extended_builder() {
+        let mut builder = ExtendedShortPreambleBuilder::new();
+        builder.set_label_args(&[OpRef(100), OpRef(101)]);
+        builder.add_guard(Op::new(OpCode::GuardTrue, &[OpRef(100)]));
+        builder.add_pure_op(Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]));
+        builder.add_heap_op(Op::new(OpCode::GetfieldGcI, &[OpRef(100)]), 42);
+        builder.add_loopinvariant_op(Op::new(OpCode::CallI, &[OpRef(100)]));
+        assert_eq!(builder.num_ops(), 4);
+    }
+
+    #[test]
+    fn test_short_boxes() {
+        let mut sb = ShortBoxes::new(3);
+        assert_eq!(sb.num_label_args, 3);
+        sb.add_pure_op(0, Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]));
+        sb.add_heap_op(1, Op::new(OpCode::GetfieldGcI, &[OpRef(0)]), 5);
+        let non_empty: Vec<_> = sb.non_empty_ops().collect();
+        assert_eq!(non_empty.len(), 2);
+    }
 }
