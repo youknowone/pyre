@@ -64,6 +64,12 @@ impl Descr for PyreFieldDescr {
     fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
         Some(self)
     }
+
+    /// ob_type (offset=0, size=8) is immutable — cache survives calls.
+    /// PyPy: FieldDescr.is_always_pure() checks immutability flag.
+    fn is_always_pure(&self) -> bool {
+        self.offset == 0 && self.field_size == 8 && self.field_type == Type::Int && !self.signed
+    }
 }
 
 impl Descr for PyreArrayDescr {
