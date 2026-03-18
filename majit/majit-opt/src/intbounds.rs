@@ -1152,6 +1152,52 @@ impl Optimization for OptIntBounds {
                 OptimizationResult::PassOn
             }
 
+            // intbounds.py: CALL_PURE_I/CALL_I — propagate bounds from oopspec.
+            // OS_INT_PY_DIV/OS_INT_PY_MOD: result bounded by divisor.
+            OpCode::CallPureI | OpCode::CallI => {
+                if let Some(ref d) = op.descr {
+                    if let Some(cd) = d.as_call_descr() {
+                        let ei = cd.effect_info();
+                        match ei.oopspec_index {
+                            majit_ir::OopSpecIndex::IntPyDiv => {
+                                // Python integer division: result sign = sign(divisor)
+                                // |result| <= |dividend|
+                                // For positive divisor: 0 <= result < divisor
+                                if op.num_args() >= 3 {
+                                    let divisor_bound = self.getintbound(op.arg(2), ctx);
+                                    if divisor_bound.known_positive() {
+                                        let result_bound = IntBound::new(
+                                            0,
+                                            divisor_bound.upper.saturating_sub(1),
+                                            0,
+                                            u64::MAX,
+                                        );
+                                        self.intersect_bound(op.pos, &result_bound);
+                                    }
+                                }
+                            }
+                            majit_ir::OopSpecIndex::IntPyMod => {
+                                // Python modulo: 0 <= result < |divisor| for positive divisor
+                                if op.num_args() >= 3 {
+                                    let divisor_bound = self.getintbound(op.arg(2), ctx);
+                                    if divisor_bound.known_positive() {
+                                        let result_bound = IntBound::new(
+                                            0,
+                                            divisor_bound.upper.saturating_sub(1),
+                                            0,
+                                            u64::MAX,
+                                        );
+                                        self.intersect_bound(op.pos, &result_bound);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                OptimizationResult::PassOn
+            }
+
             _ => OptimizationResult::PassOn,
         };
 
