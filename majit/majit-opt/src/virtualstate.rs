@@ -421,6 +421,23 @@ impl VirtualState {
             _ => {} // Already compatible or will fail at is_compatible check
         }
     }
+
+    /// virtualstate.py: compute_renum(oprefs)
+    /// Build the renum mapping from OpRef to numbering index.
+    /// This ensures consistent virtual identity across loop iterations.
+    pub fn compute_renum(&mut self, oprefs: &[OpRef]) {
+        self.renum.clear();
+        for (i, &opref) in oprefs.iter().enumerate() {
+            if !opref.is_none() {
+                self.renum.insert(opref, i);
+            }
+        }
+    }
+
+    /// Get the numbering index for an OpRef.
+    pub fn get_renum(&self, opref: OpRef) -> Option<usize> {
+        self.renum.get(&opref).copied()
+    }
 }
 
 impl VirtualState {
