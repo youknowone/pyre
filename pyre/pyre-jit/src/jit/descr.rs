@@ -252,7 +252,7 @@ pub fn list_items_len_descr() -> DescrRef {
 }
 
 pub fn tuple_items_ptr_descr() -> DescrRef {
-    make_field_descr(
+    make_immutable_field_descr(
         std::mem::offset_of!(W_TupleObject, items),
         8,
         Type::Int,
@@ -261,7 +261,7 @@ pub fn tuple_items_ptr_descr() -> DescrRef {
 }
 
 pub fn tuple_items_len_descr() -> DescrRef {
-    make_field_descr(
+    make_immutable_field_descr(
         std::mem::offset_of!(W_TupleObject, items) + PYOBJECT_ARRAY_LEN_OFFSET,
         8,
         Type::Int,
@@ -279,19 +279,19 @@ pub fn list_items_heap_cap_descr() -> DescrRef {
 }
 
 pub fn int_intval_descr() -> DescrRef {
-    make_field_descr(INT_INTVAL_OFFSET, 8, Type::Int, true)
+    make_immutable_field_descr(INT_INTVAL_OFFSET, 8, Type::Int, true)
 }
 
 pub fn bool_boolval_descr() -> DescrRef {
-    make_field_descr(BOOL_BOOLVAL_OFFSET, 1, Type::Int, false)
+    make_immutable_field_descr(BOOL_BOOLVAL_OFFSET, 1, Type::Int, false)
 }
 
 pub fn float_floatval_descr() -> DescrRef {
-    make_field_descr(FLOAT_FLOATVAL_OFFSET, 8, Type::Float, false)
+    make_immutable_field_descr(FLOAT_FLOATVAL_OFFSET, 8, Type::Float, false)
 }
 
 pub fn str_len_descr() -> DescrRef {
-    make_field_descr(STR_LEN_OFFSET, 8, Type::Int, false)
+    make_immutable_field_descr(STR_LEN_OFFSET, 8, Type::Int, false)
 }
 
 pub fn dict_len_descr() -> DescrRef {
