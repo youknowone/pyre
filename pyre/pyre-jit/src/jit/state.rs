@@ -1708,9 +1708,10 @@ impl TraceFrameState {
             helper_args.extend_from_slice(args);
             let callee_frame = ctx.call_int(frame_helper, &helper_args);
 
-            // CallMayForceI(force_fn_boxed, callee_frame)
-            // force_fn now uses eval_with_jit → compiled code dispatch
-            let force_fn_ptr = crate::call_jit::jit_force_callee_frame_boxed as *const ();
+            // CallMayForceI(force_fn, callee_frame) — returns raw int.
+            // unbox_call_assembler_results post-process will strip
+            // the subsequent GetfieldRawI unbox ops.
+            let force_fn_ptr = crate::call_jit::jit_force_callee_frame as *const ();
             let result = ctx.call_may_force_int(force_fn_ptr, &[callee_frame]);
 
             // GuardNotForced: protects outer trace (PyPy compile.py)

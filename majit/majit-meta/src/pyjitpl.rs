@@ -7226,9 +7226,13 @@ fn unbox_finish_result(
 fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
     use majit_ir::OpCode;
 
+    // Strip unboxing for both CallAssemblerI and CallMayForceI results.
+    // Both return raw int via the raw-int protocol.
     let ca_results: Vec<OpRef> = ops
         .iter()
-        .filter(|op| op.opcode == OpCode::CallAssemblerI)
+        .filter(|op| {
+            op.opcode == OpCode::CallAssemblerI || op.opcode == OpCode::CallMayForceI
+        })
         .map(|op| op.pos)
         .collect();
 
