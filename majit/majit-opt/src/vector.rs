@@ -251,6 +251,66 @@ pub struct PackGroup {
     pub members: Vec<usize>,
 }
 
+/// vector.py: Accumulation pack — tracks reduction operations
+/// (e.g., sum += array[i]) that can be vectorized with horizontal
+/// reduction instructions.
+#[derive(Clone, Debug)]
+pub struct AccumulationPack {
+    /// The scalar opcode of the accumulation (e.g., IntAdd, FloatAdd).
+    pub scalar_opcode: OpCode,
+    /// The initial accumulator value OpRef.
+    pub init_value: OpRef,
+    /// Indices of the accumulation operations in the loop body.
+    pub members: Vec<usize>,
+    /// Whether this is a float accumulation.
+    pub is_float: bool,
+}
+
+/// vector.py: Guard analysis result — determines which guards can be
+/// moved to the loop header (hoisted) to expose more vectorization.
+#[derive(Clone, Debug)]
+pub struct GuardAnalysis {
+    /// Guards that can be hoisted to the loop header.
+    pub hoistable: Vec<usize>,
+    /// Guards that must remain in the loop body.
+    pub body_guards: Vec<usize>,
+}
+
+impl GuardAnalysis {
+    /// Analyze guards in a loop body for hoistability.
+    /// vector.py: analyze_guards()
+    /// A guard is hoistable if its arguments are loop-invariant
+    /// (not produced by any op in the loop body).
+    pub fn analyze(ops: &[Op]) -> Self {
+        let mut body_results: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+        for op in ops {
+            if !op.pos.is_none() {
+                body_results.insert(op.pos);
+            }
+        }
+
+        let mut hoistable = Vec::new();
+        let mut body_guards = Vec::new();
+
+        for (i, op) in ops.iter().enumerate() {
+            if !op.opcode.is_guard() {
+                continue;
+            }
+            let all_invariant = op.args.iter().all(|arg| !body_results.contains(arg));
+            if all_invariant {
+                hoistable.push(i);
+            } else {
+                body_guards.push(i);
+            }
+        }
+
+        GuardAnalysis {
+            hoistable,
+            body_guards,
+        }
+    }
+}
+
 // ── Cost Model ──────────────────────────────────────────────────────────
 
 /// Cost model for deciding whether vectorization is profitable.
