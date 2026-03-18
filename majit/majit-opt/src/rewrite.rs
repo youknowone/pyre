@@ -33,12 +33,16 @@ pub struct OptRewrite {
     /// Tracks whether the last non-guard op was removed by the optimizer.
     /// Used to eliminate redundant GuardNoException after removed calls.
     last_op_removed: bool,
+    /// rewrite.py: bool_result_cache — maps (opcode, arg0, arg1) → result OpRef.
+    /// Used by find_rewritable_bool to check if inverse/reflex was computed.
+    bool_result_cache: std::collections::HashMap<(OpCode, OpRef, OpRef), OpRef>,
 }
 
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
             last_op_removed: false,
+            bool_result_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -673,7 +677,7 @@ impl OptRewrite {
     // ── Comparisons ──
 
     /// Constant fold binary comparisons.
-    fn optimize_comparison(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_comparison(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -683,6 +687,11 @@ impl OptRewrite {
                 return OptimizationResult::Remove;
             }
         }
+
+        // rewrite.py: postprocess — record comparison result for
+        // find_rewritable_bool (inverse/reflex lookup).
+        self.bool_result_cache
+            .insert((op.opcode, arg0, arg1), op.pos);
 
         OptimizationResult::PassOn
     }
@@ -787,11 +796,39 @@ impl OptRewrite {
     /// This mirrors `find_rewritable_bool` from rewrite.py: if we see INT_LT(a, b)
     /// and we previously computed INT_GE(a, b) = K (a constant 0 or 1), then
     /// INT_LT(a, b) = 1 - K.
-    fn find_rewritable_bool(&self, _op: &Op, _ctx: &mut OptContext) -> Option<OptimizationResult> {
-        // This requires a pure-result cache (get_pure_result), which is part
-        // of the Pure optimization pass. For now, we skip this rewrite.
-        // The algebraic simplifications and constant folding above cover
-        // the most important cases.
+    /// rewrite.py: find_rewritable_bool(op)
+    /// If we see INT_LT(a, b) and previously computed INT_GE(a, b) = K,
+    /// then INT_LT(a, b) = 1 - K (boolean inverse).
+    fn find_rewritable_bool(&self, op: &Op, ctx: &mut OptContext) -> Option<OptimizationResult> {
+        if op.num_args() < 2 {
+            return None;
+        }
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
+
+        // Check inverse: INT_LT ↔ INT_GE, INT_LE ↔ INT_GT, etc.
+        if let Some(inverse_opcode) = op.opcode.bool_inverse() {
+            let key = (inverse_opcode, arg0, arg1);
+            if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
+                if let Some(val) = ctx.get_constant_int(cached_ref) {
+                    // Inverse of a known boolean: 1 - val
+                    let result = 1 - val;
+                    ctx.make_constant(op.pos, Value::Int(result));
+                    return Some(OptimizationResult::Remove);
+                }
+            }
+        }
+
+        // Check reflex: INT_LT(a,b) = INT_GT(b,a)
+        if let Some(reflex_opcode) = op.opcode.bool_reflex() {
+            let key = (reflex_opcode, arg1, arg0);
+            if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
+                // Same result, just swapped args.
+                ctx.replace_op(op.pos, cached_ref);
+                return Some(OptimizationResult::Remove);
+            }
+        }
+
         None
     }
 
