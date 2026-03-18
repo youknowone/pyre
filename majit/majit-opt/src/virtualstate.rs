@@ -456,6 +456,40 @@ impl VirtualState {
     pub fn get_renum(&self, opref: OpRef) -> Option<usize> {
         self.renum.get(&opref).copied()
     }
+
+    /// virtualstate.py: enum_forced_boxes(boxes, optimizer)
+    /// Collect the concrete OpRefs for non-virtual entries.
+    /// Virtual entries are skipped (they don't need concrete boxes).
+    pub fn enum_forced_boxes(&self, oprefs: &[OpRef]) -> Vec<OpRef> {
+        self.state
+            .iter()
+            .zip(oprefs.iter())
+            .filter(|(info, _)| !info.is_virtual())
+            .map(|(_, opref)| *opref)
+            .collect()
+    }
+
+    /// virtualstate.py: debug_print(hdr, bad, metainterp_sd)
+    /// Format the virtual state for debugging.
+    pub fn debug_print(&self) -> String {
+        let mut out = String::new();
+        for (i, info) in self.state.iter().enumerate() {
+            let kind = match info {
+                VirtualStateInfo::Constant(_) => "Constant",
+                VirtualStateInfo::Virtual { .. } => "Virtual",
+                VirtualStateInfo::VirtualArray { .. } => "VArray",
+                VirtualStateInfo::VirtualStruct { .. } => "VStruct",
+                VirtualStateInfo::VirtualArrayStruct { .. } => "VArrayStruct",
+                VirtualStateInfo::VirtualRawBuffer { .. } => "VRawBuf",
+                VirtualStateInfo::KnownClass { .. } => "KnownClass",
+                VirtualStateInfo::NonNull => "NonNull",
+                VirtualStateInfo::IntBounded(_) => "IntBounded",
+                VirtualStateInfo::Unknown => "Unknown",
+            };
+            out.push_str(&format!("  [{i}] {kind}\n"));
+        }
+        out
+    }
 }
 
 impl VirtualState {
