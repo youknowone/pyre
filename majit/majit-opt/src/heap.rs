@@ -695,6 +695,18 @@ impl Optimization for OptHeap {
             // ── Array item writes ──
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => self.optimize_setarrayitem(op, ctx),
 
+            // ── heap.py: Interior field reads (array-of-structs pattern) ──
+            OpCode::GetinteriorfieldGcI
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetinteriorfieldGcF => {
+                // Interior fields use the same field cache as regular fields.
+                // The key is (array_opref, interior_field_descr_index).
+                self.optimize_getfield(op, ctx)
+            }
+
+            // ── heap.py: Interior field writes ──
+            OpCode::SetinteriorfieldGc => self.optimize_setfield(op, ctx),
+
             // ── heap.py: ARRAYLEN_GC — cache array lengths ──
             OpCode::ArraylenGc => {
                 let array = op.arg(0);

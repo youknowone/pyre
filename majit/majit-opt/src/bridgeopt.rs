@@ -101,6 +101,21 @@ impl BridgeKnowledge {
             buf.extend_from_slice(&lo.to_le_bytes());
             buf.extend_from_slice(&hi.to_le_bytes());
         }
+        // Serialize known_fields
+        buf.extend_from_slice(&(self.known_fields.len() as u32).to_le_bytes());
+        for (&(obj, field_idx), &value) in &self.known_fields {
+            buf.extend_from_slice(&obj.0.to_le_bytes());
+            buf.extend_from_slice(&field_idx.to_le_bytes());
+            buf.extend_from_slice(&value.0.to_le_bytes());
+        }
+        // Serialize known_arrayitems
+        buf.extend_from_slice(&(self.known_arrayitems.len() as u32).to_le_bytes());
+        for (&(array, index, descr_idx), &value) in &self.known_arrayitems {
+            buf.extend_from_slice(&array.0.to_le_bytes());
+            buf.extend_from_slice(&index.to_le_bytes());
+            buf.extend_from_slice(&descr_idx.to_le_bytes());
+            buf.extend_from_slice(&value.0.to_le_bytes());
+        }
         buf
     }
 
@@ -156,6 +171,40 @@ impl BridgeKnowledge {
             let hi = i64::from_le_bytes(buf[pos..pos+8].try_into().ok()?);
             pos += 8;
             k.known_bounds.insert(opref, (lo, hi));
+        }
+
+        // Deserialize known_fields (if present — backwards compatible)
+        if pos + 4 <= buf.len() {
+            let n_fields = u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?) as usize;
+            pos += 4;
+            for _ in 0..n_fields {
+                if pos + 12 > buf.len() { break; }
+                let obj = OpRef(u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?));
+                pos += 4;
+                let field_idx = u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?);
+                pos += 4;
+                let value = OpRef(u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?));
+                pos += 4;
+                k.known_fields.insert((obj, field_idx), value);
+            }
+        }
+
+        // Deserialize known_arrayitems (if present)
+        if pos + 4 <= buf.len() {
+            let n_items = u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?) as usize;
+            pos += 4;
+            for _ in 0..n_items {
+                if pos + 20 > buf.len() { break; }
+                let array = OpRef(u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?));
+                pos += 4;
+                let index = i64::from_le_bytes(buf[pos..pos+8].try_into().ok()?);
+                pos += 8;
+                let descr_idx = u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?);
+                pos += 4;
+                let value = OpRef(u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?));
+                pos += 4;
+                k.known_arrayitems.insert((array, index, descr_idx), value);
+            }
         }
 
         Some(k)
