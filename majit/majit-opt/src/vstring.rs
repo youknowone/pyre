@@ -49,6 +49,9 @@ pub struct OptString {
     vstrings: HashMap<OpRef, VStringInfo>,
     /// Map from OpRef to the known length (as OpRef to a constant op or input).
     known_lengths: HashMap<OpRef, OpRef>,
+    /// vstring.py: Track which OpRefs are unicode strings (vs byte strings).
+    /// Affects which opcodes are emitted during force (NEWUNICODE vs NEWSTR).
+    unicode_refs: std::collections::HashSet<OpRef>,
 }
 
 impl OptString {
@@ -56,6 +59,7 @@ impl OptString {
         OptString {
             vstrings: HashMap::new(),
             known_lengths: HashMap::new(),
+            unicode_refs: std::collections::HashSet::new(),
         }
     }
 
@@ -94,17 +98,18 @@ impl OptString {
                         let _ = const_chars; // future: string constant pool
                     }
                 }
+                let is_unicode = self.unicode_refs.contains(&resolved);
                 let len_ref = self.emit_constant_int(len as i64, ctx);
-                // Emit NEWSTR(length).
-                let newstr_op = Op::new(OpCode::Newstr, &[len_ref]);
+                // vstring.py: use NEWUNICODE/UNICODESETITEM for unicode strings.
+                let new_opcode = if is_unicode { OpCode::Newunicode } else { OpCode::Newstr };
+                let set_opcode = if is_unicode { OpCode::Unicodesetitem } else { OpCode::Strsetitem };
+                let newstr_op = Op::new(new_opcode, &[len_ref]);
                 let str_ref = ctx.emit(newstr_op);
-                // Emit STRSETITEM for each known character.
                 for (i, ch) in chars.iter().enumerate() {
                     if let Some(ch_ref) = ch {
                         let idx_ref = self.emit_constant_int(i as i64, ctx);
                         let ch_resolved = ctx.get_replacement(*ch_ref);
-                        let setitem_op =
-                            Op::new(OpCode::Strsetitem, &[str_ref, idx_ref, ch_resolved]);
+                        let setitem_op = Op::new(set_opcode, &[str_ref, idx_ref, ch_resolved]);
                         ctx.emit(setitem_op);
                     }
                 }
@@ -575,7 +580,11 @@ impl Optimization for OptString {
 
             // vstring.py: Unicode operations — same logic as string ops
             // but with unicode-specific opcodes.
-            OpCode::Newunicode => self.optimize_newstr(op, ctx),
+            OpCode::Newunicode => {
+                // Track that this is a unicode string for force_string.
+                self.unicode_refs.insert(op.pos);
+                self.optimize_newstr(op, ctx)
+            }
             OpCode::Unicodesetitem => self.optimize_strsetitem(op, ctx),
             OpCode::Unicodegetitem => self.optimize_strgetitem(op, ctx),
             OpCode::Unicodelen => self.optimize_strlen(op, ctx),
@@ -608,6 +617,7 @@ impl Optimization for OptString {
     fn setup(&mut self) {
         self.vstrings.clear();
         self.known_lengths.clear();
+        self.unicode_refs.clear();
     }
 
     fn name(&self) -> &'static str {

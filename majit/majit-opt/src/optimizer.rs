@@ -254,6 +254,36 @@ impl Optimizer {
         ctx.forwarding.clear();
     }
 
+    /// optimizer.py: get_count_of_ops()
+    /// Count operations emitted so far.
+    pub fn get_count_of_ops(ctx: &OptContext) -> usize {
+        ctx.new_operations.len()
+    }
+
+    /// optimizer.py: get_count_of_guards()
+    /// Count guards emitted so far.
+    pub fn get_count_of_guards(ctx: &OptContext) -> usize {
+        ctx.new_operations
+            .iter()
+            .filter(|op| op.opcode.is_guard())
+            .count()
+    }
+
+    /// optimizer.py: log_loop(ops)
+    /// Log the optimized trace for debugging/profiling.
+    pub fn log_optimized_trace(ctx: &OptContext) {
+        if std::env::var("MAJIT_LOG_OPT").is_ok() {
+            eprintln!(
+                "[MAJIT] optimized trace: {} ops, {} guards",
+                ctx.new_operations.len(),
+                ctx.new_operations
+                    .iter()
+                    .filter(|op| op.opcode.is_guard())
+                    .count()
+            );
+        }
+    }
+
     /// optimizer.py: is_call_pure_pure_canraise(op)
     /// Check if a CALL_PURE can raise an exception.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {

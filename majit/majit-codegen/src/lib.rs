@@ -459,6 +459,28 @@ impl JitCellToken {
     pub fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
     }
+
+    /// model.py: has_compiled_code()
+    /// Whether this token has compiled code attached.
+    pub fn has_compiled_code(&self) -> bool {
+        self.compiled.is_some()
+    }
+
+    /// model.py: get_number()
+    pub fn get_number(&self) -> u64 {
+        self.number
+    }
+
+    /// model.py: reset_compiled()
+    /// Remove the compiled code (e.g., after invalidation).
+    pub fn reset_compiled(&mut self) {
+        self.compiled = None;
+    }
+
+    /// Get a clone of the invalidated flag (for registering with QuasiImmut).
+    pub fn invalidation_flag(&self) -> Arc<AtomicBool> {
+        self.invalidated.clone()
+    }
 }
 
 impl std::fmt::Debug for JitCellToken {
