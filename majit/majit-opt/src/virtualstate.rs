@@ -326,7 +326,7 @@ impl VirtualState {
         let mut concrete_idx = 0;
         for info in &self.state {
             if info.is_virtual() {
-                args.push(OpRef::NONE); // virtual — no concrete OpRef needed
+                args.push(OpRef::NONE);
             } else {
                 let opref = concrete_refs
                     .get(concrete_idx)
@@ -337,6 +337,24 @@ impl VirtualState {
             }
         }
         args
+    }
+
+    /// virtualstate.py: make_inputargs_and_virtuals(oprefs)
+    /// Returns (inputargs, virtual_indices) where virtual_indices lists
+    /// the positions of virtual entries in the state.
+    pub fn make_inputargs_and_virtuals(
+        &self,
+        concrete_refs: &[OpRef],
+    ) -> (Vec<OpRef>, Vec<usize>) {
+        let inputargs = self.make_inputargs(concrete_refs);
+        let virtual_indices: Vec<usize> = self
+            .state
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| info.is_virtual())
+            .map(|(i, _)| i)
+            .collect();
+        (inputargs, virtual_indices)
     }
 
     /// Check if another VirtualState is compatible (can reuse the optimized loop body).
