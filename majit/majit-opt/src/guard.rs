@@ -60,6 +60,121 @@ impl GuardKey {
     }
 }
 
+/// guard.py: Guard — wraps a guard op with its comparison op for
+/// implication analysis. Used to determine if one guard implies another
+/// (e.g., `x < 10` implies `x < 100`).
+#[derive(Clone, Debug)]
+pub struct Guard {
+    /// Position in the operations list.
+    pub index: usize,
+    /// The guard opcode (GuardTrue or GuardFalse).
+    pub guard_opcode: OpCode,
+    /// The comparison opcode (IntLt, IntLe, IntGt, IntGe, etc.).
+    pub cmp_opcode: OpCode,
+    /// Left-hand side of the comparison.
+    pub lhs: OpRef,
+    /// Right-hand side of the comparison.
+    pub rhs: OpRef,
+}
+
+impl Guard {
+    /// Create from a guard_true/guard_false op and its preceding comparison.
+    pub fn from_ops(index: usize, guard_op: &Op, cmp_op: &Op) -> Option<Self> {
+        if !guard_op.opcode.is_guard() {
+            return None;
+        }
+        match cmp_op.opcode {
+            OpCode::IntLt | OpCode::IntLe | OpCode::IntGt | OpCode::IntGe
+            | OpCode::IntEq | OpCode::IntNe
+            | OpCode::UintLt | OpCode::UintLe | OpCode::UintGt | OpCode::UintGe => {}
+            _ => return None,
+        }
+        Some(Guard {
+            index,
+            guard_opcode: guard_op.opcode,
+            cmp_opcode: cmp_op.opcode,
+            lhs: cmp_op.arg(0),
+            rhs: if cmp_op.num_args() > 1 {
+                cmp_op.arg(1)
+            } else {
+                OpRef::NONE
+            },
+        })
+    }
+
+    /// guard.py: get_compare_opnum — effective comparison considering
+    /// guard_true vs guard_false inversion.
+    pub fn effective_cmp(&self) -> OpCode {
+        if self.guard_opcode == OpCode::GuardTrue {
+            self.cmp_opcode
+        } else {
+            // guard_false(x < y) means x >= y
+            match self.cmp_opcode {
+                OpCode::IntLt => OpCode::IntGe,
+                OpCode::IntLe => OpCode::IntGt,
+                OpCode::IntGt => OpCode::IntLe,
+                OpCode::IntGe => OpCode::IntLt,
+                OpCode::IntEq => OpCode::IntNe,
+                OpCode::IntNe => OpCode::IntEq,
+                OpCode::UintLt => OpCode::UintGe,
+                OpCode::UintLe => OpCode::UintGt,
+                OpCode::UintGt => OpCode::UintLe,
+                OpCode::UintGe => OpCode::UintLt,
+                other => other,
+            }
+        }
+    }
+
+    /// guard.py: implies(other) — does this guard imply the other?
+    ///
+    /// `self` implies `other` if whenever self passes, other also passes.
+    /// E.g., `x < 5` implies `x < 10` (same lhs, tighter rhs).
+    pub fn implies(&self, other: &Guard, ctx: &OptContext) -> bool {
+        if self.lhs != other.lhs {
+            return false;
+        }
+        let self_cmp = self.effective_cmp();
+        let other_cmp = other.effective_cmp();
+
+        // Same comparison direction with constant rhs
+        let self_rhs = ctx.get_constant_int(self.rhs);
+        let other_rhs = ctx.get_constant_int(other.rhs);
+        if let (Some(sv), Some(ov)) = (self_rhs, other_rhs) {
+            match (self_cmp, other_cmp) {
+                // x < sv → x < ov  if sv <= ov
+                (OpCode::IntLt, OpCode::IntLt) => return sv <= ov,
+                // x <= sv → x <= ov  if sv <= ov
+                (OpCode::IntLe, OpCode::IntLe) => return sv <= ov,
+                // x < sv → x <= ov  if sv <= ov
+                (OpCode::IntLt, OpCode::IntLe) => return sv <= ov,
+                // x <= sv → x < ov  if sv < ov
+                (OpCode::IntLe, OpCode::IntLt) => return sv < ov,
+                // x > sv → x > ov  if sv >= ov
+                (OpCode::IntGt, OpCode::IntGt) => return sv >= ov,
+                // x >= sv → x >= ov  if sv >= ov
+                (OpCode::IntGe, OpCode::IntGe) => return sv >= ov,
+                // x > sv → x >= ov  if sv >= ov
+                (OpCode::IntGt, OpCode::IntGe) => return sv >= ov,
+                // x >= sv → x > ov  if sv > ov
+                (OpCode::IntGe, OpCode::IntGt) => return sv > ov,
+                _ => {}
+            }
+        }
+
+        // Same rhs variable
+        if self.rhs == other.rhs {
+            match (self_cmp, other_cmp) {
+                (OpCode::IntLt, OpCode::IntLe) => return true,
+                (OpCode::IntGt, OpCode::IntGe) => return true,
+                (c1, c2) if c1 == c2 => return true,
+                _ => {}
+            }
+        }
+
+        false
+    }
+}
+
 pub struct GuardStrengthenOpt {
     /// Set of guard conditions already verified in the trace.
     seen: HashSet<GuardKey>,
