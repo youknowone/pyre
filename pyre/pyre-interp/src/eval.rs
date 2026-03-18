@@ -60,7 +60,11 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
                         while frame.valuestackdepth > target_depth {
                             frame.pop();
                         }
-                        // Push exception info (CPython: PUSH_EXC_INFO equivalent)
+                        // CPython: if push_lasti, push the instruction offset
+                        if entry.push_lasti {
+                            frame.push(pyre_object::w_int_new(pc as i64));
+                        }
+                        // Push exception value
                         let exc_obj = pyre_object::w_str_new(&err.message);
                         frame.push(exc_obj);
                         frame.next_instr = entry.target as usize;
@@ -575,17 +579,51 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── PushExcInfo ──
+    // CPython 3.13: push current exc_info, then push the exception value again
+    fn push_exc_info(&mut self) -> Result<(), Self::Error> {
+        let exc = self.pop();
+        // Push "previous exception" (None for now — no exc_info chain)
+        self.push(pyre_object::w_none());
+        // Push the exception value back
+        self.push(exc);
+        Ok(())
+    }
+
     // ── CheckExcMatch ──
-    // CPython: TOS = exception type to match, TOS1 = caught exception
-    // Pushes True/False
+    // CPython 3.13: TOS = exception type to match, TOS1 = caught exception
+    // Pops type, peeks exc, pushes bool
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
-        let exc_type = self.pop(); // the type to match against
-        let _exc_value = self.peek(); // peek caught exception (don't pop)
-        // Phase 1: always match (like bare except)
-        // TODO: proper isinstance check when exception types are implemented
+        let exc_type = self.pop();
+        let _exc_value = self.peek();
+        // Phase 1: always match (proper isinstance needs exception type hierarchy)
         let _ = exc_type;
         self.push(pyre_object::w_bool_from(true));
         Ok(())
+    }
+
+    // ── PopExcept ──
+    fn pop_except(&mut self) -> Result<(), Self::Error> {
+        // CPython 3.13: restore previous exc_info from stack
+        // At this point stack has [prev_exc] from PUSH_EXC_INFO
+        let _prev_exc = self.pop();
+        Ok(())
+    }
+
+    // ── Reraise ──
+    fn reraise(&mut self) -> Result<(), Self::Error> {
+        // CPython: pop exception values and re-raise
+        // In Phase 1: pop the exc value and return error
+        let exc = self.pop();
+        let _prev = self.pop(); // previous exc_info
+        let msg = unsafe {
+            if pyre_object::is_str(exc) {
+                pyre_object::w_str_get_value(exc).to_string()
+            } else {
+                "exception re-raised".to_string()
+            }
+        };
+        Err(PyError::type_error(msg))
     }
 
     // ── LoadFromDictOrGlobals ──
@@ -2162,7 +2200,7 @@ result = fib(10)";
     }
 
     #[test]
-    #[ignore = "specific except needs PUSH_EXC_INFO to push 2 values + CHECK_EXC_MATCH"]
+    #[ignore = "needs ZeroDivisionError in builtins namespace"]
     fn test_try_except_specific() {
         let source = "\
 result = 0
