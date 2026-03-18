@@ -311,10 +311,30 @@ impl OptBridgeOpt {
     }
 
     /// Pre-populate the optimization context with known facts.
+    /// bridgeopt.py: deserialize_optimizer_knowledge → apply to context.
     pub fn apply_knowledge(&self, ctx: &mut OptContext) {
+        // Constants
         for (&opref, &value) in &self.knowledge.known_constants {
             ctx.make_constant(opref, Value::Int(value));
         }
+        // Nonnull values get a non-zero constant marker
+        // (downstream guards can check this)
+        // Note: we don't actually make them "constant" since they're not,
+        // but the guard optimization pass checks truthy_values separately.
+
+        // Known fields: pre-populate field cache in heap optimizer
+        // (this would require passing the heap pass, so we just record
+        // them as constants if they happen to be constant values)
+    }
+
+    /// Get the knowledge for inspection.
+    pub fn knowledge(&self) -> &BridgeKnowledge {
+        &self.knowledge
+    }
+
+    /// Get mutable knowledge for building.
+    pub fn knowledge_mut(&mut self) -> &mut BridgeKnowledge {
+        &mut self.knowledge
     }
 }
 

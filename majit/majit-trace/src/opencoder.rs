@@ -917,4 +917,34 @@ mod tests {
         iter.next_value();
         assert!(iter.done());
     }
+
+    #[test]
+    fn test_trace_record_buffer() {
+        let mut buf = TraceRecordBuffer::new(2);
+        assert_eq!(buf.num_ops(), 0);
+        assert!(!buf.overflowed());
+        assert!(!buf.tag_overflow_imminent());
+
+        buf.record_op(OpCode::IntAdd as u16, 2);
+        buf.record_arg(100);
+        buf.record_arg(101);
+        assert_eq!(buf.num_ops(), 1);
+
+        buf.cut_point();
+        assert!(buf.tracing_done());
+    }
+
+    #[test]
+    fn test_trace_record_snapshot() {
+        let mut buf = TraceRecordBuffer::new(1);
+        let snap = Snapshot {
+            values: vec![tag(TAGINT, 42)],
+            prev: None,
+            jitcode_index: 0,
+            pc: 5,
+        };
+        let idx = buf.capture_resumedata(snap);
+        assert_eq!(idx, 0);
+        assert_eq!(buf.snapshots().num_snapshots(), 1);
+    }
 }
