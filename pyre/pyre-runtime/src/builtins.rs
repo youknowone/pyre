@@ -17,6 +17,16 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("isinstance", || {
         w_builtin_func_new("isinstance", builtin_isinstance)
     });
+
+    // Exception type names — sentinels for CHECK_EXC_MATCH
+    for name in [
+        "Exception", "BaseException", "ArithmeticError", "ZeroDivisionError",
+        "TypeError", "ValueError", "KeyError", "IndexError", "AttributeError",
+        "NameError", "RuntimeError", "StopIteration", "OverflowError",
+        "ImportError", "NotImplementedError", "AssertionError",
+    ] {
+        namespace.get_or_insert_with(name, || w_str_new(name));
+    }
 }
 
 /// Create a fresh namespace seeded with the default builtins.
