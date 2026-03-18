@@ -6006,9 +6006,12 @@ mod tests {
             "on_compile_loop should NOT fire yet"
         );
 
-        // Start another trace and compile it
+        // Start another trace and compile it.
+        // After abort, the cell goes to DontTraceHere if retrace limit is exceeded.
+        // Use a fresh green key to avoid this.
+        let green_key2 = 200;
         for _ in 0..2 {
-            meta.on_back_edge(green_key, &[0]);
+            meta.on_back_edge(green_key2, &[0]);
         }
         if let Some(ctx) = meta.trace_ctx() {
             let i0 = OpRef(0);
