@@ -185,6 +185,58 @@ impl VirtualRefInfo {
     pub fn is_in_residual_call(token: i64) -> bool {
         token == TOKEN_TRACING_RESCALL
     }
+
+    /// virtualref.py: is_virtual_ref(gcref)
+    /// Check if a GC pointer is a JitVirtualRef by checking its vtable.
+    /// In RPython this compares the object's typeptr against jit_virtual_ref_vtable.
+    /// Here we check a well-known marker field at a fixed offset.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid object or be null.
+    pub unsafe fn is_virtual_ref(&self, ptr: *const u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        // Read the virtual_token field — if it's a non-zero JIT frame token
+        // or TOKEN_TRACING_RESCALL, this is an active virtual ref.
+        let token_ptr = ptr.add(self.descr_virtual_token as usize * 8) as *const i64;
+        let token = *token_ptr;
+        token != TOKEN_NONE
+    }
+
+    /// virtualref.py: force_virtual(inst)
+    /// Force a virtual reference: materialize the virtual object if needed.
+    /// This is the full force path that handles all token states.
+    ///
+    /// # Safety
+    /// `vref_ptr` must point to a valid JitVirtualRef object.
+    pub unsafe fn force_virtual_full(
+        &self,
+        vref_ptr: *mut u8,
+        force_fn: impl FnOnce(i64) -> *mut u8,
+    ) -> *mut u8 {
+        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
+        let forced_ptr = vref_ptr.add(self.descr_forced as usize * 8) as *mut *mut u8;
+        let token = *token_ptr;
+
+        if token == TOKEN_NONE {
+            // Already forced or never active.
+            return *forced_ptr;
+        }
+
+        if token == TOKEN_TRACING_RESCALL {
+            // virtualref.py: during tracing, just reset the token.
+            // The "virtual" is not truly virtual — just a marker.
+            *token_ptr = TOKEN_NONE;
+            return *forced_ptr;
+        }
+
+        // Active JIT frame — call force_fn to materialize.
+        let materialized = force_fn(token);
+        *forced_ptr = materialized;
+        *token_ptr = TOKEN_NONE;
+        materialized
+    }
 }
 
 #[cfg(test)]
