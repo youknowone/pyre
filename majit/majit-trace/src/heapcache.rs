@@ -16,18 +16,20 @@ use majit_ir::{GcRef, OpCode, OpRef};
 /// a single trace recording session.
 pub struct HeapCache {
     /// Field cache: (object_ref, field_descr_index) -> cached value.
-    /// If we've seen a GETFIELD or SETFIELD on (obj, field), we remember
-    /// what OpRef holds the value, so the next GETFIELD can reuse it.
     field_cache: HashMap<(OpRef, u32), OpRef>,
 
+    /// Array item cache: (array_ref, index_opref, descr_index) -> cached value.
+    /// RPython heapcache.py: `cached_arrayitems`.
+    array_cache: HashMap<(OpRef, OpRef, u32), OpRef>,
+
     /// Known class map: object_ref -> class pointer.
-    /// If we've seen GUARD_CLASS on an object, we remember its class.
     known_class: HashMap<OpRef, GcRef>,
 
+    /// Quasi-immutable fields known in this trace.
+    /// RPython heapcache.py: `quasi_immut_known`.
+    quasi_immut_known: HashSet<(OpRef, u32)>,
+
     /// Set of OpRefs known to be newly allocated and not yet escaped.
-    /// An "unescaped" object is one that was allocated during this trace
-    /// and whose reference has not been stored into another object or
-    /// passed to a call that might retain it.
     is_unescaped: HashSet<OpRef>,
 
     /// Set of OpRefs for which we saw the allocation during this trace.
@@ -39,7 +41,9 @@ impl HeapCache {
     pub fn new() -> Self {
         HeapCache {
             field_cache: HashMap::new(),
+            array_cache: HashMap::new(),
             known_class: HashMap::new(),
+            quasi_immut_known: HashSet::new(),
             is_unescaped: HashSet::new(),
             seen_allocation: HashSet::new(),
         }
@@ -158,10 +162,52 @@ impl HeapCache {
         }
     }
 
+    // ── Array item caching (RPython heapcache.py cached_arrayitems) ──
+
+    /// Look up a cached array item value.
+    pub fn getarrayitem_cache(&self, array: OpRef, index: OpRef, descr: u32) -> Option<OpRef> {
+        self.array_cache.get(&(array, index, descr)).copied()
+    }
+
+    /// Record an array item write.
+    pub fn setarrayitem_cache(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
+        self.array_cache.insert((array, index, descr), value);
+    }
+
+    /// Record an array item read.
+    pub fn getarrayitem_now_known(
+        &mut self,
+        array: OpRef,
+        index: OpRef,
+        descr: u32,
+        value: OpRef,
+    ) {
+        self.array_cache.insert((array, index, descr), value);
+    }
+
+    /// Invalidate array caches for a specific array.
+    pub fn invalidate_array_cache(&mut self, array: OpRef) {
+        self.array_cache.retain(|&(a, _, _), _| a != array);
+    }
+
+    // ── Quasi-immutable tracking (RPython heapcache.py quasi_immut_known) ──
+
+    /// Record that a quasi-immutable field is known.
+    pub fn quasi_immut_now_known(&mut self, obj: OpRef, field_index: u32) {
+        self.quasi_immut_known.insert((obj, field_index));
+    }
+
+    /// Check if a quasi-immutable field is already known.
+    pub fn is_quasi_immut_known(&self, obj: OpRef, field_index: u32) -> bool {
+        self.quasi_immut_known.contains(&(obj, field_index))
+    }
+
     /// Reset the entire cache state.
     pub fn reset(&mut self) {
         self.field_cache.clear();
+        self.array_cache.clear();
         self.known_class.clear();
+        self.quasi_immut_known.clear();
         self.is_unescaped.clear();
         self.seen_allocation.clear();
     }
