@@ -113,6 +113,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             /// Number of storages from the original meta layout.
             /// Extra storages added during tracing are ignored in Jump args.
             meta_storage_count: usize,
+            /// Virtualizable: preamble already emitted for this trace.
+            preamble_done: bool,
+            /// Virtualizable: actual depths loaded by preamble (storage_idx → depth).
+            preamble_depths: std::collections::HashMap<usize, usize>,
         }
 
         #[allow(non_camel_case_types)]
@@ -225,7 +229,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
                 let storages = #scan_fn(program, header_pc, self.#sel_field);
-                // Always use actual depth (even with virtualizable).
                 let layout = storages.iter()
                     .map(|&s| (s, self.#pool_field.get(s).len()))
                     .collect();
@@ -236,7 +239,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
-                // Always extract actual stack contents as InputArgs.
                 let mut values = Vec::new();
                 for &(sidx, num_slots) in &meta.storage_layout {
                     let store = self.#pool_field.get(sidx);
@@ -251,7 +253,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 let mut stacks = std::collections::HashMap::new();
                 let vable_len_refs = std::collections::HashMap::new();
                 let vable_array_refs = std::collections::HashMap::new();
-                // Always use from_input_args (actual depth).
                 let mut offset = 0;
                 for &(sidx, num_slots) in &meta.storage_layout {
                     stacks.insert(
@@ -269,6 +270,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     vable_array_refs,
                     vable_len_refs,
                     meta_storage_count: meta.storage_layout.len(),
+                    preamble_done: false,
+                    preamble_depths: std::collections::HashMap::new(),
                 }
             }
 
@@ -280,34 +283,27 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                if false {
-                    // Placeholder for future virtualizable restore.
-                    let _ = meta;
-                } else {
-                    let mut offset = 0;
-                    for &(sidx, num_slots) in &meta.storage_layout {
-                        let end = offset + num_slots;
-                        {
-                            let store = self.#pool_field.get_mut(sidx);
-                            store.clear();
-                            for &value in &values[offset..end] {
-                                store.push(value);
-                            }
+                let mut offset = 0;
+                for &(sidx, num_slots) in &meta.storage_layout {
+                    let end = offset + num_slots;
+                    {
+                        let store = self.#pool_field.get_mut(sidx);
+                        store.clear();
+                        for &value in &values[offset..end] {
+                            store.push(value);
                         }
-                        offset = end;
                     }
-                    self.#sel_field = values
-                        .get(offset)
-                        .copied()
-                        .map(|value| value as usize)
-                        .unwrap_or(meta.initial_selected);
+                    offset = end;
                 }
+                self.#sel_field = values
+                    .get(offset)
+                    .copied()
+                    .map(|value| value as usize)
+                    .unwrap_or(meta.initial_selected);
             }
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
                 let mut args = Vec::new();
-                // Only include original meta storages; extra storages from
-                // trace-time OP_SEL are excluded (must be empty at close).
                 let count = if #virtualizable { sym.meta_storage_count } else { sym.storage_layout.len() };
                 for &(sidx, _) in sym.storage_layout.iter().take(count) {
                     args.extend(sym.stacks[&sidx].to_jump_args());
@@ -319,8 +315,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
                 if #virtualizable {
-                    // Virtualizable: check selected + meta storages have same depth.
-                    // Extra storages visited during trace must be empty (depth=0).
+                    // Virtualizable: check selected + original storages have same depth.
+                    // Extra storages visited during trace via OP_SEL must be empty.
                     sym.current_selected == meta.initial_selected
                         && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
                             sym.stacks
