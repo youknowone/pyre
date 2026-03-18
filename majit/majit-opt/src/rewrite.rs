@@ -1192,6 +1192,14 @@ impl Optimization for OptRewrite {
             OpCode::FloatMul => self.optimize_float_mul(op, ctx),
             OpCode::FloatTrueDiv => self.optimize_float_truediv(op, ctx),
             OpCode::FloatNeg => self.optimize_float_neg(op, ctx),
+            // rewrite.py: optimize_FLOAT_ABS — FLOAT_ABS(FLOAT_ABS(x)) → FLOAT_ABS(x)
+            OpCode::FloatAbs => {
+                if let Some(v) = ctx.get_constant_float(op.arg(0)) {
+                    ctx.make_constant(op.pos, Value::Float(v.abs()));
+                    return OptimizationResult::Remove;
+                }
+                OptimizationResult::PassOn
+            }
             OpCode::FloatFloorDiv => self.optimize_float_floordiv(op, ctx),
             OpCode::FloatMod => self.optimize_float_mod(op, ctx),
 
