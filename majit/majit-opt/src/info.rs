@@ -97,10 +97,7 @@ pub enum PtrInfo {
     Constant(GcRef),
     /// Known class (type) of the object.
     /// info.py: NonNullPtrInfo with _known_class set
-    KnownClass {
-        class_ptr: GcRef,
-        is_nonnull: bool,
-    },
+    KnownClass { class_ptr: GcRef, is_nonnull: bool },
     /// Virtual object (allocation removed by the optimizer).
     /// info.py: InstancePtrInfo
     Virtual(VirtualInfo),
@@ -338,10 +335,16 @@ impl PtrInfo {
     /// info.py: getfield(field_descr) — get a field from a virtual object.
     pub fn get_field(&self, field_idx: u32) -> Option<OpRef> {
         match self {
-            PtrInfo::Virtual(v) => v.fields.iter().find(|(k, _)| *k == field_idx).map(|(_, v)| *v),
-            PtrInfo::VirtualStruct(v) => {
-                v.fields.iter().find(|(k, _)| *k == field_idx).map(|(_, v)| *v)
-            }
+            PtrInfo::Virtual(v) => v
+                .fields
+                .iter()
+                .find(|(k, _)| *k == field_idx)
+                .map(|(_, v)| *v),
+            PtrInfo::VirtualStruct(v) => v
+                .fields
+                .iter()
+                .find(|(k, _)| *k == field_idx)
+                .map(|(_, v)| *v),
             _ => None,
         }
     }
@@ -597,8 +600,8 @@ pub struct VirtualizableFieldState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use majit_ir::{Descr, OpCode, Value};
+    use std::sync::Arc;
 
     #[derive(Debug)]
     struct TestDescr;

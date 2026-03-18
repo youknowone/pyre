@@ -2488,14 +2488,24 @@ fn normalize_ops_for_codegen(
     // Dead constants (not referenced by any op) should not inflate the index space.
     for (op_idx, op) in ops.iter().enumerate() {
         if op.result_type() != Type::Void {
-            let idx = if op.pos.is_none() { num_inputs + op_idx as u32 } else { op.pos.0 };
+            let idx = if op.pos.is_none() {
+                num_inputs + op_idx as u32
+            } else {
+                op.pos.0
+            };
             all_indices.insert(idx);
         }
         for arg in &op.args {
-            if !arg.is_none() { all_indices.insert(arg.0); }
+            if !arg.is_none() {
+                all_indices.insert(arg.0);
+            }
         }
         if let Some(ref fa) = op.fail_args {
-            for arg in fa { if !arg.is_none() { all_indices.insert(arg.0); } }
+            for arg in fa {
+                if !arg.is_none() {
+                    all_indices.insert(arg.0);
+                }
+            }
         }
     }
 
@@ -2507,22 +2517,34 @@ fn normalize_ops_for_codegen(
         .collect();
 
     // Apply remap to all ops.
-    let remapped = ops.iter().enumerate().map(|(op_idx, op)| {
-        let mut n = op.clone();
-        if n.result_type() != Type::Void {
-            let old = if n.pos.is_none() { num_inputs + op_idx as u32 } else { n.pos.0 };
-            n.pos = OpRef(remap[&old]);
-        }
-        for arg in n.args.iter_mut() {
-            if !arg.is_none() { *arg = OpRef(remap[&arg.0]); }
-        }
-        if let Some(ref mut fa) = n.fail_args {
-            for arg in fa.iter_mut() {
-                if !arg.is_none() { *arg = OpRef(remap[&arg.0]); }
+    let remapped = ops
+        .iter()
+        .enumerate()
+        .map(|(op_idx, op)| {
+            let mut n = op.clone();
+            if n.result_type() != Type::Void {
+                let old = if n.pos.is_none() {
+                    num_inputs + op_idx as u32
+                } else {
+                    n.pos.0
+                };
+                n.pos = OpRef(remap[&old]);
             }
-        }
-        n
-    }).collect();
+            for arg in n.args.iter_mut() {
+                if !arg.is_none() {
+                    *arg = OpRef(remap[&arg.0]);
+                }
+            }
+            if let Some(ref mut fa) = n.fail_args {
+                for arg in fa.iter_mut() {
+                    if !arg.is_none() {
+                        *arg = OpRef(remap[&arg.0]);
+                    }
+                }
+            }
+            n
+        })
+        .collect();
 
     (remapped, remap)
 }
@@ -7477,7 +7499,11 @@ impl majit_codegen::Backend for CraneliftBackend {
         find_trace_terminal_exit_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
     }
 
-    fn compiled_trace_info(&self, token: &JitCellToken, trace_id: u64) -> Option<CompiledTraceInfo> {
+    fn compiled_trace_info(
+        &self,
+        token: &JitCellToken,
+        trace_id: u64,
+    ) -> Option<CompiledTraceInfo> {
         let compiled = token
             .compiled
             .as_ref()

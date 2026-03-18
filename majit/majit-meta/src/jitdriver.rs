@@ -590,24 +590,30 @@ impl<S: JitState> JitDriver<S> {
         if !ok {
             return false;
         }
-        // Cache the current virtualizable object + array lengths from state.
+        // Cache the live virtualizable object and its array lengths for
+        // trace-entry box layout.
         //
-        // RPython compile.py reads lengths from the actual virtualizable
-        // object via vinfo.get_array_length(). Here we use two sources:
-        // 1. Primary: JitState::virtualizable_array_lengths() (interpreter knows)
-        // 2. Fallback: VirtualizableInfo::get_array_length() (from object header)
-        //
-        // This eliminates the need for callers to manually call
-        // driver.set_vable_array_lengths().
+        // Keep the long-term source-of-truth aligned with RPython compile.py:
+        // use the actual virtualizable object whenever its layout can provide
+        // lengths. Preserve the current interpreter hook as the primary path
+        // for no-header arrays and legacy JitState implementations.
         let vable_name = virtualizable.name.clone();
         let info_clone = self.meta.virtualizable_info().cloned();
         if let Some(ref info) = info_clone {
-            if let Some(ptr) = state.virtualizable_heap_ptr(meta, &vable_name, info) {
+            let ptr = state.virtualizable_heap_ptr(meta, &vable_name, info);
+            if let Some(ptr) = ptr {
                 self.meta.set_vable_ptr(ptr.cast_const());
             }
-            // Prefer JitState-provided lengths (interpreter always knows).
-            // Fall back to reading from object header if available.
-            if let Some(lengths) = state.virtualizable_array_lengths(meta, &vable_name, info) {
+            let lengths = state
+                .virtualizable_array_lengths(meta, &vable_name, info)
+                .or_else(|| {
+                    ptr.map(|ptr| {
+                        // Safety: JitState::virtualizable_heap_ptr() returns
+                        // the live virtualizable object pointer.
+                        unsafe { info.load_list_of_boxes(ptr.cast_const()) }.1
+                    })
+                });
+            if let Some(lengths) = lengths {
                 self.meta.set_vable_array_lengths(lengths);
             }
         }

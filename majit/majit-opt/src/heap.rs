@@ -968,10 +968,7 @@ impl Optimization for OptHeap {
     /// heap.py: produce_potential_short_preamble_ops(sb)
     /// Add cached field/array reads to the short preamble so bridges
     /// can re-populate the optimizer's cache.
-    fn produce_potential_short_preamble_ops(
-        &self,
-        _sb: &mut crate::shortpreamble::ShortBoxes,
-    ) {
+    fn produce_potential_short_preamble_ops(&self, _sb: &mut crate::shortpreamble::ShortBoxes) {
         // In RPython, this adds GETFIELD/GETARRAYITEM ops for each
         // cached field value to the short preamble builder.
         // The bridge then re-reads these fields to populate the cache.

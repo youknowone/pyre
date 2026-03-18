@@ -91,7 +91,11 @@ pub fn resolve_types(graph: &MajitGraph, annotations: &AnnotationState) -> TypeR
                 }
             }
             crate::graph::Terminator::Branch {
-                if_true, true_args, if_false, false_args, ..
+                if_true,
+                true_args,
+                if_false,
+                false_args,
+                ..
             } => {
                 for (target, args) in [(*if_true, true_args), (*if_false, false_args)] {
                     let target_block = graph.block(target);
@@ -133,7 +137,11 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         | OpKind::CallMayForce { result_ty, .. } => valuetype_to_concrete(result_ty),
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
             let c = valuetype_to_concrete(result_ty);
-            if c != ConcreteType::Unknown { c } else { ConcreteType::Signed }
+            if c != ConcreteType::Unknown {
+                c
+            } else {
+                ConcreteType::Signed
+            }
         }
         _ => ConcreteType::Unknown,
     }

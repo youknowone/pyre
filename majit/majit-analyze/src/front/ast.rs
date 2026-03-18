@@ -7,8 +7,8 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 use syn::{Item, ItemFn};
 
-use crate::graph::{BasicBlockId, MajitGraph, OpKind, Terminator, ValueId, ValueType};
 use crate::ParsedInterpreter;
+use crate::graph::{BasicBlockId, MajitGraph, OpKind, Terminator, ValueId, ValueType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstGraphOptions {
@@ -180,8 +180,8 @@ fn lower_expr(
 
         // ── base[index] ──
         syn::Expr::Index(idx) => {
-            let base = lower_expr(graph, block, &idx.expr, options)
-                .unwrap_or_else(|| graph.alloc_value());
+            let base =
+                lower_expr(graph, block, &idx.expr, options).unwrap_or_else(|| graph.alloc_value());
             let index = lower_expr(graph, block, &idx.index, options)
                 .unwrap_or_else(|| graph.alloc_value());
             graph.push_op(
@@ -349,13 +349,19 @@ fn lower_expr(
                 if graph.block(then_block).terminator == Terminator::Unreachable {
                     graph.set_terminator(
                         then_block,
-                        Terminator::Goto { target: merge, args: vec![] },
+                        Terminator::Goto {
+                            target: merge,
+                            args: vec![],
+                        },
                     );
                 }
                 if graph.block(else_block).terminator == Terminator::Unreachable {
                     graph.set_terminator(
                         else_block,
-                        Terminator::Goto { target: merge, args: vec![] },
+                        Terminator::Goto {
+                            target: merge,
+                            args: vec![],
+                        },
                     );
                 }
                 (merge, None)
@@ -419,8 +425,8 @@ fn lower_expr(
 
         // ── unary !x, -x ──
         syn::Expr::Unary(u) => {
-            let operand = lower_expr(graph, block, &u.expr, options)
-                .unwrap_or_else(|| graph.alloc_value());
+            let operand =
+                lower_expr(graph, block, &u.expr, options).unwrap_or_else(|| graph.alloc_value());
             let op_name = quote!(#u.op).to_string();
             graph.push_op(
                 *block,
@@ -435,8 +441,8 @@ fn lower_expr(
 
         // ── binary a + b ──
         syn::Expr::Binary(bin) => {
-            let lhs = lower_expr(graph, block, &bin.left, options)
-                .unwrap_or_else(|| graph.alloc_value());
+            let lhs =
+                lower_expr(graph, block, &bin.left, options).unwrap_or_else(|| graph.alloc_value());
             let rhs = lower_expr(graph, block, &bin.right, options)
                 .unwrap_or_else(|| graph.alloc_value());
             let op_name = quote!(#bin.op).to_string();
@@ -457,8 +463,8 @@ fn lower_expr(
 
         // ── match expr { arms } → multi-block (RPython switch) ──
         syn::Expr::Match(m) => {
-            let scrutinee = lower_expr(graph, block, &m.expr, options)
-                .unwrap_or_else(|| graph.alloc_value());
+            let scrutinee =
+                lower_expr(graph, block, &m.expr, options).unwrap_or_else(|| graph.alloc_value());
 
             if m.arms.is_empty() {
                 return None;
@@ -476,7 +482,10 @@ fn lower_expr(
                     let goto_args = result.map_or(vec![], |v| vec![v]);
                     graph.set_terminator(
                         arm_block,
-                        Terminator::Goto { target: merge, args: goto_args },
+                        Terminator::Goto {
+                            target: merge,
+                            args: goto_args,
+                        },
                     );
                 }
             }
@@ -485,7 +494,10 @@ fn lower_expr(
             if m.arms.len() == 1 {
                 graph.set_terminator(
                     *block,
-                    Terminator::Goto { target: arm_results[0].0, args: vec![] },
+                    Terminator::Goto {
+                        target: arm_results[0].0,
+                        args: vec![],
+                    },
                 );
             } else {
                 // Binary branch on scrutinee for first arm, else second
@@ -520,7 +532,13 @@ fn lower_expr(
             let exit = graph.create_block();
 
             // Current block → header
-            graph.set_terminator(*block, Terminator::Goto { target: header, args: vec![] });
+            graph.set_terminator(
+                *block,
+                Terminator::Goto {
+                    target: header,
+                    args: vec![],
+                },
+            );
 
             // Header: evaluate condition, branch to body or exit
             let cond = lower_expr(graph, &mut header, &w.cond, options)
@@ -541,7 +559,13 @@ fn lower_expr(
                 lower_stmt(graph, &mut body, stmt, options);
             }
             if graph.block(body).terminator == Terminator::Unreachable {
-                graph.set_terminator(body, Terminator::Goto { target: header, args: vec![] });
+                graph.set_terminator(
+                    body,
+                    Terminator::Goto {
+                        target: header,
+                        args: vec![],
+                    },
+                );
             }
 
             *block = exit;
@@ -551,13 +575,25 @@ fn lower_expr(
             let mut body = graph.create_block();
             let exit = graph.create_block();
 
-            graph.set_terminator(*block, Terminator::Goto { target: body, args: vec![] });
+            graph.set_terminator(
+                *block,
+                Terminator::Goto {
+                    target: body,
+                    args: vec![],
+                },
+            );
 
             for stmt in &l.body.stmts {
                 lower_stmt(graph, &mut body, stmt, options);
             }
             if graph.block(body).terminator == Terminator::Unreachable {
-                graph.set_terminator(body, Terminator::Goto { target: body, args: vec![] });
+                graph.set_terminator(
+                    body,
+                    Terminator::Goto {
+                        target: body,
+                        args: vec![],
+                    },
+                );
             }
 
             *block = exit;
@@ -568,7 +604,13 @@ fn lower_expr(
             let mut body = graph.create_block();
             let exit = graph.create_block();
 
-            graph.set_terminator(*block, Terminator::Goto { target: header, args: vec![] });
+            graph.set_terminator(
+                *block,
+                Terminator::Goto {
+                    target: header,
+                    args: vec![],
+                },
+            );
 
             lower_expr(graph, &mut header, &f.expr, options);
             let iter_cond = graph.alloc_value();
@@ -587,7 +629,13 @@ fn lower_expr(
                 lower_stmt(graph, &mut body, stmt, options);
             }
             if graph.block(body).terminator == Terminator::Unreachable {
-                graph.set_terminator(body, Terminator::Goto { target: header, args: vec![] });
+                graph.set_terminator(
+                    body,
+                    Terminator::Goto {
+                        target: header,
+                        args: vec![],
+                    },
+                );
             }
 
             *block = exit;
@@ -679,7 +727,8 @@ mod tests {
         let ops = &graph.block(graph.entry).ops;
         // Should contain a FieldRead op
         assert!(
-            ops.iter().any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field == "x")),
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field == "x")),
             "expected FieldRead for 'x', got {:?}",
             ops
         );
@@ -698,7 +747,8 @@ mod tests {
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.entry).ops;
         assert!(
-            ops.iter().any(|op| matches!(&op.kind, OpKind::Call { target, .. } if target == "push")),
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::Call { target, .. } if target == "push")),
             "expected Call to 'push', got {:?}",
             ops
         );

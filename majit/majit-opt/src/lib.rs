@@ -233,10 +233,7 @@ pub trait Optimization {
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
     /// Contribute operations to the short preamble builder.
     /// Called after preamble optimization to collect ops that bridges need to replay.
-    fn produce_potential_short_preamble_ops(
-        &self,
-        _sb: &mut crate::shortpreamble::ShortBoxes,
-    ) {
+    fn produce_potential_short_preamble_ops(&self, _sb: &mut crate::shortpreamble::ShortBoxes) {
         // Default: no contribution
     }
 

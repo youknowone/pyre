@@ -1,4 +1,5 @@
 pub mod boolobject;
+pub mod cellobject;
 pub mod dictobject;
 pub mod floatobject;
 pub mod intobject;
@@ -12,6 +13,7 @@ pub mod strobject;
 pub mod tupleobject;
 
 pub use boolobject::*;
+pub use cellobject::*;
 pub use dictobject::*;
 pub use floatobject::*;
 pub use intobject::*;

@@ -388,6 +388,28 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── Import (Phase 1: stub) ──
+
+    fn import_name(&mut self, name: &str) -> Result<(), Self::Error> {
+        // Phase 1: pop level and fromlist, push a namespace object
+        let _fromlist = self.pop();
+        let _level = self.pop();
+        // Create a simple namespace as the "module"
+        let module = pyre_object::w_none();
+        self.push(module);
+        // TODO: actual module loading
+        Ok(())
+    }
+
+    fn import_from(&mut self, name: &str) -> Result<(), Self::Error> {
+        // Phase 1: peek module (TOS), get attribute
+        let module = self.peek();
+        let attr = pyre_objspace::space::py_getattr(module, name)
+            .unwrap_or(pyre_object::w_none());
+        self.push(attr);
+        Ok(())
+    }
+
     fn unsupported(
         &mut self,
         instruction: &Instruction,

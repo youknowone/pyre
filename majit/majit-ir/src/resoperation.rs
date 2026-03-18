@@ -610,7 +610,6 @@ impl OpCode {
         matches!(self, OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF)
     }
 
-
     pub fn is_getfield(self) -> bool {
         matches!(
             self,
@@ -641,9 +640,7 @@ impl OpCode {
     pub fn is_getinteriorfield(self) -> bool {
         matches!(
             self,
-            OpCode::GetinteriorfieldGcI
-                | OpCode::GetinteriorfieldGcR
-                | OpCode::GetinteriorfieldGcF
+            OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcR | OpCode::GetinteriorfieldGcF
         )
     }
 

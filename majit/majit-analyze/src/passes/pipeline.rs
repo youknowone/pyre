@@ -53,10 +53,7 @@ pub struct ProgramPipelineResult {
 ///
 /// RPython equivalent: translate a single function through
 /// flowspace → annotator → rtyper → jtransform → flatten.
-pub fn analyze_function(
-    func: &SemanticFunction,
-    config: &PipelineConfig,
-) -> PipelineResult {
+pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> PipelineResult {
     let graph = &func.graph;
     let original_blocks = graph.blocks.len();
 

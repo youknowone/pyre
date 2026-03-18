@@ -264,8 +264,10 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     let mut calls: Vec<String> = Vec::new();
     let mut has_guard = false;
 
-    let mut has_vable_field = false;
-    let mut has_vable_array = false;
+    let mut first_vable_field_read: Option<(usize, crate::graph::ValueType)> = None;
+    let mut first_vable_field_write: Option<(usize, crate::graph::ValueType)> = None;
+    let mut first_vable_array_read: Option<(usize, crate::graph::ValueType)> = None;
+    let mut first_vable_array_write: Option<(usize, crate::graph::ValueType)> = None;
 
     // Analyze ALL blocks (not just entry) for multi-block graphs
     for block in &graph.blocks {
@@ -281,11 +283,27 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
                 | OpKind::CallMayForce { target, .. } => calls.push(target.clone()),
                 OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => has_guard = true,
                 OpKind::BinOp { .. } | OpKind::UnaryOp { .. } => {}
-                OpKind::VableFieldRead { .. } | OpKind::VableFieldWrite { .. } => {
-                    has_vable_field = true;
+                OpKind::VableFieldRead { field_index, ty } => {
+                    first_vable_field_read.get_or_insert((*field_index, ty.clone()));
                 }
-                OpKind::VableArrayRead { .. } | OpKind::VableArrayWrite { .. } => {
-                    has_vable_array = true;
+                OpKind::VableFieldWrite {
+                    field_index, ty, ..
+                } => {
+                    first_vable_field_write.get_or_insert((*field_index, ty.clone()));
+                }
+                OpKind::VableArrayRead {
+                    array_index,
+                    item_ty,
+                    ..
+                } => {
+                    first_vable_array_read.get_or_insert((*array_index, item_ty.clone()));
+                }
+                OpKind::VableArrayWrite {
+                    array_index,
+                    item_ty,
+                    ..
+                } => {
+                    first_vable_array_write.get_or_insert((*array_index, item_ty.clone()));
                 }
                 _ => {}
             }
@@ -294,10 +312,38 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
 
     // Classify based on op patterns (RPython jtransform-level analysis)
 
+    // Virtualizable-specialized ops come from the graph rewrite pass and
+    // should take precedence over legacy local/heap classifications.
+    if let Some((array_index, item_ty)) = first_vable_array_read {
+        return Some(TracePattern::VableArrayRead {
+            array_index,
+            item_type: value_type_name(&item_ty).into(),
+        });
+    }
+    if let Some((array_index, item_ty)) = first_vable_array_write {
+        return Some(TracePattern::VableArrayWrite {
+            array_index,
+            item_type: value_type_name(&item_ty).into(),
+        });
+    }
+    if let Some((field_index, field_ty)) = first_vable_field_read {
+        return Some(TracePattern::VableFieldRead {
+            field_index,
+            field_type: value_type_name(&field_ty).into(),
+        });
+    }
+    if let Some((field_index, field_ty)) = first_vable_field_write {
+        return Some(TracePattern::VableFieldWrite {
+            field_index,
+            field_type: value_type_name(&field_ty).into(),
+        });
+    }
+
     // Integer binary operations
-    if calls.iter().any(|c| {
-        c.contains("w_int_add") || c.contains("w_int_sub") || c.contains("w_int_mul")
-    }) {
+    if calls
+        .iter()
+        .any(|c| c.contains("w_int_add") || c.contains("w_int_sub") || c.contains("w_int_mul"))
+    {
         return Some(TracePattern::UnboxIntBinop {
             op_name: "dispatch".into(),
             has_overflow_guard: true,
@@ -375,20 +421,25 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Iterator
-    if calls.iter().any(|c| c.contains("iter_next") || c.contains("for_iter")) {
+    if calls
+        .iter()
+        .any(|c| c.contains("iter_next") || c.contains("for_iter"))
+    {
         return Some(TracePattern::RangeIterNext);
     }
-    if calls.iter().any(|c| c.contains("end_for") || c.contains("pop_iter")) {
+    if calls
+        .iter()
+        .any(|c| c.contains("end_for") || c.contains("pop_iter"))
+    {
         return Some(TracePattern::IterCleanup);
     }
 
     // Return (few ops ending in Return terminator)
-    if matches!(
-        &entry.terminator,
-        crate::graph::Terminator::Return(Some(_))
-    ) && ops.len() <= 5
-    {
-        if calls.iter().any(|c| c.contains("finish") || c.contains("return")) {
+    if matches!(&entry.terminator, crate::graph::Terminator::Return(Some(_))) && ops.len() <= 5 {
+        if calls
+            .iter()
+            .any(|c| c.contains("finish") || c.contains("return"))
+        {
             return Some(TracePattern::Return);
         }
     }
@@ -412,32 +463,61 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Build collection
-    if calls.iter().any(|c| c.contains("build_list") || c.contains("new_list")) {
-        return Some(TracePattern::BuildCollection { kind: "list".into() });
+    if calls
+        .iter()
+        .any(|c| c.contains("build_list") || c.contains("new_list"))
+    {
+        return Some(TracePattern::BuildCollection {
+            kind: "list".into(),
+        });
     }
-    if calls.iter().any(|c| c.contains("build_tuple") || c.contains("new_tuple")) {
-        return Some(TracePattern::BuildCollection { kind: "tuple".into() });
+    if calls
+        .iter()
+        .any(|c| c.contains("build_tuple") || c.contains("new_tuple"))
+    {
+        return Some(TracePattern::BuildCollection {
+            kind: "tuple".into(),
+        });
     }
 
     // Sequence operations
     if calls.iter().any(|c| c.contains("unpack")) {
         return Some(TracePattern::UnpackSequence);
     }
-    if calls.iter().any(|c| c.contains("store_subscr") || c.contains("setitem")) {
+    if calls
+        .iter()
+        .any(|c| c.contains("store_subscr") || c.contains("setitem"))
+    {
         return Some(TracePattern::SequenceSetitem);
     }
-    if calls.iter().any(|c| c.contains("list_append") || c.contains("append")) {
+    if calls
+        .iter()
+        .any(|c| c.contains("list_append") || c.contains("append"))
+    {
         return Some(TracePattern::CollectionAppend);
     }
 
     // Noop (empty or trivial ops only)
-    if ops.iter().all(|op| matches!(&op.kind, OpKind::Input { .. } | OpKind::Unknown { .. }))
+    if ops
+        .iter()
+        .all(|op| matches!(&op.kind, OpKind::Input { .. } | OpKind::Unknown { .. }))
         && ops.len() <= 2
     {
         return Some(TracePattern::Noop);
     }
 
     None
+}
+
+fn value_type_name(ty: &crate::graph::ValueType) -> &'static str {
+    match ty {
+        crate::graph::ValueType::Int => "int",
+        crate::graph::ValueType::Ref => "ref",
+        crate::graph::ValueType::Float => "float",
+        crate::graph::ValueType::Void => "void",
+        crate::graph::ValueType::State => "state",
+        crate::graph::ValueType::Unknown => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -532,5 +612,30 @@ mod tests {
         graph.set_terminator(entry, Terminator::Return(None));
 
         assert_eq!(classify_from_graph(&graph), Some(TracePattern::Noop));
+    }
+
+    #[test]
+    fn classify_vable_array_read_from_graph() {
+        let mut graph = MajitGraph::new("load_fast_vable");
+        let entry = graph.entry;
+        let idx = graph.alloc_value();
+        graph.push_op(
+            entry,
+            OpKind::VableArrayRead {
+                array_index: 0,
+                elem_index: idx,
+                item_ty: ValueType::Ref,
+            },
+            true,
+        );
+        graph.set_terminator(entry, Terminator::Return(None));
+
+        assert_eq!(
+            classify_from_graph(&graph),
+            Some(TracePattern::VableArrayRead {
+                array_index: 0,
+                item_type: "ref".into(),
+            })
+        );
     }
 }

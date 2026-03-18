@@ -158,7 +158,10 @@ pub fn flatten(graph: &MajitGraph) -> FlattenedFunction {
                     max_value = max_value.max(v + 1);
                 }
             }
-            FlatOp::Move { dst: ValueId(d), src: ValueId(s) } => {
+            FlatOp::Move {
+                dst: ValueId(d),
+                src: ValueId(s),
+            } => {
                 max_value = max_value.max(*d + 1);
                 max_value = max_value.max(*s + 1);
             }
@@ -244,9 +247,7 @@ mod tests {
     fn flatten_single_block() {
         let mut graph = MajitGraph::new("simple");
         let entry = graph.entry;
-        let v = graph
-            .push_op(entry, OpKind::ConstInt(42), true)
-            .unwrap();
+        let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_terminator(entry, Terminator::Return(Some(v)));
 
         let flat = flatten(&graph);
@@ -260,9 +261,7 @@ mod tests {
     fn flatten_if_else_produces_jumps() {
         let mut graph = MajitGraph::new("branch");
         let entry = graph.entry;
-        let cond = graph
-            .push_op(entry, OpKind::ConstInt(1), true)
-            .unwrap();
+        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let then_block = graph.create_block();
         let else_block = graph.create_block();
         let merge = graph.create_block();
@@ -324,9 +323,7 @@ mod tests {
                 args: vec![],
             },
         );
-        let cond = graph
-            .push_op(header, OpKind::ConstInt(1), true)
-            .unwrap();
+        let cond = graph.push_op(header, OpKind::ConstInt(1), true).unwrap();
         graph.set_terminator(
             header,
             Terminator::Branch {

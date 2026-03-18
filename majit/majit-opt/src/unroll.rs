@@ -131,11 +131,7 @@ impl UnrollOptimizer {
 
     /// unroll.py: check_retrace_count(retrace_count, max_retrace_guards)
     /// Whether this bridge has too many guards for retrace to be worthwhile.
-    pub fn too_many_guards_for_retrace(
-        &self,
-        retrace_count: u32,
-        max_retrace_guards: u32,
-    ) -> bool {
+    pub fn too_many_guards_for_retrace(&self, retrace_count: u32, max_retrace_guards: u32) -> bool {
         if retrace_count >= self.retrace_limit {
             return true;
         }

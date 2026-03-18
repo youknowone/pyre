@@ -101,8 +101,16 @@ impl OptString {
                 let is_unicode = self.unicode_refs.contains(&resolved);
                 let len_ref = self.emit_constant_int(len as i64, ctx);
                 // vstring.py: use NEWUNICODE/UNICODESETITEM for unicode strings.
-                let new_opcode = if is_unicode { OpCode::Newunicode } else { OpCode::Newstr };
-                let set_opcode = if is_unicode { OpCode::Unicodesetitem } else { OpCode::Strsetitem };
+                let new_opcode = if is_unicode {
+                    OpCode::Newunicode
+                } else {
+                    OpCode::Newstr
+                };
+                let set_opcode = if is_unicode {
+                    OpCode::Unicodesetitem
+                } else {
+                    OpCode::Strsetitem
+                };
                 let newstr_op = Op::new(new_opcode, &[len_ref]);
                 let str_ref = ctx.emit(newstr_op);
                 for (i, ch) in chars.iter().enumerate() {
@@ -140,14 +148,25 @@ impl OptString {
                 let total_op = Op::new(OpCode::IntAdd, &[left_len, right_len]);
                 let total_ref = ctx.emit(total_op);
                 // vstring.py: use correct opcodes for byte vs unicode strings
-                let new_opcode = if is_unicode { OpCode::Newunicode } else { OpCode::Newstr };
-                let copy_opcode = if is_unicode { OpCode::Copyunicodecontent } else { OpCode::Copystrcontent };
+                let new_opcode = if is_unicode {
+                    OpCode::Newunicode
+                } else {
+                    OpCode::Newstr
+                };
+                let copy_opcode = if is_unicode {
+                    OpCode::Copyunicodecontent
+                } else {
+                    OpCode::Copystrcontent
+                };
                 let newstr_op = Op::new(new_opcode, &[total_ref]);
                 let str_ref = ctx.emit(newstr_op);
                 let zero = self.emit_constant_int(0, ctx);
                 let copy_left = Op::new(copy_opcode, &[left_forced, str_ref, zero, zero, left_len]);
                 ctx.emit(copy_left);
-                let copy_right = Op::new(copy_opcode, &[right_forced, str_ref, zero, left_len, right_len]);
+                let copy_right = Op::new(
+                    copy_opcode,
+                    &[right_forced, str_ref, zero, left_len, right_len],
+                );
                 ctx.emit(copy_right);
                 ctx.replace_op(resolved, str_ref);
                 str_ref
@@ -161,8 +180,16 @@ impl OptString {
                 let start_resolved = ctx.get_replacement(start);
                 let length_resolved = ctx.get_replacement(length);
                 let is_unicode = self.unicode_refs.contains(&resolved);
-                let new_opcode = if is_unicode { OpCode::Newunicode } else { OpCode::Newstr };
-                let copy_opcode = if is_unicode { OpCode::Copyunicodecontent } else { OpCode::Copystrcontent };
+                let new_opcode = if is_unicode {
+                    OpCode::Newunicode
+                } else {
+                    OpCode::Newstr
+                };
+                let copy_opcode = if is_unicode {
+                    OpCode::Copyunicodecontent
+                } else {
+                    OpCode::Copystrcontent
+                };
                 let newstr_op = Op::new(new_opcode, &[length_resolved]);
                 let str_ref = ctx.emit(newstr_op);
                 let zero = self.emit_constant_int(0, ctx);
@@ -425,12 +452,7 @@ impl OptString {
     /// Force all args that are virtual strings.
     /// vstring.py: _int_add(opref1, opref2, ctx)
     /// If both are constants, return a constant OpRef for their sum.
-    fn int_add_oprefs(
-        &self,
-        a: OpRef,
-        b: OpRef,
-        ctx: &mut OptContext,
-    ) -> Option<OpRef> {
+    fn int_add_oprefs(&self, a: OpRef, b: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
         let va = ctx.get_constant_int(a)?;
         let vb = ctx.get_constant_int(b)?;
         let sum = va.checked_add(vb)?;
@@ -440,12 +462,7 @@ impl OptString {
     }
 
     /// vstring.py: _int_sub(opref1, opref2, ctx)
-    fn int_sub_oprefs(
-        &self,
-        a: OpRef,
-        b: OpRef,
-        ctx: &mut OptContext,
-    ) -> Option<OpRef> {
+    fn int_sub_oprefs(&self, a: OpRef, b: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
         let va = ctx.get_constant_int(a)?;
         let vb = ctx.get_constant_int(b)?;
         let diff = va.checked_sub(vb)?;

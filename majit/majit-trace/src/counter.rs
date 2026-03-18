@@ -30,7 +30,9 @@ impl JitCounter {
     /// Check if counter would fire without modifying state.
     #[inline]
     pub fn would_fire(&self, hash: u64) -> bool {
-        if self.threshold == 0 { return true; }
+        if self.threshold == 0 {
+            return true;
+        }
         let base = (hash as usize) & TABLE_MASK;
         for i in 0..ASSOCIATIVITY {
             let idx = (base + i) & TABLE_MASK;

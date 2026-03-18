@@ -1212,8 +1212,7 @@ pub fn make_field_descr(
     signed: bool,
 ) -> DescrRef {
     std::sync::Arc::new(
-        SimpleFieldDescr::new(0, offset, field_size, field_type, false)
-            .with_signed(signed),
+        SimpleFieldDescr::new(0, offset, field_size, field_type, false).with_signed(signed),
     )
 }
 
@@ -1245,11 +1244,7 @@ pub fn make_size_descr_full(index: u32, size: usize, type_id: u32) -> DescrRef {
 }
 
 /// Create an array descriptor.
-pub fn make_array_descr(
-    base_size: usize,
-    item_size: usize,
-    item_type: Type,
-) -> DescrRef {
+pub fn make_array_descr(base_size: usize, item_size: usize, item_type: Type) -> DescrRef {
     std::sync::Arc::new(SimpleArrayDescr::new(0, base_size, item_size, 0, item_type))
 }
 
@@ -1261,15 +1256,13 @@ pub fn make_array_descr_full(
     type_id: u32,
     item_type: Type,
 ) -> DescrRef {
-    std::sync::Arc::new(SimpleArrayDescr::new(index, base_size, item_size, type_id, item_type))
+    std::sync::Arc::new(SimpleArrayDescr::new(
+        index, base_size, item_size, type_id, item_type,
+    ))
 }
 
 /// Create a call descriptor.
-pub fn make_call_descr(
-    arg_types: Vec<Type>,
-    result_type: Type,
-    effect: EffectInfo,
-) -> DescrRef {
+pub fn make_call_descr(arg_types: Vec<Type>, result_type: Type, effect: EffectInfo) -> DescrRef {
     std::sync::Arc::new(SimpleCallDescr::new(
         0,
         arg_types,
@@ -1328,9 +1321,7 @@ pub fn unpack_arraydescr(descr: &DescrRef) -> Option<(usize, usize, Type)> {
 
 /// descr.py: unpack_interiorfielddescr(descr)
 /// Extract array and field info from an interior field descriptor.
-pub fn unpack_interiorfielddescr(
-    descr: &DescrRef,
-) -> Option<(usize, usize, usize, usize, Type)> {
+pub fn unpack_interiorfielddescr(descr: &DescrRef) -> Option<(usize, usize, usize, usize, Type)> {
     let ifd = descr.as_interior_field_descr()?;
     let ad = ifd.array_descr();
     let fd = ifd.field_descr();

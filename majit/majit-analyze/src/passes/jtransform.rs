@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueType};
+use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
 
 /// Configuration for the graph rewrite pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +67,7 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
     let mut rewritten = graph.clone();
     let mut vable_rewrites = 0usize;
     let mut calls_classified = 0usize;
+    let mut aliases: std::collections::HashMap<ValueId, ValueId> = std::collections::HashMap::new();
 
     // Build lookup sets for virtualizable fields/arrays
     let vable_field_set: std::collections::HashMap<&str, usize> = config
@@ -88,8 +89,41 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
     for block in &mut rewritten.blocks {
         let mut new_ops = Vec::with_capacity(block.ops.len());
 
-        for op in &block.ops {
+        for original_op in &block.ops {
+            let op = remap_op(original_op, &aliases);
             match &op.kind {
+                // ── hint(access_directly=True) / hint(fresh_virtualizable=True) ──
+                // RPython jtransform.py:655 — consume as identity during translation.
+                OpKind::Call { target, args, .. } if is_vable_identity_hint(target) => {
+                    notes.push(GraphTransformNote {
+                        function: graph.name.clone(),
+                        detail: format!("rewrite: {target}(...) → identity"),
+                    });
+                    if let (Some(result), Some(arg)) = (op.result, args.first().copied()) {
+                        aliases.insert(result, resolve_alias(arg, &aliases));
+                    }
+                    continue;
+                }
+
+                // ── hint(force_virtualizable=True) ──
+                // RPython jtransform.py:650 — emit hint_force_virtualizable op,
+                // preserving the value as an identity result.
+                OpKind::Call { target, args, .. } if is_vable_force_hint(target) => {
+                    notes.push(GraphTransformNote {
+                        function: graph.name.clone(),
+                        detail: format!("rewrite: {target}(...) → VableForce"),
+                    });
+                    vable_rewrites += 1;
+                    if let (Some(result), Some(arg)) = (op.result, args.first().copied()) {
+                        aliases.insert(result, resolve_alias(arg, &aliases));
+                    }
+                    new_ops.push(Op {
+                        result: None,
+                        kind: OpKind::VableForce,
+                    });
+                    continue;
+                }
+
                 // ── Virtualizable field read → VableFieldRead ──
                 // RPython jtransform.py:832 `rewrite_op_getfield`
                 OpKind::FieldRead { field, ty, .. } if config.lower_virtualizable => {
@@ -118,7 +152,9 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
 
                 // ── Virtualizable field write → VableFieldWrite ──
                 // RPython jtransform.py:923 `_rewrite_op_setfield`
-                OpKind::FieldWrite { field, value, ty, .. } if config.lower_virtualizable => {
+                OpKind::FieldWrite {
+                    field, value, ty, ..
+                } if config.lower_virtualizable => {
                     if let Some(&idx) = vable_field_set.get(field.as_str()) {
                         notes.push(GraphTransformNote {
                             function: graph.name.clone(),
@@ -239,10 +275,12 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
 
                 _ => {}
             }
-            new_ops.push(op.clone());
+            new_ops.push(op);
         }
 
         block.ops = new_ops;
+
+        block.terminator = remap_terminator(&block.terminator, &aliases);
 
         if let Terminator::Abort { reason } = &block.terminator {
             notes.push(GraphTransformNote {
@@ -258,6 +296,231 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
         vable_rewrites,
         calls_classified,
     }
+}
+
+fn resolve_alias(
+    mut value: ValueId,
+    aliases: &std::collections::HashMap<ValueId, ValueId>,
+) -> ValueId {
+    while let Some(next) = aliases.get(&value).copied() {
+        if next == value {
+            break;
+        }
+        value = next;
+    }
+    value
+}
+
+fn remap_value(value: ValueId, aliases: &std::collections::HashMap<ValueId, ValueId>) -> ValueId {
+    resolve_alias(value, aliases)
+}
+
+fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> Op {
+    let kind = match &op.kind {
+        OpKind::Input { .. }
+        | OpKind::ConstInt(_)
+        | OpKind::VableForce
+        | OpKind::Unknown { .. } => op.kind.clone(),
+        OpKind::FieldRead { base, field, ty } => OpKind::FieldRead {
+            base: remap_value(*base, aliases),
+            field: field.clone(),
+            ty: ty.clone(),
+        },
+        OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } => OpKind::FieldWrite {
+            base: remap_value(*base, aliases),
+            field: field.clone(),
+            value: remap_value(*value, aliases),
+            ty: ty.clone(),
+        },
+        OpKind::ArrayRead {
+            base,
+            index,
+            item_ty,
+        } => OpKind::ArrayRead {
+            base: remap_value(*base, aliases),
+            index: remap_value(*index, aliases),
+            item_ty: item_ty.clone(),
+        },
+        OpKind::ArrayWrite {
+            base,
+            index,
+            value,
+            item_ty,
+        } => OpKind::ArrayWrite {
+            base: remap_value(*base, aliases),
+            index: remap_value(*index, aliases),
+            value: remap_value(*value, aliases),
+            item_ty: item_ty.clone(),
+        },
+        OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } => OpKind::Call {
+            target: target.clone(),
+            args: args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::GuardTrue { cond } => OpKind::GuardTrue {
+            cond: remap_value(*cond, aliases),
+        },
+        OpKind::GuardFalse { cond } => OpKind::GuardFalse {
+            cond: remap_value(*cond, aliases),
+        },
+        OpKind::VableFieldRead { .. } => op.kind.clone(),
+        OpKind::VableFieldWrite {
+            field_index,
+            value,
+            ty,
+        } => OpKind::VableFieldWrite {
+            field_index: *field_index,
+            value: remap_value(*value, aliases),
+            ty: ty.clone(),
+        },
+        OpKind::VableArrayRead {
+            array_index,
+            elem_index,
+            item_ty,
+        } => OpKind::VableArrayRead {
+            array_index: *array_index,
+            elem_index: remap_value(*elem_index, aliases),
+            item_ty: item_ty.clone(),
+        },
+        OpKind::VableArrayWrite {
+            array_index,
+            elem_index,
+            value,
+            item_ty,
+        } => OpKind::VableArrayWrite {
+            array_index: *array_index,
+            elem_index: remap_value(*elem_index, aliases),
+            value: remap_value(*value, aliases),
+            item_ty: item_ty.clone(),
+        },
+        OpKind::BinOp {
+            op,
+            lhs,
+            rhs,
+            result_ty,
+        } => OpKind::BinOp {
+            op: op.clone(),
+            lhs: remap_value(*lhs, aliases),
+            rhs: remap_value(*rhs, aliases),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::UnaryOp {
+            op,
+            operand,
+            result_ty,
+        } => OpKind::UnaryOp {
+            op: op.clone(),
+            operand: remap_value(*operand, aliases),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::CallElidable {
+            target,
+            args,
+            result_ty,
+        } => OpKind::CallElidable {
+            target: target.clone(),
+            args: args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::CallResidual {
+            target,
+            args,
+            result_ty,
+        } => OpKind::CallResidual {
+            target: target.clone(),
+            args: args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::CallMayForce {
+            target,
+            args,
+            result_ty,
+        } => OpKind::CallMayForce {
+            target: target.clone(),
+            args: args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            result_ty: result_ty.clone(),
+        },
+    };
+    Op {
+        result: op.result,
+        kind,
+    }
+}
+
+fn remap_terminator(
+    term: &Terminator,
+    aliases: &std::collections::HashMap<ValueId, ValueId>,
+) -> Terminator {
+    match term {
+        Terminator::Goto { target, args } => Terminator::Goto {
+            target: *target,
+            args: args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+        },
+        Terminator::Branch {
+            cond,
+            if_true,
+            true_args,
+            if_false,
+            false_args,
+        } => Terminator::Branch {
+            cond: remap_value(*cond, aliases),
+            if_true: *if_true,
+            true_args: true_args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            if_false: *if_false,
+            false_args: false_args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+        },
+        Terminator::Return(val) => Terminator::Return(val.map(|v| remap_value(v, aliases))),
+        Terminator::Abort { reason } => Terminator::Abort {
+            reason: reason.clone(),
+        },
+        Terminator::Unreachable => Terminator::Unreachable,
+    }
+}
+
+fn is_vable_identity_hint(target: &str) -> bool {
+    let last = target.split("::").last().unwrap_or(target);
+    matches!(last, "hint_access_directly" | "hint_fresh_virtualizable")
+}
+
+fn is_vable_force_hint(target: &str) -> bool {
+    target.split("::").last().unwrap_or(target) == "hint_force_virtualizable"
 }
 
 /// Classify a call's side-effect level.
@@ -325,7 +588,10 @@ mod tests {
         // Should be rewritten to VableFieldRead
         let rewritten_op = &result.graph.block(graph.entry).ops[0];
         assert!(
-            matches!(&rewritten_op.kind, OpKind::VableFieldRead { field_index: 0, .. }),
+            matches!(
+                &rewritten_op.kind,
+                OpKind::VableFieldRead { field_index: 0, .. }
+            ),
             "expected VableFieldRead, got {:?}",
             rewritten_op.kind
         );
@@ -367,5 +633,90 @@ mod tests {
         );
         let result = rewrite_graph(&graph, &GraphTransformConfig::default());
         assert_eq!(result.notes.len(), 2); // unknown + abort
+    }
+
+    #[test]
+    fn rewrite_graph_consumes_identity_virtualizable_hints() {
+        let mut graph = MajitGraph::new("demo");
+        let frame = graph.alloc_value();
+        let hinted = graph.alloc_value();
+        graph.block_mut(graph.entry).inputargs.push(frame);
+        graph.push_op(
+            graph.entry,
+            OpKind::Call {
+                target: "hint_access_directly".into(),
+                args: vec![frame],
+                result_ty: ValueType::Ref,
+            },
+            false,
+        );
+        graph.block_mut(graph.entry).ops.last_mut().unwrap().result = Some(hinted);
+        graph.push_op(
+            graph.entry,
+            OpKind::FieldRead {
+                base: hinted,
+                field: "next_instr".into(),
+                ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_terminator(graph.entry, Terminator::Return(None));
+
+        let result = rewrite_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![("next_instr".into(), 0)],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(result.graph.block(graph.entry).ops.len(), 1);
+        match &result.graph.block(graph.entry).ops[0].kind {
+            OpKind::VableFieldRead { field_index, .. } => assert_eq!(*field_index, 0),
+            other => panic!("expected VableFieldRead after hint suppression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_graph_rewrites_hint_force_virtualizable() {
+        let mut graph = MajitGraph::new("demo");
+        let frame = graph.alloc_value();
+        let forced = graph.alloc_value();
+        graph.block_mut(graph.entry).inputargs.push(frame);
+        graph.push_op(
+            graph.entry,
+            OpKind::Call {
+                target: "hint_force_virtualizable".into(),
+                args: vec![frame],
+                result_ty: ValueType::Ref,
+            },
+            false,
+        );
+        graph.block_mut(graph.entry).ops.last_mut().unwrap().result = Some(forced);
+        graph.push_op(
+            graph.entry,
+            OpKind::FieldRead {
+                base: forced,
+                field: "next_instr".into(),
+                ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_terminator(graph.entry, Terminator::Return(None));
+
+        let result = rewrite_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![("next_instr".into(), 0)],
+                ..Default::default()
+            },
+        );
+
+        let ops = &result.graph.block(graph.entry).ops;
+        assert!(matches!(ops[0].kind, OpKind::VableForce));
+        assert!(matches!(
+            ops[1].kind,
+            OpKind::VableFieldRead { field_index: 0, .. }
+        ));
     }
 }
