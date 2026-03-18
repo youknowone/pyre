@@ -210,19 +210,22 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             type Env = #env_type;
 
             fn can_trace(&self) -> bool {
-                // RPython parity: skip tracing when total storage depth is too large
-                // for SymbolicStack-based tracing. Without virtualizable preamble,
-                // huge InputArgs cause expensive trace attempts that always abort.
+                if !(true #( && self.#sel_field != #untraceable )* #extra_guard) {
+                    return false;
+                }
                 if #virtualizable {
-                    let total: usize = (0..aheui_runtime::aheui::STORAGE_COUNT)
+                    // O(26) but skips Queue/Port. ~26 .len() calls per back-edge.
+                    // Without virtualizable preamble, traces with >500 traceable
+                    // values always abort at validate_close.
+                    let traceable_depth: usize = (0..aheui_runtime::aheui::STORAGE_COUNT)
+                        .filter(|&i| true #( && i != #untraceable )*)
                         .map(|i| self.#pool_field.get(i).len())
                         .sum();
-                    if total > 500 {
+                    if traceable_depth > 50 {
                         return false;
                     }
                 }
-                true #( && self.#sel_field != #untraceable )*
-                #extra_guard
+                true
             }
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
