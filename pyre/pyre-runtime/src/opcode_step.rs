@@ -799,8 +799,12 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     // Exception handling
-    fn push_exc_info(&mut self) -> Result<(), Self::Error> { Ok(()) }
-    fn pop_except(&mut self) -> Result<(), Self::Error> { Ok(()) }
+    fn push_exc_info(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn pop_except(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("check_exc_match not implemented").into())
     }
@@ -812,7 +816,10 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn build_set(&mut self, _count: usize) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("build_set not implemented").into())
     }
-    fn build_slice(&mut self, _argc: pyre_bytecode::bytecode::BuildSliceArgCount) -> Result<(), Self::Error> {
+    fn build_slice(
+        &mut self,
+        _argc: pyre_bytecode::bytecode::BuildSliceArgCount,
+    ) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("build_slice not implemented").into())
     }
     fn build_string(&mut self, _count: usize) -> Result<(), Self::Error> {
@@ -856,7 +863,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     // Closures 3.11+
-    fn copy_free_vars(&mut self, _count: usize) -> Result<(), Self::Error> { Ok(()) }
+    fn copy_free_vars(&mut self, _count: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn return_generator(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("return_generator not implemented").into())
     }
@@ -887,7 +896,10 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn format_with_spec(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("format_with_spec not implemented").into())
     }
-    fn convert_value(&mut self, _conv: pyre_bytecode::bytecode::ConvertValueOparg) -> Result<(), Self::Error> {
+    fn convert_value(
+        &mut self,
+        _conv: pyre_bytecode::bytecode::ConvertValueOparg,
+    ) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("convert_value not implemented").into())
     }
 
@@ -974,13 +986,19 @@ where
 
         Instruction::StoreFastLoadFast { var_nums } => {
             let pair = var_nums.get(op_arg);
-            executor.store_fast_load_fast(u32::from(pair.idx_1()) as usize, u32::from(pair.idx_2()) as usize)?;
+            executor.store_fast_load_fast(
+                u32::from(pair.idx_1()) as usize,
+                u32::from(pair.idx_2()) as usize,
+            )?;
             Ok(StepResult::Continue)
         }
 
         Instruction::StoreFastStoreFast { var_nums } => {
             let pair = var_nums.get(op_arg);
-            executor.store_fast_store_fast(u32::from(pair.idx_1()) as usize, u32::from(pair.idx_2()) as usize)?;
+            executor.store_fast_store_fast(
+                u32::from(pair.idx_1()) as usize,
+                u32::from(pair.idx_2()) as usize,
+            )?;
             Ok(StepResult::Continue)
         }
 

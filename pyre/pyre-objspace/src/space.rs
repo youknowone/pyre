@@ -1179,12 +1179,35 @@ pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, P
             return Ok(h.contains(n));
         }
     }
-    Err(PyError::type_error("argument of type is not iterable"))
+    // Fallback: try iterating with py_getitem(obj, i) for i=0,1,...
+    unsafe {
+        let mut i = 0i64;
+        loop {
+            match py_getitem(haystack, pyre_object::w_int_new(i)) {
+                Ok(item) => {
+                    if py_eq_bool(item, needle) { return Ok(true); }
+                    i += 1;
+                }
+                Err(_) => return Ok(false), // IndexError → not found
+            }
+        }
+    }
 }
 
 /// Compare two objects for equality (returns bool, not PyObjectRef).
 fn py_eq_bool(a: PyObjectRef, b: PyObjectRef) -> bool {
-    if a == b { return true; }
+    if a == b {
+        return true;
+    }
+    unsafe {
+        use pyre_object::*;
+        if is_int(a) && is_int(b) {
+            return w_int_get_value(a) == w_int_get_value(b);
+        }
+        if is_str(a) && is_str(b) {
+            return w_str_get_value(a) == w_str_get_value(b);
+        }
+    }
     py_compare(a, b, CompareOp::Eq)
         .map(|r| py_is_true(r))
         .unwrap_or(false)
@@ -1213,13 +1236,28 @@ pub fn py_delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
 pub fn py_str(obj: PyObjectRef) -> String {
     use pyre_object::*;
     unsafe {
-        if is_str(obj) { return w_str_get_value(obj).to_string(); }
-        if is_int(obj) { return w_int_get_value(obj).to_string(); }
-        if is_none(obj) { return "None".to_string(); }
-        if is_bool(obj) { return if w_bool_get_value(obj) { "True" } else { "False" }.to_string(); }
+        if is_str(obj) {
+            return w_str_get_value(obj).to_string();
+        }
+        if is_int(obj) {
+            return w_int_get_value(obj).to_string();
+        }
+        if is_none(obj) {
+            return "None".to_string();
+        }
+        if is_bool(obj) {
+            return if w_bool_get_value(obj) {
+                "True"
+            } else {
+                "False"
+            }
+            .to_string();
+        }
         if is_float(obj) {
             let v = w_float_get_value(obj);
-            if v == v.floor() && v.is_finite() { return format!("{v:.1}"); }
+            if v == v.floor() && v.is_finite() {
+                return format!("{v:.1}");
+            }
             return v.to_string();
         }
     }
@@ -1230,13 +1268,28 @@ pub fn py_str(obj: PyObjectRef) -> String {
 pub fn py_repr(obj: PyObjectRef) -> String {
     use pyre_object::*;
     unsafe {
-        if is_str(obj) { return format!("'{}'", w_str_get_value(obj)); }
-        if is_int(obj) { return w_int_get_value(obj).to_string(); }
-        if is_none(obj) { return "None".to_string(); }
-        if is_bool(obj) { return if w_bool_get_value(obj) { "True" } else { "False" }.to_string(); }
+        if is_str(obj) {
+            return format!("'{}'", w_str_get_value(obj));
+        }
+        if is_int(obj) {
+            return w_int_get_value(obj).to_string();
+        }
+        if is_none(obj) {
+            return "None".to_string();
+        }
+        if is_bool(obj) {
+            return if w_bool_get_value(obj) {
+                "True"
+            } else {
+                "False"
+            }
+            .to_string();
+        }
         if is_float(obj) {
             let v = w_float_get_value(obj);
-            if v == v.floor() && v.is_finite() { return format!("{v:.1}"); }
+            if v == v.floor() && v.is_finite() {
+                return format!("{v:.1}");
+            }
             return v.to_string();
         }
     }
