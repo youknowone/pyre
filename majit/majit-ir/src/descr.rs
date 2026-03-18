@@ -126,6 +126,17 @@ pub trait SizeDescr: Descr {
     fn gc_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
         &[]
     }
+
+    /// All field descriptors (not just GC pointer ones).
+    /// descr.py: get_all_fielddescrs()
+    fn all_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
+        self.gc_field_descrs() // default: same as gc_field_descrs
+    }
+
+    /// Number of fields.
+    fn num_fields(&self) -> usize {
+        self.all_field_descrs().len()
+    }
 }
 
 /// Descriptor for a field within a struct.
@@ -204,6 +215,18 @@ pub trait ArrayDescr: Descr {
     fn len_descr(&self) -> Option<&dyn FieldDescr> {
         None
     }
+
+    /// Whether items are primitive (integer or float, not pointer).
+    /// descr.py: is_array_of_primitives()
+    fn is_array_of_primitives(&self) -> bool {
+        !self.is_array_of_pointers()
+    }
+
+    /// Whether items are structs (array-of-structs pattern).
+    /// descr.py: is_array_of_structs()
+    fn is_array_of_structs(&self) -> bool {
+        false
+    }
 }
 
 /// Descriptor for a field within an array element (interior pointer).
@@ -240,6 +263,35 @@ pub trait CallDescr: Descr {
 
     /// Side effect information.
     fn effect_info(&self) -> &EffectInfo;
+
+    /// Argument class string (RPython encoding: 'i'=int, 'r'=ref, 'f'=float).
+    /// descr.py: arg_classes
+    fn arg_classes(&self) -> String {
+        self.arg_types()
+            .iter()
+            .map(|t| match t {
+                Type::Int => 'i',
+                Type::Ref => 'r',
+                Type::Float => 'f',
+                Type::Void => 'v',
+            })
+            .collect()
+    }
+
+    /// Result type as arg class character.
+    fn result_class(&self) -> char {
+        match self.result_type() {
+            Type::Int => 'i',
+            Type::Ref => 'r',
+            Type::Float => 'f',
+            Type::Void => 'v',
+        }
+    }
+
+    /// Number of arguments.
+    fn num_args(&self) -> usize {
+        self.arg_types().len()
+    }
 }
 
 /// Descriptor for `DebugMergePoint` operations — carries source position

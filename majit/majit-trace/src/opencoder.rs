@@ -146,6 +146,144 @@ pub fn decode_trace(buf: &[u8]) -> TreeLoop {
     TreeLoop::new(inputargs, ops)
 }
 
+// ── Signed varint encoding (opencoder.py) ──
+
+/// Encode a signed i64 as a varint (zigzag encoding).
+/// opencoder.py: encode_varint_signed
+pub fn encode_varint_signed(buf: &mut Vec<u8>, value: i64) {
+    // Zigzag: map negative to odd, positive to even
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    encode_varint(buf, zigzag);
+}
+
+/// Decode a signed varint (zigzag encoding). Returns (value, bytes_consumed).
+/// opencoder.py: decode_varint_signed
+pub fn decode_varint_signed(buf: &[u8]) -> (i64, usize) {
+    let (zigzag, consumed) = decode_varint(buf);
+    let value = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+    (value, consumed)
+}
+
+// ── Snapshot management (opencoder.py) ──
+
+/// Tag constants for snapshot encoding.
+/// opencoder.py: TAGINT, TAGCONSTPTR, TAGCONSTOTHER, TAGBOX
+pub const TAGINT: u8 = 0; // small integer constant
+pub const TAGCONSTPTR: u8 = 1; // GC pointer constant
+pub const TAGCONSTOTHER: u8 = 2; // big int or float constant
+pub const TAGBOX: u8 = 3; // reference to a traced value (OpRef)
+
+/// Number of tag bits.
+pub const TAG_SHIFT: u32 = 2;
+/// Mask for tag extraction.
+pub const TAG_MASK: u8 = (1 << TAG_SHIFT) - 1;
+
+/// Encode a tagged value for snapshot storage.
+/// opencoder.py: tag(kind, value)
+pub fn tag(kind: u8, value: u32) -> u32 {
+    (value << TAG_SHIFT) | kind as u32
+}
+
+/// Decode a tagged value from snapshot storage.
+/// opencoder.py: untag(tagged) -> (kind, value)
+pub fn untag(tagged: u32) -> (u8, u32) {
+    let kind = (tagged & TAG_MASK as u32) as u8;
+    let value = tagged >> TAG_SHIFT;
+    (kind, value)
+}
+
+/// A snapshot captures the interpreter state at a guard/exit point.
+/// opencoder.py: Snapshot
+///
+/// When a guard fails, the JIT needs to reconstruct the interpreter
+/// state (frames, local variables) from the snapshot to resume
+/// execution in the interpreter.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    /// Encoded values (tagged): local variables and virtual object fields.
+    pub values: Vec<u32>,
+    /// Index of the previous snapshot in the chain (for call stack).
+    pub prev: Option<usize>,
+    /// Jitcode index identifying which interpreter function this frame belongs to.
+    pub jitcode_index: u32,
+    /// Program counter (bytecode offset) within the jitcode.
+    pub pc: u32,
+}
+
+/// Top-level snapshot (includes vable/vref tracking).
+/// opencoder.py: TopSnapshot
+#[derive(Clone, Debug)]
+pub struct TopSnapshot {
+    /// The snapshot for the topmost frame.
+    pub snapshot: Snapshot,
+    /// Index into snapshot data for virtualizable array.
+    pub vable_array_index: Option<usize>,
+    /// Index into snapshot data for virtual ref array.
+    pub vref_array_index: Option<usize>,
+}
+
+/// Snapshot storage for a trace.
+/// opencoder.py: Trace._snapshot_data, _snapshot_array_data
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotStorage {
+    /// All snapshots in this trace, indexed by position.
+    pub snapshots: Vec<Snapshot>,
+    /// Top snapshots corresponding to guard operations.
+    pub top_snapshots: Vec<TopSnapshot>,
+    /// Constant pool: GC references (pointers).
+    pub const_refs: Vec<u64>,
+    /// Constant pool: big integers (>28-bit).
+    pub const_bigints: Vec<i64>,
+    /// Constant pool: float values.
+    pub const_floats: Vec<f64>,
+}
+
+impl SnapshotStorage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a snapshot and return its index.
+    pub fn add_snapshot(&mut self, snapshot: Snapshot) -> usize {
+        let idx = self.snapshots.len();
+        self.snapshots.push(snapshot);
+        idx
+    }
+
+    /// Add a top snapshot (for a guard).
+    pub fn add_top_snapshot(&mut self, top: TopSnapshot) -> usize {
+        let idx = self.top_snapshots.len();
+        self.top_snapshots.push(top);
+        idx
+    }
+
+    /// Add a GC reference constant and return its pool index.
+    pub fn add_const_ref(&mut self, ptr: u64) -> u32 {
+        let idx = self.const_refs.len() as u32;
+        self.const_refs.push(ptr);
+        idx
+    }
+
+    /// Add a big integer constant and return its pool index.
+    pub fn add_const_bigint(&mut self, value: i64) -> u32 {
+        let idx = self.const_bigints.len() as u32;
+        self.const_bigints.push(value);
+        idx
+    }
+
+    /// Add a float constant and return its pool index.
+    pub fn add_const_float(&mut self, value: f64) -> u32 {
+        let idx = self.const_floats.len() as u32;
+        self.const_floats.push(value);
+        idx
+    }
+
+    /// Total number of snapshots.
+    pub fn num_snapshots(&self) -> usize {
+        self.snapshots.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
