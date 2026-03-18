@@ -672,35 +672,69 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── DictUpdate ──
-    fn dict_update(&mut self, _i: usize) -> Result<(), Self::Error> {
-        // Phase 1 stub: pop update dict, merge into TOS
-        let update = self.pop();
-        // TODO: actual dict merge
-        let _ = update;
+    // PyPy: dict.update(source); CPython: DICT_UPDATE
+    // Merges source dict entries into STACK[-i] dict.
+    fn dict_update(&mut self, i: usize) -> Result<(), Self::Error> {
+        let source = self.pop();
+        let dict = PyFrame::peek_at(self, i - 1);
+        unsafe {
+            if pyre_object::is_dict(source) {
+                let src = &*(source as *const pyre_object::dictobject::W_DictObject);
+                let entries = &*src.entries;
+                for &(k, v) in entries {
+                    pyre_object::w_dict_setitem(dict, k, v);
+                }
+            }
+        }
         Ok(())
     }
 
     // ── DictMerge ──
-    fn dict_merge(&mut self, _i: usize) -> Result<(), Self::Error> {
-        let update = self.pop();
-        let _ = update;
+    // PyPy: dict merge for **kwargs; CPython: DICT_MERGE
+    fn dict_merge(&mut self, i: usize) -> Result<(), Self::Error> {
+        let source = self.pop();
+        let dict = PyFrame::peek_at(self, i - 1);
+        unsafe {
+            if pyre_object::is_dict(source) {
+                let src = &*(source as *const pyre_object::dictobject::W_DictObject);
+                let entries = &*src.entries;
+                for &(k, v) in entries {
+                    pyre_object::w_dict_setitem(dict, k, v);
+                }
+            }
+        }
         Ok(())
     }
 
     // ── MapAdd ──
-    fn map_add(&mut self, _i: usize) -> Result<(), Self::Error> {
+    // PyPy: STORE_MAP/MAP_ADD; CPython: MAP_ADD
+    // dict = STACK[-i-2]; dict[TOS1] = TOS; pop key+value
+    fn map_add(&mut self, i: usize) -> Result<(), Self::Error> {
         let value = self.pop();
         let key = self.pop();
-        let _ = (key, value);
-        // TODO: dict[key] = value on stack[i]
+        let dict = PyFrame::peek_at(self, i - 1);
+        unsafe {
+            if pyre_object::is_int(key) {
+                let k = pyre_object::w_int_get_value(key);
+                pyre_object::w_dict_setitem(dict, k, value);
+            }
+            // Phase 1: only int keys supported in dict
+        }
         Ok(())
     }
 
     // ── SetAdd ──
-    fn set_add(&mut self, _i: usize) -> Result<(), Self::Error> {
+    // PyPy: SET_ADD; CPython: SET_ADD
+    // set = STACK[-i]; set.add(TOS); pop value
+    // Phase 1: set is backed by list, so we use list_append.
+    fn set_add(&mut self, i: usize) -> Result<(), Self::Error> {
         let value = self.pop();
-        let _ = value;
-        // TODO: set.add(value) on stack[i]
+        let set = PyFrame::peek_at(self, i - 1);
+        unsafe {
+            if pyre_object::is_list(set) {
+                pyre_object::w_list_append(set, value);
+            }
+        }
         Ok(())
     }
 
