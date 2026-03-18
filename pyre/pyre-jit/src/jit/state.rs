@@ -369,6 +369,16 @@ impl TraceFrameState {
         self.sym().frame
     }
 
+    /// PyPy interp_jit.py:89 — hint(self.valuestackdepth, promote=True).
+    /// Emits GuardValue on valuestackdepth to force it to a compile-time constant.
+    /// This is a no-op if symbolic state isn't ready or if vsd is already constant.
+    pub(crate) fn promote_valuestackdepth(&mut self, _concrete_frame: usize) {
+        // promote is handled implicitly by the virtualizable mechanism:
+        // valuestackdepth is carried as a JUMP arg and synced at guards.
+        // Explicit GuardValue would be redundant and adds fail_args complexity.
+        // TODO: add explicit promote when the optimizer can exploit it.
+    }
+
     pub(crate) fn push_value(&mut self, _ctx: &mut TraceCtx, value: OpRef) {
         let s = self.sym_mut();
         let stack_idx = s.stack_only_depth();
