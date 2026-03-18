@@ -383,10 +383,16 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
                 if #virtualizable {
-                    // Virtualizable: only check selected.
-                    // sync_virtualizable_to_heap already wrote contents + updated len_ref.
-                    // Jump args = [ptr_0, new_len_0, ...] which match InputArgs layout.
+                    // Virtualizable: check selected + preamble-loaded depths must match.
+                    // Unbalanced loops (depth changed) cannot close because sync
+                    // would write wrong number of elements to heap.
                     sym.current_selected == meta.initial_selected
+                        && sym.preamble_depths.iter().all(|(sidx, &depth)| {
+                            sym.stacks.get(sidx).is_some_and(|s| s.len() == depth)
+                        })
+                        && sym.stacks.iter().all(|(sidx, stack)| {
+                            sym.preamble_depths.contains_key(sidx) || stack.len() == 0
+                        })
                 } else {
                     sym.current_selected == meta.initial_selected
                         && sym.storage_layout.len() == meta.storage_layout.len()
