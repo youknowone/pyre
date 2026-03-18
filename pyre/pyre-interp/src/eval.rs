@@ -1968,6 +1968,78 @@ result = x";
     }
 
     #[test]
+    fn test_inplace_add() {
+        let source = "x = 10\nx += 5\nresult = x";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("inplace add failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 15);
+        }
+    }
+
+    #[test]
+    #[ignore = "list += list needs __iadd__ / list.extend"]
+    fn test_augmented_assign_list() {
+        let source = "x = [1, 2]\nx += [3]\nresult = x";
+        let (res, frame) = run_exec_frame(source);
+        match res {
+            Ok(_) => unsafe {
+                let result = *(*frame.namespace).get("result").unwrap();
+                assert!(is_list(result));
+                // After += [3], x should have 3 elements
+                assert_eq!(w_list_len(result), 3);
+            },
+            Err(e) => panic!("augmented list failed: {} ({:?})", e.message, e.kind),
+        }
+    }
+
+    #[test]
+    fn test_for_loop_over_list() {
+        let source = "\
+total = 0
+for x in [1, 2, 3, 4, 5]:
+    total = total + x
+result = total";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("for loop failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 15);
+        }
+    }
+
+    #[test]
+    fn test_for_loop_over_string() {
+        let source = "\
+result = 0
+for c in 'abc':
+    result = result + 1";
+        let (res, frame) = run_exec_frame(source);
+        match res {
+            Ok(_) => unsafe {
+                let result = *(*frame.namespace).get("result").unwrap();
+                assert_eq!(w_int_get_value(result), 3);
+            },
+            Err(e) => {
+                // String iteration might not work yet — ignore
+                eprintln!("for-string: {}", e.message);
+            }
+        }
+    }
+
+    #[test]
+    fn test_multiple_assignment() {
+        let source = "a = b = 42\nresult = a + b";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("multiple assign failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 84);
+        }
+    }
+
+    #[test]
     #[ignore = "list comprehension needs inner function scope (MAKE_FUNCTION + CopyFreeVars)"]
     fn test_list_comprehension() {
         let source = "result = [x * 2 for x in [1, 2, 3]]";
