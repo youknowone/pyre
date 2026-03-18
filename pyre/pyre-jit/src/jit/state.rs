@@ -1533,6 +1533,15 @@ impl TraceFrameState {
                 let (driver, _) = crate::eval::driver_pair();
                 let nargs = args.len();
 
+                // PyPy max_unroll_recursion: inline before CallAssembler
+                if driver.should_inline(callee_key) == majit_meta::InlineDecision::Inline {
+                    if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
+                        return self.inline_function_call(
+                            callable, args, concrete_callable, callee_key, frame_helper,
+                        );
+                    }
+                }
+
                 if let Some(token_number) = driver.get_pending_token_number(callee_key) {
                     let callee_nlocals = {
                         let code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
