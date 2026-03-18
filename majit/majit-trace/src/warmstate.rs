@@ -336,6 +336,8 @@ pub struct WarmEnterState {
     /// Cost threshold for vectorization decisions.
     /// RPython: `set_param_vec_cost`
     vec_cost: u32,
+    /// warmstate.py: enable_opts — list of enabled optimization pass names.
+    enable_opts: Vec<String>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -373,6 +375,7 @@ impl WarmEnterState {
             loop_longevity: 1000,
             vectorize: false,
             vec_cost: 0,
+            enable_opts: Vec::new(),
         }
     }
 
@@ -397,6 +400,7 @@ impl WarmEnterState {
             loop_longevity: 1000,
             vectorize: false,
             vec_cost: 0,
+            enable_opts: Vec::new(),
         }
     }
 
@@ -895,6 +899,33 @@ impl WarmEnterState {
             "enable_opts" => {} // string param in RPython, handled separately
             _ => {}
         }
+    }
+
+    /// warmstate.py: set_param_enable_opts(value)
+    /// Set which optimization passes are enabled.
+    /// Value is a colon-separated string like "intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll".
+    /// "all" enables all passes.
+    pub fn set_param_enable_opts(&mut self, value: &str) {
+        self.enable_opts = if value == "all" || value.is_empty() {
+            // All passes enabled (default)
+            vec![
+                "intbounds".to_string(),
+                "rewrite".to_string(),
+                "virtualize".to_string(),
+                "string".to_string(),
+                "pure".to_string(),
+                "earlyforce".to_string(),
+                "heap".to_string(),
+                "unroll".to_string(),
+            ]
+        } else {
+            value.split(':').filter(|s| !s.is_empty()).map(String::from).collect()
+        };
+    }
+
+    /// Get enabled optimization pass names.
+    pub fn get_enable_opts(&self) -> &[String] {
+        &self.enable_opts
     }
 
     /// warmstate.py: confirm_enter_jit(*args)
