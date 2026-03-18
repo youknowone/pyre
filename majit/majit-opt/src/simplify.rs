@@ -188,4 +188,47 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::CallI);
         assert_eq!(result[2].opcode, OpCode::IntSub);
     }
+
+    #[test]
+    fn test_guard_future_condition_removed() {
+        let mut ops = vec![
+            Op::new(OpCode::GuardFutureCondition, &[]),
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let result = run_pass(&ops);
+        // GUARD_FUTURE_CONDITION should be removed
+        assert!(!result.iter().any(|o| o.opcode == OpCode::GuardFutureCondition));
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_assert_not_none_removed() {
+        let mut ops = vec![
+            Op::new(OpCode::AssertNotNone, &[OpRef(100)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let result = run_pass(&ops);
+        assert!(!result.iter().any(|o| o.opcode == OpCode::AssertNotNone));
+    }
+
+    #[test]
+    fn test_virtual_ref_r_to_same_as() {
+        let ops = vec![
+            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let result = run_pass(&ops);
+        assert!(result.iter().any(|o| o.opcode == OpCode::SameAsR));
+    }
+
+    #[test]
+    fn test_record_exact_class_removed() {
+        let mut ops = vec![
+            Op::new(OpCode::RecordExactClass, &[OpRef(100), OpRef(200)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let result = run_pass(&ops);
+        assert!(!result.iter().any(|o| o.opcode == OpCode::RecordExactClass));
+    }
 }
