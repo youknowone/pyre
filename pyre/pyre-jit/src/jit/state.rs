@@ -1684,76 +1684,51 @@ impl TraceFrameState {
     /// self-recursion with ResidualCall + boost). The callee is fully
     /// traced and executed before returning — like PyPy's perform_call
     /// but synchronous instead of ChangeFrame.
+    /// Emit a force-able call to the callee: CallMayForceI + GuardNotForced.
+    ///
+    /// This matches PyPy's pattern for inlined recursive calls: the callee
+    /// is called via a force-able function call, and GuardNotForced protects
+    /// the outer trace from callee guard failures.
+    ///
+    /// The force_fn (jit_force_callee_frame) handles callee guard failures
+    /// transparently: it executes the callee to completion and returns the
+    /// result. The outer trace sees a clean function call.
     fn inline_function_call(
         &mut self,
         callable: OpRef,
         args: &[OpRef],
         concrete_callable: PyObjectRef,
-        callee_key: u64,
+        _callee_key: u64,
         frame_helper: *const (),
     ) -> Result<OpRef, PyError> {
-        let (driver, _) = crate::eval::driver_pair();
-
         self.with_ctx(|this, ctx| {
             this.guard_value(ctx, callable, concrete_callable as i64);
 
-            // IR: create callee frame
+            // Create callee frame (same as CallAssembler path)
             let mut helper_args = vec![this.frame(), callable];
             helper_args.extend_from_slice(args);
-            let callee_frame_opref = ctx.call_int(frame_helper, &helper_args);
+            let callee_frame = ctx.call_int(frame_helper, &helper_args);
 
-            // Concrete: create callee frame
-            unsafe {
-                let caller_frame = &*(this.concrete_frame as *const pyre_interp::frame::PyFrame);
-                let code_ptr = w_func_get_code_ptr(concrete_callable);
-                let globals = pyre_runtime::w_func_get_globals(concrete_callable);
-                let func_code = code_ptr as *const CodeObject;
-                let concrete_sd =
-                    (*(this.concrete_frame as *const pyre_interp::frame::PyFrame)).stack_depth;
-                let nargs = args.len();
-                let concrete_args: Vec<PyObjectRef> = (0..nargs)
-                    .map(|i| {
-                        concrete_stack_value(this.concrete_frame, concrete_sd - nargs + i)
-                            .unwrap_or(std::ptr::null_mut())
-                    })
-                    .collect();
-                let mut callee_frame = pyre_interp::frame::PyFrame::new_for_call(
-                    func_code,
-                    &concrete_args,
-                    globals,
-                    caller_frame.execution_context,
-                );
-                callee_frame.fix_array_ptrs();
+            // CallMayForceI: call force_fn on the callee frame.
+            // force_fn executes the callee (via compiled code or interpreter)
+            // and returns the result. If a guard fails inside, force_fn
+            // handles it transparently.
+            let force_fn_ptr = crate::call_jit::jit_force_callee_frame as *const ();
+            let result = ctx.call_may_force_int(force_fn_ptr, &[callee_frame]);
 
-                driver.enter_inline_frame(callee_key);
+            // GuardNotForced: ensures the callee didn't trigger a force.
+            // If the callee's guard failed, force_fn handled it and returned
+            // the correct result. This guard is a no-op in practice but
+            // maintains the RPython invariant.
+            this.record_guard(ctx, OpCode::GuardNotForced, &[]);
 
-                // Synchronously trace + execute callee
-                let inline_result = inline_trace_and_execute(ctx, callee_frame_opref, callee_frame);
+            // Drop callee frame
+            ctx.call_void(
+                crate::call_jit::jit_drop_callee_frame as *const (),
+                &[callee_frame],
+            );
 
-                match inline_result {
-                    Ok((result_opref, concrete_result)) => {
-                        driver.leave_inline_frame();
-                        ctx.call_void(
-                            crate::call_jit::jit_drop_callee_frame as *const (),
-                            &[callee_frame_opref],
-                        );
-                        pyre_interp::call::set_inline_handled_result(concrete_result);
-                        Ok(result_opref)
-                    }
-                    Err(_) => {
-                        driver.leave_inline_frame();
-                        // Fall back to residual call
-                        let result = crate::jit::helpers::emit_trace_call_known_function(
-                            ctx,
-                            this.frame(),
-                            callable,
-                            args,
-                        )?;
-                        this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                        Ok(result)
-                    }
-                }
-            }
+            Ok(result)
         })
     }
 

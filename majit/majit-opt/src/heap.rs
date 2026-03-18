@@ -80,6 +80,10 @@ pub struct OptHeap {
     /// Survives calls and side-effecting operations (only cleared on setup).
     loopinvariant_cache: HashMap<(u32, u64), OpRef>,
 
+    /// Whether the last call is known to not raise (for GUARD_NO_EXCEPTION dedup).
+    /// RPython heap.py: consecutive GUARD_NO_EXCEPTION can be deduplicated.
+    last_call_did_not_raise: bool,
+
     /// Fields known to be quasi-immutable: (obj, field_idx) -> cached value OpRef.
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
     /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
@@ -99,6 +103,7 @@ impl OptHeap {
             unescaped: HashSet::new(),
             known_nonnull: HashSet::new(),
             loopinvariant_cache: HashMap::new(),
+            last_call_did_not_raise: false,
             quasi_immut_cache: HashMap::new(),
         }
     }
@@ -543,6 +548,8 @@ impl OptHeap {
         if !opcode.has_no_side_effect() && !opcode.is_ovf() {
             self.force_all_lazy(ctx);
             self.invalidate_caches();
+            // Any side-effecting op may raise — reset exception dedup state.
+            self.last_call_did_not_raise = false;
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -578,6 +585,18 @@ impl Optimization for OptHeap {
 
             // ── Array item writes ──
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => self.optimize_setarrayitem(op, ctx),
+
+            // ── GUARD_NO_EXCEPTION deduplication ──
+            // RPython heap.py: consecutive GUARD_NO_EXCEPTION after a call
+            // that didn't raise can be removed (the exception state is still clean).
+            OpCode::GuardNoException => {
+                if self.last_call_did_not_raise {
+                    return OptimizationResult::Remove;
+                }
+                self.last_call_did_not_raise = true;
+                self.force_all_lazy(ctx);
+                return OptimizationResult::Emit(op.clone());
+            }
 
             // ── GUARD_NOT_INVALIDATED deduplication ──
             OpCode::GuardNotInvalidated => {
@@ -653,6 +672,7 @@ impl Optimization for OptHeap {
         self.unescaped.clear();
         self.known_nonnull.clear();
         self.loopinvariant_cache.clear();
+        self.last_call_did_not_raise = false;
         self.quasi_immut_cache.clear();
     }
 
@@ -672,6 +692,7 @@ impl Optimization for OptHeap {
         self.unescaped.clear();
         self.known_nonnull.clear();
         self.loopinvariant_cache.clear();
+        self.last_call_did_not_raise = false;
         self.quasi_immut_cache.clear();
     }
 
