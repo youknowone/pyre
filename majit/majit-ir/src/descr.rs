@@ -380,6 +380,20 @@ impl Descr for DebugMergePointDescr {
 pub struct EffectInfo {
     pub extra_effect: ExtraEffect,
     pub oopspec_index: OopSpecIndex,
+    /// effectinfo.py: bitstring_readonly_descrs_fields
+    /// Bitset of field descriptor indices that may be read by this call.
+    pub readonly_descrs_fields: u64,
+    /// effectinfo.py: bitstring_write_descrs_fields
+    /// Bitset of field descriptor indices that may be written by this call.
+    pub write_descrs_fields: u64,
+    /// effectinfo.py: bitstring_readonly_descrs_arrays
+    /// Bitset of array descriptor indices that may be read.
+    pub readonly_descrs_arrays: u64,
+    /// effectinfo.py: bitstring_write_descrs_arrays
+    /// Bitset of array descriptor indices that may be written.
+    pub write_descrs_arrays: u64,
+    /// effectinfo.py: can_invalidate
+    pub can_invalidate: bool,
 }
 
 impl Default for EffectInfo {
@@ -387,6 +401,11 @@ impl Default for EffectInfo {
         EffectInfo {
             extra_effect: ExtraEffect::CanRaise,
             oopspec_index: OopSpecIndex::None,
+            readonly_descrs_fields: 0,
+            write_descrs_fields: 0,
+            readonly_descrs_arrays: 0,
+            write_descrs_arrays: 0,
+            can_invalidate: false,
         }
     }
 }
@@ -510,10 +529,10 @@ impl EffectInfo {
         self.extra_effect >= ExtraEffect::ElidableCanRaise
     }
 
+    /// effectinfo.py: check_can_invalidate()
     /// Whether this call can invalidate compiled code (quasi-immutable mutations).
-    /// RPython: `effectinfo.can_invalidate()`
     pub fn can_invalidate(&self) -> bool {
-        self.extra_effect >= ExtraEffect::ForcesVirtualOrVirtualizable
+        self.can_invalidate
     }
 
     /// Whether this call can trigger GC collection.
@@ -522,9 +541,10 @@ impl EffectInfo {
         self.extra_effect >= ExtraEffect::CanRaise
     }
 
+    /// effectinfo.py: check_forces_virtual_or_virtualizable()
     /// Whether this call forces virtualizables or virtual objects.
     pub fn forces_virtual_or_virtualizable(&self) -> bool {
-        self.extra_effect == ExtraEffect::ForcesVirtualOrVirtualizable
+        self.extra_effect >= ExtraEffect::ForcesVirtualOrVirtualizable
     }
 
     /// Whether this call has random effects (worst case).
@@ -560,11 +580,25 @@ impl EffectInfo {
         false // Not applicable in our Rust runtime
     }
 
+    /// Const-compatible constructor for static initialization.
+    pub const fn const_new(extra_effect: ExtraEffect, oopspec_index: OopSpecIndex) -> Self {
+        EffectInfo {
+            extra_effect,
+            oopspec_index,
+            readonly_descrs_fields: 0,
+            write_descrs_fields: 0,
+            readonly_descrs_arrays: 0,
+            write_descrs_arrays: 0,
+            can_invalidate: false,
+        }
+    }
+
     /// Create a new EffectInfo with the given effect and oopspec.
     pub fn new(extra_effect: ExtraEffect, oopspec_index: OopSpecIndex) -> Self {
         EffectInfo {
             extra_effect,
             oopspec_index,
+            ..Default::default()
         }
     }
 
@@ -572,7 +606,7 @@ impl EffectInfo {
     pub fn elidable() -> Self {
         EffectInfo {
             extra_effect: ExtraEffect::ElidableCannotRaise,
-            oopspec_index: OopSpecIndex::None,
+            ..Default::default()
         }
     }
 
@@ -580,8 +614,37 @@ impl EffectInfo {
     pub fn side_effecting() -> Self {
         EffectInfo {
             extra_effect: ExtraEffect::RandomEffects,
-            oopspec_index: OopSpecIndex::None,
+            ..Default::default()
         }
+    }
+
+    // ── Bitstring check methods (effectinfo.py parity) ──
+
+    /// effectinfo.py: check_readonly_descr_field(fielddescr)
+    /// Check if this call may read the given field descriptor.
+    pub fn check_readonly_descr_field(&self, descr_idx: u32) -> bool {
+        descr_idx < 64 && (self.readonly_descrs_fields & (1u64 << descr_idx)) != 0
+    }
+
+    /// effectinfo.py: check_write_descr_field(fielddescr)
+    /// Check if this call may write the given field descriptor.
+    pub fn check_write_descr_field(&self, descr_idx: u32) -> bool {
+        descr_idx < 64 && (self.write_descrs_fields & (1u64 << descr_idx)) != 0
+    }
+
+    /// effectinfo.py: check_readonly_descr_array(arraydescr)
+    pub fn check_readonly_descr_array(&self, descr_idx: u32) -> bool {
+        descr_idx < 64 && (self.readonly_descrs_arrays & (1u64 << descr_idx)) != 0
+    }
+
+    /// effectinfo.py: check_write_descr_array(arraydescr)
+    pub fn check_write_descr_array(&self, descr_idx: u32) -> bool {
+        descr_idx < 64 && (self.write_descrs_arrays & (1u64 << descr_idx)) != 0
+    }
+
+    /// effectinfo.py: check_is_elidable()
+    pub fn check_is_elidable(&self) -> bool {
+        self.is_elidable()
     }
 }
 
