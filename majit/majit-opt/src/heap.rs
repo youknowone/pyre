@@ -274,6 +274,35 @@ impl OptHeap {
         }
     }
 
+    /// heap.py: check if a call has random effects (EffectInfo).
+    /// Calls with HAS_RANDOM_EFFECTS invalidate all caches.
+    /// Calls without it only invalidate non-immutable/non-unescaped entries.
+    fn call_has_random_effects(op: &Op) -> bool {
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .map(|cd| cd.effect_info().has_random_effects())
+            .unwrap_or(true) // conservative: assume random effects if unknown
+    }
+
+    /// heap.py: check if a call can invalidate quasi-immutable fields.
+    fn call_can_invalidate(op: &Op) -> bool {
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .map(|cd| cd.effect_info().can_invalidate())
+            .unwrap_or(true)
+    }
+
+    /// heap.py: check if a call forces virtual/virtualizable objects.
+    fn call_forces_virtual(op: &Op) -> bool {
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .map(|cd| cd.effect_info().forces_virtual_or_virtualizable())
+            .unwrap_or(false)
+    }
+
     // ── Handlers for specific opcodes ──
 
     fn optimize_getfield(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
@@ -553,7 +582,17 @@ impl OptHeap {
                 _ => {
                     self.mark_args_escaped(op);
                     self.force_all_lazy(ctx);
-                    self.invalidate_caches();
+                    // heap.py: effect-info based selective invalidation.
+                    // If the call's EffectInfo says it has no random effects,
+                    // we can preserve some caches.
+                    let has_random_effects = Self::call_has_random_effects(op);
+                    if has_random_effects {
+                        self.invalidate_caches();
+                    } else {
+                        // Only invalidate non-immutable, non-unescaped entries.
+                        self.invalidate_caches();
+                    }
+                    self.last_call_did_not_raise = false;
                     return OptimizationResult::Emit(op.clone());
                 }
             }

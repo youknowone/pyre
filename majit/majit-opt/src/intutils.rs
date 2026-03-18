@@ -241,6 +241,46 @@ impl IntBound {
         self.lower >= 0
     }
 
+    /// intutils.py: known_nonzero — is the value definitely nonzero?
+    pub fn known_nonzero(&self) -> bool {
+        (self.lower > 0) || (self.upper < 0)
+    }
+
+    /// intutils.py: known_negative — is the value definitely negative?
+    pub fn known_negative(&self) -> bool {
+        self.upper < 0
+    }
+
+    /// intutils.py: known_positive — is the value definitely > 0?
+    pub fn known_positive(&self) -> bool {
+        self.lower > 0
+    }
+
+    /// intutils.py: getnullness — return NONNULL, NULL, or UNKNOWN.
+    /// 0 = unknown, 1 = nonnull, -1 = null
+    pub fn getnullness(&self) -> i8 {
+        if self.known_nonzero() {
+            1 // NONNULL
+        } else if self.is_constant() && self.lower == 0 {
+            -1 // NULL
+        } else {
+            0 // UNKNOWN
+        }
+    }
+
+    /// intutils.py: make_guards — generate guard ops to enforce these bounds.
+    /// Returns a list of (opcode, constant_arg) pairs.
+    pub fn make_guards(&self) -> Vec<(majit_ir::OpCode, i64)> {
+        let mut guards = Vec::new();
+        if self.lower > i64::MIN {
+            guards.push((majit_ir::OpCode::IntGe, self.lower));
+        }
+        if self.upper < i64::MAX {
+            guards.push((majit_ir::OpCode::IntLe, self.upper));
+        }
+        guards
+    }
+
     /// Whether this abstract integer is unbounded.
     pub fn is_unbounded(&self) -> bool {
         self.lower == i64::MIN
