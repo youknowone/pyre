@@ -660,6 +660,43 @@ impl VectorizingOptimizer {
     /// vector.py: user_loop_heuristic — quick check if a loop body is
     /// worth trying to vectorize. Returns false if there are too few ops,
     /// no vectorizable opcodes, or too many guards.
+    /// vector.py: extend_packset()
+    /// Iteratively follow def-use and use-def chains to grow the pack set.
+    /// Stops when no more packs are added in a full iteration.
+    pub fn extend_packset(pack_set: &mut PackSet, graph: &DependencyGraph) {
+        loop {
+            let before = pack_set.num_packs();
+            // follow_def_uses: for each pack, check if dependents can form new packs
+            let current_packs: Vec<PackGroup> = pack_set.packs.clone();
+            for pack in &current_packs {
+                if pack.members.len() >= 2 {
+                    let left = pack.members[0];
+                    let right = pack.members[1];
+                    // Check users of left and right for isomorphic pairs
+                    for &l_user in &graph.nodes[left].users {
+                        for &r_user in &graph.nodes[right].users {
+                            if l_user != r_user
+                                && graph.nodes[l_user].op.opcode == graph.nodes[r_user].op.opcode
+                                && !graph.has_dependency(l_user, r_user)
+                            {
+                                if let Some(vec_op) = graph.nodes[l_user].op.opcode.to_vector() {
+                                    pack_set.add_pack(PackGroup {
+                                        scalar_opcode: graph.nodes[l_user].op.opcode,
+                                        vector_opcode: vec_op,
+                                        members: vec![l_user, r_user],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if pack_set.num_packs() == before {
+                break;
+            }
+        }
+    }
+
     pub fn user_loop_heuristic(ops: &[Op]) -> bool {
         if ops.len() < 4 {
             return false;
