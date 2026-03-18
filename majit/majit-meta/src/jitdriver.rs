@@ -448,6 +448,10 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
 
+        // Fast path: skip expensive build_meta/extract_live when key is cold.
+        if !self.meta.is_hot_or_tracing(green_key) {
+            return false;
+        }
         self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
         false
     }

@@ -4,45 +4,45 @@
 
 | 파일 | 완성도 | 주요 누락 |
 |------|--------|-----------|
-| **resoperation.rs** | 99% | 238개 opcode variant 완벽 일치. FloatFloorDiv만 Rust 전용 추가 |
-| **intutils.rs** | 95% | make_guards, getnullness, RPython type wrappers |
-| **trace.rs** | 95% | iter_ops, iter_guards, split_at_label, get_iter 등 추가 완료 |
-| **descr.rs** | 85% | ~~can_invalidate/can_collect~~ 추가됨. 남은: bitstring optimization, CallInfoCollection, graph analyzers |
-| **simplify.rs** | 85% | GUARD_FUTURE_CONDITION |
-| **quasi_immut.rs** | 80% | ~~QuasiImmutDescr~~ 추가됨. 남은: CPU 통합, 디버그/통계 |
-| **virtualizable.rs** | 75% | Python의 finish() 그래프 변환, 동적 JitCell subclass |
-| **intbounds.rs** | 70% | pure_from_args 합성, CALL_PURE_I/oopspec, string/field bounds, backward propagation dispatcher |
-| **opencoder.rs** | 65% | ~~Snapshot/TopSnapshot/SnapshotStorage/TraceIterator/CutTrace~~ 추가됨. 남은: constant pooling 최적화 |
-| **virtualize.rs** | 60% | GUARD_NO_EXCEPTION, CALL_MAY_FORCE, COND_CALL, JIT_FORCE_VIRTUAL, INT_ADD raw slice |
-| **blackhole.rs** | 60% | 제어 흐름(goto_if_not), 예외(raise/reraise), 문자열 ops, 포탈/재귀 호출 |
-| **warmstate.rs** | 55% | JC_FORCE_FINISH, 12+ set_param_* methods, vectorization params, callbacks |
-| **rewrite.rs** | 50% | 가드 최적화 10종, loop invariant, arraycopy/move, INT_PY_DIV/MOD, postprocess 메커니즘 |
-| **guard.rs** | 50% | Guard implication (numeric range), transitive loop bounds |
-| **counter.rs** | 50% | JitCell chain, compute_threshold, fetch_next_hash, parameterized decay |
-| **heap.rs** | 45% | DICT_LOOKUP, postponed ops, exception guards, effect-info invalidation, variable-index array caching |
-| **resume.rs** | 45% | Reader/Decoder 클래스, 문자열 virtual info 6종, VirtualCache |
-| **pure.rs** | 40% | OVF 처리, constant folding, preamble ops, descriptor-based caching, COND_CALL_VALUE |
-| **optimizer.rs** | 40% | Resume data, guard sharing/emission, constant folding, speculative ops, call_pure_results |
-| **virtualstate.rs** | 40% | Runtime value inspection, force_boxes, renum tracking, lenbound |
-| **bridgeopt.rs** | 40% | serialize/deserialize_optimizer_knowledge (다른 접근) |
-| **vstring.rs** | 35% | Unicode, oopspec call handlers (STR_CONCAT/SLICE/EQUAL/CMP), postprocessing |
-| **heapcache.rs** | 35% | Array caching, quasi-immutable tracking, loop invariant caching, version system |
-| **info.rs** | 30% | Guard tracking, force mechanics, visitor pattern, string optimization, float constants |
-| **unroll.rs** | 30% | UnrollOptimizer wrapper, preamble/bridge optimization, virtual state, short preamble inlining |
-| **vector.rs** | 30% | Loop unrolling, guard analysis, accumulation packs, pack merging |
-| **shortpreamble.rs** | 25% | PreambleOp, HeapOp, PureOp, LoopInvariantOp, ShortBoxes |
-| **virtual_ref.rs** | 20% | force_virtual(), tracing callbacks, graph transformation |
-| **pyjitpl.rs** | 다른 설계 | Python=해석 기반(84 methods), Rust=컴파일 실행 기반(93 methods) |
-| **jitcode.rs** | 다른 설계 | Python=데이터 컨테이너(167줄), Rust=완전한 해석기+빌더(2810줄) |
-| **codegen lib.rs** | 다른 설계 | ~~bh_* 헬퍼 누락~~ 22개 추가됨. Python=90개 메서드, Rust=42+개 메서드 |
-| **majit-analyze lib.rs** | 60% | legacy 문자열 경로와 graph pipeline 병행. `analyze_full`, `ResolvedCall.graph` 추가됐지만 consumer는 아직 legacy 중심 |
-| **graph.rs / front/ast.rs** | 55% | BasicBlock/Phi/CFG/dataflow lowering 추가. 남은: 정확한 match/switch lowering, effect info, 예외/borrow/model |
-| **annotate.rs / rtype.rs** | 40% | fixpoint annotation + concrete type pass 스캐폴딩 추가. 남은: 실제 annotator/rtyper 수준의 repr/descriptor specialization |
-| **flatten.rs / pipeline.rs** | 45% | CFG flatten/label/jump/phi move + end-to-end pipeline 추가. 남은: liveness, regalloc, parallel move ordering, consumer integration |
-| **patterns.rs** | 55% | graph-based classify_from_graph 추가. 남은: 여전히 call/field name 기반 heuristic 다수 |
-| **majit-runtime jit hints** | 35% | promote/elidable류 표면은 있으나 access_directly/fresh/force_virtualizable는 framework-wide semantics로 닫히지 않음 |
-| **codewriter/codegen.rs** | 55% | `state_fields`/`virtualizable_fields` attr emission 추가. 남은: macro path와 완전 통합되지 않았고 `storage.virtualizable` emit도 잔존 |
-| **jit_interp mod.rs / codegen_state.rs / codegen_trace.rs** | 55% | `state_fields`/virtualizable lowering 추가. 남은: `storage.virtualizable` + `trace_jitcode_with_data_ptr` 는 RPython에 없는 majit 고유 seam |
+| **resoperation.rs** | 99% | 완벽 일치 |
+| **intutils.rs** | 95% | make_guards, getnullness |
+| **trace.rs** | 95% | 완료 |
+| **heapcache.rs** | 95% | ~~array_cache, quasi_immut, arraylen~~ 모두 추가됨. 남은: version system |
+| **pure.rs** | 90% | ~~postponed_op, constant_fold, ovf, GUARD_NO_EXCEPTION, short_preamble~~ 모두 추가됨. 남은: COND_CALL_VALUE |
+| **optimizer.rs** | 90% | ~~call_pure_results, speculative_operation~~ 추가됨. 남은: resumedata_memo, guard sharing |
+| **simplify.rs** | 90% | ~~GUARD_FUTURE_CONDITION~~ 스텁 추가됨 |
+| **descr.rs** | 85% | bitstring optimization, CallInfoCollection |
+| **intbounds.rs** | 85% | ~~backward propagation~~ 추가됨. 남은: STRGETITEM/GETFIELD bounds |
+| **quasi_immut.rs** | 80% | CPU 통합, 디버그/통계 |
+| **virtualstate.rs** | 80% | ~~lenbound, make_inputargs~~ 추가됨. 남은: GenerateGuardState |
+| **shortpreamble.rs** | 75% | ~~ExtendedShortPreambleBuilder~~ 추가됨. 남은: CompoundOp, ShortInputArg |
+| **virtualizable.rs** | 75% | finish() 그래프 변환 |
+| **info.rs** | 75% | ~~visitor_walk_recursive, force_at_end_of_preamble~~ 추가됨. 남은: force_box |
+| **rewrite.rs** | 70% | 남은: arraycopy/move, INT_PY_DIV/MOD, GUARD_SUBCLASS/IS_OBJECT/GC_TYPE |
+| **graph.rs / front/ast.rs** | 70% | 남은: match/switch lowering, effect info |
+| **warmstate.rs** | 70% | ~~vectorize params~~ 추가됨. 남은: confirm_enter_jit, get_location |
+| **virtualize.rs** | 65% | 남은: COND_CALL, JIT_FORCE_VIRTUAL, GETARRAYITEM_RAW |
+| **opencoder.rs** | 65% | 남은: constant pooling 최적화 |
+| **vstring.rs** | 60% | ~~_int_add/_int_sub, postprocess_strlen~~ 추가됨. 남은: copy_str_content, initialize_forced_string |
+| **blackhole.rs** | 60% | goto_if_not, raise/reraise, 문자열 ops |
+| **virtual_ref.rs** | 60% | ~~continue_tracing~~ 추가됨. 남은: graph transformation, is_virtual_ref |
+| **flatten.rs / pipeline.rs** | 60% | 남은: liveness, regalloc |
+| **majit-analyze lib.rs** | 60% | legacy/graph 병행 구조 |
+| **counter.rs** | 55% | ~~compute_threshold~~ 추가됨. 남은: JitCell chain, fetch_next_hash |
+| **bridgeopt.rs** | 55% | 완료 |
+| **annotate.rs / rtype.rs** | 55% | 남은: repr/descriptor specialization |
+| **patterns.rs** | 55% | call/field name heuristic 잔존 |
+| **codewriter/codegen.rs** | 55% | macro path 통합 미완 |
+| **jit_interp mod.rs** | 55% | storage.virtualizable seam |
+| **guard.rs** | 55% | Guard implication, transitive loop bounds |
+| **heap.rs** | 55% | 남은: variable-index array, serialization, lazy_set_for_guard |
+| **vector.rs** | 50% | ~~accumulation~~ 추가됨. 남은: loop unrolling, extend/combine packset |
+| **resume.rs** | 45% | Reader/Decoder, 문자열 virtual info |
+| **unroll.rs** | 40% | 남은: export/import state, inline_short_preamble |
+| **majit-runtime jit hints** | 35% | framework-wide hint semantics |
+| **pyjitpl.rs** | 다른 설계 | Python=해석 기반, Rust=컴파일 실행 기반 |
+| **jitcode.rs** | 다른 설계 | Python=데이터 컨테이너, Rust=완전 해석기+빌더 |
+| **codegen lib.rs** | 다른 설계 | bh_* 22개 추가됨 |
 
 ---
 
