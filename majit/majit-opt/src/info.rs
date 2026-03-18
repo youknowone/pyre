@@ -296,6 +296,42 @@ impl PtrInfo {
         }
     }
 
+    /// info.py: is_null() — whether this pointer is known to be null.
+    pub fn is_null(&self) -> bool {
+        match self {
+            PtrInfo::Constant(gcref) => gcref.is_null(),
+            _ => false,
+        }
+    }
+
+    /// info.py: is_about_object() — whether this info describes an object
+    /// (has fields/vtable, as opposed to an array or raw buffer).
+    pub fn is_about_object(&self) -> bool {
+        matches!(self, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_))
+    }
+
+    /// info.py: is_precise() — whether the type info is exact (not just a bound).
+    pub fn is_precise(&self) -> bool {
+        matches!(
+            self,
+            PtrInfo::Constant(_)
+                | PtrInfo::Virtual(_)
+                | PtrInfo::VirtualArray(_)
+                | PtrInfo::VirtualStruct(_)
+                | PtrInfo::VirtualArrayStruct(_)
+                | PtrInfo::VirtualRawBuffer(_)
+        )
+    }
+
+    /// info.py: same_info(other) — whether two PtrInfos describe the same value.
+    pub fn same_info(&self, other: &PtrInfo) -> bool {
+        match (self, other) {
+            (PtrInfo::Constant(a), PtrInfo::Constant(b)) => a == b,
+            (PtrInfo::NonNull, PtrInfo::NonNull) => true,
+            _ => std::ptr::eq(self, other),
+        }
+    }
+
     /// info.py: get_descr() — get the size/type descriptor for virtual objects.
     pub fn get_descr(&self) -> Option<&DescrRef> {
         match self {
