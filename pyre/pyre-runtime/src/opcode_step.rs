@@ -910,9 +910,20 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Err(crate::PyError::type_error("load_fast_and_clear not implemented").into())
     }
     fn set_function_attribute(&mut self) -> Result<(), Self::Error> {
-        // Phase 1: pop attribute value, keep function — no-op effectively
         let _attr = self.pop_value().map_err(Into::into)?;
         Ok(())
+    }
+    fn load_from_dict_or_globals(&mut self, _name: &str) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_from_dict_or_globals not implemented").into())
+    }
+    fn load_from_dict_or_deref(&mut self, _idx: usize, _name: &str) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_from_dict_or_deref not implemented").into())
+    }
+    fn match_stub(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
+    fn unpack_ex(&mut self, _args: pyre_bytecode::bytecode::UnpackExArgs) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("unpack_ex not implemented").into())
     }
 
     fn unsupported(
@@ -1446,6 +1457,57 @@ where
             let _flag = flag.get(op_arg);
             executor.set_function_attribute()?;
             Ok(StepResult::Continue)
+        }
+
+        // ── Scoping ──
+        Instruction::LoadFromDictOrGlobals { i } => {
+            let idx = i.get(op_arg) as usize;
+            executor.load_from_dict_or_globals(code.names[idx].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::LoadFromDictOrDeref { i } => {
+            let idx = i.get(op_arg) as usize;
+            executor.load_from_dict_or_deref(idx, code.names[idx].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Pattern matching (Python 3.10+) ──
+        Instruction::MatchMapping | Instruction::MatchSequence => {
+            // Phase 1 stub: push False
+            executor.match_stub()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Unpack extended ──
+        Instruction::UnpackEx { counts } => {
+            executor.unpack_ex(counts.get(op_arg))?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Delete name/global ──
+        Instruction::DeleteName { namei } => {
+            executor.delete_name(code.names[namei.get(op_arg) as usize].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::DeleteGlobal { namei } => {
+            executor.delete_global(code.names[namei.get(op_arg) as usize].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Async stubs ──
+        Instruction::GetAwaitable { .. } | Instruction::GetAIter | Instruction::GetANext
+        | Instruction::EndAsyncFor | Instruction::Send { .. } | Instruction::EndSend
+        | Instruction::GetYieldFromIter | Instruction::CleanupThrow => {
+            Err(crate::PyError::type_error("async/generator send not yet implemented").into())
+        }
+
+        // ── Misc stubs ──
+        Instruction::LoadSpecial { .. } => {
+            Err(crate::PyError::type_error("LOAD_SPECIAL not yet implemented").into())
+        }
+        Instruction::ExitInitCheck => Ok(StepResult::Continue),
+        Instruction::WithExceptStart => {
+            Err(crate::PyError::type_error("WITH_EXCEPT_START not yet implemented").into())
         }
 
         other => executor.unsupported(&other),
