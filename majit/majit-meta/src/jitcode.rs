@@ -505,7 +505,14 @@ where
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         while !self.frames.is_empty() {
-            let action = self.run_one_step(ctx, sym, runtime);
+            // Catch panics from BigInt overflow in runtime stack operations.
+            // RPython doesn't have this issue (no BigInt); we abort the trace.
+            let action = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_one_step(ctx, sym, runtime)
+            })) {
+                Ok(a) => a,
+                Err(_) => return TraceAction::AbortPermanent,
+            };
             if !matches!(action, TraceAction::Continue) {
                 return action;
             }
