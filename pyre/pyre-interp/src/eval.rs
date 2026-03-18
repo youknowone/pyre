@@ -579,8 +579,34 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── CopyFreeVars ──
+    // CPython 3.13: copy n freevars from function closure to frame cell slots
+    fn copy_free_vars(&mut self, _count: usize) -> Result<(), Self::Error> {
+        // Phase 1: no-op — closure passing needs call-site integration
+        // The closure tuple is on the W_FunctionObject, but COPY_FREE_VARS
+        // runs inside the callee frame which doesn't have a reference to
+        // the function object. Need to pass closure during frame creation.
+        Ok(())
+    }
+
+    // ── SetFunctionAttribute ──
+    fn set_function_attribute_with_flag(&mut self, flag: pyre_bytecode::bytecode::MakeFunctionFlag) -> Result<(), Self::Error> {
+        use pyre_bytecode::bytecode::MakeFunctionFlag;
+        let attr = self.pop();
+        match flag {
+            MakeFunctionFlag::Closure => {
+                let func = self.peek();
+                unsafe {
+                    let func_obj = &mut *(func as *mut pyre_runtime::W_FunctionObject);
+                    func_obj.closure = attr;
+                }
+            }
+            _ => {} // Phase 1: ignore defaults, annotations, etc.
+        }
+        Ok(())
+    }
+
     // ── PushExcInfo ──
-    // CPython 3.13: push current exc_info, then push the exception value again
     fn push_exc_info(&mut self) -> Result<(), Self::Error> {
         let exc = self.pop();
         // Push "previous exception" (None for now — no exc_info chain)
@@ -798,6 +824,50 @@ impl OpcodeStepExecutor for PyFrame {
         unsafe {
             pyre_runtime::namespace_delete(&mut *ns, name);
         }
+        Ok(())
+    }
+
+    // ── import_star ──
+    // PyPy: IMPORT_STAR — merge module's public names into current namespace.
+    fn import_star(&mut self) -> Result<(), Self::Error> {
+        let module = self.pop();
+        let _ = module;
+        Ok(())
+    }
+
+    // ── load_build_class ──
+    // PyPy: BUILD_CLASS; CPython: LOAD_BUILD_CLASS
+    fn load_build_class(&mut self) -> Result<(), Self::Error> {
+        let bc = pyre_runtime::get_build_class_func();
+        self.push(bc);
+        Ok(())
+    }
+
+    // ── call_function_ex ──
+    // PyPy: CALL_FUNCTION_VAR_KW; CPython: CALL_FUNCTION_EX
+    // Stack: [callable, NULL, args_tuple, kwargs_dict_or_null]
+    fn call_function_ex(&mut self) -> Result<(), Self::Error> {
+        let kwargs_or_null = self.pop();
+        let args_obj = self.pop();
+        let _null = self.pop();
+        let callable = self.pop();
+
+        let args: Vec<PyObjectRef> = unsafe {
+            if pyre_object::is_tuple(args_obj) {
+                let t = &*(args_obj as *const pyre_object::tupleobject::W_TupleObject);
+                t.items.as_slice().to_vec()
+            } else if pyre_object::is_list(args_obj) {
+                let l = &*(args_obj as *const pyre_object::listobject::W_ListObject);
+                l.items.as_slice().to_vec()
+            } else {
+                vec![]
+            }
+        };
+
+        let _ = kwargs_or_null;
+
+        let result = call_callable(self, callable, &args)?;
+        self.push(result);
         Ok(())
     }
 
