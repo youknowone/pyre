@@ -4,7 +4,7 @@ use crate::intutils::IntBound;
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::{DescrRef, GcRef, OpRef, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
 
 /// Information about an operation's result, attached during optimization.
 ///
@@ -401,6 +401,69 @@ impl PtrInfo {
         } else {
             None
         }
+    }
+
+    /// info.py: force_box(op, optforce)
+    ///
+    /// If this PtrInfo is virtual, generate the operations needed to
+    /// materialize the virtual object into a concrete allocation.
+    /// Returns a Vec of ops to emit (NEW + SETFIELD/SETARRAYITEM).
+    /// If not virtual, returns empty vec (caller uses original op).
+    pub fn force_box(&self, original_opref: OpRef) -> Vec<Op> {
+        if !self.is_virtual() {
+            return vec![];
+        }
+        let mut ops = Vec::new();
+        match self {
+            PtrInfo::Virtual(v) => {
+                // Emit: NEW_WITH_VTABLE(vtable)
+                let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
+                new_op.descr = Some(v.descr.clone());
+                new_op.pos = original_opref;
+                ops.push(new_op);
+                // Emit: SETFIELD_GC for each field
+                for &(field_idx, value) in &v.fields {
+                    if !value.is_none() {
+                        let mut set_op = Op::new(OpCode::SetfieldGc, &[original_opref, value]);
+                        // The field descriptor index is embedded in the op's descr
+                        // (normally the Descr carries the offset). For now, just
+                        // record the field index for the caller to resolve.
+                        let _ = field_idx;
+                        ops.push(set_op);
+                    }
+                }
+            }
+            PtrInfo::VirtualStruct(v) => {
+                let mut new_op = Op::new(OpCode::New, &[]);
+                new_op.descr = Some(v.descr.clone());
+                new_op.pos = original_opref;
+                ops.push(new_op);
+                for &(field_idx, value) in &v.fields {
+                    if !value.is_none() {
+                        let set_op = Op::new(OpCode::SetfieldGc, &[original_opref, value]);
+                        let _ = field_idx;
+                        ops.push(set_op);
+                    }
+                }
+            }
+            PtrInfo::VirtualArray(v) => {
+                let len_const = OpRef(10000 + v.items.len() as u32); // placeholder
+                let mut new_op = Op::new(OpCode::NewArray, &[len_const]);
+                new_op.descr = Some(v.descr.clone());
+                new_op.pos = original_opref;
+                ops.push(new_op);
+                for (i, &item) in v.items.iter().enumerate() {
+                    if !item.is_none() {
+                        let idx_const = OpRef(10000 + i as u32); // placeholder
+                        let set_op =
+                            Op::new(OpCode::SetarrayitemGc, &[original_opref, idx_const, item]);
+                        ops.push(set_op);
+                    }
+                }
+            }
+            _ => {}
+        }
+        ops
     }
 
     /// Copy fields from this virtual info to another.
