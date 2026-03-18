@@ -110,6 +110,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             vable_array_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
             /// Virtualizable: length OpRefs (storage_idx → OpRef).
             vable_len_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
+            /// Number of storages from the original meta layout.
+            /// Extra storages added during tracing are ignored in Jump args.
+            meta_storage_count: usize,
         }
 
         #[allow(non_camel_case_types)]
@@ -164,16 +167,19 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
                 let mut args = Vec::new();
-                for &(sidx, _) in &self.storage_layout {
+                let count = if #virtualizable { self.meta_storage_count } else { self.storage_layout.len() };
+                for &(sidx, _) in self.storage_layout.iter().take(count) {
                     args.extend(self.stacks[&sidx].to_jump_args());
                 }
                 Some(args)
             }
 
             fn fail_storage_lengths(&self) -> Option<Vec<usize>> {
+                let count = if #virtualizable { self.meta_storage_count } else { self.storage_layout.len() };
                 Some(
                     self.storage_layout
                         .iter()
+                        .take(count)
                         .map(|&(sidx, _)| self.stacks[&sidx].len())
                         .collect(),
                 )
@@ -262,19 +268,15 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     loop_header_pc: header_pc,
                     vable_array_refs,
                     vable_len_refs,
+                    meta_storage_count: meta.storage_layout.len(),
                 }
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
-                if #virtualizable {
-                    // Virtualizable: only check selected (depths are irrelevant).
-                    meta.initial_selected == self.#sel_field
-                } else {
-                    meta.initial_selected == self.#sel_field
-                        && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
-                            self.#pool_field.get(sidx).len() == expected_len
-                        })
-                }
+                meta.initial_selected == self.#sel_field
+                    && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
+                        self.#pool_field.get(sidx).len() == expected_len
+                    })
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
@@ -304,7 +306,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
                 let mut args = Vec::new();
-                for &(sidx, _) in &sym.storage_layout {
+                // Only include original meta storages; extra storages from
+                // trace-time OP_SEL are excluded (must be empty at close).
+                let count = if #virtualizable { sym.meta_storage_count } else { sym.storage_layout.len() };
+                for &(sidx, _) in sym.storage_layout.iter().take(count) {
                     args.extend(sym.stacks[&sidx].to_jump_args());
                 }
                 args
@@ -314,8 +319,18 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
                 if #virtualizable {
-                    // Virtualizable: only check selected matches.
+                    // Virtualizable: check selected + meta storages have same depth.
+                    // Extra storages visited during trace must be empty (depth=0).
                     sym.current_selected == meta.initial_selected
+                        && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
+                            sym.stacks
+                                .get(&sidx)
+                                .is_some_and(|stack| stack.len() == initial_depth)
+                        })
+                        && sym.stacks.iter().all(|(sidx, stack)| {
+                            meta.storage_layout.iter().any(|&(s, _)| s == *sidx)
+                                || stack.len() == 0
+                        })
                 } else {
                     sym.current_selected == meta.initial_selected
                         && sym.storage_layout.len() == meta.storage_layout.len()

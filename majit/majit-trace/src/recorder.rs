@@ -10,7 +10,8 @@ use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 use crate::trace::TreeLoop;
 
 /// Maximum number of operations before the trace is considered too long.
-const TRACE_LIMIT: usize = 6000;
+/// RPython default: trace_limit = 2**14 = 16384
+const TRACE_LIMIT: usize = 16384;
 
 /// The trace recorder: accumulates operations during tracing.
 pub struct Trace {
