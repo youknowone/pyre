@@ -312,6 +312,47 @@ unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     Ok(w_str_new(&sv.repeat(count)))
 }
 
+unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let len_a = w_list_len(a);
+    let len_b = w_list_len(b);
+    let mut items = Vec::with_capacity(len_a + len_b);
+    for i in 0..len_a {
+        if let Some(item) = w_list_getitem(a, i as i64) { items.push(item); }
+    }
+    for i in 0..len_b {
+        if let Some(item) = w_list_getitem(b, i as i64) { items.push(item); }
+    }
+    Ok(w_list_new(items))
+}
+
+unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let len_a = w_tuple_len(a);
+    let len_b = w_tuple_len(b);
+    let mut items = Vec::with_capacity(len_a + len_b);
+    for i in 0..len_a {
+        if let Some(item) = w_tuple_getitem(a, i as i64) { items.push(item); }
+    }
+    for i in 0..len_b {
+        if let Some(item) = w_tuple_getitem(b, i as i64) { items.push(item); }
+    }
+    Ok(w_tuple_new(items))
+}
+
+unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
+    let nv = w_int_get_value(n);
+    let count = if nv < 0 { 0 } else { nv as usize };
+    let len = w_list_len(list);
+    let mut items = Vec::with_capacity(len * count);
+    for _ in 0..count {
+        for i in 0..len {
+            if let Some(item) = w_list_getitem(list, i as i64) {
+                items.push(item);
+            }
+        }
+    }
+    Ok(w_list_new(items))
+}
+
 // ── Comparison operations ─────────────────────────────────────────────
 
 unsafe fn int_lt(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -382,6 +423,12 @@ pub fn py_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_str(a) && is_str(b) {
             return str_concat(a, b);
         }
+        if is_list(a) && is_list(b) {
+            return list_concat(a, b);
+        }
+        if is_tuple(a) && is_tuple(b) {
+            return tuple_concat(a, b);
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -425,6 +472,13 @@ pub fn py_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_int(a) && is_str(b) {
             return str_repeat(b, a);
+        }
+        // list * int
+        if is_list(a) && is_int(b) {
+            return list_repeat(a, b);
+        }
+        if is_int(a) && is_list(b) {
+            return list_repeat(b, a);
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for *: '{}' and '{}'",
