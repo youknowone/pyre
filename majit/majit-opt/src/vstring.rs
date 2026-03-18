@@ -519,8 +519,15 @@ impl OptString {
                     let source = ctx.get_replacement(op.arg(1));
                     let start = ctx.get_replacement(op.arg(2));
                     let stop = ctx.get_replacement(op.arg(3));
-                    // Length = stop - start
-                    let length = stop; // simplified: pass stop as length for now
+                    // vstring.py: length = stop - start
+                    let length = if let Some(length_ref) =
+                        self.int_sub_oprefs(stop, start, ctx)
+                    {
+                        length_ref
+                    } else {
+                        let sub_op = Op::new(OpCode::IntSub, &[stop, start]);
+                        ctx.emit(sub_op)
+                    };
                     self.vstrings.insert(
                         op.pos,
                         VStringInfo::Slice {
@@ -602,6 +609,13 @@ impl Optimization for OptString {
             OpCode::Unicodelen => self.optimize_strlen(op, ctx),
             OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, ctx),
 
+            // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
+            OpCode::Strhash | OpCode::Unicodehash => {
+                let src = ctx.get_replacement(op.arg(0));
+                self.force_if_virtual(src, ctx);
+                OptimizationResult::PassOn
+            }
+
             // vstring.py: optimize_GUARD_NO_EXCEPTION — if the last
             // emitted operation was removed (e.g. a string oopspec call
             // was virtualized), skip the guard.
@@ -614,7 +628,9 @@ impl Optimization for OptString {
             // vstring.py: oopspec call handlers for string operations.
             // STR_CONCAT, STR_SLICE, STR_EQUAL are dispatched by OopSpecIndex
             // on CALL_* ops. For now, check if the call is a string oopspec.
-            OpCode::CallI | OpCode::CallR | OpCode::CallN => {
+            // vstring.py: oopspec call dispatch (CALL and CALL_PURE).
+            OpCode::CallI | OpCode::CallR | OpCode::CallN
+            | OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureN => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
