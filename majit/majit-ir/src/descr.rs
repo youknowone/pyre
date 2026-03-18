@@ -263,6 +263,16 @@ pub trait ArrayDescr: Descr {
     fn is_array_of_structs(&self) -> bool {
         false
     }
+
+    /// descr.py: repr_of_descr()
+    fn repr_of_descr(&self) -> String {
+        format!(
+            "ArrayDescr(base={}, item={}, type={:?})",
+            self.base_size(),
+            self.item_size(),
+            self.item_type()
+        )
+    }
 }
 
 /// Descriptor for a field within an array element (interior pointer).
@@ -327,6 +337,15 @@ pub trait CallDescr: Descr {
     /// Number of arguments.
     fn num_args(&self) -> usize {
         self.arg_types().len()
+    }
+
+    /// descr.py: repr_of_descr()
+    fn repr_of_descr(&self) -> String {
+        format!(
+            "CallDescr(args={}, result={:?})",
+            self.arg_classes(),
+            self.result_type()
+        )
     }
 }
 
