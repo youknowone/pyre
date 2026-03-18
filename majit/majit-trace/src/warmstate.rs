@@ -401,6 +401,14 @@ impl WarmEnterState {
     ///
     /// Called by the interpreter at loop back-edges and function entries.
     /// Returns a `HotResult` telling the interpreter what to do next.
+    pub fn counter_would_fire(&self, green_key_hash: u64) -> bool {
+        if let Some(cell) = self.cells.get(&green_key_hash) {
+            if cell.is_compiled() || cell.is_tracing() { return true; }
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 { return false; }
+        }
+        self.counter.would_fire(green_key_hash)
+    }
+
     pub fn maybe_compile(&mut self, green_key_hash: u64) -> HotResult {
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() {

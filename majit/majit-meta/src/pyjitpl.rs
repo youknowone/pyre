@@ -884,6 +884,11 @@ impl<M: Clone> MetaInterp<M> {
         &mut self.warm_state
     }
 
+    pub fn is_hot_or_tracing(&self, green_key: u64) -> bool {
+        if self.tracing.is_some() { return true; }
+        self.warm_state.counter_would_fire(green_key)
+    }
+
     /// Decay all counters to avoid stale hotness data.
     pub fn decay_counters(&mut self) {
         self.warm_state.decay_counters();

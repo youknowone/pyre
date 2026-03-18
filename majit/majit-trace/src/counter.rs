@@ -27,6 +27,19 @@ impl JitCounter {
         }
     }
 
+    /// Check if counter would fire without modifying state.
+    pub fn would_fire(&self, hash: u64) -> bool {
+        if self.threshold == 0 { return true; }
+        let base = (hash as usize) & TABLE_MASK;
+        for i in 0..ASSOCIATIVITY {
+            let idx = (base + i) & TABLE_MASK;
+            if self.table[idx].0 == hash {
+                return self.table[idx].1 + 1 >= self.threshold;
+            }
+        }
+        1 >= self.threshold
+    }
+
     /// Increment the counter for the given hash. Returns true if threshold is reached.
     pub fn tick(&mut self, hash: u64) -> bool {
         let base = (hash as usize) & TABLE_MASK;
