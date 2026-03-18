@@ -475,6 +475,29 @@ pub struct CompoundOp {
     pub two: Box<PreambleOp>,
 }
 
+impl CompoundOp {
+    /// shortpreamble.py: CompoundOp.flatten(sb, l)
+    ///
+    /// Recursively flatten a tree of CompoundOps into a list of
+    /// ProducedShortOps in dependency order (children first).
+    pub fn flatten(&self) -> Vec<ProducedShortOp> {
+        let mut result = Vec::new();
+        // Emit first sub-op
+        result.push(ProducedShortOp {
+            kind: self.one.kind.clone(),
+            preamble_op: self.one.op.clone(),
+        });
+        // Emit second sub-op (may itself be compound — but in Rust
+        // we don't have the recursive PreambleOp tree structure,
+        // so we just emit `two` directly).
+        result.push(ProducedShortOp {
+            kind: self.two.kind.clone(),
+            preamble_op: self.two.op.clone(),
+        });
+        result
+    }
+}
+
 /// shortpreamble.py: ShortInputArg — a short op that represents
 /// a label input argument (no actual operation needed, just maps
 /// a preamble value to a label arg position).
@@ -484,6 +507,27 @@ pub struct ShortInputArg {
     pub res: OpRef,
     /// The preamble operation that produces this value.
     pub preamble_op: Op,
+}
+
+impl ShortInputArg {
+    /// shortpreamble.py: ShortInputArg.add_op_to_short(sb)
+    ///
+    /// Returns a ProducedShortOp wrapping the preamble_op.
+    /// For input args, the preamble_op is just forwarded.
+    pub fn add_op_to_short(&self) -> ProducedShortOp {
+        ProducedShortOp {
+            kind: PreambleOpKind::Pure,
+            preamble_op: self.preamble_op.clone(),
+        }
+    }
+
+    /// shortpreamble.py: ShortInputArg.produce_op(opt, ...)
+    ///
+    /// For input args, produce_op is a no-op — the value is
+    /// already available as a label argument.
+    pub fn produce_op(&self) {
+        // No-op: the value is directly available from label args
+    }
 }
 
 /// shortpreamble.py: ProducedShortOp — wraps a short op with its
