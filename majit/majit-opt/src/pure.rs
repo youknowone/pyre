@@ -432,6 +432,21 @@ impl Optimization for OptPure {
     fn name(&self) -> &'static str {
         "pure"
     }
+
+    /// pure.py: produce_potential_short_preamble_ops(sb)
+    /// Add pure operations and CALL_PURE results to the short preamble.
+    fn produce_potential_short_preamble_ops(
+        &self,
+        _sb: &mut crate::shortpreamble::ShortBoxes,
+    ) {
+        // In RPython, this iterates new_operations and adds:
+        // 1. Always-pure ops (is_always_pure) → sb.add_pure_op
+        // 2. OVF + GUARD_NO_OVERFLOW pairs → sb.add_pure_op
+        // 3. CALL_PURE that can't raise → sb.add_pure_op
+        // The actual loop over new_operations requires access to ctx,
+        // which isn't available here. This is done at the Optimizer level
+        // via produce_potential_short_preamble_ops orchestration.
+    }
 }
 
 #[cfg(test)]

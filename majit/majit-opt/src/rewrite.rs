@@ -1203,6 +1203,46 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
 
+            // ── rewrite.py: INT_SIGNEXT(x, n) where bounds already fit ──
+            // If x is already known to fit in n bytes, the signext is a no-op.
+            OpCode::IntSignext => {
+                // args: [value, num_bytes]
+                if let Some(nbytes) = ctx.get_constant_int(op.arg(1)) {
+                    if nbytes == 8 {
+                        // signext to 8 bytes is always a no-op on 64-bit
+                        ctx.replace_op(op.pos, op.arg(0));
+                        return OptimizationResult::Remove;
+                    }
+                }
+                OptimizationResult::PassOn
+            }
+
+            // ── rewrite.py: CALL_PURE demote (if not handled by pure.rs) ──
+            OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
+                let call_opcode = OpCode::call_for_type(op.result_type());
+                let mut new_op = Op::new(call_opcode, &op.args);
+                new_op.pos = op.pos;
+                new_op.descr = op.descr.clone();
+                self.last_op_removed = false;
+                OptimizationResult::Emit(new_op)
+            }
+
+            // ── rewrite.py: CALL_LOOPINVARIANT demote ──
+            OpCode::CallLoopinvariantI
+            | OpCode::CallLoopinvariantR
+            | OpCode::CallLoopinvariantF
+            | OpCode::CallLoopinvariantN => {
+                let call_opcode = OpCode::call_for_type(op.result_type());
+                let mut new_op = Op::new(call_opcode, &op.args);
+                new_op.pos = op.pos;
+                new_op.descr = op.descr.clone();
+                self.last_op_removed = false;
+                OptimizationResult::Emit(new_op)
+            }
+
+            // ── rewrite.py: ASSERT_NOT_NONE → no-op ──
+            OpCode::AssertNotNone => OptimizationResult::Remove,
+
             // Everything else: pass on to next optimization pass
             _ => OptimizationResult::PassOn,
         }
