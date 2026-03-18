@@ -120,7 +120,7 @@ extern "C" fn jit_call_user_function_from_frame(
     }
 }
 
-extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
+pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
@@ -377,6 +377,15 @@ pub fn callee_frame_helper(nargs: usize) -> Option<*const ()> {
         4 => Some(jit_create_callee_frame_4 as *const ()),
         _ => None,
     }
+}
+
+/// Force callee and return BOXED result (for inline_function_call).
+/// Unlike jit_force_callee_frame which returns raw int for the CA protocol,
+/// this returns a boxed PyObjectRef for use in traces that expect boxed values.
+pub extern "C" fn jit_force_callee_frame_boxed(frame_ptr: i64) -> i64 {
+    let raw = jit_force_callee_frame(frame_ptr);
+    // Re-box: raw int → PyObjectRef
+    pyre_object::intobject::w_int_new(raw) as i64
 }
 
 pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {

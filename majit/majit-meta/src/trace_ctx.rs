@@ -1093,13 +1093,6 @@ impl TraceCtx {
         self.call_typed(OpCode::CallI, func_ptr, args, arg_types, Type::Int)
     }
 
-    /// Record a may-force int call (CallMayForceI). The callee may trigger
-    /// a force via virtualizable — pair with GuardNotForced.
-    pub fn call_may_force_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        self.call_typed(OpCode::CallMayForceI, func_ptr, args, &arg_types, Type::Int)
-    }
-
     pub fn call_elidable_int_typed(
         &mut self,
         func_ptr: *const (),
