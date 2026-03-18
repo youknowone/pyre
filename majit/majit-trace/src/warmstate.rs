@@ -338,6 +338,16 @@ pub struct WarmEnterState {
     vec_cost: u32,
     /// warmstate.py: enable_opts — list of enabled optimization pass names.
     enable_opts: Vec<String>,
+    /// warmstate.py: set_param_inlining — whether inlining is enabled.
+    inlining: bool,
+    /// warmstate.py: set_param_disable_unrolling — threshold below
+    /// which loop unrolling is disabled.
+    disable_unrolling_threshold: u32,
+    /// warmstate.py: set_param_pureop_historylength — size of the
+    /// pure operation history cache.
+    pureop_historylength: u32,
+    /// warmstate.py: set_param_decay — counter decay factor.
+    decay: u32,
 }
 
 /// Result of checking whether a green key is hot.
@@ -376,6 +386,10 @@ impl WarmEnterState {
             vectorize: false,
             vec_cost: 0,
             enable_opts: Vec::new(),
+            inlining: true,
+            disable_unrolling_threshold: 0,
+            pureop_historylength: 16,
+            decay: 40,
         }
     }
 
@@ -401,6 +415,10 @@ impl WarmEnterState {
             vectorize: false,
             vec_cost: 0,
             enable_opts: Vec::new(),
+            inlining: true,
+            disable_unrolling_threshold: 0,
+            pureop_historylength: 16,
+            decay: 40,
         }
     }
 
@@ -896,7 +914,11 @@ impl WarmEnterState {
             "loop_longevity" => self.loop_longevity = value as u32,
             "vectorize" => self.vectorize = value != 0,
             "vec_cost" => self.vec_cost = value as u32,
-            "enable_opts" => {} // string param in RPython, handled separately
+            "inlining" => self.inlining = value != 0,
+            "disable_unrolling" => self.disable_unrolling_threshold = value as u32,
+            "pureop_historylength" => self.pureop_historylength = value as u32,
+            "decay" => self.decay = value as u32,
+            "enable_opts" => {} // string param, handled by set_param_enable_opts
             _ => {}
         }
     }
@@ -964,6 +986,10 @@ impl WarmEnterState {
             "loop_longevity" => Some(self.loop_longevity as i64),
             "vectorize" => Some(if self.vectorize { 1 } else { 0 }),
             "vec_cost" => Some(self.vec_cost as i64),
+            "inlining" => Some(if self.inlining { 1 } else { 0 }),
+            "disable_unrolling" => Some(self.disable_unrolling_threshold as i64),
+            "pureop_historylength" => Some(self.pureop_historylength as i64),
+            "decay" => Some(self.decay as i64),
             _ => None,
         }
     }
@@ -1004,6 +1030,10 @@ impl WarmEnterState {
             "loop_longevity",
             "vectorize",
             "vec_cost",
+            "inlining",
+            "disable_unrolling",
+            "pureop_historylength",
+            "decay",
         ]
     }
 
@@ -1029,6 +1059,22 @@ impl WarmEnterState {
     }
     pub fn vec_cost(&self) -> u32 {
         self.vec_cost
+    }
+    /// warmstate.py: inlining
+    pub fn inlining(&self) -> bool {
+        self.inlining
+    }
+    /// warmstate.py: disable_unrolling
+    pub fn disable_unrolling_threshold(&self) -> u32 {
+        self.disable_unrolling_threshold
+    }
+    /// warmstate.py: pureop_historylength
+    pub fn pureop_historylength(&self) -> u32 {
+        self.pureop_historylength
+    }
+    /// warmstate.py: decay
+    pub fn decay(&self) -> u32 {
+        self.decay
     }
 
     /// Get a snapshot of current JIT statistics.
