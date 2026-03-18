@@ -311,6 +311,30 @@ pub struct WarmEnterState {
     /// encountered during tracing. Used by `should_inline_function()` to decide
     /// whether to inline or leave as residual call.
     function_call_counts: HashMap<u64, u32>,
+
+    // ── RPython warmstate.py additional parameters ──
+
+    /// Maximum number of retrace attempts for a single green key.
+    /// RPython: `set_param_retrace_limit`
+    retrace_limit: u32,
+    /// Maximum number of extra guards allowed in a retrace before giving up.
+    /// RPython: `set_param_max_retrace_guards`
+    max_retrace_guards: u32,
+    /// Maximum number of loop unrolling iterations.
+    /// RPython: `set_param_max_unroll_loops`
+    max_unroll_loops: u32,
+    /// Maximum recursive unrolling depth.
+    /// RPython: `set_param_max_unroll_recursion`
+    max_unroll_recursion: u32,
+    /// Loop longevity factor (how long compiled loops survive without being hot).
+    /// RPython: `set_param_loop_longevity`
+    loop_longevity: u32,
+    /// Whether SIMD vectorization is enabled.
+    /// RPython: `set_param_vectorize`
+    vectorize: bool,
+    /// Cost threshold for vectorization decisions.
+    /// RPython: `set_param_vec_cost`
+    vec_cost: u32,
 }
 
 /// Result of checking whether a green key is hot.
@@ -341,6 +365,13 @@ impl WarmEnterState {
             jitlog: Logger::from_env(),
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
+            retrace_limit: 5,
+            max_retrace_guards: 15,
+            max_unroll_loops: 0,
+            max_unroll_recursion: 3,
+            loop_longevity: 1000,
+            vectorize: false,
+            vec_cost: 0,
         }
     }
 
@@ -358,6 +389,13 @@ impl WarmEnterState {
             jitlog,
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
+            retrace_limit: 5,
+            max_retrace_guards: 15,
+            max_unroll_loops: 0,
+            max_unroll_recursion: 3,
+            loop_longevity: 1000,
+            vectorize: false,
+            vec_cost: 0,
         }
     }
 
