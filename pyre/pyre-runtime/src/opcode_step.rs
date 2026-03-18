@@ -903,6 +903,18 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Err(crate::PyError::type_error("convert_value not implemented").into())
     }
 
+    fn get_len(&mut self, _obj: <Self as SharedOpcodeHandler>::Value) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+        Err(crate::PyError::type_error("get_len not implemented").into())
+    }
+    fn load_fast_and_clear(&mut self, _idx: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_fast_and_clear not implemented").into())
+    }
+    fn set_function_attribute(&mut self) -> Result<(), Self::Error> {
+        // Phase 1: pop attribute value, keep function — no-op effectively
+        let _attr = self.pop_value().map_err(Into::into)?;
+        Ok(())
+    }
+
     fn unsupported(
         &mut self,
         instruction: &Instruction,
@@ -1404,6 +1416,35 @@ where
         }
         Instruction::ConvertValue { oparg: conv } => {
             executor.convert_value(conv.get(op_arg))?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Sequence matching ──
+        Instruction::GetLen => {
+            let obj = executor.peek_at(0)?;
+            let len = executor.get_len(obj)?;
+            executor.push_value(len)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Loop / generator control ──
+        Instruction::JumpBackwardNoInterrupt { delta } => {
+            let tgt = u32::from(delta.get(op_arg)) as usize;
+            executor.set_next_instr(next_instr - tgt)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Load fast and clear (comprehension scope) ──
+        Instruction::LoadFastAndClear { var_num } => {
+            let idx = var_num.get(op_arg).as_usize();
+            executor.load_fast_and_clear(idx)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Set function attribute (closure, annotations, etc.) ──
+        Instruction::SetFunctionAttribute { flag } => {
+            let _flag = flag.get(op_arg);
+            executor.set_function_attribute()?;
             Ok(StepResult::Continue)
         }
 
