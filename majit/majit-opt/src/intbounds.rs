@@ -1224,6 +1224,19 @@ impl Optimization for OptIntBounds {
     fn name(&self) -> &'static str {
         "intbounds"
     }
+
+    /// intbounds.py: produce_potential_short_preamble_ops(sb)
+    /// Contribute bounds guards to the short preamble.
+    fn produce_potential_short_preamble_ops(
+        &self,
+        _sb: &mut crate::shortpreamble::ShortBoxes,
+    ) {
+        // In RPython, this adds INT_GE/INT_LE guards for known bounds
+        // that the loop body depends on. The bounds are discovered during
+        // preamble optimization and must be re-checked on bridge entry.
+        // The actual bounds are in self.bounds — a real implementation
+        // would iterate non-trivial bounds and generate guard ops.
+    }
 }
 
 #[cfg(test)]
