@@ -1202,3 +1202,39 @@ pub fn make_array_descr_full(
 ) -> DescrRef {
     std::sync::Arc::new(SimpleArrayDescr::new(index, base_size, item_size, type_id, item_type))
 }
+
+/// Create a call descriptor.
+pub fn make_call_descr(
+    arg_types: Vec<Type>,
+    result_type: Type,
+    effect: EffectInfo,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleCallDescr::new(
+        0,
+        arg_types,
+        result_type,
+        match result_type {
+            Type::Int | Type::Ref => 8,
+            Type::Float => 8,
+            Type::Void => 0,
+        },
+        effect,
+    ))
+}
+
+/// Create a call descriptor with explicit index.
+pub fn make_call_descr_full(
+    index: u32,
+    arg_types: Vec<Type>,
+    result_type: Type,
+    result_size: usize,
+    effect: EffectInfo,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleCallDescr::new(
+        index,
+        arg_types,
+        result_type,
+        result_size,
+        effect,
+    ))
+}
