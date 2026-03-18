@@ -139,11 +139,13 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         }
     }
 
-    match pyre_interp::eval::eval_loop_for_force(frame) {
+    // Use eval_with_jit to leverage compiled code when available.
+    // This matches PyPy's assembler_call_helper which dispatches through
+    // the compiled code first, falling back to blackhole on failure.
+    match crate::eval::eval_with_jit(frame) {
         Ok(result) => {
             // Return raw int value (not boxed pointer) to match the
-            // CallAssembler raw-int protocol. Finish stores raw int,
-            // so force_fn must also return raw int for consistency.
+            // CallAssembler raw-int protocol.
             let raw = if !result.is_null() && unsafe { is_int(result) } {
                 unsafe { w_int_get_value(result) }
             } else {
