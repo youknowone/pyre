@@ -270,11 +270,11 @@ fn build_jit_state(
     let mut jit_state = PyreJitState {
         frame: frame as *const PyFrame as usize,
         next_instr: frame.next_instr,
-        stack_depth: frame.stack_depth,
+        valuestackdepth: frame.valuestackdepth,
     };
     if !jit_state.sync_from_virtualizable(virtualizable_info) {
         jit_state.next_instr = frame.next_instr;
-        jit_state.stack_depth = frame.stack_depth;
+        jit_state.valuestackdepth = frame.valuestackdepth;
     }
     jit_state
 }
@@ -286,10 +286,10 @@ fn sync_jit_state_to_frame(
 ) {
     if !jit_state.sync_to_virtualizable(virtualizable_info) {
         frame.next_instr = jit_state.next_instr;
-        frame.stack_depth = jit_state.stack_depth;
+        frame.valuestackdepth = jit_state.valuestackdepth;
     }
     frame.next_instr = jit_state.next_instr;
-    frame.stack_depth = jit_state.stack_depth;
+    frame.valuestackdepth = jit_state.valuestackdepth;
 }
 
 #[cfg(test)]

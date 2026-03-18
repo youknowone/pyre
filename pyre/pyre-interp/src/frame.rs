@@ -19,9 +19,14 @@ const _: () = assert!(
 
 /// Execution frame for a single Python code block.
 ///
-/// The JIT's Virtualize pass keeps `locals_w` and `value_stack_w`
-/// in CPU registers during compiled code execution, eliminating
-/// heap reads/writes for the hottest interpreter state.
+/// Unified `locals_cells_stack_w` array stores locals (indices 0..nlocals)
+/// and the operand stack (indices nlocals..) in one contiguous allocation.
+/// `valuestackdepth` is the absolute index into this array; it starts at
+/// `nlocals` (empty stack) and grows upward on push.
+///
+/// The JIT's Virtualize pass keeps `locals_cells_stack_w` slots in CPU
+/// registers during compiled code execution, eliminating heap reads/writes
+/// for the hottest interpreter state.
 ///
 /// The `vable_token` field coordinates ownership: when JIT code is
 /// running, the token is nonzero and the canonical field values live
@@ -35,12 +40,12 @@ pub struct PyFrame {
     /// Raw pointer to the code object (shared, not owned — the CodeObject
     /// is leaked via `Box::into_raw` at creation time and lives forever).
     pub code: *const CodeObject,
-    /// Local variables (fast locals), indexed by varname slot.
-    pub locals_w: PyObjectArray,
-    /// Operand stack for bytecode execution.
-    pub value_stack_w: PyObjectArray,
-    /// Current stack depth (number of live values on value_stack_w).
-    pub stack_depth: usize,
+    /// Unified locals + operand stack array.
+    /// Indices 0..nlocals are local variables, nlocals.. is the operand stack.
+    pub locals_cells_stack_w: PyObjectArray,
+    /// Absolute index into `locals_cells_stack_w` marking the top of the
+    /// operand stack. Starts at `nlocals` (empty stack), grows upward.
+    pub valuestackdepth: usize,
     /// Index of the next instruction to execute.
     pub next_instr: usize,
     /// Raw pointer to the shared globals namespace object.
@@ -63,14 +68,16 @@ pub const PYFRAME_VABLE_TOKEN_OFFSET: usize = std::mem::offset_of!(PyFrame, vabl
 /// Byte offset of `next_instr` in `PyFrame`.
 pub const PYFRAME_NEXT_INSTR_OFFSET: usize = std::mem::offset_of!(PyFrame, next_instr);
 
-/// Byte offset of `stack_depth` in `PyFrame`.
-pub const PYFRAME_STACK_DEPTH_OFFSET: usize = std::mem::offset_of!(PyFrame, stack_depth);
+/// Byte offset of `valuestackdepth` in `PyFrame`.
+pub const PYFRAME_VALUESTACKDEPTH_OFFSET: usize = std::mem::offset_of!(PyFrame, valuestackdepth);
 
-/// Byte offset of `locals_w` in `PyFrame`.
-pub const PYFRAME_LOCALS_OFFSET: usize = std::mem::offset_of!(PyFrame, locals_w);
+/// Byte offset of `locals_cells_stack_w` in `PyFrame`.
+pub const PYFRAME_LOCALS_CELLS_STACK_OFFSET: usize =
+    std::mem::offset_of!(PyFrame, locals_cells_stack_w);
 
-/// Byte offset of `value_stack_w` in `PyFrame`.
-pub const PYFRAME_STACK_OFFSET: usize = std::mem::offset_of!(PyFrame, value_stack_w);
+// Backward-compat aliases used by JIT code.
+pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
+pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 
 impl PyFrame {
     /// Create a new frame for executing a code object with a fresh execution context.
@@ -104,38 +111,43 @@ impl PyFrame {
         PyFrame {
             execution_context,
             code,
-            locals_w: PyObjectArray::filled(num_locals, PY_NULL),
-            value_stack_w: PyObjectArray::filled(max_stack, PY_NULL),
-            stack_depth: 0,
+            locals_cells_stack_w: PyObjectArray::filled(num_locals + max_stack, PY_NULL),
+            valuestackdepth: num_locals,
             next_instr: 0,
             namespace,
             vable_token: 0,
         }
     }
 
+    /// Number of local variable slots (from code object).
+    #[inline]
+    pub fn nlocals(&self) -> usize {
+        unsafe { (&(*self.code).varnames).len() }
+    }
+
     // ── Stack operations ──────────────────────────────────────────────
 
     #[inline]
     pub fn push(&mut self, value: PyObjectRef) {
-        self.value_stack_w[self.stack_depth] = value;
-        self.stack_depth += 1;
+        self.locals_cells_stack_w[self.valuestackdepth] = value;
+        self.valuestackdepth += 1;
     }
 
     #[inline]
     pub fn pop(&mut self) -> PyObjectRef {
-        self.stack_depth -= 1;
-        self.value_stack_w[self.stack_depth]
+        self.valuestackdepth -= 1;
+        self.locals_cells_stack_w[self.valuestackdepth]
     }
 
     #[inline]
     pub fn peek(&self) -> PyObjectRef {
-        self.value_stack_w[self.stack_depth - 1]
+        self.locals_cells_stack_w[self.valuestackdepth - 1]
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
-        self.value_stack_w[self.stack_depth - 1 - depth]
+        self.locals_cells_stack_w[self.valuestackdepth - 1 - depth]
     }
 
     /// Create a new frame for a function call.
@@ -152,19 +164,18 @@ impl PyFrame {
         let num_locals = code_ref.varnames.len();
         let max_stack = code_ref.max_stackdepth as usize;
 
-        let mut locals_w = PyObjectArray::filled(num_locals, PY_NULL);
+        let mut locals_cells_stack_w = PyObjectArray::filled(num_locals + max_stack, PY_NULL);
         // Bind positional arguments directly — no intermediate Vec.
         let nargs = args.len().min(num_locals);
         for i in 0..nargs {
-            locals_w[i] = args[i];
+            locals_cells_stack_w[i] = args[i];
         }
 
         PyFrame {
             execution_context,
             code,
-            locals_w,
-            value_stack_w: PyObjectArray::filled(max_stack, PY_NULL),
-            stack_depth: 0,
+            locals_cells_stack_w,
+            valuestackdepth: num_locals,
             next_instr: 0,
             namespace: globals,
             vable_token: 0,
@@ -184,8 +195,7 @@ impl PyFrame {
     /// frame is at its final stack location.
     #[inline]
     pub fn fix_array_ptrs(&mut self) {
-        self.locals_w.fix_ptr();
-        self.value_stack_w.fix_ptr();
+        self.locals_cells_stack_w.fix_ptr();
     }
 }
 

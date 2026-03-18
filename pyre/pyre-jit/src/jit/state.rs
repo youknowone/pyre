@@ -40,8 +40,8 @@ use crate::jit::descr::{
     tuple_items_len_descr, tuple_items_ptr_descr, w_int_size_descr,
 };
 use crate::jit::frame_layout::{
-    PYFRAME_LOCALS_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
-    PYFRAME_STACK_DEPTH_OFFSET, PYFRAME_STACK_OFFSET,
+    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
+    PYFRAME_VALUESTACKDEPTH_OFFSET,
 };
 use crate::jit::helpers::{TraceHelperAccess, emit_trace_bool_value_from_truth};
 
@@ -54,8 +54,9 @@ pub struct PyreJitState {
     pub frame: usize,
     /// Current instruction index.
     pub next_instr: usize,
-    /// Current stack depth.
-    pub stack_depth: usize,
+    /// Absolute index into `locals_cells_stack_w` marking stack top.
+    /// Starts at `nlocals` (empty stack), grows upward on push.
+    pub valuestackdepth: usize,
 }
 
 /// Meta information for a trace — describes the shape of the code being traced.
@@ -67,20 +68,20 @@ pub struct PyreMeta {
     pub num_locals: usize,
     /// Sorted namespace keys expected by this trace.
     pub ns_keys: Vec<String>,
-    /// Stack depth at the merge point.
-    pub stack_depth: usize,
+    /// Absolute valuestackdepth at the merge point.
+    pub valuestackdepth: usize,
     /// Whether the optimizer uses the virtualizable mechanism.
     /// When true, guard fail_args follow the layout:
-    ///   [frame, next_instr, stack_depth, locals_len, l0..lN, stack_len, s0..sM]
+    ///   [frame, next_instr, valuestackdepth, l0..lN, s0..sM]
     pub has_virtualizable: bool,
 }
 
 /// Symbolic state during tracing.
 ///
 /// `frame` maps to a live IR `OpRef`. Symbolic frame field tracking
-/// (locals, stack, stack_depth, next_instr) persists across instructions.
+/// (locals, stack, valuestackdepth, next_instr) persists across instructions.
 /// Locals and stack are virtualized (carried through JUMP args);
-/// only next_instr and stack_depth are synced before guards / loop close.
+/// only next_instr and valuestackdepth are synced before guards / loop close.
 pub struct PyreSym {
     /// OpRef for the owning PyFrame pointer.
     pub frame: OpRef,
@@ -89,25 +90,25 @@ pub struct PyreSym {
     pub(crate) symbolic_locals: Vec<OpRef>,
     pub(crate) symbolic_stack: Vec<OpRef>,
     pub(crate) pending_next_instr: Option<usize>,
-    pub(crate) locals_array_ref: OpRef,
-    pub(crate) stack_array_ref: OpRef,
-    pub(crate) stack_depth: usize,
+    pub(crate) locals_cells_stack_array_ref: OpRef,
+    /// Absolute index into the unified array (starts at nlocals).
+    pub(crate) valuestackdepth: usize,
+    /// Number of local variable slots (cached from code object).
+    pub(crate) nlocals: usize,
     pub(crate) symbolic_initialized: bool,
     pub(crate) vable_next_instr: OpRef,
-    pub(crate) vable_stack_depth: OpRef,
-    /// Base OpRef index for virtualizable local variables.
-    /// When set, symbolic_locals[i] = OpRef(vable_locals_base + i).
-    pub(crate) vable_locals_base: Option<u32>,
-    /// Base OpRef index for virtualizable stack slots.
-    /// When set, symbolic_stack[i] = OpRef(vable_stack_base + i).
-    pub(crate) vable_stack_base: Option<u32>,
+    pub(crate) vable_valuestackdepth: OpRef,
+    /// Base OpRef index for virtualizable array slots.
+    /// When set, symbolic_locals[i] = OpRef(vable_array_base + i),
+    /// symbolic_stack[j] = OpRef(vable_array_base + nlocals + j).
+    pub(crate) vable_array_base: Option<u32>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
 ///
 /// Per-instruction wrapper that borrows persistent symbolic state from
 /// `PyreSym` via raw pointer. The symbolic tracking (locals, stack,
-/// stack_depth, next_instr) lives in PyreSym and survives across
+/// valuestackdepth, next_instr) lives in PyreSym and survives across
 /// instructions; this struct provides the per-instruction context
 /// (ctx, fallthrough_pc, concrete_frame).
 pub(crate) struct TraceFrameState {
@@ -125,16 +126,12 @@ fn pyobject_array_descr() -> DescrRef {
     make_array_descr(0, 8, Type::Int, false)
 }
 
-fn frame_locals_descr() -> DescrRef {
-    make_field_descr(PYFRAME_LOCALS_OFFSET, 8, Type::Int, false)
-}
-
-fn frame_stack_descr() -> DescrRef {
-    make_field_descr(PYFRAME_STACK_OFFSET, 8, Type::Int, false)
+fn frame_locals_cells_stack_descr() -> DescrRef {
+    make_field_descr(PYFRAME_LOCALS_CELLS_STACK_OFFSET, 8, Type::Int, false)
 }
 
 fn frame_stack_depth_descr() -> DescrRef {
-    make_field_descr(PYFRAME_STACK_DEPTH_OFFSET, 8, Type::Int, true)
+    make_field_descr(PYFRAME_VALUESTACKDEPTH_OFFSET, 8, Type::Int, true)
 }
 
 fn frame_next_instr_descr() -> DescrRef {
@@ -149,12 +146,8 @@ pub(crate) fn trace_ob_type_descr() -> DescrRef {
     make_field_descr(OB_TYPE_OFFSET, 8, Type::Int, false)
 }
 
-pub(crate) fn frame_locals_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_locals_descr())
-}
-
-pub(crate) fn frame_stack_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_stack_descr())
+pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
+    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_locals_cells_stack_descr())
 }
 
 pub(crate) fn frame_namespace_ptr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
@@ -202,21 +195,36 @@ pub(crate) fn frame_get_stack_depth(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_stack_depth_descr())
 }
 
-pub(crate) fn concrete_stack_value(frame: usize, idx: usize) -> Option<PyObjectRef> {
+/// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
+pub(crate) fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let stack = unsafe { &*(frame_ptr.add(PYFRAME_STACK_OFFSET) as *const PyObjectArray) };
-    stack.as_slice().get(idx).copied()
+    let arr =
+        unsafe { &*(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *const PyObjectArray) };
+    arr.as_slice().get(abs_idx).copied()
 }
 
+/// Return nlocals for the given frame (from the unified array's total length and code object).
+pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
+    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
+    let code_ptr = unsafe {
+        *(frame_ptr.add(crate::jit::frame_layout::PYFRAME_CODE_OFFSET)
+            as *const *const pyre_bytecode::CodeObject)
+    };
+    if code_ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { (&(*code_ptr).varnames).len() })
+}
+
+/// Return nlocals as the "locals_len" for virtualizable.
 pub(crate) fn concrete_locals_len(frame: usize) -> Option<usize> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let locals = unsafe { &*(frame_ptr.add(PYFRAME_LOCALS_OFFSET) as *const PyObjectArray) };
-    Some(locals.len())
+    concrete_nlocals(frame)
 }
 
+/// Return the absolute valuestackdepth.
 pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    Some(unsafe { *(frame_ptr.add(PYFRAME_STACK_DEPTH_OFFSET) as *const usize) })
+    Some(unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
 }
 
 pub(crate) fn concrete_namespace_slot(frame: usize, name: &str) -> Option<usize> {
@@ -250,7 +258,12 @@ fn synthesize_fresh_callee_entry_args(
     args: &[OpRef],
     callee_nlocals: usize,
 ) -> Vec<OpRef> {
-    let mut ca_args = vec![callee_frame, ctx.const_int(0), ctx.const_int(0)];
+    // Fresh entry: next_instr=0, valuestackdepth=nlocals (empty stack)
+    let mut ca_args = vec![
+        callee_frame,
+        ctx.const_int(0),
+        ctx.const_int(callee_nlocals as i64),
+    ];
     ca_args.extend(args.iter().copied().take(callee_nlocals));
     let null = ctx.const_int(PY_NULL as i64);
     while ca_args.len() < 3 + callee_nlocals {
@@ -266,14 +279,13 @@ impl PyreSym {
             symbolic_locals: Vec::new(),
             symbolic_stack: Vec::new(),
             pending_next_instr: None,
-            locals_array_ref: OpRef::NONE,
-            stack_array_ref: OpRef::NONE,
-            stack_depth: 0,
+            locals_cells_stack_array_ref: OpRef::NONE,
+            valuestackdepth: 0,
+            nlocals: 0,
             symbolic_initialized: false,
             vable_next_instr: OpRef::NONE,
-            vable_stack_depth: OpRef::NONE,
-            vable_locals_base: None,
-            vable_stack_base: None,
+            vable_valuestackdepth: OpRef::NONE,
+            vable_array_base: None,
         }
     }
 
@@ -283,23 +295,33 @@ impl PyreSym {
         if self.symbolic_initialized {
             return;
         }
-        let nlocals = concrete_locals_len(concrete_frame).unwrap_or(0);
-        let stack_depth = concrete_stack_depth(concrete_frame).unwrap_or(0);
-        self.locals_array_ref = frame_locals_array(ctx, self.frame);
-        self.stack_array_ref = frame_stack_array(ctx, self.frame);
-        self.symbolic_locals = if let Some(base) = self.vable_locals_base {
+        let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
+        let valuestackdepth = concrete_stack_depth(concrete_frame).unwrap_or(nlocals);
+        let stack_only_depth = valuestackdepth.saturating_sub(nlocals);
+        self.nlocals = nlocals;
+        self.locals_cells_stack_array_ref = frame_locals_cells_stack_array(ctx, self.frame);
+        self.symbolic_locals = if let Some(base) = self.vable_array_base {
             (0..nlocals).map(|i| OpRef(base + i as u32)).collect()
         } else {
             vec![OpRef::NONE; nlocals]
         };
-        self.symbolic_stack = if let Some(base) = self.vable_stack_base {
-            (0..stack_depth).map(|i| OpRef(base + i as u32)).collect()
+        self.symbolic_stack = if let Some(base) = self.vable_array_base {
+            let stack_base = base + nlocals as u32;
+            (0..stack_only_depth)
+                .map(|i| OpRef(stack_base + i as u32))
+                .collect()
         } else {
-            vec![OpRef::NONE; stack_depth]
+            vec![OpRef::NONE; stack_only_depth]
         };
         self.pending_next_instr = None;
-        self.stack_depth = stack_depth;
+        self.valuestackdepth = valuestackdepth;
         self.symbolic_initialized = true;
+    }
+
+    /// Stack-only depth (number of values on the operand stack).
+    #[inline]
+    pub(crate) fn stack_only_depth(&self) -> usize {
+        self.valuestackdepth.saturating_sub(self.nlocals)
     }
 }
 
@@ -349,27 +371,29 @@ impl TraceFrameState {
 
     pub(crate) fn push_value(&mut self, _ctx: &mut TraceCtx, value: OpRef) {
         let s = self.sym_mut();
-        let idx = s.stack_depth;
-        if idx >= s.symbolic_stack.len() {
-            s.symbolic_stack.resize(idx + 1, OpRef::NONE);
+        let stack_idx = s.stack_only_depth();
+        if stack_idx >= s.symbolic_stack.len() {
+            s.symbolic_stack.resize(stack_idx + 1, OpRef::NONE);
         }
-        s.symbolic_stack[idx] = value;
-        s.stack_depth += 1;
+        s.symbolic_stack[stack_idx] = value;
+        s.valuestackdepth += 1;
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
         let s = self.sym_mut();
-        let top_idx = s
-            .stack_depth
-            .checked_sub(1)
+        let nlocals = s.nlocals;
+        let stack_idx = s
+            .valuestackdepth
+            .checked_sub(nlocals + 1)
             .ok_or_else(|| pyre_runtime::stack_underflow_error("trace opcode"))?;
-        if s.symbolic_stack[top_idx] == OpRef::NONE {
-            let idx_const = ctx.const_int(top_idx as i64);
-            s.symbolic_stack[top_idx] =
-                trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+        if s.symbolic_stack[stack_idx] == OpRef::NONE {
+            let abs_idx = nlocals + stack_idx;
+            let idx_const = ctx.const_int(abs_idx as i64);
+            s.symbolic_stack[stack_idx] =
+                trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
-        let value = s.symbolic_stack[top_idx];
-        s.stack_depth -= 1;
+        let value = s.symbolic_stack[stack_idx];
+        s.valuestackdepth -= 1;
         Ok(value)
     }
 
@@ -379,33 +403,40 @@ impl TraceFrameState {
         depth: usize,
     ) -> Result<OpRef, PyError> {
         let s = self.sym_mut();
-        let idx = s
-            .stack_depth
-            .checked_sub(depth + 1)
+        let nlocals = s.nlocals;
+        let stack_idx = s
+            .valuestackdepth
+            .checked_sub(nlocals + depth + 1)
             .ok_or_else(|| pyre_runtime::stack_underflow_error("trace peek"))?;
-        if s.symbolic_stack[idx] == OpRef::NONE {
-            let idx_const = ctx.const_int(idx as i64);
-            s.symbolic_stack[idx] = trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+        if s.symbolic_stack[stack_idx] == OpRef::NONE {
+            let abs_idx = nlocals + stack_idx;
+            let idx_const = ctx.const_int(abs_idx as i64);
+            s.symbolic_stack[stack_idx] =
+                trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
-        Ok(s.symbolic_stack[idx])
+        Ok(s.symbolic_stack[stack_idx])
     }
 
     pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
         let s = self.sym_mut();
-        if depth == 0 || s.stack_depth < depth {
+        let stack_only = s.stack_only_depth();
+        if depth == 0 || stack_only < depth {
             return Err(PyError::type_error("stack underflow during trace swap"));
         }
-        let top_idx = s.stack_depth - 1;
-        let other_idx = s.stack_depth - depth;
+        let top_idx = stack_only - 1;
+        let other_idx = stack_only - depth;
+        let nlocals = s.nlocals;
         if s.symbolic_stack[top_idx] == OpRef::NONE {
-            let idx_const = ctx.const_int(top_idx as i64);
+            let abs_idx = nlocals + top_idx;
+            let idx_const = ctx.const_int(abs_idx as i64);
             s.symbolic_stack[top_idx] =
-                trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+                trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
         if s.symbolic_stack[other_idx] == OpRef::NONE {
-            let idx_const = ctx.const_int(other_idx as i64);
+            let abs_idx = nlocals + other_idx;
+            let idx_const = ctx.const_int(abs_idx as i64);
             s.symbolic_stack[other_idx] =
-                trace_array_getitem_value(ctx, s.stack_array_ref, idx_const);
+                trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
         s.symbolic_stack.swap(top_idx, other_idx);
         Ok(())
@@ -421,14 +452,14 @@ impl TraceFrameState {
             return Err(PyError::type_error("local index out of range in trace"));
         }
         if s.symbolic_locals[idx] == OpRef::NONE {
-            if let Some(base) = s.vable_locals_base {
+            if let Some(base) = s.vable_array_base {
                 // Virtualizable: locals[idx] was loaded in the preamble
                 // and carried as a JUMP arg. OpRef(base + idx) references it.
                 s.symbolic_locals[idx] = OpRef(base + idx as u32);
             } else {
                 let idx_const = ctx.const_int(idx as i64);
                 s.symbolic_locals[idx] =
-                    trace_array_getitem_value(ctx, s.locals_array_ref, idx_const);
+                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
             }
         }
         Ok(s.symbolic_locals[idx])
@@ -506,51 +537,54 @@ impl TraceFrameState {
         self.sym_mut().pending_next_instr = Some(self.fallthrough_pc);
     }
 
-    /// Update virtualizable next_instr and stack_depth before guards / loop close.
+    /// Update virtualizable next_instr and valuestackdepth before guards / loop close.
     /// Locals and stack are carried through JUMP args (virtualizable), not flushed to heap.
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let s = self.sym_mut();
         if let Some(pc) = s.pending_next_instr.take() {
             s.vable_next_instr = ctx.const_int(pc as i64);
         }
-        // stack_depth is unconditionally synced (const_int is cheap — deduped by HashMap).
-        s.vable_stack_depth = ctx.const_int(s.stack_depth as i64);
+        // valuestackdepth is unconditionally synced (const_int is cheap — deduped by HashMap).
+        s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
     }
 
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame(ctx);
         let s = self.sym();
-        let mut args = vec![s.frame, s.vable_next_instr, s.vable_stack_depth];
+        let stack_only = s.stack_only_depth();
+        let mut args = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
         args.extend_from_slice(&s.symbolic_locals);
-        args.extend_from_slice(&s.symbolic_stack[..s.stack_depth.min(s.symbolic_stack.len())]);
+        args.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         args
     }
 
-    /// Build the current fail_args for guards: [frame, ni, sd, locals..., stack...]
+    /// Build the current fail_args for guards: [frame, ni, vsd, locals..., stack...]
     pub(crate) fn current_fail_args(&self, _ctx: &mut TraceCtx) -> Vec<OpRef> {
         let s = self.sym();
-        let mut fa = vec![s.frame, s.vable_next_instr, s.vable_stack_depth];
-        // When virtualizable locals are active (vable_locals_base is set),
+        let stack_only = s.stack_only_depth();
+        let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
+        // When virtualizable array is active (vable_array_base is set),
         // DON'T include symbolic_locals in fail_args — they are recovered
         // from the virtualizable frame via augment_guard_with_virtualizable.
         // Including them would force virtual New objects to materialize,
         // preventing boxing elimination.
-        if s.vable_locals_base.is_none() {
+        if s.vable_array_base.is_none() {
             fa.extend_from_slice(&s.symbolic_locals);
         }
-        fa.extend_from_slice(&s.symbolic_stack[..s.stack_depth.min(s.symbolic_stack.len())]);
+        fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         fa
     }
 
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         self.flush_to_frame(ctx);
         let s = self.sym();
-        let stack_slice = &s.symbolic_stack[..s.stack_depth.min(s.symbolic_stack.len())];
+        let stack_only = s.stack_only_depth();
+        let stack_slice = &s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())];
         record_current_state_guard(
             ctx,
             s.frame,
             s.vable_next_instr,
-            s.vable_stack_depth,
+            s.vable_valuestackdepth,
             &s.symbolic_locals,
             stack_slice,
             opcode,
@@ -604,23 +638,23 @@ impl TraceFrameState {
     }
 
     fn concrete_popped_value(&self) -> Option<PyObjectRef> {
-        concrete_stack_value(self.concrete_frame, self.sym().stack_depth)
+        concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth)
     }
 
     fn concrete_binary_operands(&self) -> Option<(PyObjectRef, PyObjectRef)> {
-        let sd = self.sym().stack_depth;
+        let vsd = self.sym().valuestackdepth;
         Some((
-            concrete_stack_value(self.concrete_frame, sd)?,
-            concrete_stack_value(self.concrete_frame, sd + 1)?,
+            concrete_stack_value(self.concrete_frame, vsd)?,
+            concrete_stack_value(self.concrete_frame, vsd + 1)?,
         ))
     }
 
     fn concrete_store_subscr_operands(&self) -> Option<(PyObjectRef, PyObjectRef, PyObjectRef)> {
-        let sd = self.sym().stack_depth;
+        let vsd = self.sym().valuestackdepth;
         Some((
-            concrete_stack_value(self.concrete_frame, sd)?,
-            concrete_stack_value(self.concrete_frame, sd + 1)?,
-            concrete_stack_value(self.concrete_frame, sd + 2)?,
+            concrete_stack_value(self.concrete_frame, vsd)?,
+            concrete_stack_value(self.concrete_frame, vsd + 1)?,
+            concrete_stack_value(self.concrete_frame, vsd + 2)?,
         ))
     }
 
@@ -1208,17 +1242,17 @@ impl TraceFrameState {
 
     pub(crate) fn concrete_iter_continues(&self) -> Result<bool, PyError> {
         let concrete_iter =
-            concrete_stack_value(self.concrete_frame, self.sym().stack_depth - 1)
+            concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth - 1)
                 .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
         range_iter_continues(concrete_iter)
     }
 
     fn concrete_callable_after_pops(&self) -> Option<PyObjectRef> {
-        concrete_stack_value(self.concrete_frame, self.sym().stack_depth)
+        concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth)
     }
 
     fn concrete_call_arg_after_pops(&self, arg_idx: usize) -> Option<PyObjectRef> {
-        concrete_stack_value(self.concrete_frame, self.sym().stack_depth + 2 + arg_idx)
+        concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth + 2 + arg_idx)
     }
 
     fn direct_len_value(&mut self, callable: OpRef, value: OpRef) -> Result<OpRef, PyError> {
@@ -1592,7 +1626,8 @@ impl TraceFrameState {
                                 )
                             });
                             let callee_nlocals = callee_meta.num_locals;
-                            let callee_sdepth = callee_meta.stack_depth;
+                            let callee_vsd = callee_meta.valuestackdepth;
+                            let callee_stack_only = callee_vsd.saturating_sub(callee_nlocals);
                             let target_num_inputs =
                                 driver.get_compiled_num_inputs(callee_key).unwrap_or(1);
 
@@ -1604,7 +1639,7 @@ impl TraceFrameState {
 
                                 let ca_args = if target_num_inputs <= 1 {
                                     vec![callee_frame]
-                                } else if callee_sdepth == 0 {
+                                } else if callee_stack_only == 0 {
                                     synthesize_fresh_callee_entry_args(
                                         ctx,
                                         callee_frame,
@@ -1615,22 +1650,21 @@ impl TraceFrameState {
                                     let callee_ni = frame_get_next_instr(ctx, callee_frame);
                                     let callee_sd = frame_get_stack_depth(ctx, callee_frame);
                                     let mut a = vec![callee_frame, callee_ni, callee_sd];
-                                    let callee_locals_ptr = frame_locals_array(ctx, callee_frame);
+                                    let callee_arr = frame_locals_cells_stack_array(ctx, callee_frame);
                                     for i in 0..callee_nlocals {
                                         let idx = ctx.const_int(i as i64);
                                         let val = ctx.record_op_with_descr(
                                             OpCode::GetarrayitemRawI,
-                                            &[callee_locals_ptr, idx],
+                                            &[callee_arr, idx],
                                             pyobject_array_descr(),
                                         );
                                         a.push(val);
                                     }
-                                    let callee_stack_ptr = frame_stack_array(ctx, callee_frame);
-                                    for i in 0..callee_sdepth {
-                                        let idx = ctx.const_int(i as i64);
+                                    for i in 0..callee_stack_only {
+                                        let idx = ctx.const_int((callee_nlocals + i) as i64);
                                         let val = ctx.record_op_with_descr(
                                             OpCode::GetarrayitemRawI,
-                                            &[callee_stack_ptr, idx],
+                                            &[callee_arr, idx],
                                             pyobject_array_descr(),
                                         );
                                         a.push(val);
@@ -1737,7 +1771,7 @@ impl TraceFrameState {
 
     pub(crate) fn iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
         let concrete_iter =
-            concrete_stack_value(self.concrete_frame, self.sym().stack_depth - 1)
+            concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth - 1)
                 .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step =
@@ -1796,7 +1830,7 @@ impl TraceFrameState {
     }
 
     pub(crate) fn concrete_branch_truth(&self) -> Result<bool, PyError> {
-        let concrete_val = concrete_stack_value(self.concrete_frame, self.sym().stack_depth)
+        let concrete_val = concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth)
             .ok_or_else(|| PyError::type_error("missing concrete branch value during trace"))?;
         Ok(objspace_truth_value(concrete_val))
     }
@@ -2312,20 +2346,12 @@ impl PyreJitState {
         true
     }
 
-    fn locals_array(&self) -> Option<&PyObjectArray> {
-        self.frame_array(PYFRAME_LOCALS_OFFSET)
+    fn locals_cells_stack_array(&self) -> Option<&PyObjectArray> {
+        self.frame_array(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
     }
 
-    fn locals_array_mut(&mut self) -> Option<&mut PyObjectArray> {
-        self.frame_array_mut(PYFRAME_LOCALS_OFFSET)
-    }
-
-    fn stack_array(&self) -> Option<&PyObjectArray> {
-        self.frame_array(PYFRAME_STACK_OFFSET)
-    }
-
-    fn stack_array_mut(&mut self) -> Option<&mut PyObjectArray> {
-        self.frame_array_mut(PYFRAME_STACK_OFFSET)
+    fn locals_cells_stack_array_mut(&mut self) -> Option<&mut PyObjectArray> {
+        self.frame_array_mut(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
     }
 
     fn namespace_ptr(&self) -> Option<*mut PyNamespace> {
@@ -2353,39 +2379,47 @@ impl PyreJitState {
     }
 
     pub fn local_at(&self, idx: usize) -> Option<PyObjectRef> {
-        self.locals_array()
-            .and_then(|locals| locals.as_slice().get(idx).copied())
+        self.locals_cells_stack_array()
+            .and_then(|arr| arr.as_slice().get(idx).copied())
     }
 
+    /// Number of local variable slots.
     pub fn local_count(&self) -> usize {
-        self.locals_array().map(PyObjectArray::len).unwrap_or(0)
+        concrete_nlocals(self.frame).unwrap_or(0)
     }
 
     pub fn set_local_at(&mut self, idx: usize, value: PyObjectRef) -> bool {
-        let Some(locals) = self.locals_array_mut() else {
+        let Some(arr) = self.locals_cells_stack_array_mut() else {
             return false;
         };
-        let Some(slot) = locals.as_mut_slice().get_mut(idx) else {
+        let Some(slot) = arr.as_mut_slice().get_mut(idx) else {
             return false;
         };
         *slot = value;
         true
     }
 
+    /// Read a stack value at stack-relative index `idx` (0-based from stack bottom).
     pub fn stack_at(&self, idx: usize) -> Option<PyObjectRef> {
-        self.stack_array()
-            .and_then(|stack| stack.as_slice().get(idx).copied())
+        let nlocals = self.local_count();
+        self.locals_cells_stack_array()
+            .and_then(|arr| arr.as_slice().get(nlocals + idx).copied())
     }
 
-    pub fn stack_capacity(&self) -> usize {
-        self.stack_array().map(PyObjectArray::len).unwrap_or(0)
+    /// Total capacity of the unified array.
+    pub fn array_capacity(&self) -> usize {
+        self.locals_cells_stack_array()
+            .map(PyObjectArray::len)
+            .unwrap_or(0)
     }
 
+    /// Set a stack value at stack-relative index `idx`.
     pub fn set_stack_at(&mut self, idx: usize, value: PyObjectRef) -> bool {
-        let Some(stack) = self.stack_array_mut() else {
+        let nlocals = self.local_count();
+        let Some(arr) = self.locals_cells_stack_array_mut() else {
             return false;
         };
-        let Some(slot) = stack.as_mut_slice().get_mut(idx) else {
+        let Some(slot) = arr.as_mut_slice().get_mut(nlocals + idx) else {
             return false;
         };
         *slot = value;
@@ -2394,50 +2428,53 @@ impl PyreJitState {
 
     fn sync_scalar_fields_to_frame(&mut self) -> bool {
         self.write_frame_usize(PYFRAME_NEXT_INSTR_OFFSET, self.next_instr)
-            && self.write_frame_usize(PYFRAME_STACK_DEPTH_OFFSET, self.stack_depth)
+            && self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, self.valuestackdepth)
     }
 
     fn refresh_from_frame(&mut self) -> bool {
         let Some(next_instr) = self.read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET) else {
             return false;
         };
-        let Some(stack_depth) = self.read_frame_usize(PYFRAME_STACK_DEPTH_OFFSET) else {
+        let Some(valuestackdepth) = self.read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET) else {
             return false;
         };
-        if self.locals_array().is_none() || self.stack_array().is_none() {
+        if self.locals_cells_stack_array().is_none() {
             return false;
         }
 
         self.next_instr = next_instr;
-        self.stack_depth = stack_depth;
+        self.valuestackdepth = valuestackdepth;
         true
     }
 
     /// Restore from virtualizable fail_args format:
-    ///   [frame, next_instr, stack_depth, l0..lN-1, s0..sM-1]
+    ///   [frame, next_instr, valuestackdepth, l0..lN-1, s0..sM-1]
     fn restore_virtualizable_i64(&mut self, values: &[i64]) {
         let mut idx = 1;
 
-        // Static fields: next_instr, stack_depth
+        // Static fields: next_instr, valuestackdepth
         if idx < values.len() {
             self.next_instr = values[idx] as usize;
             idx += 1;
         }
         if idx < values.len() {
-            self.stack_depth = values[idx] as usize;
+            self.valuestackdepth = values[idx] as usize;
             idx += 1;
         }
 
-        // Locals follow directly
-        for i in 0..self.local_count() {
+        let nlocals = self.local_count();
+
+        // Locals follow directly (indices 0..nlocals in unified array)
+        for i in 0..nlocals {
             if idx < values.len() {
                 let _ = self.set_local_at(i, values[idx] as PyObjectRef);
                 idx += 1;
             }
         }
 
-        // Stack values follow locals
-        for i in 0..self.stack_depth {
+        // Stack values follow locals (indices nlocals..valuestackdepth)
+        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        for i in 0..stack_only {
             if idx < values.len() {
                 let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
                 idx += 1;
@@ -2453,36 +2490,24 @@ impl PyreJitState {
         let Some(&next_instr) = static_boxes.first() else {
             return false;
         };
-        let Some(&stack_depth) = static_boxes.get(1) else {
+        let Some(&valuestackdepth) = static_boxes.get(1) else {
             return false;
         };
-        let Some(locals) = array_boxes.first() else {
-            return false;
-        };
-        let Some(stack) = array_boxes.get(1) else {
+        // Single unified array: locals_cells_stack_w
+        let Some(unified) = array_boxes.first() else {
             return false;
         };
 
         self.next_instr = next_instr as usize;
-        self.stack_depth = stack_depth as usize;
+        self.valuestackdepth = valuestackdepth as usize;
 
-        let Some(frame_locals) = self.locals_array_mut() else {
+        let Some(frame_arr) = self.locals_cells_stack_array_mut() else {
             return false;
         };
-        if frame_locals.len() != locals.len() {
+        if frame_arr.len() != unified.len() {
             return false;
         }
-        for (dst, &src) in frame_locals.as_mut_slice().iter_mut().zip(locals) {
-            *dst = src as PyObjectRef;
-        }
-
-        let Some(frame_stack) = self.stack_array_mut() else {
-            return false;
-        };
-        if frame_stack.len() != stack.len() {
-            return false;
-        }
-        for (dst, &src) in frame_stack.as_mut_slice().iter_mut().zip(stack) {
+        for (dst, &src) in frame_arr.as_mut_slice().iter_mut().zip(unified) {
             *dst = src as PyObjectRef;
         }
 
@@ -2491,26 +2516,17 @@ impl PyreJitState {
                 .read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET)
                 .is_some_and(|next_instr| next_instr == self.next_instr)
             && self
-                .read_frame_usize(PYFRAME_STACK_DEPTH_OFFSET)
-                .is_some_and(|stack_depth| stack_depth == self.stack_depth)
+                .read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
+                .is_some_and(|vsd| vsd == self.valuestackdepth)
     }
 
     fn export_virtualizable_state(&self) -> (Vec<i64>, Vec<Vec<i64>>) {
-        let static_boxes = vec![self.next_instr as i64, self.stack_depth as i64];
-        let array_boxes = vec![
-            self.locals_array()
-                .map(|locals| {
-                    locals
-                        .as_slice()
-                        .iter()
-                        .map(|&value| value as i64)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            self.stack_array()
-                .map(|stack| stack.as_slice().iter().map(|&value| value as i64).collect())
-                .unwrap_or_default(),
-        ];
+        let static_boxes = vec![self.next_instr as i64, self.valuestackdepth as i64];
+        // Single unified array
+        let array_boxes = vec![self
+            .locals_cells_stack_array()
+            .map(|arr| arr.as_slice().iter().map(|&value| value as i64).collect())
+            .unwrap_or_default()];
         (static_boxes, array_boxes)
     }
 
@@ -2518,7 +2534,7 @@ impl PyreJitState {
         let Some(frame_ptr) = self.frame_ptr() else {
             return false;
         };
-        let lengths = vec![self.local_count(), self.stack_capacity()];
+        let lengths = vec![self.array_capacity()];
         let (static_boxes, array_boxes) =
             unsafe { read_all_virtualizable_boxes(info, frame_ptr.cast_const(), &lengths) };
         self.import_virtualizable_state(&static_boxes, &array_boxes)
@@ -2547,33 +2563,34 @@ impl JitState for PyreJitState {
             merge_pc: self.next_instr,
             num_locals: self.local_count(),
             ns_keys: self.namespace_keys(),
-            stack_depth: self.stack_depth,
+            valuestackdepth: self.valuestackdepth,
             has_virtualizable: self.has_virtualizable_info(),
         }
     }
 
     fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        let nlocals = self.local_count();
+        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
         let mut vals = vec![
             self.frame as i64,
             self.next_instr as i64,
-            self.stack_depth as i64,
+            self.valuestackdepth as i64,
         ];
-        for i in 0..self.local_count() {
+        for i in 0..nlocals {
             vals.push(self.local_at(i).unwrap_or(0 as PyObjectRef) as i64);
         }
-        for i in 0..self.stack_depth {
+        for i in 0..stack_only {
             vals.push(self.stack_at(i).unwrap_or(0 as PyObjectRef) as i64);
         }
         vals
     }
 
-    fn create_sym(meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
+    fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
         let mut sym = PyreSym::new_uninit(OpRef(0));
         sym.vable_next_instr = OpRef(1);
-        sym.vable_stack_depth = OpRef(2);
-        sym.vable_locals_base = Some(3); // locals start after frame(0), ni(1), sd(2)
-        // stack starts after locals: 3 + num_locals
-        sym.vable_stack_base = Some(3 + meta.num_locals as u32);
+        sym.vable_valuestackdepth = OpRef(2);
+        // Unified array: locals at base+0..base+nlocals, stack at base+nlocals..
+        sym.vable_array_base = Some(3); // starts after frame(0), ni(1), vsd(2)
         sym
     }
 
@@ -2585,7 +2602,7 @@ impl JitState for PyreJitState {
         self.next_instr == meta.merge_pc
             && self.local_count() == meta.num_locals
             && self.namespace_len() == meta.ns_keys.len()
-            && self.stack_depth == meta.stack_depth
+            && self.valuestackdepth == meta.valuestackdepth
     }
 
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
@@ -2600,15 +2617,17 @@ impl JitState for PyreJitState {
 
         if meta.has_virtualizable {
             // Virtualizable format:
-            //   [frame, next_instr, stack_depth, locals_len, l0..lN, stack_len, s0..sM]
+            //   [frame, next_instr, valuestackdepth, l0..lN, s0..sM]
             self.restore_virtualizable_i64(values);
         } else {
+            let nlocals = self.local_count();
+            let stack_only = self.valuestackdepth.saturating_sub(nlocals);
             let mut idx = 1;
-            for local_idx in 0..self.local_count() {
+            for local_idx in 0..nlocals {
                 let _ = self.set_local_at(local_idx, values[idx] as PyObjectRef);
                 idx += 1;
             }
-            for i in 0..self.stack_depth {
+            for i in 0..stack_only {
                 let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
                 idx += 1;
             }
@@ -2638,17 +2657,18 @@ impl JitState for PyreJitState {
                 .collect();
             self.restore_virtualizable_i64(&ints);
         } else {
+            let nlocals = self.local_count();
+            let stack_only_depth = meta.valuestackdepth.saturating_sub(nlocals);
             let mut idx = 1;
-            for local_idx in 0..self.local_count() {
+            for local_idx in 0..nlocals {
                 let _ = self.set_local_at(local_idx, value_to_ptr(&values[idx]));
                 idx += 1;
             }
-            let stack_depth = meta.stack_depth;
-            for i in 0..stack_depth {
+            for i in 0..stack_only_depth {
                 let _ = self.set_stack_at(i, value_to_ptr(&values[idx]));
                 idx += 1;
             }
-            self.stack_depth = stack_depth;
+            self.valuestackdepth = meta.valuestackdepth;
         }
         let _ = self.sync_scalar_fields_to_frame();
     }
@@ -2707,7 +2727,7 @@ impl JitState for PyreJitState {
         _virtualizable: &str,
         _info: &VirtualizableInfo,
     ) -> Option<Vec<usize>> {
-        Some(vec![self.local_count(), self.stack_capacity()])
+        Some(vec![self.array_capacity()])
     }
 
     fn import_virtualizable_boxes(
@@ -2748,8 +2768,9 @@ impl JitState for PyreJitState {
         meta: &Self::Meta,
         jump_args: &[OpRef],
     ) -> bool {
-        // [frame, next_instr, stack_depth, locals..., stack...]
-        let expected = 3 + meta.num_locals + meta.stack_depth;
+        // [frame, next_instr, valuestackdepth, locals..., stack...]
+        let stack_only = meta.valuestackdepth.saturating_sub(meta.num_locals);
+        let expected = 3 + meta.num_locals + stack_only;
         jump_args.len() == expected
     }
 }
@@ -2890,7 +2911,7 @@ fn inline_trace_and_execute(
                         // make_result_of_lastop: store result in parent
                         let parent = framestack.last_mut().unwrap();
                         parent.sym.symbolic_stack.push(result_opref);
-                        parent.sym.stack_depth += 1;
+                        parent.sym.valuestackdepth += 1;
 
                         // Store concrete result for parent's execute step
                         pyre_interp::call::set_inline_handled_result(concrete_result);

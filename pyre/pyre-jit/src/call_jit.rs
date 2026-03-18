@@ -128,8 +128,8 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
-    let arg_key = if frame.locals_w.len() > 0 {
-        force_cache_arg_key(frame.locals_w[0])
+    let arg_key = if frame.locals_cells_stack_w.len() > 0 {
+        force_cache_arg_key(frame.locals_cells_stack_w[0])
     } else {
         0
     };
@@ -153,10 +153,10 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         let mut inputs = vec![
             frame_ptr,
             frame.next_instr as i64,
-            frame.stack_depth as i64,
+            frame.valuestackdepth as i64,
         ];
         for i in 0..nlocals {
-            inputs.push(frame.locals_w[i] as i64);
+            inputs.push(frame.locals_cells_stack_w[i] as i64);
         }
         if let Some(raw) = majit_codegen_cranelift::execute_call_assembler_direct(
             token_num,
@@ -189,8 +189,8 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
-    let arg_key = if frame.locals_w.len() > 0 {
-        force_cache_arg_key(frame.locals_w[0])
+    let arg_key = if frame.locals_cells_stack_w.len() > 0 {
+        force_cache_arg_key(frame.locals_cells_stack_w[0])
     } else {
         0
     };
@@ -249,8 +249,8 @@ extern "C" fn jit_bridge_compile_callee(
     };
 
     let code_key = frame.code as usize;
-    let arg_key = if frame.locals_w.len() > 0 {
-        force_cache_arg_key(frame.locals_w[0])
+    let arg_key = if frame.locals_cells_stack_w.len() > 0 {
+        force_cache_arg_key(frame.locals_cells_stack_w[0])
     } else {
         0
     };
@@ -306,17 +306,17 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     if let Some((ptr, was_init)) = arena.take() {
         if was_init {
             // Fast reinit: only update fields that change between calls.
-            // code, execution_context, namespace, locals_w.ptr, value_stack_w.ptr
+            // code, execution_context, namespace, locals_cells_stack_w.ptr
             // are stable for self-recursion (same function, same module).
             let f = unsafe { &mut *ptr };
             let same_code = f.code == func_code;
             if same_code {
                 // Self-recursion hot path: ~4 writes instead of ~40
-                let nargs = args.len().min(f.locals_w.len());
+                let nargs = args.len().min(f.locals_cells_stack_w.len());
                 for i in 0..nargs {
-                    f.locals_w[i] = args[i];
+                    f.locals_cells_stack_w[i] = args[i];
                 }
-                f.stack_depth = 0;
+                f.valuestackdepth = f.nlocals();
                 f.next_instr = 0;
                 f.vable_token = 0;
             } else {
