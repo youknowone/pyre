@@ -610,6 +610,7 @@ impl OpCode {
         matches!(self, OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF)
     }
 
+
     pub fn is_getfield(self) -> bool {
         matches!(
             self,
@@ -627,6 +628,27 @@ impl OpCode {
                 | OpCode::GetarrayitemGcPureR
                 | OpCode::GetarrayitemGcPureF
         )
+    }
+
+    pub fn is_setarrayitem(self) -> bool {
+        matches!(self, OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw)
+    }
+
+    pub fn is_setfield(self) -> bool {
+        matches!(self, OpCode::SetfieldGc | OpCode::SetfieldRaw)
+    }
+
+    pub fn is_getinteriorfield(self) -> bool {
+        matches!(
+            self,
+            OpCode::GetinteriorfieldGcI
+                | OpCode::GetinteriorfieldGcR
+                | OpCode::GetinteriorfieldGcF
+        )
+    }
+
+    pub fn is_setinteriorfield(self) -> bool {
+        matches!(self, OpCode::SetinteriorfieldGc)
     }
 
     pub fn is_plain_call(self) -> bool {
