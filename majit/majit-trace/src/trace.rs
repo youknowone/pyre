@@ -92,6 +92,71 @@ impl TreeLoop {
     pub fn get_iter(&self) -> crate::opencoder::TraceIterator<'_> {
         crate::opencoder::TraceIterator::new(&self.ops)
     }
+
+    /// history.py: check_consistency()
+    /// Verify that the trace structure is valid.
+    pub fn check_consistency(&self) -> bool {
+        if self.ops.is_empty() {
+            return true;
+        }
+        // Last op must be Jump or Finish
+        let last = self.ops.last().unwrap();
+        if !last.opcode.is_final() {
+            return false;
+        }
+        // No duplicate positions
+        let mut seen = std::collections::HashSet::new();
+        for op in &self.ops {
+            if !op.pos.is_none() {
+                if !seen.insert(op.pos) {
+                    return false; // duplicate position
+                }
+            }
+        }
+        true
+    }
+
+    /// Get all OpRefs used as arguments but not defined by any op.
+    /// These are the "free variables" — inputs from outside the trace.
+    pub fn free_vars(&self) -> Vec<OpRef> {
+        let defined: std::collections::HashSet<OpRef> = self
+            .ops
+            .iter()
+            .filter(|op| !op.pos.is_none())
+            .map(|op| op.pos)
+            .collect();
+        let mut free = std::collections::HashSet::new();
+        for op in &self.ops {
+            for arg in &op.args {
+                if !arg.is_none() && !defined.contains(arg) {
+                    free.insert(*arg);
+                }
+            }
+        }
+        let mut result: Vec<OpRef> = free.into_iter().collect();
+        result.sort_by_key(|r| r.0);
+        result
+    }
+
+    /// Count operations by opcode category.
+    pub fn count_by_category(&self) -> (usize, usize, usize, usize) {
+        let mut guards = 0;
+        let mut pure = 0;
+        let mut calls = 0;
+        let mut other = 0;
+        for op in &self.ops {
+            if op.opcode.is_guard() {
+                guards += 1;
+            } else if op.opcode.is_always_pure() {
+                pure += 1;
+            } else if op.opcode.is_call() {
+                calls += 1;
+            } else {
+                other += 1;
+            }
+        }
+        (guards, pure, calls, other)
+    }
 }
 
 #[cfg(test)]
