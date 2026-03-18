@@ -783,6 +783,102 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn delete_attr(&mut self, _name: &str) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("delete_attr not implemented").into())
     }
+    fn delete_name(&mut self, _name: &str) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("delete_name not implemented").into())
+    }
+    fn delete_global(&mut self, _name: &str) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("delete_global not implemented").into())
+    }
+
+    // Containment / identity
+    fn contains_op(&mut self, _invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("contains_op not implemented").into())
+    }
+    fn is_op(&mut self, _invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("is_op not implemented").into())
+    }
+
+    // Exception handling
+    fn push_exc_info(&mut self) -> Result<(), Self::Error> { Ok(()) }
+    fn pop_except(&mut self) -> Result<(), Self::Error> { Ok(()) }
+    fn check_exc_match(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("check_exc_match not implemented").into())
+    }
+    fn reraise(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("reraise not implemented").into())
+    }
+
+    // Collections
+    fn build_set(&mut self, _count: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("build_set not implemented").into())
+    }
+    fn build_slice(&mut self, _argc: pyre_bytecode::bytecode::BuildSliceArgCount) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("build_slice not implemented").into())
+    }
+    fn build_string(&mut self, _count: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("build_string not implemented").into())
+    }
+    fn list_extend(&mut self, _i: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("list_extend not implemented").into())
+    }
+    fn set_add(&mut self, _i: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("set_add not implemented").into())
+    }
+    fn dict_merge(&mut self, _i: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("dict_merge not implemented").into())
+    }
+    fn dict_update(&mut self, _i: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("dict_update not implemented").into())
+    }
+    fn map_add(&mut self, _i: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("map_add not implemented").into())
+    }
+
+    // Slicing
+    fn binary_slice(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("binary_slice not implemented").into())
+    }
+    fn store_slice(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("store_slice not implemented").into())
+    }
+
+    // Boolean
+    fn to_bool(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("to_bool not implemented").into())
+    }
+
+    // None jumps
+    fn pop_jump_if_none(&mut self, _target: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("pop_jump_if_none not implemented").into())
+    }
+    fn pop_jump_if_not_none(&mut self, _target: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("pop_jump_if_not_none not implemented").into())
+    }
+
+    // Closures 3.11+
+    fn copy_free_vars(&mut self, _count: usize) -> Result<(), Self::Error> { Ok(()) }
+    fn return_generator(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("return_generator not implemented").into())
+    }
+
+    // Call variants
+    fn call_kw(&mut self, _argc: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("call_kw not implemented").into())
+    }
+    fn call_function_ex(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("call_function_ex not implemented").into())
+    }
+
+    // Class
+    fn load_build_class(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_build_class not implemented").into())
+    }
+    fn load_super_attr(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_super_attr not implemented").into())
+    }
+    fn load_locals(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_locals not implemented").into())
+    }
 
     fn unsupported(
         &mut self,
@@ -835,8 +931,8 @@ where
 
         Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
             let pair = var_nums.get(op_arg);
-            let idx1 = (pair >> 4) as usize;
-            let idx2 = (pair & 15) as usize;
+            let idx1 = u32::from(pair.idx_1()) as usize;
+            let idx2 = u32::from(pair.idx_2()) as usize;
             executor.load_fast_pair_checked(
                 idx1,
                 code.varnames[idx1].as_ref(),
@@ -859,21 +955,21 @@ where
 
         Instruction::LoadFastLoadFast { var_nums } => {
             let pair = var_nums.get(op_arg);
-            let idx1 = (pair >> 4) as usize;
-            let idx2 = (pair & 15) as usize;
+            let idx1 = u32::from(pair.idx_1()) as usize;
+            let idx2 = u32::from(pair.idx_2()) as usize;
             executor.load_fast_load_fast(idx1, idx2)?;
             Ok(StepResult::Continue)
         }
 
         Instruction::StoreFastLoadFast { var_nums } => {
             let pair = var_nums.get(op_arg);
-            executor.store_fast_load_fast(pair.store_idx() as usize, pair.load_idx() as usize)?;
+            executor.store_fast_load_fast(u32::from(pair.idx_1()) as usize, u32::from(pair.idx_2()) as usize)?;
             Ok(StepResult::Continue)
         }
 
         Instruction::StoreFastStoreFast { var_nums } => {
             let pair = var_nums.get(op_arg);
-            executor.store_fast_store_fast((pair >> 4) as usize, (pair & 15) as usize)?;
+            executor.store_fast_store_fast(u32::from(pair.idx_1()) as usize, u32::from(pair.idx_2()) as usize)?;
             Ok(StepResult::Continue)
         }
 
@@ -1094,6 +1190,177 @@ where
         Instruction::ImportFrom { namei } => {
             let name_idx = namei.get(op_arg) as usize;
             executor.import_from(code.names[name_idx].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Containment / identity tests ──
+        Instruction::ContainsOp { invert } => {
+            let inv = invert.get(op_arg);
+            executor.contains_op(inv)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::IsOp { invert } => {
+            let inv = invert.get(op_arg);
+            executor.is_op(inv)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Delete subscript ──
+        Instruction::DeleteSubscr => {
+            executor.delete_subscript()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Exception handling (CPython 3.13) ──
+        Instruction::PushExcInfo => {
+            executor.push_exc_info()?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::PopExcept => {
+            executor.pop_except()?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::CheckExcMatch => {
+            executor.check_exc_match()?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::RaiseVarargs { argc } => {
+            executor.raise_varargs(argc.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::Reraise { .. } => {
+            executor.reraise()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Collection operations ──
+        Instruction::BuildSet { count } => {
+            executor.build_set(count.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::BuildSlice { argc } => {
+            executor.build_slice(argc.get(op_arg))?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::BuildString { count } => {
+            executor.build_string(count.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::ListExtend { i } => {
+            executor.list_extend(i.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::SetAdd { i } => {
+            executor.set_add(i.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::DictMerge { i } => {
+            executor.dict_merge(i.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::DictUpdate { i } => {
+            executor.dict_update(i.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::MapAdd { i } => {
+            executor.map_add(i.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Slicing ──
+        Instruction::BinarySlice => {
+            executor.binary_slice()?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::StoreSlice => {
+            executor.store_slice()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Boolean conversion ──
+        Instruction::ToBool => {
+            executor.to_bool()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── None comparison jumps ──
+        Instruction::PopJumpIfNone { delta } => {
+            let target = u32::from(delta.get(op_arg)) as usize;
+            executor.pop_jump_if_none(target)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::PopJumpIfNotNone { delta } => {
+            let target = u32::from(delta.get(op_arg)) as usize;
+            executor.pop_jump_if_not_none(target)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Closure 3.11+ ──
+        Instruction::MakeCell { i } => {
+            // Phase 1: no-op (cell slots initialized in frame constructor)
+            Ok(StepResult::Continue)
+        }
+        Instruction::CopyFreeVars { n } => {
+            executor.copy_free_vars(n.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Generator ──
+        Instruction::ReturnGenerator => {
+            executor.return_generator()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Function call variants ──
+        Instruction::CallKw { argc } => {
+            executor.call_kw(argc.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::CallFunctionEx => {
+            executor.call_function_ex()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Class support ──
+        Instruction::LoadBuildClass => {
+            executor.load_build_class()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Delete ops ──
+        Instruction::DeleteFast { var_num } => {
+            executor.delete_fast(u32::from(var_num.get(op_arg)) as usize)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::DeleteName { namei } => {
+            executor.delete_name(code.names[namei.get(op_arg) as usize].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::DeleteGlobal { namei } => {
+            executor.delete_global(code.names[namei.get(op_arg) as usize].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::DeleteAttr { namei } => {
+            executor.delete_attr(code.names[namei.get(op_arg) as usize].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Load super attr ──
+        Instruction::LoadSuperAttr { .. } => {
+            executor.load_super_attr()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Misc ──
+        Instruction::SetupAnnotations => Ok(StepResult::Continue),
+        Instruction::LoadLocals => {
+            executor.load_locals()?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::Copy { i } => {
+            let depth = i.get(op_arg) as usize;
+            let val = executor.peek_at(depth - 1)?;
+            executor.push_value(val)?;
             Ok(StepResult::Continue)
         }
 

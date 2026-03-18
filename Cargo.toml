@@ -43,9 +43,9 @@ pyre-objspace = { path = "pyre/pyre-objspace" }
 pyre-bytecode = { path = "pyre/pyre-bytecode" }
 pyre-interp = { path = "pyre/pyre-interp" }
 
-# RustPython compiler toolchain
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython", branch = "main" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython", branch = "main" }
+# RustPython compiler toolchain (0.5.0, pinned to main @ 2026-03-18)
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython", rev = "9a5de28b793d20424a7e6545db06dc4c2bd0b756" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython", rev = "9a5de28b793d20424a7e6545db06dc4c2bd0b756" }
 
 # majit JIT framework
 majit-meta = { path = "majit/majit-meta" }
