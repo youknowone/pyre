@@ -3375,4 +3375,42 @@ mod tests {
         let result = opt.optimize_with_constants(&ops, &mut constants);
         assert!(!result.is_empty());
     }
+
+    #[test]
+    fn test_cond_call_n_zero_removes() {
+        // COND_CALL_N(0, func, args...) → removed (condition is false)
+        let mut ops = vec![
+            Op::new(OpCode::CondCallN, &[OpRef(200), OpRef(100), OpRef(101)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        with_positions(&mut ops);
+        let mut opt = crate::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(OptRewrite::new()));
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(200, 0i64);
+        let result = opt.optimize_with_constants(&ops, &mut constants);
+        assert!(
+            !result.iter().any(|o| o.opcode == OpCode::CondCallN),
+            "COND_CALL_N(0, ...) should be removed"
+        );
+    }
+
+    #[test]
+    fn test_cond_call_n_nonzero_converts() {
+        // COND_CALL_N(1, func, args...) → CALL_N(func, args...)
+        let mut ops = vec![
+            Op::new(OpCode::CondCallN, &[OpRef(200), OpRef(100), OpRef(101)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        with_positions(&mut ops);
+        let mut opt = crate::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(OptRewrite::new()));
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(200, 1i64);
+        let result = opt.optimize_with_constants(&ops, &mut constants);
+        assert!(
+            result.iter().any(|o| o.opcode == OpCode::CallN),
+            "COND_CALL_N(1, ...) should become CALL_N"
+        );
+    }
 }
