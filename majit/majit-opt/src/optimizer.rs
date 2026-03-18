@@ -717,4 +717,27 @@ mod tests {
         assert!(opt.has_pending_fields());
         assert_eq!(opt.num_pending_fields(), 1);
     }
+
+    #[test]
+    fn test_getnullness() {
+        let mut ctx = OptContext::new(10);
+        // Unknown → 0
+        assert_eq!(Optimizer::getnullness(&ctx, OpRef(0)), 0);
+        // Known nonzero → 1 (NONNULL)
+        ctx.make_constant(OpRef(1), majit_ir::Value::Int(42));
+        assert_eq!(Optimizer::getnullness(&ctx, OpRef(1)), 1);
+        // Known zero → -1 (NULL)
+        ctx.make_constant(OpRef(2), majit_ir::Value::Int(0));
+        assert_eq!(Optimizer::getnullness(&ctx, OpRef(2)), -1);
+    }
+
+    #[test]
+    fn test_guard_replacement_flag() {
+        let mut opt = Optimizer::new();
+        assert!(opt.can_replace_guards);
+        opt.disable_guard_replacement();
+        assert!(!opt.can_replace_guards);
+        opt.enable_guard_replacement();
+        assert!(opt.can_replace_guards);
+    }
 }
