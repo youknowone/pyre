@@ -410,6 +410,80 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── ContainsOp (in / not in) ──
+    // PyPy: pyopcode.py COMPARE_OP with 'in' / 'not in'
+
+    fn contains_op(&mut self, invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
+        let needle = self.pop();
+        let haystack = self.pop();
+        let result = pyre_objspace::space::py_contains(haystack, needle)?;
+        let inverted = match invert {
+            pyre_bytecode::bytecode::Invert::No => result,
+            pyre_bytecode::bytecode::Invert::Yes => !result,
+        };
+        self.push(pyre_object::w_bool_from(inverted));
+        Ok(())
+    }
+
+    // ── IsOp (is / is not) ──
+    // PyPy: pyopcode.py COMPARE_OP with 'is' / 'is not'
+
+    fn is_op(&mut self, invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
+        let b = self.pop();
+        let a = self.pop();
+        let same = std::ptr::eq(a, b); // pointer identity
+        let result = match invert {
+            pyre_bytecode::bytecode::Invert::No => same,
+            pyre_bytecode::bytecode::Invert::Yes => !same,
+        };
+        self.push(pyre_object::w_bool_from(result));
+        Ok(())
+    }
+
+    // ── ToBool ──
+    // CPython 3.13: converts TOS to bool
+
+    fn to_bool(&mut self) -> Result<(), Self::Error> {
+        let val = self.pop();
+        let truth = pyre_objspace::space::py_is_true(val);
+        self.push(pyre_object::w_bool_from(truth));
+        Ok(())
+    }
+
+    // ── PopJumpIfNone / PopJumpIfNotNone ──
+
+    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), Self::Error> {
+        let val = self.pop();
+        if unsafe { pyre_object::is_none(val) } {
+            self.next_instr = target;
+        }
+        Ok(())
+    }
+
+    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), Self::Error> {
+        let val = self.pop();
+        if !unsafe { pyre_object::is_none(val) } {
+            self.next_instr = target;
+        }
+        Ok(())
+    }
+
+    // ── DeleteSubscr ──
+
+    fn delete_subscript(&mut self) -> Result<(), Self::Error> {
+        let index = self.pop();
+        let obj = self.pop();
+        pyre_objspace::space::py_delitem(obj, index)?;
+        Ok(())
+    }
+
+    // ── DeleteFast ──
+
+    fn delete_fast(&mut self, idx: usize) -> Result<(), Self::Error> {
+        self.locals_cells_stack_w[idx] = PY_NULL;
+        Ok(())
+    }
+
     fn unsupported(
         &mut self,
         instruction: &Instruction,
