@@ -31,6 +31,8 @@ pub trait SharedOpcodeHandler {
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> OpcodeResult<()>;
     fn unpack_sequence(&mut self, seq: Self::Value, count: usize)
     -> OpcodeResult<Vec<Self::Value>>;
+    fn load_attr(&mut self, obj: Self::Value, name: &str) -> OpcodeResult<Self::Value>;
+    fn store_attr(&mut self, obj: Self::Value, name: &str, value: Self::Value) -> OpcodeResult<()>;
 }
 
 fn pop_n<H: SharedOpcodeHandler + ?Sized>(
@@ -153,6 +155,24 @@ pub fn exec_unpack_sequence<H: SharedOpcodeHandler + ?Sized>(
         handler.push_value(item)?;
     }
     Ok(())
+}
+
+pub fn exec_load_attr<H: SharedOpcodeHandler + ?Sized>(
+    handler: &mut H,
+    name: &str,
+) -> OpcodeResult<()> {
+    let obj = handler.pop_value()?;
+    let attr = handler.load_attr(obj, name)?;
+    handler.push_value(attr)
+}
+
+pub fn exec_store_attr<H: SharedOpcodeHandler + ?Sized>(
+    handler: &mut H,
+    name: &str,
+) -> OpcodeResult<()> {
+    let obj = handler.pop_value()?;
+    let value = handler.pop_value()?;
+    handler.store_attr(obj, name, value)
 }
 
 pub fn stack_underflow_error(context: &str) -> PyError {

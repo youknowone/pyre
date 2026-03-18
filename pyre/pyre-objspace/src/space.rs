@@ -13,6 +13,9 @@ use malachite_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::ToPrimitive;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use pyre_object::strobject::is_str;
 use pyre_object::*;
 pub use pyre_runtime::{PyError, PyErrorKind, PyResult};
@@ -838,6 +841,56 @@ pub fn py_len(obj: PyObjectRef) -> PyResult {
     }
 }
 
+// ── Attribute operations ──────────────────────────────────────────────
+
+thread_local! {
+    /// Side table mapping object addresses to their instance __dict__.
+    ///
+    /// Every object can have attributes stored here. This avoids modifying
+    /// the repr(C) layout of existing object types.
+    static ATTR_TABLE: RefCell<HashMap<usize, HashMap<String, PyObjectRef>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Get an attribute from an object: `obj.name`.
+///
+/// Looks up the attribute in the per-object side table.
+pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
+    ATTR_TABLE.with(|table| {
+        let table = table.borrow();
+        let key = obj as usize;
+        if let Some(dict) = table.get(&key) {
+            if let Some(&value) = dict.get(name) {
+                return Ok(value);
+            }
+        }
+        unsafe {
+            Err(PyError {
+                kind: PyErrorKind::AttributeError,
+                message: format!(
+                    "'{}' object has no attribute '{name}'",
+                    (*(*obj).ob_type).tp_name,
+                ),
+            })
+        }
+    })
+}
+
+/// Set an attribute on an object: `obj.name = value`.
+///
+/// Stores the attribute in the per-object side table.
+pub fn py_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+    ATTR_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        let key = obj as usize;
+        table
+            .entry(key)
+            .or_default()
+            .insert(name.to_string(), value);
+    });
+    Ok(w_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,5 +1119,29 @@ mod tests {
                 !(BigInt::from(i64::MAX) + BigInt::from(1))
             );
         }
+    }
+
+    #[test]
+    fn test_setattr_getattr() {
+        let obj = w_int_new(42);
+        py_setattr(obj, "name", w_int_new(100)).unwrap();
+        let result = py_getattr(obj, "name").unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 100) };
+    }
+
+    #[test]
+    fn test_getattr_missing() {
+        let obj = w_int_new(1);
+        let err = py_getattr(obj, "missing").unwrap_err();
+        assert!(matches!(err.kind, PyErrorKind::AttributeError));
+    }
+
+    #[test]
+    fn test_setattr_overwrite() {
+        let obj = w_int_new(42);
+        py_setattr(obj, "x", w_int_new(1)).unwrap();
+        py_setattr(obj, "x", w_int_new(2)).unwrap();
+        let result = py_getattr(obj, "x").unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 2) };
     }
 }

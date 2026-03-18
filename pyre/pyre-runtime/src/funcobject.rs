@@ -1,8 +1,9 @@
 //! W_FunctionObject — Python user-defined function object.
 //!
-//! Wraps a code object pointer, a function name, and a pointer to the
-//! defining module's globals namespace.  When called, the interpreter
-//! creates a new PyFrame that *shares* the globals pointer (no clone).
+//! Wraps a code object pointer, a function name, a pointer to the
+//! defining module's globals namespace, and an optional closure tuple.
+//! When called, the interpreter creates a new PyFrame that *shares*
+//! the globals pointer (no clone).
 
 use crate::executioncontext::PyNamespace;
 use pyre_object::pyobject::*;
@@ -14,10 +15,11 @@ pub static FUNCTION_TYPE: PyType = PyType {
 
 /// User-defined function object.
 ///
-/// Layout: `[ob_type | code_ptr | name_ptr | globals]`
+/// Layout: `[ob_type | code_ptr | name_ptr | globals | closure]`
 /// - `code_ptr`: opaque pointer to the CodeObject
 /// - `name_ptr`: leaked `Box<String>` containing the function name
 /// - `globals`:  raw pointer to the module-level namespace (shared, not owned)
+/// - `closure`:  tuple of cell objects, or PY_NULL if no closure
 #[repr(C)]
 pub struct W_FunctionObject {
     pub ob: PyObject,
@@ -27,6 +29,9 @@ pub struct W_FunctionObject {
     pub name: *const String,
     /// Shared pointer to the defining module's globals namespace.
     pub globals: *mut PyNamespace,
+    /// Closure: tuple of cell objects from the enclosing scope,
+    /// or PY_NULL if this function has no free variables.
+    pub closure: PyObjectRef,
 }
 
 /// Field offset of `code_ptr` within `W_FunctionObject`, for JIT field access.
@@ -35,6 +40,8 @@ pub const FUNC_CODE_OFFSET: usize = std::mem::offset_of!(W_FunctionObject, code_
 pub const FUNC_NAME_OFFSET: usize = std::mem::offset_of!(W_FunctionObject, name);
 /// Field offset of `globals` within `W_FunctionObject`.
 pub const FUNC_GLOBALS_OFFSET: usize = std::mem::offset_of!(W_FunctionObject, globals);
+/// Field offset of `closure` within `W_FunctionObject`.
+pub const FUNC_CLOSURE_OFFSET: usize = std::mem::offset_of!(W_FunctionObject, closure);
 
 /// Allocate a new `W_FunctionObject`.
 ///
@@ -42,6 +49,18 @@ pub const FUNC_GLOBALS_OFFSET: usize = std::mem::offset_of!(W_FunctionObject, gl
 /// `name` is the function name string (leaked).
 /// `globals` is the defining module's namespace pointer (shared).
 pub fn w_func_new(code_ptr: *const (), name: String, globals: *mut PyNamespace) -> PyObjectRef {
+    w_func_new_with_closure(code_ptr, name, globals, PY_NULL)
+}
+
+/// Allocate a new `W_FunctionObject` with a closure.
+///
+/// `closure` is a tuple of cell objects, or PY_NULL if no closure.
+pub fn w_func_new_with_closure(
+    code_ptr: *const (),
+    name: String,
+    globals: *mut PyNamespace,
+    closure: PyObjectRef,
+) -> PyObjectRef {
     let name_ptr = Box::into_raw(Box::new(name)) as *const String;
     let obj = Box::new(W_FunctionObject {
         ob: PyObject {
@@ -50,6 +69,7 @@ pub fn w_func_new(code_ptr: *const (), name: String, globals: *mut PyNamespace) 
         code_ptr,
         name: name_ptr,
         globals,
+        closure,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -90,6 +110,25 @@ pub unsafe fn w_func_get_globals(obj: PyObjectRef) -> *mut PyNamespace {
     unsafe { (*(obj as *const W_FunctionObject)).globals }
 }
 
+/// Get the closure tuple from a function object.
+/// Returns PY_NULL if the function has no closure.
+///
+/// # Safety
+/// `obj` must point to a valid `W_FunctionObject`.
+#[inline]
+pub unsafe fn w_func_get_closure(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_FunctionObject)).closure }
+}
+
+/// Set the closure on a function object.
+///
+/// # Safety
+/// `obj` must point to a valid `W_FunctionObject`.
+#[inline]
+pub unsafe fn w_func_set_closure(obj: PyObjectRef, closure: PyObjectRef) {
+    unsafe { (*(obj as *mut W_FunctionObject)).closure = closure }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +144,7 @@ mod tests {
             assert_eq!(w_func_get_code_ptr(obj), code_ptr);
             assert_eq!(w_func_get_name(obj), "myfunc");
             assert_eq!(w_func_get_globals(obj), &mut ns as *mut PyNamespace);
+            assert!(w_func_get_closure(obj).is_null());
         }
     }
 
@@ -113,5 +153,6 @@ mod tests {
         assert_eq!(FUNC_CODE_OFFSET, 8); // after ob_type pointer
         assert_eq!(FUNC_NAME_OFFSET, 16); // after code_ptr
         assert_eq!(FUNC_GLOBALS_OFFSET, 24); // after name
+        assert_eq!(FUNC_CLOSURE_OFFSET, 32); // after globals
     }
 }

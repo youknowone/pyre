@@ -44,9 +44,25 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         let (instruction, op_arg) = arg_state.get(code_unit);
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
-        match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
-            StepResult::Continue | StepResult::CloseLoop(_) => {}
-            StepResult::Return(result) => return Ok(result),
+        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+            Ok(StepResult::Continue) | Ok(StepResult::CloseLoop(_)) => {}
+            Ok(StepResult::Return(result)) => return Ok(result),
+            Ok(StepResult::Yield(result)) => return Ok(result),
+            Err(err) => {
+                // PyPy: handle_operation_error — walk block stack for handler
+                if let Some(block) = frame.block_stack.pop() {
+                    // Unwind operand stack to block level
+                    while frame.valuestackdepth > block.level {
+                        frame.pop();
+                    }
+                    // Push exception value for except clause
+                    let exc_obj = pyre_object::w_str_new(&err.message);
+                    frame.push(exc_obj);
+                    frame.next_instr = block.handler;
+                    continue;
+                }
+                return Err(err);
+            }
         }
     }
 }
@@ -117,6 +133,19 @@ impl SharedOpcodeHandler for PyFrame {
         count: usize,
     ) -> Result<Vec<Self::Value>, PyError> {
         unpack_sequence_exact(seq, count)
+    }
+
+    fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
+        py_getattr(obj, name)
+    }
+
+    fn store_attr(
+        &mut self,
+        obj: Self::Value,
+        name: &str,
+        value: Self::Value,
+    ) -> Result<(), PyError> {
+        py_setattr(obj, name, value).map(|_| ())
     }
 }
 
@@ -290,6 +319,74 @@ impl ConstantOpcodeHandler for PyFrame {
 
 impl OpcodeStepExecutor for PyFrame {
     type Error = PyError;
+
+    // ── Closures / cells ──
+
+    fn load_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
+        let nlocals = self.nlocals();
+        let value = self.locals_cells_stack_w[nlocals + idx];
+        if value == PY_NULL {
+            return Err(PyError::type_error("free variable referenced before assignment"));
+        }
+        self.push(value);
+        Ok(())
+    }
+
+    fn store_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
+        let nlocals = self.nlocals();
+        let value = self.pop();
+        self.locals_cells_stack_w[nlocals + idx] = value;
+        Ok(())
+    }
+
+    fn load_closure(&mut self, idx: usize) -> Result<(), Self::Error> {
+        // Push the cell value itself (same as load_deref for Phase 1)
+        self.load_deref(idx)
+    }
+
+    fn delete_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
+        let nlocals = self.nlocals();
+        self.locals_cells_stack_w[nlocals + idx] = PY_NULL;
+        Ok(())
+    }
+
+    // ── Exception handling ──
+
+    fn setup_finally(&mut self, handler: usize) -> Result<(), Self::Error> {
+        self.block_stack.push(crate::frame::Block {
+            handler,
+            level: self.valuestackdepth,
+        });
+        Ok(())
+    }
+
+    fn setup_except(&mut self, handler: usize) -> Result<(), Self::Error> {
+        self.setup_finally(handler)
+    }
+
+    fn pop_block(&mut self) -> Result<(), Self::Error> {
+        self.block_stack.pop();
+        Ok(())
+    }
+
+    fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
+        match argc {
+            0 => Err(PyError::type_error("no active exception to re-raise")),
+            1 => {
+                let exc = self.pop();
+                // For Phase 1: treat the exception object as an error message
+                let _ = exc; // TODO: proper exception propagation
+                Err(PyError::type_error("exception raised"))
+            }
+            _ => Err(PyError::type_error("too many arguments for raise")),
+        }
+    }
+
+    fn end_finally(&mut self) -> Result<(), Self::Error> {
+        // Pop the exception or None from stack
+        let _ = self.pop();
+        Ok(())
+    }
 
     fn unsupported(
         &mut self,
@@ -1262,6 +1359,69 @@ result = factorial(5)";
         unsafe {
             let result = *(*frame.namespace).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 120);
+        }
+    }
+
+    // ── attribute tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_store_load_attr() {
+        let source = "\
+def f():
+    pass
+f.x = 42
+result = f.x";
+        let (_, frame) = run_exec_frame(source);
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 42);
+        }
+    }
+
+    #[test]
+    fn test_store_load_multiple_attrs() {
+        let source = "\
+def f():
+    pass
+f.a = 10
+f.b = 20
+result = f.a + f.b";
+        let (_, frame) = run_exec_frame(source);
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 30);
+        }
+    }
+
+    #[test]
+    fn test_attr_overwrite() {
+        let source = "\
+def f():
+    pass
+f.x = 1
+f.x = 2
+result = f.x";
+        let (_, frame) = run_exec_frame(source);
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 2);
+        }
+    }
+
+    #[test]
+    fn test_attr_on_different_objects() {
+        let source = "\
+def f():
+    pass
+def g():
+    pass
+f.x = 10
+g.x = 20
+result = f.x + g.x";
+        let (_, frame) = run_exec_frame(source);
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 30);
         }
     }
 }

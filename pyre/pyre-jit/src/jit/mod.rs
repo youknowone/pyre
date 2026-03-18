@@ -3,6 +3,7 @@ pub mod frame_layout;
 pub mod helpers;
 pub mod state;
 pub mod trace;
+pub mod virtualizable_spec;
 
 /// Auto-generated trace functions from majit-analyze.
 #[allow(dead_code, unused_imports)]

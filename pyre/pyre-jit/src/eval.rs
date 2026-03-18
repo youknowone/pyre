@@ -164,6 +164,7 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 }
             }
             StepResult::Return(result) => return Ok(result),
+            StepResult::Yield(result) => return Ok(result),
         }
     }
 }

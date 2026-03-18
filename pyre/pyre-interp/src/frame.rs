@@ -19,10 +19,13 @@ const _: () = assert!(
 
 /// Execution frame for a single Python code block.
 ///
-/// Unified `locals_cells_stack_w` array stores locals (indices 0..nlocals)
-/// and the operand stack (indices nlocals..) in one contiguous allocation.
+/// Unified `locals_cells_stack_w` array layout:
+///   - indices `0..nlocals` — local variables
+///   - indices `nlocals..nlocals+ncells` — cell/free variable slots
+///   - indices `nlocals+ncells..` — operand stack
+///
 /// `valuestackdepth` is the absolute index into this array; it starts at
-/// `nlocals` (empty stack) and grows upward on push.
+/// `nlocals + ncells` (empty stack) and grows upward on push.
 ///
 /// The JIT's Virtualize pass keeps `locals_cells_stack_w` slots in CPU
 /// registers during compiled code execution, eliminating heap reads/writes
@@ -40,11 +43,10 @@ pub struct PyFrame {
     /// Raw pointer to the code object (shared, not owned — the CodeObject
     /// is leaked via `Box::into_raw` at creation time and lives forever).
     pub code: *const CodeObject,
-    /// Unified locals + operand stack array.
-    /// Indices 0..nlocals are local variables, nlocals.. is the operand stack.
+    /// Unified locals + cells + operand stack array.
     pub locals_cells_stack_w: PyObjectArray,
     /// Absolute index into `locals_cells_stack_w` marking the top of the
-    /// operand stack. Starts at `nlocals` (empty stack), grows upward.
+    /// operand stack. Starts at `nlocals + ncells` (empty stack), grows upward.
     pub valuestackdepth: usize,
     /// Index of the next instruction to execute.
     pub next_instr: usize,
@@ -54,6 +56,17 @@ pub struct PyFrame {
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
+    /// Exception handler block stack (PyPy: lastblock linked list).
+    /// NOT repr(C)-visible to JIT — stored after vable_token.
+    pub block_stack: Vec<Block>,
+}
+
+/// Exception handler block — pushed by SETUP_FINALLY/SETUP_EXCEPT, popped by POP_BLOCK.
+/// PyPy equivalent: pyframe.py Block classes (ExceptBlock, FinallyBlock).
+#[derive(Debug, Clone, Copy)]
+pub struct Block {
+    pub handler: usize,
+    pub level: usize,
 }
 
 // ── Virtualizable field offsets ───────────────────────────────────────
@@ -78,6 +91,12 @@ pub const PYFRAME_LOCALS_CELLS_STACK_OFFSET: usize =
 // Backward-compat aliases used by JIT code.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
+
+/// Number of cell + free variable slots for a code object.
+#[inline]
+fn ncells(code: &CodeObject) -> usize {
+    code.cellvars.len() + code.freevars.len()
+}
 
 impl PyFrame {
     /// Create a new frame for executing a code object with a fresh execution context.
@@ -106,16 +125,21 @@ impl PyFrame {
     ) -> Self {
         let code_ref = unsafe { &*code };
         let num_locals = code_ref.varnames.len();
+        let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
         PyFrame {
             execution_context,
             code,
-            locals_cells_stack_w: PyObjectArray::filled(num_locals + max_stack, PY_NULL),
-            valuestackdepth: num_locals,
+            locals_cells_stack_w: PyObjectArray::filled(
+                num_locals + num_cells + max_stack,
+                PY_NULL,
+            ),
+            valuestackdepth: num_locals + num_cells,
             next_instr: 0,
             namespace,
             vable_token: 0,
+            block_stack: Vec::new(),
         }
     }
 
@@ -123,6 +147,18 @@ impl PyFrame {
     #[inline]
     pub fn nlocals(&self) -> usize {
         unsafe { (&(*self.code).varnames).len() }
+    }
+
+    /// Number of cell + free variable slots.
+    #[inline]
+    pub fn ncells(&self) -> usize {
+        unsafe { ncells(&*self.code) }
+    }
+
+    /// First index of the operand stack (after locals and cells).
+    #[inline]
+    pub fn stack_base(&self) -> usize {
+        self.nlocals() + self.ncells()
     }
 
     // ── Stack operations ──────────────────────────────────────────────
@@ -152,33 +188,61 @@ impl PyFrame {
 
     /// Create a new frame for a function call.
     ///
-    /// The `globals` pointer is shared from the function object — no clone.
-    /// The `code` pointer is shared from the function object — no clone.
+    /// The `globals` pointer is shared from the function object -- no clone.
+    /// The `code` pointer is shared from the function object -- no clone.
+    /// `closure` is a tuple of cell objects from the enclosing scope,
+    /// or PY_NULL if the function has no free variables.
     pub fn new_for_call(
         code: *const CodeObject,
         args: &[PyObjectRef],
         globals: *mut PyNamespace,
         execution_context: *const PyExecutionContext,
     ) -> Self {
+        Self::new_for_call_with_closure(code, args, globals, execution_context, PY_NULL)
+    }
+
+    /// Create a new frame for a function call with a closure.
+    pub fn new_for_call_with_closure(
+        code: *const CodeObject,
+        args: &[PyObjectRef],
+        globals: *mut PyNamespace,
+        execution_context: *const PyExecutionContext,
+        closure: PyObjectRef,
+    ) -> Self {
         let code_ref = unsafe { &*code };
         let num_locals = code_ref.varnames.len();
+        let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
-        let mut locals_cells_stack_w = PyObjectArray::filled(num_locals + max_stack, PY_NULL);
-        // Bind positional arguments directly — no intermediate Vec.
+        let mut locals_cells_stack_w =
+            PyObjectArray::filled(num_locals + num_cells + max_stack, PY_NULL);
+
+        // Bind positional arguments directly -- no intermediate Vec.
         let nargs = args.len().min(num_locals);
         for i in 0..nargs {
             locals_cells_stack_w[i] = args[i];
+        }
+
+        // Copy free variables from closure tuple into the frame's cell slots.
+        // Free vars go after cell vars: indices nlocals+ncellvars..nlocals+ncells
+        if !closure.is_null() {
+            let n_cellvars = code_ref.cellvars.len();
+            let n_freevars = code_ref.freevars.len();
+            for i in 0..n_freevars {
+                let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
+                locals_cells_stack_w[num_locals + n_cellvars + i] = cell;
+            }
         }
 
         PyFrame {
             execution_context,
             code,
             locals_cells_stack_w,
-            valuestackdepth: num_locals,
+            valuestackdepth: num_locals + num_cells,
             next_instr: 0,
             namespace: globals,
             vable_token: 0,
+            block_stack: Vec::new(),
         }
     }
 
