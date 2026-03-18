@@ -183,6 +183,53 @@ impl OptPure {
     }
 }
 
+/// Try to constant-fold a pure operation when all arguments are constants.
+///
+/// RPython equivalent: pure.py constant folding in optimize_default().
+/// Returns the constant result value if successful.
+fn try_constant_fold_value(op: &Op, ctx: &OptContext) -> Option<i64> {
+    // Only fold binary int operations for now (most common case).
+    if op.num_args() != 2 {
+        return None;
+    }
+    let a = ctx.get_constant_int(op.arg(0))?;
+    let b = ctx.get_constant_int(op.arg(1))?;
+
+    let result = match op.opcode {
+        OpCode::IntAdd => a.checked_add(b)?,
+        OpCode::IntSub => a.checked_sub(b)?,
+        OpCode::IntMul => a.checked_mul(b)?,
+        OpCode::IntAnd => Some(a & b)?,
+        OpCode::IntOr => Some(a | b)?,
+        OpCode::IntXor => Some(a ^ b)?,
+        OpCode::IntLshift if b >= 0 && b < 64 => Some(a << b)?,
+        OpCode::IntRshift if b >= 0 && b < 64 => Some(a >> b)?,
+        OpCode::UintRshift if b >= 0 && b < 64 => Some((a as u64 >> b as u64) as i64)?,
+        OpCode::IntLt => Some(if a < b { 1 } else { 0 })?,
+        OpCode::IntLe => Some(if a <= b { 1 } else { 0 })?,
+        OpCode::IntGt => Some(if a > b { 1 } else { 0 })?,
+        OpCode::IntGe => Some(if a >= b { 1 } else { 0 })?,
+        OpCode::IntEq => Some(if a == b { 1 } else { 0 })?,
+        OpCode::IntNe => Some(if a != b { 1 } else { 0 })?,
+        OpCode::UintLt => Some(if (a as u64) < (b as u64) { 1 } else { 0 })?,
+        OpCode::UintLe => Some(if (a as u64) <= (b as u64) { 1 } else { 0 })?,
+        OpCode::UintGe => Some(if (a as u64) >= (b as u64) { 1 } else { 0 })?,
+        OpCode::UintGt => Some(if (a as u64) > (b as u64) { 1 } else { 0 })?,
+        OpCode::IntFloorDiv if b != 0 => {
+            // Python-style floor division
+            let (q, r) = (a / b, a % b);
+            if (r != 0) && ((r ^ b) < 0) { Some(q - 1) } else { Some(q) }
+        }?,
+        OpCode::IntMod if b != 0 => {
+            let r = a % b;
+            if (r != 0) && ((r ^ b) < 0) { Some(r + b) } else { Some(r) }
+        }?,
+        _ => return None,
+    };
+
+    Some(result)
+}
+
 impl Default for OptPure {
     fn default() -> Self {
         Self::new()
@@ -193,9 +240,14 @@ impl Optimization for OptPure {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.opcode.is_always_pure() {
             // RPython pure.py: constant folding — if all args are constants,
-            // compute the result at optimization time.
-            if let Some(folded) = try_constant_fold(op, ctx) {
-                ctx.replace_op(op.pos, folded);
+            // compute the result at optimization time and replace with constant.
+            if let Some(folded_value) = try_constant_fold_value(op, ctx) {
+                // Find or create a constant OpRef for this value.
+                // Check if any existing constant matches.
+                let const_ref = ctx.find_or_record_constant_int(op.pos, folded_value);
+                if const_ref != op.pos {
+                    ctx.replace_op(op.pos, const_ref);
+                }
                 return OptimizationResult::Remove;
             }
 
@@ -671,5 +723,48 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::CallI);
+    }
+
+    #[test]
+    fn test_constant_fold_int_add() {
+        // IntAdd(const(3), const(4)) → eliminated, result = const(7)
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(10_000), OpRef(10_001)]),
+            // Use the result in a guard to prevent dead code elimination
+            Op::new(OpCode::Finish, &[OpRef(0)]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 3i64);
+        constants.insert(10_001, 4i64);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize_with_constants(&ops, &mut constants);
+
+        // IntAdd should be folded away (only Finish remains)
+        assert_eq!(result.len(), 1, "IntAdd(3,4) should be constant-folded");
+        assert_eq!(result[0].opcode, OpCode::Finish);
+    }
+
+    #[test]
+    fn test_constant_fold_int_lt() {
+        // IntLt(const(3), const(5)) → const(1) (true)
+        let mut ops = vec![
+            Op::new(OpCode::IntLt, &[OpRef(10_000), OpRef(10_001)]),
+            Op::new(OpCode::Finish, &[OpRef(0)]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 3i64);
+        constants.insert(10_001, 5i64);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize_with_constants(&ops, &mut constants);
+
+        assert_eq!(result.len(), 1, "IntLt(3,5) should be constant-folded");
     }
 }

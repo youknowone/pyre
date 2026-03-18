@@ -139,6 +139,15 @@ impl OptContext {
         })
     }
 
+    /// Record a constant-folded value and return its OpRef.
+    ///
+    /// If `opref` is not already a known constant, records the value.
+    /// Returns `opref` (which is now known to be this constant).
+    pub fn find_or_record_constant_int(&mut self, opref: OpRef, value: i64) -> OpRef {
+        self.make_constant(opref, Value::Int(value));
+        opref
+    }
+
     /// Get constant float value, if known.
     pub fn get_constant_float(&self, opref: OpRef) -> Option<f64> {
         self.get_constant(opref).and_then(|v| match v {
