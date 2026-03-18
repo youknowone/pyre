@@ -871,6 +871,46 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── call_kw ──
+    // PyPy: CALL_FUNCTION_KW; CPython 3.13: CALL_KW
+    // Stack: [callable, self_or_null, arg1, ..., argN, kwarg_names_tuple]
+    fn call_kw(&mut self, nargs: usize) -> Result<(), Self::Error> {
+        // Pop kwarg_names tuple (tells which args are keyword)
+        let _kwarg_names = self.pop();
+
+        // Pop all N args
+        let mut args = Vec::with_capacity(nargs);
+        for _ in 0..nargs {
+            args.push(self.pop());
+        }
+        args.reverse();
+
+        // Pop self_or_null
+        let self_or_null = self.pop();
+        // Pop callable
+        let callable = self.pop();
+
+        // If self_or_null is non-null, prepend it to args (bound method call)
+        if self_or_null != PY_NULL && !unsafe { pyre_object::is_none(self_or_null) } {
+            args.insert(0, self_or_null);
+        }
+
+        // Phase 1: pass all args positionally (ignore kwarg semantics)
+        let result = call_callable(self, callable, &args)?;
+        self.push(result);
+        Ok(())
+    }
+
+    // ── load_locals ──
+    // PyPy: LOAD_LOCALS; CPython: LOAD_LOCALS
+    // Pushes the current namespace dict onto the stack.
+    fn load_locals(&mut self) -> Result<(), Self::Error> {
+        // In pyre, "locals" in a class body is the namespace dict.
+        // Phase 1: push a new empty dict (class body locals placeholder)
+        self.push(pyre_object::w_dict_new());
+        Ok(())
+    }
+
     // ── BuildSlice ──
     // CPython 3.13: BUILD_SLICE creates a slice object from 2 or 3 stack items
     fn build_slice(&mut self, argc: pyre_bytecode::bytecode::BuildSliceArgCount) -> Result<(), Self::Error> {
@@ -2535,7 +2575,6 @@ for c in 'abc':
     }
 
     #[test]
-    #[ignore = "closures need COPY_FREE_VARS + cell passing in MAKE_FUNCTION"]
     fn test_closure_basic() {
         let source = "\
 def make_adder(n):
