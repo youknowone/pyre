@@ -192,13 +192,16 @@ impl Default for OptPure {
 impl Optimization for OptPure {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.opcode.is_always_pure() {
-            // Check if all arguments are constant -> could constant-fold.
-            // (Actual constant folding is left to a dedicated pass; here we
-            // just do CSE.)
+            // RPython pure.py: constant folding — if all args are constants,
+            // compute the result at optimization time.
+            if let Some(folded) = try_constant_fold(op, ctx) {
+                ctx.replace_op(op.pos, folded);
+                return OptimizationResult::Remove;
+            }
 
             let key = PureOpKey::from_op(op);
 
-            // Did we do the exact same operation already?
+            // CSE: did we do the exact same operation already?
             if let Some(cached_ref) = self.lookup_pure(&key) {
                 let cached_ref = ctx.get_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
