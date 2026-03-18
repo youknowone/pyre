@@ -1145,3 +1145,66 @@ mod tests {
         unsafe { assert_eq!(w_int_get_value(result), 2) };
     }
 }
+
+/// `in` operator: check if `needle` is in `haystack`.
+/// PyPy: space.contains_w(haystack, needle)
+pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    use pyre_object::*;
+    unsafe {
+        if is_list(haystack) {
+            let len = w_list_len(haystack);
+            for i in 0..len {
+                if let Some(item) = w_list_getitem(haystack, i as i64) {
+                    if py_eq_bool(item, needle) {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        if is_tuple(haystack) {
+            let len = w_tuple_len(haystack);
+            for i in 0..len {
+                if let Some(item) = w_tuple_getitem(haystack, i as i64) {
+                    if py_eq_bool(item, needle) {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        if is_str(haystack) && is_str(needle) {
+            let h = w_str_get_value(haystack);
+            let n = w_str_get_value(needle);
+            return Ok(h.contains(n));
+        }
+    }
+    Err(PyError::type_error("argument of type is not iterable"))
+}
+
+/// Compare two objects for equality (returns bool, not PyObjectRef).
+fn py_eq_bool(a: PyObjectRef, b: PyObjectRef) -> bool {
+    if a == b { return true; }
+    py_compare(a, b, CompareOp::Eq)
+        .map(|r| py_is_true(r))
+        .unwrap_or(false)
+}
+
+/// Delete item: `del obj[index]`
+pub fn py_delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
+    use pyre_object::*;
+    unsafe {
+        if is_list(obj) && is_int(index) {
+            let i = w_int_get_value(index);
+            let len = w_list_len(obj) as i64;
+            let idx = if i < 0 { len + i } else { i };
+            if idx >= 0 && idx < len {
+                // For Phase 1: set to PY_NULL (proper removal needs list mutation API)
+                w_list_setitem(obj, idx, PY_NULL);
+                return Ok(());
+            }
+            return Err(PyError::type_error("list index out of range"));
+        }
+    }
+    Err(PyError::type_error("object does not support item deletion"))
+}
