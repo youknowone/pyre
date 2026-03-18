@@ -308,6 +308,109 @@ impl PackSet {
         self.packs = merged;
     }
 
+    /// vector.py: extend_packset()
+    ///
+    /// Follow dependency chains to find more candidates to put into pairs.
+    /// For each existing pack, check if the users (def→use) or producers
+    /// (use→def) of the packed ops can also form isomorphic pairs.
+    pub fn extend_packset(&mut self, graph: &DependencyGraph) {
+        loop {
+            let count_before = self.packs.len();
+            let num_packs = self.packs.len();
+            for pi in 0..num_packs {
+                if self.packs[pi].members.len() < 2 {
+                    continue;
+                }
+                let left = self.packs[pi].members[0];
+                let right = self.packs[pi].members[1];
+                // follow_def_uses: users of left/right that are isomorphic
+                for &uleft in &graph.nodes[left].users {
+                    for &uright in &graph.nodes[right].users {
+                        if uleft < uright
+                            && graph.nodes[uleft].op.opcode == graph.nodes[uright].op.opcode
+                            && !self.already_packed(uleft)
+                            && !self.already_packed(uright)
+                        {
+                            let sc = graph.nodes[uleft].op.opcode;
+                            self.packs.push(PackGroup {
+                                scalar_opcode: sc,
+                                vector_opcode: sc.to_vector().unwrap_or(sc),
+                                members: vec![uleft, uright],
+                            });
+                        }
+                    }
+                }
+                // follow_use_defs: deps of left/right that are isomorphic
+                for &dleft in &graph.nodes[left].deps {
+                    for &dright in &graph.nodes[right].deps {
+                        if dleft < dright
+                            && graph.nodes[dleft].op.opcode == graph.nodes[dright].op.opcode
+                            && !self.already_packed(dleft)
+                            && !self.already_packed(dright)
+                        {
+                            let sc = graph.nodes[dleft].op.opcode;
+                            self.packs.push(PackGroup {
+                                scalar_opcode: sc,
+                                vector_opcode: sc.to_vector().unwrap_or(sc),
+                                members: vec![dleft, dright],
+                            });
+                        }
+                    }
+                }
+            }
+            if self.packs.len() == count_before {
+                break;
+            }
+        }
+    }
+
+    /// Check if an op index is already in some pack.
+    fn already_packed(&self, idx: usize) -> bool {
+        self.packs.iter().any(|p| p.members.contains(&idx))
+    }
+
+    /// vector.py: combine_packset()
+    ///
+    /// Combine packs that share edges: if pack1.rightmost == pack2.leftmost,
+    /// merge them into a longer pack. Iterates until stable.
+    pub fn combine_packset(&mut self) {
+        loop {
+            let len_before = self.packs.len();
+            let mut i = 0;
+            while i < self.packs.len() {
+                let mut j = 0;
+                while j < self.packs.len() {
+                    if i == j {
+                        j += 1;
+                        continue;
+                    }
+                    if i < self.packs.len() && j < self.packs.len() {
+                        let right_of_i = *self.packs[i].members.last().unwrap_or(&usize::MAX);
+                        let left_of_j = *self.packs[j].members.first().unwrap_or(&usize::MAX);
+                        if right_of_i == left_of_j
+                            && self.packs[i].scalar_opcode == self.packs[j].scalar_opcode
+                        {
+                            // Merge j into i
+                            let mut merged_members = self.packs[i].members.clone();
+                            merged_members.extend_from_slice(&self.packs[j].members[1..]);
+                            self.packs[i].members = merged_members;
+                            self.packs.remove(j);
+                            if j < i {
+                                i -= 1;
+                            }
+                            continue; // re-check from j
+                        }
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
+            if self.packs.len() == len_before {
+                break;
+            }
+        }
+    }
+
     /// Number of packs.
     pub fn num_packs(&self) -> usize {
         self.packs.len()
