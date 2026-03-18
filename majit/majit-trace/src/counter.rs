@@ -251,3 +251,74 @@ impl DeterministicJitCounter {
         self.threshold
     }
 }
+
+#[cfg(test)]
+mod deterministic_tests {
+    use super::*;
+
+    #[test]
+    fn test_deterministic_basic() {
+        let mut counter = DeterministicJitCounter::new(3);
+        assert!(!counter.tick(42));
+        assert!(!counter.tick(42));
+        assert!(counter.tick(42));
+    }
+
+    #[test]
+    fn test_deterministic_no_eviction() {
+        let mut counter = DeterministicJitCounter::new(3);
+        // Insert many different hashes — no eviction
+        for i in 0..100u64 {
+            counter.tick(i);
+        }
+        // All should still be tracked at count 1
+        for i in 0..100u64 {
+            assert_eq!(counter.get(i), 1);
+        }
+    }
+
+    #[test]
+    fn test_deterministic_would_fire() {
+        let mut counter = DeterministicJitCounter::new(3);
+        counter.tick(42);
+        assert!(!counter.would_fire(42)); // count=1, need 2 more
+        counter.tick(42);
+        assert!(counter.would_fire(42)); // count=2, one more tick fires
+    }
+
+    #[test]
+    fn test_deterministic_reset() {
+        let mut counter = DeterministicJitCounter::new(2);
+        counter.tick(42);
+        counter.reset(42);
+        assert_eq!(counter.get(42), 0);
+        assert!(!counter.tick(42)); // count=1, not yet
+        assert!(counter.tick(42)); // count=2, fires
+    }
+
+    #[test]
+    fn test_jit_counter_install() {
+        let mut counter = JitCounter::new(10);
+        counter.install(42, 8);
+        assert_eq!(counter.get(42), 8);
+        assert!(!counter.tick(42)); // 9, not yet
+        assert!(counter.tick(42)); // 10, fires
+    }
+
+    #[test]
+    fn test_jit_counter_compute_threshold() {
+        let counter = JitCounter::new(100);
+        assert_eq!(counter.compute_threshold(0.5), 50);
+        assert_eq!(counter.compute_threshold(1.0), 100);
+        assert_eq!(counter.compute_threshold(2.0), 100); // capped
+    }
+
+    #[test]
+    fn test_jit_counter_num_active() {
+        let mut counter = JitCounter::new(10);
+        assert_eq!(counter.num_active(), 0);
+        counter.tick(1);
+        counter.tick(2);
+        assert_eq!(counter.num_active(), 2);
+    }
+}
