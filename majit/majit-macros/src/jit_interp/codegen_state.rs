@@ -210,6 +210,17 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             type Env = #env_type;
 
             fn can_trace(&self) -> bool {
+                // RPython parity: skip tracing when total storage depth is too large
+                // for SymbolicStack-based tracing. Without virtualizable preamble,
+                // huge InputArgs cause expensive trace attempts that always abort.
+                if #virtualizable {
+                    let total: usize = (0..aheui_runtime::aheui::STORAGE_COUNT)
+                        .map(|i| self.#pool_field.get(i).len())
+                        .sum();
+                    if total > 500 {
+                        return false;
+                    }
+                }
                 true #( && self.#sel_field != #untraceable )*
                 #extra_guard
             }
