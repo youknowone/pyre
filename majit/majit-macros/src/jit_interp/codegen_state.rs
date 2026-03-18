@@ -222,8 +222,20 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             type Env = #env_type;
 
             fn can_trace(&self) -> bool {
-                true #( && self.#sel_field != #untraceable )*
-                #extra_guard
+                if !(true #( && self.#sel_field != #untraceable )*) {
+                    return false;
+                }
+                // Depth cap: skip expensive all_jit_compatible scan for large states.
+                if #virtualizable {
+                    let traceable_depth: usize = (0..aheui_runtime::aheui::STORAGE_COUNT)
+                        .filter(|&i| true #( && i != #untraceable )*)
+                        .map(|i| self.#pool_field.get(i).len())
+                        .sum();
+                    if traceable_depth > 50 {
+                        return false;
+                    }
+                }
+                true #extra_guard
             }
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
