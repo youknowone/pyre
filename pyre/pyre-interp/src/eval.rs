@@ -742,7 +742,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── print_expr ──
     // PyPy: PRINT_EXPR → sys.displayhook(value)
     fn print_expr(&mut self, val: PyObjectRef) -> Result<(), Self::Error> {
-        if !pyre_object::is_none(val) {
+        if !unsafe { pyre_object::is_none(val) } {
             let s = pyre_objspace::space::py_repr(val);
             println!("{}", s);
         }
@@ -2428,6 +2428,83 @@ for c in 'abc':
             let result = *(*frame.namespace).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 84);
         }
+    }
+
+    #[test]
+    #[ignore = "closures need COPY_FREE_VARS + cell passing in MAKE_FUNCTION"]
+    fn test_closure_basic() {
+        let source = "\
+def make_adder(n):
+    def adder(x):
+        return x + n
+    return adder
+add5 = make_adder(5)
+result = add5(10)";
+        let (res, frame) = run_exec_frame(source);
+        match res {
+            Ok(_) => unsafe {
+                let r = *(*frame.namespace).get("result").unwrap();
+                assert_eq!(w_int_get_value(r), 15);
+            },
+            Err(e) => eprintln!("closure: {} ({:?})", e.message, e.kind),
+        }
+    }
+
+    #[test]
+    fn test_tuple_unpacking_assign() {
+        let source = "a, b, c = 1, 2, 3\nresult = a + b + c";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("tuple unpack failed");
+        unsafe {
+            let r = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(r), 6);
+        }
+    }
+
+    #[test]
+    fn test_dict_access_ops() {
+        let source = "d = {1: 10, 2: 20}\nresult = d[1] + d[2]";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("dict access failed");
+        unsafe {
+            let r = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(r), 30);
+        }
+    }
+
+    #[test]
+    fn test_string_len() {
+        let source = "result = len('hello')";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("string len failed");
+        unsafe {
+            let r = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(r), 5);
+        }
+    }
+
+    #[test]
+    fn test_power_operator() {
+        let result = run_eval("2 ** 10").unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 1024); }
+    }
+
+    #[test]
+    fn test_modulo() {
+        let result = run_eval("17 % 5").unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 2); }
+    }
+
+    #[test]
+    fn test_floor_division() {
+        let result = run_eval("17 // 3").unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 5); }
+    }
+
+    #[test]
+    fn test_bitwise_ops() {
+        let result = run_eval("(0xFF & 0x0F) | 0x30").unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 0x3F); }
     }
 
     #[test]
