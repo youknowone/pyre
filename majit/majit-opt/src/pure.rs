@@ -554,6 +554,26 @@ impl Optimization for OptPure {
             return self.handle_call_loopinvariant(op, ctx);
         }
 
+        // pure.py: COND_CALL_VALUE_I/R — treated like CALL_PURE but
+        // with args starting at index 1 (index 0 is the condition).
+        if op.opcode == OpCode::CondCallValueI || op.opcode == OpCode::CondCallValueR {
+            if op.num_args() >= 2 {
+                // CSE key uses args[1..] (skip condition arg)
+                let key = PureOpKey {
+                    opcode: op.opcode,
+                    args: op.args[1..].to_vec(),
+                };
+                if let Some(cached_ref) = self.lookup_pure(&key) {
+                    let cached_ref = ctx.get_replacement(cached_ref);
+                    ctx.replace_op(op.pos, cached_ref);
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove;
+                }
+                self.cache.insert(key, op.pos);
+            }
+            return OptimizationResult::PassOn;
+        }
+
         OptimizationResult::PassOn
     }
 
