@@ -525,6 +525,53 @@ impl EffectInfo {
     pub fn has_oopspec(&self) -> bool {
         self.oopspec_index != OopSpecIndex::None
     }
+
+    /// effectinfo.py: check_can_raise(ignore_memoryerror)
+    /// Whether this call can raise exceptions (optionally ignoring MemoryError).
+    pub fn check_can_raise(&self, ignore_memoryerror: bool) -> bool {
+        if ignore_memoryerror {
+            // ElidableOrMemoryError can only raise MemoryError
+            matches!(
+                self.extra_effect,
+                ExtraEffect::ElidableCanRaise
+                    | ExtraEffect::CanRaise
+                    | ExtraEffect::ForcesVirtualOrVirtualizable
+                    | ExtraEffect::RandomEffects
+            )
+        } else {
+            self.can_raise()
+        }
+    }
+
+    /// effectinfo.py: is_call_release_gil()
+    /// Whether this call releases the GIL (for FFI calls).
+    pub fn is_call_release_gil(&self) -> bool {
+        false // Not applicable in our Rust runtime
+    }
+
+    /// Create a new EffectInfo with the given effect and oopspec.
+    pub fn new(extra_effect: ExtraEffect, oopspec_index: OopSpecIndex) -> Self {
+        EffectInfo {
+            extra_effect,
+            oopspec_index,
+        }
+    }
+
+    /// Create an EffectInfo for a pure, elidable operation.
+    pub fn elidable() -> Self {
+        EffectInfo {
+            extra_effect: ExtraEffect::ElidableCannotRaise,
+            oopspec_index: OopSpecIndex::None,
+        }
+    }
+
+    /// Create an EffectInfo for a side-effecting operation.
+    pub fn side_effecting() -> Self {
+        EffectInfo {
+            extra_effect: ExtraEffect::RandomEffects,
+            oopspec_index: OopSpecIndex::None,
+        }
+    }
 }
 
 #[cfg(test)]

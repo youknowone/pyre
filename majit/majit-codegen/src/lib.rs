@@ -778,6 +778,58 @@ pub trait Backend: Send {
     fn free_loop(&mut self, _token: &JitCellToken) {
         // Default: no-op
     }
+
+    // ── model.py: bh_* blackhole interpreter helpers ──
+    //
+    // These methods provide fallback implementations for operations
+    // that the blackhole interpreter needs to execute when falling
+    // back from JIT-compiled code. The backend implements these
+    // to read/write memory at known addresses.
+
+    /// model.py: bh_getfield_gc_i(struct_ptr, descr)
+    fn bh_getfield_gc_i(&self, _struct_ptr: i64, _offset: usize) -> i64 { 0 }
+    /// model.py: bh_getfield_gc_r(struct_ptr, descr)
+    fn bh_getfield_gc_r(&self, _struct_ptr: i64, _offset: usize) -> GcRef { GcRef::NULL }
+    /// model.py: bh_getfield_gc_f(struct_ptr, descr)
+    fn bh_getfield_gc_f(&self, _struct_ptr: i64, _offset: usize) -> f64 { 0.0 }
+    /// model.py: bh_setfield_gc_i(struct_ptr, value, descr)
+    fn bh_setfield_gc_i(&self, _struct_ptr: i64, _offset: usize, _value: i64) {}
+    /// model.py: bh_setfield_gc_r(struct_ptr, value, descr)
+    fn bh_setfield_gc_r(&self, _struct_ptr: i64, _offset: usize, _value: GcRef) {}
+    /// model.py: bh_setfield_gc_f(struct_ptr, value, descr)
+    fn bh_setfield_gc_f(&self, _struct_ptr: i64, _offset: usize, _value: f64) {}
+    /// model.py: bh_getarrayitem_gc_i(array_ptr, index, descr)
+    fn bh_getarrayitem_gc_i(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> i64 { 0 }
+    /// model.py: bh_getarrayitem_gc_r(array_ptr, index, descr)
+    fn bh_getarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> GcRef { GcRef::NULL }
+    /// model.py: bh_setarrayitem_gc_i(array_ptr, index, value, descr)
+    fn bh_setarrayitem_gc_i(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: i64) {}
+    /// model.py: bh_setarrayitem_gc_r(array_ptr, index, value, descr)
+    fn bh_setarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: GcRef) {}
+    /// model.py: bh_arraylen_gc(array_ptr, descr)
+    fn bh_arraylen_gc(&self, _array_ptr: i64, _len_offset: usize) -> i64 { 0 }
+    /// model.py: bh_new(descr)
+    fn bh_new(&self, _size: usize, _type_id: u32) -> i64 { 0 }
+    /// model.py: bh_new_with_vtable(descr)
+    fn bh_new_with_vtable(&self, _size: usize, _vtable: usize) -> i64 { 0 }
+    /// model.py: bh_new_array(length, descr)
+    fn bh_new_array(&self, _length: i64, _item_size: usize, _type_id: u32) -> i64 { 0 }
+    /// model.py: bh_strlen(string_ptr)
+    fn bh_strlen(&self, _string_ptr: i64) -> i64 { 0 }
+    /// model.py: bh_strgetitem(string_ptr, index)
+    fn bh_strgetitem(&self, _string_ptr: i64, _index: i64) -> i64 { 0 }
+    /// model.py: bh_strsetitem(string_ptr, index, value)
+    fn bh_strsetitem(&self, _string_ptr: i64, _index: i64, _value: i64) {}
+    /// model.py: bh_newstr(length)
+    fn bh_newstr(&self, _length: i64) -> i64 { 0 }
+    /// model.py: bh_call_i(func_ptr, args, calldescr)
+    fn bh_call_i(&self, _func_ptr: i64, _args: &[i64]) -> i64 { 0 }
+    /// model.py: bh_call_r(func_ptr, args, calldescr)
+    fn bh_call_r(&self, _func_ptr: i64, _args: &[i64]) -> GcRef { GcRef::NULL }
+    /// model.py: bh_call_f(func_ptr, args, calldescr)
+    fn bh_call_f(&self, _func_ptr: i64, _args: &[i64]) -> f64 { 0.0 }
+    /// model.py: bh_call_v(func_ptr, args, calldescr)
+    fn bh_call_v(&self, _func_ptr: i64, _args: &[i64]) {}
 }
 
 /// Errors from the backend.
