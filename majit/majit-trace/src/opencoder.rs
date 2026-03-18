@@ -420,6 +420,103 @@ impl CutTrace {
     }
 }
 
+// ── Trace Recording API (opencoder.py: Trace class) ──
+
+/// opencoder.py: Trace — compact trace recording buffer.
+///
+/// Records operations and snapshots during tracing. The recorded data
+/// can be iterated via `TraceIterator` or serialized via `encode_trace`.
+pub struct TraceRecordBuffer {
+    /// Encoded operation stream (binary).
+    data: Vec<u8>,
+    /// Number of input arguments.
+    num_inputargs: usize,
+    /// Number of recorded operations.
+    num_ops: usize,
+    /// Snapshot storage.
+    snapshots: SnapshotStorage,
+    /// Cut points for bridge compilation.
+    cut_points: Vec<usize>,
+    /// Whether the trace has overflowed (too long).
+    overflow: bool,
+    /// Maximum allowed data size.
+    max_size: usize,
+}
+
+impl TraceRecordBuffer {
+    /// Create a new trace recording buffer.
+    pub fn new(num_inputargs: usize) -> Self {
+        TraceRecordBuffer {
+            data: Vec::with_capacity(4096),
+            num_inputargs,
+            num_ops: 0,
+            snapshots: SnapshotStorage::new(),
+            cut_points: Vec::new(),
+            overflow: false,
+            max_size: 1 << 20, // 1MB default
+        }
+    }
+
+    /// opencoder.py: tag_overflow_imminent()
+    /// Check if the recording buffer is nearly full.
+    pub fn tag_overflow_imminent(&self) -> bool {
+        self.data.len() > self.max_size * 9 / 10
+    }
+
+    /// opencoder.py: tracing_done()
+    /// Finalize the trace and check for overflow.
+    pub fn tracing_done(&mut self) -> bool {
+        if self.data.len() > self.max_size {
+            self.overflow = true;
+        }
+        !self.overflow
+    }
+
+    /// Record an operation.
+    pub fn record_op(&mut self, opcode: u16, num_args: u8) {
+        encode_varint(&mut self.data, opcode as u64);
+        self.data.push(num_args);
+        self.num_ops += 1;
+    }
+
+    /// Record an argument value.
+    pub fn record_arg(&mut self, value: u32) {
+        encode_varint(&mut self.data, value as u64);
+    }
+
+    /// opencoder.py: cut_point()
+    /// Mark the current position as a potential bridge entry.
+    pub fn cut_point(&mut self) {
+        self.cut_points.push(self.data.len());
+    }
+
+    /// Number of recorded operations.
+    pub fn num_ops(&self) -> usize {
+        self.num_ops
+    }
+
+    /// Whether the trace overflowed.
+    pub fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    /// Get the snapshot storage.
+    pub fn snapshots(&self) -> &SnapshotStorage {
+        &self.snapshots
+    }
+
+    /// Get mutable snapshot storage (for adding snapshots during tracing).
+    pub fn snapshots_mut(&mut self) -> &mut SnapshotStorage {
+        &mut self.snapshots
+    }
+
+    /// opencoder.py: capture_resumedata(snapshot)
+    /// Record a snapshot at the current position (for guard resume data).
+    pub fn capture_resumedata(&mut self, snapshot: Snapshot) -> usize {
+        self.snapshots.add_snapshot(snapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
