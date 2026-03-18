@@ -10,6 +10,7 @@ pub mod object_array;
 pub mod pyobject;
 pub mod rangeobject;
 pub mod strobject;
+pub mod sliceobject;
 pub mod tupleobject;
 
 pub use boolobject::*;
@@ -23,5 +24,6 @@ pub use noneobject::*;
 pub use object_array::*;
 pub use pyobject::*;
 pub use rangeobject::*;
+pub use sliceobject::*;
 pub use strobject::*;
 pub use tupleobject::*;
