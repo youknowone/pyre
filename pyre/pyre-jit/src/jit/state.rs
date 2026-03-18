@@ -1737,27 +1737,30 @@ impl TraceFrameState {
         let result = self.with_ctx(|this, ctx| {
             this.guard_value(ctx, callable, concrete_callable as i64);
 
-            // Create callee frame
-            let mut helper_args = vec![this.frame(), callable];
-            helper_args.extend_from_slice(args);
-            let callee_frame = ctx.call_int(frame_helper, &helper_args);
-
-            // CallMayForceI(force_fn, callee_frame) — returns raw int.
-            // unbox_call_assembler_results post-process will strip
-            // the subsequent GetfieldRawI unbox ops.
-            let force_fn_ptr = crate::call_jit::jit_force_callee_frame as *const ();
-            let result = ctx.call_may_force_int(force_fn_ptr, &[callee_frame]);
-
-            // GuardNotForced: protects outer trace (PyPy compile.py)
-            this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-
-            // Drop callee frame
-            ctx.call_void(
-                crate::call_jit::jit_drop_callee_frame as *const (),
-                &[callee_frame],
-            );
-
-            Ok(result)
+            if args.len() == 1 {
+                // Fused: CallMayForce(force_recursive_1, caller_frame, callable, boxed_arg)
+                // Eliminates create_frame + drop_frame from trace (2 Call ops saved).
+                let force_fn = crate::call_jit::jit_force_recursive_call_1 as *const ();
+                let result = ctx.call_may_force_int(
+                    force_fn,
+                    &[this.frame(), callable, args[0]],
+                );
+                this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                Ok(result)
+            } else {
+                // Multi-arg: frame helper path
+                let mut helper_args = vec![this.frame(), callable];
+                helper_args.extend_from_slice(args);
+                let callee_frame = ctx.call_int(frame_helper, &helper_args);
+                let force_fn = crate::call_jit::jit_force_callee_frame as *const ();
+                let result = ctx.call_may_force_int(force_fn, &[callee_frame]);
+                this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                ctx.call_void(
+                    crate::call_jit::jit_drop_callee_frame as *const (),
+                    &[callee_frame],
+                );
+                Ok(result)
+            }
         });
 
         let (driver, _) = crate::eval::driver_pair();

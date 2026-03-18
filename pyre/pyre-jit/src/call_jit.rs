@@ -217,6 +217,43 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     }
 }
 
+/// Fused recursive call: create frame + compiled dispatch + drop, all in one.
+///
+/// Eliminates 2 of 4 Call ops per recursive call in the trace:
+///   Before: CallI(box) + CallI(create_frame) + CallMayForce(force) + CallN(drop)
+///   After:  CallI(box) + CallMayForce(force_recursive, caller_frame, callable, boxed_arg)
+///
+/// Takes a boxed arg (already traced via trace_box_int), creates callee frame
+/// internally, dispatches to compiled code, drops frame, returns raw int result.
+pub extern "C" fn jit_force_recursive_call_1(
+    caller_frame: i64,
+    callable: i64,
+    boxed_arg: i64,
+) -> i64 {
+    let callable_ref = callable as PyObjectRef;
+    let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
+    let code_key = code_ptr as usize;
+    let arg_key = force_cache_arg_key(boxed_arg as PyObjectRef);
+
+    // FORCE_CACHE check
+    let hash_idx = (code_key.wrapping_mul(2654435761) ^ arg_key) % FORCE_CACHE_SIZE;
+    unsafe {
+        let entry = &FORCE_CACHE[hash_idx];
+        if entry.0 == code_key && entry.1 == arg_key {
+            return entry.2;
+        }
+    }
+
+    // Create callee frame (arena), dispatch, drop — all internal
+    let frame_ptr = create_callee_frame_impl(caller_frame, callable, &[boxed_arg as PyObjectRef]);
+    let result = jit_force_callee_frame(frame_ptr);
+    jit_drop_callee_frame(frame_ptr);
+
+    // Cache result
+    unsafe { FORCE_CACHE[hash_idx] = (code_key, arg_key, result); }
+    result
+}
+
 pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
