@@ -132,28 +132,22 @@ impl OptString {
                     return left_forced;
                 }
 
+                let is_unicode = self.unicode_refs.contains(&resolved);
                 let left_forced = self.force_string(left, ctx);
                 let right_forced = self.force_string(right, ctx);
                 let left_len = self.get_or_emit_strlen(left_forced, ctx);
                 let right_len = self.get_or_emit_strlen(right_forced, ctx);
-                // total = left_len + right_len
                 let total_op = Op::new(OpCode::IntAdd, &[left_len, right_len]);
                 let total_ref = ctx.emit(total_op);
-                // Emit NEWSTR(total)
-                let newstr_op = Op::new(OpCode::Newstr, &[total_ref]);
+                // vstring.py: use correct opcodes for byte vs unicode strings
+                let new_opcode = if is_unicode { OpCode::Newunicode } else { OpCode::Newstr };
+                let copy_opcode = if is_unicode { OpCode::Copyunicodecontent } else { OpCode::Copystrcontent };
+                let newstr_op = Op::new(new_opcode, &[total_ref]);
                 let str_ref = ctx.emit(newstr_op);
-                // COPYSTRCONTENT(left, str, 0, 0, left_len)
                 let zero = self.emit_constant_int(0, ctx);
-                let copy_left = Op::new(
-                    OpCode::Copystrcontent,
-                    &[left_forced, str_ref, zero, zero, left_len],
-                );
+                let copy_left = Op::new(copy_opcode, &[left_forced, str_ref, zero, zero, left_len]);
                 ctx.emit(copy_left);
-                // COPYSTRCONTENT(right, str, 0, left_len, right_len)
-                let copy_right = Op::new(
-                    OpCode::Copystrcontent,
-                    &[right_forced, str_ref, zero, left_len, right_len],
-                );
+                let copy_right = Op::new(copy_opcode, &[right_forced, str_ref, zero, left_len, right_len]);
                 ctx.emit(copy_right);
                 ctx.replace_op(resolved, str_ref);
                 str_ref
@@ -166,13 +160,14 @@ impl OptString {
                 let src_forced = self.force_string(source, ctx);
                 let start_resolved = ctx.get_replacement(start);
                 let length_resolved = ctx.get_replacement(length);
-                // Emit NEWSTR(length)
-                let newstr_op = Op::new(OpCode::Newstr, &[length_resolved]);
+                let is_unicode = self.unicode_refs.contains(&resolved);
+                let new_opcode = if is_unicode { OpCode::Newunicode } else { OpCode::Newstr };
+                let copy_opcode = if is_unicode { OpCode::Copyunicodecontent } else { OpCode::Copystrcontent };
+                let newstr_op = Op::new(new_opcode, &[length_resolved]);
                 let str_ref = ctx.emit(newstr_op);
-                // COPYSTRCONTENT(source, str, start, 0, length)
                 let zero = self.emit_constant_int(0, ctx);
                 let copy_op = Op::new(
-                    OpCode::Copystrcontent,
+                    copy_opcode,
                     &[src_forced, str_ref, start_resolved, zero, length_resolved],
                 );
                 ctx.emit(copy_op);
