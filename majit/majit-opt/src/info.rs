@@ -597,6 +597,12 @@ pub struct VirtualizableFieldState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use majit_ir::{Descr, OpCode, Value};
+
+    #[derive(Debug)]
+    struct TestDescr;
+    impl Descr for TestDescr {}
 
     fn make_buf(size: usize) -> VirtualRawBufferInfo {
         VirtualRawBufferInfo {
@@ -734,5 +740,104 @@ mod tests {
         assert_eq!(buf.entries[0].0, 0);
         assert_eq!(buf.entries[1].0, 8);
         assert_eq!(buf.entries[2].0, 16);
+    }
+
+    #[test]
+    fn test_ptr_info_factories() {
+        let nonnull = PtrInfo::nonnull();
+        assert!(nonnull.is_nonnull());
+        assert!(!nonnull.is_virtual());
+
+        let constant = PtrInfo::constant(GcRef(0x1000));
+        assert!(constant.is_nonnull());
+        assert!(constant.is_constant());
+
+        let kc = PtrInfo::known_class(GcRef(0x2000), true);
+        assert!(kc.is_nonnull());
+        assert!(kc.get_known_class().is_some());
+    }
+
+    #[test]
+    fn test_ptr_info_virtual_factories() {
+        let descr: DescrRef = Arc::new(TestDescr);
+
+        let virtual_obj = PtrInfo::virtual_obj(descr.clone(), Some(GcRef(0x3000)));
+        assert!(virtual_obj.is_virtual());
+        assert!(virtual_obj.is_nonnull());
+        assert!(virtual_obj.get_descr().is_some());
+
+        let virtual_arr = PtrInfo::virtual_array(descr.clone(), 5);
+        assert!(virtual_arr.is_virtual());
+        assert_eq!(virtual_arr.num_fields(), 5);
+
+        let virtual_struct = PtrInfo::virtual_struct(descr);
+        assert!(virtual_struct.is_virtual());
+    }
+
+    #[test]
+    fn test_ptr_info_set_get_field() {
+        let descr: DescrRef = Arc::new(TestDescr);
+        let mut info = PtrInfo::virtual_obj(descr, None);
+
+        assert_eq!(info.get_field(0), None);
+        info.set_field(0, OpRef(10));
+        assert_eq!(info.get_field(0), Some(OpRef(10)));
+        info.set_field(0, OpRef(20)); // overwrite
+        assert_eq!(info.get_field(0), Some(OpRef(20)));
+        info.set_field(1, OpRef(30));
+        assert_eq!(info.get_field(1), Some(OpRef(30)));
+    }
+
+    #[test]
+    fn test_ptr_info_set_get_item() {
+        let descr: DescrRef = Arc::new(TestDescr);
+        let mut info = PtrInfo::virtual_array(descr, 3);
+
+        assert_eq!(info.get_item(0), Some(OpRef::NONE)); // initialized to NONE
+        info.set_item(0, OpRef(10));
+        assert_eq!(info.get_item(0), Some(OpRef(10)));
+        info.set_item(2, OpRef(30));
+        assert_eq!(info.get_item(2), Some(OpRef(30)));
+        assert_eq!(info.get_item(5), None); // out of bounds
+    }
+
+    #[test]
+    fn test_ptr_info_make_guards() {
+        let nonnull = PtrInfo::nonnull();
+        let guards = nonnull.make_guards();
+        assert!(guards.contains(&OpCode::GuardNonnull));
+
+        let constant = PtrInfo::constant(GcRef(0x1000));
+        let guards = constant.make_guards();
+        assert!(guards.contains(&OpCode::GuardValue));
+
+        let kc = PtrInfo::known_class(GcRef(0x2000), true);
+        let guards = kc.make_guards();
+        assert!(guards.contains(&OpCode::GuardNonnullClass));
+    }
+
+    #[test]
+    fn test_ptr_info_visitor_walk() {
+        let descr: DescrRef = Arc::new(TestDescr);
+        let mut info = PtrInfo::virtual_obj(descr, None);
+        info.set_field(0, OpRef(10));
+        info.set_field(1, OpRef(20));
+        let refs = info.visitor_walk_recursive();
+        assert_eq!(refs, vec![OpRef(10), OpRef(20)]);
+    }
+
+    #[test]
+    fn test_opinfo_is_nonnull() {
+        assert!(!OpInfo::Unknown.is_nonnull());
+        assert!(OpInfo::Constant(Value::Int(42)).is_nonnull());
+        assert!(!OpInfo::Constant(Value::Int(0)).is_nonnull());
+        assert!(OpInfo::Ptr(PtrInfo::NonNull).is_nonnull());
+    }
+
+    #[test]
+    fn test_opinfo_float_const() {
+        let info = OpInfo::FloatConst(3.14);
+        assert!(info.is_constant());
+        assert_eq!(info.get_constant_float(), Some(3.14));
     }
 }
