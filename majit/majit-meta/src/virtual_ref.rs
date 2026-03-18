@@ -108,7 +108,7 @@ impl VirtualRefInfo {
 
     /// Create a virtual reference during tracing.
     ///
-    /// RPython virtualref.py: `virtual_ref_during_tracing()`
+    /// virtualref.py: `virtual_ref_during_tracing()`
     ///
     /// Returns (virtual_token_opref, forced_opref) that the tracer should
     /// record in the virtual ref's fields.
@@ -117,6 +117,80 @@ impl VirtualRefInfo {
         force_token: i64,
     ) -> (i64, i64) {
         (force_token, 0) // (active token, null forced)
+    }
+
+    /// Mark a virtual ref as "in residual call" before a non-JIT call.
+    ///
+    /// virtualref.py: `tracing_before_residual_call(vref)`
+    /// Sets token to TOKEN_TRACING_RESCALL so that if the callee
+    /// forces the vref, we detect it after the call.
+    ///
+    /// # Safety
+    /// `vref_ptr` must point to a valid JitVirtualRef object.
+    pub unsafe fn tracing_before_residual_call(&self, vref_ptr: *mut u8) {
+        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
+        *token_ptr = TOKEN_TRACING_RESCALL;
+    }
+
+    /// Check and restore a virtual ref after a residual call.
+    ///
+    /// virtualref.py: `tracing_after_residual_call(vref)`
+    /// Returns true if the vref was forced during the residual call
+    /// (token was cleared by the callee).
+    ///
+    /// # Safety
+    /// `vref_ptr` must point to a valid JitVirtualRef object.
+    pub unsafe fn tracing_after_residual_call(
+        &self,
+        vref_ptr: *mut u8,
+        original_token: i64,
+    ) -> bool {
+        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
+        let current_token = *token_ptr;
+
+        if current_token != TOKEN_TRACING_RESCALL {
+            // Token was modified during the call — vref was forced
+            return true;
+        }
+
+        // Not forced: restore original token
+        *token_ptr = original_token;
+        false
+    }
+
+    /// Continue tracing after a residual call that forced a vref.
+    ///
+    /// virtualref.py: `continue_tracing(vref, real_object)`
+    /// Updates the forced field and clears the token.
+    ///
+    /// # Safety
+    /// `vref_ptr` must point to a valid JitVirtualRef object.
+    pub unsafe fn continue_tracing(
+        &self,
+        vref_ptr: *mut u8,
+        real_object: *mut u8,
+    ) {
+        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
+        let forced_ptr = vref_ptr.add(self.descr_forced as usize * 8) as *mut *mut u8;
+        *forced_ptr = real_object;
+        *token_ptr = TOKEN_NONE;
+    }
+
+    /// Check if a virtual reference is currently active (has a JIT frame token).
+    ///
+    /// virtualref.py: token != TOKEN_NONE and token != TOKEN_TRACING_RESCALL
+    pub fn is_active(token: i64) -> bool {
+        token != TOKEN_NONE && token != TOKEN_TRACING_RESCALL
+    }
+
+    /// Check if a virtual reference is forced (token == TOKEN_NONE).
+    pub fn is_forced(token: i64) -> bool {
+        token == TOKEN_NONE
+    }
+
+    /// Check if a virtual reference is in a residual call.
+    pub fn is_in_residual_call(token: i64) -> bool {
+        token == TOKEN_TRACING_RESCALL
     }
 }
 
