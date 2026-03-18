@@ -194,6 +194,24 @@ impl OptContext {
     pub fn last_emitted_operation_mut(&mut self) -> Option<&mut Op> {
         self.new_operations.last_mut()
     }
+
+    /// optimizer.py: replace_op_with(old, new_op, ctx)
+    /// Replace old opref AND emit the new op.
+    pub fn replace_op_with(&mut self, old: OpRef, new_op: Op) -> OpRef {
+        let new_ref = self.emit(new_op);
+        self.replace_op(old, new_ref);
+        new_ref
+    }
+
+    /// Check if an opref has been replaced (forwarded).
+    pub fn is_replaced(&self, opref: OpRef) -> bool {
+        let idx = opref.0 as usize;
+        if idx < self.forwarding.len() {
+            !self.forwarding[idx].is_none()
+        } else {
+            false
+        }
+    }
 }
 
 /// An optimization pass.

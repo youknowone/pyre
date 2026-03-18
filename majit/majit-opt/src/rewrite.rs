@@ -1384,6 +1384,7 @@ impl Optimization for OptRewrite {
 
     fn setup(&mut self) {
         self.last_op_removed = false;
+        self.bool_result_cache.clear();
     }
 
     fn name(&self) -> &'static str {

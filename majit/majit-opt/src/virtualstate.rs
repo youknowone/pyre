@@ -398,6 +398,20 @@ impl VirtualState {
                 });
             }
 
+            // virtualstate.py: VirtualArray with known length vs unknown.
+            // Need guards to ensure the incoming array has the expected length.
+            (
+                VirtualStateInfo::VirtualArray { items: expected_items, .. },
+                VirtualStateInfo::Unknown,
+            ) => {
+                // The bridge needs to provide an array with exactly this many items.
+                let expected_len = expected_items.len() as i64;
+                guards.push(GuardRequirement::GuardValue {
+                    arg_index: arg_idx,
+                    expected_value: Value::Int(expected_len),
+                });
+            }
+
             _ => {} // Already compatible or will fail at is_compatible check
         }
     }
