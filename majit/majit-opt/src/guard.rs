@@ -71,6 +71,9 @@ pub struct GuardStrengthenOpt {
     /// guard.py: values with known class (from GuardClass/GuardNonnullClass).
     known_classes: std::collections::HashMap<OpRef, majit_ir::GcRef>,
 
+    /// guard.py: values known to be specific constants (from GuardValue).
+    known_constants: std::collections::HashMap<OpRef, i64>,
+
     /// Descriptor of the last emitted guard, used for consecutive-guard
     /// fusion.
     last_guard_descr: Option<DescrRef>,
@@ -82,6 +85,7 @@ impl GuardStrengthenOpt {
             seen: HashSet::new(),
             truthy_values: HashSet::new(),
             known_classes: std::collections::HashMap::new(),
+            known_constants: std::collections::HashMap::new(),
             last_guard_descr: None,
         }
     }
@@ -107,9 +111,10 @@ impl GuardStrengthenOpt {
                 // But we record it so that a later guard_false(v) can be eliminated.
             }
             OpCode::GuardValue => {
-                // guard_value(v, c): if the constant is nonzero, v is truthy.
                 let val_arg = op.arg(0);
                 if let Some(c) = ctx.get_constant_int(op.arg(1)) {
+                    // guard.py: record known constant value.
+                    self.known_constants.insert(val_arg, c);
                     if c != 0 {
                         self.truthy_values.insert(val_arg);
                     }
@@ -136,7 +141,23 @@ impl GuardStrengthenOpt {
     /// Returns `true` if the guard can be removed.
     fn is_subsumed(&self, op: &Op) -> bool {
         match op.opcode {
-            OpCode::GuardTrue => self.truthy_values.contains(&op.arg(0)),
+            OpCode::GuardTrue => {
+                // guard.py: also subsumed if value is a known nonzero constant.
+                if self.truthy_values.contains(&op.arg(0)) {
+                    return true;
+                }
+                if let Some(&c) = self.known_constants.get(&op.arg(0)) {
+                    return c != 0;
+                }
+                false
+            }
+            OpCode::GuardFalse => {
+                // Subsumed if value is a known zero constant.
+                if let Some(&c) = self.known_constants.get(&op.arg(0)) {
+                    return c == 0;
+                }
+                false
+            }
             OpCode::GuardNonnull => self.truthy_values.contains(&op.arg(0)),
             // guard.py: GUARD_NONNULL_CLASS subsumed if value is known nonnull
             // AND a previous GUARD_CLASS with same args was already seen.
@@ -215,6 +236,7 @@ impl Optimization for GuardStrengthenOpt {
         self.seen.clear();
         self.truthy_values.clear();
         self.known_classes.clear();
+        self.known_constants.clear();
         self.last_guard_descr = None;
     }
 

@@ -450,7 +450,20 @@ impl VirtualState {
         let mut count = 0;
         for info in &mut self.state {
             if info.is_virtual() {
-                *info = VirtualStateInfo::Unknown;
+                // virtualstate.py: forced virtuals become NonNull
+                // (they were allocated, so they're always non-null).
+                match info {
+                    VirtualStateInfo::Virtual { known_class, .. } => {
+                        *info = if let Some(cls) = known_class.take() {
+                            VirtualStateInfo::KnownClass { class_ptr: cls }
+                        } else {
+                            VirtualStateInfo::NonNull
+                        };
+                    }
+                    _ => {
+                        *info = VirtualStateInfo::NonNull;
+                    }
+                }
                 count += 1;
             }
         }
