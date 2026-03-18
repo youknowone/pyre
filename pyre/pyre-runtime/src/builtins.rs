@@ -203,3 +203,15 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> PyObjectRef {
     let check_type = unsafe { w_str_get_value(type_name_obj) };
     w_bool_from(obj_type == check_type)
 }
+
+/// `__build_class__(body, name, *bases)` — stub for class creation.
+/// Phase 1: returns None (class bodies not yet executed).
+fn builtin_build_class(args: &[PyObjectRef]) -> PyObjectRef {
+    let _ = args;
+    w_none()
+}
+
+/// Get a reference to the `__build_class__` builtin function.
+pub fn get_build_class_func() -> PyObjectRef {
+    w_builtin_func_new("__build_class__", builtin_build_class)
+}

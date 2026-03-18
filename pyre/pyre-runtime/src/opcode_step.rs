@@ -912,7 +912,8 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn load_fast_and_clear(&mut self, _idx: usize) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("load_fast_and_clear not implemented").into())
     }
-    fn set_function_attribute(&mut self) -> Result<(), Self::Error> {
+    fn set_function_attribute_with_flag(&mut self, _flag: pyre_bytecode::bytecode::MakeFunctionFlag) -> Result<(), Self::Error> {
+        // Default: pop the attribute value and discard
         let _attr = self.pop_value().map_err(Into::into)?;
         Ok(())
     }
@@ -1536,8 +1537,8 @@ where
 
         // ── Set function attribute (closure, annotations, etc.) ──
         Instruction::SetFunctionAttribute { flag } => {
-            let _flag = flag.get(op_arg);
-            executor.set_function_attribute()?;
+            let f = flag.get(op_arg);
+            executor.set_function_attribute_with_flag(f)?;
             Ok(StepResult::Continue)
         }
 
