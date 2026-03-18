@@ -955,12 +955,36 @@ impl Optimization for OptHeap {
     }
 
     /// heap.py: produce_potential_short_preamble_ops(sb)
+    ///
     /// Add cached field/array reads to the short preamble so bridges
     /// can re-populate the optimizer's cache.
-    fn produce_potential_short_preamble_ops(&self, _sb: &mut crate::shortpreamble::ShortBoxes) {
-        // In RPython, this adds GETFIELD/GETARRAYITEM ops for each
-        // cached field value to the short preamble builder.
-        // The bridge then re-reads these fields to populate the cache.
+    fn produce_potential_short_preamble_ops(&self, sb: &mut crate::shortpreamble::ShortBoxes) {
+        for (&(obj, descr_idx), &cached_val) in &self.cached_fields {
+            if cached_val.is_none() || obj.is_none() {
+                continue;
+            }
+            let label_arg_idx = cached_val.0 as usize;
+            if label_arg_idx >= sb.num_label_args {
+                continue;
+            }
+            let mut op = Op::new(OpCode::GetfieldGcI, &[obj]);
+            op.pos = cached_val;
+            sb.add_heap_op(label_arg_idx, op, descr_idx);
+        }
+
+        for (&(obj, descr_idx, index), &cached_val) in &self.cached_arrayitems {
+            if cached_val.is_none() || obj.is_none() {
+                continue;
+            }
+            let label_arg_idx = cached_val.0 as usize;
+            if label_arg_idx >= sb.num_label_args {
+                continue;
+            }
+            let idx_ref = OpRef(index as u32);
+            let mut op = Op::new(OpCode::GetarrayitemGcI, &[obj, idx_ref]);
+            op.pos = cached_val;
+            sb.add_heap_op(label_arg_idx, op, descr_idx);
+        }
     }
 
     fn name(&self) -> &'static str {
