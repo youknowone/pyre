@@ -574,6 +574,171 @@ impl EffectInfo {
     }
 }
 
+// ── Concrete descriptor implementations (descr.py) ──
+
+/// Simple concrete FieldDescr for use by pyre-jit and tests.
+#[derive(Debug, Clone)]
+pub struct SimpleFieldDescr {
+    index: u32,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    is_immutable: bool,
+    is_signed: bool,
+}
+
+impl SimpleFieldDescr {
+    pub fn new(
+        index: u32,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        is_immutable: bool,
+    ) -> Self {
+        SimpleFieldDescr {
+            index,
+            offset,
+            field_size,
+            field_type,
+            is_immutable,
+            is_signed: true,
+        }
+    }
+
+    pub fn with_signed(mut self, signed: bool) -> Self {
+        self.is_signed = signed;
+        self
+    }
+}
+
+impl Descr for SimpleFieldDescr {
+    fn index(&self) -> u32 {
+        self.index
+    }
+    fn is_always_pure(&self) -> bool {
+        self.is_immutable
+    }
+    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+        Some(self)
+    }
+}
+
+impl FieldDescr for SimpleFieldDescr {
+    fn offset(&self) -> usize {
+        self.offset
+    }
+    fn field_size(&self) -> usize {
+        self.field_size
+    }
+    fn field_type(&self) -> Type {
+        self.field_type
+    }
+    fn is_field_signed(&self) -> bool {
+        self.is_signed
+    }
+    fn is_immutable(&self) -> bool {
+        self.is_immutable
+    }
+}
+
+/// Simple concrete SizeDescr.
+#[derive(Debug, Clone)]
+pub struct SimpleSizeDescr {
+    index: u32,
+    size: usize,
+    type_id: u32,
+    is_immutable: bool,
+}
+
+impl SimpleSizeDescr {
+    pub fn new(index: u32, size: usize, type_id: u32) -> Self {
+        SimpleSizeDescr {
+            index,
+            size,
+            type_id,
+            is_immutable: false,
+        }
+    }
+}
+
+impl Descr for SimpleSizeDescr {
+    fn index(&self) -> u32 {
+        self.index
+    }
+    fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+        Some(self)
+    }
+}
+
+impl SizeDescr for SimpleSizeDescr {
+    fn size(&self) -> usize {
+        self.size
+    }
+    fn type_id(&self) -> u32 {
+        self.type_id
+    }
+    fn is_immutable(&self) -> bool {
+        self.is_immutable
+    }
+}
+
+/// Simple concrete ArrayDescr.
+#[derive(Debug, Clone)]
+pub struct SimpleArrayDescr {
+    index: u32,
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type: Type,
+    is_signed: bool,
+}
+
+impl SimpleArrayDescr {
+    pub fn new(
+        index: u32,
+        base_size: usize,
+        item_size: usize,
+        type_id: u32,
+        item_type: Type,
+    ) -> Self {
+        SimpleArrayDescr {
+            index,
+            base_size,
+            item_size,
+            type_id,
+            item_type,
+            is_signed: true,
+        }
+    }
+}
+
+impl Descr for SimpleArrayDescr {
+    fn index(&self) -> u32 {
+        self.index
+    }
+    fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
+        Some(self)
+    }
+}
+
+impl ArrayDescr for SimpleArrayDescr {
+    fn base_size(&self) -> usize {
+        self.base_size
+    }
+    fn item_size(&self) -> usize {
+        self.item_size
+    }
+    fn type_id(&self) -> u32 {
+        self.type_id
+    }
+    fn item_type(&self) -> Type {
+        self.item_type
+    }
+    fn is_item_signed(&self) -> bool {
+        self.is_signed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,38 +1049,7 @@ mod tests {
     }
 }
 
-// ── Helper constructors ──
-
-/// A simple concrete FieldDescr for use in meta-interpreter preamble patching
-/// and other contexts that need a field descriptor without a full backend.
-#[derive(Debug)]
-struct SimpleFieldDescr {
-    offset: usize,
-    field_size: usize,
-    field_type: Type,
-    signed: bool,
-}
-
-impl Descr for SimpleFieldDescr {
-    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
-        Some(self)
-    }
-}
-
-impl FieldDescr for SimpleFieldDescr {
-    fn offset(&self) -> usize {
-        self.offset
-    }
-    fn field_size(&self) -> usize {
-        self.field_size
-    }
-    fn field_type(&self) -> Type {
-        self.field_type
-    }
-    fn is_field_signed(&self) -> bool {
-        self.signed
-    }
-}
+// ── Factory functions (descr.py: get_field_descr, get_size_descr, etc.) ──
 
 /// Create a field descriptor with the given layout.
 pub fn make_field_descr(
@@ -924,10 +1058,55 @@ pub fn make_field_descr(
     field_type: Type,
     signed: bool,
 ) -> DescrRef {
-    std::sync::Arc::new(SimpleFieldDescr {
+    std::sync::Arc::new(
+        SimpleFieldDescr::new(0, offset, field_size, field_type, false)
+            .with_signed(signed),
+    )
+}
+
+/// Create a field descriptor with explicit index and immutability.
+pub fn make_field_descr_full(
+    index: u32,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    is_immutable: bool,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleFieldDescr::new(
+        index,
         offset,
         field_size,
         field_type,
-        signed,
-    })
+        is_immutable,
+    ))
+}
+
+/// Create a size descriptor.
+pub fn make_size_descr(size: usize) -> DescrRef {
+    std::sync::Arc::new(SimpleSizeDescr::new(0, size, 0))
+}
+
+/// Create a size descriptor with explicit index and type_id.
+pub fn make_size_descr_full(index: u32, size: usize, type_id: u32) -> DescrRef {
+    std::sync::Arc::new(SimpleSizeDescr::new(index, size, type_id))
+}
+
+/// Create an array descriptor.
+pub fn make_array_descr(
+    base_size: usize,
+    item_size: usize,
+    item_type: Type,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleArrayDescr::new(0, base_size, item_size, 0, item_type))
+}
+
+/// Create an array descriptor with explicit index and type_id.
+pub fn make_array_descr_full(
+    index: u32,
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type: Type,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleArrayDescr::new(index, base_size, item_size, type_id, item_type))
 }
