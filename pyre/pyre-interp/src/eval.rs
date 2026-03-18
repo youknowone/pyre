@@ -60,14 +60,14 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn pop_value(&mut self) -> Result<Self::Value, PyError> {
-        if self.stack_depth == 0 {
+        if self.valuestackdepth <= self.nlocals() {
             return Err(stack_underflow_error("interpreter opcode"));
         }
         Ok(PyFrame::pop(self))
     }
 
     fn peek_at(&mut self, depth: usize) -> Result<Self::Value, PyError> {
-        if self.stack_depth <= depth {
+        if self.valuestackdepth <= self.nlocals() + depth {
             return Err(stack_underflow_error("interpreter peek"));
         }
         Ok(PyFrame::peek_at(self, depth))
@@ -122,11 +122,11 @@ impl SharedOpcodeHandler for PyFrame {
 
 impl LocalOpcodeHandler for PyFrame {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
-        Ok(self.locals_w[idx])
+        Ok(self.locals_cells_stack_w[idx])
     }
 
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
-        let value = self.locals_w[idx];
+        let value = self.locals_cells_stack_w[idx];
         if value.is_null() {
             return Err(PyError {
                 kind: PyErrorKind::NameError,
@@ -137,7 +137,7 @@ impl LocalOpcodeHandler for PyFrame {
     }
 
     fn store_local_value(&mut self, idx: usize, value: Self::Value) -> Result<(), PyError> {
-        self.locals_w[idx] = value;
+        self.locals_cells_stack_w[idx] = value;
         Ok(())
     }
 }
@@ -161,9 +161,9 @@ impl NamespaceOpcodeHandler for PyFrame {
 
 impl StackOpcodeHandler for PyFrame {
     fn swap_values(&mut self, depth: usize) -> Result<(), PyError> {
-        let top_idx = self.stack_depth - 1;
-        let other_idx = self.stack_depth - depth;
-        self.value_stack_w.swap(top_idx, other_idx);
+        let top_idx = self.valuestackdepth - 1;
+        let other_idx = self.valuestackdepth - depth;
+        self.locals_cells_stack_w.swap(top_idx, other_idx);
         Ok(())
     }
 }
