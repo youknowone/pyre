@@ -121,10 +121,17 @@ impl GuardStrengthenOpt {
     /// Returns `true` if the guard can be removed.
     fn is_subsumed(&self, op: &Op) -> bool {
         match op.opcode {
-            // guard_true(v) is subsumed if v is already known truthy.
             OpCode::GuardTrue => self.truthy_values.contains(&op.arg(0)),
-            // guard_nonnull(v) is subsumed if v is already known truthy/nonnull.
             OpCode::GuardNonnull => self.truthy_values.contains(&op.arg(0)),
+            // guard.py: GUARD_NONNULL_CLASS subsumed if value is known nonnull
+            // AND a previous GUARD_CLASS with same args was already seen.
+            OpCode::GuardNonnullClass if self.truthy_values.contains(&op.arg(0)) => {
+                let class_key = GuardKey {
+                    opcode: OpCode::GuardClass,
+                    args: op.args.to_vec(),
+                };
+                self.seen.contains(&class_key)
+            }
             _ => false,
         }
     }

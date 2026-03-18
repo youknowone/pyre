@@ -177,6 +177,23 @@ impl OptContext {
     pub fn last_emitted_operation(&self) -> Option<&Op> {
         self.new_operations.last()
     }
+
+    /// optimizer.py: get_constant_box(opref)
+    /// Get a constant Value for an OpRef, or None if not constant.
+    pub fn get_constant_box(&self, opref: OpRef) -> Option<Value> {
+        self.get_constant(opref).cloned()
+    }
+
+    /// optimizer.py: clear_newoperations()
+    /// Clear the output operation list (used when restarting optimization).
+    pub fn clear_newoperations(&mut self) {
+        self.new_operations.clear();
+    }
+
+    /// Get a mutable reference to the last emitted operation.
+    pub fn last_emitted_operation_mut(&mut self) -> Option<&mut Op> {
+        self.new_operations.last_mut()
+    }
 }
 
 /// An optimization pass.
