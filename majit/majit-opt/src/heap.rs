@@ -323,6 +323,94 @@ impl OptHeap {
             .unwrap_or(false)
     }
 
+    /// heap.py: force_from_effectinfo(effectinfo)
+    ///
+    /// Selective cache invalidation based on EffectInfo bitstrings.
+    /// Instead of invalidating all caches, only force/invalidate
+    /// fields and arrays that the call may read or write.
+    fn force_from_effectinfo(&mut self, op: &Op, ctx: &mut OptContext) {
+        let ei = match op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+        {
+            Some(cd) => cd.effect_info().clone(),
+            None => {
+                self.force_all_lazy(ctx);
+                self.invalidate_caches();
+                return;
+            }
+        };
+
+        // If all bitstrings are zero (no specific field info), fall back
+        // to conservative invalidation of all non-immutable/non-unescaped.
+        let has_bitstrings = ei.readonly_descrs_fields != 0
+            || ei.write_descrs_fields != 0
+            || ei.readonly_descrs_arrays != 0
+            || ei.write_descrs_arrays != 0;
+        if !has_bitstrings {
+            self.force_all_lazy(ctx);
+            self.cached_fields.retain(|&(obj, descr_idx), _| {
+                self.immutable_field_descrs.contains(&descr_idx)
+                    || self.unescaped.contains(&obj)
+            });
+            self.cached_arrayitems
+                .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+            if !self.seen_allocation.is_empty() {
+                self.known_nonnull
+                    .retain(|v| self.seen_allocation.contains(v));
+            } else {
+                self.known_nonnull.clear();
+            }
+            return;
+        }
+
+        // Force/invalidate field caches based on read/write bitstrings
+        let field_keys: Vec<(OpRef, u32)> = self.cached_fields.keys().copied().collect();
+        for (obj, descr_idx) in field_keys {
+            if ei.check_readonly_descr_field(descr_idx) {
+                // Call reads this field → force lazy set (but keep cache)
+                if let Some(lazy_op) = self.lazy_setfields.remove(&(obj, descr_idx)) {
+                    ctx.emit(lazy_op);
+                }
+            }
+            if ei.check_write_descr_field(descr_idx) {
+                // Call writes this field → force lazy set AND invalidate cache
+                if let Some(lazy_op) = self.lazy_setfields.remove(&(obj, descr_idx)) {
+                    ctx.emit(lazy_op);
+                }
+                if !self.immutable_field_descrs.contains(&descr_idx) {
+                    self.cached_fields.remove(&(obj, descr_idx));
+                }
+            }
+        }
+
+        // Force/invalidate array caches
+        let array_keys: Vec<(OpRef, u32, i64)> = self.cached_arrayitems.keys().copied().collect();
+        for (obj, descr_idx, index) in array_keys {
+            if ei.check_readonly_descr_array(descr_idx) {
+                if let Some(lazy_op) = self.lazy_setarrayitems.remove(&(obj, descr_idx, index)) {
+                    ctx.emit(lazy_op);
+                }
+            }
+            if ei.check_write_descr_array(descr_idx) {
+                if let Some(lazy_op) = self.lazy_setarrayitems.remove(&(obj, descr_idx, index)) {
+                    ctx.emit(lazy_op);
+                }
+                self.cached_arrayitems.remove(&(obj, descr_idx, index));
+            }
+        }
+
+        // Remaining lazy sets for unaffected fields stay lazy.
+        // Nonnull tracking: keep for allocated objects only.
+        if !self.seen_allocation.is_empty() {
+            self.known_nonnull
+                .retain(|v| self.seen_allocation.contains(v));
+        } else {
+            self.known_nonnull.clear();
+        }
+    }
+
     // ── Handlers for specific opcodes ──
 
     fn optimize_getfield(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
@@ -638,26 +726,14 @@ impl OptHeap {
                 }
                 _ => {
                     self.mark_args_escaped(op);
-                    self.force_all_lazy(ctx);
-                    // heap.py: effect-info based selective invalidation.
+                    // heap.py: force_from_effectinfo — selective cache
+                    // invalidation using EffectInfo bitstrings.
                     if Self::call_has_random_effects(op) {
+                        self.force_all_lazy(ctx);
                         self.invalidate_caches();
                     } else {
-                        // No random effects: keep immutable and unescaped caches.
-                        self.cached_fields.retain(|&(obj, descr_idx), _| {
-                            self.immutable_field_descrs.contains(&descr_idx)
-                                || self.unescaped.contains(&obj)
-                        });
-                        self.cached_arrayitems
-                            .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
-                        if !self.seen_allocation.is_empty() {
-                            self.known_nonnull
-                                .retain(|v| self.seen_allocation.contains(v));
-                        } else {
-                            self.known_nonnull.clear();
-                        }
+                        self.force_from_effectinfo(op, ctx);
                     }
-                    // heap.py: if call can invalidate → reset guard_not_invalidated
                     if Self::call_can_invalidate(op) {
                         self.seen_guard_not_invalidated = false;
                     }
