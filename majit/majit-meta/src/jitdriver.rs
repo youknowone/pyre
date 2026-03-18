@@ -1107,6 +1107,7 @@ impl<S: JitState> JitDriver<S> {
     ///   failure values; returns `Some(resume_pc)` on success
     ///
     /// Returns `Some(resume_pc)` if compiled code ran or guard state was restored.
+    #[inline]
     pub fn run_back_edge_generic(
         &mut self,
         green_values: &[i64],
@@ -1131,11 +1132,9 @@ impl<S: JitState> JitDriver<S> {
         }
 
         if !self.has_compiled_loop(key_hash) {
-            // Fast path: if this key is already marked DONT_TRACE_HERE, skip
-            // the expensive GreenKey allocation and tracing attempt.
-            if self.meta.warm_state_ref().get_cell_state(key_hash)
-                == majit_trace::warmstate::BaseJitCellState::DontTraceHere
-            {
+            // RPython parity: check warm counter BEFORE any allocation.
+            // DontTraceHere, NotHot, and cold keys all return immediately.
+            if !self.meta.warm_state_ref().counter_would_fire(key_hash) {
                 return None;
             }
             let green_key = GreenKey::new(green_values.to_vec());

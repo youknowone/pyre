@@ -410,6 +410,7 @@ impl WarmEnterState {
         self.disable_noninlinable_function(green_key_hash);
     }
 
+    #[inline]
     pub fn counter_would_fire(&self, green_key_hash: u64) -> bool {
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() { return true; }
@@ -793,6 +794,7 @@ impl WarmEnterState {
 
     /// Get the explicit state of a BaseJitCell for a green key.
     /// Returns `NotHot` if no cell exists.
+    #[inline]
     pub fn get_cell_state(&self, green_key_hash: u64) -> BaseJitCellState {
         self.cells
             .get(&green_key_hash)
