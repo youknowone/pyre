@@ -285,6 +285,69 @@ pub enum DecodedSnapshotValue {
     Box(majit_ir::OpRef),
 }
 
+/// opencoder.py: TopDownSnapshotIterator — iterates snapshots
+/// from outermost to innermost frame (top-down order).
+/// Used by resume data construction which processes frames from
+/// the outermost caller to the innermost callee.
+pub struct TopDownSnapshotIterator<'a> {
+    storage: &'a SnapshotStorage,
+    /// Frames collected in bottom-up order, then reversed.
+    frames: Vec<usize>,
+    pos: usize,
+}
+
+impl<'a> TopDownSnapshotIterator<'a> {
+    /// Create a top-down iterator starting from a top snapshot.
+    pub fn new(storage: &'a SnapshotStorage, top_idx: usize) -> Self {
+        let mut frames = Vec::new();
+        if top_idx < storage.top_snapshots.len() {
+            // Walk the prev chain to collect all frames bottom-up
+            let first_snap_idx = storage
+                .top_snapshots
+                .get(top_idx)
+                .and_then(|top| top.snapshot.prev)
+                .unwrap_or(0);
+            let mut idx = Some(first_snap_idx);
+            while let Some(i) = idx {
+                if i < storage.snapshots.len() {
+                    frames.push(i);
+                    idx = storage.snapshots[i].prev;
+                } else {
+                    break;
+                }
+            }
+            // Reverse for top-down order (outermost first)
+            frames.reverse();
+        }
+        TopDownSnapshotIterator {
+            storage,
+            frames,
+            pos: 0,
+        }
+    }
+
+    /// Get the next frame (outermost to innermost).
+    pub fn next_frame(&mut self) -> Option<&'a Snapshot> {
+        if self.pos < self.frames.len() {
+            let idx = self.frames[self.pos];
+            self.pos += 1;
+            self.storage.snapshots.get(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Number of frames.
+    pub fn num_frames(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Whether all frames have been consumed.
+    pub fn done(&self) -> bool {
+        self.pos >= self.frames.len()
+    }
+}
+
 /// Snapshot storage for a trace.
 /// opencoder.py: Trace._snapshot_data, _snapshot_array_data
 #[derive(Clone, Debug, Default)]

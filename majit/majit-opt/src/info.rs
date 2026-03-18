@@ -299,6 +299,71 @@ impl PtrInfo {
         }
     }
 
+    /// info.py: get_descr() — get the size/type descriptor for virtual objects.
+    pub fn get_descr(&self) -> Option<&DescrRef> {
+        match self {
+            PtrInfo::Virtual(v) => Some(&v.descr),
+            PtrInfo::VirtualArray(v) => Some(&v.descr),
+            PtrInfo::VirtualStruct(v) => Some(&v.descr),
+            PtrInfo::VirtualArrayStruct(v) => Some(&v.descr),
+            _ => None,
+        }
+    }
+
+    /// info.py: setfield(field_descr, value) — set a field on a virtual object.
+    pub fn set_field(&mut self, field_idx: u32, value: OpRef) {
+        match self {
+            PtrInfo::Virtual(v) => {
+                for entry in &mut v.fields {
+                    if entry.0 == field_idx {
+                        entry.1 = value;
+                        return;
+                    }
+                }
+                v.fields.push((field_idx, value));
+            }
+            PtrInfo::VirtualStruct(v) => {
+                for entry in &mut v.fields {
+                    if entry.0 == field_idx {
+                        entry.1 = value;
+                        return;
+                    }
+                }
+                v.fields.push((field_idx, value));
+            }
+            _ => {}
+        }
+    }
+
+    /// info.py: getfield(field_descr) — get a field from a virtual object.
+    pub fn get_field(&self, field_idx: u32) -> Option<OpRef> {
+        match self {
+            PtrInfo::Virtual(v) => v.fields.iter().find(|(k, _)| *k == field_idx).map(|(_, v)| *v),
+            PtrInfo::VirtualStruct(v) => {
+                v.fields.iter().find(|(k, _)| *k == field_idx).map(|(_, v)| *v)
+            }
+            _ => None,
+        }
+    }
+
+    /// info.py: setitem(index, value) — set an item in a virtual array.
+    pub fn set_item(&mut self, index: usize, value: OpRef) {
+        if let PtrInfo::VirtualArray(v) = self {
+            if index < v.items.len() {
+                v.items[index] = value;
+            }
+        }
+    }
+
+    /// info.py: getitem(index) — get an item from a virtual array.
+    pub fn get_item(&self, index: usize) -> Option<OpRef> {
+        if let PtrInfo::VirtualArray(v) = self {
+            v.items.get(index).copied()
+        } else {
+            None
+        }
+    }
+
     /// Copy fields from this virtual info to another.
     /// info.py: copy_fields_to_const()
     pub fn copy_fields_to(&self, other: &mut PtrInfo) {
