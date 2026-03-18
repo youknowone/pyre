@@ -39,10 +39,10 @@ impl CallDescr for MetaCallDescr {
         0
     }
     fn effect_info(&self) -> &EffectInfo {
-        static INFO: EffectInfo = EffectInfo {
-            extra_effect: ExtraEffect::CannotRaise,
-            oopspec_index: OopSpecIndex::None,
-        };
+        static INFO: EffectInfo = EffectInfo::const_new(
+            ExtraEffect::CannotRaise,
+            OopSpecIndex::None,
+        );
         &INFO
     }
 }
@@ -70,10 +70,10 @@ impl CallDescr for MetaCallAssemblerDescr {
         Some(self.target_token)
     }
     fn effect_info(&self) -> &EffectInfo {
-        static INFO: EffectInfo = EffectInfo {
-            extra_effect: ExtraEffect::CanRaise,
-            oopspec_index: OopSpecIndex::None,
-        };
+        static INFO: EffectInfo = EffectInfo::const_new(
+            ExtraEffect::CanRaise,
+            OopSpecIndex::None,
+        );
         &INFO
     }
 }

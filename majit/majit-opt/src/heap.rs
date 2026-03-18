@@ -2336,6 +2336,7 @@ mod tests {
             effect: EffectInfo {
                 extra_effect: ExtraEffect::CanRaise,
                 oopspec_index: OopSpecIndex::Arraycopy,
+                ..Default::default()
             },
         })
     }

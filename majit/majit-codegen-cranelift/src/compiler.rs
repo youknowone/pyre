@@ -124,6 +124,7 @@ impl CallAssemblerDescr {
             effect_info: EffectInfo {
                 extra_effect: majit_ir::ExtraEffect::CanRaise,
                 oopspec_index: OopSpecIndex::None,
+                ..Default::default()
             },
         }
     }
