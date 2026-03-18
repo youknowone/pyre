@@ -109,6 +109,21 @@ impl QuasiImmutDescr {
             qi.invalidate();
         }
     }
+
+    /// quasiimmut.py: get_parent_descr()
+    /// Return the field descriptor index.
+    pub fn get_parent_descr(&self) -> u32 {
+        self.field_descr_idx
+    }
+}
+
+/// quasiimmut.py: do_force_quasi_immutable(cpu, p, mutatefielddescr)
+/// Force a quasi-immutable mutation: clear the mutate field and
+/// invalidate all dependent compiled loops.
+///
+/// Called by the interpreter when a quasi-immutable field is written.
+pub fn do_force_quasi_immutable(descr: &QuasiImmutDescr) {
+    descr.invalidate();
 }
 
 #[cfg(test)]
