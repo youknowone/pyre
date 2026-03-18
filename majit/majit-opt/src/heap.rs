@@ -866,27 +866,6 @@ impl Optimization for OptHeap {
                 OptimizationResult::Remove
             }
 
-            // ── heap.py: Allocation tracking ──
-            // NEW/NEW_WITH_VTABLE/NEW_ARRAY: mark as unescaped + allocation seen.
-            // The object is freshly allocated, so field caches on it won't alias
-            // with pre-existing objects.
-            OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
-                self.seen_allocation.insert(op.pos);
-                self.unescaped.insert(op.pos);
-                self.known_nonnull.insert(op.pos);
-                OptimizationResult::PassOn
-            }
-
-            // ── heap.py: COND_CALL handling ──
-            // COND_CALL_N: may call → force lazy sets, invalidate caches.
-            OpCode::CondCallN => {
-                self.force_all_lazy(ctx);
-                // The call might modify heap if the condition is true.
-                self.invalidate_caches();
-                self.last_call_did_not_raise = false;
-                OptimizationResult::PassOn
-            }
-
             // ── heap.py: RAW_LOAD — cache raw memory reads ──
             OpCode::RawLoadI | OpCode::RawLoadF => {
                 // Raw loads use the field cache with a synthetic key.
@@ -921,20 +900,6 @@ impl Optimization for OptHeap {
                 self.force_all_lazy_setfields(ctx);
                 self.force_all_lazy_setarrayitems(ctx);
                 self.known_nonnull.insert(op.arg(0));
-                OptimizationResult::Emit(op.clone())
-            }
-
-            // ── GETFIELD_RAW_*: cache like GC fields (same struct layout) ──
-            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF => {
-                self.optimize_getfield(op, ctx)
-            }
-
-            // ── SETFIELD_RAW: cache update like GC fields ──
-            OpCode::SetfieldRaw => {
-                // Raw field writes don't need GC barriers but still affect caches.
-                if let Some(key) = Self::field_key(op) {
-                    self.cached_fields.insert(key, op.arg(1));
-                }
                 OptimizationResult::Emit(op.clone())
             }
 
