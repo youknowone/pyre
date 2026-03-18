@@ -162,6 +162,14 @@ impl Optimizer {
         }
     }
 
+    /// Build a short preamble from an optimized trace's preamble section.
+    /// Convenience method that combines extract + produce.
+    pub fn build_short_preamble(
+        optimized_ops: &[Op],
+    ) -> crate::shortpreamble::ShortPreamble {
+        crate::shortpreamble::extract_short_preamble(optimized_ops)
+    }
+
     /// optimizer.py: send_extra_operation(op, ctx)
     /// Send an extra operation through the pass chain as if it were
     /// a new operation from the trace. Used by passes that need to

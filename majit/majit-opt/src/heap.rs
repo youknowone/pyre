@@ -865,6 +865,28 @@ impl Optimization for OptHeap {
                 OptimizationResult::PassOn
             }
 
+            // ── heap.py: RAW_LOAD — cache raw memory reads ──
+            OpCode::RawLoadI | OpCode::RawLoadF => {
+                // Raw loads use the field cache with a synthetic key.
+                if let Some(key) = Self::field_key(op) {
+                    if let Some(&cached) = self.cached_fields.get(&key) {
+                        let cached = ctx.get_replacement(cached);
+                        ctx.replace_op(op.pos, cached);
+                        return OptimizationResult::Remove;
+                    }
+                    self.cached_fields.insert(key, op.pos);
+                }
+                OptimizationResult::Emit(op.clone())
+            }
+
+            // ── heap.py: RAW_STORE — invalidate raw memory cache ──
+            OpCode::RawStore => {
+                if let Some(key) = Self::field_key(op) {
+                    self.cached_fields.insert(key, op.arg(1));
+                }
+                OptimizationResult::Emit(op.clone())
+            }
+
             // ── GC_LOAD / GC_LOAD_INDEXED: generic memory loads ──
             // These could read from any field/array slot, so force all
             // pending lazy writes to ensure correct values.
