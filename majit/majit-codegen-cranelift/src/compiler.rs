@@ -3613,21 +3613,6 @@ impl CraneliftBackend {
             declared_vars.insert(i as u32);
         }
         for (op_idx, op) in ops.iter().enumerate() {
-            // Declare all OpRefs referenced in args (they may be resolved via use_var).
-            for arg in &op.args {
-                if !arg.is_none() && !declared_vars.contains(&arg.0) && !constants.contains_key(&arg.0) {
-                    declared_vars.insert(arg.0);
-                    builder.declare_var(var(arg.0), cl_types::I64);
-                }
-            }
-            if let Some(ref fa) = op.fail_args {
-                for arg in fa {
-                    if !arg.is_none() && !declared_vars.contains(&arg.0) && !constants.contains_key(&arg.0) {
-                        declared_vars.insert(arg.0);
-                        builder.declare_var(var(arg.0), cl_types::I64);
-                    }
-                }
-            }
             if op.result_type() != Type::Void {
                 let vi = op_var_index(op, op_idx, num_inputs);
                 if declared_vars.contains(&(vi as u32)) {
@@ -4547,9 +4532,6 @@ impl CraneliftBackend {
                             as i64,
                     );
 
-                    // No tagged pointer cache — callee is always executed
-                    // (matches PyPy's approach: always call, fast/slow path
-                    // only for result extraction after execution).
                     let ca_merge_block = builder.create_block();
                     builder.append_block_param(ca_merge_block, cl_types::I64);
 
