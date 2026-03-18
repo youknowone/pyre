@@ -575,6 +575,45 @@ impl VectorLoop {
     }
 }
 
+/// vector.py: follow_def_use_chain — trace a value through its uses
+/// to find related vectorizable operations.
+pub fn follow_def_use_chain(
+    ops: &[Op],
+    start: usize,
+    max_depth: usize,
+) -> Vec<usize> {
+    let mut chain = vec![start];
+    let result_ref = ops[start].pos;
+    if result_ref.is_none() {
+        return chain;
+    }
+
+    let mut current_refs = vec![result_ref];
+    for depth in 0..max_depth {
+        let mut next_refs = Vec::new();
+        for (i, op) in ops.iter().enumerate() {
+            if chain.contains(&i) {
+                continue;
+            }
+            for arg in &op.args {
+                if current_refs.contains(arg) {
+                    chain.push(i);
+                    if !op.pos.is_none() {
+                        next_refs.push(op.pos);
+                    }
+                    break;
+                }
+            }
+        }
+        if next_refs.is_empty() {
+            break;
+        }
+        current_refs = next_refs;
+    }
+
+    chain
+}
+
 pub struct VectorizingOptimizer {
     /// Operations in the current loop body (between Label and Jump).
     body_ops: Vec<Op>,
