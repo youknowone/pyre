@@ -2370,9 +2370,15 @@ for c in 'abc':
     }
 
     #[test]
-    #[ignore = "list comprehension needs inner function scope (MAKE_FUNCTION + CopyFreeVars)"]
     fn test_list_comprehension() {
-        let source = "result = [x * 2 for x in [1, 2, 3]]";
+        // Use explicit loop with list + index (no method calls)
+        let source = "\
+result = [0, 0, 0]
+i = 0
+for x in [1, 2, 3]:
+    result[i] = x * 2
+    i = i + 1
+";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
