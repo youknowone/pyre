@@ -1,3 +1,6 @@
+#[path = "src/jit/virtualizable_spec.rs"]
+mod virtualizable_spec;
+
 /// Build script for pyre-jit: runs majit-analyze on the ENTIRE pyre
 /// interpreter to auto-generate tracing code. This is the Rust
 /// equivalent of RPython's translation pipeline.
@@ -31,9 +34,31 @@ fn main() {
         source_paths,
     );
 
-    // Run analysis on ALL files
+    // Run analysis on ALL files with PyFrame virtualizable metadata.
+    //
+    // This keeps the generic analyzer closer to the proc-macro/runtime path:
+    // graph rewrite can recognize `next_instr`, `valuestackdepth`, and
+    // `locals_cells_stack_w[*]` as virtualizable accesses before legacy
+    // TracePattern classification runs.
     let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
-    let result = majit_analyze::analyze_multiple(&source_refs);
+    let result = majit_analyze::analyze_multiple_with_config(
+        &source_refs,
+        &majit_analyze::AnalyzeConfig {
+            pipeline: majit_analyze::PipelineConfig {
+                transform: majit_analyze::GraphTransformConfig {
+                    vable_fields: virtualizable_spec::PYFRAME_VABLE_FIELDS
+                        .iter()
+                        .map(|(name, idx)| ((*name).to_string(), *idx))
+                        .collect(),
+                    vable_arrays: virtualizable_spec::PYFRAME_VABLE_ARRAYS
+                        .iter()
+                        .map(|(name, idx)| ((*name).to_string(), *idx))
+                        .collect(),
+                    ..Default::default()
+                },
+            },
+        },
+    );
 
     // Generate tracing code (existing path: pattern-based dispatch table)
     let code = majit_analyze::generate_trace_code(&result);
@@ -91,6 +116,7 @@ fn main() {
     for path in &source_paths {
         println!("cargo::rerun-if-changed={path}");
     }
+    println!("cargo::rerun-if-changed=src/jit/virtualizable_spec.rs");
 }
 
 /// Recursively collect all .rs files from a directory.

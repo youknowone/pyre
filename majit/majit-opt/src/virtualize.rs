@@ -706,7 +706,11 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_getinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getinteriorfield_gc(
+        &mut self,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let array_ref = ctx.get_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let field_idx = descr_index(&op.descr);
@@ -725,7 +729,11 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_setinteriorfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_setinteriorfield_gc(
+        &mut self,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let array_ref = ctx.get_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_replacement(op.arg(2));
@@ -874,7 +882,11 @@ impl OptVirtualize {
         self.force_guard_fail_args(op, ctx)
     }
 
-    fn optimize_guard_nonnull_class(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_guard_nonnull_class(
+        &mut self,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let obj_ref = ctx.get_replacement(op.arg(0));
 
         if let Some(info) = self.get_info(obj_ref) {

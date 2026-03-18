@@ -153,10 +153,7 @@ impl Optimizer {
 
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
     /// Collect short preamble ops from all passes.
-    pub fn produce_potential_short_preamble_ops(
-        &self,
-        sb: &mut crate::shortpreamble::ShortBoxes,
-    ) {
+    pub fn produce_potential_short_preamble_ops(&self, sb: &mut crate::shortpreamble::ShortBoxes) {
         for pass in &self.passes {
             pass.produce_potential_short_preamble_ops(sb);
         }
@@ -164,9 +161,7 @@ impl Optimizer {
 
     /// Build a short preamble from an optimized trace's preamble section.
     /// Convenience method that combines extract + produce.
-    pub fn build_short_preamble(
-        optimized_ops: &[Op],
-    ) -> crate::shortpreamble::ShortPreamble {
+    pub fn build_short_preamble(optimized_ops: &[Op]) -> crate::shortpreamble::ShortPreamble {
         crate::shortpreamble::extract_short_preamble(optimized_ops)
     }
 
@@ -627,10 +622,7 @@ mod tests {
     #[test]
     fn test_call_pure_results() {
         let mut opt = Optimizer::new();
-        opt.record_call_pure_result(
-            vec![OpRef(10), OpRef(20)],
-            majit_ir::Value::Int(42),
-        );
+        opt.record_call_pure_result(vec![OpRef(10), OpRef(20)], majit_ir::Value::Int(42));
         assert_eq!(
             opt.get_call_pure_result(&[OpRef(10), OpRef(20)]),
             Some(&majit_ir::Value::Int(42))

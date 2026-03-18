@@ -1085,6 +1085,18 @@ where
             Ok(StepResult::Yield(value))
         }
 
+        // ── Import ──
+        Instruction::ImportName { namei } => {
+            let name_idx = namei.get(op_arg) as usize;
+            executor.import_name(code.names[name_idx].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::ImportFrom { namei } => {
+            let name_idx = namei.get(op_arg) as usize;
+            executor.import_from(code.names[name_idx].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+
         other => executor.unsupported(&other),
     }
 }

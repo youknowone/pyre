@@ -17,7 +17,7 @@ use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionS
 use crate::io_buffer;
 use crate::resume::{
     EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
-    ResumeData, ResumeDataVirtualAdder, ResumeDataLoopMemo, ResumeFrameLayoutSummary,
+    ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
     ResumeLayoutSummary,
 };
 use crate::trace_ctx::{JitDriverStaticData, TraceCtx};
@@ -475,10 +475,11 @@ pub struct MetaInterp<M: Clone> {
     pending_token: Option<(u64, u64)>,
     /// Cumulative statistics counters.
     stats: JitStatsCounters,
-    /// Pointer to the actual virtualizable object at compile time.
-    /// Used by preamble patching to read array lengths from the object.
+    /// Pointer to the live virtualizable object at trace entry.
+    /// Used to derive lengths from the actual object when the interpreter
+    /// does not provide them explicitly.
     vable_ptr: *const u8,
-    /// Fallback array lengths (for tests without real objects).
+    /// Virtualizable array lengths for trace-entry box layout.
     vable_array_lengths: Vec<usize>,
     /// Green keys whose compiled Finish returns a raw int (not a boxed pointer).
     raw_int_finish_keys: HashSet<u64>,
@@ -843,14 +844,26 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Set the virtualizable object pointer for compile-time array length reading.
-    pub fn set_vable_ptr(&mut self, ptr: *const u8) {
+    /// Cache the current virtualizable object pointer for trace-entry setup.
+    pub(crate) fn set_vable_ptr(&mut self, ptr: *const u8) {
         self.vable_ptr = ptr;
     }
 
-    /// Set virtualizable array lengths as fallback (for tests without real objects).
-    pub fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
+    /// Cache virtualizable array lengths for preamble patching.
+    pub(crate) fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
         self.vable_array_lengths = lengths;
+    }
+
+    fn trace_entry_vable_lengths(&self, info: &VirtualizableInfo) -> Vec<usize> {
+        if !self.vable_array_lengths.is_empty() {
+            return self.vable_array_lengths.clone();
+        }
+        if self.vable_ptr.is_null() {
+            return Vec::new();
+        }
+        // Safety: vable_ptr is cached from JitState::virtualizable_heap_ptr()
+        // for the currently active interpreter state.
+        unsafe { info.load_list_of_boxes(self.vable_ptr) }.1
     }
 
     /// Set the trace eagerness (guard failure threshold for bridge tracing).
@@ -882,11 +895,6 @@ impl<M: Clone> MetaInterp<M> {
 
     pub fn warm_state_mut(&mut self) -> &mut majit_trace::warmstate::WarmEnterState {
         &mut self.warm_state
-    }
-
-    pub fn is_hot_or_tracing(&self, green_key: u64) -> bool {
-        if self.tracing.is_some() { return true; }
-        self.warm_state.counter_would_fire(green_key)
     }
 
     /// Decay all counters to avoid stale hotness data.
@@ -1013,8 +1021,9 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // Init virtualizable boxes (same as on_back_edge_typed)
                 if let Some(ref info) = self.virtualizable_info {
+                    let array_lengths = self.trace_entry_vable_lengths(info);
                     let num_static = info.num_static_extra_boxes;
-                    let num_array_elems: usize = self.vable_array_lengths.iter().sum();
+                    let num_array_elems: usize = array_lengths.iter().sum();
                     let total_vable = num_static + num_array_elems;
                     if total_vable > 0 && live_values.len() >= 1 + total_vable {
                         let vable_oprefs: Vec<OpRef> =
@@ -1023,7 +1032,7 @@ impl<M: Clone> MetaInterp<M> {
                             info,
                             OpRef(0), // frame ref = first inputarg
                             &vable_oprefs,
-                            &self.vable_array_lengths,
+                            &array_lengths,
                         );
                     }
                 }
@@ -1084,8 +1093,9 @@ impl<M: Clone> MetaInterp<M> {
                 // pass them to init_virtualizable_boxes so that subsequent
                 // vable_getfield/setfield calls use boxes instead of heap ops.
                 if let Some(ref info) = self.virtualizable_info {
+                    let array_lengths = self.trace_entry_vable_lengths(info);
                     let num_static = info.num_static_extra_boxes;
-                    let num_array_elems: usize = self.vable_array_lengths.iter().sum();
+                    let num_array_elems: usize = array_lengths.iter().sum();
                     let total_vable = num_static + num_array_elems;
 
                     if total_vable > 0 && live_values.len() >= 1 + total_vable {
@@ -1095,7 +1105,7 @@ impl<M: Clone> MetaInterp<M> {
                             info,
                             OpRef(0), // frame ref = first inputarg
                             &vable_oprefs,
-                            &self.vable_array_lengths,
+                            &array_lengths,
                         );
                     }
                 }
@@ -1210,12 +1220,13 @@ impl<M: Clone> MetaInterp<M> {
         // loop body. Entry block reads fields from frame; Label defines the
         // loop header block params; JUMP targets them on the back-edge.
         let (inputargs, optimized_ops) = if let Some(ref info) = self.virtualizable_info {
+            let array_lengths = self.trace_entry_vable_lengths(info);
             let (new_ia, new_ops) = patch_new_loop_to_load_virtualizable_fields(
                 info,
                 &inputargs,
                 optimized_ops,
                 &mut constants,
-                &self.vable_array_lengths,
+                &array_lengths,
             );
             (new_ia, new_ops)
         } else {
@@ -1330,7 +1341,8 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
-                self.warm_state.attach_procedure_to_interp(green_key, install_token);
+                self.warm_state
+                    .attach_procedure_to_interp(green_key, install_token);
 
                 self.stats.loops_compiled += 1;
 
@@ -1527,7 +1539,8 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
-                self.warm_state.attach_procedure_to_interp(green_key, install_token);
+                self.warm_state
+                    .attach_procedure_to_interp(green_key, install_token);
                 self.warm_state.reset_function_counts();
                 self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
@@ -3692,7 +3705,8 @@ impl<M: Clone> MetaInterp<M> {
     /// When a box helper result feeds directly into create_frame as the last arg,
     /// the two calls can be folded into a single create_frame_raw_int call.
     pub fn register_create_frame_raw(&mut self, normal: *const (), raw_int: *const ()) {
-        self.create_frame_raw_map.insert(normal as i64, raw_int as i64);
+        self.create_frame_raw_map
+            .insert(normal as i64, raw_int as i64);
     }
 
     /// PyPy warmspot.py set_param_max_unroll_recursion().
@@ -5346,7 +5360,13 @@ mod tests {
         ];
         let mut root_constants = HashMap::new();
         root_constants.insert(100, 99);
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, root_ops, root_constants);
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            root_ops,
+            root_constants,
+        );
 
         let detailed = meta
             .run_compiled_detailed(green_key, &[1])
@@ -5426,7 +5446,13 @@ mod tests {
         ];
         let mut root_constants = HashMap::new();
         root_constants.insert(100, 77);
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, root_ops, root_constants);
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            root_ops,
+            root_constants,
+        );
 
         let root_failure = meta
             .run_compiled_detailed(green_key, &[1])
@@ -5513,7 +5539,13 @@ mod tests {
             },
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, root_ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            root_ops,
+            HashMap::new(),
+        );
         let root_trace_id = meta.compiled_loops[&green_key].root_trace_id;
         meta.attach_resume_data_to_trace(
             green_key,
@@ -7239,9 +7271,7 @@ fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
     // Both return raw int via the raw-int protocol.
     let ca_results: Vec<OpRef> = ops
         .iter()
-        .filter(|op| {
-            op.opcode == OpCode::CallAssemblerI || op.opcode == OpCode::CallMayForceI
-        })
+        .filter(|op| op.opcode == OpCode::CallAssemblerI || op.opcode == OpCode::CallMayForceI)
         .map(|op| op.pos)
         .collect();
 

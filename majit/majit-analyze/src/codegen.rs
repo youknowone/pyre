@@ -30,7 +30,9 @@ pub fn generate_from_graph(result: &crate::passes::ProgramPipelineResult) -> Str
     for func in &result.functions {
         out.push_str(&format!(
             "    (\"{}\", {}, {}),\n",
-            func.name, func.original_blocks, func.flattened.ops.len()
+            func.name,
+            func.original_blocks,
+            func.flattened.ops.len()
         ));
     }
     out.push_str("];\n\n");
@@ -374,15 +376,19 @@ mod tests {
         "#,
         );
         let program = crate::front::build_semantic_program(&parsed);
-        let pipeline = crate::passes::analyze_program(
-            &program,
-            &crate::passes::PipelineConfig::default(),
-        );
+        let pipeline =
+            crate::passes::analyze_program(&program, &crate::passes::PipelineConfig::default());
         let code = generate_from_graph(&pipeline);
 
-        assert!(code.contains("GRAPH_FUNCTIONS"), "should contain GRAPH_FUNCTIONS table");
+        assert!(
+            code.contains("GRAPH_FUNCTIONS"),
+            "should contain GRAPH_FUNCTIONS table"
+        );
         assert!(code.contains("add"), "should list 'add' function");
         assert!(code.contains("sub"), "should list 'sub' function");
-        assert!(code.contains("graph pipeline"), "should have graph pipeline header");
+        assert!(
+            code.contains("graph pipeline"),
+            "should have graph pipeline header"
+        );
     }
 }

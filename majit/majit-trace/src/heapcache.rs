@@ -191,10 +191,7 @@ impl HeapCache {
             let container = args[0];
             let value = args[1];
             // Record dependency: if container escapes, value escapes too.
-            self.escape_deps
-                .entry(container)
-                .or_default()
-                .push(value);
+            self.escape_deps.entry(container).or_default().push(value);
             // If container is already escaped, mark value as escaped now.
             if !self.is_unescaped.contains(&container) {
                 self.mark_escaped_recursive(value);
@@ -204,10 +201,7 @@ impl HeapCache {
         if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
             let container = args[0];
             let value = args[2];
-            self.escape_deps
-                .entry(container)
-                .or_default()
-                .push(value);
+            self.escape_deps.entry(container).or_default().push(value);
             if !self.is_unescaped.contains(&container) {
                 self.mark_escaped_recursive(value);
             }
@@ -262,13 +256,7 @@ impl HeapCache {
     }
 
     /// Record an array item read.
-    pub fn getarrayitem_now_known(
-        &mut self,
-        array: OpRef,
-        index: OpRef,
-        descr: u32,
-        value: OpRef,
-    ) {
+    pub fn getarrayitem_now_known(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
         self.array_cache.insert((array, index, descr), value);
     }
 
@@ -335,12 +323,15 @@ impl HeapCache {
     /// Record a loop-invariant call result.
     /// heapcache.py: call_loopinvariant_known_result
     pub fn call_loopinvariant_cache(&mut self, func: OpRef, args_hash: u64, result: OpRef) {
-        self.loopinvariant_call_cache.insert((func, args_hash), result);
+        self.loopinvariant_call_cache
+            .insert((func, args_hash), result);
     }
 
     /// Look up a cached loop-invariant call result.
     pub fn call_loopinvariant_lookup(&self, func: OpRef, args_hash: u64) -> Option<OpRef> {
-        self.loopinvariant_call_cache.get(&(func, args_hash)).copied()
+        self.loopinvariant_call_cache
+            .get(&(func, args_hash))
+            .copied()
     }
 
     // ── Reset variants ──

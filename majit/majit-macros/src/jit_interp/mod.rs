@@ -163,10 +163,6 @@ pub struct StorageConfig {
     /// Optional method on StoragePool to check JIT compatibility of all values.
     /// When set, `can_trace` additionally calls `pool.method()`.
     pub can_trace_guard: Option<Ident>,
-    /// When true, storage stacks are virtualizable — not flattened into
-    /// inputargs. The JIT accesses elements via GETARRAYITEM/SETARRAYITEM,
-    /// allowing variable stack depths across loop iterations.
-    pub virtualizable: bool,
 }
 
 impl Parse for JitInterpConfig {
@@ -249,7 +245,6 @@ impl Parse for JitInterpConfig {
                     untraceable: Vec::new(),
                     scan_fn: syn::parse_str("__dummy_scan").unwrap(),
                     can_trace_guard: None,
-                    virtualizable: false,
                 }
             }
             (None, None) => {
@@ -293,8 +288,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut untraceable = Vec::new();
     let mut scan_fn = None;
     let mut can_trace_guard = None;
-    let mut virtualizable = false;
-
     while !content.is_empty() {
         let key: Ident = content.parse()?;
         content.parse::<Token![:]>()?;
@@ -323,7 +316,11 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
                 can_trace_guard = Some(content.parse::<Ident>()?);
             }
             "virtualizable" => {
-                virtualizable = content.parse::<LitBool>()?.value;
+                let _ = content.parse::<LitBool>()?;
+                return Err(syn::Error::new(
+                    key.span(),
+                    "`storage.virtualizable` is deprecated; use `virtualizable_fields` or `state_fields`",
+                ));
             }
             other => {
                 return Err(syn::Error::new(
@@ -352,7 +349,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         untraceable,
         scan_fn,
         can_trace_guard,
-        virtualizable,
     })
 }
 
@@ -979,5 +975,34 @@ mod tests {
         fn parse(input: ParseStream) -> syn::Result<Self> {
             Ok(Self(parse_helpers_list(input)?))
         }
+    }
+
+    struct StorageWrapper(StorageConfig);
+    impl Parse for StorageWrapper {
+        fn parse(input: ParseStream) -> syn::Result<Self> {
+            Ok(Self(parse_storage_config(input)?))
+        }
+    }
+
+    #[test]
+    fn parse_storage_config_rejects_legacy_virtualizable_flag() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            {
+                pool: state.storage,
+                pool_type: StoragePool,
+                selector: state.selected,
+                untraceable: [],
+                scan: find_used_storages,
+                virtualizable: true,
+            }
+        };
+        let err = match syn::parse2::<StorageWrapper>(tokens) {
+            Ok(_) => panic!("expected legacy storage.virtualizable to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("storage.virtualizable"),
+            "unexpected error: {err}",
+        );
     }
 }

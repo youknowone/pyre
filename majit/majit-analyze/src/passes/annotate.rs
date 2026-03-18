@@ -77,7 +77,11 @@ pub fn annotate(graph: &MajitGraph) -> AnnotationState {
                     }
                 }
                 Terminator::Branch {
-                    if_true, true_args, if_false, false_args, ..
+                    if_true,
+                    true_args,
+                    if_false,
+                    false_args,
+                    ..
                 } => {
                     let true_block = graph.block(*if_true);
                     for (dst, src) in true_block.inputargs.iter().zip(true_args.iter()) {
@@ -120,7 +124,12 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         OpKind::FieldWrite { .. } => ValueType::Void,
         OpKind::ArrayRead { item_ty, .. } => item_ty.clone(),
         OpKind::ArrayWrite { .. } => ValueType::Void,
-        OpKind::Call { result_ty, target, args, .. } => {
+        OpKind::Call {
+            result_ty,
+            target,
+            args,
+            ..
+        } => {
             // Infer from target name heuristic
             if result_ty != &ValueType::Unknown {
                 return result_ty.clone();
@@ -137,9 +146,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
             // If all args are Int and it's an arithmetic-like op, result is Int
             if !args.is_empty()
                 && args.iter().all(|a| state.get(*a) == &ValueType::Int)
-                && (target.contains("add")
-                    || target.contains("sub")
-                    || target.contains("mul"))
+                && (target.contains("add") || target.contains("sub") || target.contains("mul"))
             {
                 return ValueType::Int;
             }
@@ -226,12 +233,8 @@ mod tests {
     fn annotates_call_with_int_args() {
         let mut graph = MajitGraph::new("test");
         let entry = graph.entry;
-        let a = graph
-            .push_op(entry, OpKind::ConstInt(1), true)
-            .unwrap();
-        let b = graph
-            .push_op(entry, OpKind::ConstInt(2), true)
-            .unwrap();
+        let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
         let result = graph
             .push_op(
                 entry,

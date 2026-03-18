@@ -342,10 +342,7 @@ impl VirtualState {
     /// virtualstate.py: make_inputargs_and_virtuals(oprefs)
     /// Returns (inputargs, virtual_indices) where virtual_indices lists
     /// the positions of virtual entries in the state.
-    pub fn make_inputargs_and_virtuals(
-        &self,
-        concrete_refs: &[OpRef],
-    ) -> (Vec<OpRef>, Vec<usize>) {
+    pub fn make_inputargs_and_virtuals(&self, concrete_refs: &[OpRef]) -> (Vec<OpRef>, Vec<usize>) {
         let inputargs = self.make_inputargs(concrete_refs);
         let virtual_indices: Vec<usize> = self
             .state
@@ -425,7 +422,10 @@ impl VirtualState {
             // virtualstate.py: VirtualArray with known length vs unknown.
             // Need guards to ensure the incoming array has the expected length.
             (
-                VirtualStateInfo::VirtualArray { items: expected_items, .. },
+                VirtualStateInfo::VirtualArray {
+                    items: expected_items,
+                    ..
+                },
                 VirtualStateInfo::Unknown,
             ) => {
                 // The bridge needs to provide an array with exactly this many items.
@@ -556,10 +556,7 @@ impl<'a> VirtualStateConstructor<'a> {
 
     /// Build VirtualState for label args and return it along with
     /// the non-virtual inputargs.
-    pub fn build_with_inputargs(
-        &self,
-        oprefs: &[OpRef],
-    ) -> (VirtualState, Vec<OpRef>) {
+    pub fn build_with_inputargs(&self, oprefs: &[OpRef]) -> (VirtualState, Vec<OpRef>) {
         let state = self.build(oprefs);
         let inputargs = state.make_inputargs(oprefs);
         (state, inputargs)
@@ -1165,7 +1162,10 @@ mod tests {
         assert_eq!(forced, 2);
         assert_eq!(state.num_virtuals(), 0);
         // Virtual with known_class becomes KnownClass
-        assert!(matches!(&state.state[0], VirtualStateInfo::KnownClass { .. }));
+        assert!(matches!(
+            &state.state[0],
+            VirtualStateInfo::KnownClass { .. }
+        ));
         // VirtualArray becomes NonNull
         assert!(matches!(&state.state[2], VirtualStateInfo::NonNull));
     }
@@ -1201,7 +1201,10 @@ mod tests {
         ]);
         let merged = s1.merge(&s2);
         // First: compatible (same class) → keep s1
-        assert!(matches!(&merged.state[0], VirtualStateInfo::KnownClass { .. }));
+        assert!(matches!(
+            &merged.state[0],
+            VirtualStateInfo::KnownClass { .. }
+        ));
         // Second: NonNull vs Unknown → not compatible → Unknown
         assert!(matches!(&merged.state[1], VirtualStateInfo::Unknown));
     }

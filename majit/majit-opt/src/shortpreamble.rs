@@ -526,9 +526,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             .args
             .iter()
             .enumerate()
-            .filter_map(|(pos, arg)| {
-                preamble_to_label.get(arg).map(|&idx| (pos, idx))
-            })
+            .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
             .collect();
 
         // Only include ops that reference label args

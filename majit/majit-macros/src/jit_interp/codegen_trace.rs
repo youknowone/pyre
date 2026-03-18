@@ -79,36 +79,6 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 )
             }
         }
-    } else if config.storage.virtualizable {
-        quote! {
-            #[allow(non_snake_case, unused_variables, unused_mut)]
-            fn #trace_fn_name(
-                __ctx: &mut majit_meta::TraceCtx,
-                __sym: &mut __JitSym,
-                program: &#env_type,
-                pc: usize,
-                __storage: &#pool_type,
-                __selected: usize,
-            ) -> majit_meta::TraceAction {
-                use majit_meta::TraceAction;
-
-                let __op = program.get_op(pc);
-                let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
-                    return TraceAction::AbortPermanent;
-                };
-
-                majit_meta::trace_jitcode_with_data_ptr(
-                    __ctx,
-                    __sym,
-                    &__jitcode,
-                    pc,
-                    |__stack_index| __storage.get(__stack_index).len(),
-                    |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
-                    #label_closure,
-                    |__stack_index| __storage.get(__stack_index).data_ptr(),
-                )
-            }
-        }
     } else {
         quote! {
             #[allow(non_snake_case, unused_variables, unused_mut)]

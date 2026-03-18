@@ -609,9 +609,19 @@ impl TraceFrameState {
     /// which encodes the full framestack for multi-frame resume.
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         self.flush_to_frame(ctx);
-        let fail_args = self.current_fail_args(ctx);
-        let fail_arg_types = vec![majit_ir::Type::Int; fail_args.len()];
-        ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
+        let s = self.sym();
+        let stack_only = s.stack_only_depth();
+        let stack_slice = &s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())];
+        record_current_state_guard(
+            ctx,
+            s.frame,
+            s.vable_next_instr,
+            s.vable_valuestackdepth,
+            &s.symbolic_locals,
+            stack_slice,
+            opcode,
+            args,
+        );
     }
 
     pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
@@ -1747,9 +1757,8 @@ impl TraceFrameState {
     /// Only used for non-self-recursive calls (should_inline blocks
     /// self-recursion with ResidualCall + boost). The callee is fully
     /// traced and executed before returning — like PyPy's perform_call
-    /// PyPy perform_call + ChangeFrame: true callee body tracing.
-    /// Callee ops recorded in same trace with multi-frame fail_args
-    /// for correct guard failure recovery (capture_resumedata pattern).
+    /// PyPy perform_call equivalent: CallMayForce + GuardNotForced.
+    /// Uses fused jit_force_recursive_call_1 for single-arg calls.
     fn inline_function_call(
         &mut self,
         callable: OpRef,
@@ -1764,68 +1773,23 @@ impl TraceFrameState {
         let result = self.with_ctx(|this, ctx| {
             this.guard_value(ctx, callable, concrete_callable as i64);
 
-            // PyPy capture_resumedata: capture parent at CALL_FUNCTION PC
-            let call_pc = this.fallthrough_pc.saturating_sub(1);
-            let resume_pc = this.fallthrough_pc;
-            let nac = 1 + args.len();
-            {
-                let s = this.sym_mut();
-                s.symbolic_stack.push(callable);
-                for &a in args { s.symbolic_stack.push(a); }
-                s.valuestackdepth += nac;
-                s.vable_next_instr = ctx.const_int(call_pc as i64);
-            }
-            let parent_single = this.build_single_frame_fail_args();
-            let mut parent_encoded = vec![ctx.const_int(1), ctx.const_int(parent_single.len() as i64)];
-            parent_encoded.extend(parent_single);
-            {
-                let s = this.sym_mut();
-                s.vable_next_instr = ctx.const_int(resume_pc as i64);
-                s.valuestackdepth -= nac;
-                for _ in 0..nac { s.symbolic_stack.pop(); }
-            }
-
-            // Create callee frame (IR + concrete)
-            let mut helper_args = vec![this.frame(), callable];
-            helper_args.extend_from_slice(args);
-            let callee_frame_opref = ctx.call_int(frame_helper, &helper_args);
-
-            unsafe {
-                let caller = &*(this.concrete_frame as *const pyre_interp::frame::PyFrame);
-                let code_ptr = w_func_get_code_ptr(concrete_callable);
-                let globals = pyre_runtime::w_func_get_globals(concrete_callable);
-                let func_code = code_ptr as *const CodeObject;
-                let cvsd = caller.valuestackdepth;
-                let na = args.len();
-                let cargs: Vec<PyObjectRef> = (0..na)
-                    .map(|i| concrete_stack_value(this.concrete_frame, cvsd - na + i)
-                        .unwrap_or(std::ptr::null_mut()))
-                    .collect();
-                let mut callee = pyre_interp::frame::PyFrame::new_for_call(
-                    func_code, &cargs, globals, caller.execution_context,
+            if args.len() == 1 {
+                let force_fn = crate::call_jit::jit_force_recursive_call_1 as *const ();
+                let result = ctx.call_may_force_int(force_fn, &[this.frame(), callable, args[0]]);
+                this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                Ok(result)
+            } else {
+                let mut helper_args = vec![this.frame(), callable];
+                helper_args.extend_from_slice(args);
+                let callee_frame = ctx.call_int(frame_helper, &helper_args);
+                let force_fn = crate::call_jit::jit_force_callee_frame as *const ();
+                let result = ctx.call_may_force_int(force_fn, &[callee_frame]);
+                this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                ctx.call_void(
+                    crate::call_jit::jit_drop_callee_frame as *const (),
+                    &[callee_frame],
                 );
-                callee.fix_array_ptrs();
-
-                let inline_result =
-                    inline_trace_and_execute(ctx, callee_frame_opref, callee, parent_encoded);
-
-                match inline_result {
-                    Ok((result_opref, concrete_result)) => {
-                        ctx.call_void(
-                            crate::call_jit::jit_drop_callee_frame as *const (),
-                            &[callee_frame_opref],
-                        );
-                        pyre_interp::call::set_inline_handled_result(concrete_result);
-                        Ok(result_opref)
-                    }
-                    Err(_) => {
-                        let result = crate::jit::helpers::emit_trace_call_known_function(
-                            ctx, this.frame(), callable, args,
-                        )?;
-                        this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                        Ok(result)
-                    }
-                }
+                Ok(result)
             }
         });
 

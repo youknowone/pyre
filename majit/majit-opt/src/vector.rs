@@ -577,11 +577,7 @@ impl VectorLoop {
 
 /// vector.py: follow_def_use_chain — trace a value through its uses
 /// to find related vectorizable operations.
-pub fn follow_def_use_chain(
-    ops: &[Op],
-    start: usize,
-    max_depth: usize,
-) -> Vec<usize> {
+pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<usize> {
     let mut chain = vec![start];
     let result_ref = ops[start].pos;
     if result_ref.is_none() {
@@ -639,7 +635,10 @@ impl VectorizingOptimizer {
         if ops.len() < 4 {
             return false;
         }
-        let vectorizable = ops.iter().filter(|op| op.opcode.to_vector().is_some()).count();
+        let vectorizable = ops
+            .iter()
+            .filter(|op| op.opcode.to_vector().is_some())
+            .count();
         let guards = ops.iter().filter(|op| op.opcode.is_guard()).count();
         // Need at least 2 vectorizable ops and guards should not dominate.
         vectorizable >= 2 && guards < ops.len() / 2
@@ -1195,9 +1194,9 @@ mod tests {
     #[test]
     fn test_guard_analysis_hoistable() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(100)]),  // loop-invariant (100 not produced)
+            Op::new(OpCode::GuardTrue, &[OpRef(100)]), // loop-invariant (100 not produced)
             Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(1)]),     // body-dependent (1 = IntAdd result)
+            Op::new(OpCode::GuardTrue, &[OpRef(1)]), // body-dependent (1 = IntAdd result)
         ];
         let mut positioned = ops;
         for (i, op) in positioned.iter_mut().enumerate() {
@@ -1213,10 +1212,10 @@ mod tests {
     #[test]
     fn test_follow_def_use_chain() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),  // 0: result used by 1
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(102)]),    // 1: uses result of 0
-            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(103)]),    // 2: uses result of 1
-            Op::new(OpCode::IntAdd, &[OpRef(104), OpRef(105)]),  // 3: independent
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // 0: result used by 1
+            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(102)]),   // 1: uses result of 0
+            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(103)]),   // 2: uses result of 1
+            Op::new(OpCode::IntAdd, &[OpRef(104), OpRef(105)]), // 3: independent
         ];
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos = OpRef(i as u32);
@@ -1231,11 +1230,11 @@ mod tests {
     #[test]
     fn test_vector_loop_from_trace() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),  // preamble
-            Op::new(OpCode::Label, &[OpRef(100)]),               // loop header
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),  // body
-            Op::new(OpCode::IntMul, &[OpRef(2), OpRef(102)]),    // body
-            Op::new(OpCode::Jump, &[OpRef(3)]),                  // back-edge
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // preamble
+            Op::new(OpCode::Label, &[OpRef(100)]),              // loop header
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // body
+            Op::new(OpCode::IntMul, &[OpRef(2), OpRef(102)]),   // body
+            Op::new(OpCode::Jump, &[OpRef(3)]),                 // back-edge
         ];
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos = OpRef(i as u32);

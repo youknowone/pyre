@@ -112,10 +112,7 @@ impl VirtualRefInfo {
     ///
     /// Returns (virtual_token_opref, forced_opref) that the tracer should
     /// record in the virtual ref's fields.
-    pub fn virtual_ref_during_tracing(
-        &self,
-        force_token: i64,
-    ) -> (i64, i64) {
+    pub fn virtual_ref_during_tracing(&self, force_token: i64) -> (i64, i64) {
         (force_token, 0) // (active token, null forced)
     }
 
@@ -165,11 +162,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
-    pub unsafe fn continue_tracing(
-        &self,
-        vref_ptr: *mut u8,
-        real_object: *mut u8,
-    ) {
+    pub unsafe fn continue_tracing(&self, vref_ptr: *mut u8, real_object: *mut u8) {
         let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
         let forced_ptr = vref_ptr.add(self.descr_forced as usize * 8) as *mut *mut u8;
         *forced_ptr = real_object;

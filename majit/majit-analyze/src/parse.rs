@@ -151,8 +151,7 @@ pub fn extract_opcode_dispatch(
                     if method.name == *call {
                         // Use pre-built graph (primary)
                         if let Some(ref graph) = method.graph {
-                            arm.trace_pattern =
-                                crate::patterns::classify_from_graph(graph);
+                            arm.trace_pattern = crate::patterns::classify_from_graph(graph);
                         }
                         break;
                     }

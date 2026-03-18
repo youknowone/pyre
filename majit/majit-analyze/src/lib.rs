@@ -24,16 +24,24 @@ pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram, build_semant
 pub use graph::{BasicBlock, BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
 pub use parse::ParsedInterpreter;
 pub use passes::{
-    GraphTransformConfig, GraphTransformResult, rewrite_graph,
-    PipelineConfig, PipelineResult, ProgramPipelineResult,
-    analyze_function, analyze_program,
-    FlatOp, FlattenedFunction, Label,
-    AnnotationState, annotate_graph,
-    ConcreteType, TypeResolutionState, resolve_types,
+    AnnotationState, ConcreteType, FlatOp, FlattenedFunction, GraphTransformConfig,
+    GraphTransformResult, Label, PipelineConfig, PipelineResult, ProgramPipelineResult,
+    TypeResolutionState, analyze_function, analyze_program, annotate_graph, resolve_types,
+    rewrite_graph,
 };
 pub use patterns::{TracePattern, classify_from_graph, classify_from_pattern};
 
 use serde::{Deserialize, Serialize};
+
+/// Configuration for the legacy multi-file analyzer.
+///
+/// This lets consumers supply graph-rewrite metadata such as
+/// virtualizable field/array mappings before falling back to the
+/// older TracePattern-based output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnalyzeConfig {
+    pub pipeline: PipelineConfig,
+}
 
 /// Complete analysis result for an interpreter crate.
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,10 +122,18 @@ pub struct MethodInfo {
 /// string-based analysis (for backward compatibility) and the new
 /// graph-based pipeline (for RPython-parity classification).
 pub fn analyze_full(source: &str) -> (AnalysisResult, passes::ProgramPipelineResult) {
-    let mut legacy = analyze(source);
+    analyze_full_with_config(source, &AnalyzeConfig::default())
+}
+
+/// Configurable full analysis entry point.
+pub fn analyze_full_with_config(
+    source: &str,
+    config: &AnalyzeConfig,
+) -> (AnalysisResult, passes::ProgramPipelineResult) {
+    let mut legacy = analyze_with_config(source, config);
     let parsed = parse::parse_source(source);
     let program = front::build_semantic_program(&parsed);
-    let pipeline = passes::analyze_program(&program, &passes::PipelineConfig::default());
+    let pipeline = passes::analyze_program(&program, &config.pipeline);
 
     // Enrich: if graph pipeline classified a function that matches an
     // unclassified opcode arm handler, propagate the graph classification.
@@ -127,7 +143,8 @@ pub fn analyze_full(source: &str) -> (AnalysisResult, passes::ProgramPipelineRes
         }
         for call in &arm.resolved_calls {
             if let Some(ref graph) = call.graph {
-                if let Some(pattern) = patterns::classify_from_graph(graph) {
+                let rewritten = passes::rewrite_graph(graph, &config.pipeline.transform);
+                if let Some(pattern) = patterns::classify_from_graph(&rewritten.graph) {
                     arm.trace_pattern = Some(pattern);
                     break;
                 }
@@ -140,7 +157,12 @@ pub fn analyze_full(source: &str) -> (AnalysisResult, passes::ProgramPipelineRes
 
 /// Analyze a single source file (legacy string-based path).
 pub fn analyze(source: &str) -> AnalysisResult {
-    analyze_multiple(&[source])
+    analyze_with_config(source, &AnalyzeConfig::default())
+}
+
+/// Analyze a single source file with graph/pipeline configuration.
+pub fn analyze_with_config(source: &str, config: &AnalyzeConfig) -> AnalysisResult {
+    analyze_multiple_with_config(&[source], config)
 }
 
 /// Analyze multiple source files as a unified program.
@@ -149,6 +171,11 @@ pub fn analyze(source: &str) -> AnalysisResult {
 /// Pass all relevant source files (opcode_step.rs, eval.rs, object types, etc.)
 /// and the analyzer builds a cross-file view of the interpreter.
 pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
+    analyze_multiple_with_config(sources, &AnalyzeConfig::default())
+}
+
+/// Analyze multiple source files with graph-rewrite configuration.
+pub fn analyze_multiple_with_config(sources: &[&str], config: &AnalyzeConfig) -> AnalysisResult {
     let mut all_helpers = Vec::new();
     let mut all_types = Vec::new();
     let mut all_trait_impls = Vec::new();
@@ -179,7 +206,13 @@ pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
 
     // Phase 3: Resolve call chains across files
     for arm in &mut opcodes {
-        resolve_call_chain(arm, &all_trait_impls, &all_functions, &all_function_graphs);
+        resolve_call_chain(
+            arm,
+            &all_trait_impls,
+            &all_functions,
+            &all_function_graphs,
+            config,
+        );
     }
 
     AnalysisResult {
@@ -197,6 +230,7 @@ fn resolve_call_chain(
     trait_impls: &[TraitImplInfo],
     functions: &std::collections::HashMap<String, String>,
     function_graphs: &std::collections::HashMap<String, graph::MajitGraph>,
+    config: &AnalyzeConfig,
 ) {
     let mut resolved_calls = Vec::new();
 
@@ -230,9 +264,21 @@ fn resolve_call_chain(
 
     arm.resolved_calls = resolved_calls;
 
-    // PRIMARY: Graph-based classification.
-    // Use pre-built semantic graphs from parse time (no body_summary re-parse).
-    // This is the RPython-parity path — the flow graph is the canonical IR.
+    // PRIMARY: graph-based classification after jtransform-style rewrite.
+    // This keeps the legacy output format but lets consumers inject
+    // virtualizable/call-effect metadata before classification.
+    for call in &arm.resolved_calls {
+        if let Some(ref graph) = call.graph {
+            let rewritten = passes::rewrite_graph(graph, &config.pipeline.transform);
+            if let Some(pattern) = patterns::classify_from_graph(&rewritten.graph) {
+                arm.trace_pattern = Some(pattern);
+                break;
+            }
+        }
+    }
+
+    // SECONDARY: raw graph classification when no configured rewrite produced
+    // a pattern (or no config metadata was supplied).
     if arm.trace_pattern.is_none() {
         for call in &arm.resolved_calls {
             if let Some(ref graph) = call.graph {
@@ -244,13 +290,13 @@ fn resolve_call_chain(
         }
     }
 
-    // SECONDARY: Method name heuristic (for cases where body parsing fails
+    // TERTIARY: Method name heuristic (for cases where body parsing fails
     // or the graph classifier doesn't recognize the pattern yet).
     if arm.trace_pattern.is_none() {
         arm.trace_pattern = classify_from_method_names(&arm.resolved_calls, &arm.handler_calls);
     }
 
-    // TERTIARY: Opcode pattern text (for arms without resolved calls).
+    // FINAL: Opcode pattern text (for arms without resolved calls).
     if arm.trace_pattern.is_none() {
         arm.trace_pattern = patterns::classify_from_pattern(&arm.pattern);
     }
@@ -288,7 +334,9 @@ fn classify_from_method_names(
             "load_fast" | "load_fast_checked" | "load_fast_load_fast" => {
                 return Some(TracePattern::LocalRead);
             }
-            "store_fast" | "store_fast_checked" | "store_fast_store_fast"
+            "store_fast"
+            | "store_fast_checked"
+            | "store_fast_store_fast"
             | "store_fast_load_fast" => {
                 return Some(TracePattern::LocalWrite);
             }
@@ -556,7 +604,11 @@ mod tests {
 
         // Step 1: AST → semantic graph
         let program = front::build_semantic_program(&parsed);
-        assert_eq!(program.functions.len(), 2, "should have load_fast + store_fast");
+        assert_eq!(
+            program.functions.len(),
+            2,
+            "should have load_fast + store_fast"
+        );
 
         // Step 2: graph transform (with virtualizable config)
         let config = passes::GraphTransformConfig {
@@ -575,7 +627,10 @@ mod tests {
 
         // Step 3: graph-based classification
         let pattern = patterns::classify_from_graph(load_fast_graph);
-        eprintln!("load_fast graph ops: {:?}", load_fast_graph.block(load_fast_graph.entry).ops);
+        eprintln!(
+            "load_fast graph ops: {:?}",
+            load_fast_graph.block(load_fast_graph.entry).ops
+        );
         eprintln!("load_fast classified as: {:?}", pattern);
         // load_fast reads a field + reads array → should be detectable
     }
@@ -635,6 +690,59 @@ mod tests {
             graph_result.functions.len(),
             graph_result.total_blocks,
             graph_result.total_ops,
+        );
+    }
+
+    #[test]
+    fn test_analyze_multiple_with_config_rewrites_virtualizable_graphs() {
+        let source = r#"
+            enum Instruction { LoadFast }
+
+            struct Frame {
+                next_instr: usize,
+                locals_w: Vec<i64>,
+            }
+
+            impl Frame {
+                fn load_fast(&mut self) -> i64 {
+                    let idx = self.next_instr;
+                    self.locals_w[idx]
+                }
+            }
+
+            fn execute_opcode_step(frame: &mut Frame, instruction: Instruction) {
+                match instruction {
+                    Instruction::LoadFast => {
+                        let _ = frame.load_fast();
+                    }
+                }
+            }
+        "#;
+
+        let result = analyze_multiple_with_config(
+            &[source],
+            &AnalyzeConfig {
+                pipeline: PipelineConfig {
+                    transform: GraphTransformConfig {
+                        vable_fields: vec![("next_instr".into(), 0)],
+                        vable_arrays: vec![("locals_w".into(), 0)],
+                        ..Default::default()
+                    },
+                },
+            },
+        );
+
+        let load_fast = result
+            .opcodes
+            .iter()
+            .find(|arm| arm.pattern.contains("LoadFast"))
+            .expect("LoadFast opcode arm");
+        assert_eq!(
+            load_fast.trace_pattern,
+            Some(TracePattern::VableArrayRead {
+                array_index: 0,
+                item_type: "unknown".into(),
+            })
         );
     }
 }

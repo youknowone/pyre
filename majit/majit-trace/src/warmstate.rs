@@ -315,7 +315,6 @@ pub struct WarmEnterState {
     function_call_counts: HashMap<u64, u32>,
 
     // ── RPython warmstate.py additional parameters ──
-
     /// Maximum number of retrace attempts for a single green key.
     /// RPython: `set_param_retrace_limit`
     retrace_limit: u32,
@@ -413,8 +412,12 @@ impl WarmEnterState {
     #[inline]
     pub fn counter_would_fire(&self, green_key_hash: u64) -> bool {
         if let Some(cell) = self.cells.get(&green_key_hash) {
-            if cell.is_compiled() || cell.is_tracing() { return true; }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 { return false; }
+            if cell.is_compiled() || cell.is_tracing() {
+                return true;
+            }
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+                return false;
+            }
         }
         self.counter.would_fire(green_key_hash)
     }
@@ -682,7 +685,10 @@ impl WarmEnterState {
     ///
     /// This is the warm-state equivalent of PyPy's `disable_noninlinable_function()`.
     pub fn disable_noninlinable_function(&mut self, callee_key: u64) {
-        let cell = self.cells.entry(callee_key).or_insert_with(BaseJitCell::new);
+        let cell = self
+            .cells
+            .entry(callee_key)
+            .or_insert_with(BaseJitCell::new);
         cell.flags |= jc_flags::DONT_TRACE_HERE;
         if cell.flags & jc_flags::TRACING == 0 {
             cell.state = BaseJitCellState::DontTraceHere;
@@ -932,13 +938,27 @@ impl WarmEnterState {
 
     // ── RPython warmstate.py getter methods ──
 
-    pub fn retrace_limit(&self) -> u32 { self.retrace_limit }
-    pub fn max_retrace_guards(&self) -> u32 { self.max_retrace_guards }
-    pub fn max_unroll_loops(&self) -> u32 { self.max_unroll_loops }
-    pub fn max_unroll_recursion(&self) -> u32 { self.max_unroll_recursion }
-    pub fn loop_longevity(&self) -> u32 { self.loop_longevity }
-    pub fn vectorize(&self) -> bool { self.vectorize }
-    pub fn vec_cost(&self) -> u32 { self.vec_cost }
+    pub fn retrace_limit(&self) -> u32 {
+        self.retrace_limit
+    }
+    pub fn max_retrace_guards(&self) -> u32 {
+        self.max_retrace_guards
+    }
+    pub fn max_unroll_loops(&self) -> u32 {
+        self.max_unroll_loops
+    }
+    pub fn max_unroll_recursion(&self) -> u32 {
+        self.max_unroll_recursion
+    }
+    pub fn loop_longevity(&self) -> u32 {
+        self.loop_longevity
+    }
+    pub fn vectorize(&self) -> bool {
+        self.vectorize
+    }
+    pub fn vec_cost(&self) -> u32 {
+        self.vec_cost
+    }
 
     /// Get a snapshot of current JIT statistics.
     pub fn get_stats(&self) -> JitStats {
@@ -2142,7 +2162,10 @@ mod tests {
         ws.set_param("trace_limit", 999);
         assert_eq!(ws.get_param("trace_limit"), Some(999));
         ws.set_param_to_default("trace_limit");
-        assert_eq!(ws.get_param("trace_limit"), Some(DEFAULT_TRACE_LIMIT as i64));
+        assert_eq!(
+            ws.get_param("trace_limit"),
+            Some(DEFAULT_TRACE_LIMIT as i64)
+        );
     }
 
     #[test]

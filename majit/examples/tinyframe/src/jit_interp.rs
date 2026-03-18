@@ -2,7 +2,6 @@
 ///
 /// Greens: [pc, bytecode]
 /// Reds:   [regs]  (tracked via state_fields)
-
 use crate::interp::{ADD, JUMP_IF_ABOVE, LOAD, RETURN};
 
 pub type Bytecode = [u8];
@@ -29,7 +28,12 @@ const DEFAULT_THRESHOLD: u32 = 3;
         regs: [int],
     },
 )]
-fn mainloop(program: &Bytecode, num_regs: usize, init_regs: &[(usize, i64)], threshold: u32) -> i64 {
+fn mainloop(
+    program: &Bytecode,
+    num_regs: usize,
+    init_regs: &[(usize, i64)],
+    threshold: u32,
+) -> i64 {
     let mut driver: majit_meta::JitDriver<TinyFrameState> = majit_meta::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;

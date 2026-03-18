@@ -263,7 +263,11 @@ impl<'a> SnapshotIterator<'a> {
         match kind {
             TAGINT => DecodedSnapshotValue::SmallInt(value as i64),
             TAGCONSTPTR => DecodedSnapshotValue::ConstPtr(
-                self.storage.const_refs.get(value as usize).copied().unwrap_or(0),
+                self.storage
+                    .const_refs
+                    .get(value as usize)
+                    .copied()
+                    .unwrap_or(0),
             ),
             TAGCONSTOTHER => DecodedSnapshotValue::ConstOther(value),
             TAGBOX => DecodedSnapshotValue::Box(majit_ir::OpRef(value)),
@@ -896,11 +900,7 @@ mod tests {
 
     #[test]
     fn test_box_array_iter() {
-        let values = vec![
-            tag(TAGINT, 42),
-            tag(TAGBOX, 10),
-            tag(TAGCONSTPTR, 0),
-        ];
+        let values = vec![tag(TAGINT, 42), tag(TAGBOX, 10), tag(TAGCONSTPTR, 0)];
         let mut iter = BoxArrayIter::new(&values);
         assert_eq!(iter.remaining(), 3);
 

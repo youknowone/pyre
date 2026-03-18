@@ -674,7 +674,11 @@ pub trait Backend: Send {
     }
 
     /// Inspect static metadata for any compiled trace owned by this token.
-    fn compiled_trace_info(&self, _token: &JitCellToken, _trace_id: u64) -> Option<CompiledTraceInfo> {
+    fn compiled_trace_info(
+        &self,
+        _token: &JitCellToken,
+        _trace_id: u64,
+    ) -> Option<CompiledTraceInfo> {
         None
     }
 
@@ -809,11 +813,17 @@ pub trait Backend: Send {
     // to read/write memory at known addresses.
 
     /// model.py: bh_getfield_gc_i(struct_ptr, descr)
-    fn bh_getfield_gc_i(&self, _struct_ptr: i64, _offset: usize) -> i64 { 0 }
+    fn bh_getfield_gc_i(&self, _struct_ptr: i64, _offset: usize) -> i64 {
+        0
+    }
     /// model.py: bh_getfield_gc_r(struct_ptr, descr)
-    fn bh_getfield_gc_r(&self, _struct_ptr: i64, _offset: usize) -> GcRef { GcRef::NULL }
+    fn bh_getfield_gc_r(&self, _struct_ptr: i64, _offset: usize) -> GcRef {
+        GcRef::NULL
+    }
     /// model.py: bh_getfield_gc_f(struct_ptr, descr)
-    fn bh_getfield_gc_f(&self, _struct_ptr: i64, _offset: usize) -> f64 { 0.0 }
+    fn bh_getfield_gc_f(&self, _struct_ptr: i64, _offset: usize) -> f64 {
+        0.0
+    }
     /// model.py: bh_setfield_gc_i(struct_ptr, value, descr)
     fn bh_setfield_gc_i(&self, _struct_ptr: i64, _offset: usize, _value: i64) {}
     /// model.py: bh_setfield_gc_r(struct_ptr, value, descr)
@@ -821,62 +831,115 @@ pub trait Backend: Send {
     /// model.py: bh_setfield_gc_f(struct_ptr, value, descr)
     fn bh_setfield_gc_f(&self, _struct_ptr: i64, _offset: usize, _value: f64) {}
     /// model.py: bh_getarrayitem_gc_i(array_ptr, index, descr)
-    fn bh_getarrayitem_gc_i(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> i64 { 0 }
+    fn bh_getarrayitem_gc_i(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> i64 {
+        0
+    }
     /// model.py: bh_getarrayitem_gc_r(array_ptr, index, descr)
-    fn bh_getarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> GcRef { GcRef::NULL }
+    fn bh_getarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> GcRef {
+        GcRef::NULL
+    }
     /// model.py: bh_setarrayitem_gc_i(array_ptr, index, value, descr)
     fn bh_setarrayitem_gc_i(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: i64) {}
     /// model.py: bh_setarrayitem_gc_r(array_ptr, index, value, descr)
-    fn bh_setarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: GcRef) {}
+    fn bh_setarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: GcRef) {
+    }
     /// model.py: bh_arraylen_gc(array_ptr, descr)
-    fn bh_arraylen_gc(&self, _array_ptr: i64, _len_offset: usize) -> i64 { 0 }
+    fn bh_arraylen_gc(&self, _array_ptr: i64, _len_offset: usize) -> i64 {
+        0
+    }
     /// model.py: bh_new(descr)
-    fn bh_new(&self, _size: usize, _type_id: u32) -> i64 { 0 }
+    fn bh_new(&self, _size: usize, _type_id: u32) -> i64 {
+        0
+    }
     /// model.py: bh_new_with_vtable(descr)
-    fn bh_new_with_vtable(&self, _size: usize, _vtable: usize) -> i64 { 0 }
+    fn bh_new_with_vtable(&self, _size: usize, _vtable: usize) -> i64 {
+        0
+    }
     /// model.py: bh_new_array(length, descr)
-    fn bh_new_array(&self, _length: i64, _item_size: usize, _type_id: u32) -> i64 { 0 }
+    fn bh_new_array(&self, _length: i64, _item_size: usize, _type_id: u32) -> i64 {
+        0
+    }
     /// model.py: bh_strlen(string_ptr)
-    fn bh_strlen(&self, _string_ptr: i64) -> i64 { 0 }
+    fn bh_strlen(&self, _string_ptr: i64) -> i64 {
+        0
+    }
     /// model.py: bh_strgetitem(string_ptr, index)
-    fn bh_strgetitem(&self, _string_ptr: i64, _index: i64) -> i64 { 0 }
+    fn bh_strgetitem(&self, _string_ptr: i64, _index: i64) -> i64 {
+        0
+    }
     /// model.py: bh_strsetitem(string_ptr, index, value)
     fn bh_strsetitem(&self, _string_ptr: i64, _index: i64, _value: i64) {}
     /// model.py: bh_newstr(length)
-    fn bh_newstr(&self, _length: i64) -> i64 { 0 }
+    fn bh_newstr(&self, _length: i64) -> i64 {
+        0
+    }
     /// model.py: bh_call_i(func_ptr, args, calldescr)
-    fn bh_call_i(&self, _func_ptr: i64, _args: &[i64]) -> i64 { 0 }
+    fn bh_call_i(&self, _func_ptr: i64, _args: &[i64]) -> i64 {
+        0
+    }
     /// model.py: bh_call_r(func_ptr, args, calldescr)
-    fn bh_call_r(&self, _func_ptr: i64, _args: &[i64]) -> GcRef { GcRef::NULL }
+    fn bh_call_r(&self, _func_ptr: i64, _args: &[i64]) -> GcRef {
+        GcRef::NULL
+    }
     /// model.py: bh_call_f(func_ptr, args, calldescr)
-    fn bh_call_f(&self, _func_ptr: i64, _args: &[i64]) -> f64 { 0.0 }
+    fn bh_call_f(&self, _func_ptr: i64, _args: &[i64]) -> f64 {
+        0.0
+    }
     /// model.py: bh_call_v(func_ptr, args, calldescr)
     fn bh_call_v(&self, _func_ptr: i64, _args: &[i64]) {}
 
     // ── model.py: additional bh_* helpers ──
 
     /// model.py: bh_unicodelen(string_ptr)
-    fn bh_unicodelen(&self, _string_ptr: i64) -> i64 { 0 }
+    fn bh_unicodelen(&self, _string_ptr: i64) -> i64 {
+        0
+    }
     /// model.py: bh_unicodegetitem(string_ptr, index)
-    fn bh_unicodegetitem(&self, _string_ptr: i64, _index: i64) -> i64 { 0 }
+    fn bh_unicodegetitem(&self, _string_ptr: i64, _index: i64) -> i64 {
+        0
+    }
     /// model.py: bh_unicodesetitem(string_ptr, index, value)
     fn bh_unicodesetitem(&self, _string_ptr: i64, _index: i64, _value: i64) {}
     /// model.py: bh_newunicode(length)
-    fn bh_newunicode(&self, _length: i64) -> i64 { 0 }
+    fn bh_newunicode(&self, _length: i64) -> i64 {
+        0
+    }
     /// model.py: bh_copystrcontent(src, dst, srcstart, dststart, length)
-    fn bh_copystrcontent(&self, _src: i64, _dst: i64, _srcstart: i64, _dststart: i64, _length: i64) {}
+    fn bh_copystrcontent(
+        &self,
+        _src: i64,
+        _dst: i64,
+        _srcstart: i64,
+        _dststart: i64,
+        _length: i64,
+    ) {
+    }
     /// model.py: bh_copyunicodecontent(src, dst, srcstart, dststart, length)
-    fn bh_copyunicodecontent(&self, _src: i64, _dst: i64, _srcstart: i64, _dststart: i64, _length: i64) {}
+    fn bh_copyunicodecontent(
+        &self,
+        _src: i64,
+        _dst: i64,
+        _srcstart: i64,
+        _dststart: i64,
+        _length: i64,
+    ) {
+    }
     /// model.py: bh_raw_load_i(ptr, offset, descr)
-    fn bh_raw_load_i(&self, _ptr: i64, _offset: i64) -> i64 { 0 }
+    fn bh_raw_load_i(&self, _ptr: i64, _offset: i64) -> i64 {
+        0
+    }
     /// model.py: bh_raw_store_i(ptr, offset, value, descr)
     fn bh_raw_store_i(&self, _ptr: i64, _offset: i64, _value: i64) {}
     /// model.py: bh_getinteriorfield_gc_i(array, index, descr)
-    fn bh_getinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize) -> i64 { 0 }
+    fn bh_getinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize) -> i64 {
+        0
+    }
     /// model.py: bh_setinteriorfield_gc_i(array, index, value, descr)
     fn bh_setinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize, _value: i64) {}
     /// model.py: bh_classof(obj_ptr)
-    fn bh_classof(&self, _obj_ptr: i64) -> i64 { 0 }
+    fn bh_classof(&self, _obj_ptr: i64) -> i64 {
+        0
+    }
 
     /// model.py: setup_once() — called once when the backend is first used.
     fn setup_once(&mut self) {}

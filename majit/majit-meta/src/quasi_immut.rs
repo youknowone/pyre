@@ -87,11 +87,7 @@ pub struct QuasiImmutDescr {
 
 impl QuasiImmutDescr {
     /// Create a new QuasiImmutDescr.
-    pub fn new(
-        obj_ref: u64,
-        field_descr_idx: u32,
-        cached_value: i64,
-    ) -> Self {
+    pub fn new(obj_ref: u64, field_descr_idx: u32, cached_value: i64) -> Self {
         QuasiImmutDescr {
             obj_ref,
             field_descr_idx,
