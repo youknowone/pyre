@@ -1091,6 +1091,13 @@ impl<S: JitState> JitDriver<S> {
         }
 
         if !self.has_compiled_loop(key_hash) {
+            // Fast path: if this key is already marked DONT_TRACE_HERE, skip
+            // the expensive GreenKey allocation and tracing attempt.
+            if self.meta.warm_state_ref().get_cell_state(key_hash)
+                == majit_trace::warmstate::BaseJitCellState::DontTraceHere
+            {
+                return None;
+            }
             let green_key = GreenKey::new(green_values.to_vec());
             let ran = self.back_edge_structured(green_key, target_pc, state, env, pre_run);
             // If tracing just finished and compiled a loop, mark it so the
