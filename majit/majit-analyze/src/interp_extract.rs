@@ -74,19 +74,23 @@ pub fn analyze_value_overflow(source: &str) -> Vec<BinopMapping> {
     let file: File = syn::parse_str(source).expect("failed to parse value source");
     let has_bigint =
         function_uses_checked_ops(&file, "val_add") || function_uses_checked_ops(&file, "val_mul");
-    eprintln!("[majit-analyze] bigint detected: {has_bigint} -- using i32 acceleration");
+    eprintln!("[majit-analyze] bigint detected: {has_bigint}");
+    // Always use non-overflow ops. Overflow handling requires blackhole
+    // interpreter (RPython parity) which is not yet implemented.
+    // Instead, can_trace_guard checks all_jit_compatible (all values i32).
+    let (add_op, sub_op, mul_op) = ("IntAdd", "IntSub", "IntMul");
     vec![
         BinopMapping {
             method: "add".into(),
-            opcode: "IntAdd".into(),
+            opcode: add_op.into(),
         },
         BinopMapping {
             method: "sub".into(),
-            opcode: "IntSub".into(),
+            opcode: sub_op.into(),
         },
         BinopMapping {
             method: "mul".into(),
-            opcode: "IntMul".into(),
+            opcode: mul_op.into(),
         },
         BinopMapping {
             method: "div".into(),
