@@ -172,6 +172,36 @@ impl UnrollOptimizer {
     pub fn count_guards(ops: &[Op]) -> u32 {
         ops.iter().filter(|op| op.opcode.is_guard()).count() as u32
     }
+
+    /// unroll.py: jump_to_preamble(cell_token, jump_op)
+    /// Redirect a Jump to target the preamble instead of the loop body.
+    /// Used when the virtual state doesn't match any existing target token.
+    pub fn jump_to_preamble(jump_op: &Op) -> Op {
+        // In RPython this changes the jump's descr to the preamble's target token.
+        // Here we just return a copy of the jump op (the caller attaches the token).
+        jump_op.clone()
+    }
+
+    /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
+    /// If the trace has too many guards, disable retracing for this location.
+    /// Returns true if retracing was disabled.
+    pub fn disable_retracing_if_max_retrace_guards(
+        ops: &[Op],
+        max_retrace_guards: u32,
+    ) -> bool {
+        let guard_count = Self::count_guards(ops);
+        guard_count > max_retrace_guards
+    }
+
+    /// unroll.py: get_virtual_state(args)
+    /// Build a VirtualState from the optimizer's current knowledge about args.
+    pub fn get_virtual_state(
+        args: &[OpRef],
+        ctx: &crate::OptContext,
+        ptr_info: &[Option<crate::info::PtrInfo>],
+    ) -> crate::virtualstate::VirtualState {
+        crate::virtualstate::export_state(args, ctx, ptr_info)
+    }
 }
 
 impl Default for UnrollOptimizer {
