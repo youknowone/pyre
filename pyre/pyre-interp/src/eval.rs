@@ -49,13 +49,33 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
             Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => return Ok(result),
             Err(err) => {
-                // PyPy: handle_operation_error — walk block stack for handler
+                // CPython 3.13: use exception table to find handler
+                let pc = frame.next_instr.saturating_sub(1) as u32;
+                let entries = pyre_bytecode::bytecode::decode_exception_table(&code.exceptiontable);
+                let mut found_handler = false;
+                for entry in &entries {
+                    if pc >= entry.start && pc < entry.end {
+                        // Unwind stack to handler's expected depth
+                        let target_depth = frame.nlocals() + frame.ncells() + entry.depth as usize;
+                        while frame.valuestackdepth > target_depth {
+                            frame.pop();
+                        }
+                        // Push exception info (CPython: PUSH_EXC_INFO equivalent)
+                        let exc_obj = pyre_object::w_str_new(&err.message);
+                        frame.push(exc_obj);
+                        frame.next_instr = entry.target as usize;
+                        found_handler = true;
+                        break;
+                    }
+                }
+                if found_handler {
+                    continue;
+                }
+                // Also try block_stack (fallback for old-style opcodes)
                 if let Some(block) = frame.block_stack.pop() {
-                    // Unwind operand stack to block level
                     while frame.valuestackdepth > block.level {
                         frame.pop();
                     }
-                    // Push exception value for except clause
                     let exc_obj = pyre_object::w_str_new(&err.message);
                     frame.push(exc_obj);
                     frame.next_instr = block.handler;
@@ -2039,6 +2059,25 @@ for i in [1, 2, 3]:
             let result = *(*frame.namespace).get("result").unwrap();
             // 1*10 + 1*20 + 2*10 + 2*20 + 3*10 + 3*20 = 10+20+20+40+30+60 = 180
             assert_eq!(w_int_get_value(result), 180);
+        }
+    }
+
+    #[test]
+    fn test_try_except_basic() {
+        let source = "\
+x = 0
+try:
+    x = 1 / 0
+except:
+    x = 42
+result = x";
+        let (res, frame) = run_exec_frame(source);
+        match res {
+            Ok(_) => unsafe {
+                let result = *(*frame.namespace).get("result").unwrap();
+                assert_eq!(w_int_get_value(result), 42);
+            },
+            Err(e) => panic!("try/except failed: {} ({:?})", e.message, e.kind),
         }
     }
 
