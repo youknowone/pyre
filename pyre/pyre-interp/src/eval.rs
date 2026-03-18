@@ -217,6 +217,22 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
                 return Ok(());
             }
+            // String → list of 1-char strings → seq_iter
+            if pyre_object::is_str(iter) {
+                let s = pyre_object::w_str_get_value(iter);
+                let chars: Vec<pyre_object::PyObjectRef> = s
+                    .chars()
+                    .map(|c| {
+                        let mut buf = [0u8; 4];
+                        pyre_object::w_str_new(c.encode_utf8(&mut buf))
+                    })
+                    .collect();
+                let char_list = pyre_object::w_list_new(chars);
+                let len = s.chars().count();
+                let seq_iter = pyre_object::w_seq_iter_new(char_list, len);
+                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                return Ok(());
+            }
         }
         ensure_range_iter(iter)
     }
@@ -1975,6 +1991,54 @@ result = x";
         unsafe {
             let result = *(*frame.namespace).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 15);
+        }
+    }
+
+    #[test]
+    fn test_string_iteration_chars() {
+        let source = "\
+result = ''
+for c in 'hello':
+    result = result + c
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("string iteration failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_str_get_value(result), "hello");
+        }
+    }
+
+    #[test]
+    fn test_enumerate_style() {
+        // Test: manual counter with for loop
+        let source = "\
+count = 0
+for x in [10, 20, 30]:
+    count = count + 1
+result = count";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("enumerate style failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 3);
+        }
+    }
+
+    #[test]
+    fn test_nested_for_loops() {
+        let source = "\
+result = 0
+for i in [1, 2, 3]:
+    for j in [10, 20]:
+        result = result + i * j
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("nested for failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            // 1*10 + 1*20 + 2*10 + 2*20 + 3*10 + 3*20 = 10+20+20+40+30+60 = 180
+            assert_eq!(w_int_get_value(result), 180);
         }
     }
 
