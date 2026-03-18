@@ -277,6 +277,25 @@ impl Optimizer {
             pass.setup();
         }
 
+        // optimizer.py: inject call_pure_results into OptPure so it can
+        // constant-fold repeated pure calls across loop iterations.
+        if !self.call_pure_results.is_empty() {
+            for pass in &mut self.passes {
+                if pass.name() == "pure" {
+                    // Downcast not possible with trait objects, but we record
+                    // the results as known constants in the context instead.
+                    for (args, value) in &self.call_pure_results {
+                        if let majit_ir::Value::Int(v) = value {
+                            if let Some(result_ref) = args.last() {
+                                ctx.make_constant(*result_ref, majit_ir::Value::Int(*v));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         // Process each operation through the pass chain
         for op in ops {
             self.propagate_one(op, &mut ctx);

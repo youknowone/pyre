@@ -336,6 +336,42 @@ impl OptString {
             }
         }
 
+        // vstring.py: M-character inline heuristic.
+        // If the source is a non-virtual string, the dest is virtual Plain,
+        // and the length is small (≤8), emit individual STRGETITEM + track
+        // in the virtual's chars array instead of a bulk copy.
+        const MAX_INLINE_COPY: i64 = 8;
+        if let (Some(dst_start), Some(length)) = (
+            ctx.get_constant_int(dst_start_ref),
+            ctx.get_constant_int(length_ref),
+        ) {
+            if length > 0
+                && length <= MAX_INLINE_COPY
+                && !self.vstrings.contains_key(&src_ref)
+                && self.vstrings.contains_key(&dst_ref)
+            {
+                // Emit STRGETITEM for each character from non-virtual source,
+                // then track them in the virtual dst.
+                let mut char_refs = Vec::new();
+                let src_start_val = ctx.get_constant_int(src_start_ref).unwrap_or(0);
+                for i in 0..length {
+                    let idx_ref = self.emit_constant_int(src_start_val + i, ctx);
+                    let get_op = Op::new(OpCode::Strgetitem, &[src_ref, idx_ref]);
+                    let ch_ref = ctx.emit(get_op);
+                    char_refs.push(ch_ref);
+                }
+                if let Some(VStringInfo::Plain { chars }) = self.vstrings.get_mut(&dst_ref) {
+                    for (i, ch) in char_refs.into_iter().enumerate() {
+                        let di = (dst_start as usize) + i;
+                        if di < chars.len() {
+                            chars[di] = Some(ch);
+                        }
+                    }
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
+
         // Force both src and dst if virtual.
         self.force_if_virtual(src_ref, ctx);
         self.force_if_virtual(dst_ref, ctx);

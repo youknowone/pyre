@@ -211,16 +211,23 @@ impl OptBridgeOpt {
                 OpCode::IntLe => a_hi <= b_lo,
                 OpCode::IntGt => a_lo > b_hi,
                 OpCode::IntGe => a_lo >= b_hi,
+                // Unsigned comparisons: treat as unsigned, bounds still work.
+                OpCode::UintLt => (a_hi as u64) < (b_lo as u64),
+                OpCode::UintLe => (a_hi as u64) <= (b_lo as u64),
+                OpCode::UintGt => (a_lo as u64) > (b_hi as u64),
+                OpCode::UintGe => (a_lo as u64) >= (b_hi as u64),
                 _ => false,
             }
         } else {
-            // GuardFalse asserts the comparison is false.
-            // IntLt false means a >= b, so check a_lo >= b_hi.
             match cmp_opcode {
                 OpCode::IntLt => a_lo >= b_hi,
                 OpCode::IntLe => a_lo > b_hi,
                 OpCode::IntGt => a_hi <= b_lo,
                 OpCode::IntGe => a_hi < b_lo,
+                OpCode::UintLt => (a_lo as u64) >= (b_hi as u64),
+                OpCode::UintLe => (a_lo as u64) > (b_hi as u64),
+                OpCode::UintGt => (a_hi as u64) <= (b_lo as u64),
+                OpCode::UintGe => (a_hi as u64) < (b_lo as u64),
                 _ => false,
             }
         }
@@ -244,7 +251,16 @@ impl Optimization for OptBridgeOpt {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // Track comparison operations so we can look them up from guards.
         match op.opcode {
-            OpCode::IntLt | OpCode::IntLe | OpCode::IntGt | OpCode::IntGe => {
+            OpCode::IntLt
+            | OpCode::IntLe
+            | OpCode::IntGt
+            | OpCode::IntGe
+            | OpCode::UintLt
+            | OpCode::UintLe
+            | OpCode::UintGt
+            | OpCode::UintGe
+            | OpCode::IntEq
+            | OpCode::IntNe => {
                 self.produced_by.insert(op.pos, op.clone());
             }
             _ => {}
