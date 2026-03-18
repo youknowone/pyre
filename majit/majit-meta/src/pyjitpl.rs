@@ -488,6 +488,8 @@ pub struct MetaInterp<M: Clone> {
     /// When a box helper feeds directly into create_frame, the box+create
     /// can be folded into a single create_frame_raw_int call.
     create_frame_raw_map: HashMap<i64, i64>,
+    /// PyPy warmspot.py max_unroll_recursion (default 7).
+    max_unroll_recursion: usize,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -837,6 +839,7 @@ impl<M: Clone> MetaInterp<M> {
             raw_int_finish_keys: HashSet::new(),
             raw_int_box_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
+            max_unroll_recursion: 7, // PyPy default
         }
     }
 
@@ -3590,7 +3593,7 @@ impl<M: Clone> MetaInterp<M> {
 
             // Self-recursion: PyPy max_unroll_recursion strategy.
             if is_self_recursive {
-                if recursive_depth < MAX_UNROLL_RECURSION {
+                if recursive_depth < self.max_unroll_recursion {
                     return InlineDecision::Inline;
                 }
                 if callee_compiled {
@@ -3682,15 +3685,16 @@ impl<M: Clone> MetaInterp<M> {
     pub fn register_create_frame_raw(&mut self, normal: *const (), raw_int: *const ()) {
         self.create_frame_raw_map.insert(normal as i64, raw_int as i64);
     }
+
+    /// PyPy warmspot.py set_param_max_unroll_recursion().
+    pub fn set_max_unroll_recursion(&mut self, value: usize) {
+        self.max_unroll_recursion = value;
+    }
 }
 
 /// Default maximum inlining depth during tracing.
 /// Configurable via WarmEnterState::set_max_inline_depth().
 const MAX_INLINE_DEPTH: usize = 10;
-
-/// Maximum recursion levels to inline during tracing.
-/// PyPy uses max_unroll_recursion=7 (pyjitpl.py:1370).
-const MAX_UNROLL_RECURSION: usize = 3;
 
 /// Describes the recovery state after a guard failure.
 #[derive(Debug, Clone)]

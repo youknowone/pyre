@@ -39,6 +39,10 @@ pub struct EntryPoint {
 ///
 /// `S` implements [`JitState`] and defines how the interpreter's live
 /// state maps to/from the JIT's representation.
+/// PyPy warmspot.py JitDriver equivalent.
+///
+/// Manages the tracing/compilation lifecycle for a single jitdriver.
+/// PyPy names: JitDriver(greens=[...], reds=[...], is_recursive=True).
 pub struct JitDriver<S: JitState> {
     meta: MetaInterp<S::Meta>,
     sym: Option<S::Sym>,
@@ -51,6 +55,9 @@ pub struct JitDriver<S: JitState> {
     /// Key of the loop just compiled — skip first execution to avoid
     /// re-entering in the same back-edge iteration (RPython compiled_new).
     just_compiled_key: Option<u64>,
+    /// PyPy JitDriver(is_recursive=True): enables max_unroll_recursion
+    /// for recursive portal calls (pyjitpl.py _opimpl_recursive_call).
+    is_recursive: bool,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -64,6 +71,7 @@ impl<S: JitState> JitDriver<S> {
             bridge_info: None,
             entry_points: Vec::new(),
             just_compiled_key: None,
+            is_recursive: false,
         }
     }
 
@@ -103,6 +111,22 @@ impl<S: JitState> JitDriver<S> {
     /// Register a create_frame_N → create_frame_N_raw_int mapping for box folding.
     pub fn register_create_frame_raw(&mut self, normal: *const (), raw_int: *const ()) {
         self.meta.register_create_frame_raw(normal, raw_int);
+    }
+
+    /// PyPy JitDriver(is_recursive=True).
+    /// Enables max_unroll_recursion for recursive portal calls.
+    pub fn set_is_recursive(&mut self, value: bool) {
+        self.is_recursive = value;
+    }
+
+    /// PyPy warmspot.py set_param_max_unroll_recursion().
+    pub fn set_max_unroll_recursion(&mut self, value: usize) {
+        self.meta.set_max_unroll_recursion(value);
+    }
+
+    /// Whether this driver was declared recursive.
+    pub fn is_recursive(&self) -> bool {
+        self.is_recursive
     }
 
     pub fn with_declarative<D: DeclarativeJitDriver>(
