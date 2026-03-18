@@ -80,6 +80,10 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             }
         }
     } else {
+        // Preamble placeholder: future heap-load preamble will go here
+        // when optimizer virtualization is implemented.
+        let preamble_code = quote! {};
+
         quote! {
             #[allow(non_snake_case, unused_variables, unused_mut)]
             fn #trace_fn_name(
@@ -91,6 +95,8 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 __selected: usize,
             ) -> majit_meta::TraceAction {
                 use majit_meta::TraceAction;
+
+                #preamble_code
 
                 let __op = program.get_op(pc);
                 let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {

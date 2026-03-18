@@ -535,38 +535,17 @@ where
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 if sym.is_virtualizable_storage() {
-                    // Virtualizable: symbolic stack may be empty (depth=0).
-                    // Check if we can pop symbolically first; if not, load from heap.
+                    // Virtualizable: pop from symbolic stack (preamble-loaded or earlier push).
+                    // RPython: read from virtualizable_boxes[index].
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                     let symbolic = stack.pop();
                     let concrete = self.runtime_stack_mut(selected, runtime).pop();
                     if let Some(sym_val) = symbolic {
-                        // Value was on symbolic stack (pushed earlier in this trace).
-                        // Still update vable_len_ref for correct guard failure recovery.
-                        if let Some(len_ref) = sym.vable_len_ref(selected) {
-                            let const_1 = ctx.const_int(1);
-                            let new_len = ctx.record_op(majit_ir::OpCode::IntSub, &[len_ref, const_1]);
-                            sym.set_vable_len_ref(selected, new_len);
-                        }
                         self.set_int_reg(dst, Some(sym_val), concrete);
                     } else {
-                        // Underflow: load from heap via raw memory ops.
-                        // Decrement length, then read from data_ptr[new_len].
-                        let len_ref = sym.vable_len_ref(selected).expect("missing vable_len_ref");
-                        let arr_ref = sym
-                            .vable_array_ref(selected)
-                            .expect("missing vable_array_ref");
-                        let const_1 = ctx.const_int(1);
-                        let const_8 = ctx.const_int(8);
-                        let new_len = ctx.record_op(majit_ir::OpCode::IntSub, &[len_ref, const_1]);
-                        let offset = ctx.record_op(majit_ir::OpCode::IntMul, &[new_len, const_8]);
-                        let raw_val =
-                            ctx.record_op_with_descr(majit_ir::OpCode::GetarrayitemRawI, &[arr_ref, offset], raw_i64_array_descr());
-                        // Untag: Val uses tagged pointers (value << 1 | 1).
-                        let untagged =
-                            ctx.record_op(majit_ir::OpCode::IntRshift, &[raw_val, const_1]);
-                        sym.set_vable_len_ref(selected, new_len);
-                        self.set_int_reg(dst, Some(untagged), concrete);
+                        // Symbolic stack underflow: should not happen if preamble
+                        // loaded correctly. Abort trace for safety.
+                        return TraceAction::Abort;
                     }
                 } else {
                     let symbolic = {
@@ -593,26 +572,10 @@ where
                 let selected = sym.current_selected();
                 let (value, concrete) = self.read_int_reg(src);
                 if sym.is_virtualizable_storage() {
-                    // Virtualizable: also write to heap via SetarrayitemRaw.
-                    let len_ref = sym.vable_len_ref(selected).expect("missing vable_len_ref");
-                    let arr_ref = sym
-                        .vable_array_ref(selected)
-                        .expect("missing vable_array_ref");
-                    let const_1 = ctx.const_int(1);
-                    let const_8 = ctx.const_int(8);
-                    // Tag: Val = (value << 1) | 1
-                    let tagged = {
-                        let shifted = ctx.record_op(majit_ir::OpCode::IntLshift, &[value, const_1]);
-                        ctx.record_op(majit_ir::OpCode::IntOr, &[shifted, const_1])
-                    };
-                    let offset = ctx.record_op(majit_ir::OpCode::IntMul, &[len_ref, const_8]);
-                    ctx.record_op_with_descr(
-                        majit_ir::OpCode::SetarrayitemRaw,
-                        &[arr_ref, offset, tagged],
-                        raw_i64_array_descr(),
-                    );
-                    let new_len = ctx.record_op(majit_ir::OpCode::IntAdd, &[len_ref, const_1]);
-                    sym.set_vable_len_ref(selected, new_len);
+                    // Virtualizable: push is purely virtual (symbolic stack only).
+                    // RPython: setarrayitem goes to virtualizable_boxes, not heap.
+                    // Heap is synced at loop close via JUMP and at guard failure.
+                    // No SetarrayitemRaw or len_ref update here.
                 }
                 // Always track on symbolic stack (for subsequent pops within trace).
                 let stack = sym.stack_mut(selected).expect("missing symbolic stack");
@@ -624,16 +587,11 @@ where
                 if sym.is_virtualizable_storage() {
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                     if stack.pop().is_some() {
-                        // Value was on symbolic stack — just discard.
                         let _ = self.runtime_stack_mut(selected, runtime).pop();
                     } else {
-                        // Underflow: decrement heap length, discard runtime value.
-                        let len_ref = sym.vable_len_ref(selected)
-                            .expect("missing vable_len_ref");
-                        let const_1 = ctx.const_int(1);
-                        let new_len = ctx.record_op(majit_ir::OpCode::IntSub, &[len_ref, const_1]);
-                        sym.set_vable_len_ref(selected, new_len);
+                        // Underflow: preamble didn't load enough. Abort.
                         let _ = self.runtime_stack_mut(selected, runtime).pop();
+                        return TraceAction::Abort;
                     }
                 } else {
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
@@ -649,25 +607,8 @@ where
                         let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                         stack.dup();
                     } else {
-                        // Underflow: peek from heap (read without decrement), push to symbolic.
-                        let len_ref = sym.vable_len_ref(selected)
-                            .expect("missing vable_len_ref");
-                        let arr_ref = sym.vable_array_ref(selected)
-                            .expect("missing vable_array_ref");
-                        let const_1 = ctx.const_int(1);
-                        let const_8 = ctx.const_int(8);
-                        let top_idx = ctx.record_op(majit_ir::OpCode::IntSub, &[len_ref, const_1]);
-                        let offset = ctx.record_op(majit_ir::OpCode::IntMul, &[top_idx, const_8]);
-                        let raw_val = ctx.record_op_with_descr(
-                            majit_ir::OpCode::GetarrayitemRawI,
-                            &[arr_ref, offset],
-                            raw_i64_array_descr(),
-                        );
-                        let untagged = ctx.record_op(majit_ir::OpCode::IntRshift, &[raw_val, const_1]);
-                        // Push two copies: the "original" and the dup.
-                        let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                        stack.push(untagged);
-                        stack.push(untagged);
+                        // Underflow: preamble didn't load enough. Abort.
+                        return TraceAction::Abort;
                     }
                     let value = self
                         .runtime_stack_mut(selected, runtime)
@@ -688,7 +629,9 @@ where
             }
             BC_SWAP_STACK => {
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() && sym.stack(selected).map_or(true, |s| s.len() < 2) {
+                if sym.is_virtualizable_storage()
+                    && sym.stack(selected).map_or(true, |s| s.len() < 2)
+                {
                     // Insufficient symbolic stack items for swap — abort trace.
                     return TraceAction::Abort;
                 }
