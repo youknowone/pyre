@@ -399,7 +399,7 @@ impl TraceFrameState {
         fa
     }
 
-        pub(crate) fn push_value(&mut self, _ctx: &mut TraceCtx, value: OpRef) {
+    pub(crate) fn push_value(&mut self, _ctx: &mut TraceCtx, value: OpRef) {
         let s = self.sym_mut();
         let stack_idx = s.stack_only_depth();
         if stack_idx >= s.symbolic_stack.len() {
@@ -2683,8 +2683,10 @@ impl JitState for PyreJitState {
     }
 
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
-        if values.is_empty() { return; }
-        
+        if values.is_empty() {
+            return;
+        }
+
         // Multi-frame format: [num_frames, size_0, data_0..., size_1, data_1...]
         // Detect: values[0] is a small number (1-10) = frame count
         // Legacy: values[0] is a large pointer
@@ -2699,11 +2701,11 @@ impl JitState for PyreJitState {
                 return;
             }
         }
-        
+
         // Legacy single-frame format
         self.restore_single_frame(meta, values);
     }
-    
+
     fn restore_values(&mut self, meta: &Self::Meta, values: &[Value]) {
         let Some(frame) = values.first() else {
             return;

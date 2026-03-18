@@ -199,6 +199,25 @@ impl StackOpcodeHandler for PyFrame {
 
 impl IterOpcodeHandler for PyFrame {
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
+        unsafe {
+            if pyre_object::is_range_iter(iter) || pyre_object::is_seq_iter(iter) {
+                return Ok(());
+            }
+            // Convert list/tuple to seq iterator on the stack
+            if pyre_object::is_list(iter) {
+                let len = pyre_object::w_list_len(iter);
+                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                // Replace TOS with the iterator
+                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                return Ok(());
+            }
+            if pyre_object::is_tuple(iter) {
+                let len = pyre_object::w_tuple_len(iter);
+                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                return Ok(());
+            }
+        }
         ensure_range_iter(iter)
     }
 
@@ -1848,5 +1867,121 @@ result = f.x + g.x";
     fn test_none_is_none() {
         let result = run_eval("None is None").unwrap();
         unsafe { assert!(w_bool_get_value(result)); }
+    }
+
+    #[test]
+    fn test_fstring_with_expr() {
+        let source = "x = 10\ny = 20\nresult = f'{x} + {y} = {x + y}'";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("f-string exec failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_str_get_value(result), "10 + 20 = 30");
+        }
+    }
+
+    #[test]
+    fn test_string_contains() {
+        let source = "result = 'lo' in 'hello'";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("string contains failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert!(w_bool_get_value(result));
+        }
+    }
+
+    #[test]
+    fn test_tuple_contains() {
+        let source = "result = 2 in (1, 2, 3)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("tuple contains failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert!(w_bool_get_value(result));
+        }
+    }
+
+    #[test]
+    fn test_not_in() {
+        let source = "result = 5 not in [1, 2, 3]";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("not in failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert!(w_bool_get_value(result));
+        }
+    }
+
+    #[test]
+    fn test_is_not_none() {
+        let source = "result = 42 is not None";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("is not None failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert!(w_bool_get_value(result));
+        }
+    }
+
+    #[test]
+    fn test_list_slice_negative() {
+        let source = "x = [1, 2, 3, 4, 5]\nresult = x[-3:]";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("negative slice failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert!(is_list(result));
+            assert_eq!(w_list_len(result), 3);
+        }
+    }
+
+    #[test]
+    fn test_nested_function_call() {
+        let source = "\
+def add(a, b):
+    return a + b
+result = add(add(1, 2), add(3, 4))";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("nested call failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 10);
+        }
+    }
+
+    #[test]
+    fn test_while_loop_with_break() {
+        let source = "\
+x = 0
+while True:
+    x = x + 1
+    if x == 5:
+        break
+result = x";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("while+break failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 5);
+        }
+    }
+
+    #[test]
+    #[ignore = "list comprehension needs inner function scope (MAKE_FUNCTION + CopyFreeVars)"]
+    fn test_list_comprehension() {
+        let source = "result = [x * 2 for x in [1, 2, 3]]";
+        let (res, frame) = run_exec_frame(source);
+        match res {
+            Ok(_) => unsafe {
+                let result = *(*frame.namespace).get("result").unwrap();
+                assert!(is_list(result));
+                assert_eq!(w_list_len(result), 3);
+                assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
+                assert_eq!(w_int_get_value(w_list_getitem(result, 1).unwrap()), 4);
+                assert_eq!(w_int_get_value(w_list_getitem(result, 2).unwrap()), 6);
+            },
+            Err(e) => panic!("list comprehension failed: {} ({:?})", e.message, e.kind),
+        }
     }
 }

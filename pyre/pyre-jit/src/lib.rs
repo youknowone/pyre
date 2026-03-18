@@ -37,27 +37,32 @@ mod tests {
     fn test_generated_dispatch_table() {
         // Verify the auto-generated code compiled and has content
         assert!(
-            TRACE_PATTERNS.len() > 20,
+            CANONICAL_TRACE_PATTERNS.len() > 20,
             "expected >20 patterns, got {}",
-            TRACE_PATTERNS.len()
+            CANONICAL_TRACE_PATTERNS.len()
         );
 
         // Check key patterns exist
-        let has_binary = TRACE_PATTERNS
+        let has_binary = CANONICAL_TRACE_PATTERNS
             .iter()
             .any(|(_, p)| p.contains("UnboxIntBinop"));
         assert!(has_binary, "missing UnboxIntBinop pattern");
 
-        let has_local_read = TRACE_PATTERNS.iter().any(|(_, p)| p.contains("LocalRead"));
+        let has_local_read = CANONICAL_TRACE_PATTERNS
+            .iter()
+            .any(|(_, p)| p.contains("LocalRead"));
         assert!(has_local_read, "missing LocalRead pattern");
 
-        let has_call = TRACE_PATTERNS
+        let has_call = CANONICAL_TRACE_PATTERNS
             .iter()
             .any(|(_, p)| p.contains("FunctionCall"));
         assert!(has_call, "missing FunctionCall pattern");
 
-        eprintln!("Auto-generated {} trace patterns", TRACE_PATTERNS.len());
-        for (pat, cls) in TRACE_PATTERNS {
+        eprintln!(
+            "Auto-generated {} canonical trace patterns",
+            CANONICAL_TRACE_PATTERNS.len()
+        );
+        for (pat, cls) in CANONICAL_TRACE_PATTERNS {
             if *cls != "Unclassified" {
                 eprintln!("  {} → {}", pat, cls);
             }

@@ -1,6 +1,7 @@
 use majit_ir::Type;
 use majit_meta::virtualizable::VirtualizableInfo;
 use pyre_bytecode::CodeObject;
+use pyre_object::{PYOBJECT_ARRAY_LEN_OFFSET, PYOBJECT_ARRAY_PTR_OFFSET};
 use pyre_runtime::{PyExecutionContext, PyNamespace, PyObjectArray};
 
 use crate::jit::virtualizable_spec::{PYFRAME_VABLE_ARRAYS, PYFRAME_VABLE_FIELDS};
@@ -75,10 +76,13 @@ pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
         PYFRAME_VALUESTACKDEPTH_OFFSET,
     );
     // PyPy: locals_cells_stack_w[*] — single unified array
-    info.add_array_field(
+    info.add_embedded_array_field_with_layout(
         PYFRAME_VABLE_ARRAYS[0].0,
         Type::Ref,
         PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+        PYOBJECT_ARRAY_PTR_OFFSET,
+        PYOBJECT_ARRAY_LEN_OFFSET,
+        0,
     );
     info
 }

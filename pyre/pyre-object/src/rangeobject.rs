@@ -181,3 +181,33 @@ mod tests {
         assert_eq!(RANGE_ITER_STEP_OFFSET, 24);
     }
 }
+
+// ── Sequence iterator (list/tuple) ──
+
+pub static SEQ_ITER_TYPE: PyType = PyType {
+    tp_name: "list_iterator",
+};
+
+#[repr(C)]
+pub struct W_SeqIterator {
+    pub ob: PyObject,
+    pub seq: PyObjectRef,
+    pub index: i64,
+    pub length: i64,
+}
+
+pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
+    let obj = Box::new(W_SeqIterator {
+        ob: PyObject {
+            ob_type: &SEQ_ITER_TYPE as *const PyType,
+        },
+        seq,
+        index: 0,
+        length: length as i64,
+    });
+    Box::into_raw(obj) as PyObjectRef
+}
+
+pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
+    !obj.is_null() && (*obj).ob_type == &SEQ_ITER_TYPE as *const PyType
+}

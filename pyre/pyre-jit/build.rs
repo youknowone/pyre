@@ -41,7 +41,7 @@ fn main() {
     // `locals_cells_stack_w[*]` as virtualizable accesses before legacy
     // TracePattern classification runs.
     let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
-    let result = majit_analyze::analyze_multiple_with_config(
+    let result = majit_analyze::analyze_multiple_full_with_config(
         &source_refs,
         &majit_analyze::AnalyzeConfig {
             pipeline: majit_analyze::PipelineConfig {
@@ -60,8 +60,8 @@ fn main() {
         },
     );
 
-    // Generate tracing code (existing path: pattern-based dispatch table)
-    let code = majit_analyze::generate_trace_code(&result);
+    // Generate tracing code from the canonical graph-first analysis result.
+    let code = majit_analyze::generate_trace_code_from_full(&result);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
@@ -100,15 +100,16 @@ fn main() {
     // Report
     eprintln!(
         "[pyre-jit build.rs] analyzed {} opcodes ({} classified), {} helpers, {} types, {} trait impls, generated {} bytes",
-        result.opcodes.len(),
+        result.legacy.opcodes.len(),
         result
+            .legacy
             .opcodes
             .iter()
             .filter(|a| a.trace_pattern.is_some())
             .count(),
-        result.helpers.len(),
-        result.type_layouts.len(),
-        result.trait_impls.len(),
+        result.legacy.helpers.len(),
+        result.legacy.type_layouts.len(),
+        result.legacy.trait_impls.len(),
         code.len(),
     );
 
