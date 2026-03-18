@@ -224,6 +224,24 @@ impl OptRewrite {
                 new_op.pos = op.pos;
                 return OptimizationResult::Emit(new_op);
             }
+            // rewrite.py: x * (-1) -> INT_NEG(x)
+            if c == -1 {
+                let mut neg = Op::new(OpCode::IntNeg, &[arg0]);
+                neg.pos = op.pos;
+                return OptimizationResult::Replace(neg);
+            }
+            // rewrite.py: x * (-(2^n)) -> -(x << n)
+            if c < -1 {
+                let abs_c = (c as i128).unsigned_abs() as u64;
+                if abs_c.is_power_of_two() {
+                    let shift = abs_c.trailing_zeros() as i64;
+                    let shift_ref = self.emit_constant_int(ctx, shift);
+                    let shifted = ctx.emit(Op::new(OpCode::IntLshift, &[arg0, shift_ref]));
+                    let mut neg = Op::new(OpCode::IntNeg, &[shifted]);
+                    neg.pos = op.pos;
+                    return OptimizationResult::Emit(neg);
+                }
+            }
         }
         if let Some(c) = ctx.get_constant_int(arg0) {
             if c > 0 && (c & (c - 1)) == 0 {
@@ -232,6 +250,12 @@ impl OptRewrite {
                 let mut new_op = Op::new(OpCode::IntLshift, &[arg1, shift_ref]);
                 new_op.pos = op.pos;
                 return OptimizationResult::Emit(new_op);
+            }
+            // (-1) * x -> INT_NEG(x)
+            if c == -1 {
+                let mut neg = Op::new(OpCode::IntNeg, &[arg1]);
+                neg.pos = op.pos;
+                return OptimizationResult::Replace(neg);
             }
         }
 

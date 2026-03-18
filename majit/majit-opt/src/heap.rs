@@ -615,14 +615,26 @@ impl OptHeap {
                     self.mark_args_escaped(op);
                     self.force_all_lazy(ctx);
                     // heap.py: effect-info based selective invalidation.
-                    // If the call's EffectInfo says it has no random effects,
-                    // we can preserve some caches.
-                    let has_random_effects = Self::call_has_random_effects(op);
-                    if has_random_effects {
+                    if Self::call_has_random_effects(op) {
                         self.invalidate_caches();
                     } else {
-                        // Only invalidate non-immutable, non-unescaped entries.
-                        self.invalidate_caches();
+                        // No random effects: keep immutable and unescaped caches.
+                        self.cached_fields.retain(|&(obj, descr_idx), _| {
+                            self.immutable_field_descrs.contains(&descr_idx)
+                                || self.unescaped.contains(&obj)
+                        });
+                        self.cached_arrayitems
+                            .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+                        if !self.seen_allocation.is_empty() {
+                            self.known_nonnull
+                                .retain(|v| self.seen_allocation.contains(v));
+                        } else {
+                            self.known_nonnull.clear();
+                        }
+                    }
+                    // heap.py: if call can invalidate → reset guard_not_invalidated
+                    if Self::call_can_invalidate(op) {
+                        self.seen_guard_not_invalidated = false;
                     }
                     self.last_call_did_not_raise = false;
                     return OptimizationResult::Emit(op.clone());
