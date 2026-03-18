@@ -170,20 +170,32 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
+                if #virtualizable {
+                    // Virtualizable: [ptr_0, len_0, ptr_1, len_1, ...]
+                    let mut args = Vec::new();
+                    for &(sidx, _) in self.storage_layout.iter().take(self.meta_storage_count) {
+                        if let (Some(ptr), Some(len)) = (
+                            self.vable_array_refs.get(&sidx).copied(),
+                            self.vable_len_refs.get(&sidx).copied(),
+                        ) {
+                            args.push(ptr);
+                            args.push(len);
+                        }
+                    }
+                    return Some(args);
+                }
                 let mut args = Vec::new();
-                let count = if #virtualizable { self.meta_storage_count } else { self.storage_layout.len() };
-                for &(sidx, _) in self.storage_layout.iter().take(count) {
+                for &(sidx, _) in &self.storage_layout {
                     args.extend(self.stacks[&sidx].to_jump_args());
                 }
                 Some(args)
             }
 
             fn fail_storage_lengths(&self) -> Option<Vec<usize>> {
-                let count = if #virtualizable { self.meta_storage_count } else { self.storage_layout.len() };
+                if #virtualizable { return None; }
                 Some(
                     self.storage_layout
                         .iter()
-                        .take(count)
                         .map(|&(sidx, _)| self.stacks[&sidx].len())
                         .collect(),
                 )
@@ -229,9 +241,14 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
                 let storages = #scan_fn(program, header_pc, self.#sel_field);
-                let layout = storages.iter()
-                    .map(|&s| (s, self.#pool_field.get(s).len()))
-                    .collect();
+                let layout = if #virtualizable {
+                    // Virtualizable: depth=0 for all. Preamble loads from heap.
+                    storages.iter().map(|&s| (s, 0usize)).collect()
+                } else {
+                    storages.iter()
+                        .map(|&s| (s, self.#pool_field.get(s).len()))
+                        .collect()
+                };
                 __JitMeta {
                     storage_layout: layout,
                     initial_selected: self.#sel_field,
@@ -239,27 +256,47 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
-                let mut values = Vec::new();
-                for &(sidx, num_slots) in &meta.storage_layout {
-                    let store = self.#pool_field.get(sidx);
-                    for i in 0..num_slots {
-                        values.push(store.peek_at(i));
+                if #virtualizable {
+                    // Virtualizable: [ptr_0, len_0, ptr_1, len_1, ...]
+                    let mut values = Vec::new();
+                    for &(sidx, _) in &meta.storage_layout {
+                        let store = self.#pool_field.get(sidx);
+                        values.push(store.data_ptr() as i64);
+                        values.push(store.len() as i64);
                     }
+                    values
+                } else {
+                    let mut values = Vec::new();
+                    for &(sidx, num_slots) in &meta.storage_layout {
+                        let store = self.#pool_field.get(sidx);
+                        for i in 0..num_slots {
+                            values.push(store.peek_at(i));
+                        }
+                    }
+                    values
                 }
-                values
             }
 
             fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                 let mut stacks = std::collections::HashMap::new();
-                let vable_len_refs = std::collections::HashMap::new();
-                let vable_array_refs = std::collections::HashMap::new();
-                let mut offset = 0;
-                for &(sidx, num_slots) in &meta.storage_layout {
-                    stacks.insert(
-                        sidx,
-                        majit_meta::SymbolicStack::from_input_args(offset, num_slots),
-                    );
-                    offset += num_slots;
+                let mut vable_len_refs = std::collections::HashMap::new();
+                let mut vable_array_refs = std::collections::HashMap::new();
+                if #virtualizable {
+                    // InputArgs = [ptr_0, len_0, ptr_1, len_1, ...]
+                    for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
+                        vable_array_refs.insert(sidx, majit_ir::OpRef((i * 2) as u32));
+                        vable_len_refs.insert(sidx, majit_ir::OpRef((i * 2 + 1) as u32));
+                        stacks.insert(sidx, majit_meta::SymbolicStack::new());
+                    }
+                } else {
+                    let mut offset = 0;
+                    for &(sidx, num_slots) in &meta.storage_layout {
+                        stacks.insert(
+                            sidx,
+                            majit_meta::SymbolicStack::from_input_args(offset, num_slots),
+                        );
+                        offset += num_slots;
+                    }
                 }
                 __JitSym {
                     stacks,
@@ -276,57 +313,80 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
-                meta.initial_selected == self.#sel_field
-                    && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
-                        self.#pool_field.get(sidx).len() == expected_len
-                    })
+                if #virtualizable {
+                    // Virtualizable: only check selected. Depths don't matter
+                    // because preamble re-loads from heap each iteration.
+                    meta.initial_selected == self.#sel_field
+                } else {
+                    meta.initial_selected == self.#sel_field
+                        && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
+                            self.#pool_field.get(sidx).len() == expected_len
+                        })
+                }
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                let mut offset = 0;
-                for &(sidx, num_slots) in &meta.storage_layout {
-                    let end = offset + num_slots;
-                    {
-                        let store = self.#pool_field.get_mut(sidx);
-                        store.clear();
-                        for &value in &values[offset..end] {
-                            store.push(value);
+                if #virtualizable {
+                    // Virtualizable: values = [ptr_0, len_0, ptr_1, len_1, ...]
+                    for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
+                        if let Some(&len_val) = values.get(i * 2 + 1) {
+                            self.#pool_field.get_mut(sidx).force_len(len_val as usize);
                         }
                     }
-                    offset = end;
+                    self.#sel_field = meta.initial_selected;
+                } else {
+                    let mut offset = 0;
+                    for &(sidx, num_slots) in &meta.storage_layout {
+                        let end = offset + num_slots;
+                        {
+                            let store = self.#pool_field.get_mut(sidx);
+                            store.clear();
+                            for &value in &values[offset..end] {
+                                store.push(value);
+                            }
+                        }
+                        offset = end;
+                    }
+                    self.#sel_field = values
+                        .get(offset)
+                        .copied()
+                        .map(|value| value as usize)
+                        .unwrap_or(meta.initial_selected);
                 }
-                self.#sel_field = values
-                    .get(offset)
-                    .copied()
-                    .map(|value| value as usize)
-                    .unwrap_or(meta.initial_selected);
             }
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
-                let mut args = Vec::new();
-                let count = if #virtualizable { sym.meta_storage_count } else { sym.storage_layout.len() };
-                for &(sidx, _) in sym.storage_layout.iter().take(count) {
-                    args.extend(sym.stacks[&sidx].to_jump_args());
+                if #virtualizable {
+                    // Virtualizable: [ptr_0, len_0, ptr_1, len_1, ...]
+                    // sync_virtualizable_to_heap already updated len_refs.
+                    let mut args = Vec::new();
+                    for &(sidx, _) in sym.storage_layout.iter().take(sym.meta_storage_count) {
+                        if let (Some(ptr), Some(len)) = (
+                            sym.vable_array_refs.get(&sidx).copied(),
+                            sym.vable_len_refs.get(&sidx).copied(),
+                        ) {
+                            args.push(ptr);
+                            args.push(len);
+                        }
+                    }
+                    args
+                } else {
+                    let mut args = Vec::new();
+                    for &(sidx, _) in &sym.storage_layout {
+                        args.extend(sym.stacks[&sidx].to_jump_args());
+                    }
+                    args
                 }
-                args
             }
 
             #vable_info_fn
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
                 if #virtualizable {
-                    // Virtualizable: check selected + original storages have same depth.
-                    // Extra storages visited during trace via OP_SEL must be empty.
+                    // Virtualizable: only check selected.
+                    // sync_virtualizable_to_heap already wrote contents + updated len_ref.
+                    // Jump args = [ptr_0, new_len_0, ...] which match InputArgs layout.
                     sym.current_selected == meta.initial_selected
-                        && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
-                            sym.stacks
-                                .get(&sidx)
-                                .is_some_and(|stack| stack.len() == initial_depth)
-                        })
-                        && sym.stacks.iter().all(|(sidx, stack)| {
-                            meta.storage_layout.iter().any(|&(s, _)| s == *sidx)
-                                || stack.len() == 0
-                        })
                 } else {
                     sym.current_selected == meta.initial_selected
                         && sym.storage_layout.len() == meta.storage_layout.len()

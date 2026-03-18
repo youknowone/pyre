@@ -431,6 +431,44 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
+    /// Virtualizable: write symbolic stack contents back to heap.
+    /// RPython: synchronize_virtualizable() in pyjitpl.py.
+    /// Called before CloseLoop to ensure heap is up-to-date for
+    /// the next iteration's preamble reload.
+    fn sync_virtualizable_to_heap(ctx: &mut TraceCtx, sym: &mut S) {
+        let const_1 = ctx.const_int(1);
+        // For each storage that has vable info, write all symbolic stack values to heap.
+        // This iterates over storages that were loaded by the preamble.
+        for sidx in 0..28 {
+            // Check if this storage has virtualizable info.
+            let (arr_ref, len_ref) = match (sym.vable_array_ref(sidx), sym.vable_len_ref(sidx)) {
+                (Some(a), Some(l)) => (a, l),
+                _ => continue,
+            };
+            let stack = match sym.stack(sidx) {
+                Some(s) => s,
+                None => continue,
+            };
+            let stack_vals = stack.to_jump_args();
+            // Update heap length: store new length
+            let new_len = ctx.const_int(stack_vals.len() as i64);
+            // Write each element: tag and store
+            for (j, &val) in stack_vals.iter().enumerate() {
+                let byte_off = ctx.const_int((j as i64) * 8);
+                // Tag: Val = (value << 1) | 1
+                let shifted = ctx.record_op(OpCode::IntLshift, &[val, const_1]);
+                let tagged = ctx.record_op(OpCode::IntOr, &[shifted, const_1]);
+                ctx.record_op_with_descr(
+                    OpCode::SetarrayitemRaw,
+                    &[arr_ref, byte_off, tagged],
+                    raw_i64_array_descr(),
+                );
+            }
+            // Update the vable_len_ref to the new length for collect_jump_args.
+            sym.set_vable_len_ref(sidx, new_len);
+        }
+    }
+
     fn record_state_guard(
         ctx: &mut TraceCtx,
         sym: &S,
@@ -843,6 +881,9 @@ where
                 let resume_pc = ctx.const_int(resume_pc);
                 Self::record_state_guard(ctx, sym, opcode, &[cond], &[resume_pc]);
                 if runtime_cond == 0 && close_loop {
+                    if sym.is_virtualizable_storage() {
+                        Self::sync_virtualizable_to_heap(ctx, sym);
+                    }
                     return TraceAction::CloseLoop;
                 }
             }
@@ -867,6 +908,11 @@ where
             BC_JUMP_TARGET => {
                 let pc = self.frames.current_mut().pc;
                 if runtime.label_at(pc) == sym.loop_header_pc() {
+                    // Virtualizable: sync symbolic stack back to heap before close.
+                    // RPython: synchronize_virtualizable() in reached_loop_header().
+                    if sym.is_virtualizable_storage() {
+                        Self::sync_virtualizable_to_heap(ctx, sym);
+                    }
                     return TraceAction::CloseLoop;
                 }
             }
