@@ -697,6 +697,23 @@ impl VectorizingOptimizer {
         }
     }
 
+    /// vector.py: combine_packset()
+    /// Combine adjacent 2-packs into larger packs where the rightmost
+    /// element of one pack matches the leftmost element of another.
+    /// This is the iterative merge step after extend_packset.
+    pub fn combine_packset(pack_set: &mut PackSet) {
+        if pack_set.packs.is_empty() {
+            return;
+        }
+        loop {
+            let len_before = pack_set.packs.len();
+            pack_set.try_merge_packs();
+            if pack_set.packs.len() == len_before {
+                break; // no more merges possible
+            }
+        }
+    }
+
     pub fn user_loop_heuristic(ops: &[Op]) -> bool {
         if ops.len() < 4 {
             return false;
