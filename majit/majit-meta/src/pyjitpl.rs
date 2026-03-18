@@ -855,15 +855,12 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn trace_entry_vable_lengths(&self, info: &VirtualizableInfo) -> Vec<usize> {
-        if !self.vable_array_lengths.is_empty() {
-            return self.vable_array_lengths.clone();
+        if !self.vable_ptr.is_null() && info.can_read_all_array_lengths_from_heap() {
+            // Safety: vable_ptr is cached from JitState::virtualizable_heap_ptr()
+            // for the currently active interpreter state.
+            return unsafe { info.load_list_of_boxes(self.vable_ptr) }.1;
         }
-        if self.vable_ptr.is_null() {
-            return Vec::new();
-        }
-        // Safety: vable_ptr is cached from JitState::virtualizable_heap_ptr()
-        // for the currently active interpreter state.
-        unsafe { info.load_list_of_boxes(self.vable_ptr) }.1
+        self.vable_array_lengths.clone()
     }
 
     /// Set the trace eagerness (guard failure threshold for bridge tracing).
@@ -1427,14 +1424,11 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        // Post-process: raw-int protocol for CallAssembler boundary.
-        let (optimized_ops, finish_unboxed) =
-            unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers);
-        if finish_unboxed {
-            self.raw_int_finish_keys.insert(green_key);
-        } else {
-            self.raw_int_finish_keys.remove(&green_key);
-        }
+        // raw-int protocol disabled: all Finish ops return boxed results.
+        // This prevents raw ints from leaking into frame locals via
+        // virtualizable writeback, which would corrupt pointer slots.
+        let finish_unboxed = false;
+        self.raw_int_finish_keys.remove(&green_key);
         let optimized_ops = unbox_call_assembler_results(optimized_ops);
 
         if crate::majit_log_enabled() {
@@ -7267,11 +7261,12 @@ fn unbox_finish_result(
 fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
     use majit_ir::OpCode;
 
-    // Strip unboxing for both CallAssemblerI and CallMayForceI results.
-    // Both return raw int via the raw-int protocol.
+    // Strip unboxing for CallAssemblerI results only.
+    // CallAssemblerI returns raw int (compiled Finish is unboxed).
+    // CallMayForceI now returns boxed — its force_fn re-boxes the result.
     let ca_results: Vec<OpRef> = ops
         .iter()
-        .filter(|op| op.opcode == OpCode::CallAssemblerI || op.opcode == OpCode::CallMayForceI)
+        .filter(|op| op.opcode == OpCode::CallAssemblerI)
         .map(|op| op.pos)
         .collect();
 
