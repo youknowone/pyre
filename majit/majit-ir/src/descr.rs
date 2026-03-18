@@ -446,6 +446,33 @@ impl EffectInfo {
     pub fn can_raise(&self) -> bool {
         self.extra_effect >= ExtraEffect::ElidableCanRaise
     }
+
+    /// Whether this call can invalidate compiled code (quasi-immutable mutations).
+    /// RPython: `effectinfo.can_invalidate()`
+    pub fn can_invalidate(&self) -> bool {
+        self.extra_effect >= ExtraEffect::ForcesVirtualOrVirtualizable
+    }
+
+    /// Whether this call can trigger GC collection.
+    /// RPython: `effectinfo.can_collect()`
+    pub fn can_collect(&self) -> bool {
+        self.extra_effect >= ExtraEffect::CanRaise
+    }
+
+    /// Whether this call forces virtualizables or virtual objects.
+    pub fn forces_virtual_or_virtualizable(&self) -> bool {
+        self.extra_effect == ExtraEffect::ForcesVirtualOrVirtualizable
+    }
+
+    /// Whether this call has random effects (worst case).
+    pub fn has_random_effects(&self) -> bool {
+        self.extra_effect == ExtraEffect::RandomEffects
+    }
+
+    /// Whether the oopspec identifies a special-cased operation.
+    pub fn has_oopspec(&self) -> bool {
+        self.oopspec_index != OopSpecIndex::None
+    }
 }
 
 #[cfg(test)]
