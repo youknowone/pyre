@@ -209,5 +209,5 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
 }
 
 pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
-    !obj.is_null() && (*obj).ob_type == &SEQ_ITER_TYPE as *const PyType
+    !obj.is_null() && unsafe { (*obj).ob_type == &SEQ_ITER_TYPE as *const PyType }
 }
