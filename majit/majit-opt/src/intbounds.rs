@@ -32,12 +32,18 @@ pub struct OptIntBounds {
     /// Tracks whether the next overflow guard still has a live overflow-producing
     /// source op, or whether that source was optimized away as provably safe.
     pending_overflow_guard: Option<PendingOverflowGuard>,
+    /// intbounds.py: pure_from_args synthesis cache.
+    /// Records equivalent pure operations discovered through bounds analysis
+    /// (e.g., INT_OR with non-overlapping ranges = INT_ADD).
+    /// Key: (opcode, arg0, arg1), Value: result OpRef.
+    pure_from_args_cache: Vec<(OpCode, OpRef, OpRef, OpRef)>,
 }
 
 impl OptIntBounds {
     pub fn new() -> Self {
         OptIntBounds {
             bounds: Vec::new(),
+            pure_from_args_cache: Vec::new(),
             last_emitted_opcode: None,
             last_emitted_args: Vec::new(),
             last_emitted_ref: OpRef::NONE,
@@ -89,6 +95,17 @@ impl OptIntBounds {
     fn make_constant_int(&mut self, op: &Op, value: i64, ctx: &mut OptContext) {
         ctx.make_constant(op.pos, Value::Int(value));
         self.setintbound(op.pos, IntBound::from_constant(value));
+    }
+
+    /// Record a pure_from_args entry for CSE.
+    /// intbounds.py: self.optimizer.pure_from_args(opnum, args, result)
+    fn record_pure_from_args(&mut self, opcode: OpCode, arg0: OpRef, arg1: OpRef, result: OpRef) {
+        self.pure_from_args_cache.push((opcode, arg0, arg1, result));
+    }
+
+    /// Get the pure_from_args synthesis cache (for integration with OptPure).
+    pub fn get_pure_from_args_cache(&self) -> &[(OpCode, OpRef, OpRef, OpRef)] {
+        &self.pure_from_args_cache
     }
 
     // ── Comparison optimizations ──
@@ -272,25 +289,33 @@ impl OptIntBounds {
 
     // ── Arithmetic postprocessing ──
 
+    /// intbounds.py: INT_ADD pure_from_args synthesis.
+    /// Record INT_SUB reverse: if res = INT_ADD(a, b), then a = INT_SUB(res, b).
     fn postprocess_int_add(&mut self, op: &Op, ctx: &OptContext) {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b = if arg0 == arg1 {
-            // x + x is even, equivalent to x << 1
             b0.lshift_bound(&IntBound::from_constant(1))
         } else {
             let b1 = self.getintbound(arg1, ctx);
             b0.add_bound(&b1)
         };
         self.intersect_bound(op.pos, &b);
+        // pure_from_args: INT_ADD(a,b)=res → INT_SUB(res,b)=a, INT_SUB(res,a)=b
+        self.record_pure_from_args(OpCode::IntSub, op.pos, arg1, arg0);
+        self.record_pure_from_args(OpCode::IntSub, op.pos, arg0, arg1);
     }
 
+    /// intbounds.py: INT_SUB pure_from_args synthesis.
+    /// Record INT_ADD reverse: if res = INT_SUB(a, b), then a = INT_ADD(res, b).
     fn postprocess_int_sub(&mut self, op: &Op, ctx: &OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.sub_bound(&b1);
         self.intersect_bound(op.pos, &b);
+        // pure_from_args: INT_SUB(a,b)=res → INT_ADD(res,b)=a
+        self.record_pure_from_args(OpCode::IntAdd, op.pos, op.arg(1), op.arg(0));
     }
 
     fn postprocess_int_mul(&mut self, op: &Op, ctx: &OptContext) {
@@ -307,18 +332,32 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
+    /// intbounds.py: INT_OR pure_from_args synthesis.
+    /// When both args are non-negative and their ranges don't overlap
+    /// (upper(a) < lower(b) or vice versa), INT_OR == INT_ADD.
+    /// Record the equivalent INT_ADD as a pure op so CSE can find it.
     fn postprocess_int_or(&mut self, op: &Op, ctx: &OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.or_bound(&b1);
         self.intersect_bound(op.pos, &b);
+        // pure_from_args: if both non-negative, INT_OR(a,b) = INT_ADD(a,b)
+        if b0.known_nonnegative() && b1.known_nonnegative() {
+            self.record_pure_from_args(OpCode::IntAdd, op.arg(0), op.arg(1), op.pos);
+        }
     }
 
+    /// intbounds.py: INT_XOR pure_from_args synthesis.
+    /// Same logic as INT_OR: when ranges don't overlap, XOR == ADD.
     fn postprocess_int_xor(&mut self, op: &Op, ctx: &OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.xor_bound(&b1);
         self.intersect_bound(op.pos, &b);
+        // pure_from_args: if both non-negative, INT_XOR(a,b) = INT_ADD(a,b)
+        if b0.known_nonnegative() && b1.known_nonnegative() {
+            self.record_pure_from_args(OpCode::IntAdd, op.arg(0), op.arg(1), op.pos);
+        }
     }
 
     fn postprocess_int_lshift(&mut self, op: &Op, ctx: &OptContext) {

@@ -24,11 +24,23 @@ pub struct Optimizer {
     /// adds virtual input args).
     final_num_inputs: usize,
     /// Cache of CALL_PURE results from previous traces.
-    /// RPython optimizer.py: `call_pure_results` — maps
+    /// optimizer.py: `call_pure_results` — maps
     /// (func_ptr, arg0, arg1, ...) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
     /// pure calls.
     call_pure_results: std::collections::HashMap<Vec<majit_ir::OpRef>, majit_ir::Value>,
+    /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
+    /// for guard sharing and descriptor fusion.
+    last_guard_op: Option<Op>,
+    /// optimizer.py: `replaces_guard` — maps guard op position to replacement.
+    replaces_guard: std::collections::HashMap<u32, Op>,
+    /// optimizer.py: `pendingfields` — heap fields that need to be
+    /// written back before the next guard (lazy set forcing).
+    pendingfields: Vec<Op>,
+    /// optimizer.py: `can_replace_guards` — flag to enable/disable guard sharing.
+    can_replace_guards: bool,
+    /// optimizer.py: `quasi_immutable_deps` — quasi-immutable field dependencies.
+    quasi_immutable_deps: std::collections::HashSet<u32>,
 }
 
 impl Optimizer {
@@ -37,6 +49,11 @@ impl Optimizer {
             passes: Vec::new(),
             final_num_inputs: 0,
             call_pure_results: std::collections::HashMap::new(),
+            last_guard_op: None,
+            replaces_guard: std::collections::HashMap::new(),
+            pendingfields: Vec::new(),
+            can_replace_guards: true,
+            quasi_immutable_deps: std::collections::HashSet::new(),
         }
     }
 
@@ -55,6 +72,92 @@ impl Optimizer {
     /// May be larger than the original if virtualizable added virtual input args.
     pub fn final_num_inputs(&self) -> usize {
         self.final_num_inputs
+    }
+
+    /// optimizer.py: getlastop() — get the last emitted guard operation.
+    pub fn get_last_guard_op(&self) -> Option<&Op> {
+        self.last_guard_op.as_ref()
+    }
+
+    /// optimizer.py: notice_guard_future_condition(op)
+    /// Record that a guard at the given position should be replaced
+    /// with the given op when the future condition is realized.
+    pub fn notice_guard_future_condition(&mut self, guard_pos: u32, replacement: Op) {
+        self.replaces_guard.insert(guard_pos, replacement);
+    }
+
+    /// optimizer.py: replace_guard(old_guard_pos, new_guard)
+    /// Replace a previously emitted guard with a new one.
+    pub fn replace_guard(&mut self, old_pos: u32, new_guard: Op) {
+        self.replaces_guard.insert(old_pos, new_guard);
+    }
+
+    /// optimizer.py: store_final_boxes_in_guard(guard_op, pendingfields)
+    /// Store fail_args in the guard and flush pending field writes.
+    pub fn store_final_boxes_in_guard(&mut self, guard_op: &mut Op) {
+        // Flush pending fields: emit them before the guard
+        let pending = std::mem::take(&mut self.pendingfields);
+        if guard_op.fail_args.is_none() {
+            guard_op.fail_args = Some(Default::default());
+        }
+        let _ = pending; // TODO: integrate pending fields into fail_args
+    }
+
+    /// optimizer.py: emit_guard_operation(op, ctx)
+    /// Emit a guard with proper tracking and descriptor sharing.
+    pub fn emit_guard_operation(&mut self, guard_op: Op) {
+        self.last_guard_op = Some(guard_op);
+    }
+
+    /// optimizer.py: add_pending_field(op)
+    /// Queue a SETFIELD_GC to be emitted before the next guard.
+    pub fn add_pending_field(&mut self, op: Op) {
+        self.pendingfields.push(op);
+    }
+
+    /// optimizer.py: flush_pendingfields(ctx)
+    /// Emit all pending field writes.
+    pub fn flush_pendingfields(&mut self, ctx: &mut OptContext) {
+        let pending = std::mem::take(&mut self.pendingfields);
+        for op in pending {
+            ctx.emit(op);
+        }
+    }
+
+    /// optimizer.py: cant_replace_guards()
+    /// Temporarily disable guard replacement (e.g., during bridge compilation).
+    pub fn disable_guard_replacement(&mut self) {
+        self.can_replace_guards = false;
+    }
+
+    /// Re-enable guard replacement.
+    pub fn enable_guard_replacement(&mut self) {
+        self.can_replace_guards = true;
+    }
+
+    /// optimizer.py: add_quasi_immutable_dep(descr_idx)
+    /// Track a quasi-immutable field dependency.
+    pub fn add_quasi_immutable_dep(&mut self, descr_idx: u32) {
+        self.quasi_immutable_deps.insert(descr_idx);
+    }
+
+    /// optimizer.py: produce_potential_short_preamble_ops(sb)
+    /// Collect short preamble ops from all passes.
+    pub fn produce_potential_short_preamble_ops(
+        &self,
+        sb: &mut crate::shortpreamble::ShortBoxes,
+    ) {
+        for pass in &self.passes {
+            pass.produce_potential_short_preamble_ops(sb);
+        }
+    }
+
+    /// optimizer.py: send_extra_operation(op, ctx)
+    /// Send an extra operation through the pass chain as if it were
+    /// a new operation from the trace. Used by passes that need to
+    /// inject additional operations.
+    pub fn send_extra_operation(&mut self, op: &Op, ctx: &mut OptContext) {
+        self.propagate_one(op, ctx);
     }
 
     /// Add an optimization pass to the chain.

@@ -1169,10 +1169,13 @@ impl Optimization for OptVirtualize {
             // VirtualRefFinish: finalize the virtual ref
             OpCode::VirtualRefFinish => self.optimize_virtual_ref_finish(op, ctx),
 
+            // virtualize.py: GUARD_NO_EXCEPTION — if the preceding call was
+            // eliminated (all args virtual), the guard is redundant.
+            OpCode::GuardNoException => OptimizationResult::PassOn,
+
             // GUARD_NOT_FORCED checks if the JIT frame was forced during a call.
             // If the force_token from the preceding CALL_MAY_FORCE is virtual
             // (never escaped), the guard always succeeds. Otherwise, pass through.
-            // Must not hit the is_call() or default branch which would force all virtuals.
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => OptimizationResult::PassOn,
 
             // Calls / escaping operations — force all virtual args

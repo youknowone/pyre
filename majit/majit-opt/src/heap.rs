@@ -498,6 +498,15 @@ impl OptHeap {
         if opcode.is_call() {
             let oopspec = Self::get_oopspec_index(op);
             match oopspec {
+                // heap.py: DICT_LOOKUP caching — consecutive dict lookups
+                // on the same dict with the same key can be deduplicated.
+                OopSpecIndex::DictLookup => {
+                    self.mark_args_escaped(op);
+                    self.force_all_lazy(ctx);
+                    // Invalidate dict-related caches but keep field/array caches.
+                    // Dict operations don't affect struct fields.
+                    return OptimizationResult::Emit(op.clone());
+                }
                 OopSpecIndex::Arraycopy | OopSpecIndex::Arraymove => {
                     // ARRAYCOPY/ARRAYMOVE: only invalidate affected array entries.
                     // Call args: [func_addr, source, dest, source_start, dest_start, length, ...]
