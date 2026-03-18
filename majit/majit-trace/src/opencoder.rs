@@ -546,6 +546,45 @@ impl CutTrace {
     }
 }
 
+/// opencoder.py: BoxArrayIter — iterates encoded box arrays
+/// in snapshot data, decoding tagged values.
+pub struct BoxArrayIter<'a> {
+    values: &'a [u32],
+    pos: usize,
+}
+
+impl<'a> BoxArrayIter<'a> {
+    pub fn new(values: &'a [u32]) -> Self {
+        BoxArrayIter { values, pos: 0 }
+    }
+
+    /// Get the next tagged value, or None if exhausted.
+    pub fn next_value(&mut self) -> Option<u32> {
+        if self.pos < self.values.len() {
+            let val = self.values[self.pos];
+            self.pos += 1;
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    /// Decode the next tagged value.
+    pub fn next_decoded(&mut self) -> Option<(u8, u32)> {
+        self.next_value().map(untag)
+    }
+
+    /// Remaining values.
+    pub fn remaining(&self) -> usize {
+        self.values.len() - self.pos
+    }
+
+    /// Whether exhausted.
+    pub fn done(&self) -> bool {
+        self.pos >= self.values.len()
+    }
+}
+
 // ── Trace Recording API (opencoder.py: Trace class) ──
 
 /// opencoder.py: Trace — compact trace recording buffer.
