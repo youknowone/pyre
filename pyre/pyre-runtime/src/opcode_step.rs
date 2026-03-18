@@ -5,13 +5,15 @@ use pyre_bytecode::bytecode::{
 
 use crate::{
     PyBigInt, PyError, SharedOpcodeHandler, exec_build_list, exec_build_map, exec_build_tuple,
-    exec_call, exec_list_append, exec_make_function, exec_store_subscr, exec_unpack_sequence,
+    exec_call, exec_list_append, exec_load_attr, exec_make_function, exec_store_attr,
+    exec_store_subscr, exec_unpack_sequence,
 };
 
 pub enum StepResult<V> {
     Continue,
     Return(V),
     CloseLoop(Vec<V>),
+    Yield(V),
 }
 
 pub fn decode_instruction_at(code: &CodeObject, pc: usize) -> Option<(Instruction, OpArg)> {
@@ -682,6 +684,20 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         exec_unpack_sequence(self, count).map_err(Into::into)
     }
 
+    fn load_attr(&mut self, name: &str) -> Result<(), Self::Error>
+    where
+        Self: SharedOpcodeHandler,
+    {
+        exec_load_attr(self, name).map_err(Into::into)
+    }
+
+    fn store_attr(&mut self, name: &str) -> Result<(), Self::Error>
+    where
+        Self: SharedOpcodeHandler,
+    {
+        exec_store_attr(self, name).map_err(Into::into)
+    }
+
     fn get_iter(&mut self) -> Result<(), Self::Error>
     where
         Self: IterOpcodeHandler,
@@ -705,6 +721,67 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Self: SharedOpcodeHandler,
     {
         exec_pop_top(self).map_err(Into::into)
+    }
+
+    // ── Closures / cells ──
+    fn load_deref(&mut self, _idx: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_deref not implemented").into())
+    }
+    fn store_deref(&mut self, _idx: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("store_deref not implemented").into())
+    }
+    fn load_closure(&mut self, _idx: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_closure not implemented").into())
+    }
+    fn delete_deref(&mut self, _idx: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("delete_deref not implemented").into())
+    }
+
+    // ── Exception handling ──
+    fn setup_finally(&mut self, _handler: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("setup_finally not implemented").into())
+    }
+    fn setup_except(&mut self, _handler: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("setup_except not implemented").into())
+    }
+    fn pop_block(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("pop_block not implemented").into())
+    }
+    fn raise_varargs(&mut self, _argc: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("raise_varargs not implemented").into())
+    }
+    fn end_finally(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("end_finally not implemented").into())
+    }
+    fn exception_handler(&mut self) -> Result<(), Self::Error> {
+        Ok(()) // no-op by default
+    }
+
+    // ── Import ──
+    fn import_name(&mut self, _name: &str) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("import_name not implemented").into())
+    }
+    fn import_from(&mut self, _name: &str) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("import_from not implemented").into())
+    }
+    fn import_star(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("import_star not implemented").into())
+    }
+
+    // ── Stack manipulation ──
+    fn rotate3(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("rotate3 not implemented").into())
+    }
+
+    // ── Delete operations ──
+    fn delete_fast(&mut self, _idx: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("delete_fast not implemented").into())
+    }
+    fn delete_subscript(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("delete_subscript not implemented").into())
+    }
+    fn delete_attr(&mut self, _name: &str) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("delete_attr not implemented").into())
     }
 
     fn unsupported(
@@ -962,6 +1039,50 @@ where
         Instruction::PopIter => {
             executor.pop_iter()?;
             Ok(StepResult::Continue)
+        }
+
+        Instruction::LoadAttr { namei } => {
+            let attr = namei.get(op_arg);
+            let name_idx = attr.name_idx() as usize;
+            OpcodeStepExecutor::load_attr(executor, code.names[name_idx].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+
+        Instruction::StoreAttr { namei } => {
+            let name_idx = namei.get(op_arg) as usize;
+            OpcodeStepExecutor::store_attr(executor, code.names[name_idx].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Generators ──
+        Instruction::YieldValue { .. } => {
+            let value = executor.pop_value()?;
+            Ok(StepResult::Yield(value))
+        }
+
+        // All other opcodes fall through to unsupported handler.
+        // Phase 1 opcodes (closures, exceptions, imports) will be added
+        // ── Closures / cells ──
+        Instruction::LoadDeref { i } => {
+            let idx = i.get(op_arg) as usize;
+            executor.load_deref(idx)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::StoreDeref { i } => {
+            let idx = i.get(op_arg) as usize;
+            executor.store_deref(idx)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::DeleteDeref { i } => {
+            let idx = i.get(op_arg) as usize;
+            executor.delete_deref(idx)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Generators ──
+        Instruction::YieldValue { .. } => {
+            let value = executor.pop_value()?;
+            Ok(StepResult::Yield(value))
         }
 
         other => executor.unsupported(&other),

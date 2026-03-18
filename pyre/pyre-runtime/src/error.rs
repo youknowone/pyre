@@ -17,6 +17,7 @@ pub enum PyErrorKind {
     NameError,
     IndexError,
     KeyError,
+    AttributeError,
 }
 
 impl PyError {

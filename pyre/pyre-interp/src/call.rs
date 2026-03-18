@@ -8,7 +8,8 @@ use std::sync::OnceLock;
 
 use pyre_object::PyObjectRef;
 use pyre_runtime::{
-    PyResult, dispatch_callable, w_builtin_func_get, w_func_get_code_ptr, w_func_get_globals,
+    PyResult, dispatch_callable, w_builtin_func_get, w_func_get_closure, w_func_get_code_ptr,
+    w_func_get_globals,
 };
 
 use crate::eval::eval_frame_plain;
@@ -64,8 +65,15 @@ pub fn call_user_function(
 ) -> PyResult {
     let code_ptr = unsafe { w_func_get_code_ptr(callable) };
     let globals = unsafe { w_func_get_globals(callable) };
+    let closure = unsafe { w_func_get_closure(callable) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
-    let mut func_frame = PyFrame::new_for_call(func_code, args, globals, frame.execution_context);
+    let mut func_frame = PyFrame::new_for_call_with_closure(
+        func_code,
+        args,
+        globals,
+        frame.execution_context,
+        closure,
+    );
     func_frame.fix_array_ptrs();
 
     let _guard = DEPTH_BUMP_OVERRIDE.get().and_then(|f| f());

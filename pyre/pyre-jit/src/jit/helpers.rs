@@ -9,8 +9,8 @@ use majit_meta::TraceCtx;
 
 use pyre_object::*;
 use pyre_objspace::{
-    jit_binary_value_from_tag, jit_compare_value_from_tag, jit_setitem, jit_truth_value,
-    jit_unary_invert_value, jit_unary_negative_value,
+    jit_binary_value_from_tag, jit_compare_value_from_tag, jit_getattr, jit_setattr, jit_setitem,
+    jit_truth_value, jit_unary_invert_value, jit_unary_negative_value,
 };
 use pyre_runtime::{
     PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_range_iter_next_or_null,
@@ -256,6 +256,29 @@ pub trait TraceHelperAccess {
     fn trace_store_subscr(&mut self, obj: OpRef, key: OpRef, value: OpRef) -> Result<(), PyError> {
         self.with_trace_ctx(|ctx| {
             let _ = emit_trace_call_int(ctx, jit_setitem as *const (), &[obj, key, value]);
+            Ok(())
+        })
+    }
+
+    fn trace_load_attr(&mut self, obj: OpRef, name: &str) -> Result<OpRef, PyError> {
+        self.with_trace_ctx(|ctx| {
+            let [name_ptr, name_len] = trace_name_args(ctx, name);
+            Ok(emit_trace_call_int(
+                ctx,
+                jit_getattr as *const (),
+                &[obj, name_ptr, name_len],
+            ))
+        })
+    }
+
+    fn trace_store_attr(&mut self, obj: OpRef, name: &str, value: OpRef) -> Result<(), PyError> {
+        self.with_trace_ctx(|ctx| {
+            let [name_ptr, name_len] = trace_name_args(ctx, name);
+            let _ = emit_trace_call_int(
+                ctx,
+                jit_setattr as *const (),
+                &[obj, name_ptr, name_len, value],
+            );
             Ok(())
         })
     }

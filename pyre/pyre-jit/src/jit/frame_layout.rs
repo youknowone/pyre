@@ -3,6 +3,8 @@ use majit_meta::virtualizable::VirtualizableInfo;
 use pyre_bytecode::CodeObject;
 use pyre_runtime::{PyExecutionContext, PyNamespace, PyObjectArray};
 
+use crate::jit::virtualizable_spec::{PYFRAME_VABLE_ARRAYS, PYFRAME_VABLE_FIELDS};
+
 /// Shared PyFrame layout contract used by the interpreter and tracer.
 ///
 /// This mirrors `pyre-interp::frame::PyFrame` exactly so both crates can
@@ -61,16 +63,20 @@ pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
     let mut info = VirtualizableInfo::new(PYFRAME_VABLE_TOKEN_OFFSET);
     // PyPy: last_instr
-    info.add_field("next_instr", Type::Int, PYFRAME_NEXT_INSTR_OFFSET);
+    info.add_field(
+        PYFRAME_VABLE_FIELDS[0].0,
+        Type::Int,
+        PYFRAME_NEXT_INSTR_OFFSET,
+    );
     // PyPy: valuestackdepth
     info.add_field(
-        "valuestackdepth",
+        PYFRAME_VABLE_FIELDS[1].0,
         Type::Int,
         PYFRAME_VALUESTACKDEPTH_OFFSET,
     );
     // PyPy: locals_cells_stack_w[*] — single unified array
     info.add_array_field(
-        "locals_cells_stack_w",
+        PYFRAME_VABLE_ARRAYS[0].0,
         Type::Ref,
         PYFRAME_LOCALS_CELLS_STACK_OFFSET,
     );
