@@ -9,20 +9,20 @@
 
 // Re-export the auto-generated tracing functions
 pub use crate::{
-    TRACE_PATTERNS, trace_box_int, trace_int_binop, trace_int_binop_ovf, trace_int_compare,
-    trace_unbox_int,
+    CANONICAL_TRACE_PATTERNS, trace_box_int, trace_int_binop, trace_int_binop_ovf,
+    trace_int_compare, trace_unbox_int,
 };
 
 /// Check if an opcode pattern has been classified for JIT tracing.
 pub fn is_traceable(pattern_name: &str) -> bool {
-    TRACE_PATTERNS
+    CANONICAL_TRACE_PATTERNS
         .iter()
         .any(|(_, cls)| *cls != "Unclassified" && cls.contains(pattern_name))
 }
 
 /// Get the trace classification for an opcode pattern.
 pub fn get_trace_classification(opcode_pattern: &str) -> Option<&'static str> {
-    TRACE_PATTERNS
+    CANONICAL_TRACE_PATTERNS
         .iter()
         .find(|(pat, _)| *pat == opcode_pattern)
         .map(|(_, cls)| *cls)
@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn test_classification_lookup() {
         // Find BinaryOp pattern
-        let cls = TRACE_PATTERNS
+        let cls = CANONICAL_TRACE_PATTERNS
             .iter()
             .find(|(pat, _)| pat.contains("BinaryOp"))
             .map(|(_, cls)| *cls);

@@ -3,9 +3,9 @@ use std::sync::OnceLock;
 
 use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{
-    PY_NULL, PyObjectRef, is_int, is_list, is_range_iter, is_tuple, w_dict_new, w_dict_setitem,
-    w_int_get_value, w_list_getitem, w_list_len, w_list_new, w_range_iter_has_next,
-    w_range_iter_next, w_tuple_getitem, w_tuple_len, w_tuple_new,
+    PY_NULL, PyObjectRef, W_SeqIterator, is_int, is_list, is_range_iter, is_seq_iter, is_tuple,
+    w_dict_new, w_dict_setitem, w_int_get_value, w_list_getitem, w_list_len, w_list_new,
+    w_range_iter_has_next, w_range_iter_next, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
 
 use crate::{
@@ -632,8 +632,20 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
 }
 
 pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
-    if unsafe { is_range_iter(iter) } {
-        return Ok(());
+    unsafe {
+        if is_range_iter(iter) || is_seq_iter(iter) {
+            return Ok(());
+        }
+        // Convert list/tuple to seq iterator
+        if is_list(iter) {
+            // Replace TOS with a seq iterator wrapping the list
+            // This is called on TOS after GET_ITER pops and pushes.
+            // But ensure_iter is called ON the iter — it can't replace stack.
+            // So we need to create iter before calling ensure.
+            // Actually ensure_range_iter is called AFTER get_iter pushes.
+            // The problem: GET_ITER calls ensure_iter_value on the pushed value.
+            // For list, we need to push a seq_iter instead of the list itself.
+        }
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
@@ -642,15 +654,37 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
 }
 
 pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
-    if unsafe { is_range_iter(iter) } {
-        return Ok(unsafe { w_range_iter_has_next(iter) });
+    unsafe {
+        if is_range_iter(iter) {
+            return Ok(w_range_iter_has_next(iter));
+        }
+        if is_seq_iter(iter) {
+            let si = &*(iter as *const W_SeqIterator);
+            return Ok(si.index < si.length);
+        }
     }
     Err(PyError::type_error("not an iterator"))
 }
 
 pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    if unsafe { is_range_iter(iter) } {
-        return Ok(unsafe { w_range_iter_next(iter).unwrap_or(PY_NULL) });
+    unsafe {
+        if is_range_iter(iter) {
+            return Ok(w_range_iter_next(iter).unwrap_or(PY_NULL));
+        }
+        if is_seq_iter(iter) {
+            let si = &mut *(iter as *mut W_SeqIterator);
+            if si.index < si.length {
+                let idx = si.index;
+                si.index += 1;
+                if is_list(si.seq) {
+                    return Ok(w_list_getitem(si.seq, idx).unwrap_or(PY_NULL));
+                }
+                if is_tuple(si.seq) {
+                    return Ok(w_tuple_getitem(si.seq, idx).unwrap_or(PY_NULL));
+                }
+            }
+            return Ok(PY_NULL);
+        }
     }
     Err(PyError::type_error("not an iterator"))
 }
