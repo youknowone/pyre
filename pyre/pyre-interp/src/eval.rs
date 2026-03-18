@@ -2200,7 +2200,6 @@ result = fib(10)";
     }
 
     #[test]
-    #[ignore = "needs ZeroDivisionError in builtins namespace"]
     fn test_try_except_specific() {
         let source = "\
 result = 0
