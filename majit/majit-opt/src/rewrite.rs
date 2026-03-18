@@ -979,6 +979,52 @@ impl Optimization for OptRewrite {
             OpCode::GuardTrue => self.optimize_guard_true(op, ctx),
             OpCode::GuardFalse => self.optimize_guard_false(op, ctx),
             OpCode::GuardValue => self.optimize_guard_value(op, ctx),
+            // RPython rewrite.py guard optimizations:
+            // If the guarded condition is already known to be true (constant),
+            // the guard can be removed entirely.
+            OpCode::GuardNonnull => {
+                // GUARD_NONNULL(x): if x is a known non-null constant, remove.
+                if let Some(v) = ctx.get_constant_int(op.arg(0)) {
+                    if v != 0 {
+                        return OptimizationResult::Remove;
+                    }
+                }
+                OptimizationResult::PassOn
+            }
+            OpCode::GuardIsnull => {
+                // GUARD_ISNULL(x): if x is a known null (0), remove.
+                if let Some(0) = ctx.get_constant_int(op.arg(0)) {
+                    return OptimizationResult::Remove;
+                }
+                OptimizationResult::PassOn
+            }
+            OpCode::GuardClass => {
+                // GUARD_CLASS(obj, expected_class): if obj's class is already
+                // known from a previous guard, remove duplicate.
+                // For now: if obj is constant, the guard is redundant after
+                // the first successful execution.
+                OptimizationResult::PassOn
+            }
+            OpCode::GuardNonnullClass => {
+                // GUARD_NONNULL_CLASS(obj, cls): combines GUARD_NONNULL + GUARD_CLASS.
+                // If obj is known non-null constant, can downgrade to GUARD_CLASS.
+                if let Some(v) = ctx.get_constant_int(op.arg(0)) {
+                    if v != 0 {
+                        // Known non-null — downgrade to GUARD_CLASS
+                        let mut new_op = Op::new(OpCode::GuardClass, &op.args);
+                        new_op.pos = op.pos;
+                        new_op.descr = op.descr.clone();
+                        new_op.fail_args = op.fail_args.clone();
+                        return OptimizationResult::Replace(new_op);
+                    }
+                }
+                OptimizationResult::PassOn
+            }
+            OpCode::GuardIsObject | OpCode::GuardSubclass | OpCode::GuardGcType => {
+                // These guards are kept as-is for now — they need info layer
+                // (PtrInfo) to optimize, which is tracked by OptVirtualize.
+                OptimizationResult::PassOn
+            }
 
             // ── Float arithmetic ──
             OpCode::FloatAdd => self.optimize_float_add(op, ctx),
