@@ -722,6 +722,11 @@ impl OptRewrite {
     }
 
     /// Optimize GUARD_VALUE: if the guarded value equals the expected constant -> remove.
+    /// rewrite.py: optimize_GUARD_VALUE + _maybe_replace_guard_value
+    ///
+    /// If both args are constants and equal, the guard is redundant → remove.
+    /// If the guarded value is a boolean comparison result, replace with
+    /// GUARD_TRUE (if expecting 1) or GUARD_FALSE (if expecting 0).
     fn optimize_guard_value(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
@@ -735,7 +740,28 @@ impl OptRewrite {
             if actual == expected {
                 return OptimizationResult::Remove;
             }
-            // Mismatch: guard always fails. Keep it.
+        }
+
+        // rewrite.py: _maybe_replace_guard_value
+        // If the expected value is 0 or 1 (boolean), replace GUARD_VALUE
+        // with GUARD_FALSE(arg0) or GUARD_TRUE(arg0). This is better because
+        // GUARD_TRUE/FALSE are foldable and can be eliminated by guard
+        // strengthening, while GUARD_VALUE cannot.
+        if let Some(expected) = ctx.get_constant_int(arg1) {
+            if expected == 0 {
+                let mut new_op = Op::new(OpCode::GuardFalse, &[arg0]);
+                new_op.pos = op.pos;
+                new_op.descr = op.descr.clone();
+                new_op.fail_args = op.fail_args.clone();
+                return OptimizationResult::Replace(new_op);
+            }
+            if expected == 1 {
+                let mut new_op = Op::new(OpCode::GuardTrue, &[arg0]);
+                new_op.pos = op.pos;
+                new_op.descr = op.descr.clone();
+                new_op.fail_args = op.fail_args.clone();
+                return OptimizationResult::Replace(new_op);
+            }
         }
 
         OptimizationResult::PassOn
