@@ -169,4 +169,32 @@ mod tests {
         qi.invalidate();
         assert!(flag.load(Ordering::Acquire));
     }
+
+    #[test]
+    fn test_quasi_immut_descr() {
+        let descr = QuasiImmutDescr::new(0x1000, 42, 99);
+        assert_eq!(descr.obj_ref, 0x1000);
+        assert_eq!(descr.field_descr_idx, 42);
+        assert_eq!(descr.cached_value, 99);
+
+        // Register and invalidate through the descr
+        let flag = Arc::new(AtomicBool::new(false));
+        descr.register_loop(&flag);
+        descr.invalidate();
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_has_watchers() {
+        let mut qi = QuasiImmut::new();
+        assert!(!qi.has_watchers());
+
+        let flag = Arc::new(AtomicBool::new(false));
+        qi.register(&flag);
+        assert!(qi.has_watchers());
+
+        drop(flag);
+        qi.cleanup();
+        assert!(!qi.has_watchers());
+    }
 }
