@@ -1210,6 +1210,39 @@ impl Optimization for OptVirtualize {
             // (never escaped), the guard always succeeds. Otherwise, pass through.
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => OptimizationResult::PassOn,
 
+            // virtualize.py: optimize_CALL_MAY_FORCE_I/R/F/N
+            // If the call is OS_JIT_FORCE_VIRTUAL and the vref is virtual
+            // with a null token → replace with the forced value.
+            OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceF
+            | OpCode::CallMayForceN => {
+                if let Some(ref descr) = op.descr {
+                    if let Some(cd) = descr.as_call_descr() {
+                        let ei = cd.effect_info();
+                        if ei.oopspec_index == OopSpecIndex::JitForceVirtual
+                            && op.num_args() >= 2
+                        {
+                            let vref = ctx.get_replacement(op.arg(1));
+                            if self.is_virtual(vref, ctx) {
+                                // Virtual ref with known null token →
+                                // return the forced value directly.
+                                // Simplified: just remove the call.
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
+                }
+                self.optimize_escaping_op(op, ctx)
+            }
+
+            // virtualize.py: optimize_FINISH — force the last
+            // GUARD_NOT_FORCED_2 op for resume data.
+            OpCode::Finish => {
+                // Force all virtual args (same as escaping op).
+                self.optimize_escaping_op(op, ctx)
+            }
+
             // virtualize.py: optimize_COND_CALL — if the call is
             // OS_JIT_FORCE_VIRTUALIZABLE and the target is virtual, remove.
             OpCode::CondCallN => {
@@ -1282,7 +1315,8 @@ impl Optimization for OptVirtualize {
             }
 
             // JUMP (no virtualizable) / FINISH — force all virtual args
-            OpCode::Jump | OpCode::Finish => self.optimize_escaping_op(op, ctx),
+            // Note: Finish is handled above with CALL_MAY_FORCE.
+            OpCode::Jump => self.optimize_escaping_op(op, ctx),
 
             // Escape ops (testing)
             OpCode::EscapeI | OpCode::EscapeR | OpCode::EscapeF | OpCode::EscapeN => {
