@@ -139,8 +139,37 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         }
     }
 
-    // PyPy assembler_call_helper: dispatch through compiled code.
-    // eval_with_jit → try_function_entry_jit → compiled code dispatch.
+    // PyPy assembler_call_helper (warmspot.py:1021): try compiled code
+    // dispatch first, fall back to interpreter.
+    let green_key = frame.code as u64;
+    let (driver, _) = crate::eval::driver_pair();
+    if let Some(token) = driver.get_loop_token(green_key) {
+        let token_num = token.number;
+        // Build CA inputs: [frame_ptr, next_instr, stack_depth, locals...]
+        // This matches synthesize_fresh_callee_entry_args.
+        let nlocals = unsafe { (&*frame.code).varnames.len() };
+        let mut inputs = vec![
+            frame_ptr,
+            frame.next_instr as i64,
+            frame.stack_depth as i64,
+        ];
+        for i in 0..nlocals {
+            inputs.push(frame.locals_w[i] as i64);
+        }
+        if let Some(raw) = majit_codegen_cranelift::execute_call_assembler_direct(
+            token_num,
+            &inputs,
+            jit_force_callee_frame,
+        ) {
+            unsafe {
+                FORCE_CACHE_1 = FORCE_CACHE_0;
+                FORCE_CACHE_0 = (code_key, arg_key, raw);
+            }
+            return raw;
+        }
+    }
+
+    // Fallback: full eval_with_jit (interpreter + JIT)
     match crate::eval::eval_with_jit(frame) {
         Ok(result) => {
             let raw = if !result.is_null() && unsafe { is_int(result) } {

@@ -91,6 +91,12 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_compiled_meta(green_key)
     }
 
+    /// PyPy warmstate.py get_assembler_token(greenkey).
+    /// Returns the JitCellToken for the compiled loop at this green key.
+    pub fn get_loop_token(&self, green_key: u64) -> Option<&majit_codegen::JitCellToken> {
+        self.meta.get_loop_token(green_key)
+    }
+
     /// Get the compiled loop's num_inputs (after preamble patching).
     pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
         self.meta.get_compiled_num_inputs(green_key)
