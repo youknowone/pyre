@@ -44,6 +44,104 @@ impl Default for BridgeKnowledge {
     }
 }
 
+impl BridgeKnowledge {
+    /// bridgeopt.py: serialize_optimizer_knowledge(numb_state, liveboxes, ...)
+    /// Serialize knowledge into a compact byte representation for embedding
+    /// in resume data. This allows bridges to inherit optimization knowledge
+    /// from the loop that spawned them.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Format: [num_constants, (opref, value)*, num_nonnull, opref*,
+        //          num_classes, (opref, class_ptr)*, num_bounds, (opref, lo, hi)*]
+        buf.extend_from_slice(&(self.known_constants.len() as u32).to_le_bytes());
+        for (&opref, &value) in &self.known_constants {
+            buf.extend_from_slice(&opref.0.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.known_nonnull.len() as u32).to_le_bytes());
+        for opref in &self.known_nonnull {
+            buf.extend_from_slice(&opref.0.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.known_classes.len() as u32).to_le_bytes());
+        for (&opref, &class) in &self.known_classes {
+            buf.extend_from_slice(&opref.0.to_le_bytes());
+            buf.extend_from_slice(&(class.0 as u64).to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.known_bounds.len() as u32).to_le_bytes());
+        for (&opref, &(lo, hi)) in &self.known_bounds {
+            buf.extend_from_slice(&opref.0.to_le_bytes());
+            buf.extend_from_slice(&lo.to_le_bytes());
+            buf.extend_from_slice(&hi.to_le_bytes());
+        }
+        buf
+    }
+
+    /// bridgeopt.py: deserialize_optimizer_knowledge(numb_state, liveboxes, ...)
+    /// Reconstruct knowledge from serialized bytes.
+    pub fn deserialize(buf: &[u8]) -> Option<Self> {
+        let mut pos = 0;
+        let mut k = BridgeKnowledge::new();
+
+        if buf.len() < 4 { return None; }
+        let n_const = u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
+        for _ in 0..n_const {
+            if pos + 12 > buf.len() { return None; }
+            let opref = OpRef(u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?));
+            pos += 4;
+            let value = i64::from_le_bytes(buf[pos..pos+8].try_into().ok()?);
+            pos += 8;
+            k.known_constants.insert(opref, value);
+        }
+
+        if pos + 4 > buf.len() { return None; }
+        let n_nonnull = u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
+        for _ in 0..n_nonnull {
+            if pos + 4 > buf.len() { return None; }
+            let opref = OpRef(u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?));
+            pos += 4;
+            k.known_nonnull.push(opref);
+        }
+
+        if pos + 4 > buf.len() { return None; }
+        let n_class = u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
+        for _ in 0..n_class {
+            if pos + 12 > buf.len() { return None; }
+            let opref = OpRef(u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?));
+            pos += 4;
+            let class_val = u64::from_le_bytes(buf[pos..pos+8].try_into().ok()?);
+            pos += 8;
+            k.known_classes.insert(opref, GcRef(class_val as usize));
+        }
+
+        if pos + 4 > buf.len() { return None; }
+        let n_bounds = u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
+        for _ in 0..n_bounds {
+            if pos + 20 > buf.len() { return None; }
+            let opref = OpRef(u32::from_le_bytes(buf[pos..pos+4].try_into().ok()?));
+            pos += 4;
+            let lo = i64::from_le_bytes(buf[pos..pos+8].try_into().ok()?);
+            pos += 8;
+            let hi = i64::from_le_bytes(buf[pos..pos+8].try_into().ok()?);
+            pos += 8;
+            k.known_bounds.insert(opref, (lo, hi));
+        }
+
+        Some(k)
+    }
+
+    /// Whether this knowledge has any useful facts.
+    pub fn is_empty(&self) -> bool {
+        self.known_constants.is_empty()
+            && self.known_nonnull.is_empty()
+            && self.known_classes.is_empty()
+            && self.known_bounds.is_empty()
+    }
+}
+
 /// The bridge optimization pass.
 pub struct OptBridgeOpt {
     knowledge: BridgeKnowledge,
