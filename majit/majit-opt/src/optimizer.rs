@@ -207,6 +207,36 @@ impl Optimizer {
         ctx.new_operations.last()
     }
 
+    /// optimizer.py: new_const(fieldvalue) — create a new constant OpRef.
+    /// Emits a SameAs op with the given constant value.
+    pub fn new_const_int(ctx: &mut OptContext, value: i64) -> OpRef {
+        let op = Op::new(OpCode::SameAsI, &[]);
+        let opref = ctx.emit(op);
+        ctx.make_constant(opref, majit_ir::Value::Int(value));
+        opref
+    }
+
+    /// optimizer.py: new_const_item(arraydescr) — create a default value
+    /// for an array item (0 for int, null for ref, 0.0 for float).
+    pub fn new_const_item(ctx: &mut OptContext, item_type: majit_ir::Type) -> OpRef {
+        match item_type {
+            majit_ir::Type::Int => Self::new_const_int(ctx, 0),
+            majit_ir::Type::Ref => {
+                let op = Op::new(OpCode::SameAsR, &[]);
+                let opref = ctx.emit(op);
+                ctx.make_constant(opref, majit_ir::Value::Ref(majit_ir::GcRef::NULL));
+                opref
+            }
+            majit_ir::Type::Float => {
+                let op = Op::new(OpCode::SameAsF, &[]);
+                let opref = ctx.emit(op);
+                ctx.make_constant(opref, majit_ir::Value::Float(0.0));
+                opref
+            }
+            majit_ir::Type::Void => OpRef::NONE,
+        }
+    }
+
     /// optimizer.py: is_call_pure_pure_canraise(op)
     /// Check if a CALL_PURE can raise an exception.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {

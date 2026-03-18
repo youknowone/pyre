@@ -464,22 +464,27 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         preamble_to_label.insert(*arg, i);
     }
 
-    // Collect guards from the preamble (before Label)
+    // shortpreamble.py: Collect guards AND pure operations from the preamble.
+    // Guards must be replayed so the body's assumptions hold.
+    // Pure ops whose results are used as label args must also be replayed
+    // (e.g., GETFIELD from preamble that feeds into loop body).
     let mut entries = Vec::new();
     for op in &peeled_ops[..label_pos] {
-        if !op.opcode.is_guard() {
+        let include = op.opcode.is_guard() || op.opcode.is_always_pure();
+        if !include {
             continue;
         }
 
-        let mut arg_mapping = Vec::new();
-        for (arg_pos, arg_ref) in op.args.iter().enumerate() {
-            if let Some(&label_idx) = preamble_to_label.get(arg_ref) {
-                arg_mapping.push((arg_pos, label_idx));
-            }
-        }
+        let arg_mapping: Vec<(usize, usize)> = op
+            .args
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, arg)| {
+                preamble_to_label.get(arg).map(|&idx| (pos, idx))
+            })
+            .collect();
 
-        // Only include guards that reference label args
-        // (guards on constants or temporaries don't need replay)
+        // Only include ops that reference label args
         if !arg_mapping.is_empty() {
             entries.push(ShortPreambleOp {
                 op: op.clone(),
@@ -533,9 +538,10 @@ mod tests {
 
         let sp = extract_short_preamble(&ops);
 
-        // Should have captured the preamble guard
-        assert_eq!(sp.len(), 1);
+        // Should have captured the preamble guard AND the pure IntAdd
+        assert_eq!(sp.len(), 2);
         assert_eq!(sp.ops[0].op.opcode, OpCode::GuardTrue);
+        assert_eq!(sp.ops[1].op.opcode, OpCode::IntAdd);
 
         // The guard's arg v100 maps to label arg index 0
         assert_eq!(sp.ops[0].arg_mapping.len(), 1);
@@ -567,8 +573,11 @@ mod tests {
 
         let sp = extract_short_preamble(&ops);
 
-        // The guard refs v0 (the IntAdd result), which is NOT in the label args
-        assert!(sp.is_empty());
+        // The guard refs v0 (the IntAdd result), which is NOT in the label args.
+        // But IntAdd refs v100 which IS a label arg → IntAdd IS extracted.
+        // The guard on v0 is NOT extracted (v0 is not a label arg).
+        assert_eq!(sp.len(), 1);
+        assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
     }
 
     #[test]
@@ -683,11 +692,12 @@ mod tests {
 
         let sp = extract_short_preamble(&ops);
 
-        // All three guards reference label args
-        assert_eq!(sp.len(), 3);
+        // All three guards + the pure IntAdd reference label args
+        assert_eq!(sp.len(), 4);
         assert_eq!(sp.ops[0].op.opcode, OpCode::GuardTrue);
         assert_eq!(sp.ops[1].op.opcode, OpCode::GuardNonnull);
         assert_eq!(sp.ops[2].op.opcode, OpCode::GuardClass);
+        assert_eq!(sp.ops[3].op.opcode, OpCode::IntAdd);
     }
 
     #[test]
@@ -709,7 +719,8 @@ mod tests {
         let bridge_args = &[OpRef(500), OpRef(501)];
         let instantiated = sp.instantiate(bridge_args);
 
-        assert_eq!(instantiated.len(), 2);
+        // 2 guards + 1 pure IntAdd
+        assert_eq!(instantiated.len(), 3);
 
         // Guard_true now checks bridge's v500 (was v100 → label arg 0)
         assert_eq!(instantiated[0].opcode, OpCode::GuardTrue);
@@ -719,5 +730,8 @@ mod tests {
         assert_eq!(instantiated[1].opcode, OpCode::GuardClass);
         assert_eq!(instantiated[1].args[0], OpRef(501)); // remapped
         assert_eq!(instantiated[1].args[1], OpRef(200)); // constant, unchanged
+
+        // IntAdd with remapped args
+        assert_eq!(instantiated[2].opcode, OpCode::IntAdd);
     }
 }
