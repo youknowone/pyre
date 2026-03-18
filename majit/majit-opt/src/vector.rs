@@ -526,6 +526,55 @@ impl Default for CostModel {
 ///
 /// Analyzes loop bodies to find independent scalar operations that can be
 /// packed into SIMD vector instructions.
+/// vector.py: VectorLoop — wraps a loop body for vectorization analysis.
+/// Provides the iteration over loop body ops and manages unrolling.
+#[derive(Clone, Debug)]
+pub struct VectorLoop {
+    /// The original loop body ops (between Label and Jump).
+    pub body: Vec<Op>,
+    /// The label op (loop header).
+    pub label: Option<Op>,
+    /// The jump op (back-edge).
+    pub jump: Option<Op>,
+    /// Number of unrolled iterations.
+    pub unroll_factor: usize,
+}
+
+impl VectorLoop {
+    /// Create from a trace by finding Label..Jump.
+    pub fn from_trace(ops: &[Op]) -> Option<Self> {
+        let label_pos = ops.iter().position(|op| op.opcode == OpCode::Label)?;
+        let jump_pos = ops.iter().rposition(|op| op.opcode == OpCode::Jump)?;
+        if jump_pos <= label_pos {
+            return None;
+        }
+        Some(VectorLoop {
+            body: ops[label_pos + 1..jump_pos].to_vec(),
+            label: Some(ops[label_pos].clone()),
+            jump: Some(ops[jump_pos].clone()),
+            unroll_factor: 1,
+        })
+    }
+
+    /// Number of ops in the loop body (excluding Label and Jump).
+    pub fn body_len(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Whether the loop is suitable for vectorization.
+    pub fn is_vectorizable(&self) -> bool {
+        VectorizingOptimizer::user_loop_heuristic(&self.body)
+    }
+
+    /// Get adjacent memory access pairs in the body.
+    pub fn find_adjacent_pairs(
+        &self,
+        constant_of: impl Fn(OpRef) -> Option<i64>,
+    ) -> Vec<(usize, usize)> {
+        VectorizingOptimizer::find_adjacent_pairs(&self.body, constant_of)
+    }
+}
+
 pub struct VectorizingOptimizer {
     /// Operations in the current loop body (between Label and Jump).
     body_ops: Vec<Op>,

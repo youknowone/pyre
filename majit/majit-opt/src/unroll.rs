@@ -141,6 +141,41 @@ impl UnrollOptimizer {
         }
         self.bridge_guard_count > max_retrace_guards
     }
+
+    /// unroll.py: optimize_trace(trace, call_pure_results)
+    /// Full trace optimization: peel → optimize preamble → optimize body.
+    /// Returns the optimized peeled+body trace.
+    pub fn optimize_trace(&mut self, ops: &[Op]) -> Vec<Op> {
+        let result = self.optimize_preamble(ops);
+        // After peeling, extract short preamble from the result.
+        let sp = crate::shortpreamble::extract_short_preamble(&result);
+        if !sp.is_empty() {
+            self.short_preamble = Some(sp);
+        }
+        result
+    }
+
+    /// unroll.py: optimize_trace_with_constants
+    /// Same as optimize_trace but with known constants.
+    pub fn optimize_trace_with_constants(
+        &mut self,
+        ops: &[Op],
+        constants: &mut std::collections::HashMap<u32, i64>,
+    ) -> Vec<Op> {
+        let mut optimizer = crate::optimizer::Optimizer::default_pipeline();
+        optimizer.add_pass(Box::new(OptUnroll::new()));
+        let result = optimizer.optimize_with_constants(ops, constants);
+        let sp = crate::shortpreamble::extract_short_preamble(&result);
+        if !sp.is_empty() {
+            self.short_preamble = Some(sp);
+        }
+        result
+    }
+
+    /// Count the guards in an optimized trace (for retrace_limit checks).
+    pub fn count_guards(ops: &[Op]) -> u32 {
+        ops.iter().filter(|op| op.opcode.is_guard()).count() as u32
+    }
 }
 
 impl Default for UnrollOptimizer {
