@@ -254,9 +254,9 @@ fn try_constant_fold_value(op: &Op, ctx: &OptContext) -> Option<i64> {
     let b = ctx.get_constant_int(op.arg(1))?;
 
     let result = match op.opcode {
-        OpCode::IntAdd => a.checked_add(b)?,
-        OpCode::IntSub => a.checked_sub(b)?,
-        OpCode::IntMul => a.checked_mul(b)?,
+        OpCode::IntAdd | OpCode::IntAddOvf => a.checked_add(b)?,
+        OpCode::IntSub | OpCode::IntSubOvf => a.checked_sub(b)?,
+        OpCode::IntMul | OpCode::IntMulOvf => a.checked_mul(b)?,
         OpCode::IntAnd => Some(a & b)?,
         OpCode::IntOr => Some(a | b)?,
         OpCode::IntXor => Some(a ^ b)?,
@@ -296,7 +296,10 @@ impl Default for OptPure {
 
 impl Optimization for OptPure {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        self.last_emitted_was_removed = false;
+        // Don't reset for GUARD_NO_EXCEPTION — it needs the previous state.
+        if op.opcode != OpCode::GuardNoException {
+            self.last_emitted_was_removed = false;
+        }
 
         // pure.py: OVF operation postponement.
         // INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF are deferred until we see
@@ -918,5 +921,103 @@ mod tests {
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
         assert_eq!(result.len(), 1, "IntLt(3,5) should be constant-folded");
+    }
+
+    #[test]
+    fn test_ovf_postponement_cse() {
+        // INT_ADD_OVF(a, b) + GUARD_NO_OVERFLOW
+        // then same INT_ADD_OVF(a, b) + GUARD_NO_OVERFLOW → CSE'd away
+        let mut ops = vec![
+            Op::new(OpCode::IntAddOvf, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::IntAddOvf, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize(&ops);
+
+        // First pair stays, second pair CSE'd → 3 ops total
+        let ovf_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::IntAddOvf)
+            .count();
+        assert_eq!(ovf_count, 1, "duplicate OVF should be CSE'd");
+    }
+
+    #[test]
+    fn test_ovf_constant_fold() {
+        // INT_ADD_OVF(const(3), const(4)) + GUARD_NO_OVERFLOW → both removed
+        let mut ops = vec![
+            Op::new(OpCode::IntAddOvf, &[OpRef(10_000), OpRef(10_001)]),
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 3i64);
+        constants.insert(10_001, 4i64);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize_with_constants(&ops, &mut constants);
+
+        // Both OVF and guard should be folded away
+        let ovf_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::IntAddOvf)
+            .count();
+        assert_eq!(ovf_count, 0, "OVF(3,4) should be constant-folded");
+    }
+
+    #[test]
+    fn test_guard_no_exception_after_removed_call_pure() {
+        // CALL_PURE_I(same args) × 2 → second removed → GUARD_NO_EXCEPTION after removed
+        let mut ops = vec![
+            Op::new(OpCode::CallPureI, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNoException, &[]),
+            Op::new(OpCode::CallPureI, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNoException, &[]), // should be removed
+            Op::new(OpCode::Finish, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize(&ops);
+
+        // Second CALL_PURE → removed (CSE), its GUARD_NO_EXCEPTION → removed
+        let gne_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNoException)
+            .count();
+        assert_eq!(
+            gne_count, 1,
+            "GUARD_NO_EXCEPTION after removed CALL_PURE should be eliminated"
+        );
+    }
+
+    #[test]
+    fn test_pure_and_pure_from_args() {
+        let mut pass = OptPure::new();
+
+        // Manually record a pure operation via the API
+        let mut op = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef(20)]);
+        op.pos = OpRef(0);
+        pass.pure(&op);
+
+        // Should find it via get_pure_result
+        let lookup_op = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef(20)]);
+        assert!(pass.get_pure_result(&lookup_op).is_some());
+
+        // pure_from_args
+        pass.pure_from_args(OpCode::IntMul, &[OpRef(30), OpRef(40)], OpRef(5));
+        let mut lookup_mul = Op::new(OpCode::IntMul, &[OpRef(30), OpRef(40)]);
+        lookup_mul.pos = OpRef(99);
+        assert!(pass.get_pure_result(&lookup_mul).is_some());
     }
 }
