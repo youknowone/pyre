@@ -573,4 +573,55 @@ mod tests {
             "distinct overflow guards must survive full-pipeline optimization"
         );
     }
+
+    #[test]
+    fn test_guard_nonnull_class_subsumed_by_nonnull_plus_class() {
+        // GUARD_NONNULL(v) then GUARD_CLASS(v, cls) already seen
+        // → later GUARD_NONNULL_CLASS(v, cls) is subsumed.
+        let mut ops = vec![
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::GuardClass, &[OpRef(100), OpRef(200)]),
+            Op::new(OpCode::GuardNonnullClass, &[OpRef(100), OpRef(200)]),
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+        ];
+        assign_positions(&mut ops, 0);
+        let result = run_guard_pass(&ops);
+        // GuardNonnullClass should be removed (subsumed)
+        let nnc_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNonnullClass)
+            .count();
+        assert_eq!(nnc_count, 0, "GuardNonnullClass should be subsumed");
+    }
+
+    #[test]
+    fn test_guard_value_to_guard_true() {
+        // GUARD_VALUE(v, 1) → GUARD_TRUE(v) via rewrite pass.
+        let mut ops = vec![
+            {
+                let mut op = Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(200)]);
+                op.pos = OpRef(0);
+                op
+            },
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+        ];
+        ops[1].pos = OpRef(1);
+
+        // Pre-seed constant 1 for OpRef(200)
+        let mut opt = crate::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(crate::rewrite::OptRewrite::new()));
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(200, 1i64);
+        let result = opt.optimize_with_constants(&ops, &mut constants);
+
+        // GUARD_VALUE should be replaced with GUARD_TRUE
+        assert!(
+            result.iter().any(|o| o.opcode == OpCode::GuardTrue),
+            "GUARD_VALUE(v, 1) should become GUARD_TRUE(v)"
+        );
+        assert!(
+            !result.iter().any(|o| o.opcode == OpCode::GuardValue),
+            "GUARD_VALUE should be gone"
+        );
+    }
 }
