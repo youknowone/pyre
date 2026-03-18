@@ -87,8 +87,26 @@ pub fn encode_trace(trace: &TreeLoop) -> Vec<u8> {
         for arg in &op.args {
             encode_varint(&mut buf, arg.0 as u64);
         }
-        // Encode whether there's a descriptor
-        buf.push(if op.descr.is_some() { 1 } else { 0 });
+        // Encode descriptor: 0 = none, else descr_index + 1.
+        if let Some(ref descr) = op.descr {
+            let idx = descr.index();
+            if idx != u32::MAX {
+                encode_varint(&mut buf, (idx as u64) + 1);
+            } else {
+                buf.push(1); // has descriptor but no index
+            }
+        } else {
+            buf.push(0);
+        }
+        // Encode fail_args presence and count.
+        if let Some(ref fa) = op.fail_args {
+            encode_varint(&mut buf, fa.len() as u64 + 1); // +1 to distinguish from 0=none
+            for arg in fa.iter() {
+                encode_varint(&mut buf, arg.0 as u64);
+            }
+        } else {
+            buf.push(0);
+        }
     }
 
     buf
@@ -137,10 +155,36 @@ pub fn decode_trace(buf: &[u8]) -> TreeLoop {
             args.push(OpRef(arg_ref as u32));
         }
 
-        let _has_descr = buf[pos];
-        pos += 1;
+        // Decode descriptor index
+        let (descr_marker, n) = decode_varint(&buf[pos..]);
+        pos += n;
+        let _descr_index = if descr_marker > 0 {
+            Some((descr_marker - 1) as u32)
+        } else {
+            None
+        };
 
-        ops.push(Op::new(opcode, &args));
+        // Decode fail_args
+        let (fa_marker, n) = decode_varint(&buf[pos..]);
+        pos += n;
+        let fail_args = if fa_marker > 0 {
+            let fa_len = (fa_marker - 1) as usize;
+            let mut fa = Vec::with_capacity(fa_len);
+            for _ in 0..fa_len {
+                let (arg_ref, n) = decode_varint(&buf[pos..]);
+                pos += n;
+                fa.push(OpRef(arg_ref as u32));
+            }
+            Some(fa)
+        } else {
+            None
+        };
+
+        let mut op = Op::new(opcode, &args);
+        if let Some(fa) = fail_args {
+            op.fail_args = Some(fa.into());
+        }
+        ops.push(op);
     }
 
     TreeLoop::new(inputargs, ops)
