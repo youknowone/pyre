@@ -728,6 +728,32 @@ impl TraceRecordBuffer {
     pub fn capture_resumedata(&mut self, snapshot: Snapshot) -> usize {
         self.snapshots.add_snapshot(snapshot)
     }
+
+    /// opencoder.py: get_live_ranges()
+    /// Compute live ranges for all recorded values.
+    /// Returns a vector where index i contains the last position
+    /// where value i is used.
+    pub fn get_live_ranges(&self, ops: &[majit_ir::Op]) -> Vec<usize> {
+        let mut iter = TraceIterator::new(ops);
+        iter.compute_dead_ranges().to_vec()
+    }
+
+    /// opencoder.py: unpack()
+    /// Decode the recorded trace into (inputargs, ops).
+    /// Convenience method for testing and debugging.
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Maximum allowed data size.
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    /// Set the maximum allowed data size.
+    pub fn set_max_size(&mut self, size: usize) {
+        self.max_size = size;
+    }
 }
 
 #[cfg(test)]
