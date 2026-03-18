@@ -7421,14 +7421,8 @@ fn fold_box_into_create_frame(
         let func_ref = ops[create_idx].args[0];
         constants.insert(func_ref.0, raw_fn_ptr);
 
-        // Replace boxed ref with raw in all remaining ops (CA args, etc.)
-        for op in ops.iter_mut() {
-            for arg in op.args.iter_mut() {
-                if *arg == boxed_ref {
-                    *arg = raw_val;
-                }
-            }
-        }
+        // Do NOT replace boxed_ref in CallAssemblerI args — callee expects boxed.
+        // Only the create_frame arg was already updated above.
 
         // Remove the boxing op
         ops.remove(box_idx);
