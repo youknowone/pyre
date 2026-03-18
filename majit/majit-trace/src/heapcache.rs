@@ -1,14 +1,30 @@
-/// Simplified heap cache for the tracing phase.
+/// Heap cache for the tracing phase.
 ///
 /// During tracing, the heap cache tracks field reads/writes to eliminate
 /// redundant loads. If we read a field from an object and it was already
 /// read or written in the same trace, we can reuse the cached value.
 ///
-/// This is a simplified version of rpython/jit/metainterp/heapcache.py.
-/// Phase 0 omits versioning, array caches, and escape tracking.
+/// Translated from rpython/jit/metainterp/heapcache.py.
 use std::collections::{HashMap, HashSet};
 
 use majit_ir::{GcRef, OpCode, OpRef};
+
+// heapcache.py: HF_* flags stored per-box on RefFrontendOp.
+// In majit these are tracked via separate HashSets (is_unescaped,
+// seen_allocation, etc.), but we define the constants for reference.
+
+/// heapcache.py: HF_LIKELY_VIRTUAL
+pub const HF_LIKELY_VIRTUAL: u8 = 0x01;
+/// heapcache.py: HF_KNOWN_CLASS
+pub const HF_KNOWN_CLASS: u8 = 0x02;
+/// heapcache.py: HF_KNOWN_NULLITY
+pub const HF_KNOWN_NULLITY: u8 = 0x04;
+/// heapcache.py: HF_SEEN_ALLOCATION
+pub const HF_SEEN_ALLOCATION: u8 = 0x08;
+/// heapcache.py: HF_IS_UNESCAPED
+pub const HF_IS_UNESCAPED: u8 = 0x10;
+/// heapcache.py: HF_NONSTD_VABLE
+pub const HF_NONSTD_VABLE: u8 = 0x20;
 
 /// Heap cache for the tracing interpreter.
 ///
