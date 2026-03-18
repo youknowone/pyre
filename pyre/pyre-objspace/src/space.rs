@@ -1208,3 +1208,37 @@ pub fn py_delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     }
     Err(PyError::type_error("object does not support item deletion"))
 }
+
+/// Convert object to string representation (str()).
+pub fn py_str(obj: PyObjectRef) -> String {
+    use pyre_object::*;
+    unsafe {
+        if is_str(obj) { return w_str_get_value(obj).to_string(); }
+        if is_int(obj) { return w_int_get_value(obj).to_string(); }
+        if is_none(obj) { return "None".to_string(); }
+        if is_bool(obj) { return if w_bool_get_value(obj) { "True" } else { "False" }.to_string(); }
+        if is_float(obj) {
+            let v = w_float_get_value(obj);
+            if v == v.floor() && v.is_finite() { return format!("{v:.1}"); }
+            return v.to_string();
+        }
+    }
+    "<object>".to_string()
+}
+
+/// Convert object to repr string (repr()).
+pub fn py_repr(obj: PyObjectRef) -> String {
+    use pyre_object::*;
+    unsafe {
+        if is_str(obj) { return format!("'{}'", w_str_get_value(obj)); }
+        if is_int(obj) { return w_int_get_value(obj).to_string(); }
+        if is_none(obj) { return "None".to_string(); }
+        if is_bool(obj) { return if w_bool_get_value(obj) { "True" } else { "False" }.to_string(); }
+        if is_float(obj) {
+            let v = w_float_get_value(obj);
+            if v == v.floor() && v.is_finite() { return format!("{v:.1}"); }
+            return v.to_string();
+        }
+    }
+    "<object>".to_string()
+}

@@ -484,6 +484,37 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── FormatSimple (str(TOS)) ──
+    fn format_simple(&mut self) -> Result<(), Self::Error> {
+        let val = self.pop();
+        let s = pyre_objspace::space::py_str(val);
+        self.push(pyre_object::w_str_new(&s));
+        Ok(())
+    }
+
+    // ── FormatWithSpec (format(TOS1, TOS)) ──
+    fn format_with_spec(&mut self) -> Result<(), Self::Error> {
+        let _spec = self.pop();
+        let val = self.pop();
+        // Phase 1: ignore spec, just convert to str
+        let s = pyre_objspace::space::py_str(val);
+        self.push(pyre_object::w_str_new(&s));
+        Ok(())
+    }
+
+    // ── ConvertValue (repr/str/ascii conversion) ──
+    fn convert_value(&mut self, conv: pyre_bytecode::bytecode::ConvertValueOparg) -> Result<(), Self::Error> {
+        let val = self.pop();
+        let s = match conv {
+            pyre_bytecode::bytecode::ConvertValueOparg::Str => pyre_objspace::space::py_str(val),
+            pyre_bytecode::bytecode::ConvertValueOparg::Repr => pyre_objspace::space::py_repr(val),
+            pyre_bytecode::bytecode::ConvertValueOparg::Ascii => pyre_objspace::space::py_repr(val),
+            pyre_bytecode::bytecode::ConvertValueOparg::None => pyre_objspace::space::py_str(val),
+        };
+        self.push(pyre_object::w_str_new(&s));
+        Ok(())
+    }
+
     // ── BinarySlice (a[b:c]) ──
     // PyPy: BINARY_SUBSCR with slice; CPython 3.13: BINARY_SLICE
     fn binary_slice(&mut self) -> Result<(), Self::Error> {
