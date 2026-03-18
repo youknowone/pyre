@@ -626,6 +626,14 @@ impl Optimization for OptHeap {
                 self.optimize_getfield(op, ctx)
             }
 
+            // ── Raw field reads (heap.py: same cache as GC fields) ──
+            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF => {
+                self.optimize_getfield(op, ctx)
+            }
+
+            // ── Raw field writes ──
+            OpCode::SetfieldRaw => self.optimize_setfield(op, ctx),
+
             // ── Field writes ──
             OpCode::SetfieldGc => self.optimize_setfield(op, ctx),
 
