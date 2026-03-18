@@ -1124,4 +1124,85 @@ mod tests {
         assert!(!VirtualStateInfo::NonNull.is_virtual());
         assert!(!VirtualStateInfo::Unknown.is_virtual());
     }
+
+    #[test]
+    fn test_force_boxes() {
+        let descr = test_descr(0);
+        let mut state = VirtualState::new(vec![
+            VirtualStateInfo::Virtual {
+                descr: descr.clone(),
+                known_class: Some(GcRef(0x1000)),
+                fields: vec![],
+            },
+            VirtualStateInfo::NonNull,
+            VirtualStateInfo::VirtualArray {
+                descr,
+                items: vec![Box::new(VirtualStateInfo::Unknown)],
+                lenbound: None,
+            },
+            VirtualStateInfo::Unknown,
+        ]);
+        assert_eq!(state.num_virtuals(), 2);
+        let forced = state.force_boxes();
+        assert_eq!(forced, 2);
+        assert_eq!(state.num_virtuals(), 0);
+        // Virtual with known_class becomes KnownClass
+        assert!(matches!(&state.state[0], VirtualStateInfo::KnownClass { .. }));
+        // VirtualArray becomes NonNull
+        assert!(matches!(&state.state[2], VirtualStateInfo::NonNull));
+    }
+
+    #[test]
+    fn test_compute_renum() {
+        let mut state = VirtualState::new(vec![
+            VirtualStateInfo::Unknown,
+            VirtualStateInfo::NonNull,
+            VirtualStateInfo::Unknown,
+        ]);
+        state.compute_renum(&[OpRef(10), OpRef(20), OpRef(30)]);
+        assert_eq!(state.get_renum(OpRef(10)), Some(0));
+        assert_eq!(state.get_renum(OpRef(20)), Some(1));
+        assert_eq!(state.get_renum(OpRef(30)), Some(2));
+        assert_eq!(state.get_renum(OpRef(99)), None);
+    }
+
+    #[test]
+    fn test_merge_states() {
+        let descr = test_descr(0);
+        let s1 = VirtualState::new(vec![
+            VirtualStateInfo::KnownClass {
+                class_ptr: GcRef(0x1000),
+            },
+            VirtualStateInfo::NonNull,
+        ]);
+        let s2 = VirtualState::new(vec![
+            VirtualStateInfo::KnownClass {
+                class_ptr: GcRef(0x1000),
+            },
+            VirtualStateInfo::Unknown,
+        ]);
+        let merged = s1.merge(&s2);
+        // First: compatible (same class) → keep s1
+        assert!(matches!(&merged.state[0], VirtualStateInfo::KnownClass { .. }));
+        // Second: NonNull vs Unknown → not compatible → Unknown
+        assert!(matches!(&merged.state[1], VirtualStateInfo::Unknown));
+    }
+
+    #[test]
+    fn test_num_entries_has_virtuals() {
+        let descr = test_descr(0);
+        let state = VirtualState::new(vec![
+            VirtualStateInfo::NonNull,
+            VirtualStateInfo::Virtual {
+                descr,
+                known_class: None,
+                fields: vec![],
+            },
+            VirtualStateInfo::Unknown,
+        ]);
+        assert_eq!(state.num_entries(), 3);
+        assert_eq!(state.num_boxes(), 2); // NonNull + Unknown
+        assert_eq!(state.num_virtuals(), 1);
+        assert!(state.has_virtuals());
+    }
 }

@@ -405,6 +405,11 @@ impl WarmEnterState {
     ///
     /// Called by the interpreter at loop back-edges and function entries.
     /// Returns a `HotResult` telling the interpreter what to do next.
+    /// Mark a green key as DONT_TRACE_HERE permanently.
+    pub fn mark_dont_trace(&mut self, green_key_hash: u64) {
+        self.disable_noninlinable_function(green_key_hash);
+    }
+
     pub fn counter_would_fire(&self, green_key_hash: u64) -> bool {
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() { return true; }
@@ -2119,5 +2124,41 @@ mod tests {
         ws.attach_procedure_to_interp(key, token2);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
+    }
+
+    #[test]
+    fn test_get_param() {
+        let ws = WarmEnterState::new(100);
+        assert_eq!(ws.get_param("threshold"), Some(100));
+        assert_eq!(ws.get_param("vectorize"), Some(0));
+        assert_eq!(ws.get_param("unknown_param"), None);
+    }
+
+    #[test]
+    fn test_set_param_to_default() {
+        let mut ws = WarmEnterState::new(100);
+        ws.set_param("trace_limit", 999);
+        assert_eq!(ws.get_param("trace_limit"), Some(999));
+        ws.set_param_to_default("trace_limit");
+        assert_eq!(ws.get_param("trace_limit"), Some(DEFAULT_TRACE_LIMIT as i64));
+    }
+
+    #[test]
+    fn test_param_names() {
+        let names = WarmEnterState::param_names();
+        assert!(names.contains(&"threshold"));
+        assert!(names.contains(&"trace_limit"));
+        assert!(names.contains(&"vectorize"));
+        assert!(names.len() >= 10);
+    }
+
+    #[test]
+    fn test_mark_dont_trace() {
+        let mut ws = WarmEnterState::new(2);
+        let key = 0xABCD;
+        ws.mark_dont_trace(key);
+        // After marking, maybe_compile should return NotHot
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
     }
 }
