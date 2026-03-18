@@ -155,11 +155,33 @@ impl OptContext {
             _ => None,
         })
     }
+
+    /// optimizer.py: make_equal_to(op, value)
+    /// Replace an op's result with a known value (forwarding + constant).
+    pub fn make_equal_to(&mut self, opref: OpRef, target: OpRef) {
+        self.replace_op(opref, target);
+    }
+
+    /// optimizer.py: get_box_replacement(opref)
+    /// Same as get_replacement — follows forwarding chain.
+    pub fn get_box_replacement(&self, opref: OpRef) -> OpRef {
+        self.get_replacement(opref)
+    }
+
+    /// Number of emitted operations so far.
+    pub fn num_emitted(&self) -> usize {
+        self.new_operations.len()
+    }
+
+    /// Get the last emitted operation, if any.
+    pub fn last_emitted_operation(&self) -> Option<&Op> {
+        self.new_operations.last()
+    }
 }
 
 /// An optimization pass.
 ///
-/// Mirrors rpython/jit/metainterp/optimizeopt/optimizer.py Optimization.
+/// optimizer.py: Optimization base class.
 pub trait Optimization {
     /// Process an operation. Called for each operation in the trace.
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult;
@@ -172,4 +194,20 @@ pub trait Optimization {
 
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
+
+    /// optimizer.py: produce_potential_short_preamble_ops(sb)
+    /// Contribute operations to the short preamble builder.
+    /// Called after preamble optimization to collect ops that bridges need to replay.
+    fn produce_potential_short_preamble_ops(
+        &self,
+        _sb: &mut crate::shortpreamble::ShortBoxes,
+    ) {
+        // Default: no contribution
+    }
+
+    /// optimizer.py: is_virtual(opref)
+    /// Whether an opref refers to a virtual object (for this pass).
+    fn is_virtual(&self, _opref: OpRef) -> bool {
+        false
+    }
 }
