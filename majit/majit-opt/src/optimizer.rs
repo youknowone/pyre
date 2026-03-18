@@ -16,11 +16,19 @@ use crate::{OptContext, Optimization, OptimizationResult};
 use majit_ir::Op;
 
 /// The optimizer: chains passes and runs them over a trace.
+///
+/// RPython optimizer.py: Optimizer class with pass chain and shared state.
 pub struct Optimizer {
     passes: Vec<Box<dyn Optimization>>,
     /// Final num_inputs after optimization (may increase if virtualizable
     /// adds virtual input args).
     final_num_inputs: usize,
+    /// Cache of CALL_PURE results from previous traces.
+    /// RPython optimizer.py: `call_pure_results` — maps
+    /// (func_ptr, arg0, arg1, ...) → result value, carried across
+    /// loop iterations so the optimizer can constant-fold repeated
+    /// pure calls.
+    call_pure_results: std::collections::HashMap<Vec<majit_ir::OpRef>, majit_ir::Value>,
 }
 
 impl Optimizer {
@@ -28,7 +36,19 @@ impl Optimizer {
         Optimizer {
             passes: Vec::new(),
             final_num_inputs: 0,
+            call_pure_results: std::collections::HashMap::new(),
         }
+    }
+
+    /// Record a CALL_PURE result for cross-iteration constant folding.
+    /// RPython optimizer.py: `call_pure_results[key] = value`
+    pub fn record_call_pure_result(&mut self, args: Vec<majit_ir::OpRef>, value: majit_ir::Value) {
+        self.call_pure_results.insert(args, value);
+    }
+
+    /// Look up a previously recorded CALL_PURE result.
+    pub fn get_call_pure_result(&self, args: &[majit_ir::OpRef]) -> Option<&majit_ir::Value> {
+        self.call_pure_results.get(args)
     }
 
     /// Get the final num_inputs after optimization.
