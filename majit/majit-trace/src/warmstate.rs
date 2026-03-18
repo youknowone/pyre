@@ -884,6 +884,45 @@ impl WarmEnterState {
         }
     }
 
+    /// warmstate.py: set_param_to_default(name)
+    /// Reset a single JIT parameter to its default value.
+    pub fn set_param_to_default(&mut self, name: &str) {
+        match name {
+            "threshold" => self.set_threshold(1039), // RPython default
+            "trace_limit" => self.trace_limit = DEFAULT_TRACE_LIMIT,
+            "trace_eagerness" | "bridge_threshold" => self.bridge_threshold = 200,
+            "function_threshold" => self.function_threshold = DEFAULT_FUNCTION_THRESHOLD,
+            "max_inline_depth" => self.max_inline_depth = 10,
+            "retrace_limit" => self.retrace_limit = DEFAULT_RETRACE_LIMIT,
+            "max_retrace_guards" => self.max_retrace_guards = 15,
+            "max_unroll_loops" => self.max_unroll_loops = 0,
+            "max_unroll_recursion" => self.max_unroll_recursion = 3,
+            "loop_longevity" => self.loop_longevity = 1000,
+            "vectorize" => self.vectorize = false,
+            "vec_cost" => self.vec_cost = 0,
+            _ => {}
+        }
+    }
+
+    /// warmstate.py: get_param_names()
+    /// Return all known parameter names.
+    pub fn param_names() -> &'static [&'static str] {
+        &[
+            "threshold",
+            "trace_limit",
+            "trace_eagerness",
+            "function_threshold",
+            "max_inline_depth",
+            "retrace_limit",
+            "max_retrace_guards",
+            "max_unroll_loops",
+            "max_unroll_recursion",
+            "loop_longevity",
+            "vectorize",
+            "vec_cost",
+        ]
+    }
+
     // ── RPython warmstate.py getter methods ──
 
     pub fn retrace_limit(&self) -> u32 { self.retrace_limit }
