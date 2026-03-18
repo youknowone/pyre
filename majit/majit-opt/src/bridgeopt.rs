@@ -452,6 +452,38 @@ impl Optimization for OptBridgeOpt {
     }
 }
 
+// ── bridgeopt.py: tag/decode helpers ──
+
+/// bridgeopt.py: TAGCONST / TAGINT / TAGBOX constants for resume data encoding.
+pub const TAGCONST: u8 = 0;
+pub const TAGINT: u8 = 1;
+pub const TAGBOX: u8 = 2;
+
+/// bridgeopt.py: tag_box(box, liveboxes_from_env, memo)
+/// Tag a live box reference for serialization in resume data.
+/// Constants get TAGCONST, live boxes get their index with TAGBOX.
+pub fn tag_box(opref: OpRef, liveboxes: &[OpRef]) -> u16 {
+    if let Some(pos) = liveboxes.iter().position(|r| *r == opref) {
+        ((pos as u16) << 2) | (TAGBOX as u16)
+    } else {
+        // Assume constant — encode as TAGINT with the raw value
+        ((opref.0 as u16) << 2) | (TAGINT as u16)
+    }
+}
+
+/// bridgeopt.py: decode_box(tagged, liveboxes)
+/// Decode a tagged reference back to an OpRef.
+pub fn decode_box(tagged: u16, liveboxes: &[OpRef]) -> OpRef {
+    let tag = (tagged & 0x3) as u8;
+    let num = (tagged >> 2) as usize;
+    match tag {
+        TAGBOX => liveboxes.get(num).copied().unwrap_or(OpRef::NONE),
+        TAGINT => OpRef(num as u32),
+        TAGCONST => OpRef::NONE, // constant pool lookup needed
+        _ => OpRef::NONE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
