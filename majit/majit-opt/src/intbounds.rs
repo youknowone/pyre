@@ -1198,6 +1198,31 @@ impl Optimization for OptIntBounds {
                 OptimizationResult::PassOn
             }
 
+            // intbounds.py: postprocess_STRGETITEM — result in [0, 255].
+            OpCode::Strgetitem => {
+                self.intersect_bound(op.pos, &IntBound::bounded(0, 255));
+                OptimizationResult::PassOn
+            }
+
+            // intbounds.py: postprocess_GETFIELD_RAW_I — integer-bounded fields.
+            // If the descriptor indicates a bounded integer field (e.g. u8, u16),
+            // narrow the result bound to [min, max].
+            OpCode::GetfieldRawI | OpCode::GetfieldGcI => {
+                if let Some(ref d) = op.descr {
+                    let (field_size, signed) = d.field_size_and_sign();
+                    if field_size > 0 && field_size < 8 {
+                        let (lo, hi) = if signed {
+                            let half = 1i64 << (field_size * 8 - 1);
+                            (-half, half - 1)
+                        } else {
+                            (0, (1i64 << (field_size * 8)) - 1)
+                        };
+                        self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
+                    }
+                }
+                OptimizationResult::PassOn
+            }
+
             _ => OptimizationResult::PassOn,
         };
 
