@@ -637,4 +637,68 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_check_consistency_valid() {
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        let trace = TreeLoop::new(vec![InputArg::new_int(0)], ops);
+        assert!(trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_no_final() {
+        let ops = vec![Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)])];
+        let trace = TreeLoop::new(vec![], ops);
+        assert!(!trace.check_consistency());
+    }
+
+    #[test]
+    fn test_free_vars() {
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::Finish, &[OpRef(0)]),
+        ];
+        ops[0].pos = OpRef(0);
+        ops[1].pos = OpRef(1);
+        let trace = TreeLoop::new(vec![], ops);
+        let free = trace.free_vars();
+        // OpRef(100) and OpRef(101) are free (not defined)
+        assert!(free.contains(&OpRef(100)));
+        assert!(free.contains(&OpRef(101)));
+        assert!(!free.contains(&OpRef(0))); // defined by op[0]
+    }
+
+    #[test]
+    fn test_count_by_category() {
+        let ops = vec![
+            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::CallI, &[OpRef(0)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let trace = TreeLoop::new(vec![], ops);
+        let (guards, pure, calls, other) = trace.count_by_category();
+        assert_eq!(guards, 1);
+        assert_eq!(pure, 2);
+        assert_eq!(calls, 1);
+        assert_eq!(other, 1); // Finish
+    }
+
+    #[test]
+    fn test_split_at_label() {
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Label, &[OpRef(0)]),
+            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        let trace = TreeLoop::new(vec![], ops);
+        let (preamble, body) = trace.split_at_label();
+        assert_eq!(preamble.len(), 1);
+        assert_eq!(body.len(), 3); // Label + IntMul + Jump
+    }
 }
