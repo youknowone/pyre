@@ -60,6 +60,15 @@ impl UnrollOptimizer {
         optimizer.optimize(ops)
     }
 
+    /// unroll.py: optimize_peeled_loop(trace)
+    /// Optimize the loop body AFTER preamble peeling.
+    /// The peeled preamble has already established the type/class/bounds
+    /// information; this method optimizes the repeating body.
+    pub fn optimize_peeled_loop(&mut self, ops: &[Op]) -> Vec<Op> {
+        let mut optimizer = crate::optimizer::Optimizer::default_pipeline();
+        optimizer.optimize(ops)
+    }
+
     /// unroll.py: optimize_bridge(trace, runtime_boxes, call_pure_results)
     /// Optimize a bridge trace that enters an existing loop.
     pub fn optimize_bridge(&mut self, bridge_ops: &[Op]) -> Vec<Op> {

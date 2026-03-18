@@ -830,6 +830,36 @@ pub trait Backend: Send {
     fn bh_call_f(&self, _func_ptr: i64, _args: &[i64]) -> f64 { 0.0 }
     /// model.py: bh_call_v(func_ptr, args, calldescr)
     fn bh_call_v(&self, _func_ptr: i64, _args: &[i64]) {}
+
+    // ── model.py: additional bh_* helpers ──
+
+    /// model.py: bh_unicodelen(string_ptr)
+    fn bh_unicodelen(&self, _string_ptr: i64) -> i64 { 0 }
+    /// model.py: bh_unicodegetitem(string_ptr, index)
+    fn bh_unicodegetitem(&self, _string_ptr: i64, _index: i64) -> i64 { 0 }
+    /// model.py: bh_unicodesetitem(string_ptr, index, value)
+    fn bh_unicodesetitem(&self, _string_ptr: i64, _index: i64, _value: i64) {}
+    /// model.py: bh_newunicode(length)
+    fn bh_newunicode(&self, _length: i64) -> i64 { 0 }
+    /// model.py: bh_copystrcontent(src, dst, srcstart, dststart, length)
+    fn bh_copystrcontent(&self, _src: i64, _dst: i64, _srcstart: i64, _dststart: i64, _length: i64) {}
+    /// model.py: bh_copyunicodecontent(src, dst, srcstart, dststart, length)
+    fn bh_copyunicodecontent(&self, _src: i64, _dst: i64, _srcstart: i64, _dststart: i64, _length: i64) {}
+    /// model.py: bh_raw_load_i(ptr, offset, descr)
+    fn bh_raw_load_i(&self, _ptr: i64, _offset: i64) -> i64 { 0 }
+    /// model.py: bh_raw_store_i(ptr, offset, value, descr)
+    fn bh_raw_store_i(&self, _ptr: i64, _offset: i64, _value: i64) {}
+    /// model.py: bh_getinteriorfield_gc_i(array, index, descr)
+    fn bh_getinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize) -> i64 { 0 }
+    /// model.py: bh_setinteriorfield_gc_i(array, index, value, descr)
+    fn bh_setinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize, _value: i64) {}
+    /// model.py: bh_classof(obj_ptr)
+    fn bh_classof(&self, _obj_ptr: i64) -> i64 { 0 }
+
+    /// model.py: setup_once() — called once when the backend is first used.
+    fn setup_once(&mut self) {}
+    /// model.py: finish_once() — called when the JIT shuts down.
+    fn finish_once(&mut self) {}
 }
 
 /// Errors from the backend.
