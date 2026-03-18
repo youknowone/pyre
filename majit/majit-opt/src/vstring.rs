@@ -602,6 +602,15 @@ impl Optimization for OptString {
             OpCode::Unicodelen => self.optimize_strlen(op, ctx),
             OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, ctx),
 
+            // vstring.py: optimize_GUARD_NO_EXCEPTION — if the last
+            // emitted operation was removed (e.g. a string oopspec call
+            // was virtualized), skip the guard.
+            OpCode::GuardNoException => {
+                // Delegate to default — the pure.rs pass handles this
+                // via last_emitted_was_removed tracking.
+                OptimizationResult::PassOn
+            }
+
             // vstring.py: oopspec call handlers for string operations.
             // STR_CONCAT, STR_SLICE, STR_EQUAL are dispatched by OopSpecIndex
             // on CALL_* ops. For now, check if the call is a string oopspec.
