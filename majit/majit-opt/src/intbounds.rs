@@ -360,11 +360,15 @@ impl OptIntBounds {
         }
     }
 
+    /// intbounds.py: INT_LSHIFT pure_from_args synthesis.
+    /// If res = INT_LSHIFT(a, b), then a = INT_RSHIFT(res, b).
     fn postprocess_int_lshift(&mut self, op: &Op, ctx: &OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.lshift_bound(&b1);
         self.intersect_bound(op.pos, &b);
+        // pure_from_args: INT_LSHIFT(a,b)=res → INT_RSHIFT(res,b)=a
+        self.record_pure_from_args(OpCode::IntRshift, op.pos, op.arg(1), op.arg(0));
     }
 
     fn postprocess_int_rshift(&mut self, op: &Op, ctx: &OptContext) {

@@ -81,6 +81,42 @@ impl RecentPureOps {
     fn lookup(&self, key: &PureOpKey) -> Option<OpRef> {
         self.map.get(key).copied()
     }
+
+    /// pure.py: lookup1(opt, box0, descr) — look up a unary pure operation.
+    /// Searches for any cached op with the given opcode and single arg.
+    fn lookup1(&self, opcode: OpCode, arg0: OpRef) -> Option<OpRef> {
+        let key = PureOpKey {
+            opcode,
+            args: vec![arg0],
+        };
+        self.map.get(&key).copied()
+    }
+
+    /// pure.py: lookup2(opt, box0, box1, descr, commutative)
+    /// Look up a binary pure operation, optionally checking swapped args.
+    fn lookup2(
+        &self,
+        opcode: OpCode,
+        arg0: OpRef,
+        arg1: OpRef,
+        commutative: bool,
+    ) -> Option<OpRef> {
+        let key = PureOpKey {
+            opcode,
+            args: vec![arg0, arg1],
+        };
+        if let Some(result) = self.map.get(&key).copied() {
+            return Some(result);
+        }
+        if commutative {
+            let key_swapped = PureOpKey {
+                opcode,
+                args: vec![arg1, arg0],
+            };
+            return self.map.get(&key_swapped).copied();
+        }
+        None
+    }
 }
 
 /// The OptPure optimization pass.
@@ -189,6 +225,22 @@ impl OptPure {
     pub fn get_pure_result(&self, op: &Op) -> Option<OpRef> {
         let key = PureOpKey::from_op(op);
         self.lookup_pure(&key)
+    }
+
+    /// pure.py: lookup1(opt, box0, descr) — look up a unary pure op result.
+    pub fn lookup1(&self, opcode: OpCode, arg0: OpRef) -> Option<OpRef> {
+        self.cache.lookup1(opcode, arg0)
+    }
+
+    /// pure.py: lookup2(opt, box0, box1, descr, commutative)
+    pub fn lookup2(
+        &self,
+        opcode: OpCode,
+        arg0: OpRef,
+        arg1: OpRef,
+        commutative: bool,
+    ) -> Option<OpRef> {
+        self.cache.lookup2(opcode, arg0, arg1, commutative)
     }
 
     /// Record a CALL_PURE result from a RECORD_KNOWN_RESULT hint.

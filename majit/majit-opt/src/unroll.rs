@@ -80,6 +80,41 @@ impl UnrollOptimizer {
     pub fn should_give_up(&self, retrace_count: u32) -> bool {
         retrace_count >= self.retrace_limit
     }
+
+    /// unroll.py: export_state(target_token)
+    /// Export the virtual state at the current loop header.
+    pub fn set_exported_state(&mut self, state: crate::virtualstate::VirtualState) {
+        self.exported_state = Some(state);
+    }
+
+    /// unroll.py: get_virtual_state()
+    /// Get the exported virtual state for this loop.
+    pub fn get_exported_state(&self) -> Option<&crate::virtualstate::VirtualState> {
+        self.exported_state.as_ref()
+    }
+
+    /// unroll.py: set_short_preamble(sp)
+    pub fn set_short_preamble(&mut self, sp: crate::shortpreamble::ShortPreamble) {
+        self.short_preamble = Some(sp);
+    }
+
+    /// unroll.py: get_short_preamble()
+    pub fn get_short_preamble(&self) -> Option<&crate::shortpreamble::ShortPreamble> {
+        self.short_preamble.as_ref()
+    }
+
+    /// unroll.py: check_retrace_count(retrace_count, max_retrace_guards)
+    /// Whether this bridge has too many guards for retrace to be worthwhile.
+    pub fn too_many_guards_for_retrace(
+        &self,
+        retrace_count: u32,
+        max_retrace_guards: u32,
+    ) -> bool {
+        if retrace_count >= self.retrace_limit {
+            return true;
+        }
+        self.bridge_guard_count > max_retrace_guards
+    }
 }
 
 impl Default for UnrollOptimizer {

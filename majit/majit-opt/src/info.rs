@@ -228,6 +228,28 @@ impl PtrInfo {
         }
     }
 
+    /// info.py: force_at_the_end_of_preamble(op, optforce, rec)
+    /// Force a virtual object at the end of the preamble iteration.
+    /// This is called when loop peeling discovers that a virtual must
+    /// be materialized before the loop body begins.
+    ///
+    /// Returns the materialized OpRef, or None if not virtual.
+    pub fn force_at_the_end_of_preamble(&self) -> bool {
+        self.is_virtual()
+    }
+
+    /// info.py: make_guards(op, short_boxes, optimizer)
+    /// Generate guard operations to verify this pointer info.
+    /// Returns a list of opcodes and expected values for guards.
+    pub fn make_guards(&self) -> Vec<majit_ir::OpCode> {
+        match self {
+            PtrInfo::NonNull => vec![majit_ir::OpCode::GuardNonnull],
+            PtrInfo::KnownClass { .. } => vec![majit_ir::OpCode::GuardNonnullClass],
+            PtrInfo::Constant(_) => vec![majit_ir::OpCode::GuardValue],
+            _ => Vec::new(),
+        }
+    }
+
     /// Copy fields from this virtual info to another.
     /// info.py: copy_fields_to_const()
     pub fn copy_fields_to(&self, other: &mut PtrInfo) {

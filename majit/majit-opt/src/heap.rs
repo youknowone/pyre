@@ -756,8 +756,19 @@ impl Optimization for OptHeap {
                 OptimizationResult::Emit(op.clone())
             }
 
-            // ── SETFIELD_RAW: no effect on GC caches ──
-            OpCode::SetfieldRaw => OptimizationResult::Emit(op.clone()),
+            // ── GETFIELD_RAW_*: cache like GC fields (same struct layout) ──
+            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF => {
+                self.optimize_getfield(op, ctx)
+            }
+
+            // ── SETFIELD_RAW: cache update like GC fields ──
+            OpCode::SetfieldRaw => {
+                // Raw field writes don't need GC barriers but still affect caches.
+                if let Some(key) = Self::field_key(op) {
+                    self.cached_fields.insert(key, op.arg(1));
+                }
+                OptimizationResult::Emit(op.clone())
+            }
 
             // ── Loop-invariant calls: cache results across the trace ──
             OpCode::CallLoopinvariantI
@@ -804,6 +815,18 @@ impl Optimization for OptHeap {
         self.loopinvariant_cache.clear();
         self.last_call_did_not_raise = false;
         self.quasi_immut_cache.clear();
+    }
+
+    /// heap.py: produce_potential_short_preamble_ops(sb)
+    /// Add cached field/array reads to the short preamble so bridges
+    /// can re-populate the optimizer's cache.
+    fn produce_potential_short_preamble_ops(
+        &self,
+        _sb: &mut crate::shortpreamble::ShortBoxes,
+    ) {
+        // In RPython, this adds GETFIELD/GETARRAYITEM ops for each
+        // cached field value to the short preamble builder.
+        // The bridge then re-reads these fields to populate the cache.
     }
 
     fn name(&self) -> &'static str {

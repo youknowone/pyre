@@ -466,12 +466,44 @@ pub enum GuardRequirement {
     GuardBounds { arg_index: usize, bounds: IntBound },
 }
 
+/// virtualstate.py: VirtualStateConstructor — visitor-based factory
+/// for building VirtualState from optimizer state.
+///
+/// Walks the optimization context and PtrInfo table to create
+/// a VirtualState snapshot for a set of loop-carried values.
+pub struct VirtualStateConstructor<'a> {
+    ctx: &'a OptContext,
+    ptr_info: &'a [Option<PtrInfo>],
+}
+
+impl<'a> VirtualStateConstructor<'a> {
+    pub fn new(ctx: &'a OptContext, ptr_info: &'a [Option<PtrInfo>]) -> Self {
+        VirtualStateConstructor { ctx, ptr_info }
+    }
+
+    /// Build a VirtualState for the given OpRefs.
+    pub fn build(&self, oprefs: &[OpRef]) -> VirtualState {
+        export_state(oprefs, self.ctx, self.ptr_info)
+    }
+
+    /// Build VirtualState for label args and return it along with
+    /// the non-virtual inputargs.
+    pub fn build_with_inputargs(
+        &self,
+        oprefs: &[OpRef],
+    ) -> (VirtualState, Vec<OpRef>) {
+        let state = self.build(oprefs);
+        let inputargs = state.make_inputargs(oprefs);
+        (state, inputargs)
+    }
+}
+
 /// Export the abstract state of loop-carried values.
 ///
 /// Given the current optimization context and PtrInfo table (from the virtualize pass),
 /// create a VirtualState snapshot for the given OpRefs (typically the Jump args).
 ///
-/// In RPython, this is `OptVirtualize.export_state()`.
+/// virtualstate.py: VirtualStateConstructor.make_virtual_state()
 pub fn export_state(
     oprefs: &[OpRef],
     ctx: &OptContext,
