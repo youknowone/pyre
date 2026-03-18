@@ -145,6 +145,45 @@ impl HeapCache {
         self.seen_allocation.insert(opref);
     }
 
+    /// heapcache.py: new_array(box, lengthbox)
+    /// Record a new array allocation. Constant-length arrays are also
+    /// marked as likely_virtual.
+    pub fn new_array(&mut self, opref: OpRef, length_is_const: bool) {
+        self.is_unescaped.insert(opref);
+        self.seen_allocation.insert(opref);
+        self.known_nullity.insert(opref, true);
+        if length_is_const {
+            self.likely_virtual.insert(opref);
+        }
+    }
+
+    /// heapcache.py: nonstandard_virtualizables_now_known(box)
+    /// Mark a box as a known nonstandard virtualizable.
+    pub fn nonstandard_virtualizables_now_known(&mut self, opref: OpRef) {
+        // In RPython this sets HF_NONSTD_VABLE flag.
+        // We track it as a known non-null value.
+        self.known_nullity.insert(opref, true);
+    }
+
+    /// heapcache.py: replace_box(oldbox, newbox)
+    /// Replace tracking for an old box with a new one (e.g., after constant folding).
+    pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
+        // Transfer field cache entries
+        let keys: Vec<_> = self.field_cache.keys().filter(|k| k.0 == old).cloned().collect();
+        for key in keys {
+            if let Some(val) = self.field_cache.remove(&key) {
+                self.field_cache.insert((new, key.1), val);
+            }
+        }
+        // Transfer escape/allocation status
+        if self.is_unescaped.remove(&old) {
+            self.is_unescaped.insert(new);
+        }
+        if self.seen_allocation.remove(&old) {
+            self.seen_allocation.insert(new);
+        }
+    }
+
     /// Mark an object as escaped. Its cached fields for aliased accesses
     /// may no longer be trusted after external calls.
     pub fn mark_escaped(&mut self, opref: OpRef) {
