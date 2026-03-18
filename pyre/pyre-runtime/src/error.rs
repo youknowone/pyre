@@ -13,6 +13,7 @@ pub struct PyError {
 #[derive(Debug, Clone)]
 pub enum PyErrorKind {
     TypeError,
+    ValueError,
     ZeroDivisionError,
     NameError,
     IndexError,
@@ -24,6 +25,13 @@ impl PyError {
     pub fn type_error(msg: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::TypeError,
+            message: msg.into(),
+        }
+    }
+
+    pub fn value_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::ValueError,
             message: msg.into(),
         }
     }
