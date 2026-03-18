@@ -214,6 +214,16 @@ impl Optimization for GuardStrengthenOpt {
             return OptimizationResult::PassOn;
         }
 
+        // GuardNotForced must reach the Heap pass, which holds the
+        // postponed CallMayForce op.  Return PassOn so Heap can emit
+        // the call immediately before the guard.
+        if matches!(
+            op.opcode,
+            OpCode::GuardNotForced | OpCode::GuardNotForced2
+        ) {
+            return OptimizationResult::PassOn;
+        }
+
         // --- Redundant guard removal (exact match) ---
         if Self::can_remove_as_duplicate(op.opcode) {
             let key = GuardKey::from_op(op);
