@@ -1299,3 +1299,46 @@ pub fn make_call_descr_full(
         effect,
     ))
 }
+
+/// Create a fail descriptor.
+pub fn make_fail_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
+    std::sync::Arc::new(SimpleFailDescr::new(0, fail_index, fail_arg_types))
+}
+
+/// Create a finish descriptor.
+pub fn make_finish_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
+    std::sync::Arc::new(SimpleFailDescr::finish(0, fail_index, fail_arg_types))
+}
+
+// ── descr.py: unpack helpers ──
+
+/// descr.py: unpack_fielddescr(descr)
+/// Extract offset and type from a field descriptor.
+pub fn unpack_fielddescr(descr: &DescrRef) -> Option<(usize, usize, Type)> {
+    let fd = descr.as_field_descr()?;
+    Some((fd.offset(), fd.field_size(), fd.field_type()))
+}
+
+/// descr.py: unpack_arraydescr(descr)
+/// Extract base size, item size, and type from an array descriptor.
+pub fn unpack_arraydescr(descr: &DescrRef) -> Option<(usize, usize, Type)> {
+    let ad = descr.as_array_descr()?;
+    Some((ad.base_size(), ad.item_size(), ad.item_type()))
+}
+
+/// descr.py: unpack_interiorfielddescr(descr)
+/// Extract array and field info from an interior field descriptor.
+pub fn unpack_interiorfielddescr(
+    descr: &DescrRef,
+) -> Option<(usize, usize, usize, usize, Type)> {
+    let ifd = descr.as_interior_field_descr()?;
+    let ad = ifd.array_descr();
+    let fd = ifd.field_descr();
+    Some((
+        ad.base_size(),
+        ad.item_size(),
+        fd.offset(),
+        fd.field_size(),
+        fd.field_type(),
+    ))
+}
