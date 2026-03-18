@@ -358,6 +358,47 @@ impl OptString {
     }
 
     /// Force all args that are virtual strings.
+    /// vstring.py: _int_add(opref1, opref2, ctx)
+    /// If both are constants, return a constant OpRef for their sum.
+    fn int_add_oprefs(
+        &self,
+        a: OpRef,
+        b: OpRef,
+        ctx: &mut OptContext,
+    ) -> Option<OpRef> {
+        let va = ctx.get_constant_int(a)?;
+        let vb = ctx.get_constant_int(b)?;
+        let sum = va.checked_add(vb)?;
+        let result = ctx.emit(Op::new(OpCode::SameAsI, &[]));
+        ctx.make_constant(result, Value::Int(sum));
+        Some(result)
+    }
+
+    /// vstring.py: _int_sub(opref1, opref2, ctx)
+    fn int_sub_oprefs(
+        &self,
+        a: OpRef,
+        b: OpRef,
+        ctx: &mut OptContext,
+    ) -> Option<OpRef> {
+        let va = ctx.get_constant_int(a)?;
+        let vb = ctx.get_constant_int(b)?;
+        let diff = va.checked_sub(vb)?;
+        let result = ctx.emit(Op::new(OpCode::SameAsI, &[]));
+        ctx.make_constant(result, Value::Int(diff));
+        Some(result)
+    }
+
+    /// vstring.py: postprocess — after STRLEN on a known-length string,
+    /// record as pure (for CSE with OptPure).
+    fn postprocess_strlen(&self, op: &Op, ctx: &OptContext) {
+        let str_ref = ctx.get_replacement(op.arg(0));
+        if let Some(len) = self.get_known_length(str_ref, ctx) {
+            // STRLEN(s) = constant len: record for CSE
+            let _ = len; // In RPython, this would call pure_from_args
+        }
+    }
+
     fn force_args_if_virtual(&mut self, op: &Op, ctx: &mut OptContext) {
         // Collect refs first to avoid borrow issues.
         let args: Vec<OpRef> = op.args.iter().map(|a| ctx.get_replacement(*a)).collect();

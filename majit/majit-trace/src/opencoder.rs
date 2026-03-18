@@ -284,6 +284,142 @@ impl SnapshotStorage {
     }
 }
 
+// ── Trace Iterator (opencoder.py: TraceIterator) ──
+
+/// opencoder.py: TraceIterator — iterates operations in a trace
+/// with dead range tracking.
+///
+/// The iterator walks through encoded trace operations and maintains
+/// live/dead range information for each value (OpRef). This enables
+/// the optimizer to know which values are still in use at each point.
+pub struct TraceIterator<'a> {
+    /// The operations being iterated.
+    ops: &'a [majit_ir::Op],
+    /// Current position in the operation list.
+    pos: usize,
+    /// Live range end for each OpRef: maps OpRef → last use position.
+    /// opencoder.py: _deadranges
+    live_range_end: Vec<usize>,
+    /// Whether live ranges have been computed.
+    ranges_computed: bool,
+}
+
+impl<'a> TraceIterator<'a> {
+    /// Create a new TraceIterator over the given operations.
+    pub fn new(ops: &'a [majit_ir::Op]) -> Self {
+        TraceIterator {
+            ops,
+            pos: 0,
+            live_range_end: Vec::new(),
+            ranges_computed: false,
+        }
+    }
+
+    /// Get the next operation, or None if exhausted.
+    pub fn next_op(&mut self) -> Option<&'a majit_ir::Op> {
+        if self.pos < self.ops.len() {
+            let op = &self.ops[self.pos];
+            self.pos += 1;
+            Some(op)
+        } else {
+            None
+        }
+    }
+
+    /// Current position in the operation list.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Whether all operations have been consumed.
+    pub fn done(&self) -> bool {
+        self.pos >= self.ops.len()
+    }
+
+    /// Total number of operations.
+    pub fn num_ops(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Reset to the beginning.
+    pub fn reset(&mut self) {
+        self.pos = 0;
+    }
+
+    /// opencoder.py: get_dead_ranges() — compute live ranges for all values.
+    /// Returns a reference to the live_range_end map.
+    pub fn compute_dead_ranges(&mut self) -> &[usize] {
+        if self.ranges_computed {
+            return &self.live_range_end;
+        }
+
+        // Find the maximum OpRef used
+        let max_ref = self
+            .ops
+            .iter()
+            .flat_map(|op| {
+                op.args
+                    .iter()
+                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
+                    .map(|r| r.0 as usize)
+            })
+            .max()
+            .unwrap_or(0);
+
+        self.live_range_end = vec![0; max_ref + 1];
+
+        // Walk backwards: last use of each OpRef is its dead range end.
+        for (i, op) in self.ops.iter().enumerate().rev() {
+            for arg in &op.args {
+                let idx = arg.0 as usize;
+                if idx < self.live_range_end.len() && self.live_range_end[idx] == 0 {
+                    self.live_range_end[idx] = i;
+                }
+            }
+            if let Some(ref fa) = op.fail_args {
+                for arg in fa.iter() {
+                    let idx = arg.0 as usize;
+                    if idx < self.live_range_end.len() && self.live_range_end[idx] == 0 {
+                        self.live_range_end[idx] = i;
+                    }
+                }
+            }
+        }
+
+        self.ranges_computed = true;
+        &self.live_range_end
+    }
+
+    /// Check if a value is dead at the given position.
+    /// opencoder.py: is_dead(opref, pos)
+    pub fn is_dead_at(&self, opref: majit_ir::OpRef, pos: usize) -> bool {
+        let idx = opref.0 as usize;
+        if idx >= self.live_range_end.len() {
+            return true; // never used
+        }
+        self.live_range_end[idx] < pos
+    }
+}
+
+/// opencoder.py: CutTrace — supports cutting traces at breakpoints
+/// for bridge compilation.
+#[derive(Clone, Debug)]
+pub struct CutTrace {
+    /// Position at which the trace was cut.
+    pub cut_at: usize,
+    /// Number of input args at the cut point.
+    pub num_inputargs: usize,
+}
+
+impl CutTrace {
+    pub fn new(cut_at: usize, num_inputargs: usize) -> Self {
+        CutTrace {
+            cut_at,
+            num_inputargs,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

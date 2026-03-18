@@ -656,6 +656,17 @@ impl Optimization for OptHeap {
                 return OptimizationResult::Emit(op.clone());
             }
 
+            // heap.py: GUARD_EXCEPTION — emit postponed op, then pass through.
+            // Unlike GUARD_NO_EXCEPTION, this does NOT deduplicate.
+            OpCode::GuardException => {
+                if let Some(postponed) = self.postponed_op.take() {
+                    ctx.emit(postponed);
+                }
+                self.last_call_did_not_raise = false;
+                self.force_all_lazy(ctx);
+                return OptimizationResult::Emit(op.clone());
+            }
+
             // ── GUARD_NOT_INVALIDATED deduplication ──
             OpCode::GuardNotInvalidated => {
                 if self.seen_guard_not_invalidated {

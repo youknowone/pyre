@@ -42,6 +42,9 @@ pub enum VirtualStateInfo {
     VirtualArray {
         descr: DescrRef,
         items: Vec<Box<VirtualStateInfo>>,
+        /// virtualstate.py: lenbound — known bounds on array length.
+        /// None means unbounded.
+        lenbound: Option<IntBound>,
     },
     /// Value is a virtual struct.
     VirtualStruct {
@@ -127,10 +130,12 @@ impl VirtualStateInfo {
                 VirtualStateInfo::VirtualArray {
                     descr: d1,
                     items: i1,
+                    ..
                 },
                 VirtualStateInfo::VirtualArray {
                     descr: d2,
                     items: i2,
+                    ..
                 },
             ) => {
                 if d1.index() != d2.index() || i1.len() != i2.len() {
@@ -398,6 +403,50 @@ impl VirtualState {
     }
 }
 
+impl VirtualState {
+    /// virtualstate.py: force_boxes(optimizer) — force all virtual entries
+    /// to be materialized. After calling this, all entries become non-virtual
+    /// (Constant, KnownClass, NonNull, IntBounded, or Unknown).
+    ///
+    /// Returns the number of virtuals that were forced.
+    pub fn force_boxes(&mut self) -> usize {
+        let mut count = 0;
+        for info in &mut self.state {
+            if info.is_virtual() {
+                *info = VirtualStateInfo::Unknown;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Get the lenbound of a virtual array at the given index, if any.
+    pub fn get_lenbound(&self, index: usize) -> Option<&IntBound> {
+        match self.state.get(index) {
+            Some(VirtualStateInfo::VirtualArray { lenbound, .. }) => lenbound.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Merge two virtual states. For each entry, take the weaker
+    /// (more general) of the two. Used when multiple paths converge.
+    pub fn merge(&self, other: &VirtualState) -> VirtualState {
+        let merged: Vec<VirtualStateInfo> = self
+            .state
+            .iter()
+            .zip(other.state.iter())
+            .map(|(a, b)| {
+                if a.is_compatible(b) {
+                    a.clone()
+                } else {
+                    VirtualStateInfo::Unknown
+                }
+            })
+            .collect();
+        VirtualState::new(merged)
+    }
+}
+
 /// A guard that must be emitted to make an incoming state compatible.
 #[derive(Clone, Debug)]
 pub enum GuardRequirement {
@@ -476,7 +525,7 @@ fn export_single_value(
                 };
             }
             PtrInfo::VirtualArray(vinfo) => {
-                let items = vinfo
+                let items: Vec<Box<VirtualStateInfo>> = vinfo
                     .items
                     .iter()
                     .map(|item_ref| {
@@ -484,9 +533,11 @@ fn export_single_value(
                         Box::new(item_state)
                     })
                     .collect();
+                let len = items.len();
                 return VirtualStateInfo::VirtualArray {
                     descr: vinfo.descr.clone(),
                     items,
+                    lenbound: Some(IntBound::from_constant(len as i64)),
                 };
             }
             PtrInfo::VirtualStruct(vinfo) => {
@@ -614,7 +665,7 @@ fn import_single_value(
                 field_descrs: Vec::new(),
             }));
         }
-        VirtualStateInfo::VirtualArray { descr, items } => {
+        VirtualStateInfo::VirtualArray { descr, items, .. } => {
             let mut vitems = Vec::new();
             for item_info in items {
                 let item_opref =
@@ -805,6 +856,7 @@ mod tests {
                 Box::new(VirtualStateInfo::Constant(Value::Int(1))),
                 Box::new(VirtualStateInfo::Unknown),
             ],
+            lenbound: None,
         };
         let a2 = VirtualStateInfo::VirtualArray {
             descr: descr.clone(),
@@ -812,10 +864,12 @@ mod tests {
                 Box::new(VirtualStateInfo::Constant(Value::Int(1))),
                 Box::new(VirtualStateInfo::Constant(Value::Int(2))),
             ],
+            lenbound: None,
         };
         let a3 = VirtualStateInfo::VirtualArray {
             descr: descr.clone(),
             items: vec![Box::new(VirtualStateInfo::Constant(Value::Int(1)))],
+            lenbound: None,
         };
 
         assert!(a1.is_compatible(&a2)); // same length, first matches, second is Unknown
@@ -981,6 +1035,7 @@ mod tests {
         assert!(VirtualStateInfo::VirtualArray {
             descr: descr.clone(),
             items: vec![],
+            lenbound: None,
         }
         .is_virtual());
 
