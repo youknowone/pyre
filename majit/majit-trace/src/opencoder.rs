@@ -729,6 +729,38 @@ impl TraceRecordBuffer {
         self.snapshots.add_snapshot(snapshot)
     }
 
+    /// opencoder.py: create_top_snapshot(frame, vable_boxes, vref_boxes)
+    /// Create a top-level snapshot with virtualizable and virtual ref arrays.
+    pub fn create_top_snapshot(
+        &mut self,
+        snapshot: Snapshot,
+        vable_array_index: Option<usize>,
+        vref_array_index: Option<usize>,
+    ) -> usize {
+        let snap_idx = self.snapshots.add_snapshot(snapshot.clone());
+        self.snapshots.add_top_snapshot(TopSnapshot {
+            snapshot,
+            vable_array_index,
+            vref_array_index,
+        })
+    }
+
+    /// opencoder.py: create_empty_top_snapshot(vable_boxes, vref_boxes)
+    /// Create a top snapshot with no frame data (for bridge entry).
+    pub fn create_empty_top_snapshot(
+        &mut self,
+        vable_array_index: Option<usize>,
+        vref_array_index: Option<usize>,
+    ) -> usize {
+        let empty_snap = Snapshot {
+            values: Vec::new(),
+            prev: None,
+            jitcode_index: 0,
+            pc: 0,
+        };
+        self.create_top_snapshot(empty_snap, vable_array_index, vref_array_index)
+    }
+
     /// opencoder.py: get_live_ranges()
     /// Compute live ranges for all recorded values.
     /// Returns a vector where index i contains the last position
