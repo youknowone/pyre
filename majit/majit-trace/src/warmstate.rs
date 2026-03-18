@@ -833,16 +833,37 @@ impl WarmEnterState {
     ///   - "bridge_threshold": guard fail count before bridge compilation
     ///   - "function_threshold": calls before inlining
     ///   - "max_inline_depth": maximum inlining depth
+    /// Set a JIT parameter by name.
+    ///
+    /// RPython warmstate.py: all `set_param_*` methods unified.
     pub fn set_param(&mut self, name: &str, value: i64) {
         match name {
             "threshold" => self.set_threshold(value as u32),
             "trace_limit" => self.trace_limit = value as u32,
-            "bridge_threshold" => self.bridge_threshold = value as u32,
+            "trace_eagerness" | "bridge_threshold" => self.bridge_threshold = value as u32,
             "function_threshold" => self.function_threshold = value as u32,
             "max_inline_depth" => self.max_inline_depth = value as u32,
+            "retrace_limit" => self.retrace_limit = value as u32,
+            "max_retrace_guards" => self.max_retrace_guards = value as u32,
+            "max_unroll_loops" => self.max_unroll_loops = value as u32,
+            "max_unroll_recursion" => self.max_unroll_recursion = value as u32,
+            "loop_longevity" => self.loop_longevity = value as u32,
+            "vectorize" => self.vectorize = value != 0,
+            "vec_cost" => self.vec_cost = value as u32,
+            "enable_opts" => {} // string param in RPython, handled separately
             _ => {}
         }
     }
+
+    // ── RPython warmstate.py getter methods ──
+
+    pub fn retrace_limit(&self) -> u32 { self.retrace_limit }
+    pub fn max_retrace_guards(&self) -> u32 { self.max_retrace_guards }
+    pub fn max_unroll_loops(&self) -> u32 { self.max_unroll_loops }
+    pub fn max_unroll_recursion(&self) -> u32 { self.max_unroll_recursion }
+    pub fn loop_longevity(&self) -> u32 { self.loop_longevity }
+    pub fn vectorize(&self) -> bool { self.vectorize }
+    pub fn vec_cost(&self) -> u32 { self.vec_cost }
 
     /// Get a snapshot of current JIT statistics.
     pub fn get_stats(&self) -> JitStats {
