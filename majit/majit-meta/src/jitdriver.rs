@@ -102,13 +102,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_compiled_num_inputs(green_key)
     }
 
-    /// Set the virtualizable object pointer for compile-time array length reading.
-    ///
-    /// RPython parity: compile.py reads array lengths from the actual object.
-    pub fn set_vable_ptr(&mut self, ptr: *const u8) {
-        self.meta.set_vable_ptr(ptr);
-    }
-
     /// Register an interpreter boxing helper for the raw-int finish protocol.
     pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
         self.meta.register_raw_int_box_helper(helper);
@@ -198,7 +191,9 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         if self.sym.is_none() || self.trace_meta.is_none() {
-            if crate::majit_log_enabled() { eprintln!("[mp] abort:sym_none"); }
+            if crate::majit_log_enabled() {
+                eprintln!("[mp] abort:sym_none");
+            }
             self.meta.abort_trace(false);
             self.sym = None;
             self.trace_meta = None;
@@ -208,13 +203,17 @@ impl<S: JitState> JitDriver<S> {
         // Phase 1: split-borrow self into meta (for ctx) and sym, run closure
         let action = {
             let Some(ctx) = self.meta.trace_ctx() else {
-                if crate::majit_log_enabled() { eprintln!("[mp] abort:ctx_none"); }
+                if crate::majit_log_enabled() {
+                    eprintln!("[mp] abort:ctx_none");
+                }
                 self.sym = None;
                 self.trace_meta = None;
                 return;
             };
             let Some(sym) = self.sym.as_mut() else {
-                if crate::majit_log_enabled() { eprintln!("[mp] abort:sym_none2"); }
+                if crate::majit_log_enabled() {
+                    eprintln!("[mp] abort:sym_none2");
+                }
                 self.meta.abort_trace(false);
                 self.trace_meta = None;
                 return;
@@ -261,7 +260,9 @@ impl<S: JitState> JitDriver<S> {
                     let meta = self.trace_meta.take().unwrap();
                     self.meta.close_and_compile(&jump_args, meta);
                 } else {
-                    if crate::majit_log_enabled() { eprintln!("[mp] abort:validate_close"); }
+                    if crate::majit_log_enabled() {
+                        eprintln!("[mp] abort:validate_close");
+                    }
                     self.meta.abort_trace(false);
                     self.trace_meta = None;
                 }
@@ -352,6 +353,10 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_internal(green_key, None, target_pc, state, env, pre_run)
     }
 
+    #[cold]
+    #[inline(never)]
+    #[cold]
+    #[inline(never)]
     pub fn back_edge_structured(
         &mut self,
         green_key: GreenKey,
@@ -448,10 +453,6 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
 
-        // Fast path: skip expensive build_meta/extract_live when key is cold.
-        if !self.meta.is_hot_or_tracing(green_key) {
-            return false;
-        }
         self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
         false
     }
@@ -513,6 +514,8 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn maybe_start_tracing(
         &mut self,
         green_key: u64,
@@ -587,7 +590,7 @@ impl<S: JitState> JitDriver<S> {
         if !ok {
             return false;
         }
-        // Auto-set vable_ptr + array_lengths from state.
+        // Cache the current virtualizable object + array lengths from state.
         //
         // RPython compile.py reads lengths from the actual virtualizable
         // object via vinfo.get_array_length(). Here we use two sources:
@@ -1132,8 +1135,8 @@ impl<S: JitState> JitDriver<S> {
         }
 
         if !self.has_compiled_loop(key_hash) {
-            // RPython parity: check warm counter BEFORE any allocation.
-            // DontTraceHere, NotHot, and cold keys all return immediately.
+            // RPython parity: check warm state BEFORE any heap allocation.
+            // DONT_TRACE_HERE and cold keys return immediately with zero cost.
             if !self.meta.warm_state_ref().counter_would_fire(key_hash) {
                 return None;
             }
