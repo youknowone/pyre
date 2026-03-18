@@ -7300,7 +7300,7 @@ fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
 /// Result:  `vF = CallI(create_frame_raw, ..., raw)` + remove vB
 fn fold_box_into_create_frame(
     mut ops: Vec<Op>,
-    constants: &HashMap<u32, i64>,
+    constants: &mut HashMap<u32, i64>,
     box_helpers: &HashSet<i64>,
     create_frame_raw_map: &HashMap<i64, i64>,
 ) -> Vec<Op> {
@@ -7346,19 +7346,28 @@ fn fold_box_into_create_frame(
             if !box_fn_ptr.is_some_and(|p| box_helpers.contains(&p)) {
                 continue;
             }
-            // Check: box result is ONLY used by this create_frame (and maybe CA args)
-            // For safety, just check it's used by create_frame — if also used elsewhere, skip.
-            let used_elsewhere = ops.iter().enumerate().any(|(i, op)| {
-                i != ci && i != bi && op.args.contains(&last_arg)
-            });
-            // Also check fail_args
+            // Check: box result is only used by create_frame, CallAssemblerI
+            // args, and possibly CallN (drop_frame). No fail_args or other ops.
             let used_in_fail_args = ops.iter().any(|op| {
                 op.fail_args
                     .as_ref()
                     .is_some_and(|fa| fa.contains(&last_arg))
             });
-            if used_elsewhere || used_in_fail_args {
-                break; // box result used elsewhere, can't fold
+            let used_in_non_call = ops.iter().enumerate().any(|(i, op)| {
+                i != ci
+                    && i != bi
+                    && op.args.contains(&last_arg)
+                    && !matches!(
+                        op.opcode,
+                        OpCode::CallAssemblerI
+                            | OpCode::CallAssemblerR
+                            | OpCode::CallAssemblerF
+                            | OpCode::CallAssemblerN
+                            | OpCode::CallN
+                    )
+            });
+            if used_in_non_call || used_in_fail_args {
+                break;
             }
             if box_op.args.len() >= 2 {
                 replacements.push((bi, ci));
@@ -7369,40 +7378,43 @@ fn fold_box_into_create_frame(
 
     // Apply replacements in reverse order
     for &(box_idx, create_idx) in replacements.iter().rev() {
+        let boxed_ref = ops[box_idx].pos;
         let raw_val = ops[box_idx].args[1]; // raw value from box(fn_ptr, raw)
-        let create_fn_ptr = ops[create_idx]
+        let create_fn_ptr = match ops[create_idx]
             .args
             .first()
             .and_then(|func| constants.get(&func.0))
             .copied()
-            .unwrap();
-        let raw_fn_ptr = create_frame_raw_map[&create_fn_ptr];
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        let raw_fn_ptr = match create_frame_raw_map.get(&create_fn_ptr) {
+            Some(&p) => p,
+            None => continue, // already replaced in a previous iteration
+        };
 
         // Replace last arg of create_frame with raw_val
         let nargs = ops[create_idx].args.len();
         ops[create_idx].args[nargs - 1] = raw_val;
 
-        // Replace function pointer constant: create_frame → create_frame_raw
-        // The func OpRef constant needs updating
+        // Replace function pointer: create_frame → create_frame_raw_int
         let func_ref = ops[create_idx].args[0];
-        // We need to update the constants map — but we have &HashMap.
-        // Instead, add a new constant entry. Use the same OpRef but update the value.
-        // Since constants is immutable here, we rewrite the func_ref's OpRef
-        // to a new one that maps to raw_fn_ptr.
-        // Simpler: just add a note and handle in caller.
-        // For now, store raw_fn_ptr in a new constant slot.
-        let new_func_ref = OpRef(func_ref.0 + 50_000); // offset to avoid collision
-        ops[create_idx].args[0] = new_func_ref;
+        constants.insert(func_ref.0, raw_fn_ptr);
+
+        // Replace boxed ref with raw in all remaining ops (CA args, etc.)
+        for op in ops.iter_mut() {
+            for arg in op.args.iter_mut() {
+                if *arg == boxed_ref {
+                    *arg = raw_val;
+                }
+            }
+        }
 
         // Remove the boxing op
         ops.remove(box_idx);
-
-        // Return replacement info so caller can add the constant
-        // (We'll handle this by returning the ops and separately adding constants)
     }
 
-    // Store new constant mappings
-    // (handled by the caller — see finish_and_compile)
     ops
 }
 
