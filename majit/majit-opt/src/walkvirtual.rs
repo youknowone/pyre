@@ -9,7 +9,7 @@ use majit_ir::OpRef;
 
 use crate::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
-    VirtualStructInfo,
+    VirtualStructInfo, VirtualizableFieldState,
 };
 
 /// Visitor for virtual object structures.
@@ -32,6 +32,9 @@ pub trait VirtualVisitor {
 
     /// Visit a virtual raw buffer.
     fn visit_vrawbuffer(&mut self, _opref: OpRef, _info: &VirtualRawBufferInfo) {}
+
+    /// Visit a virtualizable object (interpreter frame).
+    fn visit_virtualizable(&mut self, _opref: OpRef, _info: &VirtualizableFieldState) {}
 }
 
 /// Walk all virtuals in a `PtrInfo` slice and dispatch to the visitor.
@@ -46,12 +49,19 @@ pub fn walk_virtuals(virtuals: &[(OpRef, PtrInfo)], visitor: &mut impl VirtualVi
             PtrInfo::VirtualStruct(v) => visitor.visit_vstruct(*opref, v),
             PtrInfo::VirtualArrayStruct(v) => visitor.visit_varraystruct(*opref, v),
             PtrInfo::VirtualRawBuffer(v) => visitor.visit_vrawbuffer(*opref, v),
-            PtrInfo::NonNull
-            | PtrInfo::Constant(_)
-            | PtrInfo::KnownClass { .. }
-            | PtrInfo::Virtualizable(_) => {}
+            PtrInfo::Virtualizable(v) => visitor.visit_virtualizable(*opref, v),
+            PtrInfo::NonNull | PtrInfo::Constant(_) | PtrInfo::KnownClass { .. } => {}
         }
     }
+}
+
+/// walkvirtual.py: walk_virtuals_and_count — count total number of virtual items.
+pub fn count_virtual_items(virtuals: &[(OpRef, PtrInfo)]) -> usize {
+    let mut count = 0;
+    for (_, info) in virtuals {
+        count += info.num_fields();
+    }
+    count
 }
 
 #[cfg(test)]
