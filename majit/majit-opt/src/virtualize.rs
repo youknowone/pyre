@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use majit_ir::{Descr, DescrRef, FieldDescr, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 
 use crate::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
@@ -1209,6 +1209,45 @@ impl Optimization for OptVirtualize {
             // If the force_token from the preceding CALL_MAY_FORCE is virtual
             // (never escaped), the guard always succeeds. Otherwise, pass through.
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => OptimizationResult::PassOn,
+
+            // virtualize.py: optimize_COND_CALL — if the call is
+            // OS_JIT_FORCE_VIRTUALIZABLE and the target is virtual, remove.
+            OpCode::CondCallN => {
+                if let Some(ref descr) = op.descr {
+                    if let Some(cd) = descr.as_call_descr() {
+                        let ei = cd.effect_info();
+                        if ei.oopspec_index == OopSpecIndex::JitForceVirtualizable
+                            && op.num_args() >= 3
+                        {
+                            let target = ctx.get_replacement(op.arg(2));
+                            if self.is_virtual(target, ctx) {
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
+                }
+                self.optimize_escaping_op(op, ctx)
+            }
+
+            // virtualize.py: optimize_CALL_N/R/I — special handling for
+            // OS_JIT_FORCE_VIRTUALIZABLE (remove if target is virtual).
+            OpCode::CallN | OpCode::CallR | OpCode::CallI | OpCode::CallF => {
+                if let Some(ref descr) = op.descr {
+                    if let Some(cd) = descr.as_call_descr() {
+                        let ei = cd.effect_info();
+                        if ei.oopspec_index == OopSpecIndex::JitForceVirtualizable {
+                            let arg_idx = if op.opcode == OpCode::CallN { 1 } else { 1 };
+                            if op.num_args() > arg_idx {
+                                let target = ctx.get_replacement(op.arg(arg_idx));
+                                if self.is_virtual(target, ctx) {
+                                    return OptimizationResult::Remove;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.optimize_escaping_op(op, ctx)
+            }
 
             // Calls / escaping operations — force all virtual args
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
