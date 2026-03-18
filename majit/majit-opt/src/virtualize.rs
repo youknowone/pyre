@@ -1327,35 +1327,7 @@ impl Optimization for OptVirtualize {
     }
 }
 
-// ── PtrInfo helpers ──
-
-impl PtrInfo {
-    fn is_virtual(&self) -> bool {
-        matches!(
-            self,
-            PtrInfo::Virtual(_)
-                | PtrInfo::VirtualArray(_)
-                | PtrInfo::VirtualStruct(_)
-                | PtrInfo::VirtualArrayStruct(_)
-                | PtrInfo::VirtualRawBuffer(_)
-                | PtrInfo::Virtualizable(_)
-        )
-    }
-
-    fn is_nonnull(&self) -> bool {
-        match self {
-            PtrInfo::NonNull => true,
-            PtrInfo::KnownClass { is_nonnull, .. } => *is_nonnull,
-            PtrInfo::Virtual(_)
-            | PtrInfo::VirtualArray(_)
-            | PtrInfo::VirtualStruct(_)
-            | PtrInfo::VirtualArrayStruct(_)
-            | PtrInfo::VirtualRawBuffer(_)
-            | PtrInfo::Virtualizable(_) => true,
-            PtrInfo::Constant(gcref) => !gcref.is_null(),
-        }
-    }
-}
+// PtrInfo helpers (is_nonnull, is_virtual, etc.) are in info.rs.
 
 // ── Field list helpers ──
 

@@ -19,14 +19,14 @@ pub struct HeapCache {
     field_cache: HashMap<(OpRef, u32), OpRef>,
 
     /// Array item cache: (array_ref, index_opref, descr_index) -> cached value.
-    /// RPython heapcache.py: `cached_arrayitems`.
+    /// heapcache.py: `cached_arrayitems`.
     array_cache: HashMap<(OpRef, OpRef, u32), OpRef>,
 
     /// Known class map: object_ref -> class pointer.
     known_class: HashMap<OpRef, GcRef>,
 
     /// Quasi-immutable fields known in this trace.
-    /// RPython heapcache.py: `quasi_immut_known`.
+    /// heapcache.py: `quasi_immut_known`.
     quasi_immut_known: HashSet<(OpRef, u32)>,
 
     /// Set of OpRefs known to be newly allocated and not yet escaped.
@@ -34,6 +34,19 @@ pub struct HeapCache {
 
     /// Set of OpRefs for which we saw the allocation during this trace.
     seen_allocation: HashSet<OpRef>,
+
+    /// heapcache.py: known nullity — values known to be null or non-null.
+    known_nullity: HashMap<OpRef, bool>,
+
+    /// heapcache.py: cached_arraylen — cached array lengths.
+    cached_arraylen: HashMap<(OpRef, u32), OpRef>,
+
+    /// heapcache.py: likely_virtual — values likely to be virtual objects.
+    likely_virtual: HashSet<OpRef>,
+
+    /// heapcache.py: loop-invariant call result cache.
+    /// (func_ptr, args_hash) → result OpRef.
+    loopinvariant_call_cache: HashMap<(OpRef, u64), OpRef>,
 }
 
 impl HeapCache {
@@ -46,6 +59,10 @@ impl HeapCache {
             quasi_immut_known: HashSet::new(),
             is_unescaped: HashSet::new(),
             seen_allocation: HashSet::new(),
+            known_nullity: HashMap::new(),
+            cached_arraylen: HashMap::new(),
+            likely_virtual: HashSet::new(),
+            loopinvariant_call_cache: HashMap::new(),
         }
     }
 
@@ -202,6 +219,62 @@ impl HeapCache {
         self.quasi_immut_known.contains(&(obj, field_index))
     }
 
+    // ── Nullity tracking (heapcache.py nullity_now_known / is_nullity_known) ──
+
+    /// Record that a value's nullity is known.
+    /// heapcache.py: nullity_now_known(box, is_nonnull)
+    pub fn nullity_now_known(&mut self, opref: OpRef, is_nonnull: bool) {
+        self.known_nullity.insert(opref, is_nonnull);
+    }
+
+    /// Check if a value's nullity is known.
+    /// heapcache.py: is_nullity_known(box)
+    pub fn is_nullity_known(&self, opref: OpRef) -> Option<bool> {
+        self.known_nullity.get(&opref).copied()
+    }
+
+    // ── Array length caching (heapcache.py arraylen_now_known / arraylen) ──
+
+    /// Record a known array length.
+    /// heapcache.py: arraylen_now_known(array, length)
+    pub fn arraylen_now_known(&mut self, array: OpRef, descr: u32, length: OpRef) {
+        self.cached_arraylen.insert((array, descr), length);
+    }
+
+    /// Look up a cached array length.
+    /// heapcache.py: arraylen(array)
+    pub fn arraylen(&self, array: OpRef, descr: u32) -> Option<OpRef> {
+        self.cached_arraylen.get(&(array, descr)).copied()
+    }
+
+    // ── Likely virtual tracking (heapcache.py is_likely_virtual) ──
+
+    /// Mark a value as likely virtual.
+    /// heapcache.py: HF_LIKELY_VIRTUAL flag
+    pub fn mark_likely_virtual(&mut self, opref: OpRef) {
+        self.likely_virtual.insert(opref);
+    }
+
+    /// Check if a value is likely virtual.
+    pub fn is_likely_virtual(&self, opref: OpRef) -> bool {
+        self.likely_virtual.contains(&opref)
+    }
+
+    // ── Loop-invariant call result caching ──
+
+    /// Record a loop-invariant call result.
+    /// heapcache.py: call_loopinvariant_known_result
+    pub fn call_loopinvariant_cache(&mut self, func: OpRef, args_hash: u64, result: OpRef) {
+        self.loopinvariant_call_cache.insert((func, args_hash), result);
+    }
+
+    /// Look up a cached loop-invariant call result.
+    pub fn call_loopinvariant_lookup(&self, func: OpRef, args_hash: u64) -> Option<OpRef> {
+        self.loopinvariant_call_cache.get(&(func, args_hash)).copied()
+    }
+
+    // ── Reset variants ──
+
     /// Reset the entire cache state.
     pub fn reset(&mut self) {
         self.field_cache.clear();
@@ -210,6 +283,25 @@ impl HeapCache {
         self.quasi_immut_known.clear();
         self.is_unescaped.clear();
         self.seen_allocation.clear();
+        self.known_nullity.clear();
+        self.cached_arraylen.clear();
+        self.likely_virtual.clear();
+        self.loopinvariant_call_cache.clear();
+    }
+
+    /// Reset but keep likely-virtual markers.
+    /// heapcache.py: reset_keep_likely_virtuals()
+    pub fn reset_keep_likely_virtuals(&mut self) {
+        self.field_cache.clear();
+        self.array_cache.clear();
+        self.known_class.clear();
+        self.quasi_immut_known.clear();
+        self.is_unescaped.clear();
+        self.seen_allocation.clear();
+        self.known_nullity.clear();
+        self.cached_arraylen.clear();
+        self.loopinvariant_call_cache.clear();
+        // likely_virtual is NOT cleared
     }
 }
 

@@ -7,26 +7,44 @@ use crate::intutils::IntBound;
 use majit_ir::{DescrRef, GcRef, OpRef, Value};
 
 /// Information about an operation's result, attached during optimization.
+///
+/// info.py: AbstractInfo hierarchy — the base class for all optimization info.
 #[derive(Clone, Debug)]
 pub enum OpInfo {
     /// No information known.
     Unknown,
-    /// Known constant value.
+    /// Known constant value (integer or pointer).
     Constant(Value),
     /// Known integer bounds.
     IntBound(IntBound),
     /// Pointer info (non-null, known class, virtual, etc.).
     Ptr(PtrInfo),
+    /// Known constant float value.
+    /// info.py: FloatConstInfo — tracks float constants separately
+    /// because they need special boxing on 32-bit platforms.
+    FloatConst(f64),
 }
 
 impl OpInfo {
     pub fn is_constant(&self) -> bool {
-        matches!(self, OpInfo::Constant(_))
+        matches!(
+            self,
+            OpInfo::Constant(_) | OpInfo::FloatConst(_) | OpInfo::Ptr(PtrInfo::Constant(_))
+        )
     }
 
     pub fn get_constant(&self) -> Option<&Value> {
         match self {
             OpInfo::Constant(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Get the constant float value if this is a FloatConst.
+    pub fn get_constant_float(&self) -> Option<f64> {
+        match self {
+            OpInfo::FloatConst(f) => Some(*f),
+            OpInfo::Constant(Value::Float(f)) => Some(*f),
             _ => None,
         }
     }
@@ -37,44 +55,197 @@ impl OpInfo {
             _ => None,
         }
     }
+
+    /// Whether this info is known non-null.
+    /// info.py: is_nonnull()
+    pub fn is_nonnull(&self) -> bool {
+        match self {
+            OpInfo::Ptr(ptr) => ptr.is_nonnull(),
+            OpInfo::Constant(Value::Int(v)) => *v != 0,
+            _ => false,
+        }
+    }
+
+    /// Whether this info represents a virtual (allocation-removed) object.
+    /// info.py: is_virtual()
+    pub fn is_virtual(&self) -> bool {
+        matches!(self, OpInfo::Ptr(ptr) if ptr.is_virtual())
+    }
+
+    /// Get the PtrInfo if present.
+    pub fn get_ptr_info(&self) -> Option<&PtrInfo> {
+        match self {
+            OpInfo::Ptr(p) => Some(p),
+            _ => None,
+        }
+    }
 }
 
 /// Information about a pointer value.
 ///
-/// Mirrors rpython/jit/metainterp/optimizeopt/info.py PtrInfo hierarchy.
+/// info.py: PtrInfo hierarchy:
+///   NonNullPtrInfo → AbstractVirtualPtrInfo → {InstancePtrInfo, StructPtrInfo,
+///   ArrayPtrInfo, ArrayStructInfo, RawBufferPtrInfo, RawStructPtrInfo, RawSlicePtrInfo}
+///   ConstPtrInfo
 #[derive(Clone, Debug)]
 pub enum PtrInfo {
     /// Known to be non-null, nothing else.
+    /// info.py: NonNullPtrInfo
     NonNull,
     /// Known constant pointer.
+    /// info.py: ConstPtrInfo
     Constant(GcRef),
     /// Known class (type) of the object.
+    /// info.py: NonNullPtrInfo with _known_class set
     KnownClass {
-        /// The class pointer.
         class_ptr: GcRef,
-        /// Whether this is also known non-null.
         is_nonnull: bool,
     },
     /// Virtual object (allocation removed by the optimizer).
+    /// info.py: InstancePtrInfo
     Virtual(VirtualInfo),
     /// Virtual array.
+    /// info.py: ArrayPtrInfo
     VirtualArray(VirtualArrayInfo),
     /// Virtual struct (no vtable).
+    /// info.py: StructPtrInfo
     VirtualStruct(VirtualStructInfo),
     /// Virtual array of structs (interior field access).
+    /// info.py: ArrayStructInfo
     VirtualArrayStruct(VirtualArrayStructInfo),
     /// Virtual raw buffer.
+    /// info.py: RawBufferPtrInfo
     VirtualRawBuffer(VirtualRawBufferInfo),
     /// Virtualizable object (interpreter frame).
-    ///
-    /// Unlike virtual objects (allocation eliminated), a virtualizable
-    /// already exists on the heap. Its fields are tracked so that
-    /// setfield/getfield ops can be eliminated — field values live in
-    /// registers instead of memory.
-    ///
-    /// On "force" (escape), only the field writes are emitted
-    /// (no allocation, since the object already exists).
     Virtualizable(VirtualizableFieldState),
+}
+
+impl PtrInfo {
+    /// Whether this pointer is known to be non-null.
+    /// info.py: is_nonnull()
+    pub fn is_nonnull(&self) -> bool {
+        match self {
+            PtrInfo::NonNull => true,
+            PtrInfo::Constant(gcref) => !gcref.is_null(),
+            PtrInfo::KnownClass { is_nonnull, .. } => *is_nonnull,
+            PtrInfo::Virtual(_)
+            | PtrInfo::VirtualArray(_)
+            | PtrInfo::VirtualStruct(_)
+            | PtrInfo::VirtualArrayStruct(_)
+            | PtrInfo::VirtualRawBuffer(_)
+            | PtrInfo::Virtualizable(_) => true,
+        }
+    }
+
+    /// Whether this pointer is a virtual (allocation removed).
+    /// info.py: is_virtual()
+    pub fn is_virtual(&self) -> bool {
+        matches!(
+            self,
+            PtrInfo::Virtual(_)
+                | PtrInfo::VirtualArray(_)
+                | PtrInfo::VirtualStruct(_)
+                | PtrInfo::VirtualArrayStruct(_)
+                | PtrInfo::VirtualRawBuffer(_)
+                | PtrInfo::Virtualizable(_)
+        )
+    }
+
+    /// Whether this is a constant pointer.
+    /// info.py: isinstance(info, ConstPtrInfo)
+    pub fn is_constant(&self) -> bool {
+        matches!(self, PtrInfo::Constant(_))
+    }
+
+    /// Get the known class, if any.
+    /// info.py: get_known_class_or_none()
+    pub fn get_known_class(&self) -> Option<&GcRef> {
+        match self {
+            PtrInfo::KnownClass { class_ptr, .. } => Some(class_ptr),
+            PtrInfo::Virtual(v) => v.known_class.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Get constant GcRef value if this is a constant pointer.
+    pub fn get_constant_ref(&self) -> Option<&GcRef> {
+        match self {
+            PtrInfo::Constant(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Get the string length from a constant string pointer.
+    /// info.py: getstrlen() on ConstPtrInfo
+    pub fn getstrlen(&self) -> Option<usize> {
+        // Only meaningful for constant string objects.
+        // In RPython, this reads the string header to get the length.
+        // In our implementation, GcRef doesn't carry string metadata,
+        // so we return None. This can be overridden when GcRef is enriched.
+        None
+    }
+
+    /// Get the string hash from a constant string pointer.
+    /// info.py: getstrhash() on ConstPtrInfo
+    pub fn getstrhash(&self) -> Option<i64> {
+        None
+    }
+
+    /// Count the number of fields/items in this virtual object.
+    /// info.py: _get_num_items() / num_fields
+    pub fn num_fields(&self) -> usize {
+        match self {
+            PtrInfo::Virtual(v) => v.fields.len(),
+            PtrInfo::VirtualArray(v) => v.items.len(),
+            PtrInfo::VirtualStruct(v) => v.fields.len(),
+            PtrInfo::VirtualArrayStruct(v) => v.element_fields.len(),
+            PtrInfo::VirtualRawBuffer(v) => v.entries.len(),
+            _ => 0,
+        }
+    }
+
+    /// Enumerate all OpRef values stored in this virtual's fields/items.
+    /// info.py: visitor_walk_recursive — walks all fields of a virtual.
+    pub fn visitor_walk_recursive(&self) -> Vec<OpRef> {
+        match self {
+            PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
+            PtrInfo::VirtualArray(v) => v.items.clone(),
+            PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| *r).collect(),
+            PtrInfo::VirtualArrayStruct(v) => v
+                .element_fields
+                .iter()
+                .flat_map(|fields| fields.iter().map(|(_, r)| *r))
+                .collect(),
+            PtrInfo::VirtualRawBuffer(v) => v.entries.iter().map(|(_, _, r)| *r).collect(),
+            PtrInfo::Virtualizable(v) => {
+                let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| *r).collect();
+                for (_, items) in &v.arrays {
+                    refs.extend(items.iter().copied());
+                }
+                refs
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Copy fields from this virtual info to another.
+    /// info.py: copy_fields_to_const()
+    pub fn copy_fields_to(&self, other: &mut PtrInfo) {
+        match (self, other) {
+            (PtrInfo::Virtual(src), PtrInfo::Virtual(dst)) => {
+                dst.fields = src.fields.clone();
+                dst.field_descrs = src.field_descrs.clone();
+            }
+            (PtrInfo::VirtualStruct(src), PtrInfo::VirtualStruct(dst)) => {
+                dst.fields = src.fields.clone();
+                dst.field_descrs = src.field_descrs.clone();
+            }
+            (PtrInfo::VirtualArray(src), PtrInfo::VirtualArray(dst)) => {
+                dst.items = src.items.clone();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A virtual object whose allocation has been removed.

@@ -7,6 +7,16 @@ use majit_ir::{Op, OpCode, OpRef, Value};
 
 use crate::{intdiv, OptContext, Optimization, OptimizationResult};
 
+/// Check if a float is an exact power of 2 (±2^n).
+/// rewrite.py: uses frexp; mantissa==0.5 means exact power of 2.
+fn is_power_of_two_float(v: f64) -> bool {
+    let bits = v.to_bits();
+    let mantissa_bits = bits & 0x000F_FFFF_FFFF_FFFF;
+    let exponent = ((bits >> 52) & 0x7FF) as i32;
+    // Normal number with zero mantissa fraction = exact power of 2
+    mantissa_bits == 0 && exponent > 0 && exponent < 0x7FF
+}
+
 /// Rewrite operations into equivalent, cheaper forms.
 ///
 /// Handles:
@@ -829,12 +839,24 @@ impl OptRewrite {
                 ctx.replace_op(op.pos, arg0);
                 return OptimizationResult::Remove;
             }
+            // rewrite.py: x * -1.0 -> FLOAT_NEG(x)
+            if v == -1.0 {
+                let mut neg = Op::new(OpCode::FloatNeg, &[arg0]);
+                neg.pos = op.pos;
+                return OptimizationResult::Replace(neg);
+            }
         }
         // 1.0 * x -> x
         if let Some(v) = ctx.get_constant_float(arg0) {
             if v == 1.0 {
                 ctx.replace_op(op.pos, arg1);
                 return OptimizationResult::Remove;
+            }
+            // -1.0 * x -> FLOAT_NEG(x)
+            if v == -1.0 {
+                let mut neg = Op::new(OpCode::FloatNeg, &[arg1]);
+                neg.pos = op.pos;
+                return OptimizationResult::Replace(neg);
             }
         }
 
@@ -858,6 +880,24 @@ impl OptRewrite {
             if v == 1.0 {
                 ctx.replace_op(op.pos, arg0);
                 return OptimizationResult::Remove;
+            }
+            // rewrite.py: x / -1.0 -> FLOAT_NEG(x)
+            if v == -1.0 {
+                let mut neg = Op::new(OpCode::FloatNeg, &[arg0]);
+                neg.pos = op.pos;
+                return OptimizationResult::Replace(neg);
+            }
+            // rewrite.py: x / const → x * (1/const) when const is an exact power of 2.
+            // An exact power of 2 has the form ±2^n, so its reciprocal is also
+            // exactly representable. Check: v.abs() is a power of 2 when
+            // converting to integer bits gives mantissa=1.0.
+            if v != 0.0 && v.is_finite() && is_power_of_two_float(v) {
+                let recip = 1.0 / v;
+                let recip_ref = self.emit_constant_float(ctx, recip);
+                return OptimizationResult::Emit(Op::new(
+                    OpCode::FloatMul,
+                    &[arg0, recip_ref],
+                ));
             }
         }
 
@@ -922,6 +962,13 @@ impl OptRewrite {
         let op = Op::new(OpCode::SameAsI, &[]);
         let opref = ctx.emit(op);
         ctx.make_constant(opref, Value::Int(value));
+        opref
+    }
+
+    fn emit_constant_float(&self, ctx: &mut OptContext, value: f64) -> OpRef {
+        let op = Op::new(OpCode::SameAsF, &[]);
+        let opref = ctx.emit(op);
+        ctx.make_constant(opref, Value::Float(value));
         opref
     }
 }
