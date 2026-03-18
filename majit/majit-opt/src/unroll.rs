@@ -173,6 +173,27 @@ impl UnrollOptimizer {
         ops.iter().filter(|op| op.opcode.is_guard()).count() as u32
     }
 
+    /// unroll.py: _map_args(mapping, arglist)
+    /// Remap a list of OpRefs through a forwarding mapping.
+    /// Constants (OpRef >= 10000) are left unchanged.
+    pub fn map_args(mapping: &std::collections::HashMap<OpRef, OpRef>, args: &[OpRef]) -> Vec<OpRef> {
+        args.iter()
+            .map(|&arg| {
+                if arg.0 >= 10_000 {
+                    arg // constant, keep as-is
+                } else {
+                    mapping.get(&arg).copied().unwrap_or(arg)
+                }
+            })
+            .collect()
+    }
+
+    /// unroll.py: _check_no_forwarding(lsts)
+    /// Debug assertion: verify no OpRef in the lists has been forwarded.
+    pub fn check_no_forwarding(ctx: &crate::OptContext, oprefs: &[OpRef]) -> bool {
+        oprefs.iter().all(|&r| ctx.get_replacement(r) == r)
+    }
+
     /// unroll.py: jump_to_preamble(cell_token, jump_op)
     /// Redirect a Jump to target the preamble instead of the loop body.
     /// Used when the virtual state doesn't match any existing target token.
