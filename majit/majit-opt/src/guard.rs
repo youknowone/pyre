@@ -65,9 +65,11 @@ pub struct GuardStrengthenOpt {
     seen: HashSet<GuardKey>,
 
     /// Set of values known to be truthy (guarded by `guard_true` or
-    /// `guard_nonnull`).  Used for guard strengthening: if we later see
-    /// `guard_true(v)` and `v` is already in this set, it is redundant.
+    /// `guard_nonnull`).
     truthy_values: HashSet<OpRef>,
+
+    /// guard.py: values with known class (from GuardClass/GuardNonnullClass).
+    known_classes: std::collections::HashMap<OpRef, majit_ir::GcRef>,
 
     /// Descriptor of the last emitted guard, used for consecutive-guard
     /// fusion.
@@ -79,6 +81,7 @@ impl GuardStrengthenOpt {
         GuardStrengthenOpt {
             seen: HashSet::new(),
             truthy_values: HashSet::new(),
+            known_classes: std::collections::HashMap::new(),
             last_guard_descr: None,
         }
     }
@@ -110,6 +113,13 @@ impl GuardStrengthenOpt {
             OpCode::GuardClass | OpCode::GuardNonnullClass => {
                 // Having a class implies the object is nonnull.
                 self.truthy_values.insert(op.arg(0));
+                // guard.py: record the known class for subsumption checks.
+                if op.num_args() >= 2 {
+                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
+                        self.known_classes
+                            .insert(op.arg(0), majit_ir::GcRef(class_val as usize));
+                    }
+                }
             }
             _ => {}
         }
@@ -199,6 +209,7 @@ impl Optimization for GuardStrengthenOpt {
     fn setup(&mut self) {
         self.seen.clear();
         self.truthy_values.clear();
+        self.known_classes.clear();
         self.last_guard_descr = None;
     }
 

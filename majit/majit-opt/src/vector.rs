@@ -154,6 +154,17 @@ impl DependencyGraph {
                     }
                 }
 
+                // vector.py: isomorphic check — ops must have the same
+                // number of args and compatible types (same opcode already
+                // guaranteed by the grouping).
+                if independent && !group_indices.is_empty() {
+                    let first = &self.nodes[group_indices[0]].op;
+                    let candidate = &self.nodes[i].op;
+                    if first.num_args() != candidate.num_args() {
+                        independent = false;
+                    }
+                }
+
                 if independent {
                     group_indices.push(i);
                 }
