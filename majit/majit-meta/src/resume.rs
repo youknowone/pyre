@@ -97,6 +97,18 @@ pub enum ResumeVirtualKind {
     Array,
     ArrayStruct,
     RawBuffer,
+    /// resume.py: VStrPlainInfo — virtual plain string.
+    StrPlain,
+    /// resume.py: VStrConcatInfo — virtual concatenated string.
+    StrConcat,
+    /// resume.py: VStrSliceInfo — virtual string slice.
+    StrSlice,
+    /// resume.py: VUniPlainInfo — virtual plain unicode string.
+    UniPlain,
+    /// resume.py: VUniConcatInfo — virtual concatenated unicode.
+    UniConcat,
+    /// resume.py: VUniSliceInfo — virtual unicode slice.
+    UniSlice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
