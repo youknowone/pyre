@@ -863,6 +863,13 @@ impl OptVirtualize {
             }
         }
 
+        // Constant-fold: non-zero constant is always nonnull.
+        if let Some(value) = ctx.get_constant_int(obj_ref) {
+            if value != 0 {
+                return OptimizationResult::Remove;
+            }
+        }
+
         self.set_info(obj_ref, PtrInfo::NonNull);
         self.force_guard_fail_args(op, ctx)
     }
