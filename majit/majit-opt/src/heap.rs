@@ -741,6 +741,40 @@ impl Optimization for OptHeap {
                 OptimizationResult::PassOn
             }
 
+            // ── heap.py: CALL_MAY_FORCE — postpone until GUARD_NOT_FORCED ──
+            // These calls may force virtualizable objects, so we defer emission
+            // until the guard arrives, ensuring correct exception semantics.
+            OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceF
+            | OpCode::CallMayForceN => {
+                self.force_all_lazy(ctx);
+                self.mark_args_escaped(op);
+                // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
+                self.postponed_op = Some(op.clone());
+                self.last_call_did_not_raise = false;
+                if Self::call_has_random_effects(op) {
+                    self.invalidate_caches();
+                } else {
+                    self.cached_fields.retain(|&(obj, descr_idx), _| {
+                        self.immutable_field_descrs.contains(&descr_idx)
+                            || self.unescaped.contains(&obj)
+                    });
+                    self.cached_arrayitems
+                        .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+                }
+                return OptimizationResult::Remove;
+            }
+
+            // ── heap.py: GUARD_NOT_FORCED — emit postponed call ──
+            OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+                if let Some(postponed) = self.postponed_op.take() {
+                    ctx.emit(postponed);
+                }
+                self.force_all_lazy(ctx);
+                return OptimizationResult::Emit(op.clone());
+            }
+
             // ── heap.py: COND_CALL handling ──
             OpCode::CondCallN => {
                 self.force_all_lazy(ctx);
