@@ -484,6 +484,104 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── BinarySlice (a[b:c]) ──
+    // PyPy: BINARY_SUBSCR with slice; CPython 3.13: BINARY_SLICE
+    fn binary_slice(&mut self) -> Result<(), Self::Error> {
+        let stop = self.pop();
+        let start = self.pop();
+        let obj = self.pop();
+        unsafe {
+            if pyre_object::is_list(obj) {
+                let len = pyre_object::w_list_len(obj) as i64;
+                let s = if pyre_object::is_none(start) { 0 } else { pyre_object::w_int_get_value(start) };
+                let e = if pyre_object::is_none(stop) { len } else { pyre_object::w_int_get_value(stop) };
+                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                let mut items = Vec::new();
+                for i in s..e {
+                    if let Some(v) = pyre_object::w_list_getitem(obj, i as i64) {
+                        items.push(v);
+                    }
+                }
+                self.push(pyre_object::w_list_new(items));
+                return Ok(());
+            }
+            if pyre_object::is_str(obj) {
+                let full = pyre_object::w_str_get_value(obj);
+                let len = full.len() as i64;
+                let s = if pyre_object::is_none(start) { 0 } else { pyre_object::w_int_get_value(start) };
+                let e = if pyre_object::is_none(stop) { len } else { pyre_object::w_int_get_value(stop) };
+                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                let slice = &full[s..e.min(full.len())];
+                self.push(pyre_object::w_str_new(slice));
+                return Ok(());
+            }
+        }
+        Err(PyError::type_error("object is not subscriptable"))
+    }
+
+    // ── StoreSlice (a[b:c] = d) ──
+    fn store_slice(&mut self) -> Result<(), Self::Error> {
+        // Phase 1 stub — rarely used in hot loops
+        Err(PyError::type_error("STORE_SLICE not yet implemented"))
+    }
+
+    // ── BuildString (f-string concatenation) ──
+    // CPython 3.13: concatenate N string fragments from stack
+    fn build_string(&mut self, count: usize) -> Result<(), Self::Error> {
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            parts.push(self.pop());
+        }
+        parts.reverse();
+        let mut result = String::new();
+        for part in &parts {
+            unsafe {
+                if pyre_object::is_str(*part) {
+                    result.push_str(pyre_object::w_str_get_value(*part));
+                } else if pyre_object::is_int(*part) {
+                    result.push_str(&pyre_object::w_int_get_value(*part).to_string());
+                } else if pyre_object::is_none(*part) {
+                    result.push_str("None");
+                } else if pyre_object::is_bool(*part) {
+                    result.push_str(if pyre_object::w_bool_get_value(*part) { "True" } else { "False" });
+                } else {
+                    result.push_str("<object>");
+                }
+            }
+        }
+        self.push(pyre_object::w_str_new(&result));
+        Ok(())
+    }
+
+    // ── ListExtend ──
+    fn list_extend(&mut self, _i: usize) -> Result<(), Self::Error> {
+        let iterable = self.pop();
+        let list = self.peek();
+        unsafe {
+            if pyre_object::is_list(iterable) {
+                let src_len = pyre_object::w_list_len(iterable);
+                for j in 0..src_len {
+                    if let Some(item) = pyre_object::w_list_getitem(iterable, j as i64) {
+                        pyre_object::w_list_append(list, item);
+                    }
+                }
+                return Ok(());
+            }
+            if pyre_object::is_tuple(iterable) {
+                let src_len = pyre_object::w_tuple_len(iterable);
+                for j in 0..src_len {
+                    if let Some(item) = pyre_object::w_tuple_getitem(iterable, j as i64) {
+                        pyre_object::w_list_append(list, item);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        Err(PyError::type_error("object is not iterable"))
+    }
+
     fn unsupported(
         &mut self,
         instruction: &Instruction,
