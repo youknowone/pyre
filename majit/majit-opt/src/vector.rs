@@ -417,6 +417,63 @@ impl GuardAnalysis {
 /// It saves:
 /// - Instruction count reduction (N scalar ops → 1 vector op)
 /// - Memory bandwidth (packed loads/stores)
+/// costmodel.py: GenericCostModel — per-opcode cost estimation.
+/// Maps opcodes to their estimated cost in abstract units.
+pub struct GenericCostModel {
+    /// Per-opcode cost overrides: opcode → cost.
+    per_opcode_cost: std::collections::HashMap<OpCode, i32>,
+    /// Default cost for opcodes not in the override map.
+    default_cost: i32,
+}
+
+impl GenericCostModel {
+    pub fn new() -> Self {
+        let mut costs = std::collections::HashMap::new();
+        // costmodel.py: memory ops are more expensive than ALU ops
+        costs.insert(OpCode::GetarrayitemGcI, 3);
+        costs.insert(OpCode::GetarrayitemGcR, 3);
+        costs.insert(OpCode::GetarrayitemGcF, 3);
+        costs.insert(OpCode::SetarrayitemGc, 3);
+        costs.insert(OpCode::GetfieldGcI, 2);
+        costs.insert(OpCode::GetfieldGcR, 2);
+        costs.insert(OpCode::SetfieldGc, 2);
+        // Float ops are more expensive
+        costs.insert(OpCode::FloatAdd, 2);
+        costs.insert(OpCode::FloatSub, 2);
+        costs.insert(OpCode::FloatMul, 2);
+        costs.insert(OpCode::FloatTrueDiv, 4);
+        GenericCostModel {
+            per_opcode_cost: costs,
+            default_cost: 1,
+        }
+    }
+
+    /// Get the cost of a single operation.
+    pub fn op_cost(&self, opcode: OpCode) -> i32 {
+        self.per_opcode_cost
+            .get(&opcode)
+            .copied()
+            .unwrap_or(self.default_cost)
+    }
+
+    /// Estimate total savings from vectorizing a pack group.
+    pub fn estimate_savings(&self, group: &PackGroup) -> i32 {
+        let n = group.members.len() as i32;
+        let per_op = self.op_cost(group.scalar_opcode);
+        // Savings = (n-1) ops eliminated * per-op cost
+        // Cost = pack + unpack overhead
+        let savings = (n - 1) * per_op;
+        let overhead = 2 * 2; // 2 pack/unpack ops at cost 2 each
+        savings - overhead
+    }
+}
+
+impl Default for GenericCostModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct CostModel {
     /// Minimum group size to consider vectorization (default: 2).
     pub min_pack_size: usize,
