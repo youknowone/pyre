@@ -124,6 +124,16 @@ impl Optimizer {
         }
     }
 
+    /// optimizer.py: has_pending_fields()
+    pub fn has_pending_fields(&self) -> bool {
+        !self.pendingfields.is_empty()
+    }
+
+    /// optimizer.py: num_pending_fields()
+    pub fn num_pending_fields(&self) -> usize {
+        self.pendingfields.len()
+    }
+
     /// optimizer.py: cant_replace_guards()
     /// Temporarily disable guard replacement (e.g., during bridge compilation).
     pub fn disable_guard_replacement(&mut self) {
