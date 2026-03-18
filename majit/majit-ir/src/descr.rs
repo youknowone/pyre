@@ -133,6 +133,11 @@ pub trait SizeDescr: Descr {
         0
     }
 
+    /// descr.py: repr_of_descr()
+    fn repr_of_descr(&self) -> String {
+        format!("SizeDescr(size={}, type_id={})", self.size(), self.type_id())
+    }
+
     /// Field descriptors for fields containing GC pointers.
     fn gc_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
         &[]
@@ -185,6 +190,26 @@ pub trait FieldDescr: Descr {
     /// Delegates to `Descr::is_always_pure()` by default.
     fn is_immutable(&self) -> bool {
         self.is_always_pure()
+    }
+
+    /// descr.py: repr_of_descr()
+    fn repr_of_descr(&self) -> String {
+        format!(
+            "FieldDescr(offset={}, size={}, type={:?})",
+            self.offset(),
+            self.field_size(),
+            self.field_type()
+        )
+    }
+
+    /// descr.py: index_in_parent — position within parent struct.
+    fn index_in_parent(&self) -> usize {
+        0
+    }
+
+    /// descr.py: sort_key() — for ordering field descriptors.
+    fn sort_key(&self) -> usize {
+        self.offset()
     }
 }
 
