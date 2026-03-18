@@ -936,10 +936,15 @@ pub trait Backend: Send {
     }
     /// model.py: bh_setinteriorfield_gc_i(array, index, value, descr)
     fn bh_setinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize, _value: i64) {}
+    // ── model.py: raw field access ──
+    fn bh_getfield_raw_i(&self, _struct_ptr: i64, _offset: usize) -> i64 { 0 }
+    fn bh_getfield_raw_r(&self, _struct_ptr: i64, _offset: usize) -> GcRef { GcRef::NULL }
+    fn bh_getfield_raw_f(&self, _struct_ptr: i64, _offset: usize) -> f64 { 0.0 }
+    fn bh_setfield_raw_i(&self, _struct_ptr: i64, _offset: usize, _value: i64) {}
+    fn bh_setfield_raw_f(&self, _struct_ptr: i64, _offset: usize, _value: f64) {}
+
     /// model.py: bh_classof(obj_ptr)
-    fn bh_classof(&self, _obj_ptr: i64) -> i64 {
-        0
-    }
+    fn bh_classof(&self, _obj_ptr: i64) -> i64 { 0 }
 
     /// model.py: setup_once() — called once when the backend is first used.
     fn setup_once(&mut self) {}
