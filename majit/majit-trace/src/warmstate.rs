@@ -256,7 +256,7 @@ const DEFAULT_TRACE_LIMIT: u32 = 6000;
 /// RPython equivalent: retrace_limit parameter (default 0 in PyPy, meaning no retrace).
 /// We allow a few retries (e.g., for stack depth variations) before marking
 /// the key as DONT_TRACE_HERE.
-const DEFAULT_RETRACE_LIMIT: u32 = 5;
+const DEFAULT_RETRACE_LIMIT: u32 = 1;
 
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
 
