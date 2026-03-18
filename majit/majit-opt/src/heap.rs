@@ -319,6 +319,38 @@ impl OptHeap {
             }
         }
 
+        // Constant-fold: if the source is a compile-time constant address,
+        // read the field value directly from memory. This is safe for
+        // immutable fields (ob_type, etc.). PyPy heap.py does this for
+        // quasi-immutable fields guarded by GUARD_NOT_INVALIDATED.
+        // Constant-fold: source is a compile-time constant address.
+        // Read the field value directly from memory at optimization time.
+        // Safe for immutable fields (ob_type). PyPy heap.py handles this
+        // via quasi-immutable guarded by GUARD_NOT_INVALIDATED.
+        if op.num_args() >= 1 {
+            if let Some(addr) = ctx.get_constant_int(op.arg(0)) {
+                if addr != 0 {
+                    if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_field_descr()) {
+                        let offset = fd.offset();
+                        let field_size = fd.field_size();
+                        if field_size <= 8 {
+                            let ptr = (addr as usize + offset) as *const u8;
+                            let mut buf = [0u8; 8];
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), field_size);
+                            }
+                            let folded = i64::from_ne_bytes(buf);
+                            let const_ref = ctx.find_or_record_constant_int(op.pos, folded);
+                            if const_ref != op.pos {
+                                ctx.replace_op(op.pos, const_ref);
+                            }
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                }
+            }
+        }
+
         // Check lazy set first: if there is a pending SETFIELD for this key,
         // the value is the second arg of that pending op.
         if let Some(lazy_op) = self.lazy_setfields.get(&key) {
