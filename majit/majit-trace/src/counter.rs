@@ -17,6 +17,8 @@ pub struct JitCounter {
     table: Vec<(u64, u32)>,
     /// Threshold for triggering compilation.
     threshold: u32,
+    /// counter.py: _nexthash — monotonically increasing hash generator.
+    next_hash: u64,
 }
 
 impl JitCounter {
@@ -24,6 +26,7 @@ impl JitCounter {
         JitCounter {
             table: vec![(0, 0); TABLE_SIZE],
             threshold,
+            next_hash: 0,
         }
     }
 
@@ -143,6 +146,26 @@ impl JitCounter {
     pub fn compute_threshold(&self, scale: f64) -> u32 {
         let result = (self.threshold as f64 * scale) as u32;
         result.min(self.threshold)
+    }
+
+    /// counter.py: fetch_next_hash()
+    /// Generate a unique hash for a new green key.
+    /// Each call returns a different hash to avoid collisions.
+    pub fn fetch_next_hash(&mut self) -> u64 {
+        let result = self.next_hash;
+        // Increment by a value that changes both the index portion
+        // and the sub-hash portion of the hash, avoiding patterns.
+        self.next_hash = result.wrapping_add(1 | (1 << 16) | (1 << 32));
+        result
+    }
+
+    /// counter.py: change_current_fraction(hash, new_fraction)
+    /// Set the counter for a hash to a fraction of the threshold.
+    /// Used for bridge compilation eagerness: a bridge that fails
+    /// frequently gets its counter boosted closer to the threshold.
+    pub fn change_current_fraction(&mut self, hash: u64, fraction: f64) {
+        let new_count = (self.threshold as f64 * fraction) as u32;
+        self.install(hash, new_count);
     }
 
     /// Get the current threshold.
