@@ -68,6 +68,56 @@ impl VirtualRefInfo {
             descr_size: descr::VREF_SIZE,
         }
     }
+
+    /// Force a virtual reference: materialize the virtual object.
+    ///
+    /// RPython virtualref.py: `force_virtual()`
+    ///
+    /// Called when non-JIT code accesses a virtual reference. The JIT
+    /// frame is forced (flushing register values to heap), and the
+    /// virtual_token is set to TOKEN_NONE.
+    ///
+    /// # Safety
+    /// `vref_ptr` must point to a valid JitVirtualRef object.
+    pub unsafe fn force_virtual(
+        &self,
+        vref_ptr: *mut u8,
+        force_fn: impl FnOnce(i64) -> *mut u8,
+    ) -> *mut u8 {
+        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
+        let forced_ptr = vref_ptr.add(self.descr_forced as usize * 8) as *mut *mut u8;
+        let token = *token_ptr;
+
+        if token == TOKEN_NONE {
+            // Already forced or not in JIT
+            return *forced_ptr;
+        }
+
+        if token == TOKEN_TRACING_RESCALL {
+            // In tracing — just clear
+            *token_ptr = TOKEN_NONE;
+            return *forced_ptr;
+        }
+
+        // Active JIT frame — call force_fn to materialize
+        let materialized = force_fn(token);
+        *forced_ptr = materialized;
+        *token_ptr = TOKEN_NONE;
+        materialized
+    }
+
+    /// Create a virtual reference during tracing.
+    ///
+    /// RPython virtualref.py: `virtual_ref_during_tracing()`
+    ///
+    /// Returns (virtual_token_opref, forced_opref) that the tracer should
+    /// record in the virtual ref's fields.
+    pub fn virtual_ref_during_tracing(
+        &self,
+        force_token: i64,
+    ) -> (i64, i64) {
+        (force_token, 0) // (active token, null forced)
+    }
 }
 
 #[cfg(test)]
