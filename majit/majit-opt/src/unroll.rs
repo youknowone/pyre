@@ -70,16 +70,33 @@ impl UnrollOptimizer {
     }
 
     /// unroll.py: optimize_bridge(trace, runtime_boxes, call_pure_results)
+    /// unroll.py: optimize_bridge(trace, runtime_boxes, call_pure_results)
     /// Optimize a bridge trace that enters an existing loop.
+    ///
+    /// If a short preamble is available, its ops are prepended to the bridge
+    /// so the optimizer can re-establish the invariants that the loop body
+    /// depends on (type checks, bounds, cached values).
     pub fn optimize_bridge(&mut self, bridge_ops: &[Op]) -> Vec<Op> {
+        self.optimize_bridge_with_label_args(bridge_ops, &[])
+    }
+
+    /// Optimize a bridge with explicit label args for short preamble instantiation.
+    pub fn optimize_bridge_with_label_args(
+        &mut self,
+        bridge_ops: &[Op],
+        label_args: &[OpRef],
+    ) -> Vec<Op> {
         let mut optimizer = crate::optimizer::Optimizer::default_pipeline();
-        // For bridges, we prepend short preamble ops before optimization.
         let mut full_ops = Vec::new();
+
+        // unroll.py: inline short preamble ops at the start of the bridge.
         if let Some(ref sp) = self.short_preamble {
-            // Instantiate short preamble with bridge's label args.
-            // For now, just pass through bridge ops as-is.
-            let _ = sp; // used in the full implementation
+            if !sp.is_empty() && !label_args.is_empty() {
+                let preamble_ops = sp.instantiate(label_args);
+                full_ops.extend(preamble_ops);
+            }
         }
+
         full_ops.extend_from_slice(bridge_ops);
         optimizer.optimize(&full_ops)
     }

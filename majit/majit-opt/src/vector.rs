@@ -544,6 +544,39 @@ impl VectorizingOptimizer {
         }
     }
 
+    /// vector.py: user_loop_heuristic — quick check if a loop body is
+    /// worth trying to vectorize. Returns false if there are too few ops,
+    /// no vectorizable opcodes, or too many guards.
+    pub fn user_loop_heuristic(ops: &[Op]) -> bool {
+        if ops.len() < 4 {
+            return false;
+        }
+        let vectorizable = ops.iter().filter(|op| op.opcode.to_vector().is_some()).count();
+        let guards = ops.iter().filter(|op| op.opcode.is_guard()).count();
+        // Need at least 2 vectorizable ops and guards should not dominate.
+        vectorizable >= 2 && guards < ops.len() / 2
+    }
+
+    /// vector.py: find_adjacent_pairs — find pairs of memory accesses
+    /// that read/write adjacent array elements and could be packed.
+    pub fn find_adjacent_pairs(
+        ops: &[Op],
+        constant_of: impl Fn(OpRef) -> Option<i64>,
+    ) -> Vec<(usize, usize)> {
+        let mut pairs = Vec::new();
+        for i in 0..ops.len() {
+            if !ops[i].opcode.is_getarrayitem() && !ops[i].opcode.is_setarrayitem() {
+                continue;
+            }
+            for j in (i + 1)..ops.len() {
+                if are_adjacent_memory_refs(&ops[i], &ops[j], &constant_of) {
+                    pairs.push((i, j));
+                }
+            }
+        }
+        pairs
+    }
+
     /// Attempt to vectorize the buffered loop body.
     ///
     /// Before packing, operations are scheduled for maximum ILP.
