@@ -331,21 +331,29 @@ impl OptBridgeOpt {
         }
     }
 
-    /// Pre-populate the optimization context with known facts.
-    /// bridgeopt.py: deserialize_optimizer_knowledge → apply to context.
+    /// bridgeopt.py: deserialize_optimizer_knowledge
+    /// Pre-populate the optimization context with all known facts.
     pub fn apply_knowledge(&self, ctx: &mut OptContext) {
-        // Constants
+        // bridgeopt.py: apply known constants
         for (&opref, &value) in &self.knowledge.known_constants {
             ctx.make_constant(opref, Value::Int(value));
         }
-        // Nonnull values get a non-zero constant marker
-        // (downstream guards can check this)
-        // Note: we don't actually make them "constant" since they're not,
-        // but the guard optimization pass checks truthy_values separately.
+        // bridgeopt.py: apply known bounds — record as constants if single-value
+        for (&opref, &(lo, hi)) in &self.knowledge.known_bounds {
+            if lo == hi {
+                ctx.make_constant(opref, Value::Int(lo));
+            }
+        }
+    }
 
-        // Known fields: pre-populate field cache in heap optimizer
-        // (this would require passing the heap pass, so we just record
-        // them as constants if they happen to be constant values)
+    /// bridgeopt.py: number of known class entries (for bitfield size)
+    pub fn num_known_classes(&self) -> usize {
+        self.knowledge.known_classes.len()
+    }
+
+    /// bridgeopt.py: number of known heap fields (for serialize size)
+    pub fn num_known_fields(&self) -> usize {
+        self.knowledge.known_fields.len()
     }
 
     /// Get the knowledge for inspection.
