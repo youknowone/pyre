@@ -224,6 +224,221 @@ impl Default for ShortPreambleBuilder {
     }
 }
 
+/// Classification of preamble operations.
+///
+/// shortpreamble.py: PreambleOp, HeapOp, PureOp, LoopInvariantOp, GuardOp
+/// Each type determines how the operation is replayed when a bridge enters.
+#[derive(Clone, Debug)]
+pub enum PreambleOpKind {
+    /// shortpreamble.py: PreambleOp — base class for all preamble operations.
+    /// A generic preamble operation (guard or other).
+    Guard,
+    /// shortpreamble.py: HeapOp — a heap read (GETFIELD_GC, GETARRAYITEM_GC)
+    /// that was cached during the preamble. On bridge entry, the field/array
+    /// must be re-read to populate the cache.
+    Heap {
+        /// The field/array descriptor index.
+        descr_idx: u32,
+    },
+    /// shortpreamble.py: PureOp — a pure operation whose result was used
+    /// in the loop body. On bridge entry, the pure op is re-computed.
+    Pure,
+    /// shortpreamble.py: LoopInvariantOp — a CALL_LOOPINVARIANT that was
+    /// cached for the loop iteration. On bridge entry, re-execute the call.
+    LoopInvariant,
+}
+
+/// Extended preamble operation with classification.
+///
+/// shortpreamble.py: used by ShortBoxes and ExtendedShortPreambleBuilder
+/// to track which operations need replay and how.
+#[derive(Clone, Debug)]
+pub struct PreambleOp {
+    /// The operation to replay.
+    pub op: Op,
+    /// Classification of this operation.
+    pub kind: PreambleOpKind,
+    /// Index of the argument in the label (None if not a label arg).
+    pub label_arg_idx: Option<usize>,
+}
+
+/// shortpreamble.py: ShortBoxes — tracks which values from the preamble
+/// are "boxed" into the short preamble. Maps label arg indices to
+/// the operations that produce them.
+#[derive(Clone, Debug, Default)]
+pub struct ShortBoxes {
+    /// Operations that produce values for each label arg.
+    /// Index = label arg index, value = the PreambleOp producing it.
+    pub producers: Vec<Option<PreambleOp>>,
+    /// The number of label args.
+    pub num_label_args: usize,
+}
+
+impl ShortBoxes {
+    pub fn new(num_label_args: usize) -> Self {
+        ShortBoxes {
+            producers: vec![None; num_label_args],
+            num_label_args,
+        }
+    }
+
+    /// Record that `label_arg_idx` is produced by `op` with the given kind.
+    pub fn add_op(&mut self, label_arg_idx: usize, op: Op, kind: PreambleOpKind) {
+        if label_arg_idx < self.producers.len() {
+            self.producers[label_arg_idx] = Some(PreambleOp {
+                op,
+                kind,
+                label_arg_idx: Some(label_arg_idx),
+            });
+        }
+    }
+
+    /// Add a pure operation that produces a label arg value.
+    /// shortpreamble.py: sb.add_pure_op(op)
+    pub fn add_pure_op(&mut self, label_arg_idx: usize, op: Op) {
+        self.add_op(label_arg_idx, op, PreambleOpKind::Pure);
+    }
+
+    /// Add a heap read that produces a label arg value.
+    /// shortpreamble.py: sb.add_heap_op(op, descr)
+    pub fn add_heap_op(&mut self, label_arg_idx: usize, op: Op, descr_idx: u32) {
+        self.add_op(label_arg_idx, op, PreambleOpKind::Heap { descr_idx });
+    }
+
+    /// Add a loop-invariant call that produces a label arg value.
+    pub fn add_loopinvariant_op(&mut self, label_arg_idx: usize, op: Op) {
+        self.add_op(label_arg_idx, op, PreambleOpKind::LoopInvariant);
+    }
+
+    /// Get all operations that have producers (non-None).
+    pub fn non_empty_ops(&self) -> impl Iterator<Item = (usize, &PreambleOp)> {
+        self.producers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.as_ref().map(|op| (i, op)))
+    }
+}
+
+/// shortpreamble.py: ExtendedShortPreambleBuilder — extended builder
+/// that classifies operations into Guard/Heap/Pure/LoopInvariant types
+/// for more precise short preamble generation.
+pub struct ExtendedShortPreambleBuilder {
+    /// Guards from the preamble.
+    guards: Vec<PreambleOp>,
+    /// Heap reads from the preamble.
+    heap_ops: Vec<PreambleOp>,
+    /// Pure operations from the preamble.
+    pure_ops: Vec<PreambleOp>,
+    /// Loop-invariant calls from the preamble.
+    loopinvariant_ops: Vec<PreambleOp>,
+    /// Map from preamble OpRef to label arg index.
+    preamble_to_label_arg: HashMap<OpRef, usize>,
+}
+
+impl ExtendedShortPreambleBuilder {
+    pub fn new() -> Self {
+        ExtendedShortPreambleBuilder {
+            guards: Vec::new(),
+            heap_ops: Vec::new(),
+            pure_ops: Vec::new(),
+            loopinvariant_ops: Vec::new(),
+            preamble_to_label_arg: HashMap::new(),
+        }
+    }
+
+    /// Set the label args mapping.
+    pub fn set_label_args(&mut self, label_args: &[OpRef]) {
+        self.preamble_to_label_arg.clear();
+        for (i, opref) in label_args.iter().enumerate() {
+            self.preamble_to_label_arg.insert(*opref, i);
+        }
+    }
+
+    /// Add a guard operation.
+    pub fn add_guard(&mut self, op: Op) {
+        let label_arg_idx = self.preamble_to_label_arg.get(&op.pos).copied();
+        self.guards.push(PreambleOp {
+            op,
+            kind: PreambleOpKind::Guard,
+            label_arg_idx,
+        });
+    }
+
+    /// Add a pure operation.
+    pub fn add_pure_op(&mut self, op: Op) {
+        let label_arg_idx = self.preamble_to_label_arg.get(&op.pos).copied();
+        self.pure_ops.push(PreambleOp {
+            op,
+            kind: PreambleOpKind::Pure,
+            label_arg_idx,
+        });
+    }
+
+    /// Add a heap read.
+    pub fn add_heap_op(&mut self, op: Op, descr_idx: u32) {
+        let label_arg_idx = self.preamble_to_label_arg.get(&op.pos).copied();
+        self.heap_ops.push(PreambleOp {
+            op,
+            kind: PreambleOpKind::Heap { descr_idx },
+            label_arg_idx,
+        });
+    }
+
+    /// Add a loop-invariant call.
+    pub fn add_loopinvariant_op(&mut self, op: Op) {
+        let label_arg_idx = self.preamble_to_label_arg.get(&op.pos).copied();
+        self.loopinvariant_ops.push(PreambleOp {
+            op,
+            kind: PreambleOpKind::LoopInvariant,
+            label_arg_idx,
+        });
+    }
+
+    /// Total number of recorded preamble operations.
+    pub fn num_ops(&self) -> usize {
+        self.guards.len() + self.heap_ops.len() + self.pure_ops.len() + self.loopinvariant_ops.len()
+    }
+
+    /// Build into a ShortPreamble, emitting operations in order:
+    /// guards first, then heap reads, then pure ops, then loop-invariant.
+    pub fn build(self, exported_state: Option<VirtualState>) -> ShortPreamble {
+        let all_ops: Vec<PreambleOp> = self
+            .guards
+            .into_iter()
+            .chain(self.heap_ops)
+            .chain(self.pure_ops)
+            .chain(self.loopinvariant_ops)
+            .collect();
+
+        let entries = all_ops
+            .into_iter()
+            .map(|preamble_op| {
+                let mut arg_mapping = Vec::new();
+                for (arg_pos, arg_ref) in preamble_op.op.args.iter().enumerate() {
+                    if let Some(&label_idx) = self.preamble_to_label_arg.get(arg_ref) {
+                        arg_mapping.push((arg_pos, label_idx));
+                    }
+                }
+                ShortPreambleOp {
+                    op: preamble_op.op,
+                    arg_mapping,
+                }
+            })
+            .collect();
+
+        ShortPreamble {
+            ops: entries,
+            exported_state,
+        }
+    }
+}
+
+impl Default for ExtendedShortPreambleBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Extract guards from a peeled trace's preamble section.
 ///
 /// Given a peeled trace (output of OptUnroll), identifies the preamble

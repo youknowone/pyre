@@ -85,32 +85,44 @@ impl RecentPureOps {
 
 /// The OptPure optimization pass.
 ///
+/// pure.py: OptPure class.
 /// For pure operations (is_always_pure), checks if the same operation was
 /// computed before. If yes, replaces the current op with the cached result
 /// (CSE). If no, records the operation for future lookups.
 ///
 /// Also handles:
 /// - CALL_PURE -> CALL demotion when arguments aren't all constant.
-/// - CALL_LOOPINVARIANT_* caching: the result of a loop-invariant call is
-///   cached for the entire loop iteration (unlike pure ops, no LRU eviction).
-///   Translated from rpython/jit/metainterp/optimizeopt/pure.py
-///   optimize_CALL_LOOPINVARIANT_I/R/F/N.
+/// - CALL_LOOPINVARIANT_* caching (result persists for entire loop iteration).
+/// - OVF operation postponement (INT_ADD_OVF etc. are deferred until GUARD_NO_OVERFLOW).
+/// - GUARD_NO_EXCEPTION removal after eliminated CALL_PURE.
+/// - RECORD_KNOWN_RESULT for pre-recorded call_pure results.
 pub struct OptPure {
     cache: RecentPureOps,
     /// Per-loop-iteration cache for CALL_LOOPINVARIANT_* results.
-    /// Key: (func_ptr_opref, arg0, arg1, ...) → result OpRef.
-    /// This cache persists across the whole loop body without eviction,
-    /// as loop-invariant calls produce the same result for one iteration.
     loopinvariant_cache: HashMap<PureOpKey, OpRef>,
+    /// Postponed OVF operation: INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF.
+    /// pure.py: postponed_op — deferred until GUARD_NO_OVERFLOW is seen.
+    postponed_op: Option<Op>,
+    /// Indices into new_operations of emitted CALL_PURE ops.
+    /// pure.py: call_pure_positions — tracked for short preamble generation.
+    call_pure_positions: Vec<usize>,
+    /// Whether the last emitted operation was removed (for GUARD_NO_EXCEPTION elimination).
+    /// pure.py: last_emitted_operation is REMOVED check.
+    last_emitted_was_removed: bool,
+    /// Pre-recorded CALL_PURE results from RECORD_KNOWN_RESULT.
+    /// pure.py: known_result_call_pure
+    known_result_call_pure: Vec<(PureOpKey, OpRef)>,
 }
 
 impl OptPure {
     pub fn new() -> Self {
         OptPure {
-            // Aheui traces routinely repeat the same comparisons hundreds of
-            // ops apart; a tiny ring buffer misses most of those CSE wins.
             cache: RecentPureOps::new(4096),
             loopinvariant_cache: HashMap::new(),
+            postponed_op: None,
+            call_pure_positions: Vec::new(),
+            last_emitted_was_removed: false,
+            known_result_call_pure: Vec::new(),
         }
     }
 
@@ -155,11 +167,57 @@ impl OptPure {
         OptimizationResult::Emit(new_op)
     }
 
+    /// Record a pure operation in the CSE cache.
+    /// pure.py: pure(opnum, op)
+    pub fn pure(&mut self, op: &Op) {
+        let key = PureOpKey::from_op(op);
+        self.cache.insert(key, op.pos);
+    }
+
+    /// Record a pure operation with explicit args.
+    /// pure.py: pure_from_args(opnum, args, op, descr=None)
+    pub fn pure_from_args(&mut self, opcode: OpCode, args: &[OpRef], result: OpRef) {
+        let key = PureOpKey {
+            opcode,
+            args: args.to_vec(),
+        };
+        self.cache.insert(key, result);
+    }
+
+    /// Look up a previously recorded pure operation result.
+    /// pure.py: get_pure_result(op)
+    pub fn get_pure_result(&self, op: &Op) -> Option<OpRef> {
+        let key = PureOpKey::from_op(op);
+        self.lookup_pure(&key)
+    }
+
+    /// Record a CALL_PURE result from a RECORD_KNOWN_RESULT hint.
+    /// pure.py: optimize_RECORD_KNOWN_RESULT
+    pub fn record_known_result(&mut self, args: &[OpRef], result: OpRef) {
+        let key = PureOpKey {
+            opcode: OpCode::CallPureI,
+            args: args.to_vec(),
+        };
+        self.known_result_call_pure.push((key, result));
+    }
+
+    /// Get the positions of emitted CALL_PURE ops (for short preamble generation).
+    /// pure.py: call_pure_positions
+    pub fn call_pure_positions(&self) -> &[usize] {
+        &self.call_pure_positions
+    }
+
+    /// Check known_result_call_pure for a matching call.
+    fn lookup_known_result(&self, key: &PureOpKey) -> Option<OpRef> {
+        for (k, result) in &self.known_result_call_pure {
+            if k.args == key.args {
+                return Some(*result);
+            }
+        }
+        None
+    }
+
     /// Handle CALL_LOOPINVARIANT_*: cache the result for the loop iteration.
-    ///
-    /// If the same call (same function + arguments) was already seen, replace
-    /// with the cached result. Otherwise, emit and cache the result.
-    /// The call is demoted to a plain CALL_* for the backend.
     fn handle_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let key = PureOpKey::from_op(op);
 
@@ -238,53 +296,134 @@ impl Default for OptPure {
 
 impl Optimization for OptPure {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        self.last_emitted_was_removed = false;
+
+        // pure.py: OVF operation postponement.
+        // INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF are deferred until we see
+        // GUARD_NO_OVERFLOW, so we can try CSE on the OVF op + guard pair.
+        if op.opcode.is_ovf() {
+            self.postponed_op = Some(op.clone());
+            return OptimizationResult::Remove;
+        }
+
+        // Handle the postponed OVF op when we see GUARD_NO_OVERFLOW.
+        if let Some(postponed) = self.postponed_op.take() {
+            if op.opcode == OpCode::GuardNoOverflow {
+                // Try constant folding on the OVF op.
+                if let Some(folded) = try_constant_fold_value(&postponed, ctx) {
+                    ctx.find_or_record_constant_int(postponed.pos, folded);
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove; // guard also removed
+                }
+
+                // Try CSE on the OVF op.
+                let key = PureOpKey::from_op(&postponed);
+                if let Some(cached_ref) = self.lookup_pure(&key) {
+                    let cached_ref = ctx.get_replacement(cached_ref);
+                    ctx.replace_op(postponed.pos, cached_ref);
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove; // guard also removed
+                }
+
+                // Record and emit both the OVF op and the guard.
+                self.cache.insert(key, postponed.pos);
+                ctx.emit(postponed);
+                return OptimizationResult::PassOn; // guard passes through
+            } else {
+                // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
+                ctx.emit(postponed);
+            }
+        }
+
+        // pure.py: GUARD_NO_EXCEPTION — remove if last emitted was removed
+        // (CALL_PURE was constant-folded or CSE'd away).
+        if op.opcode == OpCode::GuardNoException {
+            if self.last_emitted_was_removed {
+                return OptimizationResult::Remove;
+            }
+            return OptimizationResult::PassOn;
+        }
+
+        // pure.py: RECORD_KNOWN_RESULT — record for later CALL_PURE lookup.
+        if op.opcode == OpCode::RecordKnownResult {
+            if op.num_args() >= 2 {
+                let result = op.arg(0);
+                let key = PureOpKey {
+                    opcode: OpCode::CallPureI,
+                    args: op.args[1..].to_vec(),
+                };
+                self.known_result_call_pure.push((key, result));
+            }
+            return OptimizationResult::Remove;
+        }
+
         if op.opcode.is_always_pure() {
-            // RPython pure.py: constant folding — if all args are constants,
-            // compute the result at optimization time and replace with constant.
+            // Constant folding: all args are constants → compute at opt time.
             if let Some(folded_value) = try_constant_fold_value(op, ctx) {
-                // Find or create a constant OpRef for this value.
-                // Check if any existing constant matches.
                 let const_ref = ctx.find_or_record_constant_int(op.pos, folded_value);
                 if const_ref != op.pos {
                     ctx.replace_op(op.pos, const_ref);
                 }
+                self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
             let key = PureOpKey::from_op(op);
 
-            // CSE: did we do the exact same operation already?
+            // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key) {
                 let cached_ref = ctx.get_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
+                self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
-            // Record this operation for future lookups.
             self.cache.insert(key, op.pos);
             return OptimizationResult::PassOn;
         }
 
-        // CALL_PURE_* -> CSE first, then demote to plain CALL_*
-        // RPython pure.py: call_pure results are cached for CSE across the trace.
+        // CALL_PURE_* -> CSE or known_result lookup, then demote to CALL_*.
         if op.opcode.is_call_pure() {
             let key = PureOpKey::from_op(op);
-            // CSE: same call_pure with same args → reuse result
+
+            // CSE: same call_pure with same args → reuse result.
             if let Some(cached_ref) = self.lookup_pure(&key) {
                 let cached_ref = ctx.get_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
+                self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
+
+            // Check RECORD_KNOWN_RESULT cache.
+            if let Some(result_ref) = self.lookup_known_result(&key) {
+                let result_ref = ctx.get_replacement(result_ref);
+                ctx.replace_op(op.pos, result_ref);
+                self.last_emitted_was_removed = true;
+                return OptimizationResult::Remove;
+            }
+
             self.cache.insert(key, op.pos);
+            // Track position for short preamble generation.
+            self.call_pure_positions.push(ctx.new_operations.len());
             return self.handle_call_pure(op);
         }
 
-        // CALL_LOOPINVARIANT_* -> cache result, demote to CALL_*
+        // CALL_LOOPINVARIANT_* -> cache result, demote to CALL_*.
         if op.opcode.is_call_loopinvariant() {
             return self.handle_call_loopinvariant(op, ctx);
         }
 
         OptimizationResult::PassOn
+    }
+
+    fn setup(&mut self) {
+        let limit = self.cache.order.len();
+        self.cache = RecentPureOps::new(limit);
+        self.loopinvariant_cache.clear();
+        self.postponed_op = None;
+        self.call_pure_positions.clear();
+        self.last_emitted_was_removed = false;
+        self.known_result_call_pure.clear();
     }
 
     fn name(&self) -> &'static str {
@@ -502,6 +641,10 @@ mod tests {
         opt.add_pass(Box::new(OptPure {
             cache: RecentPureOps::new(16),
             loopinvariant_cache: HashMap::new(),
+            postponed_op: None,
+            call_pure_positions: Vec::new(),
+            last_emitted_was_removed: false,
+            known_result_call_pure: Vec::new(),
         }));
         let result = opt.optimize(&ops);
 

@@ -68,11 +68,65 @@ impl JitCounter {
         }
     }
 
-    /// Decay all counters (halve them). Called periodically.
+    /// Decay all counters by the given factor (0.0 = clear, 1.0 = keep).
+    /// counter.py: decay_all_counters with configurable decay factor.
+    /// For backwards compatibility, the default halves all counters.
     pub fn decay_all_counters(&mut self) {
+        self.decay_all_counters_by(0.5);
+    }
+
+    /// Decay all counters by a multiplicative factor.
+    /// counter.py: set_decay(decay) — accepts 0..1000, computes per-call multiplier.
+    pub fn decay_all_counters_by(&mut self, factor: f64) {
         for entry in &mut self.table {
-            entry.1 /= 2;
+            entry.1 = (entry.1 as f64 * factor) as u32;
         }
+    }
+
+    /// Get the current count for a hash (for testing/introspection).
+    /// counter.py: get() — returns the current count.
+    pub fn get(&self, hash: u64) -> u32 {
+        let base = (hash as usize) & TABLE_MASK;
+        for i in 0..ASSOCIATIVITY {
+            let idx = (base + i) & TABLE_MASK;
+            if self.table[idx].0 == hash {
+                return self.table[idx].1;
+            }
+        }
+        0
+    }
+
+    /// Install a specific count for a hash (for bridge eagerness).
+    /// counter.py: install_new_cell(hash, count)
+    pub fn install(&mut self, hash: u64, count: u32) {
+        let base = (hash as usize) & TABLE_MASK;
+        // Find existing or lowest entry
+        for i in 0..ASSOCIATIVITY {
+            let idx = (base + i) & TABLE_MASK;
+            if self.table[idx].0 == hash {
+                self.table[idx].1 = count;
+                return;
+            }
+        }
+        // Not found — evict lowest
+        let mut min_idx = base;
+        let mut min_count = self.table[base].1;
+        for i in 1..ASSOCIATIVITY {
+            let idx = (base + i) & TABLE_MASK;
+            if self.table[idx].1 < min_count {
+                min_count = self.table[idx].1;
+                min_idx = idx;
+            }
+        }
+        self.table[min_idx] = (hash, count);
+    }
+
+    /// Compute the threshold for bridge compilation based on guard eagerness.
+    /// counter.py: compute_threshold(scale)
+    /// Returns `threshold * scale` capped at threshold.
+    pub fn compute_threshold(&self, scale: f64) -> u32 {
+        let result = (self.threshold as f64 * scale) as u32;
+        result.min(self.threshold)
     }
 
     /// Get the current threshold.
@@ -83,6 +137,11 @@ impl JitCounter {
     /// Set the threshold.
     pub fn set_threshold(&mut self, threshold: u32) {
         self.threshold = threshold;
+    }
+
+    /// Total number of active entries (non-zero counts).
+    pub fn num_active(&self) -> usize {
+        self.table.iter().filter(|(_, c)| *c > 0).count()
     }
 }
 
