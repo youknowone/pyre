@@ -711,4 +711,38 @@ mod tests {
             ),
         }
     }
+
+    #[test]
+    fn test_serialize_deserialize_roundtrip() {
+        let mut k = BridgeKnowledge::new();
+        k.known_constants.insert(OpRef(10), 42);
+        k.known_constants.insert(OpRef(20), -1);
+        k.known_nonnull.push(OpRef(30));
+        k.known_classes.insert(OpRef(40), GcRef(0x1000));
+        k.known_bounds.insert(OpRef(50), (0, 100));
+        k.add_known_field(OpRef(60), 5, OpRef(70));
+        k.add_known_arrayitem(OpRef(80), 3, 7, OpRef(90));
+
+        let serialized = k.serialize();
+        let deserialized = BridgeKnowledge::deserialize(&serialized).unwrap();
+
+        assert_eq!(deserialized.known_constants.len(), 2);
+        assert_eq!(deserialized.known_constants[&OpRef(10)], 42);
+        assert_eq!(deserialized.known_constants[&OpRef(20)], -1);
+        assert_eq!(deserialized.known_nonnull.len(), 1);
+        assert_eq!(deserialized.known_classes.len(), 1);
+        assert_eq!(deserialized.known_bounds.len(), 1);
+        assert_eq!(deserialized.known_fields.len(), 1);
+        assert_eq!(deserialized.known_arrayitems.len(), 1);
+        assert_eq!(deserialized.num_facts(), k.num_facts());
+    }
+
+    #[test]
+    fn test_serialize_empty() {
+        let k = BridgeKnowledge::new();
+        assert!(k.is_empty());
+        let serialized = k.serialize();
+        let deserialized = BridgeKnowledge::deserialize(&serialized).unwrap();
+        assert!(deserialized.is_empty());
+    }
 }
