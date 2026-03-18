@@ -781,4 +781,66 @@ mod tests {
         // IntAdd with remapped args
         assert_eq!(instantiated[2].opcode, OpCode::IntAdd);
     }
+
+    #[test]
+    fn test_apply_to_bridge() {
+        let sp = ShortPreamble {
+            ops: vec![ShortPreambleOp {
+                op: Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+                arg_mapping: vec![(0, 0)],
+            }],
+            exported_state: None,
+        };
+
+        let bridge_ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(500), OpRef(501)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+
+        let result = sp.apply_to_bridge(&[OpRef(500)], &bridge_ops);
+        // Short preamble guard + bridge ops
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::GuardNonnull);
+        assert_eq!(result[1].opcode, OpCode::IntAdd);
+        assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_num_guards_and_pure_ops() {
+        let sp = ShortPreamble {
+            ops: vec![
+                ShortPreambleOp {
+                    op: Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+                    arg_mapping: vec![(0, 0)],
+                },
+                ShortPreambleOp {
+                    op: Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+                    arg_mapping: vec![(0, 0), (1, 1)],
+                },
+                ShortPreambleOp {
+                    op: Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+                    arg_mapping: vec![(0, 0)],
+                },
+            ],
+            exported_state: None,
+        };
+
+        assert_eq!(sp.num_guards(), 2);
+        assert_eq!(sp.num_pure_ops(), 1);
+    }
+
+    #[test]
+    fn test_build_from_preamble_and_label() {
+        let mut preamble = vec![
+            Op::new(OpCode::GuardTrue, &[OpRef(100)]),
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+        ];
+        assign_positions(&mut preamble, 0);
+
+        let label_args = &[OpRef(100), OpRef(101)];
+        let sp = build_from_preamble_and_label(&preamble, label_args, None);
+
+        // Guard + pure IntAdd
+        assert_eq!(sp.len(), 2);
+    }
 }
