@@ -280,11 +280,17 @@ impl VirtualStateInfo {
 pub struct VirtualState {
     /// Abstract info for each loop-carried variable, in order matching Label/Jump args.
     pub state: Vec<VirtualStateInfo>,
+    /// virtualstate.py: renum — maps virtual OpRef to numbering index.
+    /// Used to ensure consistent virtual identity across loop iterations.
+    pub renum: std::collections::HashMap<OpRef, usize>,
 }
 
 impl VirtualState {
     pub fn new(state: Vec<VirtualStateInfo>) -> Self {
-        VirtualState { state }
+        VirtualState {
+            state,
+            renum: std::collections::HashMap::new(),
+        }
     }
 
     /// Number of non-virtual values (need concrete OpRefs at loop entry).

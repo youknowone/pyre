@@ -303,6 +303,10 @@ impl OptString {
             self.known_lengths.insert(op.pos, op.pos);
             return OptimizationResult::Remove;
         }
+        // vstring.py: even if not virtual, cache the STRLEN result
+        // so subsequent STRLEN on the same string can be eliminated
+        // (via heap.rs STRLEN caching or here).
+        self.known_lengths.insert(str_ref, op.pos);
         OptimizationResult::PassOn
     }
 
