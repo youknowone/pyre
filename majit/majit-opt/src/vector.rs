@@ -1053,4 +1053,72 @@ mod tests {
         let sched = schedule_operations(&graph);
         assert!(sched.is_empty());
     }
+
+    #[test]
+    fn test_user_loop_heuristic_too_small() {
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        assert!(!VectorizingOptimizer::user_loop_heuristic(&ops));
+    }
+
+    #[test]
+    fn test_user_loop_heuristic_no_vectorizable() {
+        let ops = vec![
+            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::GuardFalse, &[OpRef(1)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(2)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        assert!(!VectorizingOptimizer::user_loop_heuristic(&ops));
+    }
+
+    #[test]
+    fn test_pack_set_merge() {
+        let mut ps = PackSet::new();
+        ps.add_pack(PackGroup {
+            scalar_opcode: OpCode::IntAdd,
+            vector_opcode: OpCode::VecIntAdd,
+            members: vec![0, 1],
+        });
+        ps.add_pack(PackGroup {
+            scalar_opcode: OpCode::IntAdd,
+            vector_opcode: OpCode::VecIntAdd,
+            members: vec![2, 3],
+        });
+        assert_eq!(ps.num_packs(), 2);
+        assert_eq!(ps.total_ops(), 4);
+
+        ps.try_merge_packs();
+        assert_eq!(ps.num_packs(), 1);
+        assert_eq!(ps.total_ops(), 4);
+    }
+
+    #[test]
+    fn test_generic_cost_model() {
+        let model = GenericCostModel::new();
+        // Memory ops are more expensive
+        assert!(model.op_cost(OpCode::GetarrayitemGcI) > model.op_cost(OpCode::IntAdd));
+        // Float div is most expensive
+        assert!(model.op_cost(OpCode::FloatTrueDiv) >= model.op_cost(OpCode::FloatAdd));
+    }
+
+    #[test]
+    fn test_guard_analysis_hoistable() {
+        let ops = vec![
+            Op::new(OpCode::GuardTrue, &[OpRef(100)]),  // loop-invariant (100 not produced)
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardTrue, &[OpRef(1)]),     // body-dependent (1 = IntAdd result)
+        ];
+        let mut positioned = ops;
+        for (i, op) in positioned.iter_mut().enumerate() {
+            op.pos = OpRef(i as u32);
+        }
+        let analysis = GuardAnalysis::analyze(&positioned);
+        assert_eq!(analysis.hoistable.len(), 1);
+        assert_eq!(analysis.hoistable[0], 0);
+        assert_eq!(analysis.body_guards.len(), 1);
+        assert_eq!(analysis.body_guards[0], 2);
+    }
 }
