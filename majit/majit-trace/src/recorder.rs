@@ -218,6 +218,36 @@ impl Trace {
     pub fn is_finalized(&self) -> bool {
         self.finalized
     }
+
+    /// Number of guards recorded so far.
+    pub fn num_guards(&self) -> usize {
+        self.ops.iter().filter(|op| op.opcode.is_guard()).count()
+    }
+
+    /// Get the last recorded operation, if any.
+    pub fn last_op(&self) -> Option<&Op> {
+        self.ops.last()
+    }
+
+    /// Get an operation by its OpRef position.
+    pub fn get_op_by_pos(&self, pos: OpRef) -> Option<&Op> {
+        self.ops.iter().find(|op| op.pos == pos)
+    }
+
+    /// Remaining capacity before the trace is too long.
+    pub fn remaining_capacity(&self) -> usize {
+        TRACE_LIMIT.saturating_sub(self.ops.len())
+    }
+
+    /// Replace an argument in the last recorded operation.
+    /// Used by the tracer to fix up arguments after recording.
+    pub fn replace_last_arg(&mut self, arg_index: usize, new_ref: OpRef) {
+        if let Some(last) = self.ops.last_mut() {
+            if arg_index < last.args.len() {
+                last.args[arg_index] = new_ref;
+            }
+        }
+    }
 }
 
 impl Default for Trace {
