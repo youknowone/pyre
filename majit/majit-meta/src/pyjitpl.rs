@@ -4435,10 +4435,10 @@ mod tests {
         }
 
         fn effect_info(&self) -> &EffectInfo {
-            static EFFECT_INFO: EffectInfo = EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
-                oopspec_index: majit_ir::OopSpecIndex::None,
-            };
+            static EFFECT_INFO: EffectInfo = EffectInfo::const_new(
+                ExtraEffect::CanRaise,
+                majit_ir::OopSpecIndex::None,
+            );
             &EFFECT_INFO
         }
     }

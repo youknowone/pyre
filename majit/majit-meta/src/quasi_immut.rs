@@ -10,6 +10,10 @@ use std::sync::{Arc, Weak};
 pub struct QuasiImmut {
     /// Weak references to JitCellToken invalidation flags.
     watchers: Vec<Weak<AtomicBool>>,
+    /// quasiimmut.py: compress_limit — threshold for compressing dead refs.
+    compress_limit: usize,
+    /// Statistics: total number of invalidations performed.
+    pub invalidation_count: u64,
 }
 
 impl std::fmt::Debug for QuasiImmut {
@@ -24,25 +28,39 @@ impl QuasiImmut {
     pub fn new() -> Self {
         Self {
             watchers: Vec::new(),
+            compress_limit: 30,
+            invalidation_count: 0,
         }
     }
 
     /// Register a compiled loop's invalidation flag.
-    /// Called after compile_loop() when the trace contains QUASIIMMUT_FIELD.
+    /// quasiimmut.py: register_loop_token(wref)
     pub fn register(&mut self, flag: &Arc<AtomicBool>) {
+        if self.watchers.len() > self.compress_limit {
+            self.compress();
+        }
         self.watchers.push(Arc::downgrade(flag));
     }
 
+    /// quasiimmut.py: compress_looptokens_list()
+    /// Remove dead weak references and update compress_limit.
+    pub fn compress(&mut self) {
+        self.watchers.retain(|w| w.strong_count() > 0);
+        self.compress_limit = (self.watchers.len() + 15) * 2;
+    }
+
     /// Invalidate all registered loops.
-    /// Called when the quasi-immutable field's value changes.
+    /// quasiimmut.py: invalidate(descr_repr)
     pub fn invalidate(&mut self) {
+        let mut invalidated = 0u64;
         for watcher in &self.watchers {
             if let Some(flag) = watcher.upgrade() {
+                invalidated += 1;
                 flag.store(true, Ordering::Release);
             }
         }
-        // Remove dead weak references
-        self.watchers.retain(|w| w.strong_count() > 0);
+        self.invalidation_count += invalidated;
+        self.watchers.clear();
     }
 
     /// Number of live watchers.
@@ -115,6 +133,35 @@ impl QuasiImmutDescr {
     pub fn get_parent_descr(&self) -> u32 {
         self.field_descr_idx
     }
+
+    /// quasiimmut.py: get_index()
+    /// Return the descriptor index (delegates to field_descr_idx).
+    pub fn get_index(&self) -> u32 {
+        self.field_descr_idx
+    }
+
+    /// quasiimmut.py: get_current_constant_fieldvalue()
+    ///
+    /// Read the current value of the quasi-immutable field from the
+    /// concrete object. Returns the raw value at the field offset.
+    pub fn get_current_constant_fieldvalue(&self, field_offset: usize) -> i64 {
+        if self.obj_ref == 0 {
+            return 0;
+        }
+        unsafe { *((self.obj_ref as *const u8).add(field_offset) as *const i64) }
+    }
+
+    /// quasiimmut.py: is_still_valid_for(structconst)
+    ///
+    /// Check if this descriptor is still valid for the given object:
+    /// same object identity AND same field value as cached.
+    pub fn is_still_valid_for(&self, struct_ref: u64, field_offset: usize) -> bool {
+        if self.obj_ref != struct_ref {
+            return false;
+        }
+        let current = self.get_current_constant_fieldvalue(field_offset);
+        current == self.cached_value
+    }
 }
 
 /// quasiimmut.py: do_force_quasi_immutable(cpu, p, mutatefielddescr)
@@ -160,9 +207,14 @@ mod tests {
         }
         // flag2 is dropped
 
+        // quasiimmut.py: compress_looptokens_list() removes dead refs
+        qi.compress();
+        assert_eq!(qi.num_watchers(), 1); // dead ref removed
+
         qi.invalidate();
         assert!(flag1.load(Ordering::Acquire));
-        assert_eq!(qi.num_watchers(), 1); // dead ref removed
+        // quasiimmut.py: invalidate() clears the list
+        assert_eq!(qi.num_watchers(), 0);
     }
 
     #[test]
@@ -231,8 +283,9 @@ mod tests {
         qi.register(&f2);
         assert_eq!(qi.num_watchers(), 2);
         qi.invalidate();
-        // Watchers are still alive (flags are still held).
-        assert_eq!(qi.num_watchers(), 2);
+        // quasiimmut.py: invalidate() clears the watcher list.
+        assert_eq!(qi.num_watchers(), 0);
+        assert_eq!(qi.invalidation_count, 2);
     }
 
     #[test]
