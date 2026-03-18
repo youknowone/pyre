@@ -93,6 +93,8 @@ pub struct OptHeap {
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
     /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
     quasi_immut_cache: HashMap<FieldKey, OpRef>,
+    /// heap.py: cached array lengths.
+    cached_arraylens: HashMap<(OpRef, u32), OpRef>,
 }
 
 impl OptHeap {
@@ -111,6 +113,7 @@ impl OptHeap {
             loopinvariant_cache: HashMap::new(),
             last_call_did_not_raise: false,
             quasi_immut_cache: HashMap::new(),
+            cached_arraylens: HashMap::new(),
         }
     }
 
@@ -807,6 +810,7 @@ impl Optimization for OptHeap {
         self.loopinvariant_cache.clear();
         self.last_call_did_not_raise = false;
         self.quasi_immut_cache.clear();
+        self.cached_arraylens.clear();
     }
 
     fn flush(&mut self) {
@@ -827,6 +831,7 @@ impl Optimization for OptHeap {
         self.loopinvariant_cache.clear();
         self.last_call_did_not_raise = false;
         self.quasi_immut_cache.clear();
+        self.cached_arraylens.clear();
     }
 
     /// heap.py: produce_potential_short_preamble_ops(sb)
