@@ -745,8 +745,24 @@ pub fn py_invert(a: PyObjectRef) -> PyResult {
 pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     unsafe {
         if is_list(obj) {
+            if is_slice(index) {
+                let len = w_list_len(obj) as i64;
+                let start = w_slice_get_start(index);
+                let stop = w_slice_get_stop(index);
+                let s = if is_none(start) { 0 } else { w_int_get_value(start) };
+                let e = if is_none(stop) { len } else { w_int_get_value(stop) };
+                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                let mut items = Vec::new();
+                for i in s..e {
+                    if let Some(v) = w_list_getitem(obj, i as i64) {
+                        items.push(v);
+                    }
+                }
+                return Ok(w_list_new(items));
+            }
             if !is_int(index) {
-                return Err(PyError::type_error("list indices must be integers"));
+                return Err(PyError::type_error("list indices must be integers or slices"));
             }
             let idx = w_int_get_value(index);
             match w_list_getitem(obj, idx) {

@@ -520,6 +520,20 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── BuildSlice ──
+    // CPython 3.13: BUILD_SLICE creates a slice object from 2 or 3 stack items
+    fn build_slice(&mut self, argc: pyre_bytecode::bytecode::BuildSliceArgCount) -> Result<(), Self::Error> {
+        use pyre_bytecode::bytecode::BuildSliceArgCount;
+        let step = match argc {
+            BuildSliceArgCount::Three => self.pop(),
+            BuildSliceArgCount::Two => pyre_object::w_none(),
+        };
+        let stop = self.pop();
+        let start = self.pop();
+        self.push(pyre_object::w_slice_new(start, stop, step));
+        Ok(())
+    }
+
     // ── BinarySlice (a[b:c]) ──
     // PyPy: BINARY_SUBSCR with slice; CPython 3.13: BINARY_SLICE
     fn binary_slice(&mut self) -> Result<(), Self::Error> {
@@ -1721,7 +1735,6 @@ result = f.x + g.x";
     }
 
     #[test]
-    #[ignore = "needs BUILD_SLICE implementation"]
     fn test_list_slice() {
         let source = "x = [1, 2, 3, 4, 5]\nresult = x[1:3]";
         let (res, frame) = run_exec_frame(source);
