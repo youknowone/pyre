@@ -47,6 +47,11 @@ pub struct HeapCache {
     /// heapcache.py: loop-invariant call result cache.
     /// (func_ptr, args_hash) → result OpRef.
     loopinvariant_call_cache: HashMap<(OpRef, u64), OpRef>,
+
+    /// heapcache.py: escape dependencies.
+    /// When value V is stored into container C via SETFIELD_GC(C, V),
+    /// record V → C. If V later escapes, C must also be marked escaped.
+    escape_deps: HashMap<OpRef, Vec<OpRef>>,
 }
 
 impl HeapCache {
@@ -63,6 +68,7 @@ impl HeapCache {
             cached_arraylen: HashMap::new(),
             likely_virtual: HashSet::new(),
             loopinvariant_call_cache: HashMap::new(),
+            escape_deps: HashMap::new(),
         }
     }
 
@@ -129,6 +135,20 @@ impl HeapCache {
         self.is_unescaped.remove(&opref);
     }
 
+    /// heapcache.py: _escape_box — recursively escape an object and
+    /// all values stored into it via SETFIELD_GC.
+    pub fn mark_escaped_recursive(&mut self, opref: OpRef) {
+        if !self.is_unescaped.remove(&opref) {
+            return; // already escaped or not tracked
+        }
+        // Propagate escape to all values stored in this object's fields.
+        if let Some(deps) = self.escape_deps.remove(&opref) {
+            for dep in deps {
+                self.mark_escaped_recursive(dep);
+            }
+        }
+    }
+
     /// Record that the class of an object is now known (e.g., after GUARD_CLASS).
     pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
         self.known_class.insert(opref, class);
@@ -164,9 +184,21 @@ impl HeapCache {
             self.new_object(result);
             return;
         }
-        // heapcache.py: SETFIELD_GC tracking — the written value escapes.
+        // heapcache.py: SETFIELD_GC tracking.
+        // The written value becomes reachable from the container.
+        // If the container later escapes, the value also escapes.
         if opcode == OpCode::SetfieldGc && args.len() >= 2 {
-            self.mark_escaped(args[1]);
+            let container = args[0];
+            let value = args[1];
+            // Record dependency: if container escapes, value escapes too.
+            self.escape_deps
+                .entry(container)
+                .or_default()
+                .push(value);
+            // If container is already escaped, mark value as escaped now.
+            if !self.is_unescaped.contains(&container) {
+                self.mark_escaped_recursive(value);
+            }
         }
         // heapcache.py: GUARD_CLASS/GUARD_NONNULL_CLASS → known class.
         if opcode == OpCode::GuardClass || opcode == OpCode::GuardNonnullClass {
@@ -309,6 +341,7 @@ impl HeapCache {
         self.cached_arraylen.clear();
         self.likely_virtual.clear();
         self.loopinvariant_call_cache.clear();
+        self.escape_deps.clear();
     }
 
     /// Reset but keep likely-virtual markers.
