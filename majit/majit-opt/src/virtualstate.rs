@@ -16,6 +16,29 @@ use std::collections::HashMap;
 
 use majit_ir::{DescrRef, GcRef, OpRef, Value};
 
+/// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
+/// are incompatible and cannot be merged for bridge compilation.
+#[derive(Clone, Debug)]
+pub struct VirtualStatesCantMatch {
+    pub msg: String,
+}
+
+impl VirtualStatesCantMatch {
+    pub fn new(msg: &str) -> Self {
+        VirtualStatesCantMatch {
+            msg: msg.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for VirtualStatesCantMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VirtualStatesCantMatch: {}", self.msg)
+    }
+}
+
+impl std::error::Error for VirtualStatesCantMatch {}
+
 use crate::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
     VirtualStructInfo,
