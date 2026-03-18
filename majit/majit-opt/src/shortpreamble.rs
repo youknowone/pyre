@@ -463,6 +463,39 @@ impl Default for ExtendedShortPreambleBuilder {
     }
 }
 
+/// shortpreamble.py: CompoundOp — a short op that is composed of
+/// two sub-operations (e.g., getfield followed by getarrayitem).
+#[derive(Clone, Debug)]
+pub struct CompoundOp {
+    /// The result OpRef of the compound operation.
+    pub res: OpRef,
+    /// First sub-operation.
+    pub one: Box<PreambleOp>,
+    /// Second sub-operation (depends on the result of `one`).
+    pub two: Box<PreambleOp>,
+}
+
+/// shortpreamble.py: ShortInputArg — a short op that represents
+/// a label input argument (no actual operation needed, just maps
+/// a preamble value to a label arg position).
+#[derive(Clone, Debug)]
+pub struct ShortInputArg {
+    /// The result OpRef.
+    pub res: OpRef,
+    /// The preamble operation that produces this value.
+    pub preamble_op: Op,
+}
+
+/// shortpreamble.py: ProducedShortOp — wraps a short op with its
+/// preamble counterpart for emission during bridge compilation.
+#[derive(Clone, Debug)]
+pub struct ProducedShortOp {
+    /// The short op classification.
+    pub kind: PreambleOpKind,
+    /// The preamble operation to replay.
+    pub preamble_op: Op,
+}
+
 /// shortpreamble.py: build short preamble from optimizer state.
 /// Called after preamble optimization is complete.
 /// Collects guards + pure ops from the optimized preamble and
