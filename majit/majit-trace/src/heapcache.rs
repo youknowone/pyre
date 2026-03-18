@@ -535,4 +535,84 @@ mod tests {
         assert_eq!(cache.getfield_cached(obj, 1), Some(OpRef(30)));
         assert_eq!(cache.getfield_cached(obj, 2), Some(OpRef(20)));
     }
+
+    #[test]
+    fn test_recursive_escape() {
+        let mut cache = HeapCache::new();
+        let container = OpRef(0);
+        let value = OpRef(1);
+        let inner = OpRef(2);
+
+        cache.new_object(container);
+        cache.new_object(value);
+        cache.new_object(inner);
+
+        // SETFIELD_GC(container, value): value stored in container
+        cache.notify_op(OpCode::SetfieldGc, &[container, value], OpRef::NONE);
+        // SETFIELD_GC(value, inner): inner stored in value
+        cache.notify_op(OpCode::SetfieldGc, &[value, inner], OpRef::NONE);
+
+        // Container is still unescaped
+        assert!(cache.is_unescaped(container));
+        // Value is still unescaped (container is unescaped)
+        assert!(cache.is_unescaped(value));
+
+        // Now mark container as escaped
+        cache.mark_escaped_recursive(container);
+        assert!(!cache.is_unescaped(container));
+        // value should also be escaped (stored in container)
+        assert!(!cache.is_unescaped(value));
+    }
+
+    #[test]
+    fn test_nullity_tracking() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef(10);
+
+        assert_eq!(cache.is_nullity_known(obj), None);
+        cache.nullity_now_known(obj, true);
+        assert_eq!(cache.is_nullity_known(obj), Some(true));
+
+        cache.nullity_now_known(obj, false);
+        assert_eq!(cache.is_nullity_known(obj), Some(false));
+    }
+
+    #[test]
+    fn test_arraylen_caching() {
+        let mut cache = HeapCache::new();
+        let arr = OpRef(5);
+        let descr = 42;
+
+        assert_eq!(cache.arraylen(arr, descr), None);
+        cache.arraylen_now_known(arr, descr, OpRef(100));
+        assert_eq!(cache.arraylen(arr, descr), Some(OpRef(100)));
+    }
+
+    #[test]
+    fn test_likely_virtual() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef(3);
+
+        assert!(!cache.is_likely_virtual(obj));
+        cache.mark_likely_virtual(obj);
+        assert!(cache.is_likely_virtual(obj));
+
+        // reset keeps likely_virtual
+        cache.reset_keep_likely_virtuals();
+        assert!(cache.is_likely_virtual(obj));
+
+        // full reset clears it
+        cache.reset();
+        assert!(!cache.is_likely_virtual(obj));
+    }
+
+    #[test]
+    fn test_guard_tracking_in_notify_op() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef(10);
+
+        // GUARD_NONNULL makes nullity known
+        cache.notify_op(OpCode::GuardNonnull, &[obj], OpRef::NONE);
+        assert_eq!(cache.is_nullity_known(obj), Some(true));
+    }
 }
