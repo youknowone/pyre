@@ -256,12 +256,12 @@ impl IntBound {
         self.lower > 0
     }
 
-    /// intutils.py: getnullness — return NONNULL, NULL, or UNKNOWN.
-    /// 0 = unknown, 1 = nonnull, -1 = null
+    /// intutils.py: getnullness — return NONNULL (1), NULL (-1), or UNKNOWN (0).
     pub fn getnullness(&self) -> i8 {
-        if self.known_nonzero() {
+        // intutils.py: known_gt(0) or known_lt(0) or tvalue != 0
+        if self.known_gt_const(0) || self.known_lt_const(0) || self.tvalue != 0 {
             1 // NONNULL
-        } else if self.is_constant() && self.lower == 0 {
+        } else if self.is_constant() && self.get_constant() == 0 {
             -1 // NULL
         } else {
             0 // UNKNOWN
@@ -269,16 +269,50 @@ impl IntBound {
     }
 
     /// intutils.py: make_guards — generate guard ops to enforce these bounds.
-    /// Returns a list of (opcode, constant_arg) pairs.
+    ///
+    /// Returns a list of (opcode, constant_arg) pairs. Handles:
+    /// - Constant → GUARD_VALUE
+    /// - Lower bound → INT_GE + GUARD_TRUE
+    /// - Upper bound → INT_LE + GUARD_TRUE
+    /// - Known bits → INT_AND + GUARD_VALUE
     pub fn make_guards(&self) -> Vec<(majit_ir::OpCode, i64)> {
         let mut guards = Vec::new();
+
+        // intutils.py: constant → GUARD_VALUE
+        if self.is_constant() {
+            guards.push((majit_ir::OpCode::GuardValue, self.upper));
+            return guards;
+        }
+
+        // intutils.py: lower bound → INT_GE
         if self.lower > i64::MIN {
             guards.push((majit_ir::OpCode::IntGe, self.lower));
         }
+
+        // intutils.py: upper bound → INT_LE
         if self.upper < i64::MAX {
             guards.push((majit_ir::OpCode::IntLe, self.upper));
         }
+
+        // intutils.py: known bits → INT_AND + GUARD_VALUE
+        if !self.are_knownbits_implied() {
+            guards.push((
+                majit_ir::OpCode::IntAnd,
+                !self.tmask as i64,
+            ));
+            guards.push((
+                majit_ir::OpCode::GuardValue,
+                self.tvalue as i64,
+            ));
+        }
+
         guards
+    }
+
+    /// intutils.py: _are_knownbits_implied — check if known bits are
+    /// fully implied by the lower/upper bounds (no separate guard needed).
+    fn are_knownbits_implied(&self) -> bool {
+        self.tmask == u64::MAX && self.tvalue == 0
     }
 
     /// Whether this abstract integer is unbounded.
