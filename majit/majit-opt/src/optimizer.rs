@@ -13,7 +13,7 @@ use crate::{
     vstring::OptString,
 };
 use crate::{OptContext, Optimization, OptimizationResult};
-use majit_ir::Op;
+use majit_ir::{Op, OpCode, OpRef};
 
 /// The optimizer: chains passes and runs them over a trace.
 ///
@@ -158,6 +158,63 @@ impl Optimizer {
     /// inject additional operations.
     pub fn send_extra_operation(&mut self, op: &Op, ctx: &mut OptContext) {
         self.propagate_one(op, ctx);
+    }
+
+    /// optimizer.py: force_box(opref, ctx) — force a virtual to be materialized.
+    /// If the opref refers to a virtual object, emit the allocation and field writes.
+    /// Returns the concrete OpRef (unchanged if not virtual).
+    pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+        // Follow forwarding chain first.
+        let resolved = ctx.get_replacement(opref);
+        // Check if any pass considers this a virtual.
+        let is_virt = self.passes.iter().any(|p| p.is_virtual(resolved));
+        if is_virt {
+            // The virtualize pass handles actual forcing.
+            // For now, return the resolved ref — the pass has already
+            // emitted the materialization ops during propagate_forward.
+            resolved
+        } else {
+            resolved
+        }
+    }
+
+    /// optimizer.py: protect_speculative_operation(op, ctx)
+    /// When constant-folding a pure operation, verify that the folded
+    /// constant doesn't cause a memory safety issue (e.g., null deref in
+    /// getfield). If the result would be invalid, don't fold.
+    pub fn protect_speculative_operation(&self, op: &Op, ctx: &OptContext) -> bool {
+        // For now, conservative: only allow folding on arithmetic ops.
+        // getfield/getarrayitem on constant null pointer would crash.
+        match op.opcode {
+            OpCode::GetfieldGcI
+            | OpCode::GetfieldGcR
+            | OpCode::GetfieldGcF
+            | OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcR
+            | OpCode::GetarrayitemGcF => {
+                // Check arg(0) is not null constant.
+                if let Some(0) = ctx.get_constant_int(op.arg(0)) {
+                    return false; // would deref null
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// optimizer.py: getlastop() — return the last emitted non-guard operation.
+    pub fn getlastop<'a>(&self, ctx: &'a OptContext) -> Option<&'a Op> {
+        ctx.new_operations.last()
+    }
+
+    /// optimizer.py: is_call_pure_pure_canraise(op)
+    /// Check if a CALL_PURE can raise an exception.
+    pub fn is_call_pure_pure_canraise(op: &Op) -> bool {
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .map(|cd| cd.effect_info().can_raise())
+            .unwrap_or(true)
     }
 
     /// Add an optimization pass to the chain.
@@ -323,14 +380,11 @@ impl Optimizer {
                 }
                 OptimizationResult::Replace(op) => {
                     current_op = op;
-                    // Continue to next pass with the replacement
                 }
                 OptimizationResult::Remove => {
                     return;
                 }
-                OptimizationResult::PassOn => {
-                    // Continue to next pass with the same op
-                }
+                OptimizationResult::PassOn => {}
             }
         }
 

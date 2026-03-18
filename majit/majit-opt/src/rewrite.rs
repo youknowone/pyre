@@ -1067,9 +1067,26 @@ impl Optimization for OptRewrite {
                 }
                 OptimizationResult::PassOn
             }
-            OpCode::GuardIsObject | OpCode::GuardSubclass | OpCode::GuardGcType => {
-                // These guards are kept as-is for now — they need info layer
-                // (PtrInfo) to optimize, which is tracked by OptVirtualize.
+            // rewrite.py: GUARD_IS_OBJECT — if arg is a known constant, the guard
+            // was already checked at recording time and can be removed.
+            OpCode::GuardIsObject => {
+                if ctx.get_constant(op.arg(0)).is_some() {
+                    return OptimizationResult::Remove;
+                }
+                OptimizationResult::PassOn
+            }
+            // rewrite.py: GUARD_GC_TYPE — if arg is a known constant, remove.
+            OpCode::GuardGcType => {
+                if ctx.get_constant(op.arg(0)).is_some() {
+                    return OptimizationResult::Remove;
+                }
+                OptimizationResult::PassOn
+            }
+            // rewrite.py: GUARD_SUBCLASS — if arg is a known constant, remove.
+            OpCode::GuardSubclass => {
+                if ctx.get_constant(op.arg(0)).is_some() {
+                    return OptimizationResult::Remove;
+                }
                 OptimizationResult::PassOn
             }
 
