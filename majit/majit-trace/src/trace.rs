@@ -58,6 +58,40 @@ impl TreeLoop {
     pub fn iter_guards(&self) -> impl Iterator<Item = &Op> {
         self.ops.iter().filter(|op| op.opcode.is_guard())
     }
+
+    /// Number of guard operations.
+    pub fn num_guards(&self) -> usize {
+        self.ops.iter().filter(|op| op.opcode.is_guard()).count()
+    }
+
+    /// Get the final operation (Jump or Finish).
+    pub fn get_final_op(&self) -> Option<&Op> {
+        self.ops.last().filter(|op| op.opcode.is_final())
+    }
+
+    /// Get the Label position (if this is a peeled loop).
+    pub fn find_label(&self) -> Option<usize> {
+        self.ops.iter().position(|op| op.opcode == OpCode::Label)
+    }
+
+    /// Split at Label: returns (preamble_ops, body_ops).
+    /// If no Label, returns (all_ops, empty).
+    pub fn split_at_label(&self) -> (&[Op], &[Op]) {
+        match self.find_label() {
+            Some(pos) => (&self.ops[..pos], &self.ops[pos..]),
+            None => (&self.ops, &[]),
+        }
+    }
+
+    /// Get the input arg types.
+    pub fn inputarg_types(&self) -> Vec<majit_ir::Type> {
+        self.inputargs.iter().map(|ia| ia.tp).collect()
+    }
+
+    /// Create a trace iterator for this trace.
+    pub fn get_iter(&self) -> crate::opencoder::TraceIterator<'_> {
+        crate::opencoder::TraceIterator::new(&self.ops)
+    }
 }
 
 #[cfg(test)]
