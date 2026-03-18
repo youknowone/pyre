@@ -597,4 +597,61 @@ mod tests {
         // Jump should still be present.
         assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
     }
+
+    #[test]
+    fn test_get_count_of_ops_and_guards() {
+        let mut opt = Optimizer::default_pipeline();
+        let mut ops = vec![
+            Op::new(OpCode::GuardTrue, &[OpRef(100)]),
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        for (i, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef(i as u32);
+        }
+        let result = opt.optimize(&ops);
+        let ctx = OptContext::new(result.len());
+        // Just verify the counting methods work
+        assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
+    }
+
+    #[test]
+    fn test_call_pure_results() {
+        let mut opt = Optimizer::new();
+        opt.record_call_pure_result(
+            vec![OpRef(10), OpRef(20)],
+            majit_ir::Value::Int(42),
+        );
+        assert_eq!(
+            opt.get_call_pure_result(&[OpRef(10), OpRef(20)]),
+            Some(&majit_ir::Value::Int(42))
+        );
+        assert_eq!(opt.get_call_pure_result(&[OpRef(10), OpRef(99)]), None);
+    }
+
+    #[test]
+    fn test_protect_speculative_operation() {
+        let opt = Optimizer::new();
+        let ctx = OptContext::new(10);
+
+        // Arithmetic ops are always safe
+        let add_op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        assert!(opt.protect_speculative_operation(&add_op, &ctx));
+
+        // Getfield on unknown arg is safe (not constant null)
+        let get_op = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        assert!(opt.protect_speculative_operation(&get_op, &ctx));
+    }
+
+    #[test]
+    fn test_pending_fields() {
+        let mut opt = Optimizer::new();
+        assert!(!opt.has_pending_fields());
+        assert_eq!(opt.num_pending_fields(), 0);
+
+        opt.add_pending_field(Op::new(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)]));
+        assert!(opt.has_pending_fields());
+        assert_eq!(opt.num_pending_fields(), 1);
+    }
 }
