@@ -704,6 +704,69 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── none_value ──
+    fn none_value(&mut self) -> Result<PyObjectRef, Self::Error> {
+        Ok(pyre_object::w_none())
+    }
+
+    // ── unary_positive ──
+    // PyPy: UNARY_POSITIVE → space.pos(w_value)
+    fn unary_positive(
+        &mut self,
+        val: PyObjectRef,
+    ) -> Result<PyObjectRef, Self::Error> {
+        unsafe {
+            if pyre_object::is_int(val) || pyre_object::is_float(val) {
+                return Ok(val);
+            }
+        }
+        Err(PyError::type_error("bad operand type for unary +"))
+    }
+
+    // ── list_to_tuple ──
+    // PyPy intrinsic: convert list to tuple (used in star unpacking).
+    fn list_to_tuple(
+        &mut self,
+        val: PyObjectRef,
+    ) -> Result<PyObjectRef, Self::Error> {
+        unsafe {
+            if pyre_object::is_list(val) {
+                let list = &*(val as *const pyre_object::listobject::W_ListObject);
+                let items = list.items.as_slice().to_vec();
+                return Ok(pyre_object::w_tuple_new(items));
+            }
+        }
+        Err(PyError::type_error("expected list for list_to_tuple"))
+    }
+
+    // ── print_expr ──
+    // PyPy: PRINT_EXPR → sys.displayhook(value)
+    fn print_expr(&mut self, val: PyObjectRef) -> Result<(), Self::Error> {
+        if !pyre_object::is_none(val) {
+            let s = pyre_objspace::space::py_repr(val);
+            println!("{}", s);
+        }
+        Ok(())
+    }
+
+    // ── delete_name ──
+    fn delete_name(&mut self, name: &str) -> Result<(), Self::Error> {
+        let ns = self.namespace as *mut pyre_runtime::PyNamespace;
+        unsafe {
+            pyre_runtime::namespace_delete(&mut *ns, name);
+        }
+        Ok(())
+    }
+
+    // ── delete_global ──
+    fn delete_global(&mut self, name: &str) -> Result<(), Self::Error> {
+        let ns = self.namespace as *mut pyre_runtime::PyNamespace;
+        unsafe {
+            pyre_runtime::namespace_delete(&mut *ns, name);
+        }
+        Ok(())
+    }
+
     // ── BuildSlice ──
     // CPython 3.13: BUILD_SLICE creates a slice object from 2 or 3 stack items
     fn build_slice(&mut self, argc: pyre_bytecode::bytecode::BuildSliceArgCount) -> Result<(), Self::Error> {
@@ -2155,7 +2218,6 @@ result = fib(10)";
     }
 
     #[test]
-    #[ignore = "list * int needs __mul__ support"]
     fn test_list_multiply() {
         let result = run_eval("[1, 2] * 3").unwrap();
         unsafe {
@@ -2309,7 +2371,6 @@ result = greet('world')
     }
 
     #[test]
-    #[ignore = "list += list needs __iadd__ / list.extend"]
     fn test_augmented_assign_list() {
         let source = "x = [1, 2]\nx += [3]\nresult = x";
         let (res, frame) = run_exec_frame(source);
