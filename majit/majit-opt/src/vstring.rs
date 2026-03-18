@@ -15,7 +15,7 @@
 /// "forced": NEWSTR + STRSETITEM ops are emitted to materialize it.
 use std::collections::HashMap;
 
-use majit_ir::{Op, OpCode, OpRef, Value};
+use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
 use crate::{OptContext, Optimization, OptimizationResult};
 
@@ -367,6 +367,69 @@ impl OptString {
             }
         }
     }
+
+    /// Handle string oopspec calls.
+    /// vstring.py: optimize_call_pure_STR_CONCAT/STR_SLICE/STR_EQUAL etc.
+    fn optimize_oopspec_call(
+        &mut self,
+        op: &Op,
+        ei: &EffectInfo,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        match ei.oopspec_index {
+            OopSpecIndex::StrConcat => {
+                // STR_CONCAT(a, b): create a virtual Concat.
+                if op.num_args() >= 3 {
+                    // args: [func_ptr, a, b]
+                    let left = ctx.get_replacement(op.arg(1));
+                    let right = ctx.get_replacement(op.arg(2));
+                    self.vstrings
+                        .insert(op.pos, VStringInfo::Concat { left, right });
+                    return OptimizationResult::Remove;
+                }
+                self.force_args_if_virtual(op, ctx);
+                OptimizationResult::PassOn
+            }
+            OopSpecIndex::StrSlice => {
+                // STR_SLICE(s, start, stop): create a virtual Slice.
+                if op.num_args() >= 4 {
+                    let source = ctx.get_replacement(op.arg(1));
+                    let start = ctx.get_replacement(op.arg(2));
+                    let stop = ctx.get_replacement(op.arg(3));
+                    // Length = stop - start
+                    let length = stop; // simplified: pass stop as length for now
+                    self.vstrings.insert(
+                        op.pos,
+                        VStringInfo::Slice {
+                            source,
+                            start,
+                            length,
+                        },
+                    );
+                    return OptimizationResult::Remove;
+                }
+                self.force_args_if_virtual(op, ctx);
+                OptimizationResult::PassOn
+            }
+            OopSpecIndex::StrEqual => {
+                // STR_EQUAL(a, b): if both are the same OpRef → always true.
+                if op.num_args() >= 3 {
+                    let a = ctx.get_replacement(op.arg(1));
+                    let b = ctx.get_replacement(op.arg(2));
+                    if a == b {
+                        ctx.make_constant(op.pos, Value::Int(1));
+                        return OptimizationResult::Remove;
+                    }
+                }
+                self.force_args_if_virtual(op, ctx);
+                OptimizationResult::PassOn
+            }
+            _ => {
+                self.force_args_if_virtual(op, ctx);
+                OptimizationResult::PassOn
+            }
+        }
+    }
 }
 
 impl Default for OptString {
@@ -383,12 +446,42 @@ impl Optimization for OptString {
             OpCode::Strgetitem => self.optimize_strgetitem(op, ctx),
             OpCode::Strlen => self.optimize_strlen(op, ctx),
             OpCode::Copystrcontent => self.optimize_copystrcontent(op, ctx),
+
+            // vstring.py: Unicode operations — same logic as string ops
+            // but with unicode-specific opcodes.
+            OpCode::Newunicode => self.optimize_newstr(op, ctx),
+            OpCode::Unicodesetitem => self.optimize_strsetitem(op, ctx),
+            OpCode::Unicodegetitem => self.optimize_strgetitem(op, ctx),
+            OpCode::Unicodelen => self.optimize_strlen(op, ctx),
+            OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, ctx),
+
+            // vstring.py: oopspec call handlers for string operations.
+            // STR_CONCAT, STR_SLICE, STR_EQUAL are dispatched by OopSpecIndex
+            // on CALL_* ops. For now, check if the call is a string oopspec.
+            OpCode::CallI | OpCode::CallR | OpCode::CallN => {
+                if let Some(ref descr) = op.descr {
+                    if let Some(cd) = descr.as_call_descr() {
+                        let ei = cd.effect_info();
+                        if ei.has_oopspec() {
+                            return self.optimize_oopspec_call(op, &ei, ctx);
+                        }
+                    }
+                }
+                self.force_args_if_virtual(op, ctx);
+                OptimizationResult::PassOn
+            }
+
             _ => {
                 // For any other op, force virtual strings that appear as arguments.
                 self.force_args_if_virtual(op, ctx);
                 OptimizationResult::PassOn
             }
         }
+    }
+
+    fn setup(&mut self) {
+        self.vstrings.clear();
+        self.known_lengths.clear();
     }
 
     fn name(&self) -> &'static str {
