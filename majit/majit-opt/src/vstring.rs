@@ -513,6 +513,26 @@ impl OptString {
                 self.force_args_if_virtual(op, ctx);
                 OptimizationResult::PassOn
             }
+            // vstring.py: STR_CMP(a, b) → if same ref, result is 0 (equal).
+            OopSpecIndex::StrCmp => {
+                if op.num_args() >= 3 {
+                    let a = ctx.get_replacement(op.arg(1));
+                    let b = ctx.get_replacement(op.arg(2));
+                    if a == b {
+                        ctx.make_constant(op.pos, Value::Int(0));
+                        return OptimizationResult::Remove;
+                    }
+                }
+                self.force_args_if_virtual(op, ctx);
+                OptimizationResult::PassOn
+            }
+            // vstring.py: SHRINK_ARRAY is a hint that can be removed.
+            OopSpecIndex::ShrinkArray => {
+                // The array is already allocated; shrinking is a no-op
+                // for the optimizer (the backend handles it).
+                self.force_args_if_virtual(op, ctx);
+                OptimizationResult::PassOn
+            }
             _ => {
                 self.force_args_if_virtual(op, ctx);
                 OptimizationResult::PassOn
