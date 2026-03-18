@@ -164,17 +164,39 @@ impl HeapCache {
             self.new_object(result);
             return;
         }
-        // SETFIELD_GC: args = [obj, value], descr identifies the field
-        // For simplicity, we handle escape tracking for calls
+        // heapcache.py: SETFIELD_GC tracking — the written value escapes.
+        if opcode == OpCode::SetfieldGc && args.len() >= 2 {
+            self.mark_escaped(args[1]);
+        }
+        // heapcache.py: GUARD_CLASS/GUARD_NONNULL_CLASS → known class.
+        if opcode == OpCode::GuardClass || opcode == OpCode::GuardNonnullClass {
+            if args.len() >= 2 {
+                if let Some(class_val) = args.get(1) {
+                    self.class_now_known(args[0], GcRef(class_val.0 as usize));
+                }
+            }
+            self.nullity_now_known(args[0], true);
+        }
+        // heapcache.py: GUARD_NONNULL → known non-null.
+        if opcode == OpCode::GuardNonnull && !args.is_empty() {
+            self.nullity_now_known(args[0], true);
+        }
+        // Calls may force/escape objects.
         if opcode.is_call() {
-            // Calls may force/escape objects. Conservative: mark all
-            // call arguments as escaped and invalidate non-unescaped caches.
             for &arg in args {
                 self.mark_escaped(arg);
             }
             if opcode.has_no_side_effect() {
                 return;
             }
+            self.invalidate_caches_for_escaped();
+        }
+    }
+
+    /// heapcache.py: invalidate_caches_varargs(descrs, args)
+    /// Selectively invalidate caches based on effect info.
+    pub fn invalidate_caches_varargs(&mut self, has_side_effects: bool) {
+        if has_side_effects {
             self.invalidate_caches_for_escaped();
         }
     }
