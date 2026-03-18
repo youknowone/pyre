@@ -3690,7 +3690,7 @@ const MAX_INLINE_DEPTH: usize = 10;
 
 /// Maximum recursion levels to inline during tracing.
 /// PyPy uses max_unroll_recursion=7 (pyjitpl.py:1370).
-const MAX_UNROLL_RECURSION: usize = 1;
+const MAX_UNROLL_RECURSION: usize = 3;
 
 /// Describes the recovery state after a guard failure.
 #[derive(Debug, Clone)]
