@@ -74,14 +74,15 @@ impl FrameArena {
     /// Return a frame to the arena. Must be the most recently taken frame (LIFO).
     #[inline]
     fn put(&mut self, ptr: *mut PyFrame) -> bool {
-        if self.top > 0 {
-            let expected = self.buf[self.top - 1].as_mut_ptr();
-            if ptr == expected {
-                self.top -= 1;
-                return true;
-            }
+        if self.top > 0 && ptr == self.buf[self.top - 1].as_mut_ptr() {
+            self.top -= 1;
+            return true;
         }
-        false
+        // Check if within arena range — don't free, but mark as non-LIFO.
+        let base = self.buf[0].as_mut_ptr() as usize;
+        let end = unsafe { self.buf.as_ptr().add(ARENA_CAP) as usize };
+        let addr = ptr as usize;
+        addr >= base && addr < end
     }
 
     /// Mark that frames up to `top` have been fully initialized.

@@ -3588,19 +3588,14 @@ impl<M: Clone> MetaInterp<M> {
                 return InlineDecision::ResidualCall;
             }
 
-            // Self-recursion: use CallAssembler if compiled, otherwise
-            // ResidualCall + boost to trigger functrace quickly.
-            // (Recursive inline via pending_inline is not connected to
-            // the runtime path yet — using it causes SIGSEGV from
-            // unresolved placeholder OpRefs in the compiled trace.)
+            // Self-recursion: PyPy max_unroll_recursion strategy.
             if is_self_recursive {
-                let _recursive_depth = recursive_depth;
+                if recursive_depth < MAX_UNROLL_RECURSION {
+                    return InlineDecision::Inline;
+                }
                 if callee_compiled {
                     return InlineDecision::CallAssembler;
                 }
-                // Boost callee's entry counter so it gets traced quickly.
-                // After a few residual calls, eval_with_jit will trace
-                // the callee as a separate function → compiled → CallAssembler.
                 self.warm_state.boost_function_entry(callee_key);
                 return InlineDecision::ResidualCall;
             }
@@ -3692,6 +3687,10 @@ impl<M: Clone> MetaInterp<M> {
 /// Default maximum inlining depth during tracing.
 /// Configurable via WarmEnterState::set_max_inline_depth().
 const MAX_INLINE_DEPTH: usize = 10;
+
+/// Maximum recursion levels to inline during tracing.
+/// PyPy uses max_unroll_recursion=7 (pyjitpl.py:1370).
+const MAX_UNROLL_RECURSION: usize = 2;
 
 /// Describes the recovery state after a guard failure.
 #[derive(Debug, Clone)]
