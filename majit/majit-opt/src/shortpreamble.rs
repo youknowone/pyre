@@ -130,6 +130,30 @@ impl ShortPreamble {
     }
 }
 
+impl ShortPreamble {
+    /// shortpreamble.py: apply to bridge — prepend instantiated short preamble
+    /// ops to a bridge trace, creating a complete trace that the optimizer
+    /// can process with full preamble context.
+    pub fn apply_to_bridge(&self, bridge_args: &[OpRef], bridge_ops: &[Op]) -> Vec<Op> {
+        let mut result = self.instantiate(bridge_args);
+        result.extend_from_slice(bridge_ops);
+        result
+    }
+
+    /// Count guards in the short preamble.
+    pub fn num_guards(&self) -> usize {
+        self.ops.iter().filter(|e| e.op.opcode.is_guard()).count()
+    }
+
+    /// Count pure ops in the short preamble.
+    pub fn num_pure_ops(&self) -> usize {
+        self.ops
+            .iter()
+            .filter(|e| e.op.opcode.is_always_pure())
+            .count()
+    }
+}
+
 /// Builder that collects short preamble operations during preamble optimization.
 ///
 /// Used by the optimizer when processing a peeled trace. As the optimizer

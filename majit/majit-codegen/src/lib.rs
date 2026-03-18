@@ -860,6 +860,37 @@ pub trait Backend: Send {
     fn setup_once(&mut self) {}
     /// model.py: finish_once() — called when the JIT shuts down.
     fn finish_once(&mut self) {}
+
+    // ── model.py: GC integration ──
+
+    /// model.py: gc_set_extra_threshold()
+    /// Inform the GC that extra memory was allocated outside of GC control.
+    fn gc_set_extra_threshold(&self) {}
+
+    /// model.py: force_head_version()
+    /// Force updating the version stamp for GC write barrier optimization.
+    fn force_head_version(&self) {}
+
+    /// model.py: get_all_loop_runs()
+    /// Return a list of (token_number, loop_run_count) for profiling.
+    fn get_all_loop_runs(&self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// model.py: cast_int_to_ptr(value)
+    fn cast_int_to_ptr(&self, value: i64) -> i64 {
+        value // identity on 64-bit
+    }
+
+    /// model.py: cast_ptr_to_int(value)
+    fn cast_ptr_to_int(&self, value: i64) -> i64 {
+        value
+    }
+
+    /// model.py: cast_gcref_to_int(ref)
+    fn cast_gcref_to_int(&self, gcref: GcRef) -> i64 {
+        gcref.as_usize() as i64
+    }
 }
 
 /// Errors from the backend.
