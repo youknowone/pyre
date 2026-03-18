@@ -1059,4 +1059,33 @@ mod tests {
         assert!(token.version_info.is_some());
         assert_eq!(token.version_info.as_ref().unwrap().versions.len(), 1);
     }
+
+    #[test]
+    fn test_jit_cell_token_lifecycle() {
+        let mut token = JitCellToken::new(42);
+        assert_eq!(token.get_number(), 42);
+        assert!(!token.has_compiled_code());
+        assert!(!token.is_invalidated());
+
+        // Invalidate
+        token.invalidate();
+        assert!(token.is_invalidated());
+
+        // Get flag clone for QuasiImmut
+        let flag = token.invalidation_flag();
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+
+        // Reset
+        token.reset_compiled();
+        assert!(!token.has_compiled_code());
+    }
+
+    #[test]
+    fn test_we_are_jitted() {
+        assert!(!we_are_jitted());
+        set_jitted(true);
+        assert!(we_are_jitted());
+        set_jitted(false);
+        assert!(!we_are_jitted());
+    }
 }
