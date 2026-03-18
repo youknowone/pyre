@@ -243,6 +243,35 @@ pub trait JitCodeSym {
     fn state_varray_len(&self, _array_idx: usize) -> Option<OpRef> {
         None
     }
+
+    // ── Storage pool virtualizable support ────────────────────
+    //
+    // RPython parity: storage contents live on heap, only lengths
+    // are InputArgs. Pop/push emit GetarrayitemRawI/SetarrayitemRaw.
+
+    /// Whether the storage pool uses virtualizable (heap-backed) mode.
+    fn is_virtualizable_storage(&self) -> bool {
+        false
+    }
+
+    /// Get the data pointer OpRef for a virtualizable storage slot.
+    fn vable_array_ref(&self, _storage_idx: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Get the length OpRef for a virtualizable storage slot.
+    fn vable_len_ref(&self, _storage_idx: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Set the data pointer OpRef for a virtualizable storage slot.
+    fn set_vable_array_ref(&mut self, _storage_idx: usize, _opref: OpRef) {}
+
+    /// Set the length OpRef for a virtualizable storage slot.
+    fn set_vable_len_ref(&mut self, _storage_idx: usize, _opref: OpRef) {}
+
+    /// Initialize a virtualizable storage (set both array ref and len ref).
+    fn init_vable_storage(&mut self, _storage_idx: usize, _array_ref: OpRef, _len_ref: OpRef) {}
 }
 
 pub trait JitCodeRuntime {
@@ -505,12 +534,48 @@ where
             BC_POP_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                let symbolic = {
+                if sym.is_virtualizable_storage() {
+                    // Virtualizable: symbolic stack may be empty (depth=0).
+                    // Check if we can pop symbolically first; if not, load from heap.
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.pop()
-                };
-                let concrete = self.runtime_stack_mut(selected, runtime).pop();
-                self.set_int_reg(dst, symbolic, concrete);
+                    let symbolic = stack.pop();
+                    let concrete = self.runtime_stack_mut(selected, runtime).pop();
+                    if let Some(sym_val) = symbolic {
+                        // Value was on symbolic stack (pushed earlier in this trace).
+                        // Still update vable_len_ref for correct guard failure recovery.
+                        if let Some(len_ref) = sym.vable_len_ref(selected) {
+                            let const_1 = ctx.const_int(1);
+                            let new_len = ctx.record_op(majit_ir::OpCode::IntSub, &[len_ref, const_1]);
+                            sym.set_vable_len_ref(selected, new_len);
+                        }
+                        self.set_int_reg(dst, Some(sym_val), concrete);
+                    } else {
+                        // Underflow: load from heap via raw memory ops.
+                        // Decrement length, then read from data_ptr[new_len].
+                        let len_ref = sym.vable_len_ref(selected).expect("missing vable_len_ref");
+                        let arr_ref = sym
+                            .vable_array_ref(selected)
+                            .expect("missing vable_array_ref");
+                        let const_1 = ctx.const_int(1);
+                        let const_8 = ctx.const_int(8);
+                        let new_len = ctx.record_op(majit_ir::OpCode::IntSub, &[len_ref, const_1]);
+                        let offset = ctx.record_op(majit_ir::OpCode::IntMul, &[new_len, const_8]);
+                        let raw_val =
+                            ctx.record_op_with_descr(majit_ir::OpCode::GetarrayitemRawI, &[arr_ref, offset], raw_i64_array_descr());
+                        // Untag: Val uses tagged pointers (value << 1 | 1).
+                        let untagged =
+                            ctx.record_op(majit_ir::OpCode::IntRshift, &[raw_val, const_1]);
+                        sym.set_vable_len_ref(selected, new_len);
+                        self.set_int_reg(dst, Some(untagged), concrete);
+                    }
+                } else {
+                    let symbolic = {
+                        let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                        stack.pop()
+                    };
+                    let concrete = self.runtime_stack_mut(selected, runtime).pop();
+                    self.set_int_reg(dst, symbolic, concrete);
+                }
             }
             BC_PEEK_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
@@ -527,29 +592,106 @@ where
                 let src = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 let (value, concrete) = self.read_int_reg(src);
+                if sym.is_virtualizable_storage() {
+                    // Virtualizable: also write to heap via SetarrayitemRaw.
+                    let len_ref = sym.vable_len_ref(selected).expect("missing vable_len_ref");
+                    let arr_ref = sym
+                        .vable_array_ref(selected)
+                        .expect("missing vable_array_ref");
+                    let const_1 = ctx.const_int(1);
+                    let const_8 = ctx.const_int(8);
+                    // Tag: Val = (value << 1) | 1
+                    let tagged = {
+                        let shifted = ctx.record_op(majit_ir::OpCode::IntLshift, &[value, const_1]);
+                        ctx.record_op(majit_ir::OpCode::IntOr, &[shifted, const_1])
+                    };
+                    let offset = ctx.record_op(majit_ir::OpCode::IntMul, &[len_ref, const_8]);
+                    ctx.record_op_with_descr(
+                        majit_ir::OpCode::SetarrayitemRaw,
+                        &[arr_ref, offset, tagged],
+                        raw_i64_array_descr(),
+                    );
+                    let new_len = ctx.record_op(majit_ir::OpCode::IntAdd, &[len_ref, const_1]);
+                    sym.set_vable_len_ref(selected, new_len);
+                }
+                // Always track on symbolic stack (for subsequent pops within trace).
                 let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                 stack.push(value);
                 self.runtime_stack_mut(selected, runtime).push(concrete);
             }
             BC_POP_DISCARD => {
                 let selected = sym.current_selected();
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                let _ = stack.pop();
-                let _ = self.runtime_stack_mut(selected, runtime).pop();
+                if sym.is_virtualizable_storage() {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    if stack.pop().is_some() {
+                        // Value was on symbolic stack — just discard.
+                        let _ = self.runtime_stack_mut(selected, runtime).pop();
+                    } else {
+                        // Underflow: decrement heap length, discard runtime value.
+                        let len_ref = sym.vable_len_ref(selected)
+                            .expect("missing vable_len_ref");
+                        let const_1 = ctx.const_int(1);
+                        let new_len = ctx.record_op(majit_ir::OpCode::IntSub, &[len_ref, const_1]);
+                        sym.set_vable_len_ref(selected, new_len);
+                        let _ = self.runtime_stack_mut(selected, runtime).pop();
+                    }
+                } else {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    let _ = stack.pop();
+                    let _ = self.runtime_stack_mut(selected, runtime).pop();
+                }
             }
             BC_DUP_STACK => {
                 let selected = sym.current_selected();
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                stack.dup();
-                let value = self
-                    .runtime_stack_mut(selected, runtime)
-                    .last()
-                    .copied()
-                    .expect("cannot dup from empty runtime stack");
-                self.runtime_stack_mut(selected, runtime).push(value);
+                if sym.is_virtualizable_storage() {
+                    let stack_len = sym.stack(selected).map_or(0, |s| s.len());
+                    if stack_len > 0 {
+                        let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                        stack.dup();
+                    } else {
+                        // Underflow: peek from heap (read without decrement), push to symbolic.
+                        let len_ref = sym.vable_len_ref(selected)
+                            .expect("missing vable_len_ref");
+                        let arr_ref = sym.vable_array_ref(selected)
+                            .expect("missing vable_array_ref");
+                        let const_1 = ctx.const_int(1);
+                        let const_8 = ctx.const_int(8);
+                        let top_idx = ctx.record_op(majit_ir::OpCode::IntSub, &[len_ref, const_1]);
+                        let offset = ctx.record_op(majit_ir::OpCode::IntMul, &[top_idx, const_8]);
+                        let raw_val = ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetarrayitemRawI,
+                            &[arr_ref, offset],
+                            raw_i64_array_descr(),
+                        );
+                        let untagged = ctx.record_op(majit_ir::OpCode::IntRshift, &[raw_val, const_1]);
+                        // Push two copies: the "original" and the dup.
+                        let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                        stack.push(untagged);
+                        stack.push(untagged);
+                    }
+                    let value = self
+                        .runtime_stack_mut(selected, runtime)
+                        .last()
+                        .copied()
+                        .expect("cannot dup from empty runtime stack");
+                    self.runtime_stack_mut(selected, runtime).push(value);
+                } else {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.dup();
+                    let value = self
+                        .runtime_stack_mut(selected, runtime)
+                        .last()
+                        .copied()
+                        .expect("cannot dup from empty runtime stack");
+                    self.runtime_stack_mut(selected, runtime).push(value);
+                }
             }
             BC_SWAP_STACK => {
                 let selected = sym.current_selected();
+                if sym.is_virtualizable_storage() && sym.stack(selected).map_or(true, |s| s.len() < 2) {
+                    // Insufficient symbolic stack items for swap — abort trace.
+                    return TraceAction::Abort;
+                }
                 let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                 stack.swap();
                 let stack = self.runtime_stack_mut(selected, runtime);
