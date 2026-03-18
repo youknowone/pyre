@@ -80,9 +80,40 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             }
         }
     } else {
-        // Preamble placeholder: future heap-load preamble will go here
-        // when optimizer virtualization is implemented.
-        let preamble_code = quote! {};
+        let virtualizable = config.storage.virtualizable;
+        let preamble_code = if virtualizable {
+            quote! {
+                // Virtualizable preamble: load storage contents from heap.
+                // RPython: initialize_virtualizable() in pyjitpl.py.
+                if !__sym.preamble_done {
+                    __sym.preamble_done = true;
+                    let __const_1 = __ctx.const_int(1);
+                    for &(__sidx, _) in __sym.storage_layout.iter().take(__sym.meta_storage_count) {
+                        if let Some(__ptr_ref) = __sym.vable_array_refs.get(&__sidx).copied() {
+                            let __actual_len = __storage.get(__sidx).len();
+                            for __j in 0..__actual_len {
+                                let __byte_off = __ctx.const_int((__j as i64) * 8);
+                                let __raw = __ctx.record_op_with_descr(
+                                    majit_ir::OpCode::GetarrayitemRawI,
+                                    &[__ptr_ref, __byte_off],
+                                    majit_meta::raw_i64_array_descr(),
+                                );
+                                let __val = __ctx.record_op(
+                                    majit_ir::OpCode::IntRshift,
+                                    &[__raw, __const_1],
+                                );
+                                if let Some(__stack) = __sym.stacks.get_mut(&__sidx) {
+                                    __stack.push(__val);
+                                }
+                            }
+                            __sym.preamble_depths.insert(__sidx, __actual_len);
+                        }
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
 
         quote! {
             #[allow(non_snake_case, unused_variables, unused_mut)]
