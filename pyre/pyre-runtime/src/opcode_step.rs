@@ -880,6 +880,17 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Err(crate::PyError::type_error("load_locals not implemented").into())
     }
 
+    // String formatting
+    fn format_simple(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("format_simple not implemented").into())
+    }
+    fn format_with_spec(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("format_with_spec not implemented").into())
+    }
+    fn convert_value(&mut self, _conv: pyre_bytecode::bytecode::ConvertValueOparg) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("convert_value not implemented").into())
+    }
+
     fn unsupported(
         &mut self,
         instruction: &Instruction,
@@ -1361,6 +1372,20 @@ where
             let depth = i.get(op_arg) as usize;
             let val = executor.peek_at(depth - 1)?;
             executor.push_value(val)?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── String formatting (f-strings) ──
+        Instruction::FormatSimple => {
+            executor.format_simple()?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::FormatWithSpec => {
+            executor.format_with_spec()?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::ConvertValue { oparg: conv } => {
+            executor.convert_value(conv.get(op_arg))?;
             Ok(StepResult::Continue)
         }
 
