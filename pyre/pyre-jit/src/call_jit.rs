@@ -139,13 +139,10 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         }
     }
 
-    // Use eval_with_jit to leverage compiled code when available.
-    // This matches PyPy's assembler_call_helper which dispatches through
-    // the compiled code first, falling back to blackhole on failure.
+    // PyPy assembler_call_helper: dispatch through compiled code.
+    // eval_with_jit → try_function_entry_jit → compiled code dispatch.
     match crate::eval::eval_with_jit(frame) {
         Ok(result) => {
-            // Return raw int value (not boxed pointer) to match the
-            // CallAssembler raw-int protocol.
             let raw = if !result.is_null() && unsafe { is_int(result) } {
                 unsafe { w_int_get_value(result) }
             } else {

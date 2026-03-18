@@ -1036,6 +1036,38 @@ pub fn register_call_assembler_force(f: extern "C" fn(i64) -> i64) {
     let _ = CALL_ASSEMBLER_FORCE_FN.set(f);
 }
 
+/// Execute compiled code for a token directly, bypassing the JitDriver chain.
+///
+/// PyPy assembler_call_helper equivalent: dispatches through compiled code
+/// for the given token_number. Returns Some(raw_result) on finish,
+/// None if no compiled code or guard failure (caller should use interpreter).
+///
+/// This is used by jit_force_callee_frame to avoid the eval_with_jit →
+/// try_function_entry_jit → run_compiled → execute_token indirection chain.
+pub fn execute_call_assembler_direct(
+    token_number: u64,
+    inputs: &[i64],
+    force_fn: extern "C" fn(i64) -> i64,
+) -> Option<i64> {
+    let target_ptr = unsafe { fast_lookup_ca_target(token_number) };
+    if target_ptr.is_null() {
+        return None;
+    }
+    let target = unsafe { &*target_ptr };
+    if target.code_ptr.is_null() {
+        return None;
+    }
+
+    let mut outcome = [0i64; 2];
+    let result = call_assembler_fast_path(target, inputs, outcome.as_mut_ptr(), force_fn);
+
+    if outcome[0] == CALL_ASSEMBLER_OUTCOME_FINISH {
+        Some(result as i64)
+    } else {
+        None // guard failure — caller should fallback
+    }
+}
+
 pub fn register_call_assembler_bridge(f: extern "C" fn(i64, u32, u64, u64) -> i64) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
