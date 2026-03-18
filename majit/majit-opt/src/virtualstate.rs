@@ -282,6 +282,38 @@ impl VirtualState {
         VirtualState { state }
     }
 
+    /// Number of non-virtual values (need concrete OpRefs at loop entry).
+    ///
+    /// RPython: `VirtualState.make_inputargs()` counts non-virtual entries.
+    pub fn num_boxes(&self) -> usize {
+        self.state.iter().filter(|s| !s.is_virtual()).count()
+    }
+
+    /// Generate input argument OpRefs from this state.
+    ///
+    /// RPython: `VirtualState.make_inputargs()` — creates the OpRef list
+    /// for the loop header Label, skipping virtual values (which live in
+    /// the optimizer's PtrInfo, not as explicit args).
+    ///
+    /// `concrete_refs` provides OpRefs for the non-virtual entries.
+    pub fn make_inputargs(&self, concrete_refs: &[OpRef]) -> Vec<OpRef> {
+        let mut args = Vec::new();
+        let mut concrete_idx = 0;
+        for info in &self.state {
+            if info.is_virtual() {
+                args.push(OpRef::NONE); // virtual — no concrete OpRef needed
+            } else {
+                let opref = concrete_refs
+                    .get(concrete_idx)
+                    .copied()
+                    .unwrap_or(OpRef::NONE);
+                args.push(opref);
+                concrete_idx += 1;
+            }
+        }
+        args
+    }
+
     /// Check if another VirtualState is compatible (can reuse the optimized loop body).
     ///
     /// Returns true if all entries are compatible.
