@@ -812,4 +812,45 @@ mod tests {
         let jump = &result[7];
         assert_eq!(jump.args[0], b2, "Jump should ref body v2");
     }
+
+    #[test]
+    fn test_unroll_optimizer_optimize_trace() {
+        let mut unroll_opt = UnrollOptimizer::new();
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        assign_positions(&mut ops, 0);
+        let result = unroll_opt.optimize_trace(&ops);
+        // The optimizer processes the trace; result should not be empty
+        assert!(!result.is_empty(), "optimize_trace should produce output");
+    }
+
+    #[test]
+    fn test_unroll_optimizer_count_guards() {
+        let ops = vec![
+            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        assert_eq!(UnrollOptimizer::count_guards(&ops), 2);
+    }
+
+    #[test]
+    fn test_unroll_optimizer_should_give_up() {
+        let opt = UnrollOptimizer::new();
+        assert!(!opt.should_give_up(0));
+        assert!(!opt.should_give_up(4));
+        assert!(opt.should_give_up(5)); // default retrace_limit = 5
+        assert!(opt.should_give_up(10));
+    }
+
+    #[test]
+    fn test_unroll_optimizer_too_many_guards() {
+        let mut opt = UnrollOptimizer::new();
+        opt.bridge_guard_count = 20;
+        assert!(opt.too_many_guards_for_retrace(0, 15));
+        assert!(!opt.too_many_guards_for_retrace(0, 25));
+    }
 }
