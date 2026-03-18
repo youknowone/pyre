@@ -240,6 +240,18 @@ impl OptPure {
         self.cache.insert(key, result);
     }
 
+    /// pure.py: pure_from_args1(opnum, arg0, op)
+    /// Specialized version for unary operations.
+    pub fn pure_from_args1(&mut self, opcode: OpCode, arg0: OpRef, result: OpRef) {
+        self.pure_from_args(opcode, &[arg0], result);
+    }
+
+    /// pure.py: pure_from_args2(opnum, arg0, arg1, op)
+    /// Specialized version for binary operations.
+    pub fn pure_from_args2(&mut self, opcode: OpCode, arg0: OpRef, arg1: OpRef, result: OpRef) {
+        self.pure_from_args(opcode, &[arg0, arg1], result);
+    }
+
     /// Look up a previously recorded pure operation result.
     /// pure.py: get_pure_result(op)
     pub fn get_pure_result(&self, op: &Op) -> Option<OpRef> {
