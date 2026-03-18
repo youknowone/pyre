@@ -520,6 +520,35 @@ impl Optimization for OptPure {
             return self.handle_call_pure(op);
         }
 
+        // COND_CALL_VALUE_I/R → CSE like CALL_PURE, but skip arg[0]
+        // (the condition value). pure.py: optimize_COND_CALL_VALUE_I.
+        if op.opcode.is_cond_call_value() {
+            // Build CSE key from args[1..] (skip condition value at arg[0])
+            let key = PureOpKey {
+                opcode: OpCode::CallPureI,
+                args: op.args[1..].to_vec(),
+            };
+
+            if let Some(cached_ref) = self.lookup_pure(&key) {
+                let cached_ref = ctx.get_replacement(cached_ref);
+                ctx.replace_op(op.pos, cached_ref);
+                self.last_emitted_was_removed = true;
+                return OptimizationResult::Remove;
+            }
+
+            if let Some(result_ref) = self.lookup_known_result(&key) {
+                let result_ref = ctx.get_replacement(result_ref);
+                ctx.replace_op(op.pos, result_ref);
+                self.last_emitted_was_removed = true;
+                return OptimizationResult::Remove;
+            }
+
+            self.cache.insert(key, op.pos);
+            self.call_pure_positions.push(ctx.new_operations.len());
+            // Unlike CALL_PURE, COND_CALL_VALUE is NOT demoted — emit as-is.
+            return OptimizationResult::Emit(op.clone());
+        }
+
         // CALL_LOOPINVARIANT_* -> cache result, demote to CALL_*.
         if op.opcode.is_call_loopinvariant() {
             return self.handle_call_loopinvariant(op, ctx);
@@ -1185,5 +1214,24 @@ mod tests {
         pass.pure_from_args(OpCode::IntNeg, &[OpRef(10)], OpRef(40));
         assert!(pass.lookup1(OpCode::IntNeg, OpRef(10)).is_some());
         assert!(pass.lookup1(OpCode::IntNeg, OpRef(99)).is_none());
+    }
+
+    #[test]
+    fn test_cond_call_value_cse() {
+        // COND_CALL_VALUE_I(cond, func, arg) → CSE using args[1..]
+        // A second COND_CALL_VALUE_I with same func+arg should reuse result.
+        let mut ops = vec![
+            Op::new(OpCode::CondCallValueI, &[OpRef(100), OpRef(200), OpRef(300)]),
+            Op::new(OpCode::CondCallValueI, &[OpRef(101), OpRef(200), OpRef(300)]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize(&ops);
+
+        // First COND_CALL_VALUE emitted, second removed by CSE
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::CondCallValueI);
     }
 }
