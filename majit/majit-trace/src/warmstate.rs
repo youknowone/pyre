@@ -865,6 +865,25 @@ impl WarmEnterState {
         }
     }
 
+    /// warmstate.py: get_param(name) — read a JIT parameter value.
+    pub fn get_param(&self, name: &str) -> Option<i64> {
+        match name {
+            "threshold" => Some(self.counter.threshold() as i64),
+            "trace_limit" => Some(self.trace_limit as i64),
+            "trace_eagerness" | "bridge_threshold" => Some(self.bridge_threshold as i64),
+            "function_threshold" => Some(self.function_threshold as i64),
+            "max_inline_depth" => Some(self.max_inline_depth as i64),
+            "retrace_limit" => Some(self.retrace_limit as i64),
+            "max_retrace_guards" => Some(self.max_retrace_guards as i64),
+            "max_unroll_loops" => Some(self.max_unroll_loops as i64),
+            "max_unroll_recursion" => Some(self.max_unroll_recursion as i64),
+            "loop_longevity" => Some(self.loop_longevity as i64),
+            "vectorize" => Some(if self.vectorize { 1 } else { 0 }),
+            "vec_cost" => Some(self.vec_cost as i64),
+            _ => None,
+        }
+    }
+
     // ── RPython warmstate.py getter methods ──
 
     pub fn retrace_limit(&self) -> u32 { self.retrace_limit }
