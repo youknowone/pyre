@@ -479,7 +479,7 @@ impl Optimizer {
         for pass in &mut self.passes {
             match pass.propagate_forward(&current_op, ctx) {
                 OptimizationResult::Emit(op) => {
-                    ctx.emit(op);
+                    self.emit_with_guard_check(op, ctx);
                     return;
                 }
                 OptimizationResult::Replace(op) => {
@@ -493,7 +493,36 @@ impl Optimizer {
         }
 
         // If no pass handled it, emit as-is
-        ctx.emit(current_op);
+        self.emit_with_guard_check(current_op, ctx);
+    }
+
+    /// optimizer.py: _emit_operation — emit with guard tracking.
+    ///
+    /// When emitting a guard, check replaces_guard to see if this guard
+    /// should replace a previously emitted one (guard strengthening).
+    /// Also track last_guard_op for consecutive guard descriptor sharing.
+    fn emit_with_guard_check(&mut self, op: Op, ctx: &mut OptContext) {
+        if op.opcode.is_guard() {
+            // optimizer.py: if orig_op in replaces_guard → replace_guard_op
+            if self.can_replace_guards {
+                if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
+                    // Replace a previously emitted guard with this one
+                    let target_pos = replacement.pos.0 as usize;
+                    if target_pos < ctx.new_operations.len() {
+                        ctx.new_operations[target_pos] = op.clone();
+                        return;
+                    }
+                }
+            }
+            self.last_guard_op = Some(op.clone());
+        } else if !op.opcode.has_no_side_effect()
+            && !op.opcode.is_ovf()
+            && !op.opcode.is_jit_debug()
+        {
+            // Side-effecting ops reset last_guard_op
+            self.last_guard_op = None;
+        }
+        ctx.emit(op);
     }
 }
 
