@@ -808,6 +808,19 @@ impl OptVirtualize {
             }
         }
 
+        // Constant-fold: if the guarded value is a compile-time constant,
+        // check the class at optimization time. If it matches, remove the guard.
+        // PyPy guard.py: guards on constants are always removable.
+        if op.num_args() >= 2 {
+            if let Some(value) = ctx.get_constant_int(obj_ref) {
+                if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                    if value == expected {
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
+        }
+
         // Record the class for future lookups.
         self.set_info(
             obj_ref,
