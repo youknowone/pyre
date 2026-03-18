@@ -163,6 +163,8 @@ pub struct StorageConfig {
     /// Optional method on StoragePool to check JIT compatibility of all values.
     /// When set, `can_trace` additionally calls `pool.method()`.
     pub can_trace_guard: Option<Ident>,
+    /// RPython virtualizable: storage contents live on heap, only lengths are InputArgs.
+    pub virtualizable: bool,
 }
 
 impl Parse for JitInterpConfig {
@@ -245,6 +247,7 @@ impl Parse for JitInterpConfig {
                     untraceable: Vec::new(),
                     scan_fn: syn::parse_str("__dummy_scan").unwrap(),
                     can_trace_guard: None,
+                    virtualizable: false,
                 }
             }
             (None, None) => {
@@ -288,6 +291,7 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut untraceable = Vec::new();
     let mut scan_fn = None;
     let mut can_trace_guard = None;
+    let mut virtualizable = false;
     while !content.is_empty() {
         let key: Ident = content.parse()?;
         content.parse::<Token![:]>()?;
@@ -316,11 +320,9 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
                 can_trace_guard = Some(content.parse::<Ident>()?);
             }
             "virtualizable" => {
-                let _ = content.parse::<LitBool>()?;
-                return Err(syn::Error::new(
-                    key.span(),
-                    "`storage.virtualizable` is deprecated; use `virtualizable_fields` or `state_fields`",
-                ));
+                // RPython parity: storage contents on heap, only lengths as InputArgs.
+                let lit: LitBool = content.parse()?;
+                virtualizable = lit.value;
             }
             other => {
                 return Err(syn::Error::new(
@@ -349,6 +351,7 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         untraceable,
         scan_fn,
         can_trace_guard,
+        virtualizable,
     })
 }
 

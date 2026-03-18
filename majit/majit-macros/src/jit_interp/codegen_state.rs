@@ -33,6 +33,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     let untraceable = &config.storage.untraceable;
     let scan_fn = &config.storage.scan_fn;
     let can_trace_guard = &config.storage.can_trace_guard;
+    let virtualizable = config.storage.virtualizable;
     let extra_guard = if let Some(method) = can_trace_guard {
         quote! { && self.#pool_field.#method() }
     } else {
@@ -105,6 +106,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             current_selected_value: Option<majit_ir::OpRef>,
             storage_layout: Vec<(usize, usize)>,
             loop_header_pc: usize,
+            /// Virtualizable: data pointer OpRefs (storage_idx → OpRef).
+            vable_array_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
+            /// Virtualizable: length OpRefs (storage_idx → OpRef).
+            vable_len_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
         }
 
         #[allow(non_camel_case_types)]
@@ -173,6 +178,31 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         .collect(),
                 )
             }
+
+            fn is_virtualizable_storage(&self) -> bool {
+                !self.vable_array_refs.is_empty()
+            }
+
+            fn vable_array_ref(&self, storage_idx: usize) -> Option<majit_ir::OpRef> {
+                self.vable_array_refs.get(&storage_idx).copied()
+            }
+
+            fn vable_len_ref(&self, storage_idx: usize) -> Option<majit_ir::OpRef> {
+                self.vable_len_refs.get(&storage_idx).copied()
+            }
+
+            fn set_vable_array_ref(&mut self, storage_idx: usize, opref: majit_ir::OpRef) {
+                self.vable_array_refs.insert(storage_idx, opref);
+            }
+
+            fn set_vable_len_ref(&mut self, storage_idx: usize, opref: majit_ir::OpRef) {
+                self.vable_len_refs.insert(storage_idx, opref);
+            }
+
+            fn init_vable_storage(&mut self, storage_idx: usize, array_ref: majit_ir::OpRef, len_ref: majit_ir::OpRef) {
+                self.vable_array_refs.insert(storage_idx, array_ref);
+                self.vable_len_refs.insert(storage_idx, len_ref);
+            }
         }
 
         impl majit_meta::JitState for #state_type {
@@ -188,8 +218,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
-                let layout = #scan_fn(program, header_pc, self.#sel_field)
-                    .iter()
+                let storages = #scan_fn(program, header_pc, self.#sel_field);
+                // Always use actual depth (even with virtualizable).
+                let layout = storages.iter()
                     .map(|&s| (s, self.#pool_field.get(s).len()))
                     .collect();
                 __JitMeta {
@@ -199,6 +230,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
+                // Always extract actual stack contents as InputArgs.
                 let mut values = Vec::new();
                 for &(sidx, num_slots) in &meta.storage_layout {
                     let store = self.#pool_field.get(sidx);
@@ -211,6 +243,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                 let mut stacks = std::collections::HashMap::new();
+                let vable_len_refs = std::collections::HashMap::new();
+                let vable_array_refs = std::collections::HashMap::new();
+                // Always use from_input_args (actual depth).
                 let mut offset = 0;
                 for &(sidx, num_slots) in &meta.storage_layout {
                     stacks.insert(
@@ -225,34 +260,46 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     current_selected_value: None,
                     storage_layout: meta.storage_layout.clone(),
                     loop_header_pc: header_pc,
+                    vable_array_refs,
+                    vable_len_refs,
                 }
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
-                meta.initial_selected == self.#sel_field
-                    && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
-                        self.#pool_field.get(sidx).len() == expected_len
-                    })
+                if #virtualizable {
+                    // Virtualizable: only check selected (depths are irrelevant).
+                    meta.initial_selected == self.#sel_field
+                } else {
+                    meta.initial_selected == self.#sel_field
+                        && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
+                            self.#pool_field.get(sidx).len() == expected_len
+                        })
+                }
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                let mut offset = 0;
-                for &(sidx, num_slots) in &meta.storage_layout {
-                    let end = offset + num_slots;
-                    {
-                        let store = self.#pool_field.get_mut(sidx);
-                        store.clear();
-                        for &value in &values[offset..end] {
-                            store.push(value);
+                if false {
+                    // Placeholder for future virtualizable restore.
+                    let _ = meta;
+                } else {
+                    let mut offset = 0;
+                    for &(sidx, num_slots) in &meta.storage_layout {
+                        let end = offset + num_slots;
+                        {
+                            let store = self.#pool_field.get_mut(sidx);
+                            store.clear();
+                            for &value in &values[offset..end] {
+                                store.push(value);
+                            }
                         }
+                        offset = end;
                     }
-                    offset = end;
+                    self.#sel_field = values
+                        .get(offset)
+                        .copied()
+                        .map(|value| value as usize)
+                        .unwrap_or(meta.initial_selected);
                 }
-                self.#sel_field = values
-                    .get(offset)
-                    .copied()
-                    .map(|value| value as usize)
-                    .unwrap_or(meta.initial_selected);
             }
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
@@ -266,18 +313,23 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             #vable_info_fn
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
-                sym.current_selected == meta.initial_selected
-                    && sym.storage_layout.len() == meta.storage_layout.len()
-                    && sym
-                        .storage_layout
-                        .iter()
-                        .zip(meta.storage_layout.iter())
-                        .all(|(&(sym_idx, _), &(meta_idx, _))| sym_idx == meta_idx)
-                    && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
-                        sym.stacks
-                            .get(&sidx)
-                            .is_some_and(|stack| stack.len() == initial_depth)
-                    })
+                if #virtualizable {
+                    // Virtualizable: only check selected matches.
+                    sym.current_selected == meta.initial_selected
+                } else {
+                    sym.current_selected == meta.initial_selected
+                        && sym.storage_layout.len() == meta.storage_layout.len()
+                        && sym
+                            .storage_layout
+                            .iter()
+                            .zip(meta.storage_layout.iter())
+                            .all(|(&(sym_idx, _), &(meta_idx, _))| sym_idx == meta_idx)
+                        && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
+                            sym.stacks
+                                .get(&sidx)
+                                .is_some_and(|stack| stack.len() == initial_depth)
+                        })
+                }
             }
         }
     }
