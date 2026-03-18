@@ -439,11 +439,34 @@ impl Default for ExtendedShortPreambleBuilder {
     }
 }
 
-/// Extract guards from a peeled trace's preamble section.
+/// shortpreamble.py: build short preamble from optimizer state.
+/// Called after preamble optimization is complete.
+/// Collects guards + pure ops from the optimized preamble and
+/// maps them to label arg indices.
+pub fn build_from_preamble_and_label(
+    preamble_ops: &[Op],
+    label_args: &[OpRef],
+    exported_state: Option<VirtualState>,
+) -> ShortPreamble {
+    let mut builder = ShortPreambleBuilder::new();
+    // Record all preamble ops
+    for op in preamble_ops {
+        if op.opcode.is_guard() {
+            builder.add_preamble_guard(op);
+        } else if op.opcode.is_always_pure() {
+            builder.add_preamble_op(op);
+        }
+    }
+    // Set label args to create the mapping
+    builder.set_label_args(label_args);
+    builder.build(exported_state)
+}
+
+/// Extract guards AND pure ops from a peeled trace's preamble section.
 ///
 /// Given a peeled trace (output of OptUnroll), identifies the preamble
-/// section (before the Label) and collects all guard operations as
-/// short preamble entries.
+/// section (before the Label) and collects all guard + pure operations
+/// as short preamble entries.
 ///
 /// This is a simpler alternative to integrating the builder with the
 /// optimizer — it works on already-peeled traces.

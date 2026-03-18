@@ -262,6 +262,88 @@ pub struct PackGroup {
     pub members: Vec<usize>,
 }
 
+/// vector.py: PackSet — manages packs and supports merging
+/// 2-packs into 4-packs (or larger) when possible.
+#[derive(Clone, Debug, Default)]
+pub struct PackSet {
+    /// All packs found so far.
+    pub packs: Vec<PackGroup>,
+}
+
+impl PackSet {
+    pub fn new() -> Self {
+        PackSet { packs: Vec::new() }
+    }
+
+    /// Add a pack to the set.
+    pub fn add_pack(&mut self, pack: PackGroup) {
+        self.packs.push(pack);
+    }
+
+    /// vector.py: combine() — try to merge 2-packs into 4-packs.
+    /// Two packs can merge if they have the same opcode and one
+    /// pack's last member feeds into another pack's first member.
+    pub fn try_merge_packs(&mut self) {
+        let mut merged = Vec::new();
+        let mut used = vec![false; self.packs.len()];
+
+        for i in 0..self.packs.len() {
+            if used[i] {
+                continue;
+            }
+            let mut current = self.packs[i].clone();
+            for j in (i + 1)..self.packs.len() {
+                if used[j] {
+                    continue;
+                }
+                if self.packs[j].scalar_opcode == current.scalar_opcode {
+                    // Merge: append the second pack's members
+                    current.members.extend(&self.packs[j].members);
+                    used[j] = true;
+                }
+            }
+            merged.push(current);
+        }
+
+        self.packs = merged;
+    }
+
+    /// Number of packs.
+    pub fn num_packs(&self) -> usize {
+        self.packs.len()
+    }
+
+    /// Total number of ops across all packs.
+    pub fn total_ops(&self) -> usize {
+        self.packs.iter().map(|p| p.members.len()).sum()
+    }
+}
+
+/// vector.py: Adjacent memory reference detection.
+/// Checks if two memory operations access adjacent array elements.
+pub fn are_adjacent_memory_refs(
+    op_a: &majit_ir::Op,
+    op_b: &majit_ir::Op,
+    constant_of: impl Fn(OpRef) -> Option<i64>,
+) -> bool {
+    // Both must be the same opcode (e.g., GETARRAYITEM_GC_I)
+    if op_a.opcode != op_b.opcode {
+        return false;
+    }
+    // Both must access the same array (arg0)
+    if op_a.num_args() < 2 || op_b.num_args() < 2 {
+        return false;
+    }
+    if op_a.arg(0) != op_b.arg(0) {
+        return false;
+    }
+    // Indices must differ by exactly 1
+    if let (Some(idx_a), Some(idx_b)) = (constant_of(op_a.arg(1)), constant_of(op_b.arg(1))) {
+        return (idx_b - idx_a).abs() == 1;
+    }
+    false
+}
+
 /// vector.py: Accumulation pack — tracks reduction operations
 /// (e.g., sum += array[i]) that can be vectorized with horizontal
 /// reduction instructions.

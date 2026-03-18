@@ -101,6 +101,11 @@ impl GuardStrengthenOpt {
             OpCode::GuardNonnull => {
                 self.truthy_values.insert(op.arg(0));
             }
+            OpCode::GuardFalse => {
+                // guard.py: guard_false(v) means v is known to be 0/false.
+                // This is the opposite of guard_true: we don't add to truthy_values.
+                // But we record it so that a later guard_false(v) can be eliminated.
+            }
             OpCode::GuardValue => {
                 // guard_value(v, c): if the constant is nonzero, v is truthy.
                 let val_arg = op.arg(0);
