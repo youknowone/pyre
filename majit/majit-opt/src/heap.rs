@@ -695,6 +695,48 @@ impl Optimization for OptHeap {
             // ── Array item writes ──
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => self.optimize_setarrayitem(op, ctx),
 
+            // ── heap.py: ARRAYLEN_GC — cache array lengths ──
+            OpCode::ArraylenGc => {
+                let array = op.arg(0);
+                let descr_idx = op.descr.as_ref().map(|d| d.index()).unwrap_or(0);
+                if let Some(&cached) = self.cached_arraylens.get(&(array, descr_idx)) {
+                    let cached = ctx.get_replacement(cached);
+                    ctx.replace_op(op.pos, cached);
+                    return OptimizationResult::Remove;
+                }
+                self.cached_arraylens.insert((array, descr_idx), op.pos);
+                OptimizationResult::Emit(op.clone())
+            }
+
+            // ── heap.py: STRLEN/UNICODELEN — cache like ARRAYLEN ──
+            OpCode::Strlen | OpCode::Unicodelen => {
+                let str_ref = op.arg(0);
+                let key = (str_ref, op.opcode as u32 + 0xFF00);
+                if let Some(&cached) = self.cached_arraylens.get(&key) {
+                    let cached = ctx.get_replacement(cached);
+                    ctx.replace_op(op.pos, cached);
+                    return OptimizationResult::Remove;
+                }
+                self.cached_arraylens.insert(key, op.pos);
+                OptimizationResult::PassOn // let intbounds set non-negative
+            }
+
+            // ── heap.py: Allocation tracking ──
+            OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
+                self.seen_allocation.insert(op.pos);
+                self.unescaped.insert(op.pos);
+                self.known_nonnull.insert(op.pos);
+                OptimizationResult::PassOn
+            }
+
+            // ── heap.py: COND_CALL handling ──
+            OpCode::CondCallN => {
+                self.force_all_lazy(ctx);
+                self.invalidate_caches();
+                self.last_call_did_not_raise = false;
+                OptimizationResult::PassOn
+            }
+
             // ── GUARD_NO_EXCEPTION ──
             // RPython heap.py: emit any postponed op before the guard,
             // then deduplicate consecutive GUARD_NO_EXCEPTION.
@@ -2693,5 +2735,33 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
             .count();
         assert_eq!(get_count, 1, "byte-array read-after-read should be cached");
+    }
+
+    #[test]
+    fn test_arraylen_caching() {
+        // Two ARRAYLEN_GC on the same array → second eliminated.
+        let d = descr(42);
+        let mut ops = vec![
+            {
+                let mut op = Op::new(OpCode::ArraylenGc, &[OpRef(100)]);
+                op.descr = Some(d.clone());
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::ArraylenGc, &[OpRef(100)]);
+                op.descr = Some(d);
+                op
+            },
+            Op::new(OpCode::Finish, &[]),
+        ];
+        assign_positions(&mut ops);
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptHeap::new()));
+        let result = opt.optimize(&ops);
+        let len_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::ArraylenGc)
+            .count();
+        assert_eq!(len_count, 1, "duplicate ARRAYLEN_GC should be cached");
     }
 }

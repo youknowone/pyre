@@ -25,6 +25,10 @@ pub mod jc_flags {
     pub const TEMPORARY: u8 = 0x04;
     /// Tracing has occurred at least once from this key.
     pub const TRACING_OCCURRED: u8 = 0x08;
+    /// warmstate.py: JC_FORCE_FINISH — the loop has a FINISH that
+    /// returns a raw int (not a boxed pointer). Used by
+    /// call_assembler to decide whether to unbox the result.
+    pub const FORCE_FINISH: u8 = 0x10;
 }
 
 /// Explicit state of a BaseJitCell in the JIT lifecycle.

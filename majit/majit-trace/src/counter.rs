@@ -205,3 +205,49 @@ mod tests {
         assert!(counter.tick(42)); // 4 + 6 = 10
     }
 }
+
+/// counter.py: DeterministicJitCounter — deterministic counter for testing.
+///
+/// Uses a HashMap instead of a lossy hash table, so no eviction occurs.
+/// This makes test behavior fully deterministic regardless of hash collisions.
+pub struct DeterministicJitCounter {
+    counts: std::collections::HashMap<u64, u32>,
+    threshold: u32,
+}
+
+impl DeterministicJitCounter {
+    pub fn new(threshold: u32) -> Self {
+        DeterministicJitCounter {
+            counts: std::collections::HashMap::new(),
+            threshold,
+        }
+    }
+
+    /// Increment and check threshold. Deterministic: no eviction.
+    pub fn tick(&mut self, hash: u64) -> bool {
+        let count = self.counts.entry(hash).or_insert(0);
+        *count += 1;
+        *count >= self.threshold
+    }
+
+    /// Reset the counter for a hash.
+    pub fn reset(&mut self, hash: u64) {
+        self.counts.insert(hash, 0);
+    }
+
+    /// Get the current count.
+    pub fn get(&self, hash: u64) -> u32 {
+        self.counts.get(&hash).copied().unwrap_or(0)
+    }
+
+    /// Check without modifying.
+    pub fn would_fire(&self, hash: u64) -> bool {
+        let count = self.counts.get(&hash).copied().unwrap_or(0);
+        count + 1 >= self.threshold
+    }
+
+    /// Threshold getter.
+    pub fn threshold(&self) -> u32 {
+        self.threshold
+    }
+}
