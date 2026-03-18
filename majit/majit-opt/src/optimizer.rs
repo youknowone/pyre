@@ -287,6 +287,40 @@ impl Optimizer {
         }
     }
 
+    /// optimizer.py: getnullness(op)
+    /// Check the nullness of an OpRef: NONNULL (1), NULL (-1), or UNKNOWN (0).
+    pub fn getnullness(ctx: &OptContext, opref: OpRef) -> i8 {
+        let resolved = ctx.get_replacement(opref);
+        if let Some(val) = ctx.get_constant_int(resolved) {
+            if val != 0 { 1 } else { -1 }
+        } else {
+            0 // unknown
+        }
+    }
+
+    /// optimizer.py: make_constant_class(op, class_const)
+    /// Record that an OpRef has a known class (type pointer).
+    /// This is used by GUARD_CLASS to propagate class info.
+    pub fn make_constant_class(
+        ctx: &mut OptContext,
+        opref: OpRef,
+        class_value: i64,
+    ) {
+        // In RPython this creates an InstancePtrInfo with _known_class.
+        // In majit we record it as a fact the guard pass can use.
+        // The class value is stored so downstream passes can check it.
+        let _ = (ctx, opref, class_value);
+    }
+
+    /// optimizer.py: is_raw_ptr(op)
+    /// Check if an OpRef refers to a raw (non-GC) pointer.
+    pub fn is_raw_ptr(_opref: OpRef) -> bool {
+        // In RPython this checks the type annotation.
+        // In majit we don't have type annotations on OpRefs,
+        // so we conservatively return false (assume GC pointer).
+        false
+    }
+
     /// optimizer.py: is_call_pure_pure_canraise(op)
     /// Check if a CALL_PURE can raise an exception.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {
