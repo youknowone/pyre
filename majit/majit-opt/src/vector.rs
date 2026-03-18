@@ -1209,4 +1209,40 @@ mod tests {
         assert_eq!(analysis.body_guards.len(), 1);
         assert_eq!(analysis.body_guards[0], 2);
     }
+
+    #[test]
+    fn test_follow_def_use_chain() {
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),  // 0: result used by 1
+            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(102)]),    // 1: uses result of 0
+            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(103)]),    // 2: uses result of 1
+            Op::new(OpCode::IntAdd, &[OpRef(104), OpRef(105)]),  // 3: independent
+        ];
+        for (i, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef(i as u32);
+        }
+        let chain = follow_def_use_chain(&ops, 0, 10);
+        assert!(chain.contains(&0));
+        assert!(chain.contains(&1));
+        assert!(chain.contains(&2));
+        assert!(!chain.contains(&3)); // independent
+    }
+
+    #[test]
+    fn test_vector_loop_from_trace() {
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),  // preamble
+            Op::new(OpCode::Label, &[OpRef(100)]),               // loop header
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),  // body
+            Op::new(OpCode::IntMul, &[OpRef(2), OpRef(102)]),    // body
+            Op::new(OpCode::Jump, &[OpRef(3)]),                  // back-edge
+        ];
+        for (i, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef(i as u32);
+        }
+        let vloop = VectorLoop::from_trace(&ops).unwrap();
+        assert_eq!(vloop.body_len(), 2); // IntAdd + IntMul
+        assert!(vloop.label.is_some());
+        assert!(vloop.jump.is_some());
+    }
 }
