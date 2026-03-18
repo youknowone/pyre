@@ -119,4 +119,39 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallAssemblerI);
     }
+
+    #[test]
+    fn test_earlyforce_guard_not_forced() {
+        // GUARD_NOT_FORCED should have its fail_args resolved.
+        let mut guard = Op::new(OpCode::GuardNotForced, &[]);
+        guard.fail_args = Some(Default::default());
+        let mut ops = vec![guard];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptEarlyForce::new()));
+        let result = opt.optimize(&ops);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::GuardNotForced);
+        assert!(result[0].fail_args.is_some());
+    }
+
+    #[test]
+    fn test_earlyforce_all_call_may_force_types() {
+        for opcode in [
+            OpCode::CallMayForceI,
+            OpCode::CallMayForceR,
+            OpCode::CallMayForceF,
+            OpCode::CallMayForceN,
+        ] {
+            let mut ops = vec![Op::new(opcode, &[OpRef(100)])];
+            assign_positions(&mut ops);
+
+            let mut opt = Optimizer::new();
+            opt.add_pass(Box::new(OptEarlyForce::new()));
+            let result = opt.optimize(&ops);
+            assert_eq!(result.len(), 1, "{opcode:?} should be handled");
+        }
+    }
 }
