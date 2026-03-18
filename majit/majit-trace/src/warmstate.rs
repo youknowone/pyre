@@ -897,6 +897,27 @@ impl WarmEnterState {
         }
     }
 
+    /// warmstate.py: confirm_enter_jit(*args)
+    /// Hook called before entering JIT compilation to allow the user
+    /// to abort tracing based on runtime conditions.
+    /// Returns true if tracing should proceed, false to abort.
+    ///
+    /// In RPython this is a user-provided callback set via JitDriver.
+    /// Here we provide a default that always returns true.
+    pub fn confirm_enter_jit(&self, _green_key: u64) -> bool {
+        true
+    }
+
+    /// warmstate.py: get_location(greenkey)
+    /// Convert a green key to a human-readable source location string.
+    /// Used for JIT logging and debugging.
+    ///
+    /// In RPython this is a user-provided callback set via JitDriver.
+    /// Here we return a default format.
+    pub fn get_location(&self, green_key: u64) -> String {
+        format!("<jit key 0x{:x}>", green_key)
+    }
+
     /// warmstate.py: get_param(name) — read a JIT parameter value.
     pub fn get_param(&self, name: &str) -> Option<i64> {
         match name {
