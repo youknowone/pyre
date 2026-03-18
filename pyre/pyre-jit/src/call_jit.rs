@@ -9,6 +9,7 @@ use std::sync::Once;
 
 use pyre_object::PyObjectRef;
 use pyre_object::intobject::w_int_get_value;
+use pyre_object::intobject::w_int_new;
 use pyre_object::pyobject::is_int;
 use pyre_runtime::{register_jit_function_caller, w_func_get_code_ptr, w_func_get_globals};
 
@@ -162,25 +163,29 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
             &inputs,
             jit_force_callee_frame_interp,
         ) {
+            // Re-box: compiled trace Finish returns raw int, but
+            // callers may pass the result as a boxed pointer arg.
+            let boxed = w_int_new(raw) as i64;
             unsafe {
-                FORCE_CACHE[hash_idx] = (code_key, arg_key, raw);
+                FORCE_CACHE[hash_idx] = (code_key, arg_key, boxed);
             }
-            return raw;
+            return boxed;
         }
     }
 
     // Fallback: full eval_with_jit (interpreter + JIT)
     match crate::eval::eval_with_jit(frame) {
         Ok(result) => {
-            let raw = if !result.is_null() && unsafe { is_int(result) } {
-                unsafe { w_int_get_value(result) }
-            } else {
-                result as i64
-            };
+            // Return boxed result — re-box raw ints from compiled traces.
+            // The trace's unbox_call_assembler_results pass will strip
+            // GetfieldRawI reads on CallMayForceI results, but if the
+            // result is used directly as an argument (not read via
+            // GetfieldRawI), it must remain a valid boxed pointer.
+            let boxed = result as i64;
             unsafe {
-                FORCE_CACHE[hash_idx] = (code_key, arg_key, raw);
+                FORCE_CACHE[hash_idx] = (code_key, arg_key, boxed);
             }
-            raw
+            boxed
         }
         Err(err) => panic!("jit force callee frame failed: {err}"),
     }
@@ -511,9 +516,8 @@ pub fn callee_frame_helper(nargs: usize) -> Option<*const ()> {
 /// Unlike jit_force_callee_frame which returns raw int for the CA protocol,
 /// this returns a boxed PyObjectRef for use in traces that expect boxed values.
 pub extern "C" fn jit_force_callee_frame_boxed(frame_ptr: i64) -> i64 {
-    let raw = jit_force_callee_frame(frame_ptr);
-    // Re-box: raw int → PyObjectRef
-    pyre_object::intobject::w_int_new(raw) as i64
+    // jit_force_callee_frame now returns boxed, so no re-boxing needed.
+    jit_force_callee_frame(frame_ptr)
 }
 
 pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
