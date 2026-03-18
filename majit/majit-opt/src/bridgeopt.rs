@@ -25,6 +25,12 @@ pub struct BridgeKnowledge {
     pub known_classes: HashMap<OpRef, GcRef>,
     /// Integer bounds: (opref, lower, upper).
     pub known_bounds: HashMap<OpRef, (i64, i64)>,
+    /// bridgeopt.py: known heap field values.
+    /// (object_ref, field_descr_index) → value OpRef.
+    pub known_fields: HashMap<(OpRef, u32), OpRef>,
+    /// bridgeopt.py: known array item values.
+    /// (array_ref, index, descr_index) → value OpRef.
+    pub known_arrayitems: HashMap<(OpRef, i64, u32), OpRef>,
 }
 
 impl BridgeKnowledge {
@@ -34,7 +40,29 @@ impl BridgeKnowledge {
             known_nonnull: Vec::new(),
             known_classes: HashMap::new(),
             known_bounds: HashMap::new(),
+            known_fields: HashMap::new(),
+            known_arrayitems: HashMap::new(),
         }
+    }
+
+    /// Add a known field value.
+    pub fn add_known_field(&mut self, obj: OpRef, field_idx: u32, value: OpRef) {
+        self.known_fields.insert((obj, field_idx), value);
+    }
+
+    /// Add a known array item value.
+    pub fn add_known_arrayitem(&mut self, array: OpRef, index: i64, descr_idx: u32, value: OpRef) {
+        self.known_arrayitems.insert((array, index, descr_idx), value);
+    }
+
+    /// Number of total known facts.
+    pub fn num_facts(&self) -> usize {
+        self.known_constants.len()
+            + self.known_nonnull.len()
+            + self.known_classes.len()
+            + self.known_bounds.len()
+            + self.known_fields.len()
+            + self.known_arrayitems.len()
     }
 }
 

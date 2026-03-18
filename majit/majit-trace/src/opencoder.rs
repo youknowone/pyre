@@ -222,6 +222,69 @@ pub struct TopSnapshot {
     pub vref_array_index: Option<usize>,
 }
 
+/// opencoder.py: SnapshotIterator — iterates snapshot values
+/// in bottom-up frame order (inner frame first).
+pub struct SnapshotIterator<'a> {
+    storage: &'a SnapshotStorage,
+    current_snapshot_idx: Option<usize>,
+}
+
+impl<'a> SnapshotIterator<'a> {
+    pub fn new(storage: &'a SnapshotStorage, top_snapshot_idx: usize) -> Self {
+        let start = if top_snapshot_idx < storage.top_snapshots.len() {
+            let top = &storage.top_snapshots[top_snapshot_idx];
+            Some(storage.snapshots.len() - 1) // start from innermost
+        } else {
+            None
+        };
+        SnapshotIterator {
+            storage,
+            current_snapshot_idx: start,
+        }
+    }
+
+    /// Get the current snapshot frame.
+    pub fn current(&self) -> Option<&'a Snapshot> {
+        self.current_snapshot_idx
+            .and_then(|idx| self.storage.snapshots.get(idx))
+    }
+
+    /// Move to the outer (caller) frame.
+    pub fn next_frame(&mut self) -> Option<&'a Snapshot> {
+        let idx = self.current_snapshot_idx?;
+        let snap = self.storage.snapshots.get(idx)?;
+        self.current_snapshot_idx = snap.prev;
+        self.current()
+    }
+
+    /// Decode a tagged value from the snapshot.
+    pub fn decode_value(&self, tagged: u32) -> DecodedSnapshotValue {
+        let (kind, value) = untag(tagged);
+        match kind {
+            TAGINT => DecodedSnapshotValue::SmallInt(value as i64),
+            TAGCONSTPTR => DecodedSnapshotValue::ConstPtr(
+                self.storage.const_refs.get(value as usize).copied().unwrap_or(0),
+            ),
+            TAGCONSTOTHER => DecodedSnapshotValue::ConstOther(value),
+            TAGBOX => DecodedSnapshotValue::Box(majit_ir::OpRef(value)),
+            _ => DecodedSnapshotValue::SmallInt(0),
+        }
+    }
+}
+
+/// Decoded value from a snapshot.
+#[derive(Clone, Debug)]
+pub enum DecodedSnapshotValue {
+    /// Small integer constant (fits in tag bits).
+    SmallInt(i64),
+    /// GC pointer constant (index into const_refs pool).
+    ConstPtr(u64),
+    /// Other constant (big int or float, index into pool).
+    ConstOther(u32),
+    /// Reference to a traced value (OpRef).
+    Box(majit_ir::OpRef),
+}
+
 /// Snapshot storage for a trace.
 /// opencoder.py: Trace._snapshot_data, _snapshot_array_data
 #[derive(Clone, Debug, Default)]
