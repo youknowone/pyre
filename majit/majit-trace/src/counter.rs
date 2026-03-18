@@ -19,6 +19,8 @@ pub struct JitCounter {
     threshold: u32,
     /// counter.py: _nexthash — monotonically increasing hash generator.
     next_hash: u64,
+    /// counter.py: decay_by_mult — multiplier for decay (1.0 = no decay).
+    decay_mult: f64,
 }
 
 impl JitCounter {
@@ -27,6 +29,7 @@ impl JitCounter {
             table: vec![(0, 0); TABLE_SIZE],
             threshold,
             next_hash: 0,
+            decay_mult: 1.0,
         }
     }
 
@@ -181,6 +184,26 @@ impl JitCounter {
     /// Total number of active entries (non-zero counts).
     pub fn num_active(&self) -> usize {
         self.table.iter().filter(|(_, c)| *c > 0).count()
+    }
+
+    /// counter.py: set_decay(decay)
+    /// Set the decay factor from 0 (none) to 1000 (max).
+    /// The decay multiplier is `1.0 - decay * 0.001`.
+    pub fn set_decay(&mut self, decay: i32) {
+        let clamped = decay.clamp(0, 1000);
+        self.decay_mult = 1.0 - (clamped as f64 * 0.001);
+    }
+
+    /// counter.py: lookup_chain(hash)
+    /// Look up the counter entry for a hash. Returns the current count.
+    pub fn lookup_chain(&self, hash: u64) -> u32 {
+        self.get(hash)
+    }
+
+    /// counter.py: cleanup_chain(hash)
+    /// Reset and remove the counter for a hash.
+    pub fn cleanup_chain(&mut self, hash: u64) {
+        self.reset(hash);
     }
 }
 
