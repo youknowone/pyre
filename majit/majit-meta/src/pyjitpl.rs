@@ -839,7 +839,7 @@ impl<M: Clone> MetaInterp<M> {
             raw_int_finish_keys: HashSet::new(),
             raw_int_box_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
-            max_unroll_recursion: 3, // PyPy default 7, but 3 is optimal for CallMayForce pattern
+            max_unroll_recursion: 3, // CallMayForce + direct dispatch
         }
     }
 
