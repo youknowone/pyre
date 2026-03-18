@@ -686,7 +686,7 @@ impl<S: JitState> JitDriver<S> {
             "trace_eagerness" => self.meta.set_trace_eagerness(value as u32),
             "bridge_threshold" => self.meta.set_bridge_threshold(value as u32),
             "function_threshold" => self.meta.set_function_threshold(value as u32),
-            _ => {} // unknown params silently ignored
+            _ => self.meta.warm_state_mut().set_param(name, value),
         }
     }
 
