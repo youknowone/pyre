@@ -60,6 +60,10 @@ impl Optimization for OptSimplify {
                 OptimizationResult::Emit(new_op)
             }
 
+            // simplify.py: GUARD_FUTURE_CONDITION — removed, the guard was
+            // already handled by notice_guard_future_condition in the optimizer.
+            OpCode::GuardFutureCondition => OptimizationResult::Remove,
+
             // Hint operations that are simply removed
             OpCode::VirtualRefFinish
             | OpCode::QuasiimmutField
