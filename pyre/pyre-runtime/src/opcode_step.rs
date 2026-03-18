@@ -1,6 +1,6 @@
 use pyre_bytecode::bytecode::{
-    BinaryOperator, CodeObject, CodeUnit, ComparisonOperator, ConstantData, Instruction, OpArg,
-    OpArgState,
+    BinaryOperator, CodeObject, CodeUnit, ComparisonOperator, ConstantData, Instruction,
+    IntrinsicFunction1, IntrinsicFunction2, OpArg, OpArgState,
 };
 
 use crate::{
@@ -837,6 +837,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn dict_update(&mut self, _i: usize) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("dict_update not implemented").into())
     }
+    fn set_update(&mut self, _i: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("set_update not implemented").into())
+    }
     fn map_add(&mut self, _i: usize) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("map_add not implemented").into())
     }
@@ -924,6 +927,79 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
     fn unpack_ex(&mut self, _args: pyre_bytecode::bytecode::UnpackExArgs) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("unpack_ex not implemented").into())
+    }
+
+    /// CALL_INTRINSIC_1: single-argument intrinsic operations.
+    fn call_intrinsic_1(
+        &mut self,
+        func: IntrinsicFunction1,
+    ) -> Result<(), Self::Error> {
+        match func {
+            IntrinsicFunction1::UnaryPositive => {
+                // PyPy: UNARY_POSITIVE → space.pos(w_value)
+                let val = self.pop_value().map_err(Into::into)?;
+                let result = self.unary_positive(val)?;
+                self.push_value(result).map_err(Into::into)?;
+                Ok(())
+            }
+            IntrinsicFunction1::ListToTuple => {
+                let val = self.pop_value().map_err(Into::into)?;
+                let result = self.list_to_tuple(val)?;
+                self.push_value(result).map_err(Into::into)?;
+                Ok(())
+            }
+            IntrinsicFunction1::ImportStar => {
+                // Module is TOS; import_star pops it internally
+                self.import_star()?;
+                let none = self.none_value()?;
+                self.push_value(none).map_err(Into::into)?;
+                Ok(())
+            }
+            IntrinsicFunction1::Print => {
+                // sys.displayhook(value)
+                let val = self.pop_value().map_err(Into::into)?;
+                self.print_expr(val)?;
+                let none = self.none_value()?;
+                self.push_value(none).map_err(Into::into)?;
+                Ok(())
+            }
+            _ => Err(crate::PyError::type_error(
+                &format!("intrinsic function {:?} not implemented", func),
+            ).into()),
+        }
+    }
+
+    /// CALL_INTRINSIC_2: two-argument intrinsic operations.
+    fn call_intrinsic_2(
+        &mut self,
+        func: IntrinsicFunction2,
+    ) -> Result<(), Self::Error> {
+        match func {
+            IntrinsicFunction2::SetFunctionTypeParams => {
+                // arg2 = type_params, arg1 = function
+                // Set __type_params__ attribute on the function; push function back
+                let _type_params = self.pop_value().map_err(Into::into)?;
+                // just leave the function on the stack
+                Ok(())
+            }
+            _ => Err(crate::PyError::type_error(
+                &format!("intrinsic function {:?} not implemented", func),
+            ).into()),
+        }
+    }
+
+    // ── Intrinsic helper methods ──
+    fn unary_positive(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+        Err(crate::PyError::type_error("unary_positive not implemented").into())
+    }
+    fn list_to_tuple(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+        Err(crate::PyError::type_error("list_to_tuple not implemented").into())
+    }
+    fn print_expr(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("print_expr not implemented").into())
+    }
+    fn none_value(&mut self) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+        Err(crate::PyError::type_error("none_value not implemented").into())
     }
 
     fn unsupported(
@@ -1314,6 +1390,10 @@ where
             executor.dict_update(i.get(op_arg) as usize)?;
             Ok(StepResult::Continue)
         }
+        Instruction::SetUpdate { i } => {
+            executor.set_update(i.get(op_arg) as usize)?;
+            Ok(StepResult::Continue)
+        }
         Instruction::MapAdd { i } => {
             executor.map_add(i.get(op_arg) as usize)?;
             Ok(StepResult::Continue)
@@ -1491,6 +1571,16 @@ where
         }
         Instruction::DeleteGlobal { namei } => {
             executor.delete_global(code.names[namei.get(op_arg) as usize].as_ref())?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Intrinsics ──
+        Instruction::CallIntrinsic1 { func } => {
+            executor.call_intrinsic_1(func.get(op_arg))?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::CallIntrinsic2 { func } => {
+            executor.call_intrinsic_2(func.get(op_arg))?;
             Ok(StepResult::Continue)
         }
 
