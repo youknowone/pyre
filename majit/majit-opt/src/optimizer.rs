@@ -358,6 +358,11 @@ impl Optimizer {
     }
 
     /// Send one operation through the pass chain.
+    ///
+    /// NOTE: Do NOT add `replace_op(original_pos, new_pos)` here.
+    /// The Emit variant's position tracking is handled by each pass
+    /// and OptContext. Adding automatic replacement mapping here
+    /// causes spurious forwarding that breaks heap/guard tests.
     fn propagate_one(&mut self, op: &Op, ctx: &mut OptContext) {
         // Resolve forwarded arguments
         let mut resolved_op = op.clone();
