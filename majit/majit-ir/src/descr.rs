@@ -739,6 +739,98 @@ impl ArrayDescr for SimpleArrayDescr {
     }
 }
 
+/// Simple concrete InteriorFieldDescr.
+#[derive(Debug, Clone)]
+pub struct SimpleInteriorFieldDescr {
+    index: u32,
+    array_descr: std::sync::Arc<SimpleArrayDescr>,
+    field_descr: std::sync::Arc<SimpleFieldDescr>,
+}
+
+impl SimpleInteriorFieldDescr {
+    pub fn new(
+        index: u32,
+        array_descr: std::sync::Arc<SimpleArrayDescr>,
+        field_descr: std::sync::Arc<SimpleFieldDescr>,
+    ) -> Self {
+        SimpleInteriorFieldDescr {
+            index,
+            array_descr,
+            field_descr,
+        }
+    }
+}
+
+impl Descr for SimpleInteriorFieldDescr {
+    fn index(&self) -> u32 {
+        self.index
+    }
+    fn as_interior_field_descr(&self) -> Option<&dyn InteriorFieldDescr> {
+        Some(self)
+    }
+}
+
+impl InteriorFieldDescr for SimpleInteriorFieldDescr {
+    fn array_descr(&self) -> &dyn ArrayDescr {
+        self.array_descr.as_ref()
+    }
+    fn field_descr(&self) -> &dyn FieldDescr {
+        self.field_descr.as_ref()
+    }
+}
+
+/// Simple concrete CallDescr for non-test use.
+#[derive(Debug, Clone)]
+pub struct SimpleCallDescr {
+    index: u32,
+    arg_types: Vec<Type>,
+    result_type: Type,
+    result_size: usize,
+    effect: EffectInfo,
+}
+
+impl SimpleCallDescr {
+    pub fn new(
+        index: u32,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        result_size: usize,
+        effect: EffectInfo,
+    ) -> Self {
+        SimpleCallDescr {
+            index,
+            arg_types,
+            result_type,
+            result_size,
+            effect,
+        }
+    }
+}
+
+impl Descr for SimpleCallDescr {
+    fn index(&self) -> u32 {
+        self.index
+    }
+    fn as_call_descr(&self) -> Option<&dyn CallDescr> {
+        Some(self)
+    }
+}
+
+impl CallDescr for SimpleCallDescr {
+    fn arg_types(&self) -> &[Type] {
+        &self.arg_types
+    }
+    fn result_type(&self) -> Type {
+        self.result_type
+    }
+    fn result_size(&self) -> usize {
+        self.result_size
+    }
+    fn effect_info(&self) -> &EffectInfo {
+        &self.effect
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

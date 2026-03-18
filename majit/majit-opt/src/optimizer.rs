@@ -237,6 +237,13 @@ impl Optimizer {
         }
     }
 
+    /// optimizer.py: _clean_optimization_info(ops)
+    /// Reset forwarding pointers on all ops before re-optimization.
+    /// Called when re-optimizing a trace (e.g., retrace).
+    pub fn clean_optimization_info(ctx: &mut OptContext) {
+        ctx.forwarding.clear();
+    }
+
     /// optimizer.py: is_call_pure_pure_canraise(op)
     /// Check if a CALL_PURE can raise an exception.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {

@@ -121,6 +121,55 @@ pub enum PtrInfo {
 }
 
 impl PtrInfo {
+    // ── Constructors (info.py: factory methods) ──
+
+    /// Create a NonNull PtrInfo.
+    pub fn nonnull() -> Self {
+        PtrInfo::NonNull
+    }
+
+    /// Create a Constant PtrInfo.
+    pub fn constant(gcref: GcRef) -> Self {
+        PtrInfo::Constant(gcref)
+    }
+
+    /// Create a KnownClass PtrInfo.
+    pub fn known_class(class_ptr: GcRef, is_nonnull: bool) -> Self {
+        PtrInfo::KnownClass {
+            class_ptr,
+            is_nonnull,
+        }
+    }
+
+    /// Create a Virtual PtrInfo (allocation removed).
+    pub fn virtual_obj(descr: DescrRef, known_class: Option<GcRef>) -> Self {
+        PtrInfo::Virtual(VirtualInfo {
+            descr,
+            known_class,
+            fields: Vec::new(),
+            field_descrs: Vec::new(),
+        })
+    }
+
+    /// Create a VirtualArray PtrInfo.
+    pub fn virtual_array(descr: DescrRef, length: usize) -> Self {
+        PtrInfo::VirtualArray(VirtualArrayInfo {
+            descr,
+            items: vec![OpRef::NONE; length],
+        })
+    }
+
+    /// Create a VirtualStruct PtrInfo.
+    pub fn virtual_struct(descr: DescrRef) -> Self {
+        PtrInfo::VirtualStruct(VirtualStructInfo {
+            descr,
+            fields: Vec::new(),
+            field_descrs: Vec::new(),
+        })
+    }
+
+    // ── Query methods ──
+
     /// Whether this pointer is known to be non-null.
     /// info.py: is_nonnull()
     pub fn is_nonnull(&self) -> bool {
