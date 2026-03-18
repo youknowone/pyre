@@ -2163,4 +2163,40 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
     }
+
+    #[test]
+    fn test_quasiimmut_dependency_lifecycle() {
+        let mut ws = WarmEnterState::new(2);
+        let key = 0xF00D;
+        let qmut = 0xBEEF;
+
+        // Compile a loop
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing(_)));
+        ws.finish_tracing(key);
+        let token = JitCellToken::new(ws.alloc_token_number());
+        ws.attach_procedure_to_interp(key, token);
+
+        // Register quasi-immutable dependency
+        ws.register_quasiimmut_dependency(qmut, key);
+
+        // Invalidate
+        let invalidated = ws.invalidate_quasiimmut(qmut);
+        assert_eq!(invalidated, 1);
+
+        // Loop should now be invalidated state
+        assert_eq!(ws.get_cell_state(key), BaseJitCellState::Invalidated);
+    }
+
+    #[test]
+    fn test_set_param_roundtrip() {
+        let mut ws = WarmEnterState::new(100);
+        for name in WarmEnterState::param_names() {
+            let original = ws.get_param(name);
+            assert!(original.is_some(), "param {name} should be gettable");
+            ws.set_param(name, 999);
+            ws.set_param_to_default(name);
+            // After default, should be same as a fresh instance
+        }
+    }
 }

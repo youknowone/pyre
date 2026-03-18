@@ -197,4 +197,37 @@ mod tests {
         qi.cleanup();
         assert!(!qi.has_watchers());
     }
+
+    #[test]
+    fn test_quasi_immut_descr_multi_loop() {
+        let descr = QuasiImmutDescr::new(0x2000, 10, 55);
+        let f1 = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::new(AtomicBool::new(false));
+        descr.register_loop(&f1);
+        descr.register_loop(&f2);
+        // Only invalidate — both flags should be set.
+        descr.invalidate();
+        assert!(f1.load(Ordering::Acquire));
+        assert!(f2.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_num_watchers_after_invalidate() {
+        let mut qi = QuasiImmut::new();
+        let f1 = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::new(AtomicBool::new(false));
+        qi.register(&f1);
+        qi.register(&f2);
+        assert_eq!(qi.num_watchers(), 2);
+        qi.invalidate();
+        // Watchers are still alive (flags are still held).
+        assert_eq!(qi.num_watchers(), 2);
+    }
+
+    #[test]
+    fn test_debug_format() {
+        let qi = QuasiImmut::new();
+        let debug = format!("{:?}", qi);
+        assert!(debug.contains("QuasiImmut"));
+    }
 }
