@@ -148,6 +148,10 @@ pub struct OptPure {
     /// Pre-recorded CALL_PURE results from RECORD_KNOWN_RESULT.
     /// pure.py: known_result_call_pure
     known_result_call_pure: Vec<(PureOpKey, OpRef)>,
+    /// pure.py: extra_call_pure — CALL_PURE results from the previous
+    /// loop iteration (fed from Optimizer.call_pure_results).
+    /// These are checked before the regular cache for cross-iteration CSE.
+    extra_call_pure: Vec<(PureOpKey, OpRef)>,
 }
 
 impl OptPure {
@@ -159,7 +163,23 @@ impl OptPure {
             call_pure_positions: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
+            extra_call_pure: Vec::new(),
         }
+    }
+
+    /// pure.py: inject extra_call_pure from optimizer.call_pure_results.
+    /// Called before optimization starts to seed cross-iteration CSE data.
+    pub fn set_extra_call_pure(&mut self, results: Vec<(Vec<OpRef>, OpRef)>) {
+        self.extra_call_pure = results
+            .into_iter()
+            .map(|(args, result)| {
+                let key = PureOpKey {
+                    opcode: OpCode::CallPureI,
+                    args,
+                };
+                (key, result)
+            })
+            .collect();
     }
 
     /// Whether this opcode is commutative (order of args doesn't matter).
@@ -261,7 +281,14 @@ impl OptPure {
 
     /// Check known_result_call_pure for a matching call.
     fn lookup_known_result(&self, key: &PureOpKey) -> Option<OpRef> {
+        // Check known_result_call_pure first (from RECORD_KNOWN_RESULT)
         for (k, result) in &self.known_result_call_pure {
+            if k.args == key.args {
+                return Some(*result);
+            }
+        }
+        // pure.py: also check extra_call_pure (from previous loop iteration)
+        for (k, result) in &self.extra_call_pure {
             if k.args == key.args {
                 return Some(*result);
             }
@@ -479,6 +506,8 @@ impl Optimization for OptPure {
         self.call_pure_positions.clear();
         self.last_emitted_was_removed = false;
         self.known_result_call_pure.clear();
+        // Note: extra_call_pure is NOT cleared on setup — it persists
+        // across optimization runs (set by set_extra_call_pure before opt).
     }
 
     fn name(&self) -> &'static str {
@@ -715,6 +744,7 @@ mod tests {
             call_pure_positions: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
+            extra_call_pure: Vec::new(),
         }));
         let result = opt.optimize(&ops);
 
