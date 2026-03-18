@@ -39,12 +39,15 @@ fn stable_array_index(base_size: usize, item_size: usize, item_type: Type, signe
 }
 
 /// Concrete field descriptor for pyre object fields.
+/// RPython FieldDescr: describes a field in a GC/raw struct.
 #[derive(Debug)]
 pub struct PyreFieldDescr {
     offset: usize,
     field_size: usize,
     field_type: Type,
     signed: bool,
+    /// RPython: is_immutable_field(). Immutable fields survive cache invalidation.
+    immutable: bool,
 }
 
 /// Concrete array descriptor for pointer-backed runtime arrays.
@@ -65,10 +68,9 @@ impl Descr for PyreFieldDescr {
         Some(self)
     }
 
-    /// ob_type (offset=0, size=8) is immutable — cache survives calls.
-    /// PyPy: FieldDescr.is_always_pure() checks immutability flag.
+    /// PyPy FieldDescr.is_always_pure(): immutable fields survive cache invalidation.
     fn is_always_pure(&self) -> bool {
-        self.offset == 0 && self.field_size == 8 && self.field_type == Type::Int && !self.signed
+        self.immutable
     }
 }
 
@@ -131,6 +133,24 @@ pub fn make_field_descr(
         field_size,
         field_type,
         signed,
+        immutable: false,
+    })
+}
+
+/// Create a field descriptor for an immutable field (RPython is_immutable_field).
+/// Cache entries for immutable fields survive call invalidation.
+pub fn make_immutable_field_descr(
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+) -> DescrRef {
+    Arc::new(PyreFieldDescr {
+        offset,
+        field_size,
+        field_type,
+        signed,
+        immutable: true,
     })
 }
 
@@ -288,9 +308,9 @@ pub fn namespace_values_len_descr() -> DescrRef {
 
 // ── Object header & allocation descriptors ──────────────────────────
 
-/// Field descriptor for ob_type (PyObject.ob_type pointer).
+/// Field descriptor for ob_type (PyObject.ob_type pointer) — immutable.
 pub fn ob_type_descr() -> DescrRef {
-    make_field_descr(OB_TYPE_OFFSET, 8, Type::Int, false)
+    make_immutable_field_descr(OB_TYPE_OFFSET, 8, Type::Int, false)
 }
 
 /// Size descriptor for W_IntObject allocation via `New`.
