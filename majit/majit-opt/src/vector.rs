@@ -628,6 +628,35 @@ impl VectorizingOptimizer {
         }
     }
 
+    /// vector.py: linear_find_smallest_type — scan ops for smallest
+    /// array element type to determine SIMD width.
+    pub fn linear_find_smallest_type(ops: &[Op]) -> usize {
+        let mut smallest = 0usize;
+        for op in ops {
+            if op.opcode.is_getarrayitem() || op.opcode.is_setarrayitem() {
+                if let Some(ref descr) = op.descr {
+                    if let Some(ad) = descr.as_array_descr() {
+                        let item_size = ad.item_size();
+                        if smallest == 0 || item_size < smallest {
+                            smallest = item_size;
+                        }
+                    }
+                }
+            }
+        }
+        smallest
+    }
+
+    /// vector.py: get_unroll_count — compute how many times to unroll
+    /// based on SIMD register width and smallest type.
+    pub fn get_unroll_count(smallest_type_bytes: usize, simd_reg_bytes: usize) -> usize {
+        if smallest_type_bytes == 0 {
+            return 0;
+        }
+        let count = simd_reg_bytes / smallest_type_bytes;
+        count.saturating_sub(1) // already unrolled once
+    }
+
     /// vector.py: user_loop_heuristic — quick check if a loop body is
     /// worth trying to vectorize. Returns false if there are too few ops,
     /// no vectorizable opcodes, or too many guards.
