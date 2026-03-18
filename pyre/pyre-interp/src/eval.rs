@@ -520,6 +520,25 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── LoadFromDictOrGlobals ──
+    // CPython 3.13: LOAD_FROM_DICT_OR_GLOBALS — try TOS dict first, then globals
+    fn load_from_dict_or_globals(&mut self, name: &str) -> Result<(), Self::Error> {
+        let dict = self.pop();
+        // Try dict first (if it's a dict or has attrs)
+        if let Ok(val) = pyre_objspace::space::py_getattr(dict, name) {
+            self.push(val);
+            return Ok(());
+        }
+        // Fall back to globals
+        unsafe {
+            if let Some(&val) = (*self.namespace).get(name) {
+                self.push(val);
+                return Ok(());
+            }
+        }
+        Err(PyError::type_error(format!("name '{name}' is not defined")))
+    }
+
     // ── GetLen ──
     fn get_len(&mut self, obj: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
         let len = pyre_objspace::space::py_len(obj)?;
