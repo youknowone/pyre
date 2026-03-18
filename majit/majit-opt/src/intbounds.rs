@@ -103,6 +103,23 @@ impl OptIntBounds {
         self.pure_from_args_cache.push((opcode, arg0, arg1, result));
     }
 
+    /// Get or create a constant OpRef for the given value.
+    fn get_or_make_const(&self, value: i64, ctx: &mut OptContext) -> OpRef {
+        // Search existing constants
+        for (idx, slot) in ctx.constants.iter().enumerate() {
+            if let Some(Value::Int(v)) = slot {
+                if *v == value {
+                    return OpRef(idx as u32);
+                }
+            }
+        }
+        // Create a new constant via a SameAs op
+        let op = Op::new(OpCode::SameAsI, &[]);
+        let opref = ctx.emit(op);
+        ctx.make_constant(opref, Value::Int(value));
+        opref
+    }
+
     /// Get the pure_from_args synthesis cache (for integration with OptPure).
     pub fn get_pure_from_args_cache(&self) -> &[(OpCode, OpRef, OpRef, OpRef)] {
         &self.pure_from_args_cache
@@ -291,7 +308,7 @@ impl OptIntBounds {
 
     /// intbounds.py: INT_ADD pure_from_args synthesis.
     /// Record INT_SUB reverse: if res = INT_ADD(a, b), then a = INT_SUB(res, b).
-    fn postprocess_int_add(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_add(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_replacement(op.arg(0));
         let arg1 = ctx.get_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
@@ -302,20 +319,49 @@ impl OptIntBounds {
             b0.add_bound(&b1)
         };
         self.intersect_bound(op.pos, &b);
-        // pure_from_args: INT_ADD(a,b)=res → INT_SUB(res,b)=a, INT_SUB(res,a)=b
+        // Synthesis: INT_ADD(a,b)=res → INT_SUB(res,b)=a, INT_SUB(res,a)=b
         self.record_pure_from_args(OpCode::IntSub, op.pos, arg1, arg0);
         self.record_pure_from_args(OpCode::IntSub, op.pos, arg0, arg1);
+        // intbounds.py: constant inversion synthesis
+        // If one arg is constant c, synthesize with -c:
+        //   INT_SUB(other, -c) = res, INT_SUB(other, res) = -c
+        let c0 = ctx.get_constant_int(arg0);
+        let c1 = ctx.get_constant_int(arg1);
+        let (inv_const, other) = if let Some(c) = c0 {
+            if c == i64::MIN { return; }
+            (c, arg1)
+        } else if let Some(c) = c1 {
+            if c == i64::MIN { return; }
+            (c, arg0)
+        } else {
+            return;
+        };
+        let neg_ref = self.get_or_make_const(-inv_const, ctx);
+        self.record_pure_from_args(OpCode::IntSub, other, neg_ref, op.pos);
+        self.record_pure_from_args(OpCode::IntSub, other, op.pos, neg_ref);
     }
 
-    /// intbounds.py: INT_SUB pure_from_args synthesis.
-    /// Record INT_ADD reverse: if res = INT_SUB(a, b), then a = INT_ADD(res, b).
-    fn postprocess_int_sub(&mut self, op: &Op, ctx: &OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+    /// intbounds.py: INT_SUB postprocess with constant inversion synthesis.
+    fn postprocess_int_sub(&mut self, op: &Op, ctx: &mut OptContext) {
+        let arg0 = ctx.get_replacement(op.arg(0));
+        let arg1 = ctx.get_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
         let b = b0.sub_bound(&b1);
         self.intersect_bound(op.pos, &b);
-        // pure_from_args: INT_SUB(a,b)=res → INT_ADD(res,b)=a
-        self.record_pure_from_args(OpCode::IntAdd, op.pos, op.arg(1), op.arg(0));
+        // Synthesis: INT_SUB(a,b)=res → INT_ADD(res,b)=a, INT_SUB(a,res)=b
+        self.record_pure_from_args(OpCode::IntAdd, op.pos, arg1, arg0);
+        self.record_pure_from_args(OpCode::IntSub, arg0, op.pos, arg1);
+        // intbounds.py: constant inversion for INT_SUB
+        if let Some(c1) = ctx.get_constant_int(arg1) {
+            if c1 != i64::MIN {
+                let neg_ref = self.get_or_make_const(-c1, ctx);
+                self.record_pure_from_args(OpCode::IntAdd, arg0, neg_ref, op.pos);
+                self.record_pure_from_args(OpCode::IntAdd, neg_ref, arg0, op.pos);
+                self.record_pure_from_args(OpCode::IntSub, op.pos, neg_ref, arg0);
+                self.record_pure_from_args(OpCode::IntSub, op.pos, arg0, neg_ref);
+            }
+        }
     }
 
     fn postprocess_int_mul(&mut self, op: &Op, ctx: &OptContext) {
