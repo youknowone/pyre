@@ -16,5 +16,12 @@ pub fn trace_bytecode(
     concrete_frame: usize,
 ) -> TraceAction {
     let mut frame_state = TraceFrameState::from_sym(ctx, sym, concrete_frame, pc + 1);
+
+    // PyPy interp_jit.py:89 — promote(valuestackdepth).
+    // hint(self.valuestackdepth, promote=True) forces valuestackdepth
+    // to be a compile-time constant, enabling constant-folding of
+    // stack offset calculations.
+    frame_state.promote_valuestackdepth(concrete_frame);
+
     frame_state.trace_code_step(code, pc)
 }

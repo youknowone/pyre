@@ -126,18 +126,19 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             return Ok(w_none());
         }
 
-        // PyPy interp_jit.py:85 — jit_merge_point on every iteration.
-        // When tracing: records trace ops.
-        // When not tracing: checks for compiled loop, runs if available.
-        if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
-            if driver.is_tracing() {
-                JIT_TRACING.with(|t| t.set(true));
-                let pc = frame.next_instr;
-                let concrete_frame = frame as *mut PyFrame as usize;
-                driver.merge_point(|ctx, sym| trace_bytecode(ctx, sym, code, pc, concrete_frame));
-                if !driver.is_tracing() {
-                    JIT_TRACING.with(|t| t.set(false));
-                }
+        // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
+        // pypyjitdriver.jit_merge_point(ec=ec, frame=self, next_instr=next_instr,
+        //     pycode=pycode, is_being_profiled=is_being_profiled)
+        //
+        // PyPy interp_jit.py:89 — promote(valuestackdepth) immediately after.
+        // self.valuestackdepth = hint(self.valuestackdepth, promote=True)
+        if JIT_CALL_DEPTH.with(|d| d.get()) == 0 && driver.is_tracing() {
+            JIT_TRACING.with(|t| t.set(true));
+            let pc = frame.next_instr;
+            let concrete_frame = frame as *mut PyFrame as usize;
+            driver.merge_point(|ctx, sym| trace_bytecode(ctx, sym, code, pc, concrete_frame));
+            if !driver.is_tracing() {
+                JIT_TRACING.with(|t| t.set(false));
             }
         }
 
