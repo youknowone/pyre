@@ -42,7 +42,7 @@ pub use io_buffer::{
 };
 pub use jit_state::{DeoptMaterializationCache, JitState, PendingFieldWriteLayout};
 pub use jitcode::{
-    trace_jitcode, trace_jitcode_with_data_ptr, raw_i64_array_descr,
+    trace_jitcode, trace_jitcode_with_data_ptr,
     ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
     JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
 };
