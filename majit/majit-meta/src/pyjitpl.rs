@@ -880,6 +880,10 @@ impl<M: Clone> MetaInterp<M> {
         &self.warm_state
     }
 
+    pub fn warm_state_mut(&mut self) -> &mut majit_trace::warmstate::WarmEnterState {
+        &mut self.warm_state
+    }
+
     /// Decay all counters to avoid stale hotness data.
     pub fn decay_counters(&mut self) {
         self.warm_state.decay_counters();
