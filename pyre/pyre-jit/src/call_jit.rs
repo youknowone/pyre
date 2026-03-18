@@ -159,7 +159,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         if let Some(raw) = majit_codegen_cranelift::execute_call_assembler_direct(
             token_num,
             &inputs,
-            jit_force_callee_frame,
+            jit_force_callee_frame_interp, // interpreter-only to avoid recursion
         ) {
             unsafe {
                 FORCE_CACHE_1 = FORCE_CACHE_0;
@@ -184,6 +184,44 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
             raw
         }
         Err(err) => panic!("jit force callee frame failed: {err}"),
+    }
+}
+
+/// Interpreter-only force: used by execute_call_assembler_direct
+/// to handle guard failures without recursive compiled dispatch.
+extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+
+    let code_key = frame.code as usize;
+    let arg_key = if frame.locals_w.len() > 0 {
+        force_cache_arg_key(frame.locals_w[0])
+    } else {
+        0
+    };
+
+    unsafe {
+        if FORCE_CACHE_0.0 == code_key && FORCE_CACHE_0.1 == arg_key {
+            return FORCE_CACHE_0.2;
+        }
+        if FORCE_CACHE_1.0 == code_key && FORCE_CACHE_1.1 == arg_key {
+            return FORCE_CACHE_1.2;
+        }
+    }
+
+    match pyre_interp::eval::eval_loop_for_force(frame) {
+        Ok(result) => {
+            let raw = if !result.is_null() && unsafe { is_int(result) } {
+                unsafe { w_int_get_value(result) }
+            } else {
+                result as i64
+            };
+            unsafe {
+                FORCE_CACHE_1 = FORCE_CACHE_0;
+                FORCE_CACHE_0 = (code_key, arg_key, raw);
+            }
+            raw
+        }
+        Err(err) => panic!("jit force callee frame (interp) failed: {err}"),
     }
 }
 
