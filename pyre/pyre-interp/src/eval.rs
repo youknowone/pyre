@@ -520,6 +520,65 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── GetLen ──
+    fn get_len(&mut self, obj: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
+        let len = pyre_objspace::space::py_len(obj)?;
+        Ok(len)
+    }
+
+    // ── LoadFastAndClear (comprehension scope) ──
+    fn load_fast_and_clear(&mut self, idx: usize) -> Result<(), Self::Error> {
+        let val = self.locals_cells_stack_w[idx];
+        self.push(val);
+        self.locals_cells_stack_w[idx] = PY_NULL;
+        Ok(())
+    }
+
+    // ── BuildSet ──
+    fn build_set(&mut self, count: usize) -> Result<(), Self::Error> {
+        // Phase 1: build as list (no set type yet)
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            items.push(self.pop());
+        }
+        items.reverse();
+        self.push(pyre_object::w_list_new(items)); // TODO: proper set type
+        Ok(())
+    }
+
+    // ── DictUpdate ──
+    fn dict_update(&mut self, _i: usize) -> Result<(), Self::Error> {
+        // Phase 1 stub: pop update dict, merge into TOS
+        let update = self.pop();
+        // TODO: actual dict merge
+        let _ = update;
+        Ok(())
+    }
+
+    // ── DictMerge ──
+    fn dict_merge(&mut self, _i: usize) -> Result<(), Self::Error> {
+        let update = self.pop();
+        let _ = update;
+        Ok(())
+    }
+
+    // ── MapAdd ──
+    fn map_add(&mut self, _i: usize) -> Result<(), Self::Error> {
+        let value = self.pop();
+        let key = self.pop();
+        let _ = (key, value);
+        // TODO: dict[key] = value on stack[i]
+        Ok(())
+    }
+
+    // ── SetAdd ──
+    fn set_add(&mut self, _i: usize) -> Result<(), Self::Error> {
+        let value = self.pop();
+        let _ = value;
+        // TODO: set.add(value) on stack[i]
+        Ok(())
+    }
+
     // ── BuildSlice ──
     // CPython 3.13: BUILD_SLICE creates a slice object from 2 or 3 stack items
     fn build_slice(&mut self, argc: pyre_bytecode::bytecode::BuildSliceArgCount) -> Result<(), Self::Error> {
