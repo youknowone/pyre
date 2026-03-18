@@ -1144,6 +1144,17 @@ mod tests {
         let result = py_getattr(obj, "x").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 2) };
     }
+
+    #[test]
+    fn test_py_contains_manual_list() {
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        let needle = w_int_new(1);
+        unsafe {
+            assert!(is_list(list), "should be list, got type: {}", (*(*list).ob_type).tp_name);
+        }
+        let result = super::py_contains(list, needle).expect("py_contains failed");
+        assert!(result, "1 should be in [1, 2, 3]");
+    }
 }
 
 /// `in` operator: check if `needle` is in `haystack`.

@@ -415,8 +415,9 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: pyopcode.py COMPARE_OP with 'in' / 'not in'
 
     fn contains_op(&mut self, invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
-        let needle = self.pop();
+        // CPython 3.13: TOS = container, TOS1 = item
         let haystack = self.pop();
+        let needle = self.pop();
         let result = pyre_objspace::space::py_contains(haystack, needle)?;
         let inverted = match invert {
             pyre_bytecode::bytecode::Invert::No => result,
@@ -1677,20 +1678,13 @@ result = f.x + g.x";
     // ── Phase 1 opcode tests ──
 
     #[test]
-    #[ignore = "py_contains list iteration needs debugging — item type mismatch"]
     fn test_contains_op_in() {
-        // Test: 1 == 1 comparison works
-        let result = run_eval("1 == 1").unwrap();
-        unsafe { assert!(w_bool_get_value(result), "1 == 1 should be True"); }
-        // Test: in operator
         let source = "x = [1, 2, 3]\nresult = 1 in x";
         let (res, frame) = run_exec_frame(source);
-        match res {
-            Ok(_) => unsafe {
-                let result = *(*frame.namespace).get("result").unwrap();
-                assert!(w_bool_get_value(result), "1 in [1,2,3] should be True");
-            },
-            Err(e) => panic!("contains_op_in failed: {} (kind: {:?})", e.message, e.kind),
+        res.expect("exec failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert!(w_bool_get_value(result), "1 in [1,2,3] should be True");
         }
     }
 
@@ -1727,14 +1721,19 @@ result = f.x + g.x";
     }
 
     #[test]
-    #[ignore = "binary_slice needs debugging — item type or list construction issue"]
+    #[ignore = "needs BUILD_SLICE implementation"]
     fn test_list_slice() {
-        let result = run_eval("[1, 2, 3, 4, 5][1:3]").unwrap();
-        unsafe {
-            assert!(is_list(result));
-            assert_eq!(w_list_len(result), 2);
-            assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
-            assert_eq!(w_int_get_value(w_list_getitem(result, 1).unwrap()), 3);
+        let source = "x = [1, 2, 3, 4, 5]\nresult = x[1:3]";
+        let (res, frame) = run_exec_frame(source);
+        match res {
+            Ok(_) => unsafe {
+                let result = *(*frame.namespace).get("result").unwrap();
+                assert!(is_list(result), "slice result should be list");
+                assert_eq!(w_list_len(result), 2);
+                assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
+                assert_eq!(w_int_get_value(w_list_getitem(result, 1).unwrap()), 3);
+            },
+            Err(e) => panic!("list_slice failed: {} (kind: {:?})", e.message, e.kind),
         }
     }
 
