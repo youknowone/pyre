@@ -1047,7 +1047,8 @@ where
 
         Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
             let idx = var_num.get(op_arg).as_usize();
-            executor.load_fast_checked(idx, code.varnames[idx].as_ref())?;
+            let name = code.varnames.get(idx).map(|s| s.as_ref()).unwrap_or("<cell>");
+            executor.load_fast_checked(idx, name)?;
             Ok(StepResult::Continue)
         }
 
@@ -1071,7 +1072,8 @@ where
 
         Instruction::LoadFastCheck { var_num } => {
             let idx = var_num.get(op_arg).as_usize();
-            executor.load_fast_checked(idx, code.varnames[idx].as_ref())?;
+            let name = code.varnames.get(idx).map(|s| s.as_ref()).unwrap_or("<cell>");
+            executor.load_fast_checked(idx, name)?;
             Ok(StepResult::Continue)
         }
 
@@ -1561,16 +1563,6 @@ where
         // ── Unpack extended ──
         Instruction::UnpackEx { counts } => {
             executor.unpack_ex(counts.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
-
-        // ── Delete name/global ──
-        Instruction::DeleteName { namei } => {
-            executor.delete_name(code.names[namei.get(op_arg) as usize].as_ref())?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::DeleteGlobal { namei } => {
-            executor.delete_global(code.names[namei.get(op_arg) as usize].as_ref())?;
             Ok(StepResult::Continue)
         }
 

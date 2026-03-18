@@ -582,6 +582,12 @@ pub fn namespace_store(namespace: &mut PyNamespace, name: &str, value: PyObjectR
     namespace.insert(name.to_string(), value);
 }
 
+pub fn namespace_delete(namespace: &mut PyNamespace, name: &str) {
+    if let Some(idx) = namespace.slot_of(name) {
+        namespace.set_slot(idx, pyre_object::PY_NULL);
+    }
+}
+
 pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
     unsafe {
         if is_tuple(seq) {
