@@ -200,6 +200,22 @@ impl HeapCache {
                 self.mark_escaped_recursive(value);
             }
         }
+        // heapcache.py: SETARRAYITEM_GC — the written value escapes.
+        if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
+            let container = args[0];
+            let value = args[2];
+            self.escape_deps
+                .entry(container)
+                .or_default()
+                .push(value);
+            if !self.is_unescaped.contains(&container) {
+                self.mark_escaped_recursive(value);
+            }
+        }
+        // heapcache.py: GUARD_VALUE → known constant + nonnull.
+        if opcode == OpCode::GuardValue && args.len() >= 2 {
+            self.nullity_now_known(args[0], true);
+        }
         // heapcache.py: GUARD_CLASS/GUARD_NONNULL_CLASS → known class.
         if opcode == OpCode::GuardClass || opcode == OpCode::GuardNonnullClass {
             if args.len() >= 2 {

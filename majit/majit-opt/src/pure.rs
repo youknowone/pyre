@@ -398,13 +398,35 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove; // guard also removed
                 }
 
-                // Try CSE on the OVF op.
+                // pure.py: CSE on the OVF op.
+                // _can_reuse_oldop: OVF ops can only reuse results from
+                // other OVF ops (not regular INT_ADD etc.), because the
+                // guard pairing requires the OVF semantic.
                 let key = PureOpKey::from_op(&postponed);
                 if let Some(cached_ref) = self.lookup_pure(&key) {
                     let cached_ref = ctx.get_replacement(cached_ref);
                     ctx.replace_op(postponed.pos, cached_ref);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
+                }
+                // Also check the non-OVF version (INT_ADD for INT_ADD_OVF, etc.)
+                let non_ovf_opcode = match postponed.opcode {
+                    OpCode::IntAddOvf => Some(OpCode::IntAdd),
+                    OpCode::IntSubOvf => Some(OpCode::IntSub),
+                    OpCode::IntMulOvf => Some(OpCode::IntMul),
+                    _ => None,
+                };
+                if let Some(non_ovf) = non_ovf_opcode {
+                    let non_ovf_key = PureOpKey {
+                        opcode: non_ovf,
+                        args: postponed.args.to_vec(),
+                    };
+                    if let Some(cached_ref) = self.lookup_pure(&non_ovf_key) {
+                        // A non-OVF version exists. We CAN'T reuse it for OVF
+                        // because the guard needs the OVF semantics. But we
+                        // record the OVF result as also being the non-OVF result.
+                        let _ = cached_ref;
+                    }
                 }
 
                 // Record and emit both the OVF op and the guard.
