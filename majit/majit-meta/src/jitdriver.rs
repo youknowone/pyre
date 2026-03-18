@@ -485,6 +485,10 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) {
+        // Fast path: skip expensive build_meta/extract_live for cold keys.
+        if !self.meta.is_hot_or_tracing(green_key) {
+            return;
+        }
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
         if !self.sync_before(state, &meta, descriptor.as_ref()) {
