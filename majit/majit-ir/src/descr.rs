@@ -60,6 +60,17 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn is_loop_version(&self) -> bool {
         false
     }
+
+    /// intbounds.py: descr.is_integer_bounded() / get_integer_min/max.
+    /// Returns (field_size_bytes, is_signed) if this is a field descriptor.
+    /// Used by intbounds to narrow GETFIELD result bounds.
+    fn field_size_and_sign(&self) -> (usize, bool) {
+        if let Some(fd) = self.as_field_descr() {
+            (fd.field_size(), fd.is_field_signed())
+        } else {
+            (0, false)
+        }
+    }
 }
 
 /// Descriptor for guard failures — carries resume information.
