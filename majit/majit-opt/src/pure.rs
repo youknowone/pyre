@@ -265,8 +265,17 @@ impl Optimization for OptPure {
             return OptimizationResult::PassOn;
         }
 
-        // CALL_PURE_* -> demote to plain CALL_*
+        // CALL_PURE_* -> CSE first, then demote to plain CALL_*
+        // RPython pure.py: call_pure results are cached for CSE across the trace.
         if op.opcode.is_call_pure() {
+            let key = PureOpKey::from_op(op);
+            // CSE: same call_pure with same args → reuse result
+            if let Some(cached_ref) = self.lookup_pure(&key) {
+                let cached_ref = ctx.get_replacement(cached_ref);
+                ctx.replace_op(op.pos, cached_ref);
+                return OptimizationResult::Remove;
+            }
+            self.cache.insert(key, op.pos);
             return self.handle_call_pure(op);
         }
 

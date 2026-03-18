@@ -56,6 +56,11 @@ pub struct OptHeap {
     lazy_setarrayitems: HashMap<ArrayItemKey, Op>,
     /// Whether we've already emitted a GUARD_NOT_INVALIDATED.
     seen_guard_not_invalidated: bool,
+    /// Postponed operation: held back until the next GUARD_NO_EXCEPTION.
+    /// RPython heap.py: `postponed_op` — delays emission of operations
+    /// that may raise (CALL_MAY_FORCE, comparison ops) until we see
+    /// a GUARD_NO_EXCEPTION, ensuring correct exception semantics.
+    postponed_op: Option<Op>,
     /// Descriptor indices known to be immutable (green fields).
     /// Cached values for these descriptors survive invalidation.
     immutable_field_descrs: HashSet<u32>,
@@ -98,6 +103,7 @@ impl OptHeap {
             cached_arrayitems: HashMap::new(),
             lazy_setarrayitems: HashMap::new(),
             seen_guard_not_invalidated: false,
+            postponed_op: None,
             immutable_field_descrs: HashSet::new(),
             seen_allocation: HashSet::new(),
             unescaped: HashSet::new(),
@@ -586,10 +592,14 @@ impl Optimization for OptHeap {
             // ── Array item writes ──
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => self.optimize_setarrayitem(op, ctx),
 
-            // ── GUARD_NO_EXCEPTION deduplication ──
-            // RPython heap.py: consecutive GUARD_NO_EXCEPTION after a call
-            // that didn't raise can be removed (the exception state is still clean).
+            // ── GUARD_NO_EXCEPTION ──
+            // RPython heap.py: emit any postponed op before the guard,
+            // then deduplicate consecutive GUARD_NO_EXCEPTION.
             OpCode::GuardNoException => {
+                // Emit postponed op if any (RPython heap.py postponed_op)
+                if let Some(postponed) = self.postponed_op.take() {
+                    ctx.emit(postponed);
+                }
                 if self.last_call_did_not_raise {
                     return OptimizationResult::Remove;
                 }
@@ -667,6 +677,7 @@ impl Optimization for OptHeap {
         self.cached_arrayitems.clear();
         self.lazy_setarrayitems.clear();
         self.seen_guard_not_invalidated = false;
+        self.postponed_op = None;
         self.immutable_field_descrs.clear();
         self.seen_allocation.clear();
         self.unescaped.clear();
