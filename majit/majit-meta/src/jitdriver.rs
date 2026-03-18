@@ -198,6 +198,7 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         if self.sym.is_none() || self.trace_meta.is_none() {
+            if crate::majit_log_enabled() { eprintln!("[mp] abort:sym_none"); }
             self.meta.abort_trace(false);
             self.sym = None;
             self.trace_meta = None;
@@ -207,11 +208,13 @@ impl<S: JitState> JitDriver<S> {
         // Phase 1: split-borrow self into meta (for ctx) and sym, run closure
         let action = {
             let Some(ctx) = self.meta.trace_ctx() else {
+                if crate::majit_log_enabled() { eprintln!("[mp] abort:ctx_none"); }
                 self.sym = None;
                 self.trace_meta = None;
                 return;
             };
             let Some(sym) = self.sym.as_mut() else {
+                if crate::majit_log_enabled() { eprintln!("[mp] abort:sym_none2"); }
                 self.meta.abort_trace(false);
                 self.trace_meta = None;
                 return;
@@ -258,6 +261,7 @@ impl<S: JitState> JitDriver<S> {
                     let meta = self.trace_meta.take().unwrap();
                     self.meta.close_and_compile(&jump_args, meta);
                 } else {
+                    if crate::majit_log_enabled() { eprintln!("[mp] abort:validate_close"); }
                     self.meta.abort_trace(false);
                     self.trace_meta = None;
                 }
