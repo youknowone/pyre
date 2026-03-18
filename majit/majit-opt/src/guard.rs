@@ -139,7 +139,7 @@ impl GuardStrengthenOpt {
     /// implications (guard strengthening).
     ///
     /// Returns `true` if the guard can be removed.
-    fn is_subsumed(&self, op: &Op) -> bool {
+    fn is_subsumed(&self, op: &Op, ctx: &OptContext) -> bool {
         match op.opcode {
             OpCode::GuardTrue => {
                 // guard.py: also subsumed if value is a known nonzero constant.
@@ -159,6 +159,16 @@ impl GuardStrengthenOpt {
                 false
             }
             OpCode::GuardNonnull => self.truthy_values.contains(&op.arg(0)),
+            // guard.py: GUARD_VALUE subsumed if value is already known to be
+            // that exact constant from a previous GuardValue.
+            OpCode::GuardValue if op.num_args() >= 2 => {
+                if let Some(&known) = self.known_constants.get(&op.arg(0)) {
+                    if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                        return known == expected;
+                    }
+                }
+                false
+            }
             // guard.py: GUARD_NONNULL_CLASS subsumed if value is known nonnull
             // AND a previous GUARD_CLASS with same args was already seen.
             OpCode::GuardNonnullClass if self.truthy_values.contains(&op.arg(0)) => {
@@ -215,7 +225,7 @@ impl Optimization for GuardStrengthenOpt {
         }
 
         // --- Guard strengthening (subsumption) ---
-        if self.is_subsumed(op) {
+        if self.is_subsumed(op, ctx) {
             return OptimizationResult::Remove;
         }
 

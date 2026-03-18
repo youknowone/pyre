@@ -701,4 +701,55 @@ mod tests {
         assert_eq!(preamble.len(), 1);
         assert_eq!(body.len(), 3); // Label + IntMul + Jump
     }
+
+    #[test]
+    fn test_num_guards() {
+        let ops = vec![
+            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let trace = TreeLoop::new(vec![], ops);
+        assert_eq!(trace.num_guards(), 3);
+    }
+
+    #[test]
+    fn test_get_final_op() {
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Finish, &[OpRef(0)]),
+        ];
+        let trace = TreeLoop::new(vec![], ops);
+        let final_op = trace.get_final_op().unwrap();
+        assert_eq!(final_op.opcode, OpCode::Finish);
+    }
+
+    #[test]
+    fn test_get_iter() {
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        let trace = TreeLoop::new(vec![], ops);
+        let mut iter = trace.get_iter();
+        assert_eq!(iter.num_ops(), 3);
+        assert!(!iter.done());
+        iter.next_op();
+        assert_eq!(iter.position(), 1);
+    }
+
+    #[test]
+    fn test_inputarg_types_all() {
+        let inputargs = vec![
+            InputArg { index: 0, tp: Type::Int },
+            InputArg { index: 1, tp: Type::Ref },
+            InputArg { index: 2, tp: Type::Float },
+        ];
+        let trace = TreeLoop::new(inputargs, vec![Op::new(OpCode::Finish, &[])]);
+        let types = trace.inputarg_types();
+        assert_eq!(types, vec![Type::Int, Type::Ref, Type::Float]);
+    }
 }
