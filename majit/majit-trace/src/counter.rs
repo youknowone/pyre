@@ -28,6 +28,7 @@ impl JitCounter {
     }
 
     /// Check if counter would fire without modifying state.
+    #[inline]
     pub fn would_fire(&self, hash: u64) -> bool {
         if self.threshold == 0 { return true; }
         let base = (hash as usize) & TABLE_MASK;
@@ -241,6 +242,7 @@ impl DeterministicJitCounter {
     }
 
     /// Check without modifying.
+    #[inline]
     pub fn would_fire(&self, hash: u64) -> bool {
         let count = self.counts.get(&hash).copied().unwrap_or(0);
         count + 1 >= self.threshold

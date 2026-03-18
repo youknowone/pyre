@@ -110,6 +110,7 @@ macro_rules! can_enter_jit {
 ///
 /// Uses the same algorithm as [`GreenKey::hash_u64`](majit_ir::GreenKey::hash_u64),
 /// so callers can compute a key hash without constructing a full `GreenKey`.
+#[inline]
 pub fn green_key_hash(values: &[i64]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
