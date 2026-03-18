@@ -36,6 +36,9 @@ pub struct OptRewrite {
     /// rewrite.py: bool_result_cache — maps (opcode, arg0, arg1) → result OpRef.
     /// Used by find_rewritable_bool to check if inverse/reflex was computed.
     bool_result_cache: std::collections::HashMap<(OpCode, OpRef, OpRef), OpRef>,
+    /// rewrite.py: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
+    /// Key: function pointer (arg0 as i64), Value: result OpRef.
+    loop_invariant_results: std::collections::HashMap<i64, OpRef>,
 }
 
 impl OptRewrite {
@@ -43,6 +46,7 @@ impl OptRewrite {
         OptRewrite {
             last_op_removed: false,
             bool_result_cache: std::collections::HashMap::new(),
+            loop_invariant_results: std::collections::HashMap::new(),
         }
     }
 
@@ -1393,6 +1397,7 @@ impl Optimization for OptRewrite {
     fn setup(&mut self) {
         self.last_op_removed = false;
         self.bool_result_cache.clear();
+        self.loop_invariant_results.clear();
     }
 
     fn name(&self) -> &'static str {
