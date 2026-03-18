@@ -95,6 +95,9 @@ pub struct OptHeap {
     quasi_immut_cache: HashMap<FieldKey, OpRef>,
     /// heap.py: cached array lengths.
     cached_arraylens: HashMap<(OpRef, u32), OpRef>,
+    /// heap.py: variable-index array cache.
+    /// Key: (array, descr_index, index_opref) → value OpRef.
+    cached_arrayitems_var: HashMap<(OpRef, u32, OpRef), OpRef>,
 }
 
 impl OptHeap {
@@ -114,6 +117,7 @@ impl OptHeap {
             last_call_did_not_raise: false,
             quasi_immut_cache: HashMap::new(),
             cached_arraylens: HashMap::new(),
+            cached_arrayitems_var: HashMap::new(),
         }
     }
 
@@ -138,6 +142,16 @@ impl OptHeap {
         let index_ref = op.arg(1);
         let index_val = ctx.get_constant_int(index_ref)?;
         Some((array, descr.index(), index_val))
+    }
+
+    /// heap.py: variable-index array key — use the OpRef itself as
+    /// the key when the index is not a known constant. This allows
+    /// caching array reads where the same variable index is used twice.
+    fn arrayitem_key_variable(op: &Op) -> Option<(OpRef, u32, OpRef)> {
+        let descr = op.descr.as_ref()?;
+        let array = op.arg(0);
+        let index_ref = op.arg(1);
+        Some((array, descr.index(), index_ref))
     }
 
     /// Force all pending lazy setfields: emit the stored ops and cache their values.
@@ -189,9 +203,12 @@ impl OptHeap {
             });
             self.cached_arrayitems
                 .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+            self.cached_arrayitems_var
+                .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
         } else {
             self.cached_fields.clear();
             self.cached_arrayitems.clear();
+            self.cached_arrayitems_var.clear();
         }
 
         // Nullity: allocated objects are permanently non-null.
@@ -429,27 +446,32 @@ impl OptHeap {
     }
 
     fn optimize_getarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let key = match Self::arrayitem_key(op, ctx) {
-            Some(k) => k,
-            None => return OptimizationResult::Emit(op.clone()),
-        };
-
-        // Check lazy set first.
-        if let Some(lazy_op) = self.lazy_setarrayitems.get(&key) {
-            let cached = lazy_op.arg(2);
-            ctx.replace_op(op.pos, cached);
-            return OptimizationResult::Remove;
+        // Try constant-index cache first.
+        if let Some(key) = Self::arrayitem_key(op, ctx) {
+            if let Some(lazy_op) = self.lazy_setarrayitems.get(&key) {
+                let cached = lazy_op.arg(2);
+                ctx.replace_op(op.pos, cached);
+                return OptimizationResult::Remove;
+            }
+            if let Some(&cached) = self.cached_arrayitems.get(&key) {
+                let cached = ctx.get_replacement(cached);
+                ctx.replace_op(op.pos, cached);
+                return OptimizationResult::Remove;
+            }
+            self.cached_arrayitems.insert(key, op.pos);
+            return OptimizationResult::Emit(op.clone());
         }
 
-        // Check read cache.
-        if let Some(&cached) = self.cached_arrayitems.get(&key) {
-            let cached = ctx.get_replacement(cached);
-            ctx.replace_op(op.pos, cached);
-            return OptimizationResult::Remove;
+        // heap.py: variable-index cache — same array + same index OpRef.
+        if let Some(var_key) = Self::arrayitem_key_variable(op) {
+            if let Some(&cached) = self.cached_arrayitems_var.get(&var_key) {
+                let cached = ctx.get_replacement(cached);
+                ctx.replace_op(op.pos, cached);
+                return OptimizationResult::Remove;
+            }
+            self.cached_arrayitems_var.insert(var_key, op.pos);
         }
 
-        // Cache miss: emit and cache.
-        self.cached_arrayitems.insert(key, op.pos);
         OptimizationResult::Emit(op.clone())
     }
 
@@ -942,6 +964,7 @@ impl Optimization for OptHeap {
         self.last_call_did_not_raise = false;
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
+        self.cached_arrayitems_var.clear();
     }
 
     fn flush(&mut self) {
@@ -963,6 +986,7 @@ impl Optimization for OptHeap {
         self.last_call_did_not_raise = false;
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
+        self.cached_arrayitems_var.clear();
     }
 
     /// heap.py: produce_potential_short_preamble_ops(sb)
