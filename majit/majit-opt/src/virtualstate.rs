@@ -23,6 +23,72 @@ use crate::info::{
 use crate::intutils::IntBound;
 use crate::OptContext;
 
+/// virtualstate.py: GenerateGuardState — context for guard generation
+/// during virtual state comparison.
+///
+/// Holds the optimizer reference, a collection of generated guards,
+/// a renumbering map (OpRef → position), and flags.
+pub struct GenerateGuardState<'a> {
+    /// Reference to optimizer context.
+    pub ctx: &'a OptContext,
+    /// Extra guards generated during state comparison.
+    pub extra_guards: Vec<majit_ir::Op>,
+    /// Renumbering map: OpRef → position in the state vector.
+    pub renum: HashMap<OpRef, usize>,
+    /// Entries that could not be matched (incompatible state).
+    pub bad: HashMap<usize, String>,
+    /// Whether to force virtual boxes during comparison.
+    pub force_boxes: bool,
+}
+
+impl<'a> GenerateGuardState<'a> {
+    pub fn new(ctx: &'a OptContext) -> Self {
+        GenerateGuardState {
+            ctx,
+            extra_guards: Vec::new(),
+            renum: HashMap::new(),
+            bad: HashMap::new(),
+            force_boxes: false,
+        }
+    }
+
+    /// virtualstate.py: get_runtime_field(box, descr)
+    ///
+    /// Read a field from a concrete object at runtime.
+    /// Returns the value as an i64 (for int fields) or pointer.
+    pub fn get_runtime_field(&self, obj_ptr: i64, offset: usize) -> i64 {
+        if obj_ptr == 0 {
+            return 0;
+        }
+        unsafe { *((obj_ptr as *const u8).add(offset) as *const i64) }
+    }
+
+    /// virtualstate.py: get_runtime_item(box, descr, i)
+    ///
+    /// Read an array item from a concrete object at runtime.
+    pub fn get_runtime_item(&self, array_ptr: i64, index: usize, item_size: usize) -> i64 {
+        if array_ptr == 0 {
+            return 0;
+        }
+        unsafe { *((array_ptr as *const u8).add(index * item_size) as *const i64) }
+    }
+
+    /// Add an extra guard to be emitted before the bridge entry.
+    pub fn add_guard(&mut self, guard: majit_ir::Op) {
+        self.extra_guards.push(guard);
+    }
+
+    /// Mark an entry as incompatible.
+    pub fn mark_bad(&mut self, index: usize, reason: &str) {
+        self.bad.insert(index, reason.to_string());
+    }
+
+    /// Whether the comparison succeeded (no bad entries).
+    pub fn is_ok(&self) -> bool {
+        self.bad.is_empty()
+    }
+}
+
 /// Abstract info for one value at the loop boundary.
 ///
 /// Mirrors the hierarchy in RPython's `AbstractVirtualStateInfo` and its subclasses:
