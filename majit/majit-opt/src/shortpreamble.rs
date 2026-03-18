@@ -341,6 +341,31 @@ impl ShortBoxes {
             .enumerate()
             .filter_map(|(i, p)| p.as_ref().map(|op| (i, op)))
     }
+
+    /// shortpreamble.py: create_short_inputargs(label_args)
+    /// Build the input args for the short preamble from label args.
+    /// Returns OpRefs for each label arg that has a producer, or the
+    /// original label arg if no producer exists.
+    pub fn create_short_inputargs(&self, label_args: &[OpRef]) -> Vec<OpRef> {
+        label_args
+            .iter()
+            .enumerate()
+            .map(|(i, &arg)| {
+                if i < self.producers.len() {
+                    if let Some(ref pop) = self.producers[i] {
+                        return pop.op.pos;
+                    }
+                }
+                arg
+            })
+            .collect()
+    }
+
+    /// shortpreamble.py: add_potential_op(op, pop)
+    /// Add a produced operation to the short boxes at the given position.
+    pub fn add_potential_op(&mut self, label_arg_idx: usize, op: Op, kind: PreambleOpKind) {
+        self.add_op(label_arg_idx, op, kind);
+    }
 }
 
 /// shortpreamble.py: ExtendedShortPreambleBuilder — extended builder
