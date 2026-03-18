@@ -2027,4 +2027,18 @@ mod tests {
             b0.upper
         );
     }
+
+    #[test]
+    fn test_strgetitem_bounds() {
+        // STRGETITEM result should be bounded to [0, 255].
+        let mut opt = OptIntBounds::new();
+        let op = Op::new(OpCode::Strgetitem, &[OpRef(100), OpRef(101)]);
+        let mut ctx = OptContext::new(10);
+        let result = opt.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::PassOn));
+        // After processing, the bounds for op.pos should be [0, 255].
+        let b = opt.getintbound(op.pos, &ctx);
+        assert!(b.lower >= 0, "STRGETITEM lower should be >= 0");
+        assert!(b.upper <= 255, "STRGETITEM upper should be <= 255");
+    }
 }
