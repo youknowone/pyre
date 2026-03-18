@@ -49,6 +49,17 @@ impl Optimization for OptEarlyForce {
                 }
                 OptimizationResult::Emit(new_op)
             }
+            // earlyforce.py: GUARD_NOT_FORCED needs to resolve fail_args
+            // through forwarding too, so forced virtual refs are properly tracked.
+            OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+                let mut new_op = op.clone();
+                if let Some(ref mut fa) = new_op.fail_args {
+                    for arg in fa.iter_mut() {
+                        *arg = ctx.get_replacement(*arg);
+                    }
+                }
+                OptimizationResult::Emit(new_op)
+            }
             _ => OptimizationResult::PassOn,
         }
     }
