@@ -113,9 +113,22 @@ impl OptString {
                 str_ref
             }
             VStringInfo::Concat { left, right } => {
+                // vstring.py: if one side has length 0, return the other.
+                let left_len_val = self.get_known_length(left, ctx);
+                let right_len_val = self.get_known_length(right, ctx);
+                if left_len_val == Some(0) {
+                    let right_forced = self.force_string(right, ctx);
+                    ctx.replace_op(resolved, right_forced);
+                    return right_forced;
+                }
+                if right_len_val == Some(0) {
+                    let left_forced = self.force_string(left, ctx);
+                    ctx.replace_op(resolved, left_forced);
+                    return left_forced;
+                }
+
                 let left_forced = self.force_string(left, ctx);
                 let right_forced = self.force_string(right, ctx);
-                // Compute lengths.
                 let left_len = self.get_or_emit_strlen(left_forced, ctx);
                 let right_len = self.get_or_emit_strlen(right_forced, ctx);
                 // total = left_len + right_len

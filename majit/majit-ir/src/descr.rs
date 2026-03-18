@@ -831,6 +831,67 @@ impl CallDescr for SimpleCallDescr {
     }
 }
 
+/// Simple concrete FailDescr for guard failure descriptors.
+#[derive(Debug, Clone)]
+pub struct SimpleFailDescr {
+    index: u32,
+    fail_index: u32,
+    fail_arg_types: Vec<Type>,
+    is_finish: bool,
+    trace_id: u64,
+}
+
+impl SimpleFailDescr {
+    pub fn new(index: u32, fail_index: u32, fail_arg_types: Vec<Type>) -> Self {
+        SimpleFailDescr {
+            index,
+            fail_index,
+            fail_arg_types,
+            is_finish: false,
+            trace_id: 0,
+        }
+    }
+
+    pub fn finish(index: u32, fail_index: u32, fail_arg_types: Vec<Type>) -> Self {
+        SimpleFailDescr {
+            index,
+            fail_index,
+            fail_arg_types,
+            is_finish: true,
+            trace_id: 0,
+        }
+    }
+
+    pub fn with_trace_id(mut self, trace_id: u64) -> Self {
+        self.trace_id = trace_id;
+        self
+    }
+}
+
+impl Descr for SimpleFailDescr {
+    fn index(&self) -> u32 {
+        self.index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for SimpleFailDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.fail_arg_types
+    }
+    fn is_finish(&self) -> bool {
+        self.is_finish
+    }
+    fn trace_id(&self) -> u64 {
+        self.trace_id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
