@@ -830,4 +830,91 @@ mod tests {
         let (v3, _n3) = decode_varint(&buf[n1 + n2..]);
         assert_eq!(v3, 0);
     }
+
+    #[test]
+    fn test_signed_varint_roundtrip() {
+        let values = [0i64, 1, -1, 127, -128, 1000, -1000, i64::MAX, i64::MIN];
+        for &val in &values {
+            let mut buf = Vec::new();
+            encode_varint_signed(&mut buf, val);
+            let (decoded, _consumed) = decode_varint_signed(&buf);
+            assert_eq!(decoded, val, "signed varint roundtrip failed for {val}");
+        }
+    }
+
+    #[test]
+    fn test_tag_untag_roundtrip() {
+        for kind in [TAGINT, TAGCONSTPTR, TAGCONSTOTHER, TAGBOX] {
+            for value in [0u32, 1, 42, 255, 1000] {
+                let tagged = tag(kind, value);
+                let (k, v) = untag(tagged);
+                assert_eq!(k, kind, "tag kind mismatch");
+                assert_eq!(v, value, "tag value mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn test_snapshot_storage() {
+        let mut storage = SnapshotStorage::new();
+        let snap = Snapshot {
+            values: vec![tag(TAGINT, 42), tag(TAGBOX, 0)],
+            prev: None,
+            jitcode_index: 0,
+            pc: 10,
+        };
+        let idx = storage.add_snapshot(snap);
+        assert_eq!(idx, 0);
+        assert_eq!(storage.num_snapshots(), 1);
+
+        let const_idx = storage.add_const_ref(0x1000);
+        assert_eq!(const_idx, 0);
+        let float_idx = storage.add_const_float(3.14);
+        assert_eq!(float_idx, 0);
+    }
+
+    #[test]
+    fn test_trace_iterator_dead_ranges() {
+        let ops = vec![
+            majit_ir::Op::new(majit_ir::OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            majit_ir::Op::new(majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(101)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(1)]),
+        ];
+        let mut iter = TraceIterator::new(&ops);
+        assert_eq!(iter.num_ops(), 3);
+        assert!(!iter.done());
+
+        let ranges = iter.compute_dead_ranges();
+        // OpRef(100) is used at position 0 only → dead after 0
+        // OpRef(101) is used at positions 0 and 1 → dead after 1
+        assert!(ranges.len() > 100);
+
+        // Check iterator works
+        assert!(iter.next_op().is_some());
+        assert_eq!(iter.position(), 1);
+    }
+
+    #[test]
+    fn test_box_array_iter() {
+        let values = vec![
+            tag(TAGINT, 42),
+            tag(TAGBOX, 10),
+            tag(TAGCONSTPTR, 0),
+        ];
+        let mut iter = BoxArrayIter::new(&values);
+        assert_eq!(iter.remaining(), 3);
+
+        let (k, v) = iter.next_decoded().unwrap();
+        assert_eq!(k, TAGINT);
+        assert_eq!(v, 42);
+
+        let (k, v) = iter.next_decoded().unwrap();
+        assert_eq!(k, TAGBOX);
+        assert_eq!(v, 10);
+
+        assert_eq!(iter.remaining(), 1);
+        assert!(!iter.done());
+        iter.next_value();
+        assert!(iter.done());
+    }
 }

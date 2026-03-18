@@ -3275,4 +3275,33 @@ mod tests {
         assert!(output.contains("GuardTrue(v0) [v0]"));
         assert!(output.contains("GuardFalse(v1) [v0, v1, v2]"));
     }
+
+    #[test]
+    fn test_is_setarrayitem() {
+        assert!(OpCode::SetarrayitemGc.is_setarrayitem());
+        assert!(OpCode::SetarrayitemRaw.is_setarrayitem());
+        assert!(!OpCode::GetarrayitemGcI.is_setarrayitem());
+        assert!(!OpCode::IntAdd.is_setarrayitem());
+    }
+
+    #[test]
+    fn test_is_setfield() {
+        assert!(OpCode::SetfieldGc.is_setfield());
+        assert!(OpCode::SetfieldRaw.is_setfield());
+        assert!(!OpCode::GetfieldGcI.is_setfield());
+    }
+
+    #[test]
+    fn test_is_getinteriorfield() {
+        assert!(OpCode::GetinteriorfieldGcI.is_getinteriorfield());
+        assert!(OpCode::GetinteriorfieldGcR.is_getinteriorfield());
+        assert!(OpCode::GetinteriorfieldGcF.is_getinteriorfield());
+        assert!(!OpCode::SetinteriorfieldGc.is_getinteriorfield());
+    }
+
+    #[test]
+    fn test_is_setinteriorfield() {
+        assert!(OpCode::SetinteriorfieldGc.is_setinteriorfield());
+        assert!(!OpCode::GetinteriorfieldGcI.is_setinteriorfield());
+    }
 }
