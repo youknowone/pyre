@@ -14,9 +14,13 @@ use pyre_runtime::{register_jit_function_caller, w_func_get_code_ptr, w_func_get
 
 use pyre_interp::frame::PyFrame;
 
-// ── Force cache ──────────────────────────────────────────────────
-static mut FORCE_CACHE_0: (usize, usize, i64) = (0, 0, 0);
-static mut FORCE_CACHE_1: (usize, usize, i64) = (0, 0, 0);
+// ── Force cache (memoization for recursive force results) ────────
+//
+// PyPy doesn't need this (compiled code dispatches directly), but
+// our force_fn path benefits from caching intermediate fib results.
+const FORCE_CACHE_SIZE: usize = 64;
+static mut FORCE_CACHE: [(usize, usize, i64); FORCE_CACHE_SIZE] =
+    [(0, 0, 0); FORCE_CACHE_SIZE];
 
 #[inline]
 fn force_cache_arg_key(arg: PyObjectRef) -> usize {
@@ -130,12 +134,12 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         0
     };
 
+    // Hash-based force cache lookup (64 entries)
+    let hash_idx = (code_key.wrapping_mul(2654435761) ^ arg_key) % FORCE_CACHE_SIZE;
     unsafe {
-        if FORCE_CACHE_0.0 == code_key && FORCE_CACHE_0.1 == arg_key {
-            return FORCE_CACHE_0.2;
-        }
-        if FORCE_CACHE_1.0 == code_key && FORCE_CACHE_1.1 == arg_key {
-            return FORCE_CACHE_1.2;
+        let entry = &FORCE_CACHE[hash_idx];
+        if entry.0 == code_key && entry.1 == arg_key {
+            return entry.2;
         }
     }
 
@@ -145,8 +149,6 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let (driver, _) = crate::eval::driver_pair();
     if let Some(token) = driver.get_loop_token(green_key) {
         let token_num = token.number;
-        // Build CA inputs: [frame_ptr, next_instr, stack_depth, locals...]
-        // This matches synthesize_fresh_callee_entry_args.
         let nlocals = unsafe { (&*frame.code).varnames.len() };
         let mut inputs = vec![
             frame_ptr,
@@ -159,12 +161,9 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         if let Some(raw) = majit_codegen_cranelift::execute_call_assembler_direct(
             token_num,
             &inputs,
-            jit_force_callee_frame_interp, // interpreter-only to avoid recursion
+            jit_force_callee_frame_interp,
         ) {
-            unsafe {
-                FORCE_CACHE_1 = FORCE_CACHE_0;
-                FORCE_CACHE_0 = (code_key, arg_key, raw);
-            }
+            unsafe { FORCE_CACHE[hash_idx] = (code_key, arg_key, raw); }
             return raw;
         }
     }
@@ -177,10 +176,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
             } else {
                 result as i64
             };
-            unsafe {
-                FORCE_CACHE_1 = FORCE_CACHE_0;
-                FORCE_CACHE_0 = (code_key, arg_key, raw);
-            }
+            unsafe { FORCE_CACHE[hash_idx] = (code_key, arg_key, raw); }
             raw
         }
         Err(err) => panic!("jit force callee frame failed: {err}"),
@@ -199,12 +195,11 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
         0
     };
 
+    let hash_idx = (code_key.wrapping_mul(2654435761) ^ arg_key) % FORCE_CACHE_SIZE;
     unsafe {
-        if FORCE_CACHE_0.0 == code_key && FORCE_CACHE_0.1 == arg_key {
-            return FORCE_CACHE_0.2;
-        }
-        if FORCE_CACHE_1.0 == code_key && FORCE_CACHE_1.1 == arg_key {
-            return FORCE_CACHE_1.2;
+        let entry = &FORCE_CACHE[hash_idx];
+        if entry.0 == code_key && entry.1 == arg_key {
+            return entry.2;
         }
     }
 
@@ -215,10 +210,7 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
             } else {
                 result as i64
             };
-            unsafe {
-                FORCE_CACHE_1 = FORCE_CACHE_0;
-                FORCE_CACHE_0 = (code_key, arg_key, raw);
-            }
+            unsafe { FORCE_CACHE[hash_idx] = (code_key, arg_key, raw); }
             raw
         }
         Err(err) => panic!("jit force callee frame (interp) failed: {err}"),
@@ -262,10 +254,8 @@ extern "C" fn jit_bridge_compile_callee(
     } else {
         0
     };
-    unsafe {
-        FORCE_CACHE_1 = FORCE_CACHE_0;
-        FORCE_CACHE_0 = (code_key, arg_key, result);
-    }
+    let hash_idx = (code_key.wrapping_mul(2654435761) ^ arg_key) % FORCE_CACHE_SIZE;
+    unsafe { FORCE_CACHE[hash_idx] = (code_key, arg_key, result); }
 
     let bridge_inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let frame_opref = OpRef(0);
