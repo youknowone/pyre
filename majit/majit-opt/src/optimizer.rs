@@ -103,9 +103,48 @@ impl Optimizer {
         let _ = pending; // TODO: integrate pending fields into fail_args
     }
 
-    /// optimizer.py: emit_guard_operation(op, ctx)
-    /// Emit a guard with proper tracking and descriptor sharing.
-    pub fn emit_guard_operation(&mut self, guard_op: Op) {
+    /// optimizer.py: emit_guard_operation(op, pendingfields)
+    /// Emit a guard with resume data sharing when possible.
+    ///
+    /// If the previous guard has compatible resume data (same fail_args)
+    /// AND the current guard has no descriptor, share the previous guard's
+    /// descriptor. Otherwise, store fresh resume data.
+    pub fn emit_guard_operation(&mut self, mut guard_op: Op, ctx: &mut OptContext) {
+        let opcode = guard_op.opcode;
+
+        // optimizer.py: guard_(no)_exception after non-GUARD_NOT_FORCED
+        // breaks the sharing chain.
+        if (opcode == OpCode::GuardNoException || opcode == OpCode::GuardException) {
+            if let Some(ref last) = self.last_guard_op {
+                if last.opcode != OpCode::GuardNotForced && last.opcode != OpCode::GuardNotForced2 {
+                    self.last_guard_op = None;
+                }
+            }
+        }
+
+        // optimizer.py: try to share resume data with last guard
+        if self.can_replace_guards {
+            if let Some(ref last_guard) = self.last_guard_op {
+                if guard_op.descr.is_none() {
+                    // _copy_resume_data_from: copy descriptor and fail_args
+                    guard_op.descr = last_guard.descr.clone();
+                    guard_op.fail_args = last_guard.fail_args.clone();
+                    // Emit without updating last_guard_op (shared)
+                    ctx.emit(guard_op);
+                    return;
+                }
+            }
+        }
+
+        // Flush pending fields before emitting a fresh guard
+        let pending = std::mem::take(&mut self.pendingfields);
+        for op in pending {
+            ctx.emit(op);
+        }
+
+        // Store this guard as the new sharing source
+        let emitted = ctx.emit(guard_op.clone());
+        guard_op.pos = emitted;
         self.last_guard_op = Some(guard_op);
     }
 
