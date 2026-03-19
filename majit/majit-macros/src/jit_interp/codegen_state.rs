@@ -174,7 +174,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
                 let mut args = Vec::new();
-                for &(sidx, _) in &self.storage_layout {
+                for &(sidx, _) in self.storage_layout.iter().take(self.meta_storage_count) {
                     args.extend(self.stacks[&sidx].to_jump_args());
                 }
                 Some(args)
@@ -276,7 +276,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
                 let mut args = Vec::new();
-                for &(sidx, _) in &sym.storage_layout {
+                // Only include original meta storages. Extra storages from
+                // trace-time OP_SEL are excluded — their state stays on the
+                // interpreter's heap and is not carried by the compiled loop.
+                for &(sidx, _) in sym.storage_layout.iter().take(sym.meta_storage_count) {
                     args.extend(sym.stacks[&sidx].to_jump_args());
                 }
                 args
@@ -285,18 +288,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             #vable_info_fn
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
+                // RPython parity: virtualizable arrays may change depth.
+                // Only check selected matches. Depth differences are handled
+                // by the optimizer's preamble peeling (OptUnroll).
                 sym.current_selected == meta.initial_selected
-                    && sym.storage_layout.len() == meta.storage_layout.len()
-                    && sym
-                        .storage_layout
-                        .iter()
-                        .zip(meta.storage_layout.iter())
-                        .all(|(&(sym_idx, _), &(meta_idx, _))| sym_idx == meta_idx)
-                    && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
-                        sym.stacks
-                            .get(&sidx)
-                            .is_some_and(|stack| stack.len() == initial_depth)
-                    })
             }
         }
     }

@@ -1221,12 +1221,33 @@ impl<M: Clone> MetaInterp<M> {
         let num_ops_after = optimized_ops.len();
 
         // Extend inputargs if the optimizer added virtual inputs (virtualizable)
+        // or if the trace's Jump has more args than InputArgs (depth growth).
         let mut inputargs = trace.inputargs.clone();
-        while inputargs.len() < final_num_inputs {
+        let jump_arg_count = optimized_ops.iter().rev()
+            .find(|op| op.opcode == majit_ir::OpCode::Jump)
+            .map(|op| op.args.len())
+            .unwrap_or(0);
+        let required = final_num_inputs.max(jump_arg_count);
+        while inputargs.len() < required {
             inputargs.push(majit_ir::InputArg {
                 tp: majit_ir::Type::Int,
                 index: inputargs.len() as u32,
             });
+        }
+
+        // If Jump has more args than the Label (depth growth), extend the Label.
+        // RPython: the optimizer's preamble peeling creates a Label with extended args.
+        // Here we do it post-hoc since the trace was recorded with smaller InputArgs.
+        let mut optimized_ops = optimized_ops;
+        if jump_arg_count > 0 {
+            for op in &mut optimized_ops {
+                if op.opcode == majit_ir::OpCode::Label && op.args.len() < jump_arg_count {
+                    // Extend Label args with dummy OpRefs for the extra positions.
+                    while op.args.len() < jump_arg_count {
+                        op.args.push(majit_ir::OpRef::NONE);
+                    }
+                }
+            }
         }
 
         // Patch: prepend virtualizable field loads as a preamble before the
