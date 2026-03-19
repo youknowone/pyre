@@ -7,7 +7,7 @@
 use smallvec::SmallVec;
 
 use crate::descr::DescrRef;
-use crate::value::Type;
+use crate::value::{GcRef, Type};
 
 /// Index into an operation list, used as a reference to an operation's result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -19,6 +19,25 @@ impl OpRef {
     pub fn is_none(self) -> bool {
         self.0 == u32::MAX
     }
+}
+
+/// Metadata for a virtual object in guard fail_args.
+///
+/// resume.py: ResumeDataVirtualAdder — instead of forcing a virtual at
+/// compile time, we record its shape so it can be reconstructed lazily
+/// on guard failure. The virtual's field values are stored as additional
+/// fail_args starting at `field_values_start`.
+#[derive(Clone, Debug)]
+pub struct GuardVirtualEntry {
+    /// Index in fail_args where this virtual was (now OpRef::NONE placeholder).
+    pub fail_arg_index: usize,
+    /// Type descriptor for the virtual object.
+    pub descr: DescrRef,
+    /// Known class pointer (for NewWithVtable objects).
+    pub known_class: Option<GcRef>,
+    /// Field descriptors and their positions in fail_args:
+    /// (field_descr_index, fail_arg_index_of_field_value).
+    pub fields: Vec<(u32, usize)>,
 }
 
 /// A single IR operation.
@@ -33,6 +52,12 @@ pub struct Op {
     /// Mirrors rpython/jit/metainterp/resoperation.py getfailargs/setfailargs.
     /// If None, the backend falls back to storing input args.
     pub fail_args: Option<SmallVec<[OpRef; 3]>>,
+    /// Virtual objects in fail_args that should be reconstructed on guard
+    /// failure instead of being materialized at compile time.
+    ///
+    /// resume.py: ResumeDataVirtualAdder encodes virtual shapes so the
+    /// backend can lazily reconstruct them from stored field values.
+    pub rd_virtuals: Option<Vec<GuardVirtualEntry>>,
 }
 
 impl Op {
@@ -43,6 +68,7 @@ impl Op {
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
+            rd_virtuals: None,
         }
     }
 
@@ -53,6 +79,7 @@ impl Op {
             descr: Some(descr),
             pos: OpRef::NONE,
             fail_args: None,
+            rd_virtuals: None,
         }
     }
 
@@ -2910,6 +2937,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(3),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -2917,6 +2945,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(4),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -2924,6 +2953,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
+                rd_virtuals: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -2942,6 +2972,7 @@ mod tests {
             descr: None,
             pos: OpRef(6),
             fail_args: None,
+            rd_virtuals: None,
         };
         let s = format!("{op}");
         assert_eq!(s, "v6 = IntAdd(v1, v2)");
@@ -2955,6 +2986,7 @@ mod tests {
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
+            rd_virtuals: None,
         };
         let s = format!("{op}");
         assert_eq!(s, "SetfieldGc(v0, v1)");
@@ -2968,6 +3000,7 @@ mod tests {
             descr: None,
             pos: OpRef::NONE,
             fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+            rd_virtuals: None,
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0) [v0, v1]");
@@ -2981,6 +3014,7 @@ mod tests {
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
+            rd_virtuals: None,
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0)");
@@ -2994,6 +3028,7 @@ mod tests {
             descr: None,
             pos: OpRef(1),
             fail_args: None,
+            rd_virtuals: None,
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 42);
@@ -3011,6 +3046,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(1),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3018,6 +3054,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::Finish,
@@ -3025,6 +3062,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
+                rd_virtuals: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3041,6 +3079,7 @@ mod tests {
             descr: None,
             pos: OpRef::NONE,
             fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(10_000)]),
+            rd_virtuals: None,
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 99);
@@ -3069,6 +3108,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3076,6 +3116,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(3),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3083,6 +3124,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(4),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -3090,6 +3132,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
+                rd_virtuals: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3119,6 +3162,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(1),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::IntGt,
@@ -3126,6 +3170,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(2),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3133,6 +3178,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::Finish,
@@ -3140,6 +3186,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
+                rd_virtuals: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3166,6 +3213,7 @@ mod tests {
             descr: Some(descr),
             pos: OpRef::NONE,
             fail_args: None,
+            rd_virtuals: None,
         }];
         let constants = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
@@ -3194,6 +3242,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3201,6 +3250,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(2),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::IntLt,
@@ -3208,6 +3258,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(3),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3215,6 +3266,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(2)]),
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::IntSub,
@@ -3222,6 +3274,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(4),
                 fail_args: None,
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -3229,6 +3282,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
+                rd_virtuals: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3258,6 +3312,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0)]),
+                rd_virtuals: None,
             },
             Op {
                 opcode: OpCode::GuardFalse,
@@ -3265,6 +3320,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]),
+                rd_virtuals: None,
             },
         ];
         let constants = std::collections::HashMap::new();
