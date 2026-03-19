@@ -971,18 +971,13 @@ impl OptVirtualize {
     /// RPython parity: virtualize.py does NOT force fail_args.
     /// encode_guard_virtuals in optimizer.rs handles virtual encoding at emit time.
     fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        // Force all virtuals while encode_guard_virtuals is disabled.
-        // TODO: use prepare_guard_fail_arg when encoding is enabled.
-        if let Some(ref fail_args) = op.fail_args {
-            for &fa in fail_args {
-                let resolved = ctx.get_replacement(fa);
-                self.force_virtual(resolved, ctx);
-            }
-        }
+        // RPython parity: don't force fail_args.
+        // encode_guard_virtuals handles encoding at emit time.
         let mut guard_op = op.clone();
         if let Some(ref mut fa) = guard_op.fail_args {
             for arg in fa.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                let resolved = ctx.get_replacement(*arg);
+                *arg = self.prepare_guard_fail_arg(resolved, ctx);
             }
         }
         for arg in &mut guard_op.args {
@@ -1713,17 +1708,10 @@ impl Optimization for OptVirtualize {
                     self.force_virtual(arg, ctx);
                 }
 
-                // Force fail_args for stability while encode_guard_virtuals is disabled.
-                // TODO: when encode_guard_virtuals is enabled, use prepare_guard_fail_arg instead.
+                // RPython parity: don't force fail_args.
+                // encode_guard_virtuals in optimizer.rs handles encoding at emit time.
                 if is_guard {
                     let mut guard_op = op.clone();
-
-                    if let Some(ref fail_args) = guard_op.fail_args {
-                        for &fa in fail_args {
-                            let resolved = ctx.get_replacement(fa);
-                            self.force_virtual(resolved, ctx);
-                        }
-                    }
 
                     for arg in &mut guard_op.args {
                         *arg = ctx.get_replacement(*arg);
@@ -1731,7 +1719,8 @@ impl Optimization for OptVirtualize {
 
                     if let Some(ref mut fa) = guard_op.fail_args {
                         for arg in fa.iter_mut() {
-                            *arg = ctx.get_replacement(*arg);
+                            let resolved = ctx.get_replacement(*arg);
+                            *arg = self.prepare_guard_fail_arg(resolved, ctx);
                         }
                     }
 

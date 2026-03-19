@@ -686,11 +686,8 @@ impl Optimizer {
     /// in guard fail_args as rd_virtuals for lazy reconstruction on guard
     /// failure. RPython does this in the optimizer's store_final_boxes_in_guard,
     /// which runs for every guard regardless of which pass emits it.
-    fn encode_guard_virtuals(op: Op, _ctx: &mut OptContext) -> Op {
-        // Virtual fail_arg encoding disabled pending fib_recursive SIGSEGV fix.
-        // Virtualizable exclusion added (Virtualizable != Virtual).
-        // To re-enable: call encode_guard_virtuals_impl(op, ctx)
-        op
+    fn encode_guard_virtuals(op: Op, ctx: &mut OptContext) -> Op {
+        Self::encode_guard_virtuals_impl(op, ctx)
     }
 
     #[allow(dead_code)]
@@ -829,6 +826,8 @@ impl Default for Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::Type;
+    use majit_ir::descr::make_size_descr;
     use majit_ir::{OpCode, OpRef};
 
     /// A trivial pass that removes INT_ADD(x, 0) -> x
@@ -1071,6 +1070,41 @@ mod tests {
             "SetfieldGc should target the emitted New, not an unrolled-only ref; got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_optimizer_encodes_direct_virtual_guard_fail_args_as_rd_virtuals() {
+        let mut opt = Optimizer::default_pipeline();
+        let size_descr = make_size_descr(16);
+        let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, true);
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], size_descr),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(11)], field_descr),
+            guard,
+            Op::new(OpCode::Jump, &[]),
+        ];
+        for (i, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef(i as u32);
+        }
+
+        let result = opt.optimize(&ops);
+        let guard = result
+            .iter()
+            .find(|op| op.opcode == OpCode::GuardTrue)
+            .expect("guard should survive optimization");
+        let rd_virtuals = guard
+            .rd_virtuals
+            .as_ref()
+            .expect("direct virtual fail arg should be encoded as rd_virtuals");
+        let fail_args = guard.fail_args.as_ref().expect("guard should keep fail args");
+
+        assert_eq!(rd_virtuals.len(), 1);
+        assert!(fail_args[0].is_none(), "virtual fail arg slot should be replaced");
+        assert_eq!(fail_args.len(), 2, "field value should be appended as extra fail arg");
     }
 
     #[test]
