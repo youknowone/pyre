@@ -777,6 +777,15 @@ impl OptRewrite {
             }
         }
 
+        // rewrite.py postprocess_GUARD_VALUE: after guard passes,
+        // arg(0) is known to equal arg(1). If arg(1) is a constant,
+        // propagate that constant to arg(0).
+        if let Some(v) = ctx.get_constant_int(arg1) {
+            ctx.make_constant(arg0, Value::Int(v));
+        } else {
+            // Even without constant: arg(0) forwards to arg(1)
+            ctx.replace_op(arg0, arg1);
+        }
         OptimizationResult::PassOn
     }
 
@@ -1136,6 +1145,10 @@ impl Optimization for OptRewrite {
                         return OptimizationResult::Remove;
                     }
                 }
+                // rewrite.py postprocess_GUARD_NONNULL: after guard passes,
+                // downstream code can assume arg(0) is non-null.
+                // (PtrInfo tracking would record this; here we note the
+                // guard survived, so the value is live and non-null.)
                 OptimizationResult::PassOn
             }
             OpCode::GuardIsnull => {
@@ -1143,6 +1156,9 @@ impl Optimization for OptRewrite {
                 if let Some(0) = ctx.get_constant_int(op.arg(0)) {
                     return OptimizationResult::Remove;
                 }
+                // rewrite.py postprocess_GUARD_ISNULL: after guard passes,
+                // arg(0) is known to be NULL.
+                ctx.make_constant(op.arg(0), Value::Int(0));
                 OptimizationResult::PassOn
             }
             OpCode::GuardClass => {
