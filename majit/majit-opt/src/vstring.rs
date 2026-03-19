@@ -83,21 +83,6 @@ impl OptString {
         match info {
             VStringInfo::Plain { chars } => {
                 let len = chars.len();
-                // vstring.py: if all chars are constants, fold to constant string.
-                // Check if every character is a known constant value.
-                let all_const: Option<Vec<i64>> = chars
-                    .iter()
-                    .map(|ch| ch.and_then(|r| ctx.get_constant_int(r)))
-                    .collect();
-                if let Some(const_chars) = &all_const {
-                    if !const_chars.is_empty() {
-                        // All characters are constants. We can't actually create
-                        // a constant string pointer at optimization time (would
-                        // need GC allocation), but we record the length as a
-                        // constant for downstream STRLEN optimization.
-                        let _ = const_chars; // future: string constant pool
-                    }
-                }
                 let is_unicode = self.unicode_refs.contains(&resolved);
                 let len_ref = self.emit_constant_int(len as i64, ctx);
                 // vstring.py: use NEWUNICODE/UNICODESETITEM for unicode strings.
