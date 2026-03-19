@@ -1,8 +1,8 @@
-mod builder;
+mod codewriter;
 mod frame;
 mod machine;
 
-pub use builder::JitCodeBuilder;
+pub use codewriter::JitCodeBuilder;
 pub use machine::*;
 
 use majit_ir::OpCode;
