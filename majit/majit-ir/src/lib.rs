@@ -8,7 +8,7 @@ pub use descr::{
     ExtraEffect, FailDescr, FieldDescr, InteriorFieldDescr, OopSpecIndex, SizeDescr,
     make_array_descr, make_field_descr,
 };
-pub use resoperation::{OPCODE_COUNT, Op, OpCode, OpRef, format_trace};
+pub use resoperation::{OPCODE_COUNT, GuardVirtualEntry, Op, OpCode, OpRef, format_trace};
 pub use value::{
     Const, FAILARGS_LIMIT, GcRef, GreenKey, InputArg, JitDriverVar, Type, Value, VarKind,
 };

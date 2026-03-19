@@ -9,7 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{
+    Descr, DescrRef, FieldDescr, GuardVirtualEntry, OopSpecIndex, Op, OpCode, OpRef, Type, Value,
+};
 
 use crate::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
@@ -32,6 +34,13 @@ pub struct VirtualizableConfig {
     pub array_field_offsets: Vec<usize>,
     /// Item types of array fields, parallel to `array_field_offsets`.
     pub array_item_types: Vec<Type>,
+    /// Trace-entry lengths of array fields, parallel to `array_field_offsets`.
+    ///
+    /// Standard virtualizable traces carry array elements in the input box
+    /// layout; the optimizer needs the concrete lengths to map those input
+    /// args back into VirtualizableFieldState without falling back to raw
+    /// heap reads.
+    pub array_lengths: Vec<usize>,
 }
 
 /// Field descriptor index for the `virtual_token` field of JitVirtualRef.
@@ -51,11 +60,7 @@ pub struct OptVirtualize {
     /// The DescrRef is captured from the first SetarrayitemRaw/GetarrayitemRaw op
     /// we absorb, so we can emit correct SetarrayitemRaw on force.
     vable_array_ptrs: HashMap<OpRef, (usize, Option<DescrRef>)>,
-    /// Virtual input args for virtualizable static fields.
-    /// Each entry: (config_index, virtual_input_OpRef).
-    /// Created lazily on first propagate_forward call.
-    vable_virtual_inputs: Vec<(usize, OpRef)>,
-    /// Whether virtual inputs have been initialized.
+    /// Whether virtualizable state has been initialized from existing trace inputs.
     vable_initialized: bool,
     /// Whether setup needs to initialize virtualizable PtrInfo on ctx.
     /// Set in setup(), applied in first propagate_forward().
@@ -67,7 +72,6 @@ impl OptVirtualize {
         OptVirtualize {
             vable_config: None,
             vable_array_ptrs: HashMap::new(),
-            vable_virtual_inputs: Vec::new(),
             vable_initialized: false,
             needs_vable_setup: false,
         }
@@ -78,34 +82,75 @@ impl OptVirtualize {
         OptVirtualize {
             vable_config: Some(config),
             vable_array_ptrs: HashMap::new(),
-            vable_virtual_inputs: Vec::new(),
             vable_initialized: false,
             needs_vable_setup: false,
         }
     }
 
-    /// Lazily initialize virtual input args for virtualizable static fields.
+    /// Seed virtualizable state from existing trace inputs.
     ///
-    /// RPython only needs extra loop inputs when the trace actually carries
-    /// virtualizable field values through the loop. Standard virtualizable
-    /// traces that stay on boxes should not grow inputargs just because a
-    /// virtualizable config exists, so allocate these only when the first
-    /// tracked raw field read is seen.
-    /// RPython _init_virtualizable: map static field values to existing
-    /// trace input args.
-    ///
-    /// In RPython, jit_merge_point passes virtualizable field values as
-    /// part of the live values — they are already input args at positions
-    /// 1..N (after the frame ref at position 0). The optimizer does NOT
-    /// allocate new inputs; it maps existing ones.
-    ///
-    /// In pyre, the same holds: input args are [frame, ni, vsd, ...] and
-    /// the trace carries ni/vsd as const_int values via flush_to_frame.
-    /// No additional optimizer-owned inputs are needed.
-    fn init_virtualizable(&mut self, _ctx: &mut OptContext) {
-        // Static field values are already in the trace as input args.
-        // Array-level tracking is handled by vable_array_ptrs, populated
-        // in handle_virtualizable_first_read when array pointer reads are seen.
+    /// RPython standard virtualizables do not synthesize optimizer-owned
+    /// loop inputs. The interpreter/JitCode contract already carries static
+    /// field values and array elements as ordinary trace inputs, and the
+    /// optimizer only maps those existing boxes into PtrInfo state.
+    fn init_virtualizable(&mut self, ctx: &mut OptContext) {
+        let Some(config) = &self.vable_config else {
+            return;
+        };
+        self.vable_initialized = true;
+        if ctx.num_inputs() <= 1 {
+            return;
+        }
+
+        let mut state = VirtualizableFieldState {
+            fields: vec![],
+            field_descrs: vec![],
+            arrays: vec![],
+        };
+        let mut flat_input_idx = 1usize;
+
+        for &offset in &config.static_field_offsets {
+            if flat_input_idx >= ctx.num_inputs() {
+                break;
+            }
+            let field_idx = virtualizable_field_index(offset);
+            let input_ref = OpRef(flat_input_idx as u32);
+            set_field(&mut state.fields, field_idx, input_ref);
+            set_field_descr(
+                &mut state.field_descrs,
+                field_idx,
+                make_field_index_descr(field_idx),
+            );
+            flat_input_idx += 1;
+        }
+
+        for (array_idx, (&offset, &length)) in config
+            .array_field_offsets
+            .iter()
+            .zip(config.array_lengths.iter())
+            .enumerate()
+        {
+            let field_idx = virtualizable_field_index(offset);
+            set_field_descr(
+                &mut state.field_descrs,
+                field_idx,
+                make_field_index_descr(field_idx),
+            );
+
+            let mut elements = Vec::with_capacity(length);
+            for _ in 0..length {
+                if flat_input_idx >= ctx.num_inputs() {
+                    break;
+                }
+                elements.push(OpRef(flat_input_idx as u32));
+                flat_input_idx += 1;
+            }
+            if !elements.is_empty() {
+                state.arrays.push((array_idx as u32, elements));
+            }
+        }
+
+        ctx.set_ptr_info(OpRef(0), PtrInfo::Virtualizable(state));
     }
 
     // ── PtrInfo accessors (delegated to ctx) ──
@@ -122,14 +167,17 @@ impl OptVirtualize {
         if self.needs_vable_setup {
             self.needs_vable_setup = false;
             if ctx.get_ptr_info(OpRef(0)).is_none() {
-                ctx.set_ptr_info(
-                    OpRef(0),
-                    PtrInfo::Virtualizable(VirtualizableFieldState {
-                        fields: vec![],
-                        field_descrs: vec![],
-                        arrays: vec![],
-                    }),
-                );
+                self.init_virtualizable(ctx);
+                if ctx.get_ptr_info(OpRef(0)).is_none() {
+                    ctx.set_ptr_info(
+                        OpRef(0),
+                        PtrInfo::Virtualizable(VirtualizableFieldState {
+                            fields: vec![],
+                            field_descrs: vec![],
+                            arrays: vec![],
+                        }),
+                    );
+                }
             }
         }
     }
@@ -196,8 +244,7 @@ impl OptVirtualize {
             if let Some(ref config) = self.vable_config {
                 if let Some(&offset) = config.array_field_offsets.get(array_idx as usize) {
                     // Compute the field descr index for this offset
-                    let descr_idx =
-                        0x1000_0000 | (((offset as u32) & 0x000f_ffff) << 4) | (0x7 << 1);
+                    let descr_idx = virtualizable_field_index(offset);
                     get_array_op.descr = get_field_descr(&vinfo.field_descrs, descr_idx)
                         .or_else(|| Some(make_field_index_descr(descr_idx)));
                 }
@@ -581,7 +628,7 @@ impl OptVirtualize {
             // Let the op emit, but cache result for future reads
             // and register array pointers for array tracking.
             if let PtrInfo::Virtualizable(_) = &info {
-                return self.handle_virtualizable_first_read(op, struct_ref, field_idx, ctx);
+                return self.handle_virtualizable_first_read(op, field_idx, ctx);
             }
         }
         OptimizationResult::PassOn
@@ -589,36 +636,17 @@ impl OptVirtualize {
 
     /// Handle first read of a virtualizable field (no cached value yet).
     ///
-    /// For static fields with virtual inputs: replace the GetfieldRawI with
-    /// the virtual input OpRef (eliminating the load from the loop body).
-    /// For other fields: emit the op and cache the result.
+    /// Standard virtualizable traces should already have scalar fields seeded
+    /// from input boxes. The remaining legacy case here is learning which raw
+    /// frame field carries an array pointer so later Get/SetarrayitemRaw ops
+    /// can be absorbed.
     fn handle_virtualizable_first_read(
         &mut self,
         op: &Op,
-        frame_ref: OpRef,
         field_idx: u32,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let offset = extract_field_offset(field_idx);
-        let virt_idx = self.vable_config.as_ref().and_then(|config| {
-            offset.and_then(|off| config.static_field_offsets.iter().position(|&o| o == off))
-        });
-        if let Some(virt_idx) = virt_idx {
-            if !self.vable_initialized {
-                self.init_virtualizable(ctx);
-                self.vable_initialized = true;
-            }
-            if let Some(&(_, virt_ref)) = self.vable_virtual_inputs.get(virt_idx) {
-                ctx.replace_op(op.pos, virt_ref);
-                if let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info_mut(frame_ref) {
-                    set_field(&mut vstate.fields, field_idx, virt_ref);
-                    if let Some(d) = op.descr.clone() {
-                        set_field_descr(&mut vstate.field_descrs, field_idx, d);
-                    }
-                }
-                return OptimizationResult::Remove;
-            }
-        }
 
         // Array pointer field: remember which array this pointer came from
         // so subsequent Get/SetarrayitemRaw can be absorbed. Do not cache
@@ -892,25 +920,128 @@ impl OptVirtualize {
         self.force_guard_fail_args(op, ctx)
     }
 
-    /// Force virtual references in guard fail_args and re-resolve all args.
-    /// Must be called for any guard that PassOn instead of Remove.
+    /// Encode virtual objects in guard fail_args as resume data instead
+    /// of forcing them.
+    ///
+    /// optimizer.py: store_final_boxes_in_guard / ResumeDataVirtualAdder
+    ///
+    /// For each fail_arg that is virtual:
+    ///   - Record its shape (descr, known_class, fields) in a GuardVirtualEntry
+    ///   - Add the virtual's field values as extra fail_args at the end
+    ///   - Set the original fail_arg slot to OpRef::NONE (placeholder)
+    ///   - If a field value is itself virtual, force it (no recursive encoding yet)
+    ///
+    /// Non-virtual fail_args are resolved normally.
     fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        if let Some(ref fail_args) = op.fail_args {
-            for &fa in fail_args {
-                let resolved = ctx.get_replacement(fa);
-                self.force_virtual(resolved, ctx);
-            }
-        }
         let mut guard_op = op.clone();
-        if let Some(ref mut fa) = guard_op.fail_args {
-            for arg in fa.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+        let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
+
+        if let Some(ref mut fail_args) = guard_op.fail_args {
+            // First pass: identify which fail_args are virtual
+            let original_len = fail_args.len();
+            let mut extra_fail_args: Vec<OpRef> = Vec::new();
+
+            for fa_idx in 0..original_len {
+                let resolved = ctx.get_replacement(fail_args[fa_idx]);
+                if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
+                    if info.is_virtual() {
+                        if let Some(entry) = self.encode_virtual_entry(
+                            fa_idx,
+                            &info,
+                            original_len + extra_fail_args.len(),
+                            &mut extra_fail_args,
+                            ctx,
+                        ) {
+                            virtual_entries.push(entry);
+                            fail_args[fa_idx] = OpRef::NONE;
+                            continue;
+                        }
+                        // Encoding failed (unsupported virtual kind), fall back to force
+                        self.force_virtual(resolved, ctx);
+                    }
+                }
+                fail_args[fa_idx] = ctx.get_replacement(fail_args[fa_idx]);
+            }
+
+            // Append extra fail_args (field values of virtuals)
+            for extra in extra_fail_args {
+                fail_args.push(extra);
             }
         }
+
+        // Resolve main guard args
         for arg in &mut guard_op.args {
             *arg = ctx.get_replacement(*arg);
         }
+
+        guard_op.rd_virtuals = if virtual_entries.is_empty() {
+            None
+        } else {
+            Some(virtual_entries)
+        };
+
         OptimizationResult::Replace(guard_op)
+    }
+
+    /// Encode a single virtual PtrInfo into a GuardVirtualEntry.
+    ///
+    /// Adds the virtual's field values to `extra_fail_args` and returns
+    /// the entry metadata. Field values that are themselves virtual are
+    /// forced before being added.
+    ///
+    /// Returns None for unsupported virtual kinds (VirtualArray, etc. for now).
+    fn encode_virtual_entry(
+        &mut self,
+        fail_arg_index: usize,
+        info: &PtrInfo,
+        extra_start: usize,
+        extra_fail_args: &mut Vec<OpRef>,
+        ctx: &mut OptContext,
+    ) -> Option<GuardVirtualEntry> {
+        match info {
+            PtrInfo::Virtual(vinfo) => {
+                let mut fields = Vec::with_capacity(vinfo.fields.len());
+                for &(field_idx, value_ref) in &vinfo.fields {
+                    // Force nested virtuals — only one level of encoding for now
+                    let resolved = ctx.get_replacement(value_ref);
+                    if Self::is_virtual(resolved, ctx) {
+                        self.force_virtual(resolved, ctx);
+                    }
+                    let final_ref = ctx.get_replacement(resolved);
+                    let fa_index = extra_start + extra_fail_args.len();
+                    extra_fail_args.push(final_ref);
+                    fields.push((field_idx, fa_index));
+                }
+                Some(GuardVirtualEntry {
+                    fail_arg_index,
+                    descr: vinfo.descr.clone(),
+                    known_class: vinfo.known_class,
+                    fields,
+                })
+            }
+            PtrInfo::VirtualStruct(vinfo) => {
+                let mut fields = Vec::with_capacity(vinfo.fields.len());
+                for &(field_idx, value_ref) in &vinfo.fields {
+                    let resolved = ctx.get_replacement(value_ref);
+                    if Self::is_virtual(resolved, ctx) {
+                        self.force_virtual(resolved, ctx);
+                    }
+                    let final_ref = ctx.get_replacement(resolved);
+                    let fa_index = extra_start + extra_fail_args.len();
+                    extra_fail_args.push(final_ref);
+                    fields.push((field_idx, fa_index));
+                }
+                Some(GuardVirtualEntry {
+                    fail_arg_index,
+                    descr: vinfo.descr.clone(),
+                    known_class: None,
+                    fields,
+                })
+            }
+            // VirtualArray, VirtualArrayStruct, VirtualRawBuffer:
+            // fall back to forcing for now
+            _ => None,
+        }
     }
 
     fn optimize_guard_nonnull(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
@@ -1124,48 +1255,6 @@ impl OptVirtualize {
         // not by separate PtrInfo variants.
     }
 
-    /// Extend JUMP args with current tracked virtualizable field values.
-    ///
-    /// Instead of forcing the frame at JUMP (which writes to heap),
-    /// carry the values through JUMP args so they flow through the loop
-    /// as virtual inputs. No heap access on the hot path.
-    fn augment_jump_with_virtualizable(&self, op: &mut Op, ctx: &OptContext) {
-        let frame_ref = ctx.get_replacement(OpRef(0));
-        let vstate = match ctx.get_ptr_info(frame_ref) {
-            Some(PtrInfo::Virtualizable(v)) => v,
-            _ => return,
-        };
-        let config = match &self.vable_config {
-            Some(c) => c,
-            None => return,
-        };
-        if self.vable_virtual_inputs.is_empty() {
-            // Standard virtualizable traces already carry box-state through
-            // the interpreter/JitCode contract. Only the raw-field virtualizable
-            // path allocates optimizer-owned virtual inputs that need JUMP
-            // augmentation here.
-            return;
-        }
-        // For each virtual input, add the current tracked value to JUMP args
-        for (i, &offset) in config.static_field_offsets.iter().enumerate() {
-            let Some((_, virt_ref)) = self.vable_virtual_inputs.get(i).copied() else {
-                break;
-            };
-            let current = vstate
-                .fields
-                .iter()
-                .find_map(|(idx, opref)| {
-                    if extract_field_offset(*idx) == Some(offset) {
-                        Some(ctx.get_replacement(*opref))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(ctx.get_replacement(virt_ref));
-            op.args.push(current);
-        }
-    }
-
     /// Augment guard fail_args with tracked virtualizable field values.
     ///
     /// After the original fail_args, appends:
@@ -1198,9 +1287,7 @@ impl OptVirtualize {
             } else {
                 // Not tracked — emit a read from the frame
                 let mut read_op = Op::new(OpCode::GetfieldRawI, &[frame_ref]);
-                read_op.descr = Some(make_field_index_descr(
-                    0x1000_0000 | (((offset as u32) & 0x000f_ffff) << 4) | (0x7 << 1),
-                ));
+                read_op.descr = Some(make_field_index_descr(virtualizable_field_index(offset)));
                 let read_ref = ctx.emit_through_passes(read_op);
                 fail_args.push(read_ref);
             }
@@ -1403,7 +1490,10 @@ impl Optimization for OptVirtualize {
             // Calls / escaping operations — force all virtual args
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
 
-            // JUMP — extend args with virtualizable values (no force/heap write)
+            // JUMP — keep the virtualizable frame virtual and preserve the
+            // existing trace input contract. Standard virtualizable traces
+            // already carry box-state in the interpreter/JitCode layout; the
+            // optimizer must not append its own synthetic inputs here.
             OpCode::Jump if self.vable_config.is_some() => {
                 let frame_ref = ctx.get_replacement(OpRef(0));
                 // Force all virtual args EXCEPT the virtualizable frame
@@ -1427,8 +1517,6 @@ impl Optimization for OptVirtualize {
                         *arg = resolved;
                     }
                 }
-                // Add virtualizable field values to JUMP args
-                self.augment_jump_with_virtualizable(&mut jump_op, ctx);
                 OptimizationResult::Replace(jump_op)
             }
 
@@ -1499,25 +1587,52 @@ impl Optimization for OptVirtualize {
                     self.force_virtual(arg, ctx);
                 }
 
-                // Guards: force virtual fail_args and re-resolve after forcing
+                // Guards: encode virtual fail_args as resume data
                 if is_guard {
-                    if let Some(ref fail_args) = op.fail_args {
-                        for &fa in fail_args {
-                            let resolved = ctx.get_replacement(fa);
-                            self.force_virtual(resolved, ctx);
-                        }
-                    }
-                    // Re-resolve fail_args after forcing (force may create new forwarding)
                     let mut guard_op = op.clone();
-                    if let Some(ref mut fa) = guard_op.fail_args {
-                        for arg in fa.iter_mut() {
-                            *arg = ctx.get_replacement(*arg);
+                    let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
+
+                    if let Some(ref mut fail_args) = guard_op.fail_args {
+                        let original_len = fail_args.len();
+                        let mut extra_fail_args: Vec<OpRef> = Vec::new();
+
+                        for fa_idx in 0..original_len {
+                            let resolved = ctx.get_replacement(fail_args[fa_idx]);
+                            if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
+                                if info.is_virtual() {
+                                    if let Some(entry) = self.encode_virtual_entry(
+                                        fa_idx,
+                                        &info,
+                                        original_len + extra_fail_args.len(),
+                                        &mut extra_fail_args,
+                                        ctx,
+                                    ) {
+                                        virtual_entries.push(entry);
+                                        fail_args[fa_idx] = OpRef::NONE;
+                                        continue;
+                                    }
+                                    // Encoding failed, fall back to force
+                                    self.force_virtual(resolved, ctx);
+                                }
+                            }
+                            fail_args[fa_idx] = ctx.get_replacement(fail_args[fa_idx]);
+                        }
+
+                        for extra in extra_fail_args {
+                            fail_args.push(extra);
                         }
                     }
-                    // Also re-resolve op args
+
+                    // Re-resolve op args
                     for arg in &mut guard_op.args {
                         *arg = ctx.get_replacement(*arg);
                     }
+
+                    guard_op.rd_virtuals = if virtual_entries.is_empty() {
+                        None
+                    } else {
+                        Some(virtual_entries)
+                    };
 
                     if self.vable_config.is_some() {
                         self.augment_guard_with_virtualizable(&mut guard_op, ctx);
@@ -1532,7 +1647,6 @@ impl Optimization for OptVirtualize {
 
     fn setup(&mut self) {
         self.vable_array_ptrs.clear();
-        self.vable_virtual_inputs.clear();
         self.vable_initialized = false;
         // Defer virtualizable PtrInfo init to first propagate_forward
         // (setup() doesn't have access to OptContext).
@@ -1629,6 +1743,10 @@ impl FieldDescr for FieldIndexDescr {
 
 fn make_field_index_descr(idx: u32) -> DescrRef {
     Arc::new(FieldIndexDescr(idx))
+}
+
+fn virtualizable_field_index(offset: usize) -> u32 {
+    0x1000_0000 | (((offset as u32) & 0x000f_ffff) << 4) | (0x7 << 1)
 }
 
 /// Extract the byte offset from a field descriptor index.
@@ -1802,6 +1920,7 @@ mod tests {
             static_field_types: vec![],
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Ref],
+            array_lengths: vec![1],
         });
         pass.setup();
         ctx.set_ptr_info(
@@ -1837,6 +1956,7 @@ mod tests {
             static_field_types: vec![],
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Ref],
+            array_lengths: vec![1],
         });
         pass.setup();
         ctx.set_ptr_info(
@@ -1870,6 +1990,7 @@ mod tests {
             static_field_types: vec![],
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Int],
+            array_lengths: vec![1],
         });
         pass.setup();
 
@@ -1929,6 +2050,7 @@ mod tests {
             static_field_types: vec![],
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Int],
+            array_lengths: vec![1],
         });
         pass.setup();
 
@@ -1973,6 +2095,64 @@ mod tests {
         assert_eq!(fail_args.len(), 2);
         assert_eq!(ctx.get_constant_box(fail_args[0]), Some(Value::Int(1)));
         assert_eq!(fail_args[1], OpRef(1));
+    }
+
+    #[test]
+    fn test_standard_virtualizable_guard_seeds_fail_args_from_input_boxes() {
+        let mut ctx = OptContext::with_num_inputs(8, 3);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![8],
+            static_field_types: vec![Type::Int],
+            array_field_offsets: vec![24],
+            array_item_types: vec![Type::Int],
+            array_lengths: vec![1],
+        });
+        pass.setup();
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(99)]);
+        guard.fail_args = Some(Default::default());
+
+        let replaced = match pass.propagate_forward(&guard, &mut ctx) {
+            OptimizationResult::Replace(op) => op,
+            other => panic!("expected guard replacement, got {other:?}"),
+        };
+        let fail_args = replaced.fail_args.expect("guard should have fail args");
+        assert_eq!(fail_args.len(), 3);
+        assert_eq!(fail_args[0], OpRef(1));
+        assert_eq!(ctx.get_constant_box(fail_args[1]), Some(Value::Int(1)));
+        assert_eq!(fail_args[2], OpRef(2));
+        assert!(
+            ctx.new_operations.is_empty(),
+            "standard virtualizable guard should not emit raw heap reads"
+        );
+    }
+
+    #[test]
+    fn test_standard_virtualizable_loop_keeps_original_input_arity() {
+        let mut opt = Optimizer::default_pipeline_with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![8],
+            static_field_types: vec![Type::Int],
+            array_field_offsets: vec![24],
+            array_item_types: vec![Type::Int],
+            array_lengths: vec![1],
+        });
+        let mut constants = HashMap::new();
+        let mut ops = vec![
+            Op::new(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)]),
+            Op::new(OpCode::GuardTrue, &[OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1), OpRef(2)]),
+        ];
+        ops[1].fail_args = Some(Default::default());
+        assign_positions(&mut ops);
+
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+        let jump = result
+            .iter()
+            .find(|op| op.opcode == OpCode::Jump)
+            .expect("optimized loop should keep a jump");
+
+        assert_eq!(opt.final_num_inputs(), 3);
+        assert_eq!(jump.args.len(), 3);
     }
 
     // ── Tests ──
@@ -2846,5 +3026,228 @@ mod tests {
             "GETFIELD after force should be forwarded via heap cache; got ops: {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_guard_fail_args_virtual_not_forced() {
+        // resume.py parity: virtual objects in guard fail_args should NOT be
+        // forced. Instead, rd_virtuals metadata should be recorded.
+        //
+        // p0 = new_with_vtable(descr=size1)
+        // setfield_gc(p0, i10, descr=field1)
+        // guard_true(i20) [p0]
+        //
+        // Expected: no NEW_WITH_VTABLE emitted, the guard has rd_virtuals
+        // with field value i10 as an extra fail_arg.
+        let sd = size_descr(1);
+        let fd = field_descr(10);
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd.clone()), // pos=1
+            guard, // pos=2
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        // The virtual should NOT be forced — no NEW_WITH_VTABLE emitted
+        let new_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::NewWithVtable)
+            .count();
+        assert_eq!(
+            new_count, 0,
+            "virtual in guard fail_args should NOT be forced; got ops: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+
+        // The guard should be emitted with rd_virtuals metadata
+        let guard_op = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard should be emitted");
+
+        let rd_virtuals = guard_op
+            .rd_virtuals
+            .as_ref()
+            .expect("guard should have rd_virtuals");
+        assert_eq!(rd_virtuals.len(), 1, "one virtual entry expected");
+
+        let entry = &rd_virtuals[0];
+        assert_eq!(entry.fail_arg_index, 0, "virtual was at fail_arg index 0");
+        assert_eq!(entry.fields.len(), 1, "virtual has one field");
+
+        // The original fail_arg[0] should be OpRef::NONE (placeholder)
+        let fa = guard_op.fail_args.as_ref().unwrap();
+        assert!(
+            fa[0].is_none(),
+            "original fail_arg slot should be OpRef::NONE"
+        );
+
+        // Field value should be in the extra fail_args
+        assert!(
+            fa.len() > 1,
+            "fail_args should have extra entries for field values; got len={}",
+            fa.len()
+        );
+
+        // The field's fail_arg_index should point to the extra entry
+        let (field_idx, field_fa_idx) = entry.fields[0];
+        assert_eq!(field_idx, 10, "field descr index should be 10");
+        assert_eq!(
+            field_fa_idx, 1,
+            "field value should be at fail_args index 1"
+        );
+    }
+
+    #[test]
+    fn test_guard_fail_args_mixed_virtual_and_non_virtual() {
+        // Guard with both virtual and non-virtual fail_args.
+        //
+        // p0 = new(descr=size1)
+        // setfield_gc(p0, i10, descr=field1)
+        // guard_true(i20) [i30, p0, i40]
+        //
+        // Expected: i30 and i40 are kept as-is, p0 becomes NONE with
+        // rd_virtuals entry, field value i10 appended to fail_args.
+        let sd = size_descr(1);
+        let fd = field_descr(10);
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
+        guard.fail_args = Some(vec![OpRef(30), OpRef(0), OpRef(40)].into());
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], sd.clone()), // pos=0
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd.clone()), // pos=1
+            guard, // pos=2
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        // No allocation emitted
+        let new_count = result
+            .iter()
+            .filter(|o| matches!(o.opcode, OpCode::New | OpCode::NewWithVtable))
+            .count();
+        assert_eq!(new_count, 0, "virtual should not be forced");
+
+        let guard_op = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard should be emitted");
+
+        let rd_virtuals = guard_op
+            .rd_virtuals
+            .as_ref()
+            .expect("guard should have rd_virtuals");
+        assert_eq!(rd_virtuals.len(), 1);
+        assert_eq!(rd_virtuals[0].fail_arg_index, 1, "virtual at index 1");
+
+        let fa = guard_op.fail_args.as_ref().unwrap();
+        // fa[0] = i30, fa[1] = NONE (virtual placeholder), fa[2] = i40, fa[3] = field value
+        assert_eq!(fa[0], OpRef(30));
+        assert!(fa[1].is_none());
+        assert_eq!(fa[2], OpRef(40));
+        assert_eq!(fa.len(), 4, "3 original + 1 field value");
+    }
+
+    #[test]
+    fn test_guard_fail_args_no_virtual_no_rd_virtuals() {
+        // Guard with no virtuals in fail_args should not have rd_virtuals.
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
+        guard.fail_args = Some(vec![OpRef(20), OpRef(30)].into());
+
+        let mut ops = vec![guard];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+        let guard_op = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard should be emitted");
+
+        assert!(
+            guard_op.rd_virtuals.is_none(),
+            "no virtuals => rd_virtuals should be None"
+        );
+    }
+
+    #[test]
+    fn test_guard_fail_args_virtual_struct_not_forced() {
+        // VirtualStruct (New) in guard fail_args should also use resume data.
+        let sd = size_descr(1);
+        let fd = field_descr(10);
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], sd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd.clone()),
+            guard,
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        let new_count = result
+            .iter()
+            .filter(|o| matches!(o.opcode, OpCode::New | OpCode::NewWithVtable))
+            .count();
+        assert_eq!(new_count, 0, "virtual struct should not be forced");
+
+        let guard_op = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard should be emitted");
+
+        let rd_virtuals = guard_op.rd_virtuals.as_ref().unwrap();
+        assert_eq!(rd_virtuals.len(), 1);
+        assert!(rd_virtuals[0].known_class.is_none(), "struct has no class");
+        assert_eq!(rd_virtuals[0].fields.len(), 1);
+    }
+
+    #[test]
+    fn test_guard_fail_args_virtual_with_multiple_fields() {
+        // Virtual with two fields in guard fail_args.
+        let sd = size_descr(1);
+        let fd_a = field_descr(10);
+        let fd_b = field_descr(20);
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(30)]);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd_a.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(20)], fd_b.clone()),
+            guard,
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+
+        let guard_op = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard should be emitted");
+
+        let rd_virtuals = guard_op.rd_virtuals.as_ref().unwrap();
+        assert_eq!(rd_virtuals.len(), 1);
+        assert_eq!(
+            rd_virtuals[0].fields.len(),
+            2,
+            "virtual has two fields"
+        );
+
+        let fa = guard_op.fail_args.as_ref().unwrap();
+        // fa[0] = NONE, fa[1] = field_a value, fa[2] = field_b value
+        assert!(fa[0].is_none());
+        assert_eq!(fa.len(), 3, "1 original + 2 field values");
     }
 }
