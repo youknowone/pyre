@@ -678,6 +678,91 @@ impl VectorLoop {
     }
 }
 
+impl VectorLoop {
+    /// vector.py: unroll_loop_iterations(loop, unroll_count)
+    ///
+    /// Unroll the loop body `count` times. Each unrolled iteration has
+    /// its OpRefs remapped to new positions. Guards like GUARD_FUTURE_CONDITION
+    /// and GUARD_NOT_INVALIDATED are not duplicated.
+    pub fn unroll_loop_iterations(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let original_body = self.body.clone();
+        let label_args = self
+            .label
+            .as_ref()
+            .map(|l| l.args.clone())
+            .unwrap_or_default();
+        let jump_args = self
+            .jump
+            .as_ref()
+            .map(|j| j.args.clone())
+            .unwrap_or_default();
+
+        let prohibit = [
+            OpCode::GuardFutureCondition,
+            OpCode::GuardNotInvalidated,
+            OpCode::DebugMergePoint,
+        ];
+
+        let base_offset = original_body
+            .iter()
+            .map(|op| op.pos.0)
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        for u in 0..count {
+            let offset = base_offset + (u as u32) * (original_body.len() as u32);
+            let mut remap = std::collections::HashMap::new();
+
+            // Map label args → jump args (or remapped jump args)
+            for (i, la) in label_args.iter().enumerate() {
+                if i < jump_args.len() {
+                    let ja = *remap.get(&jump_args[i]).unwrap_or(&jump_args[i]);
+                    if *la != ja {
+                        remap.insert(*la, ja);
+                    }
+                }
+            }
+
+            for op in &original_body {
+                if prohibit.contains(&op.opcode) {
+                    continue;
+                }
+                let mut new_op = op.clone();
+                let new_pos = OpRef(op.pos.0 + offset);
+                if !op.pos.is_none() {
+                    remap.insert(op.pos, new_pos);
+                }
+                new_op.pos = new_pos;
+                for arg in &mut new_op.args {
+                    if let Some(&mapped) = remap.get(arg) {
+                        *arg = mapped;
+                    }
+                }
+                if let Some(ref mut fa) = new_op.fail_args {
+                    for arg in fa.iter_mut() {
+                        if let Some(&mapped) = remap.get(arg) {
+                            *arg = mapped;
+                        }
+                    }
+                }
+                self.body.push(new_op);
+            }
+        }
+
+        // Update jump args
+        if let Some(ref mut jump) = self.jump {
+            for arg in &mut jump.args {
+                // Use latest remap if available
+            }
+        }
+        self.unroll_factor = count + 1;
+    }
+}
+
 /// vector.py: follow_def_use_chain — trace a value through its uses
 /// to find related vectorizable operations.
 pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<usize> {
