@@ -273,7 +273,7 @@ impl OptHeap {
             self.cached_fields.clear();
             self.cached_arrayitems.clear();
             self.cached_arrayitems_var.clear();
-        self.array_min_lengths.clear();
+            self.array_min_lengths.clear();
         }
 
         // Nullity: allocated objects are permanently non-null.
@@ -673,7 +673,7 @@ impl OptHeap {
                 self.force_all_lazy_setarrayitems(ctx);
                 self.cached_arrayitems.clear();
                 self.cached_arrayitems_var.clear();
-        self.array_min_lengths.clear();
+                self.array_min_lengths.clear();
                 // heap.py: cache_varindex_write — cache this write so that
                 // a subsequent read with the same variable index can hit.
                 if let Some(var_key) = Self::arrayitem_key_variable(op) {
@@ -1460,7 +1460,11 @@ mod tests {
     fn test_setarrayitem_postprocess_updates_ptr_info() {
         let d = descr(0);
         let idx = OpRef(50);
-        let op = Op::with_descr(OpCode::SetarrayitemGc, &[OpRef(100), idx, OpRef(101)], d.clone());
+        let op = Op::with_descr(
+            OpCode::SetarrayitemGc,
+            &[OpRef(100), idx, OpRef(101)],
+            d.clone(),
+        );
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));

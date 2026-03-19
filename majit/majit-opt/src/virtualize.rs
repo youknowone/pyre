@@ -3204,7 +3204,7 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd.clone()), // pos=1
-            guard, // pos=2
+            guard,                                                  // pos=2
         ];
         assign_positions(&mut ops);
 
@@ -3216,7 +3216,8 @@ mod tests {
             .filter(|o| o.opcode == OpCode::NewWithVtable)
             .count();
         assert_eq!(
-            new_count, 0,
+            new_count,
+            0,
             "virtual in guard fail_args should NOT be forced; got ops: {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
@@ -3280,7 +3281,7 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()), // pos=0
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd.clone()), // pos=1
-            guard, // pos=2
+            guard,                                        // pos=2
         ];
         assign_positions(&mut ops);
 
@@ -3398,11 +3399,7 @@ mod tests {
 
         let rd_virtuals = guard_op.rd_virtuals.as_ref().unwrap();
         assert_eq!(rd_virtuals.len(), 1);
-        assert_eq!(
-            rd_virtuals[0].fields.len(),
-            2,
-            "virtual has two fields"
-        );
+        assert_eq!(rd_virtuals[0].fields.len(), 2, "virtual has two fields");
 
         let fa = guard_op.fail_args.as_ref().unwrap();
         // fa[0] = NONE, fa[1] = field_a value, fa[2] = field_b value
