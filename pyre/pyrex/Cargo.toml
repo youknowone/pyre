@@ -1,7 +1,12 @@
 [package]
-name = "pyre-main"
+name = "pyrex"
 version.workspace = true
 edition.workspace = true
+description = "pyre executable — Python Yet Reforged Entirely"
+
+[[bin]]
+name = "pyre"
+path = "src/main.rs"
 
 [dependencies]
 pyre-object = { workspace = true }
