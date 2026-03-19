@@ -61,8 +61,18 @@ impl OptIntBounds {
         let idx = opref.0 as usize;
         if idx < self.bounds.len() {
             if let Some(ref b) = self.bounds[idx] {
+                // heap.py: merge with cross-pass lower bounds (array lengths)
+                if let Some(&lower) = ctx.int_lower_bounds.get(&opref) {
+                    let mut merged = b.clone();
+                    merged.intersect(&IntBound::bounded(lower, i64::MAX));
+                    return merged;
+                }
                 return b.clone();
             }
+        }
+        // heap.py: check cross-pass lower bounds even without local bound
+        if let Some(&lower) = ctx.int_lower_bounds.get(&opref) {
+            return IntBound::bounded(lower, i64::MAX);
         }
         IntBound::unbounded()
     }

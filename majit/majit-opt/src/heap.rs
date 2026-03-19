@@ -98,6 +98,10 @@ pub struct OptHeap {
     /// heap.py: variable-index array cache.
     /// Key: (array, descr_index, index_opref) → value OpRef.
     cached_arrayitems_var: HashMap<(OpRef, u32, OpRef), OpRef>,
+    /// heap.py: arrayinfo.getlenbound() — minimum known array lengths.
+    /// When GETARRAYITEM_GC with constant index N is seen, the array
+    /// must have length >= N+1. Tracked per array OpRef.
+    array_min_lengths: HashMap<OpRef, i64>,
 }
 
 impl OptHeap {
@@ -118,6 +122,7 @@ impl OptHeap {
             quasi_immut_cache: HashMap::new(),
             cached_arraylens: HashMap::new(),
             cached_arrayitems_var: HashMap::new(),
+            array_min_lengths: HashMap::new(),
         }
     }
 
@@ -268,6 +273,7 @@ impl OptHeap {
             self.cached_fields.clear();
             self.cached_arrayitems.clear();
             self.cached_arrayitems_var.clear();
+        self.array_min_lengths.clear();
         }
 
         // Nullity: allocated objects are permanently non-null.
@@ -410,6 +416,8 @@ impl OptHeap {
             });
             self.cached_arrayitems
                 .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+            self.cached_arrayitems_var
+                .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
             if !self.seen_allocation.is_empty() {
                 self.known_nonnull
                     .retain(|v| self.seen_allocation.contains(v));
@@ -454,6 +462,8 @@ impl OptHeap {
                 self.cached_arrayitems.remove(&(obj, descr_idx, index));
             }
         }
+        self.cached_arrayitems_var
+            .retain(|&(_, descr_idx, _), _| !ei.check_write_descr_array(descr_idx));
 
         // Remaining lazy sets for unaffected fields stay lazy.
         // Nonnull tracking: keep for allocated objects only.
@@ -616,7 +626,21 @@ impl OptHeap {
             }
             self.cached_arrayitems.insert(key, op.pos);
             // heap.py line 701: make_nonnull(op.getarg(0))
-            self.known_nonnull.insert(ctx.get_replacement(op.arg(0)));
+            let array_ref = ctx.get_replacement(op.arg(0));
+            self.known_nonnull.insert(array_ref);
+            // heap.py line 681: arrayinfo.getlenbound(None).make_gt_const(index)
+            // Record that array length >= index + 1
+            let (_, _, const_index) = key;
+            if const_index >= 0 {
+                let min_len = const_index + 1;
+                let entry = self.array_min_lengths.entry(array_ref).or_insert(0);
+                if min_len > *entry {
+                    *entry = min_len;
+                }
+            }
+            if let Some(info) = ctx.get_ptr_info_mut(array_ref) {
+                info.set_item(key.2 as usize, op.pos);
+            }
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -649,6 +673,7 @@ impl OptHeap {
                 self.force_all_lazy_setarrayitems(ctx);
                 self.cached_arrayitems.clear();
                 self.cached_arrayitems_var.clear();
+        self.array_min_lengths.clear();
                 // heap.py: cache_varindex_write — cache this write so that
                 // a subsequent read with the same variable index can hit.
                 if let Some(var_key) = Self::arrayitem_key_variable(op) {
@@ -675,6 +700,9 @@ impl OptHeap {
         // Write-after-write or new lazy set.
         self.lazy_setarrayitems.insert(key, op.clone());
         self.cached_arrayitems.remove(&key);
+        if let Some(info) = ctx.get_ptr_info_mut(ctx.get_replacement(op.arg(0))) {
+            info.set_item(key.2 as usize, new_value);
+        }
         // heap.py: ArrayCachedItem.invalidate() calls parent.clear_varindex()
         // — writing to any constant index invalidates variable-index cache
         // for the same array+descr, since the variable index could match.
@@ -879,12 +907,10 @@ impl Optimization for OptHeap {
             }
 
             // ── Raw field reads/writes ──
-            // These are used by compact storage / virtualizable-like live
-            // state in interpreters such as Aheui. Treating them like normal
-            // heap.py cached fields is unsound here because the state is
-            // intentionally carried outside Jump args and reloaded from heap
-            // each iteration. Caching or lazifying them lets loop-optimizing
-            // passes turn dynamic lengths/indices into stale constants.
+            // Keep these conservative. The standard heap.py cache/postprocess
+            // logic applies to GC field descriptors, while raw field traffic is
+            // used by compatibility seams that intentionally reload state from
+            // memory instead of carrying it through loop args.
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF => {
                 OptimizationResult::Emit(op.clone())
             }
@@ -924,7 +950,7 @@ impl Optimization for OptHeap {
 
             // ── heap.py: ARRAYLEN_GC — cache array lengths ──
             OpCode::ArraylenGc => {
-                let array = op.arg(0);
+                let array = ctx.get_replacement(op.arg(0));
                 let descr_idx = op.descr.as_ref().map(|d| d.index()).unwrap_or(0);
                 if let Some(&cached) = self.cached_arraylens.get(&(array, descr_idx)) {
                     let cached = ctx.get_replacement(cached);
@@ -932,6 +958,14 @@ impl Optimization for OptHeap {
                     return OptimizationResult::Remove;
                 }
                 self.cached_arraylens.insert((array, descr_idx), op.pos);
+                // heap.py: transfer array length bound to the ARRAYLEN result.
+                // intbounds can use this to eliminate length guards.
+                if let Some(&min_len) = self.array_min_lengths.get(&array) {
+                    let entry = ctx.int_lower_bounds.entry(op.pos).or_insert(0);
+                    if min_len > *entry {
+                        *entry = min_len;
+                    }
+                }
                 OptimizationResult::Emit(op.clone())
             }
 
@@ -971,12 +1005,10 @@ impl Optimization for OptHeap {
                 if Self::call_has_random_effects(op) {
                     self.invalidate_caches();
                 } else {
-                    self.cached_fields.retain(|&(obj, descr_idx), _| {
-                        self.immutable_field_descrs.contains(&descr_idx)
-                            || self.unescaped.contains(&obj)
-                    });
-                    self.cached_arrayitems
-                        .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+                    self.force_from_effectinfo(op, ctx);
+                }
+                if Self::call_can_invalidate(op) {
+                    self.seen_guard_not_invalidated = false;
                 }
                 return OptimizationResult::Remove;
             }
@@ -1115,6 +1147,7 @@ impl Optimization for OptHeap {
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
         self.cached_arrayitems_var.clear();
+        self.array_min_lengths.clear();
     }
 
     fn flush(&mut self) {
@@ -1137,6 +1170,7 @@ impl Optimization for OptHeap {
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
         self.cached_arrayitems_var.clear();
+        self.array_min_lengths.clear();
     }
 
     /// heap.py: produce_potential_short_preamble_ops(sb)
@@ -1186,7 +1220,7 @@ mod tests {
     };
 
     use crate::optimizer::Optimizer;
-    use crate::{OptContext, Optimization, OptimizationResult};
+    use crate::{OptContext, Optimization, OptimizationResult, PtrInfo};
 
     use super::OptHeap;
 
@@ -1397,6 +1431,51 @@ mod tests {
         // SETARRAYITEM (forced at Jump) + Jump. GETARRAYITEM eliminated.
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
         assert_eq!(opcodes, vec![OpCode::SetarrayitemGc, OpCode::Jump]);
+    }
+
+    #[test]
+    fn test_getarrayitem_postprocess_updates_ptr_info() {
+        let d = descr(0);
+        let idx = OpRef(50);
+        let mut op = Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone());
+        op.pos = OpRef(200);
+
+        let mut ctx = OptContext::new(256);
+        ctx.make_constant(idx, majit_ir::Value::Int(3));
+        ctx.set_ptr_info(OpRef(100), PtrInfo::virtual_array(d, 8));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Emit(_)));
+        assert_eq!(
+            ctx.get_ptr_info(OpRef(100))
+                .and_then(|info| info.get_item(3)),
+            Some(OpRef(200))
+        );
+    }
+
+    #[test]
+    fn test_setarrayitem_postprocess_updates_ptr_info() {
+        let d = descr(0);
+        let idx = OpRef(50);
+        let op = Op::with_descr(OpCode::SetarrayitemGc, &[OpRef(100), idx, OpRef(101)], d.clone());
+
+        let mut ctx = OptContext::new(256);
+        ctx.make_constant(idx, majit_ir::Value::Int(3));
+        ctx.set_ptr_info(OpRef(100), PtrInfo::virtual_array(d, 8));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert_eq!(
+            ctx.get_ptr_info(OpRef(100))
+                .and_then(|info| info.get_item(3)),
+            Some(OpRef(101))
+        );
     }
 
     // ── Test 7: Guard forces lazy sets ──
@@ -2515,6 +2594,10 @@ mod tests {
         }
     }
 
+    fn call_descr(idx: u32, effect: EffectInfo) -> DescrRef {
+        Arc::new(TestCallDescr { idx, effect })
+    }
+
     fn arraycopy_descr(idx: u32) -> DescrRef {
         Arc::new(TestCallDescr {
             idx,
@@ -2524,6 +2607,203 @@ mod tests {
                 ..Default::default()
             },
         })
+    }
+
+    #[test]
+    fn test_call_may_force_uses_effectinfo_to_keep_unaffected_field_cache() {
+        let d0 = descr(0);
+        let call_d = call_descr(
+            70,
+            EffectInfo {
+                extra_effect: ExtraEffect::CanRaise,
+                write_descrs_fields: 1u64 << 1,
+                ..Default::default()
+            },
+        );
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0.clone()),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "CallMayForce with unrelated write bit should preserve cached GETFIELD"
+        );
+    }
+
+    #[test]
+    fn test_call_may_force_uses_effectinfo_to_invalidate_written_field_cache() {
+        let d0 = descr(0);
+        let call_d = call_descr(
+            71,
+            EffectInfo {
+                extra_effect: ExtraEffect::CanRaise,
+                write_descrs_fields: 1u64 << 0,
+                ..Default::default()
+            },
+        );
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0.clone()),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            get_count, 2,
+            "CallMayForce with matching write bit must invalidate cached GETFIELD"
+        );
+    }
+
+    #[test]
+    fn test_call_may_force_resets_guard_not_invalidated_when_call_can_invalidate() {
+        let call_d = call_descr(
+            72,
+            EffectInfo {
+                extra_effect: ExtraEffect::CanRaise,
+                can_invalidate: true,
+                ..Default::default()
+            },
+        );
+        let mut ops = vec![
+            Op::new(OpCode::GuardNotInvalidated, &[]),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::new(OpCode::GuardNotInvalidated, &[]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        let guard_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GuardNotInvalidated)
+            .count();
+        assert_eq!(
+            guard_count, 2,
+            "CallMayForce that can invalidate must keep the later GuardNotInvalidated"
+        );
+    }
+
+    #[test]
+    fn test_call_may_force_keeps_unaffected_variable_index_array_cache() {
+        let d0 = descr(0);
+        let idx = OpRef(50);
+        let call_d = call_descr(
+            73,
+            EffectInfo {
+                extra_effect: ExtraEffect::CanRaise,
+                write_descrs_arrays: 1u64 << 1,
+                ..Default::default()
+            },
+        );
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d0.clone()),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d0),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let mut ctx = OptContext::new(ops.len() + 64);
+        assign_positions(&mut ops);
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+            }
+        }
+
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "CallMayForce with unrelated array write bit should preserve variable-index cache"
+        );
+    }
+
+    #[test]
+    fn test_call_may_force_invalidates_written_variable_index_array_cache() {
+        let d0 = descr(0);
+        let idx = OpRef(50);
+        let call_d = call_descr(
+            74,
+            EffectInfo {
+                extra_effect: ExtraEffect::CanRaise,
+                write_descrs_arrays: 1u64 << 0,
+                ..Default::default()
+            },
+        );
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d0.clone()),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d0),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let mut ctx = OptContext::new(ops.len() + 64);
+        assign_positions(&mut ops);
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+            }
+        }
+
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 2,
+            "CallMayForce with matching array write bit must invalidate variable-index cache"
+        );
     }
 
     // ── ARRAYCOPY cache invalidation tests ──
