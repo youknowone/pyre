@@ -195,15 +195,38 @@ impl JitCounter {
     }
 
     /// counter.py: lookup_chain(hash)
-    /// Look up the counter entry for a hash. Returns the current count.
+    /// Look up the JitCell chain head for this hash bucket.
+    /// Returns the current count (simplified — no cell chain yet).
     pub fn lookup_chain(&self, hash: u64) -> u32 {
         self.get(hash)
     }
 
     /// counter.py: cleanup_chain(hash)
-    /// Reset and remove the counter for a hash.
+    /// Reset counter and clean up the cell chain for this hash.
     pub fn cleanup_chain(&mut self, hash: u64) {
         self.reset(hash);
+    }
+
+    /// counter.py: install_new_cell(hash, newcell)
+    ///
+    /// Walk the linked list at celltable[index], remove dead cells
+    /// (should_remove_jitcell), and prepend the new cell.
+    /// In our implementation, this is a no-op since we use WarmEnterState's
+    /// HashMap<u64, BaseJitCell> instead of a per-bucket chain.
+    /// The method exists for API parity.
+    pub fn install_new_cell(&mut self, _hash: u64) {
+        // In RPython, celltable is a parallel array of JitCell linked lists.
+        // In majit, WarmEnterState.cells HashMap handles this directly.
+    }
+
+    /// counter.py: _get_index(hash) — hash to bucket index.
+    fn get_index(&self, hash: u64) -> usize {
+        (hash as usize) & TABLE_MASK
+    }
+
+    /// counter.py: _get_subhash(hash) — lower 16 bits for associative match.
+    fn get_subhash(hash: u64) -> u16 {
+        (hash & 0xFFFF) as u16
     }
 }
 
