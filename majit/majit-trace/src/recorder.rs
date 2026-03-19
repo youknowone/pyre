@@ -453,7 +453,7 @@ mod tests {
 
         // Record operations up to the limit
         let mut last = i0;
-        for _ in 0..TRACE_LIMIT {
+        for _ in 0..DEFAULT_TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(rec.is_too_long());
@@ -463,23 +463,26 @@ mod tests {
 
     #[test]
     fn test_is_too_long_boundary() {
-        // Verify exact boundary: TRACE_LIMIT-1 ops is not too long,
-        // TRACE_LIMIT ops is too long.
+        // Verify exact boundary: DEFAULT_TRACE_LIMIT-1 ops is not too long,
+        // DEFAULT_TRACE_LIMIT ops is too long.
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
-        for _ in 0..(TRACE_LIMIT - 1) {
+        for _ in 0..(DEFAULT_TRACE_LIMIT - 1) {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(
             !rec.is_too_long(),
-            "TRACE_LIMIT - 1 ops should not be too long"
+            "DEFAULT_TRACE_LIMIT - 1 ops should not be too long"
         );
 
         // One more op pushes it to the limit.
         let _over = rec.record_op(OpCode::IntAdd, &[last, i0]);
-        assert!(rec.is_too_long(), "TRACE_LIMIT ops should be too long");
+        assert!(
+            rec.is_too_long(),
+            "DEFAULT_TRACE_LIMIT ops should be too long"
+        );
     }
 
     #[test]
@@ -490,7 +493,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
-        for _ in 0..TRACE_LIMIT {
+        for _ in 0..DEFAULT_TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(rec.is_too_long());
@@ -509,17 +512,17 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
-        for _ in 0..(TRACE_LIMIT + 100) {
+        for _ in 0..(DEFAULT_TRACE_LIMIT + 100) {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(rec.is_too_long());
-        assert_eq!(rec.num_ops(), TRACE_LIMIT + 100);
+        assert_eq!(rec.num_ops(), DEFAULT_TRACE_LIMIT + 100);
 
         // Can still finalize if we want to (the limit is advisory).
         rec.close_loop(&[last]);
         let trace = rec.get_trace();
         // The trace contains all ops, including those beyond the limit.
-        assert!(trace.num_ops() > TRACE_LIMIT);
+        assert!(trace.num_ops() > DEFAULT_TRACE_LIMIT);
     }
 
     #[test]
@@ -1128,7 +1131,7 @@ mod tests {
             op_count: 1,
             finalized: true,
             aborted: true,
-            trace_limit: TRACE_LIMIT,
+            trace_limit: DEFAULT_TRACE_LIMIT,
         };
         rec3.get_trace(); // should panic
     }
@@ -1283,7 +1286,7 @@ mod tests {
 
         // Fill rec_b past the limit
         let mut last_b = b0;
-        for _ in 0..TRACE_LIMIT {
+        for _ in 0..DEFAULT_TRACE_LIMIT {
             last_b = rec_b.record_op(OpCode::IntAdd, &[last_b, b0]);
         }
         assert!(rec_b.is_too_long());
@@ -1304,13 +1307,13 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
-        for idx in 0..(TRACE_LIMIT / 2) {
+        for idx in 0..(DEFAULT_TRACE_LIMIT / 2) {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
             let descr = make_fail_descr(idx as u32);
             rec.record_guard(OpCode::GuardTrue, &[last], descr);
         }
 
-        // Each iteration adds 2 ops (IntAdd + GuardTrue), total = TRACE_LIMIT
+        // Each iteration adds 2 ops (IntAdd + GuardTrue), total = DEFAULT_TRACE_LIMIT
         assert!(
             rec.is_too_long(),
             "guards should count toward trace limit: num_ops={}",
@@ -1327,20 +1330,20 @@ mod tests {
         assert!(!rec.is_too_long());
         assert_eq!(rec.num_ops(), 0);
 
-        // The retrace recorder can record up to TRACE_LIMIT ops
+        // The retrace recorder can record up to DEFAULT_TRACE_LIMIT ops
         let mut last = OpRef(0);
-        for _ in 0..(TRACE_LIMIT - 1) {
+        for _ in 0..(DEFAULT_TRACE_LIMIT - 1) {
             last = rec.record_op(OpCode::IntAdd, &[last, OpRef(1)]);
         }
         assert!(
             !rec.is_too_long(),
-            "retrace with TRACE_LIMIT-1 ops should not be too long"
+            "retrace with DEFAULT_TRACE_LIMIT-1 ops should not be too long"
         );
 
         let _ = rec.record_op(OpCode::IntAdd, &[last, OpRef(1)]);
         assert!(
             rec.is_too_long(),
-            "retrace with TRACE_LIMIT ops should be too long"
+            "retrace with DEFAULT_TRACE_LIMIT ops should be too long"
         );
     }
 
@@ -1356,7 +1359,7 @@ mod tests {
 
         let i0 = OpRef(0);
         let mut last = i0;
-        for _ in 0..TRACE_LIMIT {
+        for _ in 0..DEFAULT_TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(rec.is_too_long());
