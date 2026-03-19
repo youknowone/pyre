@@ -32,7 +32,7 @@ members = [
     "pyre/pyre-bytecode",
     "pyre/pyre-interp",
     "pyre/pyre-jit",
-    "pyre/pyre-main",
+    "pyre/pyrex",
 ]
 
 [workspace.dependencies]
