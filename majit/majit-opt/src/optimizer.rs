@@ -586,8 +586,15 @@ impl Optimizer {
 
     fn drain_extra_operations_from(&mut self, start_pass: usize, ctx: &mut OptContext) {
         let end_pass = self.extra_operation_end_pass();
+        let mut pending = std::collections::VecDeque::new();
         while let Some(op) = ctx.pop_extra_operation() {
+            pending.push_back(op);
+        }
+        while let Some(op) = pending.pop_front() {
             self.propagate_from_pass_range(start_pass, end_pass, &op, ctx);
+            while let Some(child) = ctx.pop_extra_operation() {
+                pending.push_front(child);
+            }
         }
     }
 
@@ -770,8 +777,30 @@ impl Optimizer {
             }
         }
 
-        for extra in extra_fail_args {
-            fail_args.push(extra);
+        if !extra_fail_args.is_empty() {
+            // RPython parity: store_final_boxes_in_guard creates a new
+            // ResumeGuardDescr with updated fail_arg_types matching the
+            // expanded fail_args. We must update the descriptor's types
+            // to include the extra field values.
+            if let Some(ref descr) = op.descr {
+                if let Some(fd) = descr.as_fail_descr() {
+                    let mut types = fd.fail_arg_types().to_vec();
+                    // Extra fail_args are field values — all Int for now
+                    // (W_Int fields are vtable ptr and int value).
+                    for _ in 0..extra_fail_args.len() {
+                        types.push(majit_ir::Type::Int);
+                    }
+                    let new_descr = majit_ir::SimpleFailDescr::new(
+                        descr.index(),
+                        fd.fail_index(),
+                        types,
+                    );
+                    op.descr = Some(std::sync::Arc::new(new_descr));
+                }
+            }
+            for extra in extra_fail_args {
+                fail_args.push(extra);
+            }
         }
 
         if !virtual_entries.is_empty() {
@@ -1070,6 +1099,76 @@ mod tests {
             "SetfieldGc should target the emitted New, not an unrolled-only ref; got {:?}",
             result
         );
+    }
+
+    struct QueueTwoForceLikePairs {
+        queued: bool,
+        field_descr: majit_ir::DescrRef,
+    }
+
+    impl Optimization for QueueTwoForceLikePairs {
+        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+            if !self.queued && op.opcode == OpCode::IntAdd {
+                self.queued = true;
+
+                let alloc_a = ctx.emit_through_passes(Op::new(OpCode::New, &[]));
+                let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a, OpRef(0)]);
+                set_a.descr = Some(self.field_descr.clone());
+                ctx.emit_through_passes(set_a);
+
+                let alloc_b = ctx.emit_through_passes(Op::new(OpCode::New, &[]));
+                let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b, OpRef(1)]);
+                set_b.descr = Some(self.field_descr.clone());
+                ctx.emit_through_passes(set_b);
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "queue_two_force_like_pairs"
+        }
+    }
+
+    #[test]
+    fn test_force_like_extra_ops_preserve_new_before_matching_setfield() {
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(QueueTwoForceLikePairs {
+            queued: false,
+            field_descr: std::sync::Arc::new(TestDescr(7)),
+        }));
+        opt.add_pass(Box::new(OptHeap::new()));
+
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
+        ];
+        ops[0].pos = OpRef(2);
+        ops[1].pos = OpRef(3);
+
+        let mut constants = std::collections::HashMap::new();
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        let op_index: std::collections::HashMap<_, _> = result
+            .iter()
+            .enumerate()
+            .map(|(idx, op)| (op.pos, idx))
+            .collect();
+
+        for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
+            let alloc_ref = set_op.arg(0);
+            let new_idx = result
+                .iter()
+                .position(|op| op.opcode == OpCode::New && op.pos == alloc_ref)
+                .unwrap_or_else(|| panic!("missing New for {alloc_ref:?} in {result:?}"));
+            let set_idx = *op_index
+                .get(&set_op.pos)
+                .unwrap_or_else(|| panic!("missing setfield pos {:?} in {:?}", set_op.pos, result));
+            assert!(
+                new_idx < set_idx,
+                "matching New must appear before SetfieldGc; got {:?}",
+                result
+            );
+        }
     }
 
     #[test]
