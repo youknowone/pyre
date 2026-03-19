@@ -1010,6 +1010,41 @@ impl FailDescr for SimpleFailDescr {
     }
 }
 
+/// effectinfo.py: CallInfoCollection — maps oopspec indices to
+/// (calldescr, func_ptr) pairs. Used to look up the implementation
+/// of special-cased operations (arraycopy, string ops, etc.).
+#[derive(Debug, Clone, Default)]
+pub struct CallInfoCollection {
+    /// Maps OopSpecIndex → (descriptor_ref, function_address).
+    entries: std::collections::HashMap<OopSpecIndex, (DescrRef, u64)>,
+}
+
+impl CallInfoCollection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// effectinfo.py: add(oopspecindex, calldescr, func_as_int)
+    pub fn add(&mut self, oopspec: OopSpecIndex, calldescr: DescrRef, func_addr: u64) {
+        self.entries.insert(oopspec, (calldescr, func_addr));
+    }
+
+    /// effectinfo.py: has_oopspec(oopspecindex)
+    pub fn has_oopspec(&self, oopspec: OopSpecIndex) -> bool {
+        self.entries.contains_key(&oopspec)
+    }
+
+    /// Get the calldescr for an oopspec.
+    pub fn get(&self, oopspec: OopSpecIndex) -> Option<&(DescrRef, u64)> {
+        self.entries.get(&oopspec)
+    }
+
+    /// effectinfo.py: all_function_addresses_as_int()
+    pub fn all_function_addresses(&self) -> Vec<u64> {
+        self.entries.values().map(|(_, addr)| *addr).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
