@@ -161,6 +161,12 @@ impl OptVirtualize {
             .is_some_and(|info| info.is_virtual())
     }
 
+    fn is_standard_virtualizable_ref(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        self.vable_config.is_some()
+            && opref == ctx.get_replacement(OpRef(0))
+            && matches!(ctx.get_ptr_info(opref), Some(PtrInfo::Virtualizable(_)))
+    }
+
     /// Apply deferred virtualizable setup if needed.
     /// Skips if OpRef(0) already has PtrInfo (e.g. tests pre-populate).
     fn ensure_vable_setup(&mut self, ctx: &mut OptContext) {
@@ -201,7 +207,13 @@ impl OptVirtualize {
                 self.force_virtual_array_struct(resolved, vinfo, ctx)
             }
             PtrInfo::VirtualRawBuffer(vinfo) => self.force_virtual_raw_buffer(resolved, vinfo, ctx),
-            PtrInfo::Virtualizable(vinfo) => self.force_virtualizable(resolved, vinfo, ctx),
+            PtrInfo::Virtualizable(vinfo) => {
+                if self.is_standard_virtualizable_ref(resolved, ctx) {
+                    resolved
+                } else {
+                    self.force_virtualizable(resolved, vinfo, ctx)
+                }
+            }
             _ => resolved,
         }
     }
@@ -576,6 +588,11 @@ impl OptVirtualize {
         let struct_ref = ctx.get_replacement(op.arg(0));
         let value_ref = ctx.get_replacement(op.arg(1));
         let field_idx = descr_index(&op.descr);
+        let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
+
+        if is_raw_op && self.is_standard_virtualizable_ref(struct_ref, ctx) {
+            return OptimizationResult::PassOn;
+        }
 
         if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
             if info.is_virtual() {
@@ -612,6 +629,14 @@ impl OptVirtualize {
     fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_replacement(op.arg(0));
         let field_idx = descr_index(&op.descr);
+        let is_raw_op = matches!(
+            op.opcode,
+            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
+        );
+
+        if is_raw_op && self.is_standard_virtualizable_ref(struct_ref, ctx) {
+            return OptimizationResult::PassOn;
+        }
 
         if let Some(info) = ctx.get_ptr_info(struct_ref).cloned() {
             let field_val = match &info {
@@ -932,18 +957,12 @@ impl OptVirtualize {
     ///   - If a field value is itself virtual, force it (no recursive encoding yet)
     ///
     /// Non-virtual fail_args are resolved normally.
-    /// Force virtual references in guard fail_args and re-resolve all args.
+    /// Resolve guard fail_args without forcing virtuals.
     ///
-    /// TODO: when encode_guard_virtuals in optimizer.rs is enabled, this
-    /// method should skip forcing and let the optimizer handle encoding.
-    /// Currently forces all virtuals for backend compatibility.
+    /// RPython parity: virtualize.py does NOT force virtuals in fail_args.
+    /// Virtual encoding is handled by optimizer.rs encode_guard_virtuals
+    /// (store_final_boxes_in_guard equivalent) at emit time.
     fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        if let Some(ref fail_args) = op.fail_args {
-            for &fa in fail_args {
-                let resolved = ctx.get_replacement(fa);
-                self.force_virtual(resolved, ctx);
-            }
-        }
         let mut guard_op = op.clone();
         if let Some(ref mut fa) = guard_op.fail_args {
             for arg in fa.iter_mut() {
@@ -1577,28 +1596,12 @@ impl Optimization for OptVirtualize {
                     self.force_virtual(arg, ctx);
                 }
 
-                // Guards: force virtual fail_args (encode_guard_virtuals in
-                // optimizer.rs will handle rd_virtuals encoding when enabled)
+                // Guards: don't force fail_args virtuals — encode_guard_virtuals
+                // in optimizer.rs handles virtual encoding at emit time.
+                // RPython parity: virtualize.py does not force fail_args.
                 if is_guard {
                     let mut guard_op = op.clone();
 
-                    if let Some(ref fail_args) = guard_op.fail_args {
-                        for &fa in fail_args {
-                            let resolved = ctx.get_replacement(fa);
-                            if self.vable_config.is_some()
-                                && resolved == ctx.get_replacement(OpRef(0))
-                                && matches!(
-                                    ctx.get_ptr_info(resolved),
-                                    Some(PtrInfo::Virtualizable(_))
-                                )
-                            {
-                                continue;
-                            }
-                            self.force_virtual(resolved, ctx);
-                        }
-                    }
-
-                    // Re-resolve op args and fail_args
                     for arg in &mut guard_op.args {
                         *arg = ctx.get_replacement(*arg);
                     }
@@ -1924,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn test_force_virtualizable_materializes_uninitialized_ref_array_slots_as_null_refs() {
+    fn test_standard_virtualizable_force_is_noop_in_optimizer() {
         let mut ctx = OptContext::with_num_inputs(8, 1);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
@@ -1943,17 +1946,12 @@ mod tests {
             }),
         );
 
-        let _ = pass.force_virtual(OpRef(0), &mut ctx);
+        let forced = pass.force_virtual(OpRef(0), &mut ctx);
         ctx.flush_extra_operations_raw();
-        let setarray = ctx
-            .new_operations
-            .iter()
-            .find(|op| op.opcode == OpCode::SetarrayitemRaw)
-            .expect("forcing virtualizable should emit SetarrayitemRaw");
-        assert!(!setarray.arg(2).is_none());
-        assert_eq!(
-            ctx.get_constant_box(setarray.arg(2)),
-            Some(Value::Ref(majit_ir::GcRef::NULL))
+        assert_eq!(forced, OpRef(0));
+        assert!(
+            ctx.new_operations.is_empty(),
+            "standard virtualizable should not be forced to raw heap ops by optimizer"
         );
     }
 
@@ -2169,6 +2167,45 @@ mod tests {
                 .all(|op| op.opcode != OpCode::SetfieldRaw),
             "standard virtualizable call should not force frame writeback"
         );
+    }
+
+    #[test]
+    fn test_standard_virtualizable_raw_getfield_is_not_absorbed_by_optimizer() {
+        let mut ctx = OptContext::with_num_inputs(8, 2);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![8],
+            static_field_types: vec![Type::Int],
+            array_field_offsets: vec![],
+            array_item_types: vec![],
+            array_lengths: vec![],
+        });
+        pass.setup();
+
+        let mut get = Op::new(OpCode::GetfieldRawI, &[OpRef(0)]);
+        get.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
+        get.pos = OpRef(10);
+
+        let result = pass.propagate_forward(&get, &mut ctx);
+        assert!(matches!(result, OptimizationResult::PassOn));
+    }
+
+    #[test]
+    fn test_standard_virtualizable_raw_setfield_is_not_absorbed_by_optimizer() {
+        let mut ctx = OptContext::with_num_inputs(8, 2);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![8],
+            static_field_types: vec![Type::Int],
+            array_field_offsets: vec![],
+            array_item_types: vec![],
+            array_lengths: vec![],
+        });
+        pass.setup();
+
+        let mut set = Op::new(OpCode::SetfieldRaw, &[OpRef(0), OpRef(1)]);
+        set.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
+
+        let result = pass.propagate_forward(&set, &mut ctx);
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     #[test]

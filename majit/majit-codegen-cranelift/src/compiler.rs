@@ -3312,9 +3312,11 @@ fn infer_fail_arg_types(
     let mut fail_arg_types = Vec::with_capacity(fail_arg_refs.len());
     for &opref in fail_arg_refs {
         if opref.is_none() {
-            return Err(BackendError::Unsupported(
-                "guard/finish fail args cannot contain OpRef::NONE".to_string(),
-            ));
+            // resume.py parity: OpRef::NONE marks a virtual object slot
+            // in fail_args. The backend stores 0 in this slot; the actual
+            // value is reconstructed from rd_virtuals on guard failure.
+            fail_arg_types.push(Type::Int);
+            continue;
         }
         // Backend constant slots are currently integer-only. If a fail arg
         // doesn't correspond to an input arg or operation result, treat it as
