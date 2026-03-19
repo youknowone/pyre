@@ -26,13 +26,17 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
 
 /// Generate JitState types for storage-pool mode (existing behaviour).
 fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
+    let storage = config
+        .storage
+        .as_ref()
+        .expect("storage config required in storage mode");
     let state_type = &config.state_type;
     let env_type = &config.env_type;
-    let pool_field = extract_field_member(&config.storage.pool);
-    let sel_field = extract_field_member(&config.storage.selector);
-    let untraceable = &config.storage.untraceable;
-    let scan_fn = &config.storage.scan_fn;
-    let can_trace_guard = &config.storage.can_trace_guard;
+    let pool_field = extract_field_member(&storage.pool);
+    let sel_field = extract_field_member(&storage.selector);
+    let untraceable = &storage.untraceable;
+    let scan_fn = &storage.scan_fn;
+    let can_trace_guard = &storage.can_trace_guard;
     let extra_guard = if let Some(method) = can_trace_guard {
         quote! { && self.#pool_field.#method() }
     } else {
@@ -677,12 +681,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .collect();
 
     quote! {
-        /// Dummy storage pool for state_fields mode.
-        /// The trace function signature requires a storage reference, but
-        /// state_fields mode uses load/store_state_field ops instead.
-        #[allow(non_camel_case_types)]
-        struct __DummyPool;
-
         /// Compiled loop metadata for state_fields mode: flattened array lengths at trace start.
         #[derive(Clone)]
         #[allow(non_camel_case_types)]
