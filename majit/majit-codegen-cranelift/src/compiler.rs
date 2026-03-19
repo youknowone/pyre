@@ -3708,6 +3708,18 @@ impl CraneliftBackend {
         // otherwise num_inputs (backwards compatible).
         let loop_param_count = label_idx.map(|li| ops[li].args.len()).unwrap_or(num_inputs);
 
+        // Declare extra variables for Label args beyond num_inputs.
+        // This handles depth growth in virtualizable storage loops where
+        // Jump args > InputArgs (RPython parity: preamble peeling bridges the gap).
+        if loop_param_count > num_inputs {
+            for i in num_inputs..loop_param_count {
+                if !declared_vars.contains(&(i as u32)) {
+                    builder.declare_var(var(i as u32), cl_types::I64);
+                    declared_vars.insert(i as u32);
+                }
+            }
+        }
+
         // Loop header block
         let loop_block = builder.create_block();
         for _ in 0..loop_param_count {
@@ -3722,12 +3734,21 @@ impl CraneliftBackend {
 
         // If no Label, jump entry -> loop immediately (old behavior)
         if label_idx.is_none() {
-            let vals: Vec<CValue> = (0..num_inputs)
-                .map(|i| builder.use_var(var(i as u32)))
+            let zero = builder.ins().iconst(cl_types::I64, 0);
+            let vals: Vec<CValue> = (0..loop_param_count)
+                .map(|i| {
+                    if i < num_inputs {
+                        builder.use_var(var(i as u32))
+                    } else {
+                        // Extra params from depth growth: initialize to 0.
+                        // First iteration will set them via the loop body.
+                        zero
+                    }
+                })
                 .collect();
             builder.ins().jump(loop_block, &vals);
             builder.switch_to_block(loop_block);
-            for i in 0..num_inputs {
+            for i in 0..loop_param_count {
                 let param = builder.block_params(loop_block)[i];
                 builder.def_var(var(i as u32), param);
             }

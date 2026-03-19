@@ -288,10 +288,18 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             #vable_info_fn
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
-                // RPython parity: virtualizable arrays may change depth.
-                // Only check selected matches. Depth differences are handled
-                // by the optimizer's preamble peeling (OptUnroll).
                 sym.current_selected == meta.initial_selected
+                    && sym.storage_layout.len() == meta.storage_layout.len()
+                    && sym
+                        .storage_layout
+                        .iter()
+                        .zip(meta.storage_layout.iter())
+                        .all(|(&(sym_idx, _), &(meta_idx, _))| sym_idx == meta_idx)
+                    && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
+                        sym.stacks
+                            .get(&sidx)
+                            .is_some_and(|stack| stack.len() == initial_depth)
+                    })
             }
         }
     }
