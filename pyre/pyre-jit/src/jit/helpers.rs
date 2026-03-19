@@ -382,6 +382,30 @@ pub trait TraceHelperAccess {
     }
 }
 
+/// Emit inline W_Int creation (New + SetfieldGc) instead of CallI.
+///
+/// This allows the optimizer to virtualize the W_Int allocation:
+/// if the intval field is read back later, the optimizer returns
+/// the original raw int directly without allocating.
+pub fn emit_box_int_inline(
+    ctx: &mut TraceCtx,
+    raw_int: OpRef,
+    size_descr: majit_ir::DescrRef,
+    ob_type_descr: majit_ir::DescrRef,
+    intval_descr: majit_ir::DescrRef,
+    int_type_addr: i64,
+) -> OpRef {
+    use crate::jit::descr::w_int_size_descr;
+    // Emit: v = New(W_Int)
+    let new_op = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    // Emit: SetfieldGc(v, ob_type, INT_TYPE)
+    let type_const = ctx.const_int(int_type_addr);
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
+    // Emit: SetfieldGc(v, intval, raw_int)
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_int], intval_descr);
+    new_op
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
