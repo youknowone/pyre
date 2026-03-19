@@ -170,26 +170,32 @@ pub(crate) fn frame_namespace_ptr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_namespace_descr())
 }
 
+/// Read from frame's locals_cells_stack_w array.
+/// Uses GcR (Ref-typed) to match RPython's GETARRAYITEM_GC_R,
+/// ensuring the optimizer knows these are boxed pointers.
 pub(crate) fn trace_array_getitem_value(ctx: &mut TraceCtx, array: OpRef, index: OpRef) -> OpRef {
     ctx.record_op_with_descr(
-        OpCode::GetarrayitemRawI,
+        OpCode::GetarrayitemGcR,
         &[array, index],
         pyobject_array_descr(),
     )
 }
 
+/// Read from frame's locals_cells_stack_w — namespace access path.
 pub(crate) fn trace_raw_array_getitem_value(
     ctx: &mut TraceCtx,
     array: OpRef,
     index: OpRef,
 ) -> OpRef {
     ctx.record_op_with_descr(
-        OpCode::GetarrayitemRawI,
+        OpCode::GetarrayitemGcR,
         &[array, index],
         pyobject_array_descr(),
     )
 }
 
+/// Write to frame's locals_cells_stack_w array.
+/// Uses Gc (GC-typed) to match RPython's SETARRAYITEM_GC.
 pub(crate) fn trace_raw_array_setitem_value(
     ctx: &mut TraceCtx,
     array: OpRef,
@@ -197,7 +203,7 @@ pub(crate) fn trace_raw_array_setitem_value(
     value: OpRef,
 ) {
     ctx.record_op_with_descr(
-        OpCode::SetarrayitemRaw,
+        OpCode::SetarrayitemGc,
         &[array, index, value],
         pyobject_array_descr(),
     );
@@ -1793,7 +1799,7 @@ impl TraceFrameState {
                                     for i in 0..callee_nlocals {
                                         let idx = ctx.const_int(i as i64);
                                         let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemRawI,
+                                            OpCode::GetarrayitemGcR,
                                             &[callee_arr, idx],
                                             pyobject_array_descr(),
                                         );
@@ -1802,7 +1808,7 @@ impl TraceFrameState {
                                     for i in 0..callee_stack_only {
                                         let idx = ctx.const_int((callee_nlocals + i) as i64);
                                         let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemRawI,
+                                            OpCode::GetarrayitemGcR,
                                             &[callee_arr, idx],
                                             pyobject_array_descr(),
                                         );
@@ -1943,7 +1949,7 @@ impl TraceFrameState {
                                     for i in 0..callee_nlocals {
                                         let idx = ctx.const_int(i as i64);
                                         let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemRawI,
+                                            OpCode::GetarrayitemGcR,
                                             &[callee_arr, idx],
                                             pyobject_array_descr(),
                                         );
@@ -1952,7 +1958,7 @@ impl TraceFrameState {
                                     for i in 0..callee_stack_only {
                                         let idx = ctx.const_int((callee_nlocals + i) as i64);
                                         let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemRawI,
+                                            OpCode::GetarrayitemGcR,
                                             &[callee_arr, idx],
                                             pyobject_array_descr(),
                                         );
