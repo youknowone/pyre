@@ -176,7 +176,23 @@ impl UnrollOptimizer {
         constants: &mut std::collections::HashMap<u32, i64>,
         num_inputs: usize,
     ) -> (Vec<Op>, usize) {
-        let mut optimizer = crate::optimizer::Optimizer::default_pipeline();
+        self.optimize_trace_with_constants_and_inputs_vable(ops, constants, num_inputs, None)
+    }
+
+    /// compile.py: compile_loop with optional virtualizable config.
+    /// When vable_config is Some, OptVirtualize tracks frame field accesses.
+    pub fn optimize_trace_with_constants_and_inputs_vable(
+        &mut self,
+        ops: &[Op],
+        constants: &mut std::collections::HashMap<u32, i64>,
+        num_inputs: usize,
+        vable_config: Option<crate::virtualize::VirtualizableConfig>,
+    ) -> (Vec<Op>, usize) {
+        let mut optimizer = if let Some(config) = vable_config {
+            crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config)
+        } else {
+            crate::optimizer::Optimizer::default_pipeline()
+        };
         optimizer.add_pass(Box::new(OptUnroll::new()));
         let result = optimizer.optimize_with_constants_and_inputs(ops, constants, num_inputs);
         let final_num_inputs = optimizer.final_num_inputs();

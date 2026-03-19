@@ -1196,11 +1196,28 @@ impl<M: Clone> MetaInterp<M> {
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
         let mut unroll_opt = majit_opt::unroll::UnrollOptimizer::new();
+
+        // RPython virtualizable.py: if interpreter has a virtualizable,
+        // pass its config to OptVirtualize so it can track field accesses.
+        // TODO: VirtualizableConfig causes OptVirtualize to mishandle traces.
+        // Disabled until the storage pool → frame field mapping is correct.
+        let _vinfo_unused = &self.virtualizable_info;
+        let vable_config: Option<majit_opt::virtualize::VirtualizableConfig> = None;
+        let _vable_config_todo = self.virtualizable_info.as_ref().map(|vinfo| {
+            majit_opt::virtualize::VirtualizableConfig {
+                static_field_offsets: vinfo.static_fields.iter().map(|f| f.offset).collect(),
+                static_field_types: vinfo.static_fields.iter().map(|f| f.field_type).collect(),
+                array_field_offsets: vinfo.array_fields.iter().map(|a| a.field_offset).collect(),
+                array_item_types: vinfo.array_fields.iter().map(|a| a.item_type).collect(),
+            }
+        });
+
         let (optimized_ops, final_num_inputs) =
-            unroll_opt.optimize_trace_with_constants_and_inputs(
+            unroll_opt.optimize_trace_with_constants_and_inputs_vable(
                 &trace.ops,
                 &mut constants,
                 trace.inputargs.len(),
+                vable_config,
             );
         let num_ops_after = optimized_ops.len();
 
