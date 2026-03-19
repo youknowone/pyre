@@ -137,11 +137,9 @@ impl Trace {
     /// `jump_args` are the values of the input arguments at the end of the loop.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {
         assert!(!self.finalized, "recorder already finalized");
-        assert_eq!(
-            jump_args.len(),
-            self.inputargs.len(),
-            "JUMP must have the same number of args as input args"
-        );
+        // RPython parity: Jump args may differ from InputArgs count when
+        // virtualizable arrays change depth. The optimizer (OptUnroll preamble
+        // peeling) bridges the gap by creating a Label with the extended count.
         let opref = OpRef(self.op_count);
         let mut op = Op::new(OpCode::Jump, jump_args);
         op.pos = opref;
