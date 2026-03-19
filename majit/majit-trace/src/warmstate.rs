@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use majit_codegen::JitCellToken;
+use majit_ir::Type;
 
 use crate::counter::JitCounter;
 use crate::logger::Logger;
@@ -530,9 +531,9 @@ impl WarmEnterState {
     ///
     /// Creates a new Trace for retracing, similar to starting a
     /// fresh trace but from a guard's failure inputs.
-    pub fn start_retrace(&mut self, num_inputs: usize) -> Trace {
+    pub fn start_retrace(&mut self, input_types: &[Type]) -> Trace {
         self.reset_function_counts();
-        Trace::with_num_inputs_and_limit(num_inputs, self.trace_limit as usize)
+        Trace::with_input_types_and_limit(input_types, self.trace_limit as usize)
     }
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
@@ -1333,6 +1334,16 @@ mod tests {
         assert!(!ws.should_compile_bridge(199));
         assert!(ws.should_compile_bridge(200));
         assert!(ws.should_compile_bridge(300));
+    }
+
+    #[test]
+    fn test_start_retrace_preserves_input_types() {
+        let mut ws = WarmEnterState::new(3);
+        let mut recorder = ws.start_retrace(&[Type::Ref, Type::Int, Type::Float]);
+        recorder.close_loop(&[majit_ir::OpRef(0), majit_ir::OpRef(1), majit_ir::OpRef(2)]);
+        let trace = recorder.get_trace();
+        let input_types: Vec<Type> = trace.inputargs.iter().map(|arg| arg.tp).collect();
+        assert_eq!(input_types, vec![Type::Ref, Type::Int, Type::Float]);
     }
 
     // ── Quasi-immutable invalidation tests ──

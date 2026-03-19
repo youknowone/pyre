@@ -1166,7 +1166,11 @@ impl Optimization for OptRewrite {
                 // rewrite.py: optimize_GUARD_CLASS
                 // If the class is already known, check match → Remove or abort.
                 let obj = ctx.get_replacement(op.arg(0));
-                if let Some(known_class) = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class()).cloned() {
+                if let Some(known_class) = ctx
+                    .get_ptr_info(obj)
+                    .and_then(|i| i.get_known_class())
+                    .cloned()
+                {
                     if op.num_args() >= 2 {
                         if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
                             if known_class.0 as i64 == expected {
@@ -1196,7 +1200,11 @@ impl Optimization for OptRewrite {
                 // GUARD_NONNULL_CLASS(obj, cls): combines GUARD_NONNULL + GUARD_CLASS.
                 let obj = ctx.get_replacement(op.arg(0));
                 // If already known class, check match.
-                if let Some(known_class) = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class()).cloned() {
+                if let Some(known_class) = ctx
+                    .get_ptr_info(obj)
+                    .and_then(|i| i.get_known_class())
+                    .cloned()
+                {
                     if op.num_args() >= 2 {
                         if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
                             if known_class.0 as i64 == expected {

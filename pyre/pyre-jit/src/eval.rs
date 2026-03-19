@@ -158,9 +158,6 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
         // pypyjitdriver.jit_merge_point(ec=ec, frame=self, next_instr=next_instr,
         //     pycode=pycode, is_being_profiled=is_being_profiled)
-        //
-        // PyPy interp_jit.py:89 — promote(valuestackdepth) immediately after.
-        // self.valuestackdepth = hint(self.valuestackdepth, promote=True)
         if JIT_CALL_DEPTH.with(|d| d.get()) == 0 && driver.is_tracing() {
             JIT_TRACING.with(|t| t.set(true));
             let pc = frame.next_instr;
@@ -179,7 +176,6 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             StepResult::Continue => {}
             StepResult::CloseLoop(_) => {
                 let mut jit_state = build_jit_state(frame, info);
-                // sync_before auto-sets array lengths from JitState.
                 if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
                     frame.code as u64,
                     frame.next_instr,
@@ -210,11 +206,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         let env = PyreEnv;
         let mut jit_state = build_jit_state(frame, info);
         // sync_before auto-sets array lengths from JitState.
-        if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
-            green_key,
-            frame.next_instr,
-            &mut jit_state,
-            &env,
+                    if let Some(outcome) = driver.can_enter_jit_keyed(
+                        green_key,
+                        frame.next_instr,
+                        &mut jit_state,
+                        &env,
             || {},
         ) {
             if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {

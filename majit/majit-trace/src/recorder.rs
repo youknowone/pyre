@@ -58,9 +58,21 @@ impl Trace {
     /// Create a trace recorder pre-configured for retracing from a guard
     /// with an explicit trace limit.
     pub fn with_num_inputs_and_limit(num_inputs: usize, trace_limit: usize) -> Self {
+        Self::with_input_types_and_limit(&vec![Type::Int; num_inputs], trace_limit)
+    }
+
+    /// Create a trace recorder pre-configured for retracing from a guard
+    /// with explicit input arg types.
+    pub fn with_input_types(input_types: &[Type]) -> Self {
+        Self::with_input_types_and_limit(input_types, DEFAULT_TRACE_LIMIT)
+    }
+
+    /// Create a trace recorder pre-configured for retracing from a guard
+    /// with explicit input arg types and an explicit trace limit.
+    pub fn with_input_types_and_limit(input_types: &[Type], trace_limit: usize) -> Self {
         let mut recorder = Self::with_limit(trace_limit);
-        for _ in 0..num_inputs {
-            recorder.record_input_arg(Type::Int);
+        for tp in input_types {
+            recorder.record_input_arg(*tp);
         }
         recorder
     }

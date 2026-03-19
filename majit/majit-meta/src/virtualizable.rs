@@ -371,6 +371,7 @@ impl VirtualizableInfo {
             static_field_types: self.static_fields.iter().map(|f| f.field_type).collect(),
             array_field_offsets: self.array_fields.iter().map(|a| a.field_offset).collect(),
             array_item_types: self.array_fields.iter().map(|a| a.item_type).collect(),
+            array_lengths: vec![],
         }
     }
 
@@ -1595,6 +1596,7 @@ mod tests {
         );
         assert_eq!(config.array_field_offsets, vec![48, 56]);
         assert_eq!(config.array_item_types, vec![Type::Ref, Type::Int]);
+        assert!(config.array_lengths.is_empty());
     }
 
     #[test]

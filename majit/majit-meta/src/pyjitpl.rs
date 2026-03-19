@@ -696,23 +696,22 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Create an optimizer with virtualizable config if available.
     ///
-    /// Virtualizable fields become virtual input args — first reads are
-    /// replaced with input references and values flow through JUMP args.
+    /// Standard virtualizable fields become virtual input args — first reads
+    /// are replaced with input references and values flow through JUMP args.
     /// No heap access for these fields on the hot path.
     fn current_virtualizable_optimizer_config(
         &self,
     ) -> Option<majit_opt::virtualize::VirtualizableConfig> {
-        // RPython parity: only traces that actually carry the standard
-        // virtualizable state on boxes should hand a virtualizable contract
-        // to the optimizer. Merely registering VirtualizableInfo is not enough.
-        self.tracing
-            .as_ref()
-            .filter(|ctx| ctx.has_virtualizable_boxes())
-            .and_then(|_| {
-                self.virtualizable_info
-                    .as_ref()
-                    .map(|info| info.to_optimizer_config())
+        self.tracing.as_ref().and_then(|ctx| {
+            if !ctx.has_virtualizable_boxes() {
+                return None;
+            }
+            self.virtualizable_info.as_ref().map(|info| {
+                let mut config = info.to_optimizer_config();
+                config.array_lengths = ctx.virtualizable_array_lengths().unwrap_or(&[]).to_vec();
+                config
             })
+        })
     }
 
     fn make_optimizer(&self) -> Optimizer {
@@ -2673,6 +2672,24 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0)
     }
 
+    fn bridge_fail_descr_proxy(
+        compiled: &CompiledEntry<M>,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<BridgeFailDescrProxy> {
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
+        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        Some(BridgeFailDescrProxy {
+            fail_index,
+            trace_id,
+            fail_arg_types: exit_layout.exit_types.clone(),
+            gc_ref_slots: exit_layout.gc_ref_slots.clone(),
+            force_token_slots: exit_layout.force_token_slots.clone(),
+            is_finish: exit_layout.is_finish,
+        })
+    }
+
     // ── Bridge Compilation ──────────────────────────────────────
 
     /// Close the current bridge trace with a FINISH op, optimize, and compile
@@ -2688,14 +2705,27 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         finish_args: &[OpRef],
     ) -> bool {
+        let finish_arg_types = {
+            let compiled = match self.compiled_loops.get(&green_key) {
+                Some(c) => c,
+                None => return false,
+            };
+            let norm_trace_id = Self::normalize_trace_id(compiled, trace_id);
+            let (_, trace_data) = match Self::trace_for_exit(compiled, norm_trace_id) {
+                Some(t) => t,
+                None => return false,
+            };
+            trace_data.inputargs.iter().map(|arg| arg.tp).collect::<Vec<_>>()
+        };
+        if finish_arg_types.len() != finish_args.len() {
+            return false;
+        }
+
         self.forced_virtualizable = None;
         let ctx = match self.tracing.take() {
             Some(ctx) => ctx,
             None => return false,
         };
-
-        // Build finish arg types (all Int for aheuijit)
-        let finish_arg_types: Vec<Type> = finish_args.iter().map(|_| Type::Int).collect();
 
         let mut recorder = ctx.recorder;
         recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
@@ -2721,29 +2751,11 @@ impl<M: Clone> MetaInterp<M> {
                 Some(c) => c,
                 None => return false,
             };
-            let norm_trace_id = Self::normalize_trace_id(compiled, trace_id);
-            let (_, trace_data) = match Self::trace_for_exit(compiled, norm_trace_id) {
-                Some(t) => t,
+            let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
+                Some(descr) => descr,
                 None => return false,
             };
-            let guard_op_index = match trace_data.guard_op_indices.get(&fail_index) {
-                Some(&idx) => idx,
-                None => return false,
-            };
-            let guard_op = match trace_data.ops.get(guard_op_index) {
-                Some(op) => op,
-                None => return false,
-            };
-            let fail_arg_types: Vec<Type> = guard_op
-                .fail_args
-                .as_ref()
-                .map(|fa| fa.iter().map(|_| Type::Int).collect())
-                .unwrap_or_default();
-            Box::new(BridgeFailDescrProxy {
-                fail_index,
-                trace_id: norm_trace_id,
-                fail_arg_types,
-            }) as Box<dyn majit_ir::FailDescr>
+            Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
         };
 
         self.compile_bridge(
@@ -2764,6 +2776,9 @@ struct BridgeFailDescrProxy {
     fail_index: u32,
     trace_id: u64,
     fail_arg_types: Vec<Type>,
+    gc_ref_slots: Vec<usize>,
+    force_token_slots: Vec<usize>,
+    is_finish: bool,
 }
 
 impl majit_ir::Descr for BridgeFailDescrProxy {
@@ -2782,8 +2797,17 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
     fn fail_arg_types(&self) -> &[Type] {
         &self.fail_arg_types
     }
+    fn is_finish(&self) -> bool {
+        self.is_finish
+    }
     fn trace_id(&self) -> u64 {
         self.trace_id
+    }
+    fn is_gc_ref_slot(&self, slot: usize) -> bool {
+        self.gc_ref_slots.contains(&slot)
+    }
+    fn force_token_slots(&self) -> &[usize] {
+        &self.force_token_slots
     }
 }
 
@@ -2798,14 +2822,9 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
     ) -> Option<Box<dyn majit_ir::FailDescr>> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        // Verify the guard exists
-        let _trace = compiled.traces.get(&trace_id)?;
-        Some(Box::new(BridgeFailDescrProxy {
-            fail_index,
-            trace_id,
-            fail_arg_types: vec![Type::Int], // call_assembler guard fail_args = [frame_ptr]
-        }))
+        Some(Box::new(Self::bridge_fail_descr_proxy(
+            compiled, trace_id, fail_index,
+        )?))
     }
 
     /// Compile a bridge from a guard failure point.
@@ -2986,29 +3005,12 @@ impl<M: Clone> MetaInterp<M> {
             Some(c) => c,
             None => return false,
         };
-
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-
-        // Find the guard's fail_arg_types to set up inputs
-        let (_, trace) = match Self::trace_for_exit(compiled, trace_id) {
-            Some(t) => t,
+        let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
+            Some(descr) => descr,
             None => return false,
         };
 
-        let guard_op_index = match trace.guard_op_indices.get(&fail_index) {
-            Some(&idx) => idx,
-            None => return false,
-        };
-
-        let guard_op = match trace.ops.get(guard_op_index) {
-            Some(op) => op,
-            None => return false,
-        };
-
-        let num_inputs = guard_op.fail_args.as_ref().map(|fa| fa.len()).unwrap_or(0);
-
-        // Create a new trace recorder for the retrace
-        let recorder = self.warm_state.start_retrace(num_inputs);
+        let recorder = self.warm_state.start_retrace(&fail_descr.fail_arg_types);
         self.forced_virtualizable = None;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
 
@@ -3737,30 +3739,10 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns `true` if retracing was started, `false` if not possible.
     pub fn start_retrace(&mut self, green_key: u64, _fail_index: u32, live_values: &[i64]) -> bool {
-        if self.tracing.is_some() {
-            return false; // already tracing
-        }
-
-        if !self.compiled_loops.contains_key(&green_key) {
+        let Some(root_trace_id) = self.compiled_loops.get(&green_key).map(|c| c.root_trace_id) else {
             return false;
-        }
-
-        // Create a new trace recorder for the bridge
-        let mut recorder = majit_trace::recorder::Trace::new();
-        for _ in live_values {
-            recorder.record_input_arg(Type::Int);
-        }
-
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] start retrace at key={}, num_inputs={}",
-                green_key,
-                live_values.len()
-            );
-        }
-
-        self.tracing = Some(TraceCtx::new(recorder, green_key));
-        true
+        };
+        self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values)
     }
 
     // ── Inlining Support ──────────────────────────────────────
@@ -5071,7 +5053,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_virtualizable_trace_does_not_prepend_raw_heap_preamble() {
+    fn compiled_virtualizable_trace_does_not_use_raw_heap_ops() {
         let mut meta = MetaInterp::<()>::new(10);
         start_tracing_with_virtualizable(
             &mut meta,
@@ -5100,31 +5082,34 @@ mod tests {
                     OpCode::GetfieldRawI
                         | OpCode::GetfieldRawR
                         | OpCode::GetfieldRawF
+                        | OpCode::SetfieldRaw
                         | OpCode::GetarrayitemRawI
                         | OpCode::GetarrayitemRawR
                         | OpCode::GetarrayitemRawF
+                        | OpCode::SetarrayitemRaw
                 )
             }),
-            "standard virtualizable loop should use vable boxes, not raw entry preamble: {}",
+            "standard virtualizable loop should use vable boxes, not raw heap ops: {}",
             majit_ir::format_trace(&trace.ops, &trace.constants)
         );
         assert_eq!(item, OpRef(2));
     }
 
     #[test]
-    fn optimizer_vable_config_requires_active_standard_boxes() {
+    fn optimizer_vable_config_requires_standard_virtualizable_boxes() {
         let mut meta = MetaInterp::<()>::new(10);
-        meta.set_virtualizable_info(test_vable_info_with_array());
+        let info = test_vable_info_with_array();
+        meta.set_virtualizable_info(info.clone());
         assert!(
             meta.current_virtualizable_optimizer_config().is_none(),
-            "registered VirtualizableInfo alone must not enable optimizer virtualizable mode"
+            "virtualizable config should only exist while tracing is active"
         );
 
         let action = meta.force_start_tracing(777, None, &[Value::Int(0x1234)]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert!(
             meta.current_virtualizable_optimizer_config().is_none(),
-            "traces without init_virtualizable_boxes must not pass vable config to optimizer"
+            "virtualizable config should require standard virtualizable boxes"
         );
     }
 
@@ -5158,6 +5143,7 @@ mod tests {
             config.array_item_types,
             info.to_optimizer_config().array_item_types
         );
+        assert_eq!(config.array_lengths, vec![2]);
     }
 
     #[test]
@@ -6094,6 +6080,167 @@ mod tests {
             .expect("bridge resume data should reconstruct frame");
         assert_eq!(reconstructed[0].pc, 555);
         assert_eq!(reconstructed[0].values, vec![ReconstructedValue::Value(1)]);
+    }
+
+    #[test]
+    fn test_start_retrace_from_guard_preserves_fail_arg_types() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 152;
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(1)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        let trace_id = meta.compiled_loops[&green_key].root_trace_id;
+
+        assert!(meta.start_retrace_from_guard(green_key, trace_id, 0, &[]));
+
+        let mut ctx = meta.tracing.take().expect("expected active bridge trace");
+        ctx.recorder.close_loop(&[OpRef(0), OpRef(1)]);
+        let trace = ctx.recorder.get_trace();
+        let input_types: Vec<Type> = trace.inputargs.iter().map(|arg| arg.tp).collect();
+        assert_eq!(input_types, vec![Type::Ref, Type::Int]);
+    }
+
+    #[test]
+    fn test_compiled_bridge_runs_with_ref_fail_args() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 153;
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let root_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(1)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            root_ops,
+            HashMap::new(),
+        );
+
+        let root_failure = meta
+            .run_compiled_detailed(green_key, &[0x1234, 1])
+            .expect("root guard should fail");
+        let root_fail_index = root_failure.fail_index;
+        let root_trace_id = root_failure.trace_id;
+        let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            root_fail_index,
+            root_trace_id,
+            vec![Type::Ref, Type::Int],
+            false,
+            Vec::new(),
+            None,
+        );
+
+        let bridge_inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+        ];
+        assert!(meta.compile_bridge(
+            green_key,
+            root_fail_index,
+            &bridge_fail_descr,
+            &bridge_ops,
+            &bridge_inputargs,
+            HashMap::new(),
+        ));
+
+        let bridge_trace_id = meta.compiled_loops[&green_key]
+            .traces
+            .keys()
+            .copied()
+            .find(|&trace_id| trace_id != root_trace_id)
+            .expect("bridge trace should exist");
+        let bridge_exit = meta
+            .run_compiled_detailed(green_key, &[0x1234, 1])
+            .expect("bridge should run and exit");
+        assert_eq!(bridge_exit.trace_id, bridge_trace_id);
+        assert_eq!(bridge_exit.values, vec![0x1234, 1]);
+        assert_eq!(bridge_exit.exit_layout.exit_types, vec![Type::Ref, Type::Int]);
+    }
+
+    #[test]
+    fn test_compiled_bridge_runs_with_new_ref_result() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let green_key = 154;
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let root_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            {
+                let mut guard = mk_op(OpCode::GuardFalse, &[OpRef(1)], OpRef::NONE.0);
+                guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1)]);
+                guard
+            },
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            root_ops,
+            HashMap::new(),
+        );
+
+        let root_failure = meta
+            .run_compiled_detailed(green_key, &[0x1234, 1])
+            .expect("root guard should fail");
+        let root_fail_index = root_failure.fail_index;
+        let root_trace_id = root_failure.trace_id;
+        let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            root_fail_index,
+            root_trace_id,
+            vec![Type::Ref, Type::Int],
+            false,
+            Vec::new(),
+            None,
+        );
+
+        let value_field = majit_ir::make_field_descr(0, 8, Type::Int, true);
+        let next_field = majit_ir::make_field_descr(8, 8, Type::Ref, false);
+        let node_size = majit_ir::descr::make_size_descr(16);
+        let bridge_inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op_with_descr(OpCode::New, &[], 2, node_size),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(2), OpRef(1)], 3, value_field),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(2), OpRef(0)], 4, next_field),
+            mk_op(OpCode::Finish, &[OpRef(2), OpRef(1)], OpRef::NONE.0),
+        ];
+        assert!(meta.compile_bridge(
+            green_key,
+            root_fail_index,
+            &bridge_fail_descr,
+            &bridge_ops,
+            &bridge_inputargs,
+            HashMap::new(),
+        ));
+
+        let bridge_trace_id = meta.compiled_loops[&green_key]
+            .traces
+            .keys()
+            .copied()
+            .find(|&trace_id| trace_id != root_trace_id)
+            .expect("bridge trace should exist");
+        let bridge_exit = meta
+            .run_compiled_detailed(green_key, &[0x1234, 1])
+            .expect("bridge should run and exit");
+        assert_eq!(bridge_exit.trace_id, bridge_trace_id);
+        assert_eq!(bridge_exit.exit_layout.exit_types, vec![Type::Ref, Type::Int]);
+        assert_eq!(bridge_exit.values[1], 1);
+        assert_ne!(bridge_exit.values[0], 0);
     }
 
     #[test]
