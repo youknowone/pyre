@@ -291,6 +291,10 @@ impl OptString {
                 return OptimizationResult::Remove;
             }
         }
+        // vstring.py postprocess_NEWSTR: pure_from_args(STRLEN, op, length)
+        // Even for non-virtual NEWSTR, record that STRLEN(result) = length.
+        // This enables CSE to eliminate subsequent STRLEN calls.
+        self.known_lengths.insert(op.pos, len_ref);
         OptimizationResult::PassOn
     }
 
