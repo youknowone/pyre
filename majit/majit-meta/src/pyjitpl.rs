@@ -1199,11 +1199,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can track field accesses.
-        // TODO: VirtualizableConfig causes OptVirtualize to mishandle traces.
-        // Disabled until the storage pool → frame field mapping is correct.
-        let _vinfo_unused = &self.virtualizable_info;
-        let vable_config: Option<majit_opt::virtualize::VirtualizableConfig> = None;
-        let _vable_config_todo = self.virtualizable_info.as_ref().map(|vinfo| {
+        let vable_config = self.virtualizable_info.as_ref().map(|vinfo| {
             majit_opt::virtualize::VirtualizableConfig {
                 static_field_offsets: vinfo.static_fields.iter().map(|f| f.offset).collect(),
                 static_field_types: vinfo.static_fields.iter().map(|f| f.field_type).collect(),
