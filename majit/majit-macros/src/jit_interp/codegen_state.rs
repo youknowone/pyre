@@ -167,6 +167,39 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 };
                 Some(unsafe { info.read_all_boxes(obj_ptr, &lengths) })
             }
+
+            fn sync_virtualizable_before_residual_call(
+                &self,
+                ctx: &mut majit_meta::trace_ctx::TraceCtx,
+            ) {
+                let Some(info) = Self::__build_virtualizable_info() else {
+                    return;
+                };
+                let Some(vable_ref) = ctx.standard_virtualizable_box() else {
+                    return;
+                };
+                let obj_ptr = (&self.#pool_field as *const _ as *mut u8).cast::<u8>();
+                unsafe {
+                    info.tracing_before_residual_call(obj_ptr);
+                }
+                let force_token = ctx.force_token();
+                ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
+            }
+
+            fn sync_virtualizable_after_residual_call(
+                &self,
+                _ctx: &mut majit_meta::trace_ctx::TraceCtx,
+            ) -> majit_meta::jit_state::ResidualVirtualizableSync {
+                let Some(info) = Self::__build_virtualizable_info() else {
+                    return majit_meta::jit_state::ResidualVirtualizableSync::default();
+                };
+                let obj_ptr = (&self.#pool_field as *const _ as *mut u8).cast::<u8>();
+                let forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
+                majit_meta::jit_state::ResidualVirtualizableSync {
+                    updated_fields: Vec::new(),
+                    forced,
+                }
+            }
         }
     });
     let compact_encode = storage
@@ -913,6 +946,329 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
         };
     }
+
+    // Generate linked list JitCodeSym methods if node layout is provided
+    let linked_list_descr_methods = if let (Some(node_size), Some(value_offset), Some(next_offset)) = (
+        &storage.linked_list_node_size,
+        &storage.linked_list_value_offset,
+        &storage.linked_list_next_offset,
+    ) {
+        quote! {
+            fn node_size_descr(&self) -> Option<majit_ir::DescrRef> {
+                Some(std::sync::Arc::new(
+                    majit_ir::descr::SimpleFieldDescr::new(
+                        0x8000_0000, // unique tag for node size
+                        0,
+                        #node_size,
+                        majit_ir::Type::Ref,
+                        false,
+                    ),
+                ))
+            }
+
+            fn node_value_descr(&self) -> Option<majit_ir::DescrRef> {
+                Some(std::sync::Arc::new(
+                    majit_ir::descr::SimpleFieldDescr::new(
+                        0x8000_0001, // unique tag for value field
+                        #value_offset,
+                        8,
+                        majit_ir::Type::Int,
+                        true,
+                    ),
+                ))
+            }
+
+            fn node_next_descr(&self) -> Option<majit_ir::DescrRef> {
+                Some(std::sync::Arc::new(
+                    majit_ir::descr::SimpleFieldDescr::new(
+                        0x8000_0002, // unique tag for next field
+                        #next_offset,
+                        8,
+                        majit_ir::Type::Ref,
+                        false,
+                    ),
+                ))
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // ── Linked list mode ──
+    // RPython parity: inputargs = [pool_ptr, selected], heads loaded lazily.
+    // No flattened stack elements, no depth constraint on validate_close.
+    if storage.linked_list_node_size.is_some() {
+        let ptrs_offset = &storage
+            .compact_ptrs_offset
+            .as_ref()
+            .expect("linked_list mode requires compact_ptrs_offset (head pointer cache offset)");
+
+        return quote! {
+            #[derive(Clone)]
+            #[allow(non_camel_case_types)]
+            struct __JitMeta {
+                storage_layout: Vec<(usize, usize)>,
+                initial_selected: usize,
+            }
+
+            #[allow(non_camel_case_types)]
+            struct __JitSym {
+                pool_ref: majit_ir::OpRef,
+                current_selected: usize,
+                current_selected_value: Option<majit_ir::OpRef>,
+                storage_layout: Vec<(usize, usize)>,
+                loop_header_pc: usize,
+                header_selected: usize,
+                trace_started: bool,
+                meta_storage_count: usize,
+                linked_list_heads: std::collections::HashMap<usize, majit_ir::OpRef>,
+                // Keep symbolic stacks for fallback (non-linked-list storages)
+                stacks: std::collections::HashMap<usize, majit_meta::SymbolicStack>,
+            }
+
+            #[allow(non_camel_case_types)]
+            impl __JitSym {
+                fn total_slots(&self) -> usize {
+                    0 // No flattened slots in linked list mode
+                }
+            }
+
+            impl majit_meta::JitCodeSym for __JitSym {
+                fn current_selected(&self) -> usize {
+                    self.current_selected
+                }
+
+                fn current_selected_value(&self) -> Option<majit_ir::OpRef> {
+                    self.current_selected_value
+                }
+
+                fn set_current_selected(&mut self, selected: usize) {
+                    self.current_selected = selected;
+                }
+
+                fn set_current_selected_value(&mut self, selected: usize, value: majit_ir::OpRef) {
+                    self.current_selected = selected;
+                    self.current_selected_value = Some(value);
+                }
+
+                fn stack(&self, selected: usize) -> Option<&majit_meta::SymbolicStack> {
+                    self.stacks.get(&selected)
+                }
+
+                fn stack_mut(&mut self, selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+                    self.stacks.get_mut(&selected)
+                }
+
+                fn total_slots(&self) -> usize { 0 }
+                fn loop_header_pc(&self) -> usize { self.loop_header_pc }
+                fn header_selected(&self) -> usize { self.header_selected }
+
+                fn ensure_stack(&mut self, selected: usize, _offset: usize, _len: usize) {
+                    if !self.storage_layout.iter().any(|&(s, _)| s == selected) {
+                        self.storage_layout.push((selected, 0));
+                    }
+                }
+
+                fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
+                    // [pool_ref, selected_value, per_storage_head...]
+                    let selected = self.current_selected_value
+                        .unwrap_or(majit_ir::OpRef::NONE);
+                    let mut args = vec![self.pool_ref, selected];
+                    for &(sidx, _) in self.storage_layout.iter().take(self.meta_storage_count) {
+                        if let Some(&head) = self.linked_list_heads.get(&sidx) {
+                            args.push(head);
+                        } else {
+                            args.push(majit_ir::OpRef::NONE);
+                        }
+                    }
+                    Some(args)
+                }
+
+                fn fail_args_types(&self) -> Option<Vec<majit_ir::Type>> {
+                    // [pool=Int, selected=Int, head_0=Ref, ..., head_N=Ref]
+                    let mut types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
+                    for _ in self.storage_layout.iter().take(self.meta_storage_count) {
+                        types.push(majit_ir::Type::Ref);
+                    }
+                    Some(types)
+                }
+
+                fn selected_in_fail_args_prefix(&self) -> bool {
+                    true
+                }
+
+                fn close_requires_header_selected(&self) -> bool {
+                    false
+                }
+
+                // Linked list methods
+                fn linked_list_head(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                    self.linked_list_heads.get(&selected).copied()
+                }
+
+                fn set_linked_list_head(&mut self, selected: usize, head: majit_ir::OpRef) {
+                    self.linked_list_heads.insert(selected, head);
+                }
+
+                fn ensure_linked_list_head(
+                    &mut self,
+                    ctx: &mut majit_meta::TraceCtx,
+                    selected: usize,
+                ) -> Option<majit_ir::OpRef> {
+                    if let Some(&head) = self.linked_list_heads.get(&selected) {
+                        return Some(head);
+                    }
+                    // Lazy load: read head pointer from pool.jit_data_ptrs[selected]
+                    let head_offset = ((#ptrs_offset) as usize) + selected * 8;
+                    let head_descr: majit_ir::DescrRef = std::sync::Arc::new(
+                        majit_ir::descr::SimpleFieldDescr::new(
+                            ((head_offset as u32) << 2) | 0,
+                            head_offset,
+                            8,
+                            majit_ir::Type::Ref,
+                            false,
+                        ),
+                    );
+                    let head = ctx.record_op_with_descr(
+                        majit_ir::OpCode::GetfieldGcR,
+                        &[self.pool_ref],
+                        head_descr,
+                    );
+                    self.linked_list_heads.insert(selected, head);
+                    Some(head)
+                }
+
+                fn linked_list_writeback_head(
+                    &mut self,
+                    ctx: &mut majit_meta::TraceCtx,
+                    selected: usize,
+                    new_head: majit_ir::OpRef,
+                ) {
+                    let head_offset = ((#ptrs_offset) as usize) + selected * 8;
+                    let head_descr: majit_ir::DescrRef = std::sync::Arc::new(
+                        majit_ir::descr::SimpleFieldDescr::new(
+                            ((head_offset as u32) << 2) | 0,
+                            head_offset,
+                            8,
+                            majit_ir::Type::Ref,
+                            false,
+                        ),
+                    );
+                    ctx.record_op_with_descr(
+                        majit_ir::OpCode::SetfieldRaw,
+                        &[self.pool_ref, new_head],
+                        head_descr,
+                    );
+                }
+
+                #linked_list_descr_methods
+            }
+
+            impl majit_meta::JitState for #state_type {
+                type Meta = __JitMeta;
+                type Sym = __JitSym;
+                type Env = #env_type;
+
+                fn can_trace(&self) -> bool {
+                    if !(true #( && self.#sel_field != #untraceable )*) {
+                        return false;
+                    }
+                    true #extra_guard
+                }
+
+                fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
+                    let storages = #scan_fn(program, header_pc, self.#sel_field);
+                    let layout = storages.into_iter().map(|sidx| (sidx, 0)).collect();
+                    __JitMeta {
+                        storage_layout: layout,
+                        initial_selected: self.#sel_field,
+                    }
+                }
+
+                fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
+                    // [pool_ptr, selected, head_0, ..., head_N]
+                    let mut values = vec![
+                        (&self.#pool_field as *const _ as usize) as i64,
+                        self.#sel_field as i64,
+                    ];
+                    for &(sidx, _) in &meta.storage_layout {
+                        values.push(self.#pool_field.get(sidx).head_ptr() as i64);
+                    }
+                    values
+                }
+
+                fn live_value_types(&self, meta: &__JitMeta) -> Vec<majit_ir::Type> {
+                    // [pool_ptr=Int, selected=Int, head_0=Ref, ..., head_N=Ref]
+                    let mut types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
+                    for _ in &meta.storage_layout {
+                        types.push(majit_ir::Type::Ref);
+                    }
+                    types
+                }
+
+                fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
+                    let mut heads = std::collections::HashMap::new();
+                    for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
+                        // inputarg index = 2 + i (after pool, selected)
+                        heads.insert(sidx, majit_ir::OpRef((2 + i) as u32));
+                    }
+                    __JitSym {
+                        pool_ref: majit_ir::OpRef(0),
+                        current_selected: meta.initial_selected,
+                        current_selected_value: Some(majit_ir::OpRef(1)),
+                        storage_layout: meta.storage_layout.clone(),
+                        loop_header_pc: header_pc,
+                        header_selected: meta.initial_selected,
+                        trace_started: false,
+                        meta_storage_count: meta.storage_layout.len(),
+                        linked_list_heads: heads,
+                        stacks: std::collections::HashMap::new(),
+                    }
+                }
+
+                fn is_compatible(&self, meta: &__JitMeta) -> bool {
+                    meta.initial_selected == self.#sel_field
+                }
+
+                fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
+                    // values = [pool_ptr, selected, per_storage_heads..., resume_pc]
+                    // OR [pool_ptr, selected] for JUMP args (loop finish)
+                    self.#sel_field = values
+                        .get(1)
+                        .copied()
+                        .and_then(|v| usize::try_from(v).ok())
+                        .unwrap_or(meta.initial_selected);
+                    // Heads are restored via pool.sync_jit_cache by the interpreter
+                }
+
+                fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
+                    // [pool_ref, selected, head_0, ..., head_N]
+                    // Heads carried as JUMP args so OptVirtualize can track them.
+                    let selected = sym.current_selected_value.unwrap_or(majit_ir::OpRef::NONE);
+                    let mut args = vec![sym.pool_ref, selected];
+                    for &(sidx, _) in sym.storage_layout.iter().take(sym.meta_storage_count) {
+                        args.push(
+                            sym.linked_list_heads
+                                .get(&sidx)
+                                .copied()
+                                .unwrap_or(majit_ir::OpRef::NONE),
+                        );
+                    }
+                    args
+                }
+
+                #vable_info_fn
+                #vable_state_hooks
+
+                fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
+                    // RPython parity: only check selected matches.
+                    // No depth constraint — linked list allows variable depth.
+                    sym.current_selected == meta.initial_selected
+                }
+            }
+        };
+    }
+
     quote! {
         /// Compiled loop metadata: which storages and how many slots each had.
         #[derive(Clone)]
@@ -937,6 +1293,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             /// Number of storages from the original meta layout.
             /// Extra storages added during tracing are ignored in Jump args.
             meta_storage_count: usize,
+            /// Linked list head OpRef per storage (RPython Node virtualization).
+            linked_list_heads: std::collections::HashMap<usize, majit_ir::OpRef>,
         }
 
         #[allow(non_camel_case_types)]
@@ -1009,6 +1367,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         .collect(),
                 )
             }
+
+            #linked_list_descr_methods
         }
 
         impl majit_meta::JitState for #state_type {
@@ -1065,6 +1425,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     header_selected: meta.initial_selected,
                     trace_started: false,
                     meta_storage_count: meta.storage_layout.len(),
+                    linked_list_heads: std::collections::HashMap::new(),
                 }
             }
 
@@ -1741,6 +2102,11 @@ mod tests {
         assert!(generated.contains("fn virtualizable_array_lengths"));
         assert!(generated.contains("fn import_virtualizable_boxes"));
         assert!(generated.contains("fn export_virtualizable_boxes"));
+        assert!(generated.contains("fn sync_virtualizable_before_residual_call"));
+        assert!(generated.contains("fn sync_virtualizable_after_residual_call"));
+        assert!(generated.contains("tracing_before_residual_call"));
+        assert!(generated.contains("tracing_after_residual_call"));
+        assert!(generated.contains("ctx . force_token"));
     }
 
     #[test]
@@ -1777,5 +2143,7 @@ mod tests {
         assert!(generated.contains("__info . add_embedded_array_field_with_layout"));
         assert!(generated.contains("fn virtualizable_heap_ptr"));
         assert!(generated.contains("fn export_virtualizable_boxes"));
+        assert!(generated.contains("fn sync_virtualizable_before_residual_call"));
+        assert!(generated.contains("fn sync_virtualizable_after_residual_call"));
     }
 }
