@@ -546,8 +546,14 @@ impl OptHeap {
 
         // Cache miss: emit the load and cache the result.
         // heap.py line 652: make_nonnull(op.getarg(0))
-        self.known_nonnull.insert(ctx.get_replacement(op.arg(0)));
+        let struct_ref = ctx.get_replacement(op.arg(0));
+        self.known_nonnull.insert(struct_ref);
         self.cached_fields.insert(key, op.pos);
+        // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
+        // Record the field value in ptr_info so other passes can see it.
+        if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
+            info.set_field(key.1, op.pos);
+        }
         OptimizationResult::Emit(op.clone())
     }
 
@@ -585,6 +591,12 @@ impl OptHeap {
         // replace it (the old write is dead).
         // Either way, store as a new lazy set.
         self.lazy_setfields.insert(key, op.clone());
+
+        // heap.py: cf.do_setfield updates info as well
+        let obj = ctx.get_replacement(obj);
+        if let Some(info) = ctx.get_ptr_info_mut(obj) {
+            info.set_field(field_idx, new_value);
+        }
 
         OptimizationResult::Remove
     }
