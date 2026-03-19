@@ -1,3 +1,6 @@
+//! No direct RPython equivalent — explicit Type-tagged symbolic stack
+//! for trace recording (RPython uses implicit Box typing in registers).
+
 use majit_ir::{OpRef, Type};
 
 /// Symbolic stack for stack-based interpreters during tracing.

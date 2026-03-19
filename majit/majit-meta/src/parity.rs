@@ -1,3 +1,6 @@
+//! Test-only trace comparison utilities — no RPython equivalent.
+//! Used by integration tests for structural trace parity validation.
+
 use std::collections::HashMap;
 
 use majit_ir::{Op, OpRef, Type};
@@ -88,7 +91,7 @@ pub fn assert_trace_parity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{make_fail_descr, SymbolicStack, TraceAction, TraceCtx};
+    use crate::{SymbolicStack, TraceAction, TraceCtx, make_fail_descr};
     use majit_ir::{OpCode, Type};
     use majit_trace::recorder::Trace;
 
@@ -136,8 +139,7 @@ mod tests {
 
         let case = TraceParityCase {
             name: "trace_ctx_constant_arith",
-            rpython_reference:
-                "rpython/jit/metainterp/pyjitpl.py: special_int_add / opimpl_int_mul",
+            rpython_reference: "rpython/jit/metainterp/pyjitpl.py: special_int_add / opimpl_int_mul",
             expected_lines: &["v1 = IntAdd(v0, 1)", "v2 = IntMul(v1, 2)", "Finish(v2)"],
         };
         assert_trace_parity(&trace, &constants, &case);
@@ -183,8 +185,7 @@ mod tests {
 
         let case = TraceParityCase {
             name: "unary_bitwise_and_comparison_ops",
-            rpython_reference:
-                "rpython/jit/metainterp/pyjitpl.py: opimpl_int_and / opimpl_int_xor / opimpl_int_ge",
+            rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_and / opimpl_int_xor / opimpl_int_ge",
             expected_lines: &[
                 "v2 = IntNeg(v0)",
                 "v3 = IntAnd(v2, v1)",
@@ -211,8 +212,7 @@ mod tests {
 
         let case = TraceParityCase {
             name: "div_and_mod_ops",
-            rpython_reference:
-                "rpython/jit/metainterp/pyjitpl.py: int_c_div / int_c_mod tracing path",
+            rpython_reference: "rpython/jit/metainterp/pyjitpl.py: int_c_div / int_c_mod tracing path",
             expected_lines: &[
                 "v1 = IntFloorDiv(v0, 3)",
                 "v2 = IntMod(v0, 3)",
@@ -239,8 +239,7 @@ mod tests {
 
         let case = TraceParityCase {
             name: "shift_ops",
-            rpython_reference:
-                "rpython/jit/metainterp/pyjitpl.py: opimpl_int_lshift / opimpl_int_rshift",
+            rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_lshift / opimpl_int_rshift",
             expected_lines: &[
                 "v2 = IntLshift(v0, 1)",
                 "v3 = IntRshift(v1, 2)",

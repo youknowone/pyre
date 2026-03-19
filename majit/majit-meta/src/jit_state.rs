@@ -1,3 +1,6 @@
+//! No direct RPython equivalent — trait abstraction for interpreter state
+//! (RPython uses concrete MetaInterp class in pyjitpl.py).
+
 use majit_ir::{GcRef, OpRef, Type, Value};
 
 use crate::blackhole::ExceptionState;
@@ -5,7 +8,7 @@ use crate::resume::{
     MaterializedValue, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
     ResumeFrameLayoutSummary,
 };
-use crate::trace_ctx::JitDriverStaticData;
+use crate::jitdriver::JitDriverStaticData;
 use crate::virtualizable::VirtualizableInfo;
 
 /// Layout description for replaying a pending field or array write during deopt.

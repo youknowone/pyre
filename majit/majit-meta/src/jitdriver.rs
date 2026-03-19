@@ -1,3 +1,4 @@
+use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::pyjitpl::{
@@ -5,11 +6,107 @@ use crate::pyjitpl::{
     MetaInterp,
 };
 use crate::resume::ResumeLayoutSummary;
-use crate::trace_ctx::{DeclarativeJitDriver, JitDriverStaticData, TraceCtx};
+use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
-use crate::TraceAction;
 use majit_ir::OpRef;
-use majit_ir::{GreenKey, Type, Value};
+use majit_ir::{GreenKey, JitDriverVar, Type, Value, VarKind};
+
+/// Descriptor for a JitDriver's variable layout.
+///
+/// Mirrors RPython's `JitDriver(greens=[...], reds=[...])`:
+/// - `greens` are compile-time constants identifying the loop header
+/// - `reds` are runtime values carried as InputArgs
+///
+/// The interpreter declares this once per JitDriver and passes it to
+/// MetaInterp for structured green/red handling.
+#[derive(Clone, Debug)]
+pub struct JitDriverStaticData {
+    /// All variables in declaration order.
+    pub vars: Vec<JitDriverVar>,
+    /// Optional name of the virtualizable red variable.
+    pub virtualizable: Option<String>,
+}
+
+impl JitDriverStaticData {
+    /// Create a descriptor from green and red variable lists.
+    pub fn new(greens: Vec<(&str, Type)>, reds: Vec<(&str, Type)>) -> Self {
+        Self::with_virtualizable(greens, reds, None)
+    }
+
+    /// Create a descriptor with optional virtualizable metadata.
+    pub fn with_virtualizable(
+        greens: Vec<(&str, Type)>,
+        reds: Vec<(&str, Type)>,
+        virtualizable: Option<&str>,
+    ) -> Self {
+        let mut vars = Vec::new();
+        for (name, tp) in greens {
+            vars.push(JitDriverVar::green(name, tp));
+        }
+        for (name, tp) in reds {
+            vars.push(JitDriverVar::red(name, tp));
+        }
+        JitDriverStaticData {
+            vars,
+            virtualizable: virtualizable.map(str::to_string),
+        }
+    }
+
+    /// Get only the green variables.
+    pub fn greens(&self) -> Vec<&JitDriverVar> {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Green)
+            .collect()
+    }
+
+    /// Get only the red variables.
+    pub fn reds(&self) -> Vec<&JitDriverVar> {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Red)
+            .collect()
+    }
+
+    /// Number of green variables.
+    pub fn num_greens(&self) -> usize {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Green)
+            .count()
+    }
+
+    /// Number of red variables.
+    pub fn num_reds(&self) -> usize {
+        self.vars.iter().filter(|v| v.kind == VarKind::Red).count()
+    }
+
+    /// Get the virtualizable variable, if any.
+    pub fn virtualizable(&self) -> Option<&JitDriverVar> {
+        let name = self.virtualizable.as_deref()?;
+        self.vars.iter().find(|var| var.name == name)
+    }
+}
+
+/// Trait implemented by declarative `#[jit_driver]` marker types.
+///
+/// This provides a stable seam between proc-macro-generated driver metadata
+/// and the runtime `JitDriver` orchestration layer.
+pub trait DeclarativeJitDriver {
+    const GREENS: &'static [&'static str];
+    const REDS: &'static [&'static str];
+    const NUM_VARS: usize;
+    const NUM_GREENS: usize;
+    const NUM_REDS: usize;
+    const VIRTUALIZABLE: Option<&'static str>;
+
+    fn descriptor(
+        green_types: &[Type],
+        red_types: &[Type],
+    ) -> Result<JitDriverStaticData, &'static str>;
+
+    fn green_key(values: &[i64]) -> Result<GreenKey, &'static str>;
+}
 
 /// A named entry point registered with a [`JitDriver`].
 ///
@@ -590,8 +687,9 @@ impl<S: JitState> JitDriver<S> {
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
     ) -> Vec<Value> {
-        let mut values =
-            Vec::with_capacity(static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>());
+        let mut values = Vec::with_capacity(
+            static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>(),
+        );
         for (field, &raw) in info.static_fields.iter().zip(static_boxes.iter()) {
             values.push(match field.field_type {
                 Type::Int => Value::Int(raw),

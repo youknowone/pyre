@@ -1,3 +1,6 @@
+//! No direct RPython equivalent — thread-local I/O buffer for compiled
+//! loops (RPython interpreter writes to stdout directly).
+
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
