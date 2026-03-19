@@ -18,7 +18,7 @@ use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::strobject::is_str;
 use pyre_object::{
     PY_NULL, w_bool_from, w_int_get_value, w_int_new, w_list_can_append_without_realloc,
-    w_list_is_inline_storage, w_list_len, w_str_get_value, w_tuple_len,
+    w_list_is_inline_storage, w_list_len, w_list_new, w_str_get_value, w_tuple_len,
 };
 use pyre_objspace::truth_value as objspace_truth_value;
 use pyre_runtime::{
@@ -207,6 +207,10 @@ pub(crate) fn trace_raw_array_setitem_value(
         &[array, index, value],
         pyobject_array_descr(),
     );
+}
+
+fn is_boxed_int_value(concrete_value: PyObjectRef) -> bool {
+    !concrete_value.is_null() && unsafe { is_int(concrete_value) }
 }
 
 pub(crate) fn frame_get_next_instr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
@@ -612,18 +616,16 @@ impl TraceFrameState {
         let Some(concrete_value) = concrete_value else {
             return value;
         };
-        unsafe {
-            if is_int(concrete_value) {
-                let raw_value = self.trace_guarded_int_payload(ctx, value);
-                return crate::jit::helpers::emit_box_int_inline(
-                    ctx,
-                    raw_value,
-                    w_int_size_descr(),
-                    ob_type_descr(),
-                    int_intval_descr(),
-                    &INT_TYPE as *const _ as i64,
-                );
-            }
+        if is_boxed_int_value(concrete_value) {
+            let raw_value = self.trace_guarded_int_payload(ctx, value);
+            return crate::jit::helpers::emit_box_int_inline(
+                ctx,
+                raw_value,
+                w_int_size_descr(),
+                ob_type_descr(),
+                int_intval_descr(),
+                &INT_TYPE as *const _ as i64,
+            );
         }
         value
     }
@@ -3389,37 +3391,126 @@ impl JitState for PyreJitState {
         _virtual_index: usize,
         materialized: &majit_meta::resume::MaterializedVirtual,
     ) -> Option<majit_ir::GcRef> {
-        use majit_meta::resume::{MaterializedValue, MaterializedVirtual};
+        self.materialize_virtual_ref_from_layout(materialized, &[])
+    }
+
+    fn materialize_virtual_ref_with_refs(
+        &mut self,
+        _meta: &Self::Meta,
+        _virtual_index: usize,
+        materialized: &majit_meta::resume::MaterializedVirtual,
+        materialized_refs: &[Option<majit_ir::GcRef>],
+    ) -> Option<majit_ir::GcRef> {
+        self.materialize_virtual_ref_from_layout(materialized, materialized_refs)
+    }
+}
+
+impl PyreJitState {
+    fn materialize_virtual_ref_from_layout(
+        &mut self,
+        materialized: &majit_meta::resume::MaterializedVirtual,
+        materialized_refs: &[Option<majit_ir::GcRef>],
+    ) -> Option<majit_ir::GcRef> {
+        use majit_meta::resume::MaterializedVirtual;
+
         match materialized {
             MaterializedVirtual::Struct { fields, .. }
             | MaterializedVirtual::Obj { fields, .. } => {
-                // Pyre virtual objects are W_IntObject (16 bytes: ob_type + intval).
-                // Field layout: offset 0 = ob_type (*const PyType), offset 8 = intval (i64).
-                let mut ob_type: usize = 0;
-                let mut intval: i64 = 0;
-                for (field_idx, value) in fields {
-                    let offset = extract_pyre_field_offset(*field_idx);
-                    let concrete = match value {
-                        MaterializedValue::Value(v) => *v,
-                        MaterializedValue::VirtualRef(_) => return None,
-                    };
-                    match offset {
-                        Some(0) => ob_type = concrete as usize,
-                        Some(8) => intval = concrete,
-                        _ => {}
-                    }
-                }
-                if ob_type == &INT_TYPE as *const _ as usize {
-                    let ptr = pyre_object::intobject::w_int_new(intval);
-                    Some(majit_ir::GcRef(ptr as usize))
-                } else {
-                    // Unknown type — allocate raw and fill fields
-                    None
-                }
+                self.materialize_virtual_object(fields, materialized_refs)
+            }
+            MaterializedVirtual::RawBuffer { size, entries } => {
+                materialize_virtual_raw_buffer(*size, entries, materialized_refs)
             }
             _ => None,
         }
     }
+
+    fn materialize_virtual_object(
+        &mut self,
+        fields: &[(u32, majit_meta::resume::MaterializedValue)],
+        materialized_refs: &[Option<majit_ir::GcRef>],
+    ) -> Option<majit_ir::GcRef> {
+        let mut ob_type: usize = 0;
+        let mut int_payload: i64 = 0;
+        let mut list_items_ptr: usize = 0;
+        let mut list_items_len: usize = 0;
+
+        for (field_idx, value) in fields {
+            let offset = extract_pyre_field_offset(*field_idx);
+            let concrete = value.resolve_with_refs(materialized_refs)?;
+            match offset {
+                Some(0) => ob_type = concrete as usize,
+                Some(8) => {
+                    if ob_type == &LIST_TYPE as *const _ as usize {
+                        list_items_ptr = concrete as usize;
+                    } else {
+                        int_payload = concrete;
+                    }
+                }
+                Some(16) if ob_type == &LIST_TYPE as *const _ as usize => {
+                    list_items_len = concrete as usize;
+                }
+                _ => {}
+            }
+        }
+
+        if ob_type == &INT_TYPE as *const _ as usize {
+            let ptr = pyre_object::intobject::w_int_new(int_payload);
+            Some(majit_ir::GcRef(ptr as usize))
+        } else if ob_type == &FLOAT_TYPE as *const _ as usize {
+            let ptr = pyre_object::floatobject::w_float_new(f64::from_bits(int_payload as u64));
+            Some(majit_ir::GcRef(ptr as usize))
+        } else if ob_type == &LIST_TYPE as *const _ as usize {
+            let items = if list_items_len == 0 {
+                Vec::new()
+            } else {
+                if list_items_ptr == 0 {
+                    return None;
+                }
+                unsafe {
+                    std::slice::from_raw_parts(
+                        list_items_ptr as *const PyObjectRef,
+                        list_items_len,
+                    )
+                    .to_vec()
+                }
+            };
+            let ptr = w_list_new(items);
+            Some(majit_ir::GcRef(ptr as usize))
+        } else {
+            None
+        }
+    }
+}
+
+fn materialize_virtual_raw_buffer(
+    size: usize,
+    entries: &[(usize, usize, majit_meta::resume::MaterializedValue)],
+    materialized_refs: &[Option<majit_ir::GcRef>],
+) -> Option<majit_ir::GcRef> {
+    use std::alloc::{Layout, alloc_zeroed};
+
+    let layout = Layout::from_size_align(size.max(1), 8).ok()?;
+    let ptr = unsafe { alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return None;
+    }
+
+    for (offset, length, value) in entries {
+        let concrete = value.resolve_with_refs(materialized_refs)?;
+        unsafe {
+            let slot = ptr.add(*offset);
+            match *length {
+                1 => slot.write(concrete as u8),
+                2 => (slot as *mut u16).write_unaligned(concrete as u16),
+                4 => (slot as *mut u32).write_unaligned(concrete as u32),
+                8 => (slot as *mut u64).write_unaligned(concrete as u64),
+                _ => return None,
+            }
+        }
+    }
+
+    Some(majit_ir::GcRef(ptr as usize))
 }
 
 fn value_to_ptr(value: &Value) -> PyObjectRef {
@@ -3446,6 +3537,137 @@ fn extract_pyre_field_offset(descr_idx: u32) -> Option<usize> {
         return None;
     }
     Some(((descr_idx >> 4) & 0x000f_ffff) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_meta::JitState;
+    use majit_meta::resume::{MaterializedValue, MaterializedVirtual};
+    use pyre_object::floatobject::w_float_get_value;
+    use pyre_object::listobject::w_list_getitem;
+
+    fn empty_meta() -> PyreMeta {
+        PyreMeta {
+            merge_pc: 0,
+            num_locals: 0,
+            ns_keys: Vec::new(),
+            valuestackdepth: 0,
+            has_virtualizable: false,
+        }
+    }
+
+    fn empty_state() -> PyreJitState {
+        PyreJitState {
+            frame: 0,
+            next_instr: 0,
+            valuestackdepth: 0,
+        }
+    }
+
+    #[test]
+    fn test_is_boxed_int_value_ignores_py_null_sentinel() {
+        assert!(!is_boxed_int_value(PY_NULL));
+        let boxed = w_int_new(7);
+        assert!(is_boxed_int_value(boxed));
+    }
+
+    #[test]
+    fn test_materialize_virtual_ref_reconstructs_float_object() {
+        let mut state = empty_state();
+        let meta = empty_meta();
+        let value = 3.25f64;
+        let materialized = MaterializedVirtual::Obj {
+            type_id: 0,
+            descr_index: crate::jit::descr::w_float_size_descr().index(),
+            fields: vec![
+                (
+                    crate::jit::descr::ob_type_descr().index(),
+                    MaterializedValue::Value(&FLOAT_TYPE as *const PyType as usize as i64),
+                ),
+                (
+                    crate::jit::descr::float_floatval_descr().index(),
+                    MaterializedValue::Value(value.to_bits() as i64),
+                ),
+            ],
+        };
+
+        let ptr = <PyreJitState as JitState>::materialize_virtual_ref_with_refs(
+            &mut state,
+            &meta,
+            0,
+            &materialized,
+            &[],
+        )
+        .expect("float virtual should materialize");
+
+        unsafe {
+            assert!(is_float(ptr.0 as PyObjectRef));
+            assert_eq!(w_float_get_value(ptr.0 as PyObjectRef), value);
+        }
+    }
+
+    #[test]
+    fn test_materialize_virtual_ref_reconstructs_list_from_raw_buffer_ref() {
+        let mut state = empty_state();
+        let meta = empty_meta();
+        let first = w_int_new(2);
+        let second = w_int_new(4);
+
+        let raw_items = MaterializedVirtual::RawBuffer {
+            size: 16,
+            entries: vec![
+                (0, 8, MaterializedValue::Value(first as i64)),
+                (8, 8, MaterializedValue::Value(second as i64)),
+            ],
+        };
+        let raw_ptr = <PyreJitState as JitState>::materialize_virtual_ref_with_refs(
+            &mut state,
+            &meta,
+            0,
+            &raw_items,
+            &[],
+        )
+        .expect("raw items buffer should materialize");
+
+        let list_virtual = MaterializedVirtual::Obj {
+            type_id: 0,
+            descr_index: 0,
+            fields: vec![
+                (
+                    crate::jit::descr::ob_type_descr().index(),
+                    MaterializedValue::Value(&LIST_TYPE as *const PyType as usize as i64),
+                ),
+                (
+                    crate::jit::descr::list_items_ptr_descr().index(),
+                    MaterializedValue::VirtualRef(0),
+                ),
+                (
+                    crate::jit::descr::list_items_len_descr().index(),
+                    MaterializedValue::Value(2),
+                ),
+                (
+                    crate::jit::descr::list_items_heap_cap_descr().index(),
+                    MaterializedValue::Value(2),
+                ),
+            ],
+        };
+
+        let list_ptr = <PyreJitState as JitState>::materialize_virtual_ref_with_refs(
+            &mut state,
+            &meta,
+            1,
+            &list_virtual,
+            &[Some(raw_ptr)],
+        )
+        .expect("list virtual should materialize");
+
+        unsafe {
+            assert!(is_list(list_ptr.0 as PyObjectRef));
+            assert_eq!(w_int_get_value(w_list_getitem(list_ptr.0 as PyObjectRef, 0).unwrap()), 2);
+            assert_eq!(w_int_get_value(w_list_getitem(list_ptr.0 as PyObjectRef, 1).unwrap()), 4);
+        }
+    }
 }
 
 // ── Virtualizable configuration ──────────────────────────────────────

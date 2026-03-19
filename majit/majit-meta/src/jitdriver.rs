@@ -500,6 +500,65 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_or_run_compiled_internal(green_key, None, target_pc, state, env, pre_run)
     }
 
+    /// RPython-style jit_merge_point slow path.
+    ///
+    /// Called from the outer interpreter dispatch loop on every iteration.
+    /// This is the only path that bumps the hot counter and starts tracing.
+    /// If compiled code already exists, it runs it immediately instead.
+    pub fn jit_merge_point_keyed<F>(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+        trace_fn: F,
+    ) -> Option<DetailedDriverRunOutcome>
+    where
+        F: FnOnce(&mut TraceCtx, &mut S::Sym) -> TraceAction,
+    {
+        if self.meta.is_tracing() {
+            self.merge_point(trace_fn);
+            return None;
+        }
+        if !state.can_trace() {
+            return None;
+        }
+        if self.meta.has_compiled_loop(green_key) {
+            return Some(self.run_compiled_detailed_keyed(green_key, state, pre_run));
+        }
+        if !self.meta.warm_state_mut().counter_tick_checked(green_key) {
+            return None;
+        }
+
+        self.force_start_tracing(green_key, target_pc, state, env);
+        if self.meta.is_tracing() {
+            self.merge_point(trace_fn);
+        }
+        None
+    }
+
+    /// RPython-style can_enter_jit path.
+    ///
+    /// Called from a back-edge. Unlike `jit_merge_point_keyed`, this path
+    /// never starts tracing and only runs already-compiled code.
+    pub fn can_enter_jit_keyed(
+        &mut self,
+        green_key: u64,
+        _target_pc: usize,
+        state: &mut S,
+        _env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> Option<DetailedDriverRunOutcome> {
+        if self.meta.is_tracing() || !state.can_trace() {
+            return None;
+        }
+        if self.meta.has_compiled_loop(green_key) {
+            return Some(self.run_compiled_detailed_keyed(green_key, state, pre_run));
+        }
+        None
+    }
+
     pub fn back_edge_declarative<D: DeclarativeJitDriver>(
         &mut self,
         green_values: &[i64],
@@ -1399,6 +1458,10 @@ impl<S: JitState> JitDriver<S> {
             return false;
         };
 
+        if !state.can_trace() {
+            return false;
+        }
+
         // Verify the current state is compatible with the loop's meta.
         // If guard failure changed storage depths, bridge tracing cannot
         // produce FINISH args matching the parent loop — skip.
@@ -1408,7 +1471,10 @@ impl<S: JitState> JitDriver<S> {
 
         let live_values = state.extract_live(&loop_meta);
 
-        if !self.meta.start_retrace(green_key, fail_index, &live_values) {
+        if !self
+            .meta
+            .start_retrace_from_guard(green_key, trace_id, fail_index, &live_values)
+        {
             return false;
         }
 
@@ -1548,6 +1614,9 @@ mod tests {
         restored_values: Vec<Value>,
     }
 
+    #[derive(Default)]
+    struct NonTraceableState;
+
     impl JitState for TypedRestoreState {
         type Meta = ();
         type Sym = ();
@@ -1663,6 +1732,84 @@ mod tests {
         fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
             true
         }
+    }
+
+    impl JitState for NonTraceableState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn can_trace(&self) -> bool {
+            false
+        }
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn can_enter_jit_does_not_start_tracing_but_jit_merge_point_does() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        let key = 123u64;
+        let mut state = TypedRestoreState {
+            live_values: vec![1],
+            ..Default::default()
+        };
+
+        assert!(
+            driver
+                .can_enter_jit_keyed(key, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(
+            driver
+                .can_enter_jit_keyed(key, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(
+            !driver.is_tracing(),
+            "can_enter_jit must not start tracing from a back-edge"
+        );
+
+        assert!(
+            driver
+                .jit_merge_point_keyed(key, 7, &mut state, &(), || {}, |_ctx, _sym| {
+                    TraceAction::Continue
+                })
+                .is_none()
+        );
+        assert!(!driver.is_tracing(), "first merge_point call should only warm up");
+
+        assert!(
+            driver
+                .jit_merge_point_keyed(key, 7, &mut state, &(), || {}, |_ctx, _sym| {
+                    TraceAction::Continue
+                })
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "jit_merge_point should start tracing once the hot counter fires"
+        );
     }
 
     #[test]
@@ -2230,6 +2377,45 @@ mod tests {
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 0);
         assert_eq!(stats.loops_aborted, 1);
+    }
+
+    #[test]
+    fn test_start_bridge_tracing_skips_non_traceable_state() {
+        let mut driver = JitDriver::<NonTraceableState>::new(1);
+        let green_key = 404u64;
+        assert!(matches!(
+            driver.meta.on_back_edge(green_key, &[]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(green_key, &[]),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let one = ctx.const_int(1);
+            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[one], 0, &[]);
+        }
+        driver.meta.close_and_compile(&[], ());
+        assert!(driver.has_compiled_loop(green_key));
+        let failure = driver
+            .meta
+            .run_compiled_detailed(green_key, &[])
+            .expect("guard should fail");
+        let trace_id = failure.trace_id;
+        let fail_index = failure.fail_index;
+
+        let started = driver.start_bridge_tracing(
+            green_key,
+            trace_id,
+            fail_index,
+            &mut NonTraceableState,
+            &(),
+            0,
+            0,
+        );
+        assert!(!started);
+        assert!(!driver.meta.is_tracing());
     }
 
     // ── Multi-entry point lifecycle tests ──

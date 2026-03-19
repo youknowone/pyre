@@ -341,6 +341,8 @@ impl OptHeap {
                 }
                 false // within range or unknown range, invalidate
             });
+        self.cached_arrayitems_var
+            .retain(|&(obj, _descr_idx, _index_ref), _| obj != dest_ref);
     }
 
     /// Extract OopSpecIndex from a call op's descriptor, if available.
@@ -844,18 +846,6 @@ impl OptHeap {
                     } else {
                         self.invalidate_caches();
                     }
-
-                    // Field caches and nonnull are not affected by arraycopy,
-                    // but we still invalidate field caches conservatively.
-                    self.cached_fields.retain(|&(obj, descr_idx), _| {
-                        if self.immutable_field_descrs.contains(&descr_idx) {
-                            return true;
-                        }
-                        if self.unescaped.contains(&obj) {
-                            return true;
-                        }
-                        false
-                    });
 
                     return OptimizationResult::Emit(op.clone());
                 }
@@ -2981,6 +2971,211 @@ mod tests {
         assert_eq!(
             get_count, 1,
             "unknown arraycopy length must invalidate all dest array entries"
+        );
+    }
+
+    #[test]
+    fn test_arraycopy_invalidates_dest_variable_index_cache() {
+        let d = descr(0);
+        let ac_d = arraycopy_descr(50);
+        let idx = OpRef(60);
+        let dst_start_ref = OpRef(62);
+        let length_ref = OpRef(63);
+        let src_start_ref = OpRef(64);
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx], d.clone()),
+            Op::with_descr(
+                OpCode::CallN,
+                &[
+                    OpRef(300),
+                    OpRef(100),
+                    OpRef(200),
+                    src_start_ref,
+                    dst_start_ref,
+                    length_ref,
+                ],
+                ac_d,
+            ),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(dst_start_ref, majit_ir::Value::Int(2));
+        ctx.make_constant(length_ref, majit_ir::Value::Int(3));
+        ctx.make_constant(src_start_ref, majit_ir::Value::Int(0));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+            }
+        }
+
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 2,
+            "arraycopy must invalidate variable-index cache for destination array"
+        );
+    }
+
+    #[test]
+    fn test_arraycopy_keeps_other_array_variable_index_cache() {
+        let d = descr(0);
+        let ac_d = arraycopy_descr(50);
+        let idx = OpRef(60);
+        let dst_start_ref = OpRef(62);
+        let length_ref = OpRef(63);
+        let src_start_ref = OpRef(64);
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(400), idx], d.clone()),
+            Op::with_descr(
+                OpCode::CallN,
+                &[
+                    OpRef(300),
+                    OpRef(100),
+                    OpRef(200),
+                    src_start_ref,
+                    dst_start_ref,
+                    length_ref,
+                ],
+                ac_d,
+            ),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(400), idx], d.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(dst_start_ref, majit_ir::Value::Int(2));
+        ctx.make_constant(length_ref, majit_ir::Value::Int(3));
+        ctx.make_constant(src_start_ref, majit_ir::Value::Int(0));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+            }
+        }
+
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "arraycopy should preserve variable-index cache for unrelated arrays"
+        );
+    }
+
+    #[test]
+    fn test_arraycopy_preserves_unrelated_field_cache() {
+        let field_d = descr(0);
+        let array_d = descr(1);
+        let ac_d = arraycopy_descr(50);
+        let idx0 = OpRef(60);
+        let dst_start_ref = OpRef(62);
+        let length_ref = OpRef(63);
+        let src_start_ref = OpRef(64);
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(500)], field_d.clone()),
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(200), idx0, OpRef(10)],
+                array_d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::CallN,
+                &[
+                    OpRef(300),
+                    OpRef(100),
+                    OpRef(200),
+                    src_start_ref,
+                    dst_start_ref,
+                    length_ref,
+                ],
+                ac_d,
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(500)], field_d),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.make_constant(idx0, majit_ir::Value::Int(0));
+        ctx.make_constant(dst_start_ref, majit_ir::Value::Int(0));
+        ctx.make_constant(length_ref, majit_ir::Value::Int(1));
+        ctx.make_constant(src_start_ref, majit_ir::Value::Int(0));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+            }
+        }
+
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "arraycopy should not invalidate unrelated field caches"
         );
     }
 
