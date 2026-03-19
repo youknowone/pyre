@@ -932,54 +932,27 @@ impl OptVirtualize {
     ///   - If a field value is itself virtual, force it (no recursive encoding yet)
     ///
     /// Non-virtual fail_args are resolved normally.
+    /// Force virtual references in guard fail_args and re-resolve all args.
+    ///
+    /// TODO: when encode_guard_virtuals in optimizer.rs is enabled, this
+    /// method should skip forcing and let the optimizer handle encoding.
+    /// Currently forces all virtuals for backend compatibility.
     fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let mut guard_op = op.clone();
-        let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
-
-        if let Some(ref mut fail_args) = guard_op.fail_args {
-            // First pass: identify which fail_args are virtual
-            let original_len = fail_args.len();
-            let mut extra_fail_args: Vec<OpRef> = Vec::new();
-
-            for fa_idx in 0..original_len {
-                let resolved = ctx.get_replacement(fail_args[fa_idx]);
-                if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
-                    if info.is_virtual() {
-                        if let Some(entry) = self.encode_virtual_entry(
-                            fa_idx,
-                            &info,
-                            original_len + extra_fail_args.len(),
-                            &mut extra_fail_args,
-                            ctx,
-                        ) {
-                            virtual_entries.push(entry);
-                            fail_args[fa_idx] = OpRef::NONE;
-                            continue;
-                        }
-                        // Encoding failed (unsupported virtual kind), fall back to force
-                        self.force_virtual(resolved, ctx);
-                    }
-                }
-                fail_args[fa_idx] = ctx.get_replacement(fail_args[fa_idx]);
-            }
-
-            // Append extra fail_args (field values of virtuals)
-            for extra in extra_fail_args {
-                fail_args.push(extra);
+        if let Some(ref fail_args) = op.fail_args {
+            for &fa in fail_args {
+                let resolved = ctx.get_replacement(fa);
+                self.force_virtual(resolved, ctx);
             }
         }
-
-        // Resolve main guard args
+        let mut guard_op = op.clone();
+        if let Some(ref mut fa) = guard_op.fail_args {
+            for arg in fa.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+        }
         for arg in &mut guard_op.args {
             *arg = ctx.get_replacement(*arg);
         }
-
-        guard_op.rd_virtuals = if virtual_entries.is_empty() {
-            None
-        } else {
-            Some(virtual_entries)
-        };
-
         OptimizationResult::Replace(guard_op)
     }
 
@@ -1215,7 +1188,24 @@ impl OptVirtualize {
 
     /// Handle operations that may cause virtuals to escape.
     fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let forced = self.force_all_args(op, ctx);
+        let mut forced = op.clone();
+        let frame_ref = ctx.get_replacement(OpRef(0));
+        for arg in &mut forced.args {
+            let resolved = ctx.get_replacement(*arg);
+            if self.vable_config.is_some()
+                && resolved == frame_ref
+                && matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_)))
+            {
+                *arg = resolved;
+                continue;
+            }
+            if Self::is_virtual(resolved, ctx) {
+                let forced_arg = self.force_virtual(resolved, ctx);
+                *arg = ctx.get_replacement(forced_arg);
+            } else {
+                *arg = resolved;
+            }
+        }
         self.clear_forced_field_caches();
         OptimizationResult::Replace(forced)
     }
@@ -1587,52 +1577,37 @@ impl Optimization for OptVirtualize {
                     self.force_virtual(arg, ctx);
                 }
 
-                // Guards: encode virtual fail_args as resume data
+                // Guards: force virtual fail_args (encode_guard_virtuals in
+                // optimizer.rs will handle rd_virtuals encoding when enabled)
                 if is_guard {
                     let mut guard_op = op.clone();
-                    let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
 
-                    if let Some(ref mut fail_args) = guard_op.fail_args {
-                        let original_len = fail_args.len();
-                        let mut extra_fail_args: Vec<OpRef> = Vec::new();
-
-                        for fa_idx in 0..original_len {
-                            let resolved = ctx.get_replacement(fail_args[fa_idx]);
-                            if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
-                                if info.is_virtual() {
-                                    if let Some(entry) = self.encode_virtual_entry(
-                                        fa_idx,
-                                        &info,
-                                        original_len + extra_fail_args.len(),
-                                        &mut extra_fail_args,
-                                        ctx,
-                                    ) {
-                                        virtual_entries.push(entry);
-                                        fail_args[fa_idx] = OpRef::NONE;
-                                        continue;
-                                    }
-                                    // Encoding failed, fall back to force
-                                    self.force_virtual(resolved, ctx);
-                                }
+                    if let Some(ref fail_args) = guard_op.fail_args {
+                        for &fa in fail_args {
+                            let resolved = ctx.get_replacement(fa);
+                            if self.vable_config.is_some()
+                                && resolved == ctx.get_replacement(OpRef(0))
+                                && matches!(
+                                    ctx.get_ptr_info(resolved),
+                                    Some(PtrInfo::Virtualizable(_))
+                                )
+                            {
+                                continue;
                             }
-                            fail_args[fa_idx] = ctx.get_replacement(fail_args[fa_idx]);
-                        }
-
-                        for extra in extra_fail_args {
-                            fail_args.push(extra);
+                            self.force_virtual(resolved, ctx);
                         }
                     }
 
-                    // Re-resolve op args
+                    // Re-resolve op args and fail_args
                     for arg in &mut guard_op.args {
                         *arg = ctx.get_replacement(*arg);
                     }
 
-                    guard_op.rd_virtuals = if virtual_entries.is_empty() {
-                        None
-                    } else {
-                        Some(virtual_entries)
-                    };
+                    if let Some(ref mut fa) = guard_op.fail_args {
+                        for arg in fa.iter_mut() {
+                            *arg = ctx.get_replacement(*arg);
+                        }
+                    }
 
                     if self.vable_config.is_some() {
                         self.augment_guard_with_virtualizable(&mut guard_op, ctx);
@@ -2124,6 +2099,75 @@ mod tests {
         assert!(
             ctx.new_operations.is_empty(),
             "standard virtualizable guard should not emit raw heap reads"
+        );
+    }
+
+    #[test]
+    fn test_standard_virtualizable_guard_fail_frame_is_not_forced_to_raw_storeback() {
+        let mut ctx = OptContext::with_num_inputs(8, 3);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![8],
+            static_field_types: vec![Type::Int],
+            array_field_offsets: vec![24],
+            array_item_types: vec![Type::Int],
+            array_lengths: vec![1],
+        });
+        pass.setup();
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(99)]);
+        guard.fail_args = Some(Default::default());
+        guard
+            .fail_args
+            .as_mut()
+            .expect("guard should have fail args")
+            .push(OpRef(0));
+
+        let replaced = match pass.propagate_forward(&guard, &mut ctx) {
+            OptimizationResult::Replace(op) => op,
+            other => panic!("expected guard replacement, got {other:?}"),
+        };
+        let fail_args = replaced.fail_args.expect("guard should have fail args");
+        assert_eq!(fail_args[0], OpRef(0));
+        assert_eq!(fail_args[1], OpRef(1));
+        assert_eq!(ctx.get_constant_box(fail_args[2]), Some(Value::Int(1)));
+        assert_eq!(fail_args[3], OpRef(2));
+        assert!(
+            ctx.new_operations
+                .iter()
+                .all(|op| op.opcode != OpCode::SetfieldRaw),
+            "standard virtualizable guard should not force frame writeback"
+        );
+    }
+
+    #[test]
+    fn test_standard_virtualizable_call_does_not_force_frame_to_raw_storeback() {
+        let mut ctx = OptContext::with_num_inputs(8, 3);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![8, 16],
+            static_field_types: vec![Type::Int, Type::Int],
+            array_field_offsets: vec![],
+            array_item_types: vec![],
+            array_lengths: vec![],
+        });
+        pass.setup();
+
+        let mut call = Op::new(OpCode::CallMayForceI, &[OpRef(0), OpRef(100), OpRef(1)]);
+        call.descr = Some(majit_ir::descr::make_call_descr(
+            vec![Type::Int, Type::Int, Type::Int],
+            Type::Int,
+            majit_ir::EffectInfo::default(),
+        ));
+
+        let replaced = match pass.propagate_forward(&call, &mut ctx) {
+            OptimizationResult::Replace(op) => op,
+            other => panic!("expected call replacement, got {other:?}"),
+        };
+        assert_eq!(replaced.arg(0), OpRef(0));
+        assert!(
+            ctx.new_operations
+                .iter()
+                .all(|op| op.opcode != OpCode::SetfieldRaw),
+            "standard virtualizable call should not force frame writeback"
         );
     }
 

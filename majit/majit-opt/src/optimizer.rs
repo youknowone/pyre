@@ -686,7 +686,19 @@ impl Optimizer {
     /// in guard fail_args as rd_virtuals for lazy reconstruction on guard
     /// failure. RPython does this in the optimizer's store_final_boxes_in_guard,
     /// which runs for every guard regardless of which pass emits it.
-    fn encode_guard_virtuals(mut op: Op, ctx: &mut OptContext) -> Op {
+    fn encode_guard_virtuals(op: Op, _ctx: &mut OptContext) -> Op {
+        // TODO: virtual fail_arg encoding is implemented but temporarily
+        // disabled while the backend integration is completed. The backend
+        // needs extra fail_args to have matching fail_arg_types entries,
+        // and the recovery layout must handle the expanded fail_args array.
+        //
+        // RPython reference: optimizer.py:store_final_boxes_in_guard
+        // creates ResumeDataVirtualAdder which handles this coordination.
+        op
+    }
+
+    #[allow(dead_code)]
+    fn encode_guard_virtuals_impl(mut op: Op, ctx: &mut OptContext) -> Op {
         use crate::info::PtrInfo;
         use majit_ir::GuardVirtualEntry;
 
