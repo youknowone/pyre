@@ -1199,7 +1199,10 @@ impl<M: Clone> MetaInterp<M> {
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can track field accesses.
-        let vable_config = self.virtualizable_info.as_ref().map(|vinfo| {
+        // NOTE: disabled — VirtualizableConfig causes OptVirtualize to put
+        // raw ints into frame locals via writeback, crashing compiled code.
+        // Re-enable after fixing virtualizable writeback for raw-int protocol.
+        let _vable_config_disabled = self.virtualizable_info.as_ref().map(|vinfo| {
             majit_opt::virtualize::VirtualizableConfig {
                 static_field_offsets: vinfo.static_fields.iter().map(|f| f.offset).collect(),
                 static_field_types: vinfo.static_fields.iter().map(|f| f.field_type).collect(),
@@ -1213,7 +1216,7 @@ impl<M: Clone> MetaInterp<M> {
                 &trace.ops,
                 &mut constants,
                 trace.inputargs.len(),
-                vable_config,
+                None, // vable_config disabled — see note above
             );
         let num_ops_after = optimized_ops.len();
 
