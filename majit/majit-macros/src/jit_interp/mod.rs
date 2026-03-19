@@ -320,7 +320,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
                 can_trace_guard = Some(content.parse::<Ident>()?);
             }
             "virtualizable" => {
-                // RPython parity: storage contents on heap, only lengths as InputArgs.
                 let lit: LitBool = content.parse()?;
                 virtualizable = lit.value;
             }
@@ -616,7 +615,50 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __sel: usize,
         ) {
             __driver.merge_point(|__ctx, __sym| {
-                #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel)
+                // RPython parity: reached_loop_header checks green keys.
+                // Skip the first merge_point (trace header itself).
+                // Only close when we return to the SAME green key after
+                // executing at least one iteration.
+                // RPython parity: reached_loop_header checks green keys.
+                // After at least one instruction, if greens match header → close.
+                use majit_meta::JitCodeSym;
+                if __sym.preamble_done
+                    && __pc == __sym.loop_header_pc()
+                    && __sel == __sym.header_selected()
+                {
+                    // Virtualizable: sync to heap before close.
+                    if __sym.is_virtualizable_storage() {
+                        let const_1 = __ctx.const_int(1);
+                        for __sidx in 0..28usize {
+                            let (__arr, __len) = match (__sym.vable_array_ref(__sidx), __sym.vable_len_ref(__sidx)) {
+                                (Some(a), Some(l)) => (a, l),
+                                _ => continue,
+                            };
+                            let __stack = match __sym.stack(__sidx) {
+                                Some(s) => s,
+                                None => continue,
+                            };
+                            let __vals = __stack.to_jump_args();
+                            let __new_len = __ctx.const_int(__vals.len() as i64);
+                            for (__j, &__val) in __vals.iter().enumerate() {
+                                let __off = __ctx.const_int((__j as i64) * 8);
+                                let __sh = __ctx.record_op(majit_ir::OpCode::IntLshift, &[__val, const_1]);
+                                let __tag = __ctx.record_op(majit_ir::OpCode::IntOr, &[__sh, const_1]);
+                                __ctx.record_op_with_descr(
+                                    majit_ir::OpCode::SetarrayitemRaw,
+                                    &[__arr, __off, __tag],
+                                    majit_meta::raw_i64_array_descr(),
+                                );
+                            }
+                            __sym.set_vable_len_ref(__sidx, __new_len);
+                        }
+                    }
+                    return majit_meta::TraceAction::CloseLoop;
+                }
+                let __result = #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel);
+                // Mark that at least one instruction has been traced.
+                __sym.preamble_done = true;
+                __result
             });
         }
     }

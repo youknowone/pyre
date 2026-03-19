@@ -238,6 +238,11 @@ pub trait JitCodeSym {
     fn stack_mut(&mut self, selected: usize) -> Option<&mut SymbolicStack>;
     fn total_slots(&self) -> usize;
     fn loop_header_pc(&self) -> usize;
+    /// RPython parity: initial_selected at the trace header.
+    /// Used by BC_JUMP_TARGET to check green key match before CloseLoop.
+    fn header_selected(&self) -> usize {
+        self.current_selected()
+    }
     /// Create a symbolic stack for a storage not in the initial layout.
     fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize);
     /// Full interpreter-visible state to materialize on guard failure.
@@ -913,7 +918,9 @@ where
                     value
                 };
                 let pc = self.frames.current_mut().pc;
-                let close_loop = runtime.label_at(pc) == sym.loop_header_pc();
+                // RPython parity: check ALL green keys (pc + selected).
+                let close_loop = runtime.label_at(pc) == sym.loop_header_pc()
+                    && sym.current_selected() == sym.header_selected();
                 let cond = {
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                     stack.pop().expect("branch_zero on empty symbolic stack")
@@ -957,9 +964,11 @@ where
             }
             BC_JUMP_TARGET => {
                 let pc = self.frames.current_mut().pc;
-                if runtime.label_at(pc) == sym.loop_header_pc() {
-                    // Virtualizable: sync symbolic stack back to heap before close.
-                    // RPython: synchronize_virtualizable() in reached_loop_header().
+                // RPython parity: reached_loop_header checks ALL green keys.
+                // Only close if both pc AND selected match the header.
+                if runtime.label_at(pc) == sym.loop_header_pc()
+                    && sym.current_selected() == sym.header_selected()
+                {
                     if sym.is_virtualizable_storage() {
                         Self::sync_virtualizable_to_heap(ctx, sym);
                     }
