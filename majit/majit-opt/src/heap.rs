@@ -195,6 +195,45 @@ impl OptHeap {
         self.force_all_lazy_setarrayitems(ctx);
     }
 
+    /// heap.py: force_lazy_sets_for_guard()
+    ///
+    /// For guards, we don't need to force ALL lazy sets. Virtual values
+    /// that would be written by lazy sets can be recorded as pendingfields
+    /// instead (they'll be materialized on guard failure). Only non-virtual
+    /// lazy sets need to be emitted before the guard.
+    ///
+    /// Returns the list of ops that should go into pendingfields.
+    fn force_lazy_sets_for_guard(&mut self, ctx: &mut OptContext) -> Vec<Op> {
+        let mut pendingfields = Vec::new();
+
+        // Force lazy setfields: virtual values → pendingfields, rest → emit
+        let field_entries: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
+        for (key, op) in field_entries {
+            let value_ref = op.arg(1);
+            // Check if the value being set is virtual (unescaped allocation)
+            if self.unescaped.contains(&value_ref) {
+                pendingfields.push(op);
+            } else {
+                ctx.emit(op);
+                self.cached_fields.insert(key, value_ref);
+            }
+        }
+
+        // Force lazy setarrayitems: same logic
+        let array_entries: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
+        for (key, op) in array_entries {
+            let value_ref = op.arg(2);
+            if self.unescaped.contains(&value_ref) {
+                pendingfields.push(op);
+            } else {
+                ctx.emit(op);
+                self.cached_arrayitems.insert(key, value_ref);
+            }
+        }
+
+        pendingfields
+    }
+
     /// Invalidate caches on calls and other side-effecting operations.
     ///
     /// Caches that survive:
