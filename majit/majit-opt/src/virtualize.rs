@@ -971,6 +971,14 @@ impl OptVirtualize {
     /// RPython parity: virtualize.py does NOT force fail_args.
     /// encode_guard_virtuals in optimizer.rs handles virtual encoding at emit time.
     fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // Force all virtuals while encode_guard_virtuals is disabled.
+        // TODO: use prepare_guard_fail_arg when encoding is enabled.
+        if let Some(ref fail_args) = op.fail_args {
+            for &fa in fail_args {
+                let resolved = ctx.get_replacement(fa);
+                self.force_virtual(resolved, ctx);
+            }
+        }
         let mut guard_op = op.clone();
         if let Some(ref mut fa) = guard_op.fail_args {
             for arg in fa.iter_mut() {
@@ -981,6 +989,86 @@ impl OptVirtualize {
             *arg = ctx.get_replacement(*arg);
         }
         OptimizationResult::Replace(guard_op)
+    }
+
+    fn prepare_guard_fail_arg(&mut self, resolved: OpRef, ctx: &mut OptContext) -> OpRef {
+        let Some(info) = ctx.get_ptr_info(resolved).cloned() else {
+            return resolved;
+        };
+        match info {
+            PtrInfo::Virtual(vinfo) => {
+                if Self::guard_virtual_fields_require_concrete_fallback(
+                    &vinfo.fields,
+                    &vinfo.field_descrs,
+                    ctx,
+                ) {
+                    let forced = self.force_virtual(resolved, ctx);
+                    ctx.get_replacement(forced)
+                } else {
+                    resolved
+                }
+            }
+            PtrInfo::VirtualStruct(vinfo) => {
+                if Self::guard_virtual_fields_require_concrete_fallback(
+                    &vinfo.fields,
+                    &vinfo.field_descrs,
+                    ctx,
+                ) {
+                    let forced = self.force_virtual(resolved, ctx);
+                    ctx.get_replacement(forced)
+                } else {
+                    resolved
+                }
+            }
+            PtrInfo::Virtualizable(_) => resolved,
+            other if other.is_virtual() => {
+                let forced = self.force_virtual(resolved, ctx);
+                ctx.get_replacement(forced)
+            }
+            _ => resolved,
+        }
+    }
+
+    fn guard_virtual_fields_require_concrete_fallback(
+        fields: &[(u32, OpRef)],
+        field_descrs: &[(u32, DescrRef)],
+        ctx: &OptContext,
+    ) -> bool {
+        fields.iter().any(|&(field_idx, value_ref)| {
+            let is_ref_field = field_descrs
+                .iter()
+                .find_map(|(idx, descr)| {
+                    (*idx == field_idx).then(|| {
+                        descr.as_field_descr()
+                            .map(|fd| fd.field_type() == Type::Ref)
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if !is_ref_field {
+                return false;
+            }
+            let resolved = ctx.get_replacement(value_ref);
+            !Self::guard_resume_value_is_concrete(resolved, ctx)
+        })
+    }
+
+    fn guard_resume_value_is_concrete(resolved: OpRef, ctx: &OptContext) -> bool {
+        if resolved.is_none() {
+            return true;
+        }
+        if let Some(info) = ctx.get_ptr_info(resolved) {
+            if info.is_virtual() {
+                return false;
+            }
+        }
+        if ctx.get_constant(resolved).is_some() {
+            return true;
+        }
+        if (resolved.0 as usize) < ctx.num_inputs() {
+            return true;
+        }
+        ctx.new_operations.iter().any(|op| op.pos == resolved)
     }
 
     /// Encode a single virtual PtrInfo into a GuardVirtualEntry.
@@ -1337,6 +1425,24 @@ impl OptVirtualize {
                 fail_args.push(zero);
             }
         }
+
+        // Sync descr types with augmented fail_args length.
+        let fail_args_len = op.fail_args.as_ref().map_or(0, |fa| fa.len());
+        if let Some(ref descr) = op.descr {
+            if let Some(fd) = descr.as_fail_descr() {
+                if fd.fail_arg_types().len() < fail_args_len {
+                    let mut types = fd.fail_arg_types().to_vec();
+                    while types.len() < fail_args_len {
+                        types.push(majit_ir::Type::Int);
+                    }
+                    op.descr = Some(std::sync::Arc::new(majit_ir::SimpleFailDescr::new(
+                        fd.fail_index(),
+                        fd.fail_index(),
+                        types,
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -1607,9 +1713,17 @@ impl Optimization for OptVirtualize {
                     self.force_virtual(arg, ctx);
                 }
 
-                // Guards: don't force fail_args — encode_guard_virtuals handles it
+                // Force fail_args for stability while encode_guard_virtuals is disabled.
+                // TODO: when encode_guard_virtuals is enabled, use prepare_guard_fail_arg instead.
                 if is_guard {
                     let mut guard_op = op.clone();
+
+                    if let Some(ref fail_args) = guard_op.fail_args {
+                        for &fa in fail_args {
+                            let resolved = ctx.get_replacement(fa);
+                            self.force_virtual(resolved, ctx);
+                        }
+                    }
 
                     for arg in &mut guard_op.args {
                         *arg = ctx.get_replacement(*arg);
@@ -1837,6 +1951,10 @@ mod tests {
         Arc::new(TestFieldDescr { idx })
     }
 
+    fn ref_field_descr(idx: u32) -> DescrRef {
+        majit_ir::make_field_descr(idx as usize * 8, 8, Type::Ref, false)
+    }
+
     fn array_descr(idx: u32) -> DescrRef {
         Arc::new(TestArrayDescr { idx })
     }
@@ -1965,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn test_virtualizable_array_first_read_is_cached() {
+    fn test_standard_virtualizable_raw_first_read_is_not_cached() {
         let mut ctx = OptContext::with_num_inputs(8, 1);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
@@ -2019,13 +2137,13 @@ mod tests {
             .filter(|op| op.opcode == OpCode::GetarrayitemRawI)
             .count();
         assert_eq!(
-            get_count, 1,
-            "second array read should forward from cached virtualizable state"
+            get_count, 2,
+            "standard virtualizable path should not absorb raw array reads into optimizer-owned state"
         );
     }
 
     #[test]
-    fn test_virtualizable_guard_captures_first_read_array_values() {
+    fn test_standard_virtualizable_guard_ignores_raw_first_read_array_values() {
         let mut ctx = OptContext::with_num_inputs(8, 1);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
@@ -2074,9 +2192,8 @@ mod tests {
             other => panic!("expected guard replacement, got {other:?}"),
         };
         let fail_args = replaced.fail_args.expect("guard should have fail args");
-        assert_eq!(fail_args.len(), 2);
-        assert_eq!(ctx.get_constant_box(fail_args[0]), Some(Value::Int(1)));
-        assert_eq!(fail_args[1], OpRef(1));
+        assert_eq!(fail_args.len(), 1);
+        assert_eq!(ctx.get_constant_box(fail_args[0]), Some(Value::Int(0)));
     }
 
     #[test]
@@ -3390,5 +3507,81 @@ mod tests {
         // fa[0] = NONE, fa[1] = field_a value, fa[2] = field_b value
         assert!(fa[0].is_none());
         assert_eq!(fa.len(), 3, "1 original + 2 field values");
+    }
+
+    #[test]
+    fn test_guard_fail_args_nested_virtual_field_is_forced_to_concrete() {
+        let outer_sd = size_descr(1);
+        let inner_sd = size_descr(2);
+        let outer_fd = ref_field_descr(10);
+        let inner_fd = field_descr(20);
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(30)]);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], outer_sd),
+            Op::with_descr(OpCode::New, &[], inner_sd),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(40)], inner_fd),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], outer_fd),
+            guard,
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+        let guard_op = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard should be emitted");
+        let fa = guard_op.fail_args.as_ref().unwrap();
+        assert!(
+            guard_op.rd_virtuals.is_none(),
+            "nested virtual fields should force the root fail_arg concrete instead of rd_virtuals"
+        );
+        assert!(
+            !fa[0].is_none(),
+            "root fail_arg should be forced concrete when nested virtual fields are present"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|op| matches!(op.opcode, OpCode::New | OpCode::NewWithVtable)),
+            "forcing the root virtual should emit concrete allocation ops"
+        );
+    }
+
+    #[test]
+    fn test_guard_fail_args_unsupported_virtual_array_is_forced() {
+        let ad = array_descr(30);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewArray, &[OpRef(10)], ad.clone()),
+            Op::with_descr(OpCode::SetarrayitemGc, &[OpRef(0), OpRef(11), OpRef(12)], ad),
+            guard,
+        ];
+        assign_positions(&mut ops);
+
+        let constants = &[
+            (OpRef(10), Value::Int(1)),
+            (OpRef(11), Value::Int(0)),
+            (OpRef(12), Value::Int(99)),
+        ];
+        let result = run_pass_with_constants(&ops, constants);
+        let guard_op = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard should be emitted");
+
+        assert!(
+            guard_op.rd_virtuals.is_none(),
+            "unsupported virtual arrays should fall back to concrete fail_args"
+        );
+        let fa = guard_op.fail_args.as_ref().unwrap();
+        assert!(
+            !fa[0].is_none(),
+            "virtual array fail_arg should be forced to a concrete value"
+        );
     }
 }
