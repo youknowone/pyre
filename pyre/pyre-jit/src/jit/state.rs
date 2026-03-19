@@ -1662,6 +1662,18 @@ impl TraceFrameState {
 
                 match driver.should_inline(callee_key) {
                     majit_meta::InlineDecision::CallAssembler => {
+                        // Trace-through: inline callee body instead of CallAssembler.
+                        // Guards use parent_fail_args to avoid OpRef::NONE in fail_args.
+                        if !is_self_recursive && nargs <= 4 {
+                            if let Ok(result) = self.trace_through_callee(
+                                callable,
+                                args,
+                                concrete_callable,
+                                callee_key,
+                            ) {
+                                return Ok(result);
+                            }
+                        }
                         let Some(token_number) = driver.get_loop_token_number(callee_key) else {
                             return self.with_ctx(|this, ctx| {
                                 this.guard_value(ctx, callable, concrete_callable as i64);
@@ -1783,12 +1795,6 @@ impl TraceFrameState {
         callee_key: u64,
     ) -> Result<OpRef, PyError> {
         use pyre_interp::frame::PyFrame;
-
-        // Only trace-through when caller has valid virtualizable state.
-        // Finish traces and nested inlines don't have vable_next_instr set.
-        if self.sym().vable_next_instr.is_none() {
-            return Err(PyError::type_error("no vable state for trace-through"));
-        }
 
         let (driver, _) = crate::eval::driver_pair();
         driver.enter_inline_frame(callee_key);
