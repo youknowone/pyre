@@ -1285,7 +1285,9 @@ impl Optimization for OptIntBounds {
             // intbounds.py: postprocess_GETFIELD_RAW_I — integer-bounded fields.
             // If the descriptor indicates a bounded integer field (e.g. u8, u16),
             // narrow the result bound to [min, max].
-            OpCode::GetfieldRawI | OpCode::GetfieldGcI => {
+            OpCode::GetfieldRawI
+            | OpCode::GetfieldGcI
+            | OpCode::GetinteriorfieldGcI => {
                 if let Some(ref d) = op.descr {
                     let (field_size, signed) = d.field_size_and_sign();
                     if field_size > 0 && field_size < 8 {
@@ -1298,6 +1300,32 @@ impl Optimization for OptIntBounds {
                         self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
                     }
                 }
+                OptimizationResult::PassOn
+            }
+
+            // intbounds.py: postprocess_GETARRAYITEM_RAW_I — bounded array items.
+            OpCode::GetarrayitemRawI => {
+                if let Some(ref d) = op.descr {
+                    if let Some(ad) = d.as_array_descr() {
+                        let item_size = ad.item_size();
+                        if item_size > 0 && item_size < 8 {
+                            let signed = ad.is_item_signed();
+                            let (lo, hi) = if signed {
+                                let half = 1i64 << (item_size * 8 - 1);
+                                (-half, half - 1)
+                            } else {
+                                (0, (1i64 << (item_size * 8)) - 1)
+                            };
+                            self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
+                        }
+                    }
+                }
+                OptimizationResult::PassOn
+            }
+
+            // intbounds.py: postprocess_STRLEN — result >= 0.
+            OpCode::Strlen | OpCode::Unicodelen => {
+                self.intersect_bound(op.pos, &IntBound::nonnegative());
                 OptimizationResult::PassOn
             }
 
