@@ -168,6 +168,25 @@ impl UnrollOptimizer {
         result
     }
 
+    /// optimize_trace with constants AND explicit num_inputs.
+    /// compile.py: compile_loop → optimize with preamble peeling.
+    pub fn optimize_trace_with_constants_and_inputs(
+        &mut self,
+        ops: &[Op],
+        constants: &mut std::collections::HashMap<u32, i64>,
+        num_inputs: usize,
+    ) -> (Vec<Op>, usize) {
+        let mut optimizer = crate::optimizer::Optimizer::default_pipeline();
+        optimizer.add_pass(Box::new(OptUnroll::new()));
+        let result = optimizer.optimize_with_constants_and_inputs(ops, constants, num_inputs);
+        let final_num_inputs = optimizer.final_num_inputs();
+        let sp = crate::shortpreamble::extract_short_preamble(&result);
+        if !sp.is_empty() {
+            self.short_preamble = Some(sp);
+        }
+        (result, final_num_inputs)
+    }
+
     /// Count the guards in an optimized trace (for retrace_limit checks).
     pub fn count_guards(ops: &[Op]) -> u32 {
         ops.iter().filter(|op| op.opcode.is_guard()).count() as u32
