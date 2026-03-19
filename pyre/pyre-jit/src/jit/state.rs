@@ -5,10 +5,7 @@
 //! after compiled code runs, and provides the meta/sym types for tracing.
 
 use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
-use majit_meta::virtualizable::{
-    VirtualizableInfo, clear_vable_token, read_all_virtualizable_boxes,
-    write_all_virtualizable_boxes,
-};
+use majit_meta::virtualizable::VirtualizableInfo;
 use majit_meta::{JitDriverStaticData, JitState, TraceAction, TraceCtx};
 
 use pyre_bytecode::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
@@ -29,7 +26,7 @@ use pyre_runtime::{
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
     PyError, PyNamespace, PyObjectArray, SharedOpcodeHandler, StackOpcodeHandler,
     TruthOpcodeHandler, decode_instruction_at, execute_opcode_step, is_builtin_func, is_func,
-    range_iter_continues, w_builtin_func_name, w_func_get_code_ptr,
+    range_iter_continues, w_builtin_func_name, w_func_get_code_ptr, w_func_get_globals,
 };
 
 use crate::jit::descr::{
@@ -98,6 +95,7 @@ pub struct PyreSym {
     pub(crate) symbolic_initialized: bool,
     pub(crate) vable_next_instr: OpRef,
     pub(crate) vable_valuestackdepth: OpRef,
+    pub(crate) symbolic_namespace_slots: std::collections::HashMap<usize, OpRef>,
     /// Base OpRef index for virtualizable array slots.
     /// When set, symbolic_locals[i] = OpRef(vable_array_base + i),
     /// symbolic_stack[j] = OpRef(vable_array_base + nlocals + j).
@@ -119,6 +117,7 @@ pub(crate) struct TraceFrameState {
     fallthrough_pc: usize,
     /// PyPy capture_resumedata: parent frame fail_args for multi-frame guards.
     pub(crate) parent_fail_args: Option<Vec<OpRef>>,
+    pending_inline_frame: Option<PendingInlineFrame>,
 }
 
 /// Environment context — currently unused.
@@ -146,6 +145,17 @@ fn frame_namespace_descr() -> DescrRef {
 
 pub(crate) fn trace_ob_type_descr() -> DescrRef {
     make_field_descr(OB_TYPE_OFFSET, 8, Type::Int, false)
+}
+
+fn box_traced_raw_int(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
+    crate::jit::helpers::emit_box_int_inline(
+        ctx,
+        value,
+        w_int_size_descr(),
+        ob_type_descr(),
+        int_intval_descr(),
+        &INT_TYPE as *const _ as i64,
+    )
 }
 
 pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
@@ -241,6 +251,14 @@ pub(crate) fn concrete_namespace_slot(frame: usize, name: &str) -> Option<usize>
     namespace.slot_of(name)
 }
 
+pub(crate) fn concrete_namespace_value(frame: usize, idx: usize) -> Option<PyObjectRef> {
+    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
+    let namespace_ptr =
+        unsafe { *(frame_ptr.add(PYFRAME_NAMESPACE_OFFSET) as *const *mut PyNamespace) };
+    let namespace = (!namespace_ptr.is_null()).then_some(unsafe { &*namespace_ptr })?;
+    namespace.get_slot(idx)
+}
+
 pub(crate) fn record_current_state_guard(
     ctx: &mut TraceCtx,
     frame: OpRef,
@@ -291,6 +309,7 @@ impl PyreSym {
             symbolic_initialized: false,
             vable_next_instr: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
+            symbolic_namespace_slots: std::collections::HashMap::new(),
             vable_array_base: None,
         }
     }
@@ -350,6 +369,7 @@ impl TraceFrameState {
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc,
             parent_fail_args: None,
+            pending_inline_frame: None,
         }
     }
 
@@ -379,23 +399,30 @@ impl TraceFrameState {
     /// PyPy interp_jit.py:89 — hint(self.valuestackdepth, promote=True).
     /// Emits GuardValue on valuestackdepth to force it to a compile-time constant.
     /// This is a no-op if symbolic state isn't ready or if vsd is already constant.
+    /// PyPy interp_jit.py:89 — hint(self.valuestackdepth, promote=True).
+    ///
+    /// Should emit GUARD_VALUE on valuestackdepth to force it to a
+    /// compile-time constant. Currently a no-op because finish traces
+    /// have incomplete vable state that causes fail_args corruption.
+    ///
+    /// Prerequisite: fix virtualizable writeback (raw int leak) so
+    /// vable_valuestackdepth is always valid in all trace types.
     pub(crate) fn promote_valuestackdepth(&mut self, _concrete_frame: usize) {
-        // promote is handled implicitly by the virtualizable mechanism:
-        // valuestackdepth is carried as a JUMP arg and synced at guards.
-        // Explicit GuardValue would be redundant and adds fail_args complexity.
-        // TODO: add explicit promote when the optimizer can exploit it.
+        // No-op until virtualizable writeback is fixed.
+        // The virtualizable mechanism carries valuestackdepth as a JUMP
+        // arg, providing implicit promotion for loop traces.
     }
 
     /// Build fail_args for the current frame only (no multi-frame header).
     /// PyPy opencoder.py create_snapshot().
     fn build_single_frame_fail_args(&self) -> Vec<OpRef> {
         let s = self.sym();
-        let stack_only = s.stack_only_depth();
         let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
         if s.vable_array_base.is_none() {
+            let stack_only = s.stack_only_depth();
             fa.extend_from_slice(&s.symbolic_locals);
+            fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         }
-        fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         fa
     }
 
@@ -514,6 +541,9 @@ impl TraceFrameState {
         ctx: &mut TraceCtx,
         idx: usize,
     ) -> Result<OpRef, PyError> {
+        if let Some(value) = self.sym().symbolic_namespace_slots.get(&idx).copied() {
+            return Ok(value);
+        }
         let frame = self.sym().frame;
         let namespace = frame_namespace_ptr(ctx, frame);
         let len = ctx.record_op_with_descr(
@@ -528,7 +558,9 @@ impl TraceFrameState {
             namespace_values_ptr_descr(),
         );
         let idx_const = ctx.const_int(idx as i64);
-        Ok(trace_raw_array_getitem_value(ctx, values, idx_const))
+        let value = trace_raw_array_getitem_value(ctx, values, idx_const);
+        self.sym_mut().symbolic_namespace_slots.insert(idx, value);
+        Ok(value)
     }
 
     pub(crate) fn store_namespace_value(
@@ -552,6 +584,7 @@ impl TraceFrameState {
         );
         let idx_const = ctx.const_int(idx as i64);
         trace_raw_array_setitem_value(ctx, values, idx_const, value);
+        self.sym_mut().symbolic_namespace_slots.insert(idx, value);
         Ok(())
     }
 
@@ -578,30 +611,75 @@ impl TraceFrameState {
         s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
     }
 
+    fn materialize_loop_carried_value(
+        &mut self,
+        ctx: &mut TraceCtx,
+        value: OpRef,
+        concrete_value: Option<PyObjectRef>,
+    ) -> OpRef {
+        let Some(concrete_value) = concrete_value else {
+            return value;
+        };
+        unsafe {
+            if is_int(concrete_value) {
+                let raw_value = self.trace_guarded_int_payload(ctx, value);
+                return crate::jit::helpers::emit_box_int_inline(
+                    ctx,
+                    raw_value,
+                    w_int_size_descr(),
+                    ob_type_descr(),
+                    int_intval_descr(),
+                    &INT_TYPE as *const _ as i64,
+                );
+            }
+        }
+        value
+    }
+
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame(ctx);
-        let s = self.sym();
-        let stack_only = s.stack_only_depth();
-        let mut args = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
-        args.extend_from_slice(&s.symbolic_locals);
-        args.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
+        let (frame, next_instr, stack_depth, nlocals, locals, stack) = {
+            let s = self.sym();
+            let stack_only = s.stack_only_depth();
+            (
+                s.frame,
+                s.vable_next_instr,
+                s.vable_valuestackdepth,
+                s.nlocals,
+                s.symbolic_locals.clone(),
+                s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
+            )
+        };
+        let mut args = vec![frame, next_instr, stack_depth];
+        for (idx, value) in locals.into_iter().enumerate() {
+            let concrete_value = concrete_stack_value(self.concrete_frame, idx);
+            args.push(self.materialize_loop_carried_value(ctx, value, concrete_value));
+        }
+        for (stack_idx, value) in stack.into_iter().enumerate() {
+            let concrete_value = concrete_stack_value(self.concrete_frame, nlocals + stack_idx);
+            args.push(self.materialize_loop_carried_value(ctx, value, concrete_value));
+        }
         args
     }
 
     /// Build the current fail_args for guards: [frame, ni, vsd, locals..., stack...]
     pub(crate) fn current_fail_args(&self, _ctx: &mut TraceCtx) -> Vec<OpRef> {
+        if let Some(ref pfa) = self.parent_fail_args {
+            return pfa.clone();
+        }
         let s = self.sym();
-        let stack_only = s.stack_only_depth();
         let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
         // When virtualizable array is active (vable_array_base is set),
-        // DON'T include symbolic_locals in fail_args — they are recovered
-        // from the virtualizable frame via augment_guard_with_virtualizable.
-        // Including them would force virtual New objects to materialize,
-        // preventing boxing elimination.
+        // DON'T include symbolic locals/stack in fail_args. PyPy's
+        // resumedata carries the frame plus virtualizable field snapshots,
+        // and majit's augment_guard_with_virtualizable() appends the
+        // unified locals/stack array after optimization. Including the
+        // symbolic stack here would prematurely force virtual W_Int boxes.
         if s.vable_array_base.is_none() {
+            let stack_only = s.stack_only_depth();
             fa.extend_from_slice(&s.symbolic_locals);
+            fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         }
-        fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         fa
     }
 
@@ -611,26 +689,24 @@ impl TraceFrameState {
         // If parent_fail_args is set (inlined callee), use parent's
         // state for guard recovery instead of callee's vable fields.
         if let Some(ref pfa) = self.parent_fail_args {
-            let types: Vec<majit_ir::Type> =
-                pfa.iter().map(|_| majit_ir::Type::Int).collect();
+            let types: Vec<majit_ir::Type> = pfa.iter().map(|_| majit_ir::Type::Int).collect();
             ctx.record_guard_typed_with_fail_args(opcode, args, types, pfa);
             return;
         }
 
         self.flush_to_frame(ctx);
         let s = self.sym();
-        let stack_only = s.stack_only_depth();
-        let stack_slice = &s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())];
-        record_current_state_guard(
-            ctx,
-            s.frame,
-            s.vable_next_instr,
-            s.vable_valuestackdepth,
-            &s.symbolic_locals,
-            stack_slice,
-            opcode,
-            args,
-        );
+        let fail_args = if s.vable_array_base.is_some() {
+            vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth]
+        } else {
+            let stack_only = s.stack_only_depth();
+            let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
+            fa.extend_from_slice(&s.symbolic_locals);
+            fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
+            fa
+        };
+        let fail_arg_types = vec![majit_ir::Type::Int; fail_args.len()];
+        ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
     }
 
     pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
@@ -702,20 +778,20 @@ impl TraceFrameState {
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
         self.guard_object_class(ctx, int_obj, &INT_TYPE as *const PyType);
         let actual_value =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[int_obj], int_intval_descr());
+            ctx.record_op_with_descr(OpCode::GetfieldGcI, &[int_obj], int_intval_descr());
         self.guard_value(ctx, actual_value, expected);
     }
 
     fn guard_object_class(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected_type: *const PyType) {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], self.ob_type_fd.clone());
         let expected_type = ctx.const_int(expected_type as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
     }
 
     fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
         self.guard_object_class(ctx, int_obj, &INT_TYPE as *const PyType);
-        ctx.record_op_with_descr(OpCode::GetfieldRawI, &[int_obj], int_intval_descr())
+        ctx.record_op_with_descr(OpCode::GetfieldGcI, &[int_obj], int_intval_descr())
     }
 
     fn concrete_binary_int_operands(&self) -> Option<(i64, i64)> {
@@ -1611,28 +1687,147 @@ impl TraceFrameState {
                 let (driver, _) = crate::eval::driver_pair();
                 let nargs = args.len();
 
-                // PyPy perform_call: trace INTO callee body for non-recursive calls.
-                // Self-recursive calls use CallMayForce (inline_function_call).
+                // PyPy perform_call: trace INTO callee body when the call
+                // should be inlined. Self-recursive portal calls are handled
+                // by max_unroll_recursion in should_inline(); if it still says
+                // Inline, prefer the same trace-through path before falling
+                // back to helper-based CallMayForce.
                 let current_green_key = unsafe {
                     let cf = &*(self.concrete_frame as *const pyre_interp::frame::PyFrame);
                     cf.code as u64
                 };
                 let is_self_recursive = callee_key == current_green_key;
+                let inline_decision = driver.should_inline(callee_key);
+                let inline_framestack_active = self.parent_fail_args.is_some();
 
-                // RPython perform_call: non-recursive helper calls are always
-                // inlined (jtransform.py handle_regular_call → inline_call).
-                // Recursive portal calls go through should_inline for
-                // unroll/call_assembler decisions below.
-                if !is_self_recursive && nargs <= 4 {
-                    if let Ok(result) = self.trace_through_callee(
-                        callable, args, concrete_callable, callee_key,
-                    ) {
+                // RPython perform_call: calls that are still within the
+                // inline policy should trace into the callee body first.
+                //
+                // Self-recursion is still more constrained than PyPy's full
+                // ChangeFrame path, but the MIFrame loop now owns concrete
+                // residual user calls and result-slot replacement directly.
+                // Re-open the root 1-arg recursive subset and validate it
+                // end-to-end before widening further.
+                let can_trace_through = if is_self_recursive {
+                    !inline_framestack_active
+                        && nargs == 1
+                        && crate::call_jit::recursive_force_cache_safe(concrete_callable)
+                } else {
+                    nargs <= 4
+                };
+
+                if inline_decision == majit_meta::InlineDecision::Inline && can_trace_through {
+                    if inline_framestack_active {
+                        if let Ok(pending) = self.build_pending_inline_frame(
+                            callable,
+                            args,
+                            concrete_callable,
+                            callee_key,
+                        ) {
+                            self.pending_inline_frame = Some(pending);
+                            return self
+                                .with_ctx(|_, ctx| Ok(ctx.const_int(pyre_object::PY_NULL as i64)));
+                        }
+                    }
+                    if let Ok(result) =
+                        self.trace_through_callee(callable, args, concrete_callable, callee_key)
+                    {
                         return Ok(result);
                     }
-                    // trace_through failed: fall through to CallMayForce
+                    // trace-through failed: fall through to the older helper
+                    // path so correctness wins over optimization.
                 }
 
-                if driver.should_inline(callee_key) == majit_meta::InlineDecision::Inline {
+                // PyPy converges self-recursion to separate functrace +
+                // call_assembler once compiled code exists. Our current
+                // self-recursive "Inline" path is still helper-boundary,
+                // so prefer direct CallAssembler as soon as a compiled token
+                // exists instead of paying that extra helper layer.
+                if is_self_recursive
+                    && crate::call_jit::recursive_force_cache_safe(concrete_callable)
+                    && !inline_framestack_active
+                {
+                    if let Some(token_number) = driver.get_loop_token_number(callee_key) {
+                        let callee_meta =
+                            driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
+                                panic!(
+                                    "compiled loop for self-recursive callee_key={callee_key} is missing compiled meta"
+                                )
+                            });
+                        let callee_nlocals = callee_meta.num_locals;
+                        let callee_vsd = callee_meta.valuestackdepth;
+                        let callee_stack_only = callee_vsd.saturating_sub(callee_nlocals);
+                        let target_num_inputs =
+                            driver.get_compiled_num_inputs(callee_key).unwrap_or(1);
+
+                        if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
+                            return self.with_ctx(|this, ctx| {
+                                this.guard_value(ctx, callable, concrete_callable as i64);
+                                let callee_frame = if nargs == 1 {
+                                    ctx.call_int(
+                                        crate::call_jit::jit_create_self_recursive_callee_frame_1
+                                            as *const (),
+                                        &[this.frame(), args[0]],
+                                    )
+                                } else {
+                                    let mut helper_args = vec![this.frame(), callable];
+                                    helper_args.extend_from_slice(args);
+                                    ctx.call_int(frame_helper, &helper_args)
+                                };
+
+                                let ca_args = if target_num_inputs <= 1 {
+                                    vec![callee_frame]
+                                } else if callee_stack_only == 0 {
+                                    synthesize_fresh_callee_entry_args(
+                                        ctx,
+                                        callee_frame,
+                                        args,
+                                        callee_nlocals,
+                                    )
+                                } else {
+                                    let callee_ni = frame_get_next_instr(ctx, callee_frame);
+                                    let callee_sd = frame_get_stack_depth(ctx, callee_frame);
+                                    let mut a = vec![callee_frame, callee_ni, callee_sd];
+                                    let callee_arr =
+                                        frame_locals_cells_stack_array(ctx, callee_frame);
+                                    for i in 0..callee_nlocals {
+                                        let idx = ctx.const_int(i as i64);
+                                        let val = ctx.record_op_with_descr(
+                                            OpCode::GetarrayitemRawI,
+                                            &[callee_arr, idx],
+                                            pyobject_array_descr(),
+                                        );
+                                        a.push(val);
+                                    }
+                                    for i in 0..callee_stack_only {
+                                        let idx = ctx.const_int((callee_nlocals + i) as i64);
+                                        let val = ctx.record_op_with_descr(
+                                            OpCode::GetarrayitemRawI,
+                                            &[callee_arr, idx],
+                                            pyobject_array_descr(),
+                                        );
+                                        a.push(val);
+                                    }
+                                    a
+                                };
+                                let result =
+                                    ctx.call_assembler_int_by_number(token_number, &ca_args);
+                                ctx.call_void(
+                                    crate::call_jit::jit_drop_callee_frame as *const (),
+                                    &[callee_frame],
+                                );
+                                let result = if inline_framestack_active {
+                                    box_traced_raw_int(ctx, result)
+                                } else {
+                                    result
+                                };
+                                Ok(result)
+                            });
+                        }
+                    }
+                }
+
+                if inline_decision == majit_meta::InlineDecision::Inline {
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                         return self.inline_function_call(
                             callable,
@@ -1652,9 +1847,17 @@ impl TraceFrameState {
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                         return self.with_ctx(|this, ctx| {
                             this.guard_value(ctx, callable, concrete_callable as i64);
-                            let mut helper_args = vec![this.frame(), callable];
-                            helper_args.extend_from_slice(args);
-                            let callee_frame = ctx.call_int(frame_helper, &helper_args);
+                            let callee_frame = if is_self_recursive && nargs == 1 {
+                                ctx.call_int(
+                                    crate::call_jit::jit_create_self_recursive_callee_frame_1
+                                        as *const (),
+                                    &[this.frame(), args[0]],
+                                )
+                            } else {
+                                let mut helper_args = vec![this.frame(), callable];
+                                helper_args.extend_from_slice(args);
+                                ctx.call_int(frame_helper, &helper_args)
+                            };
                             let ca_args = synthesize_fresh_callee_entry_args(
                                 ctx,
                                 callee_frame,
@@ -1666,12 +1869,17 @@ impl TraceFrameState {
                                 crate::call_jit::jit_drop_callee_frame as *const (),
                                 &[callee_frame],
                             );
+                            let result = if inline_framestack_active {
+                                box_traced_raw_int(ctx, result)
+                            } else {
+                                result
+                            };
                             Ok(result)
                         });
                     }
                 }
 
-                match driver.should_inline(callee_key) {
+                match inline_decision {
                     majit_meta::InlineDecision::CallAssembler => {
                         // Trace-through: inline callee body instead of CallAssembler.
                         // Guards use parent_fail_args to avoid OpRef::NONE in fail_args.
@@ -1758,6 +1966,13 @@ impl TraceFrameState {
                                     crate::call_jit::jit_drop_callee_frame as *const (),
                                     &[callee_frame],
                                 );
+                                let result = if inline_framestack_active
+                                    && driver.has_raw_int_finish(callee_key)
+                                {
+                                    box_traced_raw_int(ctx, result)
+                                } else {
+                                    result
+                                };
                                 Ok(result)
                             });
                         }
@@ -1793,6 +2008,112 @@ impl TraceFrameState {
         self.trace_call_callable(callable, args)
     }
 
+    fn build_pending_inline_frame(
+        &mut self,
+        callable: OpRef,
+        args: &[OpRef],
+        concrete_callable: PyObjectRef,
+        callee_key: u64,
+    ) -> Result<PendingInlineFrame, PyError> {
+        use pyre_interp::frame::PyFrame;
+
+        self.with_ctx(|this, ctx| {
+            this.guard_value(ctx, callable, concrete_callable as i64);
+        });
+
+        let concrete_args: Vec<PyObjectRef> = (0..args.len())
+            .map(|i| {
+                self.concrete_call_arg_after_pops(i)
+                    .unwrap_or(pyre_object::PY_NULL)
+            })
+            .collect();
+        for (idx, arg) in concrete_args.iter().copied().enumerate() {
+            if arg.is_null() {
+                panic!("pending inline frame lost concrete arg at index {idx}");
+            }
+        }
+
+        let caller = unsafe { &*(self.concrete_frame as *const PyFrame) };
+        let code_ptr = unsafe { w_func_get_code_ptr(concrete_callable) } as *const CodeObject;
+        let globals = unsafe { w_func_get_globals(concrete_callable) };
+        let closure = unsafe { pyre_runtime::w_func_get_closure(concrete_callable) };
+        let is_self_recursive = caller.code as u64 == callee_key;
+        let mut callee_frame = PyFrame::new_for_call_with_closure(
+            code_ptr,
+            &concrete_args,
+            globals,
+            caller.execution_context,
+            closure,
+        );
+        callee_frame.fix_array_ptrs();
+
+        let callee_code = unsafe { &*callee_frame.code };
+        let callee_nlocals = callee_code.varnames.len();
+        let caller_namespace = caller.namespace;
+        let callee_globals = unsafe { w_func_get_globals(concrete_callable) };
+        let can_skip_traced_callee_frame = !is_self_recursive
+            && callee_globals == caller_namespace
+            && callee_nlocals == args.len();
+
+        let (callee_sym, drop_frame_opref) = if can_skip_traced_callee_frame {
+            let frame = self.frame();
+            let mut sym = PyreSym::new_uninit(frame);
+            sym.nlocals = callee_nlocals;
+            sym.valuestackdepth = callee_nlocals;
+            sym.symbolic_locals = args.to_vec();
+            sym.symbolic_stack = Vec::new();
+            sym.symbolic_initialized = true;
+            let (vable_next_instr, vable_valuestackdepth) =
+                self.with_ctx(|_, ctx| (ctx.const_int(0), ctx.const_int(callee_nlocals as i64)));
+            sym.vable_next_instr = vable_next_instr;
+            sym.vable_valuestackdepth = vable_valuestackdepth;
+            (sym, None)
+        } else {
+            // Create symbolic OpRef for callee frame in trace
+            let callee_frame_opref = self.with_ctx(|this, ctx| {
+                if is_self_recursive && args.len() == 1 {
+                    ctx.call_int(
+                        crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
+                        &[this.frame(), args[0]],
+                    )
+                } else if let Some(frame_helper) = crate::call_jit::callee_frame_helper(args.len())
+                {
+                    let mut helper_args = vec![this.frame(), callable];
+                    helper_args.extend_from_slice(args);
+                    ctx.call_int(frame_helper, &helper_args)
+                } else {
+                    panic!("no frame helper for {} args", args.len());
+                }
+            });
+
+            let mut sym = PyreSym::new_uninit(callee_frame_opref);
+            sym.nlocals = callee_nlocals;
+            sym.valuestackdepth = sym.nlocals;
+            sym.symbolic_locals = Vec::with_capacity(sym.nlocals);
+            for i in 0..sym.nlocals {
+                if i < args.len() {
+                    sym.symbolic_locals.push(args[i]);
+                } else {
+                    sym.symbolic_locals.push(OpRef::NONE);
+                }
+            }
+            sym.symbolic_stack = Vec::new();
+            sym.symbolic_initialized = true;
+            (sym, Some(callee_frame_opref))
+        };
+
+        let parent_fail_args = self.build_single_frame_fail_args();
+        Ok(PendingInlineFrame {
+            sym: callee_sym,
+            concrete_frame: callee_frame,
+            drop_frame_opref,
+            green_key: callee_key,
+            parent_fail_args,
+            nargs: args.len(),
+            caller_result_stack_idx: None,
+        })
+    }
+
     /// PyPy perform_call + _interpret: trace INTO callee body.
     ///
     /// Instead of emitting an opaque CallMayForce, traces each callee
@@ -1805,77 +2126,20 @@ impl TraceFrameState {
         concrete_callable: PyObjectRef,
         callee_key: u64,
     ) -> Result<OpRef, PyError> {
-        use pyre_interp::frame::PyFrame;
-
+        let pending =
+            self.build_pending_inline_frame(callable, args, concrete_callable, callee_key)?;
         let (driver, _) = crate::eval::driver_pair();
         driver.enter_inline_frame(callee_key);
 
-        // Guard callable identity
-        self.with_ctx(|this, ctx| {
-            this.guard_value(ctx, callable, concrete_callable as i64);
-        });
-
-        // Get concrete args using the established helper
-        let concrete_args: Vec<PyObjectRef> = (0..args.len())
-            .map(|i| {
-                self.concrete_call_arg_after_pops(i)
-                    .unwrap_or(pyre_object::PY_NULL)
-            })
-            .collect();
-
-        // Create concrete callee frame
-        let callee_frame_ptr = crate::call_jit::create_callee_frame_impl_pub(
-            self.concrete_frame as i64,
-            concrete_callable as i64,
-            &concrete_args,
-        );
-        let callee_frame = unsafe { &mut *(callee_frame_ptr as *mut PyFrame) };
-
-        // Create symbolic OpRef for callee frame in trace
-        let callee_frame_opref = self.with_ctx(|this, ctx| {
-            if let Some(frame_helper) = crate::call_jit::callee_frame_helper(args.len()) {
-                let mut helper_args = vec![this.frame(), callable];
-                helper_args.extend_from_slice(args);
-                ctx.call_int(frame_helper, &helper_args)
-            } else {
-                panic!("no frame helper for {} args", args.len());
-            }
-        });
-
-        // Initialize callee PyreSym with arg OpRefs as locals
-        let callee_code = unsafe { &*callee_frame.code };
-        let mut callee_sym = PyreSym::new_uninit(callee_frame_opref);
-        callee_sym.nlocals = callee_code.varnames.len();
-        callee_sym.valuestackdepth = callee_sym.nlocals;
-        callee_sym.symbolic_locals = Vec::with_capacity(callee_sym.nlocals);
-        for i in 0..callee_sym.nlocals {
-            if i < args.len() {
-                callee_sym.symbolic_locals.push(args[i]);
-            } else {
-                callee_sym.symbolic_locals.push(OpRef::NONE);
-            }
-        }
-        callee_sym.symbolic_stack = Vec::new();
-        callee_sym.symbolic_initialized = true;
-
-        // Capture parent fail_args for multi-frame guard resume
-        let parent_fail_args = self.build_single_frame_fail_args();
-
-        // Trace and execute callee body (PyPy _interpret loop)
         let ctx_ptr = self.ctx;
         let ctx = unsafe { &mut *ctx_ptr };
-        let (result_opref, concrete_result) = inline_trace_and_execute(
-            ctx,
-            callee_frame_opref,
-            unsafe { std::ptr::read(callee_frame as *const PyFrame) },
-            parent_fail_args,
-        )?;
+        let result = inline_trace_and_execute(ctx, pending);
+        let (driver, _) = crate::eval::driver_pair();
+        driver.leave_inline_frame();
+        let (result_opref, concrete_result) = result?;
 
         // Write concrete result to caller's stack for subsequent execution
         pyre_interp::call::set_inline_handled_result(concrete_result);
-
-        let (driver, _) = crate::eval::driver_pair();
-        driver.leave_inline_frame();
 
         Ok(result_opref)
     }
@@ -1890,15 +2154,54 @@ impl TraceFrameState {
         callee_key: u64,
         frame_helper: *const (),
     ) -> Result<OpRef, PyError> {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.enter_inline_frame(callee_key);
+        let concrete_arg0 = if args.len() == 1 {
+            self.concrete_call_arg_after_pops(0)
+        } else {
+            None
+        };
 
         let result = self.with_ctx(|this, ctx| {
             this.guard_value(ctx, callable, concrete_callable as i64);
 
             if args.len() == 1 {
-                let force_fn = crate::call_jit::jit_force_recursive_call_1 as *const ();
-                let result = ctx.call_may_force_int(force_fn, &[this.frame(), callable, args[0]]);
+                let is_self_recursive = callee_key
+                    == unsafe {
+                        (*(this.concrete_frame as *const pyre_interp::frame::PyFrame)).code as u64
+                    };
+                let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
+                    let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
+                    let is_self_recursive = callee_key
+                        == unsafe {
+                            (*(this.concrete_frame as *const pyre_interp::frame::PyFrame)).code as u64
+                        };
+                    let force_fn = if is_self_recursive
+                        && crate::call_jit::recursive_force_cache_safe(concrete_callable)
+                    {
+                        crate::call_jit::jit_force_self_recursive_call_raw_1 as *const ()
+                    } else {
+                        crate::call_jit::jit_force_recursive_call_raw_1 as *const ()
+                    };
+                    if force_fn == crate::call_jit::jit_force_self_recursive_call_raw_1 as *const ()
+                    {
+                        let raw = ctx.call_may_force_int(force_fn, &[this.frame(), raw_arg]);
+                        if this.parent_fail_args.is_some() {
+                            box_traced_raw_int(ctx, raw)
+                        } else {
+                            raw
+                        }
+                    } else {
+                        let raw =
+                            ctx.call_may_force_int(force_fn, &[this.frame(), callable, raw_arg]);
+                        if this.parent_fail_args.is_some() {
+                            box_traced_raw_int(ctx, raw)
+                        } else {
+                            raw
+                        }
+                    }
+                } else {
+                    let force_fn = crate::call_jit::jit_force_recursive_call_1 as *const ();
+                    ctx.call_may_force_int(force_fn, &[this.frame(), callable, args[0]])
+                };
                 this.record_guard(ctx, OpCode::GuardNotForced, &[]);
                 Ok(result)
             } else {
@@ -1916,8 +2219,6 @@ impl TraceFrameState {
             }
         });
 
-        let (driver, _) = crate::eval::driver_pair();
-        driver.leave_inline_frame();
         result
     }
 
@@ -2156,6 +2457,41 @@ impl TraceFrameState {
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
         self.into_trace_action(step_result)
     }
+
+    pub(crate) fn trace_code_step_inline(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+    ) -> InlineTraceStepAction {
+        if pc >= code.instructions.len() {
+            return InlineTraceStepAction::Trace(TraceAction::Abort);
+        }
+
+        let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
+            return InlineTraceStepAction::Trace(TraceAction::Abort);
+        };
+
+        self.prepare_fallthrough();
+        let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+        let action = self.into_trace_action(step_result);
+        match action {
+            TraceAction::Continue => {
+                if let Some(mut pending) = self.pending_inline_frame.take() {
+                    let result_idx = self
+                        .sym()
+                        .symbolic_stack
+                        .len()
+                        .checked_sub(1)
+                        .expect("pending inline frame missing caller result slot");
+                    pending.caller_result_stack_idx = Some(result_idx);
+                    InlineTraceStepAction::PushFrame(pending)
+                } else {
+                    InlineTraceStepAction::Trace(TraceAction::Continue)
+                }
+            }
+            other => InlineTraceStepAction::Trace(other),
+        }
+    }
 }
 
 pub(crate) fn trace_step_result_to_action(
@@ -2304,6 +2640,21 @@ impl NamespaceOpcodeHandler for TraceFrameState {
         let Some(slot) = concrete_namespace_slot(self.concrete_frame, name) else {
             return self.trace_load_name(name);
         };
+        if let Some(concrete_value) = concrete_namespace_value(self.concrete_frame, slot) {
+            unsafe {
+                if is_func(concrete_value) || is_builtin_func(concrete_value) {
+                    return self.with_ctx(|this, ctx| {
+                        let loaded = TraceFrameState::load_namespace_value(this, ctx, slot)?;
+                        this.guard_value(ctx, loaded, concrete_value as i64);
+                        let const_value = ctx.const_int(concrete_value as i64);
+                        this.sym_mut()
+                            .symbolic_namespace_slots
+                            .insert(slot, const_value);
+                        Ok(const_value)
+                    });
+                }
+            }
+        }
         self.with_ctx(|this, ctx| TraceFrameState::load_namespace_value(this, ctx, slot))
     }
 
@@ -2736,7 +3087,7 @@ impl PyreJitState {
         };
         let lengths = vec![self.array_capacity()];
         let (static_boxes, array_boxes) =
-            unsafe { read_all_virtualizable_boxes(info, frame_ptr.cast_const(), &lengths) };
+            unsafe { info.read_all_boxes(frame_ptr.cast_const(), &lengths) };
         self.import_virtualizable_state(&static_boxes, &array_boxes)
     }
 
@@ -2746,8 +3097,8 @@ impl PyreJitState {
         };
         let (static_boxes, array_boxes) = self.export_virtualizable_state();
         unsafe {
-            write_all_virtualizable_boxes(info, frame_ptr, &static_boxes, &array_boxes);
-            clear_vable_token(info, frame_ptr);
+            info.write_from_resume_data_partial(frame_ptr, &static_boxes, &array_boxes);
+            info.clear_vable_token(frame_ptr);
         }
         true
     }
@@ -3010,9 +3361,49 @@ fn value_to_usize(value: &Value) -> usize {
 struct MIFrame {
     sym: PyreSym,
     concrete_frame: pyre_interp::frame::PyFrame,
-    frame_opref: OpRef,
+    drop_frame_opref: Option<OpRef>,
     green_key: u64,
     arg_state: pyre_bytecode::bytecode::OpArgState,
+    parent_fail_args: Vec<OpRef>,
+    caller_result_stack_idx: Option<usize>,
+}
+
+struct PendingInlineFrame {
+    sym: PyreSym,
+    concrete_frame: pyre_interp::frame::PyFrame,
+    drop_frame_opref: Option<OpRef>,
+    green_key: u64,
+    parent_fail_args: Vec<OpRef>,
+    nargs: usize,
+    caller_result_stack_idx: Option<usize>,
+}
+
+enum InlineTraceStepAction {
+    Trace(TraceAction),
+    PushFrame(PendingInlineFrame),
+}
+
+fn execute_inline_residual_call(
+    frame: &mut pyre_interp::frame::PyFrame,
+    nargs: usize,
+) -> Result<(), pyre_runtime::PyError> {
+    let required = nargs + 2; // callable + null/self + args
+    if frame.valuestackdepth < frame.stack_base() + required {
+        return Err(pyre_runtime::PyError::type_error(
+            "inline residual call stack underflow",
+        ));
+    }
+
+    let mut args = Vec::with_capacity(nargs);
+    for _ in 0..nargs {
+        args.push(frame.pop());
+    }
+    args.reverse();
+    let _null_or_self = frame.pop();
+    let callable = frame.pop();
+    let result = pyre_interp::call::call_callable_inline_residual(frame, callable, &args)?;
+    frame.push(result);
+    Ok(())
 }
 
 /// PyPy pyjitpl.py `_interpret()` equivalent for inlined calls.
@@ -3027,18 +3418,18 @@ struct MIFrame {
 /// - finishframe → popframe + make_result_of_lastop + ChangeFrame
 fn inline_trace_and_execute(
     ctx: &mut majit_meta::TraceCtx,
-    callee_frame_opref: OpRef,
-    callee: pyre_interp::frame::PyFrame,
-    parent_fail_args: Vec<OpRef>,
+    pending: PendingInlineFrame,
 ) -> Result<(OpRef, PyObjectRef), pyre_runtime::PyError> {
     use pyre_runtime::StepResult;
-
+    let _inline_call_override = pyre_interp::call::inline_call_override_guard();
     let mut framestack: Vec<MIFrame> = vec![MIFrame {
-        sym: PyreSym::new_uninit(callee_frame_opref),
-        concrete_frame: callee,
-        frame_opref: callee_frame_opref,
-        green_key: 0, // set by caller
+        sym: pending.sym,
+        concrete_frame: pending.concrete_frame,
+        drop_frame_opref: pending.drop_frame_opref,
+        green_key: pending.green_key,
         arg_state: pyre_bytecode::bytecode::OpArgState::default(),
+        parent_fail_args: pending.parent_fail_args,
+        caller_result_stack_idx: pending.caller_result_stack_idx,
     }];
 
     // PyPy _interpret(): while True: framestack[-1].run_one_step()
@@ -3053,7 +3444,7 @@ fn inline_trace_and_execute(
         }
 
         // ── run_one_step: TRACE ──
-        let pfa = parent_fail_args.clone();
+        let pfa = top.parent_fail_args.clone();
         let trace_action = {
             let mut fs = TraceFrameState::from_sym(
                 ctx,
@@ -3063,12 +3454,51 @@ fn inline_trace_and_execute(
             );
             // PyPy capture_resumedata: callee guards use parent fail_args
             fs.parent_fail_args = Some(pfa);
-            fs.trace_code_step(code, pc)
+            fs.trace_code_step_inline(code, pc)
         };
 
         match trace_action {
-            majit_meta::TraceAction::Continue => {}
-            majit_meta::TraceAction::Finish { finish_args, .. } => {
+            InlineTraceStepAction::PushFrame(pending) => {
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][inline] push frame depth={} green_key={} nargs={}",
+                        framestack.len(),
+                        pending.green_key,
+                        pending.nargs
+                    );
+                }
+                {
+                    let parent = framestack.last_mut().unwrap();
+                    for _ in 0..pending.nargs {
+                        let value = parent.concrete_frame.pop();
+                        if value.is_null() {
+                            panic!("inline framestack popped null concrete arg");
+                        }
+                    }
+                    let _null_or_self = parent.concrete_frame.pop();
+                    let concrete_callable = parent.concrete_frame.pop();
+                    if concrete_callable.is_null() {
+                        panic!("inline framestack lost concrete callable");
+                    }
+                    parent.concrete_frame.next_instr = pc + 1;
+                }
+                let (driver, _) = crate::eval::driver_pair();
+                driver.enter_inline_frame(pending.green_key);
+                framestack.push(MIFrame {
+                    sym: pending.sym,
+                    concrete_frame: pending.concrete_frame,
+                    drop_frame_opref: pending.drop_frame_opref,
+                    green_key: pending.green_key,
+                    arg_state: pyre_bytecode::bytecode::OpArgState::default(),
+                    parent_fail_args: pending.parent_fail_args,
+                    caller_result_stack_idx: pending.caller_result_stack_idx,
+                });
+                continue;
+            }
+            InlineTraceStepAction::Trace(majit_meta::TraceAction::Continue) => {}
+            InlineTraceStepAction::Trace(majit_meta::TraceAction::Finish {
+                finish_args, ..
+            }) => {
                 // PyPy finishframe(): pop frame, store result in parent
                 let result_opref = finish_args[0];
 
@@ -3093,26 +3523,46 @@ fn inline_trace_and_execute(
                         // popframe()
                         let popped = framestack.pop().unwrap();
 
-                        // TODO: LEAVE_PORTAL_FRAME op (PyPy pyjitpl.py:2452)
+                        // PyPy pyjitpl.py:2452 — leave_portal_frame()
+                        ctx.record_op(majit_ir::OpCode::LeavePortalFrame, &[]);
 
                         // Drop callee frame in trace
-                        ctx.call_void(
-                            crate::call_jit::jit_drop_callee_frame as *const (),
-                            &[popped.frame_opref],
-                        );
+                        if let Some(frame_opref) = popped.drop_frame_opref {
+                            ctx.call_void(
+                                crate::call_jit::jit_drop_callee_frame as *const (),
+                                &[frame_opref],
+                            );
+                        }
 
                         if framestack.is_empty() {
                             // Outermost inline frame returned
+                            if majit_meta::majit_log_enabled() {
+                                eprintln!("[jit][inline] return outermost");
+                            }
                             return Ok((result_opref, concrete_result));
+                        }
+
+                        let (driver, _) = crate::eval::driver_pair();
+                        driver.leave_inline_frame();
+                        if majit_meta::majit_log_enabled() {
+                            eprintln!(
+                                "[jit][inline] pop frame, resume parent depth={}",
+                                framestack.len()
+                            );
                         }
 
                         // make_result_of_lastop: store result in parent
                         let parent = framestack.last_mut().unwrap();
-                        parent.sym.symbolic_stack.push(result_opref);
-                        parent.sym.valuestackdepth += 1;
-
-                        // Store concrete result for parent's execute step
-                        pyre_interp::call::set_inline_handled_result(concrete_result);
+                        let result_idx = popped
+                            .caller_result_stack_idx
+                            .expect("inline child frame lost caller result slot");
+                        let slot = parent
+                            .sym
+                            .symbolic_stack
+                            .get_mut(result_idx)
+                            .expect("inline caller result slot out of bounds");
+                        *slot = result_opref;
+                        parent.concrete_frame.push(concrete_result);
                         continue; // ChangeFrame: resume parent
                     }
                     other => {
@@ -3122,11 +3572,15 @@ fn inline_trace_and_execute(
                     }
                 }
             }
-            majit_meta::TraceAction::Abort | majit_meta::TraceAction::AbortPermanent => {
+            InlineTraceStepAction::Trace(
+                majit_meta::TraceAction::Abort | majit_meta::TraceAction::AbortPermanent,
+            ) => {
                 return Err(pyre_runtime::PyError::type_error("inline trace aborted"));
             }
-            majit_meta::TraceAction::CloseLoop
-            | majit_meta::TraceAction::CloseLoopWithArgs { .. } => {
+            InlineTraceStepAction::Trace(
+                majit_meta::TraceAction::CloseLoop
+                | majit_meta::TraceAction::CloseLoopWithArgs { .. },
+            ) => {
                 return Err(pyre_runtime::PyError::type_error(
                     "inline callee has loop (not supported)",
                 ));
@@ -3141,6 +3595,10 @@ fn inline_trace_and_execute(
         let (instruction, op_arg) = top.arg_state.get(code_unit);
         top.concrete_frame.next_instr = ni + 1;
         let next = top.concrete_frame.next_instr;
+        if let Instruction::Call { argc } = instruction {
+            execute_inline_residual_call(&mut top.concrete_frame, argc.get(op_arg) as usize)?;
+            continue;
+        }
         match pyre_runtime::execute_opcode_step(
             &mut top.concrete_frame,
             code,
