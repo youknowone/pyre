@@ -368,6 +368,41 @@ impl ShortBoxes {
     }
 }
 
+/// shortpreamble.py: create_short_boxes(optimizer, inputargs, label_args)
+///
+/// Build the short boxes mapping: for each label arg, determine
+/// which preamble operation produces it. This is used to build
+/// the short preamble that bridges need to replay.
+pub fn create_short_boxes(
+    short_boxes: &mut ShortBoxes,
+    label_args: &[OpRef],
+    optimizer_ops: &[Op],
+) -> Vec<ProducedShortOp> {
+    // Step 1: register each label arg as a ShortInputArg
+    for (i, &arg) in label_args.iter().enumerate() {
+        if i < short_boxes.num_label_args {
+            let short_input = ShortInputArg {
+                res: arg,
+                preamble_op: Op::new(majit_ir::OpCode::SameAsI, &[arg]),
+            };
+            let produced = short_input.add_op_to_short();
+            short_boxes.add_op(i, produced.preamble_op, produced.kind);
+        }
+    }
+
+    // Step 2: collect produced short boxes from optimizer passes
+    // (done externally via produce_potential_short_preamble_ops)
+
+    // Step 3: collect all produced ops
+    short_boxes
+        .non_empty_ops()
+        .map(|(_, pop)| ProducedShortOp {
+            kind: pop.kind.clone(),
+            preamble_op: pop.op.clone(),
+        })
+        .collect()
+}
+
 /// shortpreamble.py: ExtendedShortPreambleBuilder — extended builder
 /// that classifies operations into Guard/Heap/Pure/LoopInvariant types
 /// for more precise short preamble generation.
