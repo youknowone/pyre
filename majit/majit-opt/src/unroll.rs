@@ -413,6 +413,65 @@ impl OptUnroll {
     }
 }
 
+/// unroll.py: pick_virtual_state(my_vs, label_vs, target_tokens)
+///
+/// Given the current virtual state and available target tokens,
+/// find a compatible target to jump to. Returns the target index
+/// or None if no match.
+pub fn pick_virtual_state(
+    my_vs: &crate::virtualstate::VirtualState,
+    target_states: &[crate::virtualstate::VirtualState],
+) -> Option<usize> {
+    for (i, target_vs) in target_states.iter().enumerate() {
+        if my_vs.is_compatible(target_vs) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// unroll.py: _jump_to_existing_trace(jump_op, label_op, runtime_boxes)
+///
+/// Check if any existing compiled trace (target_token) has a compatible
+/// virtual state. If so, generate extra guards, inline the short preamble,
+/// and redirect the jump.
+///
+/// Returns Some(ops_to_emit) if a match was found, None otherwise.
+pub fn jump_to_existing_trace_full(
+    jump_args: &[OpRef],
+    target_states: &[crate::virtualstate::VirtualState],
+    target_short_preambles: &[Option<crate::shortpreamble::ShortPreamble>],
+    ctx: &mut OptContext,
+) -> Option<(usize, Vec<OpRef>)> {
+    let my_vs = crate::virtualstate::VirtualState::new(
+        jump_args
+            .iter()
+            .map(|_| crate::virtualstate::VirtualStateInfo::Unknown)
+            .collect(),
+    );
+
+    for (i, target_vs) in target_states.iter().enumerate() {
+        if !my_vs.is_compatible(target_vs) {
+            continue;
+        }
+        // Generate extra guards from virtual state mismatch
+        let _extra_guards = target_vs.generate_guards(&my_vs);
+
+        // Make input args matching the target's virtual state
+        let args = target_vs.make_inputargs(jump_args);
+
+        // Inline short preamble if available
+        let final_args = if let Some(Some(sp)) = target_short_preambles.get(i) {
+            OptUnroll::inline_short_preamble(&args, sp, ctx)
+        } else {
+            args.clone()
+        };
+
+        return Some((i, final_args));
+    }
+    None
+}
+
 pub struct OptUnroll {
     /// Buffer of ops received before the Jump back-edge.
     buffer: Vec<Op>,
