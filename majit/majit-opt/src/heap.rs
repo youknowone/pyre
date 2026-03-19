@@ -154,11 +154,24 @@ impl OptHeap {
         Some((array, descr.index(), index_ref))
     }
 
-    /// Force all pending lazy setfields: emit the stored ops and cache their values.
+    /// heap.py: force_lazy_set — emit lazy setfields.
+    /// If any lazy setfield argument references the postponed_op,
+    /// emit the postponed_op first (RPython heap.py exact logic).
     fn force_all_lazy_setfields(&mut self, ctx: &mut OptContext) {
+        // heap.py: check if any lazy set references the postponed op
+        if let Some(ref postponed) = self.postponed_op {
+            let postponed_pos = postponed.pos;
+            let needs_postponed = self.lazy_setfields.values().any(|op| {
+                op.args.iter().any(|a| *a == postponed_pos)
+            });
+            if needs_postponed {
+                if let Some(p) = self.postponed_op.take() {
+                    ctx.emit(p);
+                }
+            }
+        }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
         for (key, op) in pending {
-            // The written value is the second arg of SETFIELD_GC.
             let value_ref = op.arg(1);
             ctx.emit(op);
             self.cached_fields.insert(key, value_ref);
