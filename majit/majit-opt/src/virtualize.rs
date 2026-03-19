@@ -253,10 +253,13 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
+        let mut forced_fields = Vec::with_capacity(vinfo.fields.len());
+
         // Emit SETFIELD_GC for each tracked field
         for (field_idx, value_ref) in vinfo.fields {
             let value_ref = self.force_virtual(value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
+            forced_fields.push((field_idx, value_ref));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(
                 get_field_descr(&vinfo.field_descrs, field_idx)
@@ -264,6 +267,16 @@ impl OptVirtualize {
             );
             ctx.emit(set_op);
         }
+
+        self.set_info(
+            alloc_ref,
+            PtrInfo::ForcedVirtual(VirtualInfo {
+                descr: vinfo.descr,
+                known_class: vinfo.known_class,
+                fields: forced_fields,
+                field_descrs: vinfo.field_descrs,
+            }),
+        );
 
         alloc_ref
     }
@@ -320,16 +333,28 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
+        let mut forced_fields = Vec::with_capacity(vinfo.fields.len());
+
         // Emit SETFIELD_GC for each tracked field
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
+            forced_fields.push((*field_idx, value_ref));
             let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(descr);
             ctx.emit(set_op);
         }
+
+        self.set_info(
+            alloc_ref,
+            PtrInfo::ForcedStruct(VirtualStructInfo {
+                descr: vinfo.descr,
+                fields: forced_fields,
+                field_descrs: vinfo.field_descrs,
+            }),
+        );
 
         alloc_ref
     }
@@ -532,6 +557,23 @@ impl OptVirtualize {
         let field_idx = descr_index(&op.descr);
 
         if let Some(info) = self.get_info_mut(struct_ref) {
+            match info {
+                PtrInfo::ForcedVirtual(vinfo) => {
+                    set_field(&mut vinfo.fields, field_idx, value_ref);
+                    if let Some(descr) = &op.descr {
+                        set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
+                    }
+                    return OptimizationResult::PassOn;
+                }
+                PtrInfo::ForcedStruct(vinfo) => {
+                    set_field(&mut vinfo.fields, field_idx, value_ref);
+                    if let Some(descr) = &op.descr {
+                        set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
+                    }
+                    return OptimizationResult::PassOn;
+                }
+                _ => {}
+            }
             if info.is_virtual() {
                 match info {
                     PtrInfo::Virtual(vinfo) => {
@@ -568,23 +610,23 @@ impl OptVirtualize {
         let field_idx = descr_index(&op.descr);
 
         if let Some(info) = self.get_info(struct_ref) {
-            if info.is_virtual() {
-                let field_val = match info {
-                    PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
-                    PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
-                    PtrInfo::Virtualizable(vstate) => get_field(&vstate.fields, field_idx),
-                    _ => None,
-                };
-                if let Some(val_ref) = field_val {
-                    ctx.replace_op(op.pos, val_ref);
-                    return OptimizationResult::Remove;
-                }
-                // Virtualizable: first read of an untracked field.
-                // Let the op emit, but cache result for future reads
-                // and register array pointers for array tracking.
-                if let PtrInfo::Virtualizable(_) = info {
-                    return self.handle_virtualizable_first_read(op, struct_ref, field_idx, ctx);
-                }
+            let field_val = match info {
+                PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
+                PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
+                PtrInfo::ForcedVirtual(vinfo) => get_field(&vinfo.fields, field_idx),
+                PtrInfo::ForcedStruct(vinfo) => get_field(&vinfo.fields, field_idx),
+                PtrInfo::Virtualizable(vstate) => get_field(&vstate.fields, field_idx),
+                _ => None,
+            };
+            if let Some(val_ref) = field_val {
+                ctx.replace_op(op.pos, val_ref);
+                return OptimizationResult::Remove;
+            }
+            // Virtualizable: first read of an untracked field.
+            // Let the op emit, but cache result for future reads
+            // and register array pointers for array tracking.
+            if let PtrInfo::Virtualizable(_) = info {
+                return self.handle_virtualizable_first_read(op, struct_ref, field_idx, ctx);
             }
         }
         OptimizationResult::PassOn
@@ -631,6 +673,10 @@ impl OptVirtualize {
             offset.and_then(|off| config.array_field_offsets.iter().position(|&o| o == off))
         });
         if let Some(arr_idx) = arr_idx {
+            if !self.vable_initialized {
+                self.init_virtualizable(ctx);
+                self.vable_initialized = true;
+            }
             self.vable_array_ptrs.insert(op.pos, (arr_idx, None));
         }
         OptimizationResult::PassOn
@@ -642,6 +688,9 @@ impl OptVirtualize {
         let value_ref = ctx.get_replacement(op.arg(2));
 
         // Virtualizable array check
+        if !self.vable_array_ptrs.contains_key(&array_ref) {
+            self.try_register_virtualizable_array_ptr(array_ref, ctx);
+        }
         if let Some(&mut (arr_idx, ref mut stored_descr)) =
             self.vable_array_ptrs.get_mut(&array_ref)
         {
@@ -686,6 +735,9 @@ impl OptVirtualize {
         let index_ref = op.arg(1);
 
         // Virtualizable array check
+        if !self.vable_array_ptrs.contains_key(&array_ref) {
+            self.try_register_virtualizable_array_ptr(array_ref, ctx);
+        }
         if let Some(&mut (arr_idx, ref mut stored_descr)) =
             self.vable_array_ptrs.get_mut(&array_ref)
         {
@@ -702,6 +754,9 @@ impl OptVirtualize {
                         ctx.replace_op(op.pos, val);
                         return OptimizationResult::Remove;
                     }
+                }
+                if let Some(PtrInfo::Virtualizable(vstate)) = self.get_info_mut(frame_ref) {
+                    set_array_element(&mut vstate.arrays, arr_idx as u32, index as usize, op.pos);
                 }
             }
         }
@@ -1073,7 +1128,54 @@ impl OptVirtualize {
     /// Handle operations that may cause virtuals to escape.
     fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let forced = self.force_all_args(op, ctx);
+        self.clear_forced_field_caches();
         OptimizationResult::Replace(forced)
+    }
+
+    fn try_register_virtualizable_array_ptr(&mut self, array_ref: OpRef, ctx: &OptContext) {
+        if self.vable_array_ptrs.contains_key(&array_ref) {
+            return;
+        }
+        let Some(config) = &self.vable_config else {
+            return;
+        };
+        let Some(source_op) = ctx.new_operations.iter().find(|op| op.pos == array_ref) else {
+            return;
+        };
+        if !matches!(
+            source_op.opcode,
+            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
+        ) {
+            return;
+        }
+        if source_op.arg(0) != ctx.get_replacement(OpRef(0)) {
+            return;
+        }
+        let field_idx = descr_index(&source_op.descr);
+        let offset = extract_field_offset(field_idx);
+        let arr_idx = config
+            .array_field_offsets
+            .iter()
+            .position(|&o| Some(o) == offset);
+        if let Some(arr_idx) = arr_idx {
+            self.vable_array_ptrs.insert(array_ref, (arr_idx, None));
+        }
+    }
+
+    fn clear_forced_field_caches(&mut self) {
+        for slot in &mut self.ptr_info {
+            let Some(info) = slot.take() else {
+                continue;
+            };
+            *slot = Some(match info {
+                PtrInfo::ForcedVirtual(vinfo) => PtrInfo::KnownClass {
+                    class_ptr: vinfo.known_class.unwrap_or(majit_ir::GcRef::NULL),
+                    is_nonnull: true,
+                },
+                PtrInfo::ForcedStruct(_) => PtrInfo::NonNull,
+                other => other,
+            });
+        }
     }
 
     /// Extend JUMP args with current tracked virtualizable field values.
@@ -1168,8 +1270,8 @@ impl OptVirtualize {
                 // Elements
                 for elem in elements {
                     if elem.is_none() {
-                        let default =
-                            self.emit_default_value_for_type(ctx, config.array_item_types[arr_cfg_idx]);
+                        let default = self
+                            .emit_default_value_for_type(ctx, config.array_item_types[arr_cfg_idx]);
                         fail_args.push(default);
                     } else {
                         let forced = self.force_virtual(*elem, ctx);
@@ -1811,6 +1913,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_virtualizable_array_first_read_is_cached() {
+        let mut ctx = OptContext::with_num_inputs(8, 1);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![],
+            static_field_types: vec![],
+            array_field_offsets: vec![8],
+            array_item_types: vec![Type::Int],
+        });
+        pass.setup();
+
+        let field_descr =
+            make_field_index_descr(0x1000_0000 | (((8_u32) & 0x000f_ffff) << 4) | (0x7 << 1));
+        let arr_descr = array_descr(20);
+        ctx.make_constant(OpRef(50), Value::Int(0));
+
+        let get_array_ptr = Op::with_descr(OpCode::GetfieldRawI, &[OpRef(0)], field_descr);
+        let get_item = Op::with_descr(
+            OpCode::GetarrayitemRawI,
+            &[OpRef(0), OpRef(50)],
+            arr_descr.clone(),
+        );
+        let get_item_again =
+            Op::with_descr(OpCode::GetarrayitemRawI, &[OpRef(0), OpRef(50)], arr_descr);
+
+        let mut ops = vec![get_array_ptr, get_item, get_item_again];
+        assign_positions(&mut ops);
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+            }
+        }
+
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|op| op.opcode == OpCode::GetarrayitemRawI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "second array read should forward from cached virtualizable state"
+        );
+    }
+
+    #[test]
+    fn test_virtualizable_guard_captures_first_read_array_values() {
+        let mut ctx = OptContext::with_num_inputs(8, 1);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![],
+            static_field_types: vec![],
+            array_field_offsets: vec![8],
+            array_item_types: vec![Type::Int],
+        });
+        pass.setup();
+
+        let field_descr =
+            make_field_index_descr(0x1000_0000 | (((8_u32) & 0x000f_ffff) << 4) | (0x7 << 1));
+        let arr_descr = array_descr(20);
+        ctx.make_constant(OpRef(50), Value::Int(0));
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldRawI, &[OpRef(0)], field_descr),
+            Op::with_descr(OpCode::GetarrayitemRawI, &[OpRef(0), OpRef(50)], arr_descr),
+        ];
+        assign_positions(&mut ops);
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for arg in &mut resolved.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Replace(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+            }
+        }
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(99)]);
+        guard.fail_args = Some(Default::default());
+        let replaced = match pass.propagate_forward(&guard, &mut ctx) {
+            OptimizationResult::Replace(op) => op,
+            other => panic!("expected guard replacement, got {other:?}"),
+        };
+        let fail_args = replaced.fail_args.expect("guard should have fail args");
+        assert_eq!(fail_args.len(), 2);
+        assert_eq!(ctx.get_constant_box(fail_args[0]), Some(Value::Int(1)));
+        assert_eq!(fail_args[1], OpRef(1));
+    }
+
     // ── Tests ──
 
     #[test]
@@ -2094,6 +2307,46 @@ mod tests {
         let has_setfield = result.iter().any(|o| o.opcode == OpCode::SetfieldGc);
         assert!(has_setfield, "should have SETFIELD_GC");
         assert_eq!(result.last().unwrap().opcode, OpCode::CallN);
+    }
+
+    #[test]
+    fn test_forced_virtual_struct_keeps_field_cache_after_guard() {
+        // p0 = new(descr=size1)
+        // setfield_gc(p0, i10, descr=field1)
+        // guard_value(i0, i1) [p0]   <- force p0 into fail_args, but no side effect
+        // i2 = getfield_gc_i(p0, descr=field1)
+        //
+        // After forcing, the concrete struct should still carry cached field
+        // info so the trailing GETFIELD can forward to i10.
+        let sd = size_descr(1);
+        let fd = field_descr(10);
+        let mut guard = Op::new(OpCode::GuardValue, &[OpRef(200), OpRef(201)]);
+        guard.fail_args = Some(Default::default());
+        guard.fail_args.as_mut().unwrap().push(OpRef(0));
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], sd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
+            guard,
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd.clone()),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+        let getfield_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            getfield_count,
+            0,
+            "forced struct field cache should remove trailing GETFIELD; got ops: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        assert!(
+            result.iter().any(|o| o.opcode == OpCode::GuardValue),
+            "guard should still be emitted"
+        );
     }
 
     #[test]

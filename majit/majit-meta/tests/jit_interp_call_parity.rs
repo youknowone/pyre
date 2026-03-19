@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use majit_ir::{GcRef, OpCode, Type};
 use majit_macros::{dont_look_inside, elidable, jit_interp};

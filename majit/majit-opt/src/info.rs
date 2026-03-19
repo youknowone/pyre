@@ -107,6 +107,16 @@ pub enum PtrInfo {
     /// Virtual struct (no vtable).
     /// info.py: StructPtrInfo
     VirtualStruct(VirtualStructInfo),
+    /// Forced instance object with concrete allocation but cached field values.
+    ///
+    /// Mirrors RPython's behavior after forcing a virtual: the object is no
+    /// longer virtual, but field cache information is still available to
+    /// forward subsequent getfield operations until an invalidating effect.
+    ForcedVirtual(VirtualInfo),
+    /// Forced struct with concrete allocation but cached field values.
+    ///
+    /// Same contract as `ForcedVirtual`, for NEW/struct objects without a vtable.
+    ForcedStruct(VirtualStructInfo),
     /// Virtual array of structs (interior field access).
     /// info.py: ArrayStructInfo
     VirtualArrayStruct(VirtualArrayStructInfo),
@@ -177,6 +187,8 @@ impl PtrInfo {
             PtrInfo::Virtual(_)
             | PtrInfo::VirtualArray(_)
             | PtrInfo::VirtualStruct(_)
+            | PtrInfo::ForcedVirtual(_)
+            | PtrInfo::ForcedStruct(_)
             | PtrInfo::VirtualArrayStruct(_)
             | PtrInfo::VirtualRawBuffer(_)
             | PtrInfo::Virtualizable(_) => true,
@@ -209,6 +221,7 @@ impl PtrInfo {
         match self {
             PtrInfo::KnownClass { class_ptr, .. } => Some(class_ptr),
             PtrInfo::Virtual(v) => v.known_class.as_ref(),
+            PtrInfo::ForcedVirtual(v) => v.known_class.as_ref(),
             _ => None,
         }
     }
@@ -244,6 +257,8 @@ impl PtrInfo {
             PtrInfo::Virtual(v) => v.fields.len(),
             PtrInfo::VirtualArray(v) => v.items.len(),
             PtrInfo::VirtualStruct(v) => v.fields.len(),
+            PtrInfo::ForcedVirtual(v) => v.fields.len(),
+            PtrInfo::ForcedStruct(v) => v.fields.len(),
             PtrInfo::VirtualArrayStruct(v) => v.element_fields.len(),
             PtrInfo::VirtualRawBuffer(v) => v.entries.len(),
             _ => 0,
@@ -257,6 +272,8 @@ impl PtrInfo {
             PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
             PtrInfo::VirtualArray(v) => v.items.clone(),
             PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| *r).collect(),
+            PtrInfo::ForcedVirtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
+            PtrInfo::ForcedStruct(v) => v.fields.iter().map(|(_, r)| *r).collect(),
             PtrInfo::VirtualArrayStruct(v) => v
                 .element_fields
                 .iter()
@@ -307,7 +324,13 @@ impl PtrInfo {
     /// info.py: is_about_object() — whether this info describes an object
     /// (has fields/vtable, as opposed to an array or raw buffer).
     pub fn is_about_object(&self) -> bool {
-        matches!(self, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_))
+        matches!(
+            self,
+            PtrInfo::Virtual(_)
+                | PtrInfo::VirtualStruct(_)
+                | PtrInfo::ForcedVirtual(_)
+                | PtrInfo::ForcedStruct(_)
+        )
     }
 
     /// info.py: is_precise() — whether the type info is exact (not just a bound).
@@ -318,6 +341,8 @@ impl PtrInfo {
                 | PtrInfo::Virtual(_)
                 | PtrInfo::VirtualArray(_)
                 | PtrInfo::VirtualStruct(_)
+                | PtrInfo::ForcedVirtual(_)
+                | PtrInfo::ForcedStruct(_)
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_)
         )
@@ -338,6 +363,8 @@ impl PtrInfo {
             PtrInfo::Virtual(v) => Some(&v.descr),
             PtrInfo::VirtualArray(v) => Some(&v.descr),
             PtrInfo::VirtualStruct(v) => Some(&v.descr),
+            PtrInfo::ForcedVirtual(v) => Some(&v.descr),
+            PtrInfo::ForcedStruct(v) => Some(&v.descr),
             PtrInfo::VirtualArrayStruct(v) => Some(&v.descr),
             _ => None,
         }
@@ -364,6 +391,24 @@ impl PtrInfo {
                 }
                 v.fields.push((field_idx, value));
             }
+            PtrInfo::ForcedVirtual(v) => {
+                for entry in &mut v.fields {
+                    if entry.0 == field_idx {
+                        entry.1 = value;
+                        return;
+                    }
+                }
+                v.fields.push((field_idx, value));
+            }
+            PtrInfo::ForcedStruct(v) => {
+                for entry in &mut v.fields {
+                    if entry.0 == field_idx {
+                        entry.1 = value;
+                        return;
+                    }
+                }
+                v.fields.push((field_idx, value));
+            }
             _ => {}
         }
     }
@@ -377,6 +422,16 @@ impl PtrInfo {
                 .find(|(k, _)| *k == field_idx)
                 .map(|(_, v)| *v),
             PtrInfo::VirtualStruct(v) => v
+                .fields
+                .iter()
+                .find(|(k, _)| *k == field_idx)
+                .map(|(_, v)| *v),
+            PtrInfo::ForcedVirtual(v) => v
+                .fields
+                .iter()
+                .find(|(k, _)| *k == field_idx)
+                .map(|(_, v)| *v),
+            PtrInfo::ForcedStruct(v) => v
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
@@ -554,6 +609,20 @@ impl PtrInfo {
                 }
             }
         }
+        if let PtrInfo::ForcedVirtual(v) = self {
+            for &(field_idx, value) in &v.fields {
+                if !value.is_none() {
+                    result.push((OpCode::GetfieldGcI, structbox, field_idx));
+                }
+            }
+        }
+        if let PtrInfo::ForcedStruct(v) = self {
+            for &(field_idx, value) in &v.fields {
+                if !value.is_none() {
+                    result.push((OpCode::GetfieldGcI, structbox, field_idx));
+                }
+            }
+        }
         result
     }
 
@@ -565,6 +634,14 @@ impl PtrInfo {
                 dst.field_descrs = src.field_descrs.clone();
             }
             (PtrInfo::VirtualStruct(src), PtrInfo::VirtualStruct(dst)) => {
+                dst.fields = src.fields.clone();
+                dst.field_descrs = src.field_descrs.clone();
+            }
+            (PtrInfo::ForcedVirtual(src), PtrInfo::ForcedVirtual(dst)) => {
+                dst.fields = src.fields.clone();
+                dst.field_descrs = src.field_descrs.clone();
+            }
+            (PtrInfo::ForcedStruct(src), PtrInfo::ForcedStruct(dst)) => {
                 dst.fields = src.fields.clone();
                 dst.field_descrs = src.field_descrs.clone();
             }

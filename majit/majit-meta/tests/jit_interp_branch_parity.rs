@@ -1,7 +1,7 @@
 use majit_ir::OpCode;
 use majit_macros::jit_interp;
 use majit_meta::{
-    assert_trace_parity, BackEdgeAction, JitState, MetaInterp, TraceAction, TraceParityCase,
+    BackEdgeAction, JitState, MetaInterp, TraceAction, TraceParityCase, assert_trace_parity,
 };
 use std::sync::Mutex;
 

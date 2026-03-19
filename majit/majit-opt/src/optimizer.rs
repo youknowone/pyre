@@ -1,3 +1,4 @@
+use crate::{OptContext, Optimization, OptimizationResult};
 /// Main optimization driver.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
@@ -12,7 +13,6 @@ use crate::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use crate::{OptContext, Optimization, OptimizationResult};
 use majit_ir::{Op, OpCode, OpRef};
 
 /// The optimizer: chains passes and runs them over a trace.
@@ -350,11 +350,7 @@ impl Optimizer {
     pub fn getnullness(ctx: &OptContext, opref: OpRef) -> i8 {
         let resolved = ctx.get_replacement(opref);
         if let Some(val) = ctx.get_constant_int(resolved) {
-            if val != 0 {
-                1
-            } else {
-                -1
-            }
+            if val != 0 { 1 } else { -1 }
         } else {
             0 // unknown
         }

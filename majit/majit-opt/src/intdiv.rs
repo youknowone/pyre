@@ -218,11 +218,7 @@ mod tests {
     fn floor_div(a: i64, b: i64) -> i64 {
         let d = a / b;
         let r = a % b;
-        if (r != 0) && ((r ^ b) < 0) {
-            d - 1
-        } else {
-            d
-        }
+        if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d }
     }
 
     // ── division_operations tests ──

@@ -1,10 +1,10 @@
 use majit_ir::{GcRef, GreenKey, OpCode, OpRef, Type, Value};
 use majit_macros::jit_driver;
 use majit_meta::{
-    resume::{MaterializedValue, MaterializedVirtual, ResumeDataVirtualAdder},
-    virtualizable::VirtualizableInfo,
     DeclarativeJitDriver, DriverRunOutcome, JitDriver, JitState, PendingFieldWriteLayout,
     TraceAction,
+    resume::{MaterializedValue, MaterializedVirtual, ResumeDataVirtualAdder},
+    virtualizable::VirtualizableInfo,
 };
 
 #[jit_driver(greens = [pc, code], reds = [frame, stack], virtualizable = frame)]
@@ -1399,12 +1399,16 @@ fn declarative_driver_trait_builds_runtime_driver_without_manual_descriptor_plum
     .expect("declarative driver should build runtime descriptor");
     let mut state = TestState { frame: 1, stack: 2 };
 
-    assert!(!driver
-        .back_edge_declarative::<DeclarativeDriver>(&[13, 21], 13, &mut state, &(), || {})
-        .expect("green key should build"));
-    assert!(!driver
-        .back_edge_declarative::<DeclarativeDriver>(&[13, 21], 13, &mut state, &(), || {})
-        .expect("green key should build"));
+    assert!(
+        !driver
+            .back_edge_declarative::<DeclarativeDriver>(&[13, 21], 13, &mut state, &(), || {})
+            .expect("green key should build")
+    );
+    assert!(
+        !driver
+            .back_edge_declarative::<DeclarativeDriver>(&[13, 21], 13, &mut state, &(), || {})
+            .expect("green key should build")
+    );
     assert!(driver.is_tracing());
 
     let ctx = driver
@@ -1438,12 +1442,16 @@ fn declarative_driver_rejects_live_value_count_mismatch() {
     .expect("declarative driver should build runtime descriptor");
     let mut state = BadLiveState { frame: 9 };
 
-    assert!(!driver
-        .back_edge_declarative::<DeclarativeDriver>(&[1, 2], 1, &mut state, &(), || {})
-        .expect("green key should build"));
-    assert!(!driver
-        .back_edge_declarative::<DeclarativeDriver>(&[1, 2], 1, &mut state, &(), || {})
-        .expect("green key should build"));
+    assert!(
+        !driver
+            .back_edge_declarative::<DeclarativeDriver>(&[1, 2], 1, &mut state, &(), || {})
+            .expect("green key should build")
+    );
+    assert!(
+        !driver
+            .back_edge_declarative::<DeclarativeDriver>(&[1, 2], 1, &mut state, &(), || {})
+            .expect("green key should build")
+    );
     assert!(!driver.is_tracing());
 }
 
@@ -1460,12 +1468,16 @@ fn declarative_driver_preserves_typed_red_inputargs_on_trace_start() {
         acc: 3.5,
     };
 
-    assert!(!driver
-        .back_edge_declarative::<TypedDeclarativeDriver>(&[17, 23], 17, &mut state, &(), || {})
-        .expect("green key should build"));
-    assert!(!driver
-        .back_edge_declarative::<TypedDeclarativeDriver>(&[17, 23], 17, &mut state, &(), || {})
-        .expect("green key should build"));
+    assert!(
+        !driver
+            .back_edge_declarative::<TypedDeclarativeDriver>(&[17, 23], 17, &mut state, &(), || {})
+            .expect("green key should build")
+    );
+    assert!(
+        !driver
+            .back_edge_declarative::<TypedDeclarativeDriver>(&[17, 23], 17, &mut state, &(), || {})
+            .expect("green key should build")
+    );
     assert!(driver.is_tracing());
 
     let (trace, _) = driver
@@ -1490,12 +1502,16 @@ fn declarative_driver_rejects_live_value_type_mismatch() {
         acc: 1.25,
     };
 
-    assert!(!driver
-        .back_edge_declarative::<TypedDeclarativeDriver>(&[19, 29], 19, &mut state, &(), || {})
-        .expect("green key should build"));
-    assert!(!driver
-        .back_edge_declarative::<TypedDeclarativeDriver>(&[19, 29], 19, &mut state, &(), || {})
-        .expect("green key should build"));
+    assert!(
+        !driver
+            .back_edge_declarative::<TypedDeclarativeDriver>(&[19, 29], 19, &mut state, &(), || {})
+            .expect("green key should build")
+    );
+    assert!(
+        !driver
+            .back_edge_declarative::<TypedDeclarativeDriver>(&[19, 29], 19, &mut state, &(), || {})
+            .expect("green key should build")
+    );
     assert!(!driver.is_tracing());
 }
 
@@ -1515,12 +1531,16 @@ fn declarative_driver_blackhole_jump_uses_typed_restore_for_ref_and_float_reds()
         typed_restore_calls: 0,
     };
 
-    assert!(!driver
-        .back_edge_declarative::<TypedDeclarativeDriver>(&[31, 41], 31, &mut state, &(), || {})
-        .expect("green key should build"));
-    assert!(!driver
-        .back_edge_declarative::<TypedDeclarativeDriver>(&[31, 41], 31, &mut state, &(), || {})
-        .expect("green key should build"));
+    assert!(
+        !driver
+            .back_edge_declarative::<TypedDeclarativeDriver>(&[31, 41], 31, &mut state, &(), || {})
+            .expect("green key should build")
+    );
+    assert!(
+        !driver
+            .back_edge_declarative::<TypedDeclarativeDriver>(&[31, 41], 31, &mut state, &(), || {})
+            .expect("green key should build")
+    );
     driver.merge_point(|ctx, sym| {
         let cond = ctx.const_int(1);
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 1, &[sym[0], sym[1]]);
@@ -1836,9 +1856,14 @@ fn generic_back_edge_restores_and_syncs_virtualizable_state() {
                 return None;
             }
         }
-        driver.run_back_edge_generic(&green_values, 444, state, &(), || {}, |_state, _meta, _| {
-            None
-        })
+        driver.run_back_edge_generic(
+            &green_values,
+            444,
+            state,
+            &(),
+            || {},
+            |_state, _meta, _| None,
+        )
     };
 
     assert_eq!(run_generic(&mut driver, &mut state), None);

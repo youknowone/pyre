@@ -22,6 +22,9 @@ use crate::patterns::TracePattern;
 pub struct PipelineConfig {
     /// jtransform configuration (virtualizable fields, call classification).
     pub transform: GraphTransformConfig,
+    /// Interpreter-owned pattern roles used by canonical trace classification.
+    #[serde(default)]
+    pub classify: crate::patterns::ClassificationConfig,
 }
 
 /// Result of running the full pipeline on a single function.
@@ -82,7 +85,8 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     let vable_rewrites = transform_result.vable_rewrites;
     let calls_classified = transform_result.calls_classified;
     let transform_notes = transform_result.notes.clone();
-    let classified_pattern = crate::patterns::classify_from_graph(&transform_result.graph);
+    let classified_pattern =
+        crate::patterns::classify_from_graph_with_config(&transform_result.graph, &config.classify);
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
     let flattened = flatten::flatten_with_types(&transform_result.graph, &types);
@@ -180,6 +184,7 @@ mod tests {
                 )],
                 ..Default::default()
             },
+            ..Default::default()
         };
         let result = analyze_program(&program, &config);
         assert_eq!(result.functions.len(), 1);

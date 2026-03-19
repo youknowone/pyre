@@ -117,11 +117,7 @@ fn py_div(a: i64, b: i64) -> i64 {
     let r = a % b;
     // If the remainder is non-zero and the signs of a and b differ,
     // we need to subtract 1 from the quotient.
-    if r != 0 && ((r ^ b) < 0) {
-        q - 1
-    } else {
-        q
-    }
+    if r != 0 && ((r ^ b) < 0) { q - 1 } else { q }
 }
 
 /// Python-style modulo: result has the same sign as the divisor.
@@ -129,11 +125,7 @@ fn py_div(a: i64, b: i64) -> i64 {
 #[allow(dead_code)]
 fn py_mod(a: i64, b: i64) -> i64 {
     let r = a % b;
-    if r != 0 && ((r ^ b) < 0) {
-        r + b
-    } else {
-        r
-    }
+    if r != 0 && ((r ^ b) < 0) { r + b } else { r }
 }
 
 // ── IntBound ──

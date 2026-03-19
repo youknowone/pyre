@@ -2090,7 +2090,9 @@ impl TraceFrameState {
             let s = self.sym_mut();
             s.symbolic_stack.push(callable);
             s.symbolic_stack.push(null_opref);
-            for &a in args { s.symbolic_stack.push(a); }
+            for &a in args {
+                s.symbolic_stack.push(a);
+            }
             s.valuestackdepth += 2 + args.len();
             s.pending_next_instr = Some(call_pc);
         }
@@ -2098,7 +2100,9 @@ impl TraceFrameState {
         let parent_fail_args = self.build_single_frame_fail_args();
         {
             let s = self.sym_mut();
-            for _ in 0..(2 + args.len()) { s.symbolic_stack.pop(); }
+            for _ in 0..(2 + args.len()) {
+                s.symbolic_stack.pop();
+            }
             s.valuestackdepth -= 2 + args.len();
             s.pending_next_instr = None;
         }
@@ -3570,9 +3574,6 @@ fn inline_trace_and_execute(
                     StepResult::Return(concrete_result) => {
                         // popframe()
                         let popped = framestack.pop().unwrap();
-
-                        // PyPy pyjitpl.py:2452 — leave_portal_frame()
-                        ctx.record_op(majit_ir::OpCode::LeavePortalFrame, &[]);
 
                         // Drop callee frame in trace
                         if let Some(frame_opref) = popped.drop_frame_opref {
