@@ -50,11 +50,7 @@ pub fn walk_virtuals(virtuals: &[(OpRef, PtrInfo)], visitor: &mut impl VirtualVi
             PtrInfo::VirtualArrayStruct(v) => visitor.visit_varraystruct(*opref, v),
             PtrInfo::VirtualRawBuffer(v) => visitor.visit_vrawbuffer(*opref, v),
             PtrInfo::Virtualizable(v) => visitor.visit_virtualizable(*opref, v),
-            PtrInfo::ForcedVirtual(_)
-            | PtrInfo::ForcedStruct(_)
-            | PtrInfo::NonNull
-            | PtrInfo::Constant(_)
-            | PtrInfo::KnownClass { .. } => {}
+            PtrInfo::NonNull | PtrInfo::Constant(_) | PtrInfo::KnownClass { .. } => {}
         }
     }
 }

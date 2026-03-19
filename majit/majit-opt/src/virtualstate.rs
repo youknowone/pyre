@@ -880,15 +880,6 @@ fn export_single_value(
                     class_ptr: *class_ptr,
                 };
             }
-            PtrInfo::ForcedVirtual(vinfo) => {
-                if let Some(class_ptr) = vinfo.known_class {
-                    return VirtualStateInfo::KnownClass { class_ptr };
-                }
-                return VirtualStateInfo::NonNull;
-            }
-            PtrInfo::ForcedStruct(_) => {
-                return VirtualStateInfo::NonNull;
-            }
             PtrInfo::NonNull => {
                 return VirtualStateInfo::NonNull;
             }

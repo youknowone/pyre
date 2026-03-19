@@ -1129,25 +1129,8 @@ impl OptVirtualize {
     }
 
     fn clear_forced_field_caches(&mut self) {
-        for slot in &mut self.ptr_info {
-            let Some(info) = slot.take() else {
-                continue;
-            };
-            *slot = Some(match info {
-                PtrInfo::ForcedVirtual(vinfo) => {
-                    if let Some(class_ptr) = vinfo.known_class {
-                        PtrInfo::KnownClass {
-                            class_ptr,
-                            is_nonnull: true,
-                        }
-                    } else {
-                        PtrInfo::NonNull
-                    }
-                }
-                PtrInfo::ForcedStruct(_) => PtrInfo::NonNull,
-                other => other,
-            });
-        }
+        // No-op: forced field caches are handled by heap.rs cache,
+        // not by separate PtrInfo variants.
     }
 
     /// Extend JUMP args with current tracked virtualizable field values.
@@ -2282,9 +2265,8 @@ mod tests {
     }
 
     // Note: forced struct field forwarding is handled by heap.rs caching,
-    // not by virtualize.rs PtrInfo tracking. RPython's info.py doesn't
-    // have a "ForcedVirtual" state — force_box just materializes the
-    // object and heap.py caches the field values independently.
+    // not by virtualize.rs PtrInfo tracking. After force_box, the object
+    // is materialized and heap.py caches field values independently.
 
     #[test]
     fn test_virtual_array_forced_at_jump() {
