@@ -653,12 +653,17 @@ impl Optimizer {
     /// When emitting a guard, check replaces_guard to see if this guard
     /// should replace a previously emitted one (guard strengthening).
     /// Also track last_guard_op for consecutive guard descriptor sharing.
-    fn emit_with_guard_check(&mut self, op: Op, ctx: &mut OptContext) {
+    fn emit_with_guard_check(&mut self, mut op: Op, ctx: &mut OptContext) {
         if op.opcode.is_guard() {
+            // optimizer.py: store_final_boxes_in_guard — encode virtual
+            // objects in fail_args as rd_virtuals instead of forcing them.
+            // This runs at the optimizer level (not per-pass) so ALL guards
+            // get virtual encoding regardless of which pass emits them.
+            op = Self::encode_guard_virtuals(op, ctx);
+
             // optimizer.py: if orig_op in replaces_guard → replace_guard_op
             if self.can_replace_guards {
                 if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
-                    // Replace a previously emitted guard with this one
                     let target_pos = replacement.pos.0 as usize;
                     if target_pos < ctx.new_operations.len() {
                         ctx.new_operations[target_pos] = op.clone();
@@ -675,6 +680,87 @@ impl Optimizer {
             self.last_guard_op = None;
         }
         ctx.emit(op);
+    }
+
+    /// optimizer.py: store_final_boxes_in_guard — encode virtual objects
+    /// in guard fail_args as rd_virtuals for lazy reconstruction on guard
+    /// failure. RPython does this in the optimizer's store_final_boxes_in_guard,
+    /// which runs for every guard regardless of which pass emits it.
+    fn encode_guard_virtuals(mut op: Op, ctx: &mut OptContext) -> Op {
+        use crate::info::PtrInfo;
+        use majit_ir::GuardVirtualEntry;
+
+        let Some(ref mut fail_args) = op.fail_args else {
+            return op;
+        };
+
+        let original_len = fail_args.len();
+        let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
+        let mut extra_fail_args: Vec<OpRef> = Vec::new();
+
+        for fa_idx in 0..original_len {
+            let resolved = ctx.get_replacement(fail_args[fa_idx]);
+            let info = ctx.get_ptr_info(resolved).cloned();
+            let Some(info) = info else {
+                fail_args[fa_idx] = resolved;
+                continue;
+            };
+            if !info.is_virtual() {
+                fail_args[fa_idx] = resolved;
+                continue;
+            }
+
+            // Encode virtual metadata
+            let extra_start = original_len + extra_fail_args.len();
+            match &info {
+                PtrInfo::Virtual(vinfo) => {
+                    let mut fields = Vec::with_capacity(vinfo.fields.len());
+                    for &(field_idx, value_ref) in &vinfo.fields {
+                        let final_ref = ctx.get_replacement(value_ref);
+                        let fa_index = extra_start + extra_fail_args.len();
+                        extra_fail_args.push(final_ref);
+                        fields.push((field_idx, fa_index));
+                    }
+                    virtual_entries.push(GuardVirtualEntry {
+                        fail_arg_index: fa_idx,
+                        descr: vinfo.descr.clone(),
+                        known_class: vinfo.known_class,
+                        fields,
+                    });
+                    fail_args[fa_idx] = OpRef::NONE;
+                }
+                PtrInfo::VirtualStruct(vinfo) => {
+                    let mut fields = Vec::with_capacity(vinfo.fields.len());
+                    for &(field_idx, value_ref) in &vinfo.fields {
+                        let final_ref = ctx.get_replacement(value_ref);
+                        let fa_index = extra_start + extra_fail_args.len();
+                        extra_fail_args.push(final_ref);
+                        fields.push((field_idx, fa_index));
+                    }
+                    virtual_entries.push(GuardVirtualEntry {
+                        fail_arg_index: fa_idx,
+                        descr: vinfo.descr.clone(),
+                        known_class: None,
+                        fields,
+                    });
+                    fail_args[fa_idx] = OpRef::NONE;
+                }
+                _ => {
+                    // Unsupported virtual kind — leave as-is (will be forced
+                    // by virtualize pass or emitted as concrete)
+                    fail_args[fa_idx] = resolved;
+                }
+            }
+        }
+
+        for extra in extra_fail_args {
+            fail_args.push(extra);
+        }
+
+        if !virtual_entries.is_empty() {
+            op.rd_virtuals = Some(virtual_entries);
+        }
+        op
     }
 }
 
@@ -780,6 +866,38 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "remove_as_constant"
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestDescr(u32);
+
+    impl majit_ir::Descr for TestDescr {
+        fn index(&self) -> u32 {
+            self.0
+        }
+    }
+
+    struct QueueForceLikeExtraOps {
+        queued: bool,
+        field_descr: majit_ir::DescrRef,
+    }
+
+    impl Optimization for QueueForceLikeExtraOps {
+        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+            if !self.queued && op.opcode == OpCode::IntAdd {
+                self.queued = true;
+
+                let alloc = ctx.emit_through_passes(Op::new(OpCode::New, &[]));
+                let mut set = Op::new(OpCode::SetfieldGc, &[alloc, OpRef(0)]);
+                set.descr = Some(self.field_descr.clone());
+                ctx.emit_through_passes(set);
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "queue_force_like_extra_ops"
         }
     }
 
@@ -893,6 +1011,46 @@ mod tests {
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
+    }
+
+    #[test]
+    fn test_extra_ops_do_not_flow_into_unroll_buffer() {
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(QueueForceLikeExtraOps {
+            queued: false,
+            field_descr: std::sync::Arc::new(TestDescr(1)),
+        }));
+        opt.add_pass(Box::new(OptHeap::new()));
+        opt.add_pass(Box::new(crate::unroll::OptUnroll::new()));
+
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
+        ];
+        ops[0].pos = OpRef(2);
+        ops[1].pos = OpRef(3);
+
+        let mut constants = std::collections::HashMap::new();
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        let new_positions: std::collections::HashSet<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::New)
+            .map(|op| op.pos)
+            .collect();
+
+        assert!(
+            !new_positions.is_empty(),
+            "force-like extra ops should still emit a New before Jump; got {:?}",
+            result
+        );
+        assert!(
+            result
+                .iter()
+                .any(|op| op.opcode == OpCode::SetfieldGc && new_positions.contains(&op.arg(0))),
+            "SetfieldGc should target the emitted New, not an unrolled-only ref; got {:?}",
+            result
+        );
     }
 
     #[test]
