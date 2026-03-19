@@ -101,6 +101,49 @@ pub struct JitCode {
     assembler_targets: Vec<JitCallAssemblerTarget>,
 }
 
+// ── RPython jitcode.py parity methods ──
+
+impl JitCode {
+    /// RPython: `JitCode.num_regs_i()`
+    pub fn num_regs_i(&self) -> u16 {
+        self.num_regs[0]
+    }
+
+    /// RPython: `JitCode.num_regs_r()`
+    pub fn num_regs_r(&self) -> u16 {
+        self.num_regs[1]
+    }
+
+    /// RPython: `JitCode.num_regs_f()`
+    pub fn num_regs_f(&self) -> u16 {
+        self.num_regs[2]
+    }
+
+    /// RPython: `JitCode.num_regs_and_consts_i()`
+    pub fn num_regs_and_consts_i(&self) -> usize {
+        self.num_regs[0] as usize + self.constants_i.len()
+    }
+
+    /// RPython: `JitCode.follow_jump(position)` — follow a label at position.
+    pub fn follow_jump(&self, position: usize) -> usize {
+        if position < 2 || position - 2 + 1 >= self.code.len() {
+            return 0;
+        }
+        let pos = position - 2;
+        (self.code[pos] as usize) | ((self.code[pos + 1] as usize) << 8)
+    }
+
+    /// RPython: `JitCode.dump()`
+    pub fn dump(&self) -> String {
+        format!(
+            "<JitCode: {} bytes, {} int regs, {} consts>",
+            self.code.len(),
+            self.num_regs[0],
+            self.constants_i.len()
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitCallTarget {
     pub trace_ptr: *const (),
