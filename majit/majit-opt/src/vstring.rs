@@ -460,6 +460,38 @@ impl OptString {
         }
     }
 
+    /// vstring.py: initialize_forced_string(op, targetbox, offsetbox, mode)
+    ///
+    /// Emit STRSETITEM for each known character of a virtual Plain string
+    /// into a target string at the given offset. Returns the new offset
+    /// (offset + length). Used by copy_str_content when the source is virtual.
+    fn initialize_forced_string(
+        &self,
+        chars: &[Option<OpRef>],
+        target: OpRef,
+        mut offset: OpRef,
+        is_unicode: bool,
+        ctx: &mut OptContext,
+    ) -> OpRef {
+        let set_opcode = if is_unicode {
+            OpCode::Unicodesetitem
+        } else {
+            OpCode::Strsetitem
+        };
+        for ch in chars {
+            if let Some(ch_ref) = ch {
+                let ch_resolved = ctx.get_replacement(*ch_ref);
+                let set_op = Op::new(set_opcode, &[target, offset, ch_resolved]);
+                ctx.emit(set_op);
+            }
+            // offset += 1
+            let one = self.emit_constant_int(1, ctx);
+            let add_op = Op::new(OpCode::IntAdd, &[offset, one]);
+            offset = ctx.emit(add_op);
+        }
+        offset
+    }
+
     /// Check if an OpRef references a virtual string (after forwarding).
     #[allow(dead_code)]
     fn is_virtual(&self, opref: OpRef, ctx: &OptContext) -> bool {
@@ -538,9 +570,7 @@ impl OptString {
                     let start = ctx.get_replacement(op.arg(2));
                     let stop = ctx.get_replacement(op.arg(3));
                     // vstring.py: length = stop - start
-                    let length = if let Some(length_ref) =
-                        self.int_sub_oprefs(stop, start, ctx)
-                    {
+                    let length = if let Some(length_ref) = self.int_sub_oprefs(stop, start, ctx) {
                         length_ref
                     } else {
                         let sub_op = Op::new(OpCode::IntSub, &[stop, start]);
@@ -684,8 +714,12 @@ impl Optimization for OptString {
             // STR_CONCAT, STR_SLICE, STR_EQUAL are dispatched by OopSpecIndex
             // on CALL_* ops. For now, check if the call is a string oopspec.
             // vstring.py: oopspec call dispatch (CALL and CALL_PURE).
-            OpCode::CallI | OpCode::CallR | OpCode::CallN
-            | OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureN => {
+            OpCode::CallI
+            | OpCode::CallR
+            | OpCode::CallN
+            | OpCode::CallPureI
+            | OpCode::CallPureR
+            | OpCode::CallPureN => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
