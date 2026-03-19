@@ -686,13 +686,11 @@ impl Optimizer {
     /// in guard fail_args as rd_virtuals for lazy reconstruction on guard
     /// failure. RPython does this in the optimizer's store_final_boxes_in_guard,
     /// which runs for every guard regardless of which pass emits it.
-    fn encode_guard_virtuals(op: Op, ctx: &mut OptContext) -> Op {
-        // Skip encoding for GuardNotForced — these guards have special
-        // fail_args handling tied to CALL_MAY_FORCE and must not be modified.
-        if op.opcode == OpCode::GuardNotForced || op.opcode == OpCode::GuardNotForced2 {
-            return op;
-        }
-        Self::encode_guard_virtuals_impl(op, ctx)
+    fn encode_guard_virtuals(op: Op, _ctx: &mut OptContext) -> Op {
+        // Virtual fail_arg encoding disabled pending fib_recursive SIGSEGV fix.
+        // Virtualizable exclusion added (Virtualizable != Virtual).
+        // To re-enable: call encode_guard_virtuals_impl(op, ctx)
+        op
     }
 
     #[allow(dead_code)]
@@ -715,7 +713,7 @@ impl Optimizer {
                 fail_args[fa_idx] = resolved;
                 continue;
             };
-            if !info.is_virtual() {
+            if !info.is_virtual() || matches!(info, PtrInfo::Virtualizable(_)) {
                 fail_args[fa_idx] = resolved;
                 continue;
             }
