@@ -29,8 +29,8 @@ pub mod quasiimmut;
 pub mod resume;
 mod symbolic_stack;
 mod trace_ctx;
-pub mod virtualref;
 pub mod virtualizable;
+pub mod virtualref;
 
 pub use call_descr::{make_call_assembler_descr, make_call_descr};
 pub use constant_pool::ConstantPool;
@@ -41,12 +41,12 @@ pub use io_buffer::{
 };
 pub use jit_state::{DeoptMaterializationCache, JitState, PendingFieldWriteLayout};
 pub use jitcode::{
-    trace_jitcode, ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
-    JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
+    ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
+    JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack, trace_jitcode,
 };
-pub use jitdriver::JitDriver;
+pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
 pub use majit_codegen::CompiledTraceInfo;
-pub use parity::{assert_trace_parity, normalize_ops, normalize_trace, TraceParityCase};
+pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
     BackEdgeAction, BlackholeRunResult, CompiledExitLayout, CompiledTerminalExitLayout,
     CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, DriverRunOutcome,
@@ -54,7 +54,7 @@ pub use pyjitpl::{
 };
 pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;
-pub use trace_ctx::{DeclarativeJitDriver, JitDriverStaticData, TraceCtx};
+pub use trace_ctx::TraceCtx;
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 pub fn majit_log_enabled() -> bool {
@@ -119,7 +119,7 @@ pub fn green_key_hash(values: &[i64]) -> u64 {
 
 // ── we_are_jitted / JIT mode flag ──
 // Re-exported from majit-codegen so both meta and backend can access it.
-pub use majit_codegen::{set_jitted, we_are_jitted, JittedGuard};
+pub use majit_codegen::{JittedGuard, set_jitted, we_are_jitted};
 
 /// Generic guard state restore for storage-pool interpreters.
 ///

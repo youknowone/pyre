@@ -1,3 +1,6 @@
+//! No direct RPython equivalent — Rust-specific constant deduplication
+//! for OpRef indices (RPython manages constants implicitly in Trace).
+
 use std::collections::HashMap;
 
 use majit_ir::OpRef;

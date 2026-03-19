@@ -17,7 +17,8 @@ use crate::resume::{
     ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
     ResumeLayoutSummary,
 };
-use crate::trace_ctx::{JitDriverStaticData, TraceCtx};
+use crate::jitdriver::JitDriverStaticData;
+use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
 
 /// Result of checking a back-edge.

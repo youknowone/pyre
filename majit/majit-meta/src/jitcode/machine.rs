@@ -8,26 +8,25 @@ use majit_codegen::JitCellToken;
 use majit_ir::{OpCode, OpRef};
 
 use super::{
-    JitArgKind, JitCallArg, JitCallTarget, JitCode, MIFrame, MIFrameStack,
     BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_BRANCH_ZERO,
-    BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF,
-    BC_CALL_ASSEMBLER_VOID, BC_CALL_FLOAT, BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT,
-    BC_CALL_LOOPINVARIANT_INT, BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID,
-    BC_CALL_MAY_FORCE_FLOAT, BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF,
-    BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT, BC_CALL_PURE_INT, BC_CALL_PURE_REF,
-    BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT, BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF,
-    BC_CALL_RELEASE_GIL_VOID, BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F,
-    BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F,
-    BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL,
-    BC_JUMP, BC_JUMP_TARGET, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
-    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I,
-    BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I,
-    BC_PUSH_R, BC_PUSH_TO, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_UNARY_F,
-    BC_RECORD_UNARY_I, BC_REQUIRE_STACK, BC_RESIDUAL_CALL_VOID, BC_SETARRAYITEM_VABLE_F,
-    BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F,
-    BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_SET_SELECTED, BC_STORE_DOWN,
-    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_SWAP_STACK,
-    MAX_HOST_CALL_ARITY,
+    BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID,
+    BC_CALL_FLOAT, BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT,
+    BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT,
+    BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
+    BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
+    BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
+    BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
+    BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
+    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_JUMP, BC_JUMP_TARGET, BC_LOAD_CONST_F,
+    BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
+    BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F,
+    BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RECORD_BINOP_F,
+    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REQUIRE_STACK,
+    BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
+    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
+    BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
+    BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY, MIFrame,
+    MIFrameStack,
 };
 use crate::{SymbolicStack, TraceAction, TraceCtx};
 
@@ -243,10 +242,7 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    fn active_standard_virtualizable(
-        &self,
-        ctx: &TraceCtx,
-    ) -> Option<ActiveStandardVirtualizable> {
+    fn active_standard_virtualizable(&self, ctx: &TraceCtx) -> Option<ActiveStandardVirtualizable> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?.clone();
         let obj_ptr = self.frames.frames.iter().rev().find_map(|frame| {
@@ -2068,7 +2064,23 @@ fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
                 )
             }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
+            [
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                a12,
+                a13,
+                a14,
+            ] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -2090,7 +2102,24 @@ fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
                 )
             }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
+            [
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                a12,
+                a13,
+                a14,
+                a15,
+            ] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -2238,7 +2267,23 @@ fn call_void_function(func_ptr: *const (), args: &[i64]) {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
                 )
             }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
+            [
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                a12,
+                a13,
+                a14,
+            ] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -2260,7 +2305,24 @@ fn call_void_function(func_ptr: *const (), args: &[i64]) {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
                 )
             }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
+            [
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                a12,
+                a13,
+                a14,
+                a15,
+            ] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -2295,10 +2357,10 @@ fn call_void_function(func_ptr: *const (), args: &[i64]) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::JitCodeBuilder;
     use super::*;
     use crate::virtualizable::VirtualizableInfo;
     use majit_ir::Type;
-    use super::super::JitCodeBuilder;
 
     #[derive(Default)]
     struct DummySym {
@@ -2430,7 +2492,10 @@ mod tests {
 
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 4);
-        assert_eq!(recorder.get_op_by_pos(OpRef(0)).unwrap().opcode, OpCode::ForceToken);
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            OpCode::ForceToken
+        );
         let set_token = recorder.get_op_by_pos(OpRef(1)).unwrap();
         assert_eq!(set_token.opcode, OpCode::SetfieldGc);
         assert_eq!(
@@ -2478,7 +2543,10 @@ mod tests {
 
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 3);
-        assert_eq!(recorder.get_op_by_pos(OpRef(0)).unwrap().opcode, OpCode::ForceToken);
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            OpCode::ForceToken
+        );
         assert_eq!(
             recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
             OpCode::SetfieldGc

@@ -15,7 +15,7 @@
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
 use majit_ir::descr::make_array_descr;
-use majit_ir::{make_field_descr, DescrRef, Type};
+use majit_ir::{DescrRef, Type, make_field_descr};
 
 /// Sentinel value for TOKEN_TRACING_RESCALL.
 ///
