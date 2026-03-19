@@ -296,14 +296,8 @@ impl IntBound {
 
         // intutils.py: known bits → INT_AND + GUARD_VALUE
         if !self.are_knownbits_implied() {
-            guards.push((
-                majit_ir::OpCode::IntAnd,
-                !self.tmask as i64,
-            ));
-            guards.push((
-                majit_ir::OpCode::GuardValue,
-                self.tvalue as i64,
-            ));
+            guards.push((majit_ir::OpCode::IntAnd, !self.tmask as i64));
+            guards.push((majit_ir::OpCode::GuardValue, self.tvalue as i64));
         }
 
         guards

@@ -4,6 +4,7 @@
 //! to model only the semantics needed by majit's translation/codewriter layer.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BasicBlockId(pub usize);
@@ -22,6 +23,93 @@ pub enum ValueType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnknownKind {
+    MacroStmt,
+    UnsupportedLiteral,
+    UnsupportedExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CallTarget {
+    Method {
+        name: String,
+        receiver_root: Option<String>,
+    },
+    FunctionPath {
+        segments: Vec<String>,
+    },
+    UnsupportedExpr,
+}
+
+impl CallTarget {
+    pub fn method(name: impl Into<String>, receiver_root: Option<String>) -> Self {
+        Self::Method {
+            name: name.into(),
+            receiver_root,
+        }
+    }
+
+    pub fn function_path<I, S>(segments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::FunctionPath {
+            segments: segments.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn receiver_root(&self) -> Option<&str> {
+        match self {
+            CallTarget::Method { receiver_root, .. } => receiver_root.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn path_segments(&self) -> Option<Vec<&str>> {
+        match self {
+            CallTarget::Method { name, .. } => Some(vec![name.as_str()]),
+            CallTarget::FunctionPath { segments } => {
+                Some(segments.iter().map(String::as_str).collect())
+            }
+            CallTarget::UnsupportedExpr => None,
+        }
+    }
+}
+
+impl fmt::Display for CallTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CallTarget::Method {
+                name,
+                receiver_root: Some(receiver_root),
+            } => write!(f, "{receiver_root}.{name}"),
+            CallTarget::Method {
+                name,
+                receiver_root: None,
+            } => f.write_str(name),
+            CallTarget::FunctionPath { segments } => f.write_str(&segments.join("::")),
+            CallTarget::UnsupportedExpr => f.write_str("<unsupported-call-expr>"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FieldDescriptor {
+    pub name: String,
+    pub owner_root: Option<String>,
+}
+
+impl FieldDescriptor {
+    pub fn new(name: impl Into<String>, owner_root: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            owner_root,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
     Input {
         name: String,
@@ -30,12 +118,12 @@ pub enum OpKind {
     ConstInt(i64),
     FieldRead {
         base: ValueId,
-        field: String,
+        field: FieldDescriptor,
         ty: ValueType,
     },
     FieldWrite {
         base: ValueId,
-        field: String,
+        field: FieldDescriptor,
         value: ValueId,
         ty: ValueType,
     },
@@ -51,7 +139,7 @@ pub enum OpKind {
         item_ty: ValueType,
     },
     Call {
-        target: String,
+        target: CallTarget,
         args: Vec<ValueId>,
         result_ty: ValueType,
     },
@@ -118,27 +206,27 @@ pub enum OpKind {
     /// Elidable (pure) call — no side effects, result depends only on args.
     /// RPython: `call_elidable` / `EF_ELIDABLE`
     CallElidable {
-        target: String,
+        descriptor: crate::call_match::CallDescriptor,
         args: Vec<ValueId>,
         result_ty: ValueType,
     },
     /// Residual call — has side effects, must be preserved.
     /// RPython: `residual_call` / default effect
     CallResidual {
-        target: String,
+        descriptor: crate::call_match::CallDescriptor,
         args: Vec<ValueId>,
         result_ty: ValueType,
     },
     /// May-force call — can trigger GC or force virtualizables.
     /// RPython: `call_may_force` / `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
     CallMayForce {
-        target: String,
+        descriptor: crate::call_match::CallDescriptor,
         args: Vec<ValueId>,
         result_ty: ValueType,
     },
 
     Unknown {
-        summary: String,
+        kind: UnknownKind,
     },
 }
 

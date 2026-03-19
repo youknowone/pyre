@@ -20,7 +20,7 @@ use syn::{
 mod jit_interp;
 
 struct JitInlineArgs {
-    calls: Vec<(Path, Option<Ident>)>,
+    calls: Vec<(Path, Option<jit_interp::CallPolicyKind>)>,
 }
 
 impl Parse for JitInlineArgs {
@@ -38,44 +38,12 @@ impl Parse for JitInlineArgs {
                         let kind = if content.peek(Token![=>]) {
                             content.parse::<Token![=>]>()?;
                             let kind: Ident = content.parse()?;
-                            match kind.to_string().as_str() {
-                                "residual_void"
-                                | "residual_void_wrapped"
-                                | "may_force_void"
-                                | "may_force_void_wrapped"
-                                | "release_gil_void"
-                                | "release_gil_void_wrapped"
-                                | "loopinvariant_void"
-                                | "loopinvariant_void_wrapped"
-                                | "residual_int"
-                                | "residual_int_wrapped"
-                                | "may_force_int"
-                                | "may_force_int_wrapped"
-                                | "release_gil_int"
-                                | "release_gil_int_wrapped"
-                                | "loopinvariant_int"
-                                | "loopinvariant_int_wrapped"
-                                | "elidable_int"
-                                | "elidable_int_wrapped"
-                                | "residual_ref_wrapped"
-                                | "may_force_ref_wrapped"
-                                | "release_gil_ref_wrapped"
-                                | "loopinvariant_ref_wrapped"
-                                | "elidable_ref_wrapped"
-                                | "residual_float_wrapped"
-                                | "may_force_float_wrapped"
-                                | "release_gil_float_wrapped"
-                                | "loopinvariant_float_wrapped"
-                                | "elidable_float_wrapped"
-                                | "inline_int" => {}
-                                _ => {
-                                    return Err(syn::Error::new(
-                                        kind.span(),
-                                        "#[jit_inline(calls = { ... })] supports residual/may_force/release_gil/loopinvariant call policies for void/int and wrapped int/ref/float helpers, plus inline_int",
-                                    ));
-                                }
-                            }
-                            Some(kind)
+                            Some(jit_interp::parse_call_policy_kind(&kind).ok_or_else(|| {
+                                syn::Error::new(
+                                    kind.span(),
+                                    "#[jit_inline(calls = { ... })] supports residual/may_force/release_gil/loopinvariant call policies for void/int and wrapped int/ref/float helpers, plus inline_int",
+                                )
+                            })?)
                         } else {
                             None
                         };

@@ -1,7 +1,6 @@
 use std::cmp::max;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use majit_codegen::JitCellToken;
 use majit_ir::{OpCode, OpRef};
@@ -71,6 +70,20 @@ const BC_LOAD_STATE_ARRAY: u8 = 58;
 const BC_STORE_STATE_ARRAY: u8 = 59;
 const BC_LOAD_STATE_VARRAY: u8 = 60;
 const BC_STORE_STATE_VARRAY: u8 = 61;
+const BC_GETFIELD_VABLE_I: u8 = 62;
+const BC_GETFIELD_VABLE_R: u8 = 63;
+const BC_GETFIELD_VABLE_F: u8 = 64;
+const BC_SETFIELD_VABLE_I: u8 = 65;
+const BC_SETFIELD_VABLE_R: u8 = 66;
+const BC_SETFIELD_VABLE_F: u8 = 67;
+const BC_GETARRAYITEM_VABLE_I: u8 = 68;
+const BC_GETARRAYITEM_VABLE_R: u8 = 69;
+const BC_GETARRAYITEM_VABLE_F: u8 = 70;
+const BC_SETARRAYITEM_VABLE_I: u8 = 71;
+const BC_SETARRAYITEM_VABLE_R: u8 = 72;
+const BC_SETARRAYITEM_VABLE_F: u8 = 73;
+const BC_ARRAYLEN_VABLE: u8 = 74;
+const BC_HINT_FORCE_VIRTUALIZABLE: u8 = 75;
 const MAX_HOST_CALL_ARITY: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -234,6 +247,21 @@ pub trait JitCodeSym {
     fn current_selected_value(&self) -> Option<OpRef>;
     fn set_current_selected(&mut self, selected: usize);
     fn set_current_selected_value(&mut self, selected: usize, value: OpRef);
+    fn guard_selected(&self) -> usize {
+        self.current_selected()
+    }
+    fn guard_selected_value(&self) -> Option<OpRef> {
+        self.current_selected_value()
+    }
+    fn selected_in_fail_args_prefix(&self) -> bool {
+        false
+    }
+    fn close_requires_header_selected(&self) -> bool {
+        true
+    }
+    fn begin_portal_op(&mut self, _pc: usize) {}
+    fn commit_portal_op(&mut self) {}
+    fn abort_portal_op(&mut self) {}
     fn stack(&self, selected: usize) -> Option<&SymbolicStack>;
     fn stack_mut(&mut self, selected: usize) -> Option<&mut SymbolicStack>;
     fn total_slots(&self) -> usize;
@@ -250,9 +278,83 @@ pub trait JitCodeSym {
     /// When `None`, guards fall back to the legacy auto-generated fail args.
     fn fail_args(&self) -> Option<Vec<OpRef>>;
 
+    /// Guard-failure state materialization that may record extra IR.
+    ///
+    /// Compact storage backends use this to attach logical stack state
+    /// (lengths and pending writes) without exposing it as loop inputargs.
+    fn fail_args_with_ctx(&mut self, _ctx: &mut TraceCtx) -> Option<Vec<OpRef>> {
+        self.fail_args()
+    }
+
     /// Current stack lengths in the same storage order as `fail_args()`.
     fn fail_storage_lengths(&self) -> Option<Vec<usize>> {
         None
+    }
+
+    /// Compact storage-pool support: raw data pointer for a traced storage.
+    fn compact_storage_ptr(&self, _selected: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Compact storage-pool support: current logical length for a traced storage.
+    fn compact_storage_len(&self, _selected: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Compact storage-pool support: current capacity for a traced storage.
+    fn compact_storage_cap(&self, _selected: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Update the symbolic length for a compact traced storage.
+    fn set_compact_storage_len(&mut self, _selected: usize, _value: OpRef) {}
+
+    /// Get a cached raw word for a concrete compact storage slot.
+    fn compact_storage_slot_raw(&self, _selected: usize, _index: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Record a cached raw word for a concrete compact storage slot.
+    fn set_compact_storage_slot_raw(&mut self, _selected: usize, _index: usize, _raw: OpRef) {}
+
+    /// Drop cached compact storage slots at and above `len`.
+    fn truncate_compact_storage_slots(&mut self, _selected: usize, _len: usize) {}
+
+    /// Ensure compact storage refs are available, recording any required loads.
+    fn ensure_compact_storage_loaded(
+        &mut self,
+        _ctx: &mut TraceCtx,
+        selected: usize,
+    ) -> Option<(OpRef, OpRef, OpRef)> {
+        Some((
+            self.compact_storage_ptr(selected)?,
+            self.compact_storage_len(selected)?,
+            self.compact_storage_cap(selected)?,
+        ))
+    }
+
+    /// Write the latest compact length back to heap metadata if needed.
+    fn compact_storage_writeback_len(
+        &mut self,
+        _ctx: &mut TraceCtx,
+        _selected: usize,
+        _new_len: OpRef,
+    ) {
+    }
+
+    /// Optional semantic bounds for compact storage values.
+    fn compact_storage_bounds(&self) -> Option<(i64, i64)> {
+        None
+    }
+
+    /// Decode a raw compact storage word into a semantic integer value.
+    fn compact_storage_decode(&self, _ctx: &mut TraceCtx, raw: OpRef) -> OpRef {
+        raw
+    }
+
+    /// Encode a semantic integer value into the raw compact storage representation.
+    fn compact_storage_encode(&self, _ctx: &mut TraceCtx, value: OpRef) -> OpRef {
+        value
     }
 
     // ── State field support (register/tape machines) ─────────────
@@ -291,35 +393,6 @@ pub trait JitCodeSym {
     fn state_varray_len(&self, _array_idx: usize) -> Option<OpRef> {
         None
     }
-
-    // ── Storage pool virtualizable support ────────────────────
-    //
-    // RPython parity: storage contents live on heap, only lengths
-    // are InputArgs. Pop/push emit GetarrayitemRawI/SetarrayitemRaw.
-
-    /// Whether the storage pool uses virtualizable (heap-backed) mode.
-    fn is_virtualizable_storage(&self) -> bool {
-        false
-    }
-
-    /// Get the data pointer OpRef for a virtualizable storage slot.
-    fn vable_array_ref(&self, _storage_idx: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Get the length OpRef for a virtualizable storage slot.
-    fn vable_len_ref(&self, _storage_idx: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Set the data pointer OpRef for a virtualizable storage slot.
-    fn set_vable_array_ref(&mut self, _storage_idx: usize, _opref: OpRef) {}
-
-    /// Set the length OpRef for a virtualizable storage slot.
-    fn set_vable_len_ref(&mut self, _storage_idx: usize, _opref: OpRef) {}
-
-    /// Initialize a virtualizable storage (set both array ref and len ref).
-    fn init_vable_storage(&mut self, _storage_idx: usize, _array_ref: OpRef, _len_ref: OpRef) {}
 }
 
 pub trait JitCodeRuntime {
@@ -361,37 +434,6 @@ where
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
     }
-}
-
-#[derive(Debug)]
-pub struct RawI64ArrayDescr;
-
-impl majit_ir::Descr for RawI64ArrayDescr {
-    fn as_array_descr(&self) -> Option<&dyn majit_ir::ArrayDescr> {
-        Some(self)
-    }
-}
-
-impl majit_ir::ArrayDescr for RawI64ArrayDescr {
-    fn base_size(&self) -> usize {
-        0
-    }
-    fn item_size(&self) -> usize {
-        8
-    }
-    fn type_id(&self) -> u32 {
-        0
-    }
-    fn item_type(&self) -> majit_ir::Type {
-        majit_ir::Type::Int
-    }
-    fn is_item_signed(&self) -> bool {
-        true
-    }
-}
-
-pub fn raw_i64_array_descr() -> majit_ir::DescrRef {
-    Arc::new(RawI64ArrayDescr)
 }
 
 pub struct MIFrame<'a> {
@@ -474,69 +516,298 @@ pub struct JitCodeMachine<'a, S, R> {
     marker: PhantomData<(S, R)>,
 }
 
+#[derive(Clone)]
+struct ActiveStandardVirtualizable {
+    vable_opref: OpRef,
+    info: crate::virtualizable::VirtualizableInfo,
+    obj_ptr: *mut u8,
+}
+
 impl<'a, S, R> JitCodeMachine<'a, S, R>
 where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    /// Virtualizable: write symbolic stack contents back to heap.
-    /// RPython: synchronize_virtualizable() in pyjitpl.py.
-    /// Called before CloseLoop to ensure heap is up-to-date for
-    /// the next iteration's preamble reload.
-    fn sync_virtualizable_to_heap(ctx: &mut TraceCtx, sym: &mut S) {
-        let const_1 = ctx.const_int(1);
-        // For each storage that has vable info, write all symbolic stack values to heap.
-        // This iterates over storages that were loaded by the preamble.
-        for sidx in 0..28 {
-            // Check if this storage has virtualizable info.
-            let (arr_ref, len_ref) = match (sym.vable_array_ref(sidx), sym.vable_len_ref(sidx)) {
-                (Some(a), Some(l)) => (a, l),
-                _ => continue,
-            };
-            let stack = match sym.stack(sidx) {
-                Some(s) => s,
-                None => continue,
-            };
-            let stack_vals = stack.to_jump_args();
-            // Update heap length: store new length
-            let new_len = ctx.const_int(stack_vals.len() as i64);
-            // Write each element: tag and store
-            for (j, &val) in stack_vals.iter().enumerate() {
-                let byte_off = ctx.const_int((j as i64) * 8);
-                // Tag: Val = (value << 1) | 1
-                let shifted = ctx.record_op(OpCode::IntLshift, &[val, const_1]);
-                let tagged = ctx.record_op(OpCode::IntOr, &[shifted, const_1]);
-                ctx.record_op_with_descr(
-                    OpCode::SetarrayitemRaw,
-                    &[arr_ref, byte_off, tagged],
-                    raw_i64_array_descr(),
-                );
-            }
-            // Update the vable_len_ref to the new length for collect_jump_args.
-            sym.set_vable_len_ref(sidx, new_len);
+    fn active_standard_virtualizable(
+        &self,
+        ctx: &TraceCtx,
+    ) -> Option<ActiveStandardVirtualizable> {
+        let vable_opref = ctx.standard_virtualizable_box()?;
+        let info = ctx.virtualizable_info()?.clone();
+        let obj_ptr = self.frames.frames.iter().rev().find_map(|frame| {
+            frame
+                .ref_regs
+                .iter()
+                .zip(frame.ref_values.iter())
+                .find_map(|(opref, concrete)| {
+                    (*opref == Some(vable_opref))
+                        .then_some(*concrete)
+                        .flatten()
+                        .map(|value| value as usize as *mut u8)
+                })
+        })?;
+        Some(ActiveStandardVirtualizable {
+            vable_opref,
+            info,
+            obj_ptr,
+        })
+    }
+
+    fn prepare_standard_virtualizable_before_residual_call(
+        &mut self,
+        ctx: &mut TraceCtx,
+    ) -> Option<ActiveStandardVirtualizable> {
+        let active = self.active_standard_virtualizable(ctx)?;
+        unsafe {
+            active.info.tracing_before_residual_call(active.obj_ptr);
         }
+        let force_token = ctx.force_token();
+        ctx.vable_setfield_descr(
+            active.vable_opref,
+            force_token,
+            active.info.token_field_descr(),
+        );
+        Some(active)
+    }
+
+    fn finish_standard_virtualizable_after_residual_call(
+        active: Option<ActiveStandardVirtualizable>,
+    ) -> bool {
+        let Some(active) = active else {
+            return false;
+        };
+        unsafe { active.info.tracing_after_residual_call(active.obj_ptr) }
     }
 
     fn record_state_guard(
         ctx: &mut TraceCtx,
-        sym: &S,
+        sym: &mut S,
         opcode: OpCode,
         args: &[OpRef],
         extra_fail_args: &[OpRef],
     ) {
-        if let Some(mut fail_args) = sym.fail_args() {
+        if let Some(mut fail_args) = sym.fail_args_with_ctx(ctx) {
             if let Some(lengths) = sym.fail_storage_lengths() {
                 fail_args.extend(lengths.into_iter().map(|len| ctx.const_int(len as i64)));
             }
-            let selected = sym
-                .current_selected_value()
-                .unwrap_or_else(|| ctx.const_int(sym.current_selected() as i64));
-            fail_args.push(selected);
+            if !sym.selected_in_fail_args_prefix() {
+                let selected = sym
+                    .guard_selected_value()
+                    .unwrap_or_else(|| ctx.const_int(sym.guard_selected() as i64));
+                fail_args.push(selected);
+            }
             fail_args.extend_from_slice(extra_fail_args);
             ctx.record_guard_with_fail_args(opcode, args, fail_args.len(), &fail_args);
         } else {
             ctx.record_guard(opcode, args, sym.total_slots());
         }
+    }
+
+    fn compact_storage_refs(
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        selected: usize,
+    ) -> Option<(OpRef, OpRef, OpRef)> {
+        sym.ensure_compact_storage_loaded(ctx, selected)
+    }
+
+    fn raw_word_array_descr() -> majit_ir::DescrRef {
+        majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int)
+    }
+
+    fn standard_vable_field_offset(ctx: &TraceCtx, field_idx: usize) -> Option<(OpRef, usize)> {
+        let vable_opref = ctx.standard_virtualizable_box()?;
+        let info = ctx.virtualizable_info()?;
+        let field = info.static_fields.get(field_idx)?;
+        Some((vable_opref, field.offset))
+    }
+
+    fn standard_vable_array_offset(ctx: &TraceCtx, array_idx: usize) -> Option<(OpRef, usize)> {
+        let vable_opref = ctx.standard_virtualizable_box()?;
+        let info = ctx.virtualizable_info()?;
+        let array = info.array_fields.get(array_idx)?;
+        Some((vable_opref, array.field_offset))
+    }
+
+    fn compact_load_raw(ctx: &mut TraceCtx, ptr: OpRef, index: OpRef) -> OpRef {
+        ctx.record_op_with_descr(
+            OpCode::GetarrayitemRawI,
+            &[ptr, index],
+            Self::raw_word_array_descr(),
+        )
+    }
+
+    fn compact_store_raw(ctx: &mut TraceCtx, ptr: OpRef, index: OpRef, raw: OpRef) {
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemRaw,
+            &[ptr, index, raw],
+            Self::raw_word_array_descr(),
+        );
+    }
+
+    fn compact_resume_pc(&mut self, ctx: &mut TraceCtx) -> OpRef {
+        ctx.const_int(self.frames.current_mut().pc as i64)
+    }
+
+    fn compact_guard_push_capacity(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        len: OpRef,
+        cap: OpRef,
+    ) {
+        let has_room = ctx.record_op(OpCode::IntLt, &[len, cap]);
+        let resume_pc = self.compact_resume_pc(ctx);
+        Self::record_state_guard(ctx, sym, OpCode::GuardTrue, &[has_room], &[resume_pc]);
+    }
+
+    fn compact_guard_required_stack(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        len: OpRef,
+        required: usize,
+        concrete_len: usize,
+    ) {
+        let required_ref = ctx.const_int(required as i64);
+        let has_enough = ctx.record_op(OpCode::IntGe, &[len, required_ref]);
+        let opcode = if concrete_len < required {
+            OpCode::GuardFalse
+        } else {
+            OpCode::GuardTrue
+        };
+        let resume_pc = if concrete_len < required {
+            // BRPOP-style traces that took the branch must resume on the
+            // fallthrough instruction when the guard fails.
+            ctx.const_int((self.frames.current_mut().pc + 1) as i64)
+        } else {
+            // Non-branching traces must re-run the current control opcode so
+            // the interpreter can take the branch concretely on guard failure.
+            self.compact_resume_pc(ctx)
+        };
+        Self::record_state_guard(ctx, sym, opcode, &[has_enough], &[resume_pc]);
+    }
+
+    fn compact_guard_value_bounds(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        value: OpRef,
+        concrete: i64,
+    ) -> Result<(), TraceAction> {
+        let Some((min, max)) = sym.compact_storage_bounds() else {
+            return Ok(());
+        };
+        if concrete < min || concrete > max {
+            return Err(TraceAction::Abort);
+        }
+        let resume_pc = self.compact_resume_pc(ctx);
+        let min_ref = ctx.const_int(min);
+        let lower_ok = ctx.record_op(OpCode::IntGe, &[value, min_ref]);
+        Self::record_state_guard(ctx, sym, OpCode::GuardTrue, &[lower_ok], &[resume_pc]);
+        let max_ref = ctx.const_int(max);
+        let upper_ok = ctx.record_op(OpCode::IntLe, &[value, max_ref]);
+        Self::record_state_guard(ctx, sym, OpCode::GuardTrue, &[upper_ok], &[resume_pc]);
+        Ok(())
+    }
+
+    fn compact_pop_int(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        selected: usize,
+    ) -> Result<(OpRef, i64), TraceAction> {
+        let concrete = self
+            .runtime_stack_mut(selected, runtime)
+            .pop()
+            .ok_or(TraceAction::Abort)?;
+        let concrete_new_len = self.runtime_stack_mut(selected, runtime).len();
+        let Some((ptr, len, _)) = Self::compact_storage_refs(ctx, sym, selected) else {
+            return Err(TraceAction::Abort);
+        };
+        let one = ctx.const_int(1);
+        let new_len = ctx.record_op(OpCode::IntSub, &[len, one]);
+        let raw = sym
+            .compact_storage_slot_raw(selected, concrete_new_len)
+            .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, new_len));
+        sym.truncate_compact_storage_slots(selected, concrete_new_len);
+        let decoded = sym.compact_storage_decode(ctx, raw);
+        sym.set_compact_storage_len(selected, new_len);
+        sym.compact_storage_writeback_len(ctx, selected, new_len);
+        Ok((decoded, concrete))
+    }
+
+    fn compact_peek_int(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        selected: usize,
+    ) -> Result<(OpRef, i64), TraceAction> {
+        let concrete_stack = self.runtime_stack_mut(selected, runtime);
+        let concrete = concrete_stack.last().copied().ok_or(TraceAction::Abort)?;
+        let concrete_index = concrete_stack.len() - 1;
+        let Some((ptr, len, _)) = Self::compact_storage_refs(ctx, sym, selected) else {
+            return Err(TraceAction::Abort);
+        };
+        let one = ctx.const_int(1);
+        let index = ctx.record_op(OpCode::IntSub, &[len, one]);
+        let raw = sym
+            .compact_storage_slot_raw(selected, concrete_index)
+            .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, index));
+        let decoded = sym.compact_storage_decode(ctx, raw);
+        Ok((decoded, concrete))
+    }
+
+    fn compact_push_int(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        selected: usize,
+        value: OpRef,
+        concrete: i64,
+    ) -> Result<(), TraceAction> {
+        let Some((ptr, len, cap)) = Self::compact_storage_refs(ctx, sym, selected) else {
+            return Err(TraceAction::Abort);
+        };
+        let concrete_index = self.runtime_stack_mut(selected, runtime).len();
+        self.compact_guard_push_capacity(ctx, sym, len, cap);
+        self.compact_guard_value_bounds(ctx, sym, value, concrete)?;
+        let raw = sym.compact_storage_encode(ctx, value);
+        Self::compact_store_raw(ctx, ptr, len, raw);
+        sym.set_compact_storage_slot_raw(selected, concrete_index, raw);
+        let one = ctx.const_int(1);
+        let new_len = ctx.record_op(OpCode::IntAdd, &[len, one]);
+        sym.set_compact_storage_len(selected, new_len);
+        sym.compact_storage_writeback_len(ctx, selected, new_len);
+        self.runtime_stack_mut(selected, runtime).push(concrete);
+        Ok(())
+    }
+
+    fn compact_push_raw(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        selected: usize,
+        raw: OpRef,
+        concrete: i64,
+    ) -> Result<(), TraceAction> {
+        let Some((ptr, len, cap)) = Self::compact_storage_refs(ctx, sym, selected) else {
+            return Err(TraceAction::Abort);
+        };
+        let concrete_index = self.runtime_stack_mut(selected, runtime).len();
+        self.compact_guard_push_capacity(ctx, sym, len, cap);
+        Self::compact_store_raw(ctx, ptr, len, raw);
+        sym.set_compact_storage_slot_raw(selected, concrete_index, raw);
+        let one = ctx.const_int(1);
+        let new_len = ctx.record_op(OpCode::IntAdd, &[len, one]);
+        sym.set_compact_storage_len(selected, new_len);
+        sym.compact_storage_writeback_len(ctx, selected, new_len);
+        self.runtime_stack_mut(selected, runtime).push(concrete);
+        Ok(())
     }
 
     pub fn new(
@@ -552,6 +823,8 @@ where
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        let portal_pc = self.frames.current_mut().pc;
+        sym.begin_portal_op(portal_pc);
         while !self.frames.is_empty() {
             // Catch panics from BigInt overflow in runtime stack operations.
             // RPython doesn't have this issue (no BigInt); we abort the trace.
@@ -559,16 +832,45 @@ where
                 self.run_one_step(ctx, sym, runtime)
             })) {
                 Ok(a) => a,
-                Err(_) => return TraceAction::AbortPermanent,
+                Err(payload) => {
+                    if crate::majit_log_enabled() {
+                        let message = if let Some(msg) = payload.downcast_ref::<&str>() {
+                            *msg
+                        } else if let Some(msg) = payload.downcast_ref::<String>() {
+                            msg.as_str()
+                        } else {
+                            "<non-string panic payload>"
+                        };
+                        eprintln!(
+                            "[jit] trace_jitcode panic while tracing pc={}: {}",
+                            self.frames.current_mut().pc,
+                            message
+                        );
+                    }
+                    sym.abort_portal_op();
+                    return TraceAction::AbortPermanent;
+                }
             };
             if !matches!(action, TraceAction::Continue) {
+                match action {
+                    TraceAction::CloseLoop => sym.commit_portal_op(),
+                    _ => sym.abort_portal_op(),
+                }
                 return action;
             }
         }
 
         if ctx.is_too_long() {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] trace_jitcode aborting: trace too long at portal pc={}",
+                    portal_pc
+                );
+            }
+            sym.abort_portal_op();
             TraceAction::AbortPermanent
         } else {
+            sym.commit_portal_op();
             TraceAction::Continue
         }
     }
@@ -576,6 +878,9 @@ where
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         if self.frames.is_empty() {
             return if ctx.is_too_long() {
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit] trace_jitcode aborting: trace too long with empty frame");
+                }
                 TraceAction::AbortPermanent
             } else {
                 TraceAction::Continue
@@ -627,19 +932,13 @@ where
             BC_POP_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() {
-                    // Virtualizable: pop from symbolic stack (preamble-loaded or earlier push).
-                    // RPython: read from virtualizable_boxes[index].
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    let symbolic = stack.pop();
-                    let concrete = self.runtime_stack_mut(selected, runtime).pop();
-                    if let Some(sym_val) = symbolic {
-                        self.set_int_reg(dst, Some(sym_val), concrete);
-                    } else {
-                        // Symbolic stack underflow: should not happen if preamble
-                        // loaded correctly. Abort trace for safety.
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                    let Ok((symbolic, concrete)) =
+                        self.compact_pop_int(ctx, sym, runtime, selected)
+                    else {
                         return TraceAction::Abort;
-                    }
+                    };
+                    self.set_int_reg(dst, Some(symbolic), Some(concrete));
                 } else {
                     let symbolic = {
                         let stack = sym.stack_mut(selected).expect("missing symbolic stack");
@@ -652,40 +951,55 @@ where
             BC_PEEK_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                // RPython parity: peek from boxes (SymbolicStack), no IR.
-                let symbolic = {
-                    let stack = sym.stack(selected).expect("missing symbolic stack");
-                    stack.peek()
-                };
-                let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
-                self.set_int_reg(dst, symbolic, concrete);
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                    let Ok((symbolic, concrete)) =
+                        self.compact_peek_int(ctx, sym, runtime, selected)
+                    else {
+                        return TraceAction::Abort;
+                    };
+                    self.set_int_reg(dst, Some(symbolic), Some(concrete));
+                } else {
+                    // RPython parity: peek from boxes (SymbolicStack), no IR.
+                    let symbolic = {
+                        let stack = sym.stack(selected).expect("missing symbolic stack");
+                        stack.peek()
+                    };
+                    let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
+                    self.set_int_reg(dst, symbolic, concrete);
+                }
             }
             BC_PUSH_I => {
                 let src = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 let (value, concrete) = self.read_int_reg(src);
-                if sym.is_virtualizable_storage() {
-                    // Virtualizable: push is purely virtual (symbolic stack only).
-                    // RPython: setarrayitem goes to virtualizable_boxes, not heap.
-                    // Heap is synced at loop close via JUMP and at guard failure.
-                    // No SetarrayitemRaw or len_ref update here.
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                    if self
+                        .compact_push_int(ctx, sym, runtime, selected, value, concrete)
+                        .is_err()
+                    {
+                        return TraceAction::Abort;
+                    }
+                } else {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.push(value);
+                    self.runtime_stack_mut(selected, runtime).push(concrete);
                 }
-                // Always track on symbolic stack (for subsequent pops within trace).
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                stack.push(value);
-                self.runtime_stack_mut(selected, runtime).push(concrete);
             }
             BC_POP_DISCARD => {
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    if stack.pop().is_some() {
-                        let _ = self.runtime_stack_mut(selected, runtime).pop();
-                    } else {
-                        // Underflow: preamble didn't load enough. Abort.
-                        let _ = self.runtime_stack_mut(selected, runtime).pop();
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                    if self.runtime_stack_mut(selected, runtime).pop().is_none() {
                         return TraceAction::Abort;
                     }
+                    let concrete_new_len = self.runtime_stack_mut(selected, runtime).len();
+                    let Some((_, len, _)) = Self::compact_storage_refs(ctx, sym, selected) else {
+                        return TraceAction::Abort;
+                    };
+                    let one = ctx.const_int(1);
+                    let new_len = ctx.record_op(OpCode::IntSub, &[len, one]);
+                    sym.truncate_compact_storage_slots(selected, concrete_new_len);
+                    sym.set_compact_storage_len(selected, new_len);
+                    sym.compact_storage_writeback_len(ctx, selected, new_len);
                 } else {
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                     let _ = stack.pop();
@@ -694,21 +1008,26 @@ where
             }
             BC_DUP_STACK => {
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage() {
-                    let stack_len = sym.stack(selected).map_or(0, |s| s.len());
-                    if stack_len > 0 {
-                        let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                        stack.dup();
-                    } else {
-                        // Underflow: preamble didn't load enough. Abort.
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                    let concrete_stack = self.runtime_stack_mut(selected, runtime);
+                    let Some(concrete) = concrete_stack.last().copied() else {
+                        return TraceAction::Abort;
+                    };
+                    let concrete_top_index = concrete_stack.len() - 1;
+                    let Some((ptr, len, _)) = Self::compact_storage_refs(ctx, sym, selected) else {
+                        return TraceAction::Abort;
+                    };
+                    let one = ctx.const_int(1);
+                    let top_index = ctx.record_op(OpCode::IntSub, &[len, one]);
+                    let raw = sym
+                        .compact_storage_slot_raw(selected, concrete_top_index)
+                        .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, top_index));
+                    if self
+                        .compact_push_raw(ctx, sym, runtime, selected, raw, concrete)
+                        .is_err()
+                    {
                         return TraceAction::Abort;
                     }
-                    let value = self
-                        .runtime_stack_mut(selected, runtime)
-                        .last()
-                        .copied()
-                        .expect("cannot dup from empty runtime stack");
-                    self.runtime_stack_mut(selected, runtime).push(value);
                 } else {
                     let stack = sym.stack_mut(selected).expect("missing symbolic stack");
                     stack.dup();
@@ -722,26 +1041,52 @@ where
             }
             BC_SWAP_STACK => {
                 let selected = sym.current_selected();
-                if sym.is_virtualizable_storage()
-                    && sym.stack(selected).map_or(true, |s| s.len() < 2)
-                {
-                    // Insufficient symbolic stack items for swap — abort trace.
-                    return TraceAction::Abort;
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                    let runtime_stack = self.runtime_stack_mut(selected, runtime);
+                    let len = runtime_stack.len();
+                    assert!(
+                        len >= 2,
+                        "cannot swap runtime stack with fewer than two values"
+                    );
+                    runtime_stack.swap(len - 1, len - 2);
+
+                    let Some((ptr, len_ref, _)) = Self::compact_storage_refs(ctx, sym, selected)
+                    else {
+                        return TraceAction::Abort;
+                    };
+                    let one = ctx.const_int(1);
+                    let two = ctx.const_int(2);
+                    let top_index = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
+                    let prev_index = ctx.record_op(OpCode::IntSub, &[len_ref, two]);
+                    let raw_top = sym
+                        .compact_storage_slot_raw(selected, len - 1)
+                        .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, top_index));
+                    let raw_prev = sym
+                        .compact_storage_slot_raw(selected, len - 2)
+                        .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, prev_index));
+                    Self::compact_store_raw(ctx, ptr, prev_index, raw_top);
+                    Self::compact_store_raw(ctx, ptr, top_index, raw_prev);
+                    sym.set_compact_storage_slot_raw(selected, len - 2, raw_top);
+                    sym.set_compact_storage_slot_raw(selected, len - 1, raw_prev);
+                } else {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.swap();
+                    let stack = self.runtime_stack_mut(selected, runtime);
+                    let len = stack.len();
+                    assert!(
+                        len >= 2,
+                        "cannot swap runtime stack with fewer than two values"
+                    );
+                    stack.swap(len - 1, len - 2);
                 }
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                stack.swap();
-                let stack = self.runtime_stack_mut(selected, runtime);
-                let len = stack.len();
-                assert!(
-                    len >= 2,
-                    "cannot swap runtime stack with fewer than two values"
-                );
-                stack.swap(len - 1, len - 2);
             }
             BC_COPY_FROM_BOTTOM => {
                 // Copy element at index (from bottom) to top of stack.
                 let idx_reg = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                    return TraceAction::Abort;
+                }
                 let (idx_sym, idx_concrete) = self.read_int_reg(idx_reg);
                 let index = idx_concrete as usize;
 
@@ -758,6 +1103,9 @@ where
                 // Pop top of stack, store at index (from bottom).
                 let idx_reg = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                    return TraceAction::Abort;
+                }
                 let (idx_sym, idx_concrete) = self.read_int_reg(idx_reg);
                 let index = idx_concrete as usize;
 
@@ -812,6 +1160,172 @@ where
                 sym.set_state_array_ref(array_idx, elem_idx, opref);
             }
 
+            // ── First-class virtualizable access (RPython getfield_vable_*) ──
+            BC_GETFIELD_VABLE_I => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, field_offset)) =
+                    Self::standard_vable_field_offset(ctx, field_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let result = ctx.vable_getfield_int(vable_opref, field_offset);
+                self.set_int_reg(dest, Some(result), Some(0));
+            }
+            BC_GETFIELD_VABLE_R => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, field_offset)) =
+                    Self::standard_vable_field_offset(ctx, field_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let result = ctx.vable_getfield_ref(vable_opref, field_offset);
+                self.set_ref_reg(dest, Some(result), Some(0));
+            }
+            BC_GETFIELD_VABLE_F => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, field_offset)) =
+                    Self::standard_vable_field_offset(ctx, field_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let result = ctx.vable_getfield_float(vable_opref, field_offset);
+                self.set_float_reg(dest, Some(result), Some(0));
+            }
+            BC_SETFIELD_VABLE_I => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, field_offset)) =
+                    Self::standard_vable_field_offset(ctx, field_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (value, _) = self.read_int_reg(src);
+                ctx.vable_setfield(vable_opref, field_offset, value);
+            }
+            BC_SETFIELD_VABLE_R => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, field_offset)) =
+                    Self::standard_vable_field_offset(ctx, field_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (value, _) = self.read_ref_reg(src);
+                ctx.vable_setfield(vable_opref, field_offset, value);
+            }
+            BC_SETFIELD_VABLE_F => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, field_offset)) =
+                    Self::standard_vable_field_offset(ctx, field_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (value, _) = self.read_float_reg(src);
+                ctx.vable_setfield(vable_opref, field_offset, value);
+            }
+            BC_GETARRAYITEM_VABLE_I => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, array_field_offset)) =
+                    Self::standard_vable_array_offset(ctx, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (index, _) = self.read_int_reg(index_reg);
+                let result =
+                    ctx.vable_getarrayitem_int_indexed(vable_opref, index, array_field_offset);
+                self.set_int_reg(dest, Some(result), Some(0));
+            }
+            BC_GETARRAYITEM_VABLE_R => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, array_field_offset)) =
+                    Self::standard_vable_array_offset(ctx, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (index, _) = self.read_int_reg(index_reg);
+                let result =
+                    ctx.vable_getarrayitem_ref_indexed(vable_opref, index, array_field_offset);
+                self.set_ref_reg(dest, Some(result), Some(0));
+            }
+            BC_GETARRAYITEM_VABLE_F => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, array_field_offset)) =
+                    Self::standard_vable_array_offset(ctx, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (index, _) = self.read_int_reg(index_reg);
+                let result =
+                    ctx.vable_getarrayitem_float_indexed(vable_opref, index, array_field_offset);
+                self.set_float_reg(dest, Some(result), Some(0));
+            }
+            BC_SETARRAYITEM_VABLE_I => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, array_field_offset)) =
+                    Self::standard_vable_array_offset(ctx, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (index, _) = self.read_int_reg(index_reg);
+                let (value, _) = self.read_int_reg(src);
+                ctx.vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+            }
+            BC_SETARRAYITEM_VABLE_R => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, array_field_offset)) =
+                    Self::standard_vable_array_offset(ctx, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (index, _) = self.read_int_reg(index_reg);
+                let (value, _) = self.read_ref_reg(src);
+                ctx.vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+            }
+            BC_SETARRAYITEM_VABLE_F => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, array_field_offset)) =
+                    Self::standard_vable_array_offset(ctx, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (index, _) = self.read_int_reg(index_reg);
+                let (value, _) = self.read_float_reg(src);
+                ctx.vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+            }
+            BC_ARRAYLEN_VABLE => {
+                let array_idx = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u16() as usize;
+                let Some((vable_opref, array_field_offset)) =
+                    Self::standard_vable_array_offset(ctx, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let result = ctx.vable_arraylen_vable(vable_opref, array_field_offset);
+                self.set_int_reg(dest, Some(result), Some(0));
+            }
+            BC_HINT_FORCE_VIRTUALIZABLE => {
+                let Some(vable_opref) = ctx.standard_virtualizable_box() else {
+                    return TraceAction::Abort;
+                };
+                ctx.gen_store_back_in_vable(vable_opref);
+            }
+
             // ── Virtualizable state array access ──
             // Array stays on heap; emit raw memory load/store IR ops.
             BC_LOAD_STATE_VARRAY => {
@@ -822,10 +1336,11 @@ where
                 let array_ptr = sym
                     .state_varray_ptr(array_idx)
                     .expect("virtualizable array not initialized");
-                // byte offset = index * 8 (i64 items)
-                let eight = ctx.const_int(8);
-                let byte_off = ctx.record_op(OpCode::IntMul, &[index_opref, eight]);
-                let result = ctx.record_op(OpCode::GetarrayitemRawI, &[array_ptr, byte_off]);
+                let result = ctx.record_op_with_descr(
+                    OpCode::GetarrayitemRawI,
+                    &[array_ptr, index_opref],
+                    Self::raw_word_array_descr(),
+                );
                 self.set_int_reg(dest, Some(result), Some(0));
             }
             BC_STORE_STATE_VARRAY => {
@@ -837,10 +1352,11 @@ where
                 let array_ptr = sym
                     .state_varray_ptr(array_idx)
                     .expect("virtualizable array not initialized");
-                // byte offset = index * 8 (i64 items)
-                let eight = ctx.const_int(8);
-                let byte_off = ctx.record_op(OpCode::IntMul, &[index_opref, eight]);
-                ctx.record_op(OpCode::SetarrayitemRaw, &[array_ptr, byte_off, value_opref]);
+                ctx.record_op_with_descr(
+                    OpCode::SetarrayitemRaw,
+                    &[array_ptr, index_opref, value_opref],
+                    Self::raw_word_array_descr(),
+                );
             }
 
             BC_RECORD_BINOP_I => {
@@ -901,30 +1417,48 @@ where
             BC_REQUIRE_STACK => {
                 let required = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if self.runtime_stack_mut(selected, runtime).len() < required {
+                let concrete_len = self.runtime_stack_mut(selected, runtime).len();
+                if let Some((_, len, _)) = Self::compact_storage_refs(ctx, sym, selected) {
+                    // RPython parity: the BRPOP path is part of the traced path,
+                    // so compact-storage mode must guard on the current stack
+                    // depth before the interpreter decides whether to jump.
+                    self.compact_guard_required_stack(ctx, sym, len, required, concrete_len);
+                }
+                if concrete_len < required {
                     // Stack insufficient: the interpreter will take the branch.
                     // Don't abort the trace — just skip this jitcode's remaining
                     // bytecodes. The branch direction is handled at interpreter level.
-                    // RPython parity: BRPOP is a no-op in the trace when branch is taken.
                 }
             }
             BC_BRANCH_ZERO => {
                 let selected = sym.current_selected();
-                let runtime_cond = {
-                    let runtime_stack = self.runtime_stack_mut(selected, runtime);
-                    let Some(value) = runtime_stack.pop() else {
-                        return TraceAction::Abort;
+                let (cond, runtime_cond) =
+                    if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                        let Ok((cond, runtime_cond)) =
+                            self.compact_pop_int(ctx, sym, runtime, selected)
+                        else {
+                            return TraceAction::Abort;
+                        };
+                        (cond, runtime_cond)
+                    } else {
+                        let runtime_cond = {
+                            let runtime_stack = self.runtime_stack_mut(selected, runtime);
+                            let Some(value) = runtime_stack.pop() else {
+                                return TraceAction::Abort;
+                            };
+                            value
+                        };
+                        let cond = {
+                            let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                            stack.pop().expect("branch_zero on empty symbolic stack")
+                        };
+                        (cond, runtime_cond)
                     };
-                    value
-                };
                 let pc = self.frames.current_mut().pc;
                 // RPython parity: check ALL green keys (pc + selected).
                 let close_loop = runtime.label_at(pc) == sym.loop_header_pc()
-                    && sym.current_selected() == sym.header_selected();
-                let cond = {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.pop().expect("branch_zero on empty symbolic stack")
-                };
+                    && (!sym.close_requires_header_selected()
+                        || sym.current_selected() == sym.header_selected());
                 let opcode = if runtime_cond == 0 {
                     OpCode::GuardFalse
                 } else {
@@ -938,9 +1472,6 @@ where
                 let resume_pc = ctx.const_int(resume_pc);
                 Self::record_state_guard(ctx, sym, opcode, &[cond], &[resume_pc]);
                 if runtime_cond == 0 && close_loop {
-                    if sym.is_virtualizable_storage() {
-                        Self::sync_virtualizable_to_heap(ctx, sym);
-                    }
                     return TraceAction::CloseLoop;
                 }
             }
@@ -967,11 +1498,9 @@ where
                 // RPython parity: reached_loop_header checks ALL green keys.
                 // Only close if both pc AND selected match the header.
                 if runtime.label_at(pc) == sym.loop_header_pc()
-                    && sym.current_selected() == sym.header_selected()
+                    && (!sym.close_requires_header_selected()
+                        || sym.current_selected() == sym.header_selected())
                 {
-                    if sym.is_virtualizable_storage() {
-                        Self::sync_virtualizable_to_heap(ctx, sym);
-                    }
                     return TraceAction::CloseLoop;
                 }
             }
@@ -1077,6 +1606,11 @@ where
                     } else {
                         target.concrete_ptr
                     };
+                    let active_vable = if bytecode == BC_CALL_MAY_FORCE_VOID {
+                        self.prepare_standard_virtualizable_before_residual_call(ctx)
+                    } else {
+                        None
+                    };
                     match bytecode {
                         BC_RESIDUAL_CALL_VOID => ctx.call_void_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_MAY_FORCE_VOID => {
@@ -1091,6 +1625,12 @@ where
                         _ => unreachable!(),
                     }
                     call_void_function(concrete_ptr, &concrete_args);
+                    if bytecode == BC_CALL_MAY_FORCE_VOID {
+                        if Self::finish_standard_virtualizable_after_residual_call(active_vable) {
+                            return TraceAction::Abort;
+                        }
+                        ctx.guard_not_forced(sym.total_slots());
+                    }
                 }
             }
             BC_SET_SELECTED => {
@@ -1106,7 +1646,12 @@ where
                         .get(const_idx)
                         .expect("jitcode const index out of bounds") as usize
                 };
-                if sym.stack(new_selected).is_none() {
+                if Self::compact_storage_refs(ctx, sym, new_selected).is_none()
+                    && sym.stack(new_selected).is_none()
+                {
+                    if Self::compact_storage_refs(ctx, sym, sym.current_selected()).is_some() {
+                        return TraceAction::Abort;
+                    }
                     let len = runtime.stack_len(new_selected);
                     let offset = sym.total_slots();
                     sym.ensure_stack(new_selected, offset, len);
@@ -1121,15 +1666,29 @@ where
                     (frame.next_u16() as usize, frame.next_u16() as usize)
                 };
                 let (value, concrete) = self.read_int_reg(src_idx);
-                if sym.stack(target).is_none() {
-                    let len = runtime.stack_len(target);
-                    let offset = sym.total_slots();
-                    sym.ensure_stack(target, offset, len);
-                    let _ = self.runtime_stack_mut(target, runtime);
+                if Self::compact_storage_refs(ctx, sym, target).is_some() {
+                    if self
+                        .compact_push_int(ctx, sym, runtime, target, value, concrete)
+                        .is_err()
+                    {
+                        return TraceAction::Abort;
+                    }
+                } else {
+                    if Self::compact_storage_refs(ctx, sym, sym.current_selected()).is_some()
+                        && sym.stack(target).is_none()
+                    {
+                        return TraceAction::Abort;
+                    }
+                    if sym.stack(target).is_none() {
+                        let len = runtime.stack_len(target);
+                        let offset = sym.total_slots();
+                        sym.ensure_stack(target, offset, len);
+                        let _ = self.runtime_stack_mut(target, runtime);
+                    }
+                    let stack = sym.stack_mut(target).expect("missing target stack");
+                    stack.push(value);
+                    self.runtime_stack_mut(target, runtime).push(concrete);
                 }
-                let stack = sym.stack_mut(target).expect("missing target stack");
-                stack.push(value);
-                self.runtime_stack_mut(target, runtime).push(concrete);
             }
             BC_MOVE_I => {
                 let (dst, src) = {
@@ -1186,6 +1745,11 @@ where
                     } else {
                         target.concrete_ptr
                     };
+                    let active_vable = if opcode == BC_CALL_MAY_FORCE_INT {
+                        self.prepare_standard_virtualizable_before_residual_call(ctx)
+                    } else {
+                        None
+                    };
                     let traced = match opcode {
                         BC_CALL_INT => ctx.call_int_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_PURE_INT => {
@@ -1203,6 +1767,12 @@ where
                         _ => unreachable!(),
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
+                    if opcode == BC_CALL_MAY_FORCE_INT {
+                        if Self::finish_standard_virtualizable_after_residual_call(active_vable) {
+                            return TraceAction::Abort;
+                        }
+                        ctx.guard_not_forced(sym.total_slots());
+                    }
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                 }
             }
@@ -1294,6 +1864,11 @@ where
                     } else {
                         target.concrete_ptr
                     };
+                    let active_vable = if opcode == BC_CALL_MAY_FORCE_REF {
+                        self.prepare_standard_virtualizable_before_residual_call(ctx)
+                    } else {
+                        None
+                    };
                     let traced = match opcode {
                         BC_CALL_REF => ctx.call_ref_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_PURE_REF => {
@@ -1311,6 +1886,12 @@ where
                         _ => unreachable!(),
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
+                    if opcode == BC_CALL_MAY_FORCE_REF {
+                        if Self::finish_standard_virtualizable_after_residual_call(active_vable) {
+                            return TraceAction::Abort;
+                        }
+                        ctx.guard_not_forced(sym.total_slots());
+                    }
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                 }
             }
@@ -1402,6 +1983,11 @@ where
                     } else {
                         target.concrete_ptr
                     };
+                    let active_vable = if opcode == BC_CALL_MAY_FORCE_FLOAT {
+                        self.prepare_standard_virtualizable_before_residual_call(ctx)
+                    } else {
+                        None
+                    };
                     let traced = match opcode {
                         BC_CALL_FLOAT => ctx.call_float_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_PURE_FLOAT => {
@@ -1419,6 +2005,12 @@ where
                         _ => unreachable!(),
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
+                    if opcode == BC_CALL_MAY_FORCE_FLOAT {
+                        if Self::finish_standard_virtualizable_after_residual_call(active_vable) {
+                            return TraceAction::Abort;
+                        }
+                        ctx.guard_not_forced(sym.total_slots());
+                    }
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 }
             }
@@ -1649,6 +2241,115 @@ impl JitCodeBuilder {
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
+    }
+
+    // ── First-class virtualizable access (RPython getfield_vable_*) ──
+
+    pub fn vable_getfield_int(&mut self, dest: u16, field_idx: u16) {
+        self.touch_reg(dest);
+        self.push_u8(BC_GETFIELD_VABLE_I);
+        self.push_u16(field_idx);
+        self.push_u16(dest);
+    }
+
+    pub fn vable_getfield_ref(&mut self, dest: u16, field_idx: u16) {
+        self.touch_ref_reg(dest);
+        self.push_u8(BC_GETFIELD_VABLE_R);
+        self.push_u16(field_idx);
+        self.push_u16(dest);
+    }
+
+    pub fn vable_getfield_float(&mut self, dest: u16, field_idx: u16) {
+        self.touch_float_reg(dest);
+        self.push_u8(BC_GETFIELD_VABLE_F);
+        self.push_u16(field_idx);
+        self.push_u16(dest);
+    }
+
+    pub fn vable_setfield_int(&mut self, field_idx: u16, src: u16) {
+        self.touch_reg(src);
+        self.push_u8(BC_SETFIELD_VABLE_I);
+        self.push_u16(field_idx);
+        self.push_u16(src);
+    }
+
+    pub fn vable_setfield_ref(&mut self, field_idx: u16, src: u16) {
+        self.touch_ref_reg(src);
+        self.push_u8(BC_SETFIELD_VABLE_R);
+        self.push_u16(field_idx);
+        self.push_u16(src);
+    }
+
+    pub fn vable_setfield_float(&mut self, field_idx: u16, src: u16) {
+        self.touch_float_reg(src);
+        self.push_u8(BC_SETFIELD_VABLE_F);
+        self.push_u16(field_idx);
+        self.push_u16(src);
+    }
+
+    pub fn vable_getarrayitem_int(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
+        self.touch_reg(dest);
+        self.touch_reg(index_reg);
+        self.push_u8(BC_GETARRAYITEM_VABLE_I);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        self.push_u16(dest);
+    }
+
+    pub fn vable_getarrayitem_ref(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
+        self.touch_ref_reg(dest);
+        self.touch_reg(index_reg);
+        self.push_u8(BC_GETARRAYITEM_VABLE_R);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        self.push_u16(dest);
+    }
+
+    pub fn vable_getarrayitem_float(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
+        self.touch_float_reg(dest);
+        self.touch_reg(index_reg);
+        self.push_u8(BC_GETARRAYITEM_VABLE_F);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        self.push_u16(dest);
+    }
+
+    pub fn vable_setarrayitem_int(&mut self, array_idx: u16, index_reg: u16, src: u16) {
+        self.touch_reg(index_reg);
+        self.touch_reg(src);
+        self.push_u8(BC_SETARRAYITEM_VABLE_I);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        self.push_u16(src);
+    }
+
+    pub fn vable_setarrayitem_ref(&mut self, array_idx: u16, index_reg: u16, src: u16) {
+        self.touch_reg(index_reg);
+        self.touch_ref_reg(src);
+        self.push_u8(BC_SETARRAYITEM_VABLE_R);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        self.push_u16(src);
+    }
+
+    pub fn vable_setarrayitem_float(&mut self, array_idx: u16, index_reg: u16, src: u16) {
+        self.touch_reg(index_reg);
+        self.touch_float_reg(src);
+        self.push_u8(BC_SETARRAYITEM_VABLE_F);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        self.push_u16(src);
+    }
+
+    pub fn vable_arraylen(&mut self, dest: u16, array_idx: u16) {
+        self.touch_reg(dest);
+        self.push_u8(BC_ARRAYLEN_VABLE);
+        self.push_u16(array_idx);
+        self.push_u16(dest);
+    }
+
+    pub fn vable_force(&mut self) {
+        self.push_u8(BC_HINT_FORCE_VIRTUALIZABLE);
     }
 
     /// Load from a virtualizable state array: emit GETARRAYITEM_RAW_I.
@@ -2953,5 +3654,201 @@ fn call_void_function(func_ptr: *const (), args: &[i64]) {
                 MAX_HOST_CALL_ARITY
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtualizable::VirtualizableInfo;
+    use majit_ir::Type;
+
+    #[derive(Default)]
+    struct DummySym {
+        selected: usize,
+        selected_value: Option<OpRef>,
+    }
+
+    impl JitCodeSym for DummySym {
+        fn current_selected(&self) -> usize {
+            self.selected
+        }
+
+        fn current_selected_value(&self) -> Option<OpRef> {
+            self.selected_value
+        }
+
+        fn set_current_selected(&mut self, selected: usize) {
+            self.selected = selected;
+        }
+
+        fn set_current_selected_value(&mut self, selected: usize, value: OpRef) {
+            self.selected = selected;
+            self.selected_value = Some(value);
+        }
+
+        fn stack(&self, _selected: usize) -> Option<&SymbolicStack> {
+            None
+        }
+
+        fn stack_mut(&mut self, _selected: usize) -> Option<&mut SymbolicStack> {
+            None
+        }
+
+        fn total_slots(&self) -> usize {
+            0
+        }
+
+        fn loop_header_pc(&self) -> usize {
+            0
+        }
+
+        fn ensure_stack(&mut self, _selected: usize, _offset: usize, _len: usize) {}
+
+        fn fail_args(&self) -> Option<Vec<OpRef>> {
+            None
+        }
+    }
+
+    fn make_test_vable_info() -> VirtualizableInfo {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field("stack", Type::Int, 24);
+        info
+    }
+
+    #[repr(C)]
+    struct ResidualVable {
+        token: u64,
+    }
+
+    extern "C" fn residual_no_force(_vable: i64) {}
+
+    extern "C" fn residual_force(vable: i64) {
+        unsafe {
+            (*(vable as usize as *mut ResidualVable)).token = 0;
+        }
+    }
+
+    #[test]
+    fn jitcode_vable_reads_use_standard_boxes_without_heap_ops() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        builder.vable_getfield_int(1, 0);
+        builder.vable_getarrayitem_int(2, 0, 0);
+        builder.vable_arraylen(3, 0);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let info = make_test_vable_info();
+        let field_box = ctx.const_int(111);
+        let array_box = ctx.const_int(222);
+        let vable_ref = ctx.const_int(999);
+        ctx.init_virtualizable_boxes(&info, vable_ref, &[field_box, array_box], &[1]);
+
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_sel| 0,
+            |_sel, _idx| 0,
+            |_pc| 0,
+        );
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 0);
+    }
+
+    #[test]
+    fn jitcode_call_may_force_marks_standard_virtualizable_token_and_guards() {
+        let mut obj = ResidualVable { token: 0 };
+        let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, obj_ptr);
+        let fn_idx = builder.add_fn_ptr(residual_no_force as *const ());
+        builder.call_may_force_void_typed_args(fn_idx, &[JitCallArg::reference(0)]);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let info = VirtualizableInfo::new(0);
+        let vable_ref = ctx.const_int(obj_ptr);
+        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_sel| 0,
+            |_sel, _idx| 0,
+            |_pc| 0,
+        );
+        assert!(matches!(action, TraceAction::Continue));
+        assert_eq!(obj.token, 0, "tracing side must restore TOKEN_NONE");
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 4);
+        assert_eq!(recorder.get_op_by_pos(OpRef(0)).unwrap().opcode, OpCode::ForceToken);
+        let set_token = recorder.get_op_by_pos(OpRef(1)).unwrap();
+        assert_eq!(set_token.opcode, OpCode::SetfieldGc);
+        assert_eq!(
+            set_token.descr.as_ref().map(|d| d.index()),
+            Some(info.token_field_descr().index())
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            OpCode::CallMayForceN
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
+            OpCode::GuardNotForced
+        );
+    }
+
+    #[test]
+    fn jitcode_call_may_force_aborts_when_standard_virtualizable_escapes() {
+        let mut obj = ResidualVable { token: 0 };
+        let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, obj_ptr);
+        let fn_idx = builder.add_fn_ptr(residual_force as *const ());
+        builder.call_may_force_void_typed_args(fn_idx, &[JitCallArg::reference(0)]);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let info = VirtualizableInfo::new(0);
+        let vable_ref = ctx.const_int(obj_ptr);
+        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_sel| 0,
+            |_sel, _idx| 0,
+            |_pc| 0,
+        );
+        assert!(matches!(action, TraceAction::Abort));
+        assert_eq!(obj.token, 0, "forced residual call must clear the token");
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 3);
+        assert_eq!(recorder.get_op_by_pos(OpRef(0)).unwrap().opcode, OpCode::ForceToken);
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
+            OpCode::SetfieldGc
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            OpCode::CallMayForceN
+        );
     }
 }

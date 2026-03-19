@@ -596,13 +596,7 @@ impl VirtualState {
         let mut state = GenerateGuardState::new(ctx);
         let len = self.state.len().min(other.state.len()).min(boxes.len());
         for i in 0..len {
-            self.generate_guard_for_entry(
-                i,
-                &self.state[i],
-                &other.state[i],
-                boxes[i],
-                &mut state,
-            );
+            self.generate_guard_for_entry(i, &self.state[i], &other.state[i], boxes[i], &mut state);
         }
         state
     }
@@ -635,7 +629,10 @@ impl VirtualState {
             // IntBounded vs unknown → bounds guards
             (VirtualStateInfo::IntBounded(_), VirtualStateInfo::Unknown) => {}
             // Virtual vs Virtual → check fields match
-            (VirtualStateInfo::Virtual { descr: d1, .. }, VirtualStateInfo::Virtual { descr: d2, .. }) => {
+            (
+                VirtualStateInfo::Virtual { descr: d1, .. },
+                VirtualStateInfo::Virtual { descr: d2, .. },
+            ) => {
                 if d1.index() != d2.index() {
                     state.mark_bad(idx, "virtual descriptor mismatch");
                 }

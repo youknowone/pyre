@@ -25,11 +25,11 @@ mod jitcode;
 mod jitdriver;
 pub mod parity;
 mod pyjitpl;
-pub mod quasi_immut;
+pub mod quasiimmut;
 pub mod resume;
 mod symbolic_stack;
 mod trace_ctx;
-pub mod virtual_ref;
+pub mod virtualref;
 pub mod virtualizable;
 
 pub use call_descr::{make_call_assembler_descr, make_call_descr};
@@ -41,9 +41,8 @@ pub use io_buffer::{
 };
 pub use jit_state::{DeoptMaterializationCache, JitState, PendingFieldWriteLayout};
 pub use jitcode::{
-    raw_i64_array_descr, trace_jitcode, ClosureRuntime, JitArgKind, JitCallArg, JitCode,
-    JitCodeBuilder, JitCodeMachine, JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame,
-    MIFrameStack, RawI64ArrayDescr,
+    trace_jitcode, ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
+    JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack,
 };
 pub use jitdriver::JitDriver;
 pub use majit_codegen::CompiledTraceInfo;
@@ -53,9 +52,9 @@ pub use pyjitpl::{
     CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, DriverRunOutcome,
     GuardRecoveryAction, InlineDecision, JitHooks, JitStats, MetaInterp, RawCompileResult,
 };
-pub use quasi_immut::QuasiImmut;
+pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;
-pub use trace_ctx::{DeclarativeJitDriver, JitDriverStaticData, TraceCtx, VableSyncField};
+pub use trace_ctx::{DeclarativeJitDriver, JitDriverStaticData, TraceCtx};
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 pub fn majit_log_enabled() -> bool {

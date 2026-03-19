@@ -20,8 +20,8 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     };
 
     let lowerer_config = LowererConfig::new(
-        &config.storage.pool,
-        &config.storage.selector,
+        config.storage.as_ref().map(|s| &s.pool),
+        config.storage.as_ref().map(|s| &s.selector),
         &config.binops,
         &config.io_shims,
         &config.calls,
@@ -32,7 +32,6 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 
     let classified = classify_arms(&match_expr.arms);
     let env_type = &config.env_type;
-    let pool_type = &config.storage.pool_type;
     let has_branch_group = classified
         .iter()
         .any(|arm| matches!(arm.pattern, ArmPattern::BranchGroup));
@@ -58,17 +57,22 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 __sym: &mut __JitSym,
                 program: &#env_type,
                 pc: usize,
-                __storage: &#pool_type,
-                __selected: usize,
             ) -> majit_meta::TraceAction {
                 use majit_meta::TraceAction;
 
                 let __op = program.get_op(pc);
                 let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
+                    if majit_meta::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] no jitcode for pc={} op={}",
+                            pc,
+                            __op
+                        );
+                    }
                     return TraceAction::AbortPermanent;
                 };
 
-                majit_meta::trace_jitcode(
+                let __result = majit_meta::trace_jitcode(
                     __ctx,
                     __sym,
                     &__jitcode,
@@ -76,45 +80,24 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                     |_| 0usize,
                     |_, _| 0i64,
                     #label_closure,
-                )
+                );
+                if majit_meta::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
+                    eprintln!(
+                        "[jit] trace action at pc={} op={} -> {:?}",
+                        pc,
+                        __op,
+                        __result
+                    );
+                }
+                __result
             }
         }
     } else {
-        let virtualizable = config.storage.virtualizable;
-        let preamble_code = if virtualizable {
-            quote! {
-                // Virtualizable preamble: load storage contents from heap.
-                // RPython: initialize_virtualizable() in pyjitpl.py.
-                if !__sym.preamble_done {
-                    __sym.preamble_done = true;
-                    let __const_1 = __ctx.const_int(1);
-                    for &(__sidx, _) in __sym.storage_layout.iter().take(__sym.meta_storage_count) {
-                        if let Some(__ptr_ref) = __sym.vable_array_refs.get(&__sidx).copied() {
-                            let __actual_len = __storage.get(__sidx).len();
-                            for __j in 0..__actual_len {
-                                let __byte_off = __ctx.const_int((__j as i64) * 8);
-                                let __raw = __ctx.record_op_with_descr(
-                                    majit_ir::OpCode::GetarrayitemRawI,
-                                    &[__ptr_ref, __byte_off],
-                                    majit_meta::raw_i64_array_descr(),
-                                );
-                                let __val = __ctx.record_op(
-                                    majit_ir::OpCode::IntRshift,
-                                    &[__raw, __const_1],
-                                );
-                                if let Some(__stack) = __sym.stacks.get_mut(&__sidx) {
-                                    __stack.push(__val);
-                                }
-                            }
-                            __sym.preamble_depths.insert(__sidx, __actual_len);
-                        }
-                    }
-                }
-            }
-        } else {
-            quote! {}
-        };
-
+        let pool_type = &config
+            .storage
+            .as_ref()
+            .expect("storage config required in storage mode")
+            .pool_type;
         quote! {
             #[allow(non_snake_case, unused_variables, unused_mut)]
             fn #trace_fn_name(
@@ -127,14 +110,20 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             ) -> majit_meta::TraceAction {
                 use majit_meta::TraceAction;
 
-                #preamble_code
-
                 let __op = program.get_op(pc);
                 let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
+                    if majit_meta::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] no jitcode for pc={} op={} selected={}",
+                            pc,
+                            __op,
+                            __selected
+                        );
+                    }
                     return TraceAction::AbortPermanent;
                 };
 
-                majit_meta::trace_jitcode(
+                let __result = majit_meta::trace_jitcode(
                     __ctx,
                     __sym,
                     &__jitcode,
@@ -142,7 +131,17 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                     |__stack_index| __storage.get(__stack_index).len(),
                     |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
                     #label_closure,
-                )
+                );
+                if majit_meta::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
+                    eprintln!(
+                        "[jit] trace action at pc={} op={} selected={} -> {:?}",
+                        pc,
+                        __op,
+                        __selected,
+                        __result
+                    );
+                }
+                __result
             }
         }
     };

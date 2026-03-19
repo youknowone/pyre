@@ -497,8 +497,7 @@ impl PtrInfo {
                 for (i, item) in v.items.iter_mut().enumerate() {
                     if !item.is_none() {
                         let idx_ref = OpRef(10000 + i as u32);
-                        let set_op =
-                            Op::new(OpCode::SetarrayitemGc, &[obj_opref, idx_ref, *item]);
+                        let set_op = Op::new(OpCode::SetarrayitemGc, &[obj_opref, idx_ref, *item]);
                         ops.push(set_op);
                         *item = OpRef::NONE;
                     }
@@ -509,10 +508,8 @@ impl PtrInfo {
                     for (field_idx, value) in fields.iter_mut() {
                         if !value.is_none() {
                             let idx_ref = OpRef(10000 + elem_idx as u32);
-                            let set_op = Op::new(
-                                OpCode::SetinteriorfieldGc,
-                                &[obj_opref, idx_ref, *value],
-                            );
+                            let set_op =
+                                Op::new(OpCode::SetinteriorfieldGc, &[obj_opref, idx_ref, *value]);
                             ops.push(set_op);
                             *value = OpRef::NONE;
                         }
@@ -524,8 +521,7 @@ impl PtrInfo {
                     let (offset, _len, ref mut value) = *entry;
                     if !value.is_none() {
                         let offset_ref = OpRef(10000 + offset as u32);
-                        let set_op =
-                            Op::new(OpCode::RawStore, &[obj_opref, offset_ref, *value]);
+                        let set_op = Op::new(OpCode::RawStore, &[obj_opref, offset_ref, *value]);
                         ops.push(set_op);
                         *value = OpRef::NONE;
                     }

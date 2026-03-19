@@ -42,6 +42,747 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     } else {
         quote! {}
     };
+    let compact_encode = storage
+        .compact_encode
+        .as_ref()
+        .map(|path| quote! { #path(ctx, value) })
+        .unwrap_or_else(|| quote! { value });
+    let compact_decode = storage
+        .compact_decode
+        .as_ref()
+        .map(|path| quote! { #path(ctx, raw) })
+        .unwrap_or_else(|| quote! { raw });
+    let compact_bounds = match (&storage.compact_min, &storage.compact_max) {
+        (Some(min), Some(max)) => quote! { Some(((#min) as i64, (#max) as i64)) },
+        _ => quote! { None },
+    };
+
+    if storage.compact_live {
+        if let (Some(ptrs_offset), Some(lengths_offset), Some(caps_offset)) = (
+            &storage.compact_ptrs_offset,
+            &storage.compact_lengths_offset,
+            &storage.compact_caps_offset,
+        ) {
+            return quote! {
+                /// Compiled loop metadata: traced storages in stable order.
+                #[derive(Clone)]
+                #[allow(non_camel_case_types)]
+                struct __JitMeta {
+                    storage_layout: Vec<(usize, usize)>,
+                    initial_selected: usize,
+                }
+
+                /// Symbolic state during tracing: compact storage is reloaded from the pool object.
+                #[allow(non_camel_case_types)]
+                struct __JitSym {
+                    pool_ref: majit_ir::OpRef,
+                    storage_refs: std::collections::HashMap<
+                        usize,
+                        (
+                            majit_ir::OpRef,
+                            majit_ir::OpRef,
+                            majit_ir::OpRef,
+                            majit_ir::OpRef,
+                            std::collections::BTreeMap<usize, majit_ir::OpRef>,
+                        ),
+                    >,
+                    pending_storage_refs: std::collections::HashMap<
+                        usize,
+                        (
+                            majit_ir::OpRef,
+                            Option<usize>,
+                            std::collections::BTreeMap<usize, majit_ir::OpRef>,
+                        ),
+                    >,
+                    committed_selected: usize,
+                    committed_selected_value: Option<majit_ir::OpRef>,
+                    pending_selected: Option<usize>,
+                    pending_selected_value: Option<majit_ir::OpRef>,
+                    storage_layout: Vec<(usize, usize)>,
+                    loop_header_pc: usize,
+                    header_selected: usize,
+                    trace_started: bool,
+                }
+
+                impl majit_meta::JitCodeSym for __JitSym {
+                    fn current_selected(&self) -> usize {
+                        self.pending_selected.unwrap_or(self.committed_selected)
+                    }
+
+                    fn current_selected_value(&self) -> Option<majit_ir::OpRef> {
+                        self.pending_selected_value.or(self.committed_selected_value)
+                    }
+
+                    fn guard_selected(&self) -> usize {
+                        self.committed_selected
+                    }
+
+                    fn guard_selected_value(&self) -> Option<majit_ir::OpRef> {
+                        self.committed_selected_value
+                    }
+
+                    fn selected_in_fail_args_prefix(&self) -> bool {
+                        true
+                    }
+
+                    fn close_requires_header_selected(&self) -> bool {
+                        false
+                    }
+
+                    fn set_current_selected(&mut self, selected: usize) {
+                        self.pending_selected = Some(selected);
+                        self.pending_selected_value = None;
+                    }
+
+                    fn set_current_selected_value(&mut self, selected: usize, value: majit_ir::OpRef) {
+                        self.pending_selected = Some(selected);
+                        self.pending_selected_value = Some(value);
+                    }
+
+                    fn begin_portal_op(&mut self, _pc: usize) {
+                        self.pending_storage_refs.clear();
+                        self.pending_selected = None;
+                        self.pending_selected_value = None;
+                    }
+
+                    fn commit_portal_op(&mut self) {
+                        for (selected, (len, truncate_to, slots)) in self.pending_storage_refs.drain() {
+                            let Some((_, _, committed_len, _, committed_slots)) =
+                                self.storage_refs.get_mut(&selected)
+                            else {
+                                continue;
+                            };
+                            *committed_len = len;
+                            if let Some(truncate_to) = truncate_to {
+                                committed_slots.retain(|&index, _| index < truncate_to);
+                            }
+                            committed_slots.extend(slots);
+                        }
+                        if let Some(selected) = self.pending_selected.take() {
+                            self.committed_selected = selected;
+                            self.committed_selected_value = self.pending_selected_value.take();
+                        } else {
+                            self.pending_selected_value = None;
+                        }
+                    }
+
+                    fn abort_portal_op(&mut self) {
+                        self.pending_storage_refs.clear();
+                        self.pending_selected = None;
+                        self.pending_selected_value = None;
+                    }
+
+                    fn stack(&self, _selected: usize) -> Option<&majit_meta::SymbolicStack> {
+                        None
+                    }
+
+                    fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+                        None
+                    }
+
+                    fn total_slots(&self) -> usize {
+                        2
+                    }
+
+                    fn loop_header_pc(&self) -> usize {
+                        self.loop_header_pc
+                    }
+
+                    fn header_selected(&self) -> usize {
+                        self.header_selected
+                    }
+
+                    fn ensure_stack(&mut self, _selected: usize, _offset: usize, _len: usize) {}
+
+                    fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
+                        let selected = self
+                            .guard_selected_value()
+                            .unwrap_or_else(|| majit_ir::OpRef::NONE);
+                        Some(vec![self.pool_ref, selected])
+                    }
+
+                    fn fail_args_with_ctx(
+                        &mut self,
+                        ctx: &mut majit_meta::TraceCtx,
+                    ) -> Option<Vec<majit_ir::OpRef>> {
+                        // Guard failures must start with the same live state
+                        // as the parent loop's inputargs so attached bridges
+                        // can reuse the guard payload as bridge inputs.
+                        let selected = self
+                            .guard_selected_value()
+                            .unwrap_or_else(|| ctx.const_int(self.guard_selected() as i64));
+                        let mut args = vec![self.pool_ref, selected];
+                        for &(selected, _) in &self.storage_layout {
+                            if let Some((_, _, len, _, slots)) = self.storage_refs.get(&selected) {
+                                args.push(*len);
+                                args.push(ctx.const_int(slots.len() as i64));
+                                for (&index, &raw) in slots {
+                                    args.push(ctx.const_int(index as i64));
+                                    args.push(raw);
+                                }
+                            } else {
+                                args.push(ctx.const_int(-1));
+                                args.push(ctx.const_int(0));
+                            }
+                        }
+                        Some(args)
+                    }
+
+                    fn compact_storage_ptr(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                        self.storage_refs
+                            .get(&selected)
+                            .map(|(_, ptr, _, _, _)| *ptr)
+                    }
+
+                    fn compact_storage_len(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                        if let Some((len, _, _)) = self.pending_storage_refs.get(&selected) {
+                            return Some(*len);
+                        }
+                        self.storage_refs
+                            .get(&selected)
+                            .map(|(_, _, len, _, _)| *len)
+                    }
+
+                    fn compact_storage_cap(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                        self.storage_refs
+                            .get(&selected)
+                            .map(|(_, _, _, cap, _)| *cap)
+                    }
+
+                    fn set_compact_storage_len(&mut self, selected: usize, value: majit_ir::OpRef) {
+                        let truncate_to = self
+                            .pending_storage_refs
+                            .get(&selected)
+                            .and_then(|(_, truncate_to, _)| *truncate_to);
+                        let slots = self
+                            .pending_storage_refs
+                            .remove(&selected)
+                            .map(|(_, _, slots)| slots)
+                            .unwrap_or_default();
+                        if self.storage_refs.contains_key(&selected) {
+                            self.pending_storage_refs
+                                .insert(selected, (value, truncate_to, slots));
+                        }
+                    }
+
+                    fn compact_storage_slot_raw(
+                        &self,
+                        selected: usize,
+                        index: usize,
+                    ) -> Option<majit_ir::OpRef> {
+                        if let Some((_, _, slots)) = self.pending_storage_refs.get(&selected) {
+                            if let Some(raw) = slots.get(&index) {
+                                return Some(*raw);
+                            }
+                        }
+                        self.storage_refs
+                            .get(&selected)
+                            .and_then(|(_, _, _, _, slots)| slots.get(&index).copied())
+                    }
+
+                    fn set_compact_storage_slot_raw(
+                        &mut self,
+                        selected: usize,
+                        index: usize,
+                        raw: majit_ir::OpRef,
+                    ) {
+                        let entry = self.pending_storage_refs.entry(selected).or_insert_with(|| {
+                            let len = self
+                                .storage_refs
+                                .get(&selected)
+                                .map(|(_, _, len, _, _)| *len)
+                                .expect("missing compact storage");
+                            (len, None, std::collections::BTreeMap::new())
+                        });
+                        entry.2.insert(index, raw);
+                    }
+
+                    fn truncate_compact_storage_slots(&mut self, selected: usize, len: usize) {
+                        let entry = self.pending_storage_refs.entry(selected).or_insert_with(|| {
+                            let current_len = self
+                                .storage_refs
+                                .get(&selected)
+                                .map(|(_, _, len, _, _)| *len)
+                                .expect("missing compact storage");
+                            (current_len, None, std::collections::BTreeMap::new())
+                        });
+                        entry.1 = Some(entry.1.map_or(len, |current| current.min(len)));
+                        entry.2.retain(|&index, _| index < len);
+                    }
+
+                    fn ensure_compact_storage_loaded(
+                        &mut self,
+                        ctx: &mut majit_meta::TraceCtx,
+                        selected: usize,
+                    ) -> Option<(majit_ir::OpRef, majit_ir::OpRef, majit_ir::OpRef)> {
+                        if false #( || selected == #untraceable )* {
+                            return None;
+                        }
+                        if let Some((_, ptr, _, cap, _)) = self.storage_refs.get(&selected) {
+                            let len = self.compact_storage_len(selected)?;
+                            return Some((*ptr, len, *cap));
+                        }
+
+                        let ptr_offset = ((#ptrs_offset) as usize) + selected * 8;
+                        let len_offset = ((#lengths_offset) as usize) + selected * 8;
+                        let cap_offset = ((#caps_offset) as usize) + selected * 8;
+                        let ptr_descr: majit_ir::DescrRef = std::sync::Arc::new(
+                            majit_ir::descr::SimpleFieldDescr::new(
+                                ((ptr_offset as u32) << 2) | 0,
+                                ptr_offset,
+                                8,
+                                majit_ir::Type::Int,
+                                false,
+                            )
+                            .with_signed(false),
+                        );
+                        let len_descr: majit_ir::DescrRef = std::sync::Arc::new(
+                            majit_ir::descr::SimpleFieldDescr::new(
+                                ((len_offset as u32) << 2) | 1,
+                                len_offset,
+                                8,
+                                majit_ir::Type::Int,
+                                false,
+                            )
+                            .with_signed(false),
+                        );
+                        let cap_descr: majit_ir::DescrRef = std::sync::Arc::new(
+                            majit_ir::descr::SimpleFieldDescr::new(
+                                ((cap_offset as u32) << 2) | 2,
+                                cap_offset,
+                                8,
+                                majit_ir::Type::Int,
+                                false,
+                            )
+                            .with_signed(false),
+                        );
+
+                        let ptr = ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetfieldRawI,
+                            &[self.pool_ref],
+                            ptr_descr,
+                        );
+                        let len = ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetfieldRawI,
+                            &[self.pool_ref],
+                            len_descr,
+                        );
+                        let cap = ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetfieldRawI,
+                            &[self.pool_ref],
+                            cap_descr,
+                        );
+                        let selected_ref = ctx.const_int(selected as i64);
+                        self.storage_refs
+                            .insert(
+                                selected,
+                                (
+                                    selected_ref,
+                                    ptr,
+                                    len,
+                                    cap,
+                                    std::collections::BTreeMap::new(),
+                                ),
+                            );
+                        Some((ptr, len, cap))
+                    }
+
+                    fn compact_storage_writeback_len(
+                        &mut self,
+                        ctx: &mut majit_meta::TraceCtx,
+                        selected: usize,
+                        new_len: majit_ir::OpRef,
+                    ) {
+                        let len_offset = ((#lengths_offset) as usize) + selected * 8;
+                        let len_descr: majit_ir::DescrRef = std::sync::Arc::new(
+                            majit_ir::descr::SimpleFieldDescr::new(
+                                ((len_offset as u32) << 2) | 1,
+                                len_offset,
+                                8,
+                                majit_ir::Type::Int,
+                                false,
+                            )
+                            .with_signed(false),
+                        );
+                        ctx.record_op_with_descr(
+                            majit_ir::OpCode::SetfieldRaw,
+                            &[self.pool_ref, new_len],
+                            len_descr,
+                        );
+                    }
+
+                    fn compact_storage_bounds(&self) -> Option<(i64, i64)> {
+                        #compact_bounds
+                    }
+
+                    fn compact_storage_decode(
+                        &self,
+                        ctx: &mut majit_meta::TraceCtx,
+                        raw: majit_ir::OpRef,
+                    ) -> majit_ir::OpRef {
+                        #compact_decode
+                    }
+
+                    fn compact_storage_encode(
+                        &self,
+                        ctx: &mut majit_meta::TraceCtx,
+                        value: majit_ir::OpRef,
+                    ) -> majit_ir::OpRef {
+                        #compact_encode
+                    }
+                }
+
+                impl majit_meta::JitState for #state_type {
+                    type Meta = __JitMeta;
+                    type Sym = __JitSym;
+                    type Env = #env_type;
+
+                    fn can_trace(&self) -> bool {
+                        if !(true #( && self.#sel_field != #untraceable )*) {
+                            return false;
+                        }
+                        true #extra_guard
+                    }
+
+                    fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
+                        let storages = #scan_fn(program, header_pc, self.#sel_field);
+                        let layout = storages.into_iter().map(|sidx| (sidx, 0)).collect();
+                        __JitMeta {
+                            storage_layout: layout,
+                            initial_selected: self.#sel_field,
+                        }
+                    }
+
+                    fn extract_live(&self, _meta: &__JitMeta) -> Vec<i64> {
+                        vec![
+                            (&self.#pool_field as *const _ as usize) as i64,
+                            self.#sel_field as i64,
+                        ]
+                    }
+
+                    fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
+                        __JitSym {
+                            pool_ref: majit_ir::OpRef(0),
+                            storage_refs: std::collections::HashMap::new(),
+                            pending_storage_refs: std::collections::HashMap::new(),
+                            committed_selected: meta.initial_selected,
+                            committed_selected_value: Some(majit_ir::OpRef(1)),
+                            pending_selected: None,
+                            pending_selected_value: None,
+                            storage_layout: meta.storage_layout.clone(),
+                            loop_header_pc: header_pc,
+                            header_selected: meta.initial_selected,
+                            trace_started: false,
+                        }
+                    }
+
+                    fn is_compatible(&self, meta: &__JitMeta) -> bool {
+                        !meta.storage_layout.is_empty()
+                    }
+
+                    fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
+                        if values.len() >= 4 {
+                            let payload_end = values.len().saturating_sub(1);
+                            let mut cursor = 2usize;
+                            let mut parsed = true;
+                            for &(sidx, _) in &meta.storage_layout {
+                                if cursor + 1 >= payload_end {
+                                    parsed = false;
+                                    break;
+                                }
+                                let len_raw = values[cursor];
+                                cursor += 1;
+                                let Some(dirty_count) = usize::try_from(values[cursor]).ok() else {
+                                    parsed = false;
+                                    break;
+                                };
+                                cursor += 1;
+                                if len_raw >= 0 {
+                                    let Some(new_len) = usize::try_from(len_raw).ok() else {
+                                        parsed = false;
+                                        break;
+                                    };
+                                    let store = self.#pool_field.get_mut(sidx);
+                                    store.force_len(new_len);
+                                    for _ in 0..dirty_count {
+                                        if cursor + 1 >= payload_end {
+                                            parsed = false;
+                                            break;
+                                        }
+                                        let Some(index) = usize::try_from(values[cursor]).ok() else {
+                                            parsed = false;
+                                            break;
+                                        };
+                                        let raw = values[cursor + 1];
+                                        cursor += 2;
+                                        store.write_jit_raw_value(index, raw);
+                                    }
+                                    if !parsed {
+                                        break;
+                                    }
+                                } else if dirty_count != 0 {
+                                    parsed = false;
+                                    break;
+                                }
+                            }
+                            if !parsed || cursor != payload_end {
+                                self.#pool_field.apply_jit_lengths();
+                            }
+                            self.#sel_field = values
+                                .get(1)
+                                .copied()
+                                .and_then(|value| usize::try_from(value).ok())
+                                .unwrap_or(meta.initial_selected);
+                            return;
+                        }
+                        if values.len() == 2 {
+                            self.#sel_field = values
+                                .get(1)
+                                .copied()
+                                .and_then(|value| usize::try_from(value).ok())
+                                .unwrap_or(meta.initial_selected);
+                        } else {
+                            self.#pool_field.apply_jit_lengths();
+                            self.#sel_field = meta.initial_selected;
+                        }
+                    }
+
+                    fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
+                        let selected = majit_meta::JitCodeSym::current_selected_value(sym)
+                            .unwrap_or_else(|| majit_ir::OpRef::NONE);
+                        vec![sym.pool_ref, selected]
+                    }
+
+                    fn validate_close(_sym: &__JitSym, _meta: &__JitMeta) -> bool {
+                        true
+                    }
+                }
+            };
+        }
+
+        return quote! {
+            /// Compiled loop metadata: traced storages in stable order.
+            #[derive(Clone)]
+            #[allow(non_camel_case_types)]
+            struct __JitMeta {
+                storage_layout: Vec<(usize, usize)>,
+                initial_selected: usize,
+            }
+
+            /// Symbolic state during tracing: compact ptr/len/cap triples per storage.
+            #[allow(non_camel_case_types)]
+            struct __JitSym {
+                storage_refs: std::collections::HashMap<
+                    usize,
+                    (majit_ir::OpRef, majit_ir::OpRef, majit_ir::OpRef),
+                >,
+                current_selected: usize,
+                current_selected_value: Option<majit_ir::OpRef>,
+                storage_layout: Vec<(usize, usize)>,
+                loop_header_pc: usize,
+                header_selected: usize,
+                trace_started: bool,
+            }
+
+            impl majit_meta::JitCodeSym for __JitSym {
+                fn current_selected(&self) -> usize {
+                    self.current_selected
+                }
+
+                fn current_selected_value(&self) -> Option<majit_ir::OpRef> {
+                    self.current_selected_value
+                }
+
+                fn set_current_selected(&mut self, selected: usize) {
+                    self.current_selected = selected;
+                }
+
+                fn set_current_selected_value(&mut self, selected: usize, value: majit_ir::OpRef) {
+                    self.current_selected = selected;
+                    self.current_selected_value = Some(value);
+                }
+
+                fn stack(&self, _selected: usize) -> Option<&majit_meta::SymbolicStack> {
+                    None
+                }
+
+                fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+                    None
+                }
+
+                fn total_slots(&self) -> usize {
+                    self.storage_refs.len() * 3
+                }
+
+                fn loop_header_pc(&self) -> usize {
+                    self.loop_header_pc
+                }
+
+                fn header_selected(&self) -> usize {
+                    self.header_selected
+                }
+
+                fn ensure_stack(&mut self, _selected: usize, _offset: usize, _len: usize) {}
+
+                fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
+                    let mut args = Vec::with_capacity(self.storage_layout.len() * 3);
+                    for &(sidx, _) in &self.storage_layout {
+                        let &(ptr, len, cap) = self
+                            .storage_refs
+                            .get(&sidx)
+                            .expect("missing compact storage refs");
+                        args.push(ptr);
+                        args.push(len);
+                        args.push(cap);
+                    }
+                    Some(args)
+                }
+
+                fn compact_storage_ptr(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                    self.storage_refs.get(&selected).map(|&(ptr, _, _)| ptr)
+                }
+
+                fn compact_storage_len(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                    self.storage_refs.get(&selected).map(|&(_, len, _)| len)
+                }
+
+                fn compact_storage_cap(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                    self.storage_refs.get(&selected).map(|&(_, _, cap)| cap)
+                }
+
+                fn set_compact_storage_len(&mut self, selected: usize, value: majit_ir::OpRef) {
+                    if let Some((_, len, _)) = self.storage_refs.get_mut(&selected) {
+                        *len = value;
+                    }
+                }
+
+                fn compact_storage_bounds(&self) -> Option<(i64, i64)> {
+                    #compact_bounds
+                }
+
+                fn compact_storage_decode(
+                    &self,
+                    ctx: &mut majit_meta::TraceCtx,
+                    raw: majit_ir::OpRef,
+                ) -> majit_ir::OpRef {
+                    #compact_decode
+                }
+
+                fn compact_storage_encode(
+                    &self,
+                    ctx: &mut majit_meta::TraceCtx,
+                    value: majit_ir::OpRef,
+                ) -> majit_ir::OpRef {
+                    #compact_encode
+                }
+            }
+
+            impl majit_meta::JitState for #state_type {
+                type Meta = __JitMeta;
+                type Sym = __JitSym;
+                type Env = #env_type;
+
+                fn can_trace(&self) -> bool {
+                    if !(true #( && self.#sel_field != #untraceable )*) {
+                        return false;
+                    }
+                    true #extra_guard
+                }
+
+                fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
+                    let storages = #scan_fn(program, header_pc, self.#sel_field);
+                    let layout = storages.into_iter().map(|sidx| (sidx, 0)).collect();
+                    __JitMeta {
+                        storage_layout: layout,
+                        initial_selected: self.#sel_field,
+                    }
+                }
+
+                fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
+                    let mut values = Vec::with_capacity(meta.storage_layout.len() * 3);
+                    for &(sidx, _) in &meta.storage_layout {
+                        let store = self.#pool_field.get(sidx);
+                        values.push(store.data_ptr() as i64);
+                        values.push(store.len() as i64);
+                        values.push(store.capacity() as i64);
+                    }
+                    values
+                }
+
+                fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
+                    let mut storage_refs = std::collections::HashMap::new();
+                    let mut offset = 0usize;
+                    for &(sidx, _) in &meta.storage_layout {
+                        let ptr = majit_ir::OpRef(offset as u32);
+                        let len = majit_ir::OpRef((offset + 1) as u32);
+                        let cap = majit_ir::OpRef((offset + 2) as u32);
+                        storage_refs.insert(sidx, (ptr, len, cap));
+                        offset += 3;
+                    }
+                    __JitSym {
+                        storage_refs,
+                        current_selected: meta.initial_selected,
+                        current_selected_value: None,
+                        storage_layout: meta.storage_layout.clone(),
+                        loop_header_pc: header_pc,
+                        header_selected: meta.initial_selected,
+                        trace_started: false,
+                    }
+                }
+
+                fn is_compatible(&self, meta: &__JitMeta) -> bool {
+                    meta.initial_selected == self.#sel_field
+                        && meta.storage_layout.iter().all(|&(sidx, _)| {
+                            let store = self.#pool_field.get(sidx);
+                            store.data_ptr() != 0 && store.capacity() != 0
+                        })
+                }
+
+                fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
+                    let mut offset = 0usize;
+                    for &(sidx, _) in &meta.storage_layout {
+                        let Some(&new_len_raw) = values.get(offset + 1) else {
+                            return;
+                        };
+                        let Ok(new_len) = usize::try_from(new_len_raw) else {
+                            return;
+                        };
+                        self.#pool_field.get_mut(sidx).force_len(new_len);
+                        offset += 3;
+                    }
+                    self.#sel_field = values
+                        .get(offset)
+                        .copied()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(meta.initial_selected);
+                }
+
+                fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
+                    let mut args = Vec::with_capacity(sym.storage_layout.len() * 3);
+                    for &(sidx, _) in &sym.storage_layout {
+                        let &(ptr, len, cap) = sym
+                            .storage_refs
+                            .get(&sidx)
+                            .expect("missing compact storage refs");
+                        args.push(ptr);
+                        args.push(len);
+                        args.push(cap);
+                    }
+                    args
+                }
+
+                fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
+                    sym.current_selected == meta.initial_selected
+                        && sym.storage_layout.len() == meta.storage_layout.len()
+                        && sym
+                            .storage_layout
+                            .iter()
+                            .zip(meta.storage_layout.iter())
+                            .all(|(&(sym_idx, _), &(meta_idx, _))| sym_idx == meta_idx)
+                }
+            }
+        };
+    }
     // ── Frame virtualizable (VirtualizableDecl) code generation ──
     let vable_info_fn = config.virtualizable_decl.as_ref().map(|decl| {
         let token_offset = &decl.token_offset;
@@ -51,10 +792,12 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             .map(|f| {
                 let name = f.name.to_string();
                 let offset = &f.offset;
-                let tp = match f.field_type.to_string().as_str() {
-                    "ref" => quote! { majit_ir::Type::Ref },
-                    "float" => quote! { majit_ir::Type::Float },
-                    _ => quote! { majit_ir::Type::Int },
+                let tp = if f.field_type == "ref" {
+                    quote! { majit_ir::Type::Ref }
+                } else if f.field_type == "float" {
+                    quote! { majit_ir::Type::Float }
+                } else {
+                    quote! { majit_ir::Type::Int }
                 };
                 quote! {
                     __info.add_field(#name, #tp, #offset);
@@ -67,10 +810,12 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             .map(|a| {
                 let name = a.name.to_string();
                 let offset = &a.offset;
-                let tp = match a.item_type.to_string().as_str() {
-                    "ref" => quote! { majit_ir::Type::Ref },
-                    "float" => quote! { majit_ir::Type::Float },
-                    _ => quote! { majit_ir::Type::Int },
+                let tp = if a.item_type == "ref" {
+                    quote! { majit_ir::Type::Ref }
+                } else if a.item_type == "float" {
+                    quote! { majit_ir::Type::Float }
+                } else {
+                    quote! { majit_ir::Type::Int }
                 };
                 quote! {
                     __info.add_array_field(#name, #tp, #offset);
@@ -326,14 +1071,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                 | StateFieldKind::VirtArray(tp) => tp.to_string(),
             };
             match ty.as_str() {
-                "int" | "ref" | "float" => None,
+                "int" => None,
                 _ => Some(format!("{}: {}", f.name, ty)),
             }
         })
         .collect();
     if !unsupported_fields.is_empty() {
         let message = format!(
-            "state_fields supports int/ref/float and [int]/[ref]/[float]; unsupported: {}",
+            "state_fields supports int, [int], and [int; virt]; unsupported: {}",
             unsupported_fields.join(", ")
         );
         return quote! {

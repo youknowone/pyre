@@ -9,9 +9,9 @@ use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 
 use crate::trace::TreeLoop;
 
-/// Maximum number of operations before the trace is considered too long.
-/// RPython default: trace_limit = 2**14 = 16384
-const TRACE_LIMIT: usize = 16384;
+/// Default maximum number of operations before the trace is considered too long.
+/// Mirrors the configurable warmstate `trace_limit` parameter.
+pub const DEFAULT_TRACE_LIMIT: usize = 6000;
 
 /// The trace recorder: accumulates operations during tracing.
 pub struct Trace {
@@ -21,6 +21,8 @@ pub struct Trace {
     inputargs: Vec<InputArg>,
     /// Next OpRef index to assign.
     op_count: u32,
+    /// Maximum number of operations allowed before this trace is too long.
+    trace_limit: usize,
     /// Whether the recorder has been finalized (closed or finished).
     finalized: bool,
     /// Whether the trace was aborted.
@@ -30,10 +32,16 @@ pub struct Trace {
 impl Trace {
     /// Create a new, empty trace recorder.
     pub fn new() -> Self {
+        Self::with_limit(DEFAULT_TRACE_LIMIT)
+    }
+
+    /// Create a new, empty trace recorder with an explicit trace limit.
+    pub fn with_limit(trace_limit: usize) -> Self {
         Trace {
             ops: Vec::with_capacity(256),
             inputargs: Vec::new(),
             op_count: 0,
+            trace_limit,
             finalized: false,
             aborted: false,
         }
@@ -44,7 +52,13 @@ impl Trace {
     /// The recorder starts with `num_inputs` int-typed input args,
     /// matching the guard's fail_args.
     pub fn with_num_inputs(num_inputs: usize) -> Self {
-        let mut recorder = Self::new();
+        Self::with_num_inputs_and_limit(num_inputs, DEFAULT_TRACE_LIMIT)
+    }
+
+    /// Create a trace recorder pre-configured for retracing from a guard
+    /// with an explicit trace limit.
+    pub fn with_num_inputs_and_limit(num_inputs: usize, trace_limit: usize) -> Self {
+        let mut recorder = Self::with_limit(trace_limit);
         for _ in 0..num_inputs {
             recorder.record_input_arg(Type::Int);
         }
@@ -210,7 +224,7 @@ impl Trace {
 
     /// Whether the trace has exceeded the maximum allowed length.
     pub fn is_too_long(&self) -> bool {
-        self.ops.len() >= TRACE_LIMIT
+        self.ops.len() >= self.trace_limit
     }
 
     /// Whether the recorder has been finalized.
@@ -235,7 +249,7 @@ impl Trace {
 
     /// Remaining capacity before the trace is too long.
     pub fn remaining_capacity(&self) -> usize {
-        TRACE_LIMIT.saturating_sub(self.ops.len())
+        self.trace_limit.saturating_sub(self.ops.len())
     }
 
     /// Replace an argument in the last recorded operation.
@@ -1114,6 +1128,7 @@ mod tests {
             op_count: 1,
             finalized: true,
             aborted: true,
+            trace_limit: TRACE_LIMIT,
         };
         rec3.get_trace(); // should panic
     }

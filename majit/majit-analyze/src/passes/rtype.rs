@@ -175,7 +175,7 @@ mod tests {
                 entry,
                 OpKind::FieldRead {
                     base,
-                    field: "obj".into(),
+                    field: crate::graph::FieldDescriptor::new("obj", None),
                     ty: ValueType::Ref,
                 },
                 true,

@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::value::Type;
+use serde::{Deserialize, Serialize};
 
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
 pub type DescrRef = Arc<dyn Descr>;
@@ -135,7 +136,11 @@ pub trait SizeDescr: Descr {
 
     /// descr.py: repr_of_descr()
     fn repr_of_descr(&self) -> String {
-        format!("SizeDescr(size={}, type_id={})", self.size(), self.type_id())
+        format!(
+            "SizeDescr(size={}, type_id={})",
+            self.size(),
+            self.type_id()
+        )
     }
 
     /// Field descriptors for fields containing GC pointers.
@@ -420,7 +425,7 @@ impl Descr for DebugMergePointDescr {
 /// Side effect classification for calls.
 ///
 /// Translated from rpython/jit/codewriter/effectinfo.py.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectInfo {
     pub extra_effect: ExtraEffect,
     pub oopspec_index: OopSpecIndex,
@@ -457,7 +462,7 @@ impl Default for EffectInfo {
 /// How a call affects the optimizer's ability to optimize surrounding code.
 ///
 /// Ordered from most optimizable to least.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ExtraEffect {
     /// Pure function that cannot raise — can be eliminated entirely.
@@ -481,7 +486,7 @@ pub enum ExtraEffect {
 /// OopSpec index — identifies special-cased operations for the optimizer.
 ///
 /// Translated from rpython/jit/codewriter/effectinfo.py OS_* constants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum OopSpecIndex {
     None = 0,
@@ -1205,6 +1210,7 @@ mod tests {
             let ei = EffectInfo {
                 extra_effect: effect,
                 oopspec_index: OopSpecIndex::None,
+                ..Default::default()
             };
             assert!(ei.is_elidable(), "expected elidable for {effect:?}");
         }
@@ -1220,6 +1226,7 @@ mod tests {
             let ei = EffectInfo {
                 extra_effect: effect,
                 oopspec_index: OopSpecIndex::None,
+                ..Default::default()
             };
             assert!(!ei.is_elidable(), "expected non-elidable for {effect:?}");
         }
@@ -1238,6 +1245,7 @@ mod tests {
             let ei = EffectInfo {
                 extra_effect: effect,
                 oopspec_index: OopSpecIndex::None,
+                ..Default::default()
             };
             assert!(!ei.can_raise(), "expected cannot raise for {effect:?}");
         }
@@ -1252,6 +1260,7 @@ mod tests {
             let ei = EffectInfo {
                 extra_effect: effect,
                 oopspec_index: OopSpecIndex::None,
+                ..Default::default()
             };
             assert!(ei.can_raise(), "expected can raise for {effect:?}");
         }
@@ -1262,6 +1271,7 @@ mod tests {
         let ei = EffectInfo {
             extra_effect: ExtraEffect::LoopInvariant,
             oopspec_index: OopSpecIndex::None,
+            ..Default::default()
         };
         assert!(ei.is_loopinvariant());
         assert!(!ei.is_elidable());
@@ -1274,6 +1284,7 @@ mod tests {
         let ei = EffectInfo {
             extra_effect: ExtraEffect::CanRaise,
             oopspec_index: OopSpecIndex::LibffiCall,
+            ..Default::default()
         };
         assert_eq!(ei.oopspec_index, OopSpecIndex::LibffiCall);
         assert!(ei.can_raise());
@@ -1285,6 +1296,7 @@ mod tests {
         let ei = EffectInfo {
             extra_effect: ExtraEffect::ForcesVirtualOrVirtualizable,
             oopspec_index: OopSpecIndex::JitForceVirtualizable,
+            ..Default::default()
         };
         assert!(ei.can_raise());
         assert!(!ei.is_elidable());

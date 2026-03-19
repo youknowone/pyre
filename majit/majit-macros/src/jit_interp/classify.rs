@@ -120,10 +120,114 @@ fn extract_stmts(expr: &Expr) -> Vec<Stmt> {
 
 /// Detect abort pattern: contains input read operations.
 fn detect_abort_pattern(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| {
-        let s_str = quote::quote!(#s).to_string();
-        s_str.contains("read_number") || s_str.contains("read_utf8")
-    })
+    stmts.iter().any(stmt_contains_abort_call)
+}
+
+fn stmt_contains_abort_call(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Expr(expr, _) => expr_contains_abort_call(expr),
+        Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .is_some_and(|init| expr_contains_abort_call(&init.expr)),
+        _ => false,
+    }
+}
+
+fn expr_contains_abort_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            path_ends_with(&call.func, &["read_number", "read_utf8"])
+                || call.args.iter().any(expr_contains_abort_call)
+        }
+        Expr::MethodCall(call) => {
+            call.method == "read_number"
+                || call.method == "read_utf8"
+                || expr_contains_abort_call(&call.receiver)
+                || call.args.iter().any(expr_contains_abort_call)
+        }
+        Expr::Block(block) => block.block.stmts.iter().any(stmt_contains_abort_call),
+        Expr::If(expr_if) => {
+            expr_contains_abort_call(&expr_if.cond)
+                || expr_if
+                    .then_branch
+                    .stmts
+                    .iter()
+                    .any(stmt_contains_abort_call)
+                || expr_if
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|(_, else_expr)| expr_contains_abort_call(else_expr))
+        }
+        Expr::Match(expr_match) => {
+            expr_contains_abort_call(&expr_match.expr)
+                || expr_match.arms.iter().any(|arm| {
+                    expr_contains_abort_call(&arm.body)
+                        || arm
+                            .guard
+                            .as_ref()
+                            .is_some_and(|(_, guard)| expr_contains_abort_call(guard))
+                })
+        }
+        Expr::Loop(expr_loop) => expr_loop.body.stmts.iter().any(stmt_contains_abort_call),
+        Expr::While(expr_while) => {
+            expr_contains_abort_call(&expr_while.cond)
+                || expr_while.body.stmts.iter().any(stmt_contains_abort_call)
+        }
+        Expr::ForLoop(expr_for) => {
+            expr_contains_abort_call(&expr_for.expr)
+                || expr_for.body.stmts.iter().any(stmt_contains_abort_call)
+        }
+        Expr::Assign(expr_assign) => {
+            expr_contains_abort_call(&expr_assign.left)
+                || expr_contains_abort_call(&expr_assign.right)
+        }
+        Expr::Binary(expr_binary) => {
+            expr_contains_abort_call(&expr_binary.left)
+                || expr_contains_abort_call(&expr_binary.right)
+        }
+        Expr::Unary(expr_unary) => expr_contains_abort_call(&expr_unary.expr),
+        Expr::Paren(expr_paren) => expr_contains_abort_call(&expr_paren.expr),
+        Expr::Return(expr_return) => expr_return
+            .expr
+            .as_ref()
+            .is_some_and(|expr| expr_contains_abort_call(expr)),
+        Expr::Break(expr_break) => expr_break
+            .expr
+            .as_ref()
+            .is_some_and(|expr| expr_contains_abort_call(expr)),
+        Expr::Array(expr_array) => expr_array.elems.iter().any(expr_contains_abort_call),
+        Expr::Tuple(expr_tuple) => expr_tuple.elems.iter().any(expr_contains_abort_call),
+        Expr::Struct(expr_struct) => {
+            expr_struct
+                .fields
+                .iter()
+                .any(|field| expr_contains_abort_call(&field.expr))
+                || expr_struct
+                    .rest
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_abort_call(expr))
+        }
+        Expr::Index(expr_index) => {
+            expr_contains_abort_call(&expr_index.expr)
+                || expr_contains_abort_call(&expr_index.index)
+        }
+        Expr::Field(expr_field) => expr_contains_abort_call(&expr_field.base),
+        Expr::Reference(expr_ref) => expr_contains_abort_call(&expr_ref.expr),
+        Expr::Cast(expr_cast) => expr_contains_abort_call(&expr_cast.expr),
+        _ => false,
+    }
+}
+
+fn path_ends_with(expr: &Expr, names: &[&str]) -> bool {
+    match expr {
+        Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| names.iter().any(|name| seg.ident == *name)),
+        _ => false,
+    }
 }
 
 /// Detect branch group pattern: contains a nested match in a let-binding.
@@ -334,6 +438,13 @@ mod tests {
     #[test]
     fn classify_read_number_as_abort() {
         let arm = parse_arm("0 => { read_number(); },");
+        let result = classify_arm_body(&arm.body);
+        assert!(matches!(result, ArmPattern::AbortPermanent));
+    }
+
+    #[test]
+    fn classify_method_read_utf8_as_abort() {
+        let arm = parse_arm("0 => { io.read_utf8(); },");
         let result = classify_arm_body(&arm.body);
         assert!(matches!(result, ArmPattern::AbortPermanent));
     }

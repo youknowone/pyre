@@ -744,9 +744,18 @@ mod tests {
     #[test]
     fn test_inputarg_types_all() {
         let inputargs = vec![
-            InputArg { index: 0, tp: Type::Int },
-            InputArg { index: 1, tp: Type::Ref },
-            InputArg { index: 2, tp: Type::Float },
+            InputArg {
+                index: 0,
+                tp: Type::Int,
+            },
+            InputArg {
+                index: 1,
+                tp: Type::Ref,
+            },
+            InputArg {
+                index: 2,
+                tp: Type::Float,
+            },
         ];
         let trace = TreeLoop::new(inputargs, vec![Op::new(OpCode::Finish, &[])]);
         let types = trace.inputarg_types();

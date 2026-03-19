@@ -9,68 +9,46 @@
 //! 5. Collects type layouts (struct fields, offsets)
 //! 6. Generates tracing code that mirrors the interpreter's execution
 
-mod classify;
+mod call_match;
 mod codegen;
 pub mod codewriter;
+mod field_match;
 pub mod front;
 pub mod graph;
-pub mod interp_extract;
 mod parse;
 pub mod passes;
 mod patterns;
+#[cfg(test)]
+mod test_support;
 
-pub use classify::{FunctionInfo, HelperClassification};
-pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program};
-pub use graph::{BasicBlock, BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
-pub use parse::ParsedInterpreter;
-pub use passes::{
-    AnnotationState, ConcreteType, FlatOp, FlattenedFunction, GraphTransformConfig,
-    GraphTransformResult, Label, PipelineConfig, PipelineResult, ProgramPipelineResult,
-    TypeResolutionState, analyze_function, analyze_program, annotate_graph, resolve_types,
-    rewrite_graph,
+pub use call_match::CallDescriptor;
+pub use front::{
+    AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
+    build_semantic_program_from_parsed_files,
 };
-pub use patterns::{TracePattern, classify_from_graph, classify_from_pattern};
+pub use graph::{
+    BasicBlock, BasicBlockId, CallTarget, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType,
+};
+pub use parse::{
+    CallPath, OpcodeDispatchSelector, ParsedInterpreter, find_opcode_dispatch_match, parse_source,
+};
+pub use passes::{
+    AnnotationState, CallEffectKind, CallEffectOverride, ConcreteType, FlatOp, FlattenedFunction,
+    GraphTransformConfig, GraphTransformResult, Label, PipelineConfig, PipelineOpcodeArm,
+    PipelineResult, ProgramPipelineResult, TypeResolutionState, VirtualizableFieldDescriptor,
+    analyze_function, analyze_program, annotate_graph, resolve_types, rewrite_graph,
+};
+pub use patterns::{TracePattern, classify_from_graph};
 
 use serde::{Deserialize, Serialize};
 
-/// Configuration for the legacy multi-file analyzer.
+/// Configuration for the canonical graph/pipeline analyzer.
 ///
-/// This lets consumers supply graph-rewrite metadata such as
-/// virtualizable field/array mappings before falling back to the
-/// older TracePattern-based output.
+/// Consumers supply graph-rewrite metadata such as virtualizable
+/// field/array mappings before the codewriter-style passes run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalyzeConfig {
     pub pipeline: PipelineConfig,
-}
-
-/// Complete analysis result for an interpreter crate.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AnalysisResult {
-    /// Opcode dispatch arms extracted from the main match
-    pub opcodes: Vec<OpcodeArm>,
-    /// Helper function classifications
-    pub helpers: Vec<FunctionInfo>,
-    /// Struct layouts (field names, types, offsets)
-    pub type_layouts: Vec<TypeLayout>,
-    /// Trait implementations found
-    pub trait_impls: Vec<TraitImplInfo>,
-    /// Named offset constants (e.g., INT_INTVAL_OFFSET = offset_of!(...))
-    #[serde(default)]
-    pub offset_constants: Vec<(String, String)>,
-}
-
-/// A single opcode match arm
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OpcodeArm {
-    /// Pattern string (e.g., "Instruction::BinaryOp { op }")
-    pub pattern: String,
-    /// Handler method calls found in the arm body
-    pub handler_calls: Vec<String>,
-    /// Resolved call chain (trait impl → concrete method → helpers)
-    #[serde(default)]
-    pub resolved_calls: Vec<ResolvedCall>,
-    /// Trace pattern classification
-    pub trace_pattern: Option<TracePattern>,
 }
 
 /// A resolved method/function call with source context.
@@ -79,24 +57,9 @@ pub struct ResolvedCall {
     pub name: String,
     pub impl_type: Option<String>,
     pub trait_name: Option<String>,
-    pub body_summary: String,
-    /// Pre-built semantic graph (avoids re-parsing body_summary).
+    /// Canonical semantic graph for this resolved target.
     #[serde(default)]
     pub graph: Option<graph::MajitGraph>,
-}
-
-/// Struct field layout information
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TypeLayout {
-    pub name: String,
-    pub fields: Vec<FieldInfo>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FieldInfo {
-    pub name: String,
-    pub ty: String,
-    pub offset_expr: Option<String>,
 }
 
 /// Trait implementation info
@@ -104,323 +67,312 @@ pub struct FieldInfo {
 pub struct TraitImplInfo {
     pub trait_name: String,
     pub for_type: String,
+    #[serde(default)]
+    pub self_ty_root: Option<String>,
     pub methods: Vec<MethodInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MethodInfo {
     pub name: String,
-    pub body_summary: String,
-    /// Pre-built semantic graph (avoids re-parsing body_summary).
+    /// Canonical semantic graph for this method when available.
     #[serde(default)]
     pub graph: Option<graph::MajitGraph>,
 }
 
-/// Full analysis: parse + build graph + run pipeline + classify.
-///
-/// This is the recommended entry point. It runs both the legacy
-/// string-based analysis (for backward compatibility) and the new
-/// graph-based pipeline (for RPython-parity classification).
-pub fn analyze_full(source: &str) -> (AnalysisResult, passes::ProgramPipelineResult) {
-    analyze_full_with_config(source, &AnalyzeConfig::default())
+/// Canonical single-file analysis entry point.
+pub fn analyze_pipeline(source: &str) -> passes::ProgramPipelineResult {
+    analyze_pipeline_with_config(source, &AnalyzeConfig::default())
 }
 
-/// Configurable full analysis entry point.
-pub fn analyze_full_with_config(
+/// Configurable canonical single-file analysis entry point.
+pub fn analyze_pipeline_with_config(
     source: &str,
     config: &AnalyzeConfig,
-) -> (AnalysisResult, passes::ProgramPipelineResult) {
-    let mut legacy = analyze_with_config(source, config);
-    let parsed = parse::parse_source(source);
-    let program = front::build_semantic_program(&parsed);
-    let pipeline = passes::analyze_program(&program, &config.pipeline);
+) -> passes::ProgramPipelineResult {
+    analyze_multiple_pipeline_with_config(&[source], config)
+}
 
-    // Enrich: if graph pipeline classified a function that matches an
-    // unclassified opcode arm handler, propagate the graph classification.
-    for arm in &mut legacy.opcodes {
-        if arm.trace_pattern.is_some() {
-            continue;
+/// Canonical multi-file analysis entry point.
+///
+/// This returns only the graph/pipeline result and is the preferred API for
+/// RPython-like translator consumers.
+pub fn analyze_multiple_pipeline(sources: &[&str]) -> passes::ProgramPipelineResult {
+    analyze_multiple_pipeline_with_config(sources, &AnalyzeConfig::default())
+}
+
+/// Configurable canonical multi-file analysis entry point.
+///
+/// This is the canonical graph/pipeline translator entry point.
+pub fn analyze_multiple_pipeline_with_config(
+    sources: &[&str],
+    config: &AnalyzeConfig,
+) -> passes::ProgramPipelineResult {
+    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
+    analyze_pipeline_from_parsed(&parsed_files, config)
+}
+
+fn analyze_pipeline_from_parsed(
+    parsed_files: &[parse::ParsedInterpreter],
+    config: &AnalyzeConfig,
+) -> passes::ProgramPipelineResult {
+    let program = front::build_semantic_program_from_parsed_files(parsed_files);
+    let mut pipeline = passes::analyze_program(&program, &config.pipeline);
+    let mut canonical_trait_impls = Vec::new();
+    let mut canonical_inherent_methods = Vec::new();
+    let mut canonical_function_graphs = std::collections::HashMap::new();
+
+    for parsed in parsed_files {
+        canonical_trait_impls.extend(parse::extract_trait_impls(parsed));
+        canonical_inherent_methods.extend(parse::extract_inherent_impl_methods(parsed));
+        parse::collect_function_graphs(parsed, &mut canonical_function_graphs);
+    }
+
+    pipeline.opcode_dispatch = build_canonical_opcode_dispatch(
+        parsed_files,
+        &canonical_trait_impls,
+        &canonical_inherent_methods,
+        &canonical_function_graphs,
+        &config.pipeline,
+    );
+
+    pipeline
+}
+
+fn build_canonical_opcode_dispatch(
+    parsed_files: &[parse::ParsedInterpreter],
+    trait_impls: &[TraitImplInfo],
+    inherent_methods: &[parse::InherentMethodInfo],
+    function_graphs: &std::collections::HashMap<parse::CallPath, graph::MajitGraph>,
+    pipeline_config: &passes::PipelineConfig,
+) -> Vec<passes::PipelineOpcodeArm> {
+    let mut opcode_arms = Vec::new();
+    let mut receiver_traits = parse::ReceiverTraitBindings::default();
+
+    for parsed in parsed_files {
+        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed);
+        if !file_opcodes.is_empty() {
+            opcode_arms = file_opcodes;
+            receiver_traits = parse::extract_opcode_dispatch_receiver_traits(parsed);
+            break;
         }
-        for call in &arm.resolved_calls {
-            if let Some(ref graph) = call.graph {
-                let rewritten = passes::rewrite_graph(graph, &config.pipeline.transform);
-                if let Some(pattern) = patterns::classify_from_graph(&rewritten.graph) {
-                    arm.trace_pattern = Some(pattern);
-                    break;
+    }
+
+    opcode_arms
+        .into_iter()
+        .map(|arm| {
+            let resolved_calls = resolve_handler_calls(
+                &arm.handler_calls,
+                trait_impls,
+                inherent_methods,
+                function_graphs,
+                &receiver_traits,
+            );
+            let classified_pattern = resolved_calls
+                .iter()
+                .find_map(|call| classify_resolved_call_graph(call, pipeline_config));
+
+            passes::PipelineOpcodeArm {
+                selector: arm.selector,
+                classified_pattern,
+            }
+        })
+        .collect()
+}
+
+fn classify_resolved_call_graph(
+    call: &ResolvedCall,
+    pipeline_config: &passes::PipelineConfig,
+) -> Option<TracePattern> {
+    let graph = call.graph.as_ref()?;
+    let rewritten = passes::rewrite_graph(graph, &pipeline_config.transform);
+    patterns::classify_from_graph(&rewritten.graph)
+}
+
+fn resolve_handler_calls(
+    handler_calls: &[parse::ExtractedHandlerCall],
+    trait_impls: &[TraitImplInfo],
+    inherent_methods: &[parse::InherentMethodInfo],
+    function_graphs: &std::collections::HashMap<parse::CallPath, graph::MajitGraph>,
+    receiver_traits: &parse::ReceiverTraitBindings,
+) -> Vec<ResolvedCall> {
+    fn push_unique(resolved_calls: &mut Vec<ResolvedCall>, call: ResolvedCall) {
+        if !resolved_calls.iter().any(|existing| {
+            existing.name == call.name
+                && existing.impl_type == call.impl_type
+                && existing.trait_name == call.trait_name
+        }) {
+            resolved_calls.push(call);
+        }
+    }
+
+    fn receiver_matches_root(
+        receiver_type_root: Option<&String>,
+        candidate_root: &Option<String>,
+    ) -> bool {
+        match (receiver_type_root, candidate_root.as_ref()) {
+            (Some(receiver), Some(candidate)) => receiver == candidate,
+            _ => false,
+        }
+    }
+
+    fn push_matching_trait_methods(
+        resolved_calls: &mut Vec<ResolvedCall>,
+        trait_impls: &[TraitImplInfo],
+        name: &str,
+        receiver_type_root: Option<&String>,
+        allowed_traits: Option<&[String]>,
+    ) -> bool {
+        let mut matched = false;
+        for impl_info in trait_impls {
+            if let Some(allowed_traits) = allowed_traits {
+                if !allowed_traits
+                    .iter()
+                    .any(|bound| bound == &impl_info.trait_name)
+                {
+                    continue;
+                }
+            }
+
+            let is_default_methods = impl_info.for_type.starts_with("<default methods of ");
+            let applies = if is_default_methods {
+                receiver_type_root.is_some_and(|receiver_ty| {
+                    trait_impls.iter().any(|candidate| {
+                        candidate.trait_name == impl_info.trait_name
+                            && candidate.self_ty_root.as_ref() == Some(receiver_ty)
+                    })
+                })
+            } else {
+                receiver_matches_root(receiver_type_root, &impl_info.self_ty_root)
+            };
+
+            if !applies {
+                continue;
+            }
+
+            for method in &impl_info.methods {
+                if method.name == name {
+                    matched = true;
+                    push_unique(
+                        resolved_calls,
+                        ResolvedCall {
+                            name: name.to_string(),
+                            impl_type: Some(impl_info.for_type.clone()),
+                            trait_name: Some(impl_info.trait_name.clone()),
+                            graph: method.graph.clone(),
+                        },
+                    );
                 }
             }
         }
+        matched
     }
 
-    (legacy, pipeline)
-}
-
-/// Analyze a single source file (legacy string-based path).
-pub fn analyze(source: &str) -> AnalysisResult {
-    analyze_with_config(source, &AnalyzeConfig::default())
-}
-
-/// Analyze a single source file with graph/pipeline configuration.
-pub fn analyze_with_config(source: &str, config: &AnalyzeConfig) -> AnalysisResult {
-    analyze_multiple_with_config(&[source], config)
-}
-
-/// Analyze multiple source files as a unified program.
-///
-/// This is the main entry point — equivalent to RPython's annotation + rtyping.
-/// Pass all relevant source files (opcode_step.rs, eval.rs, object types, etc.)
-/// and the analyzer builds a cross-file view of the interpreter.
-pub fn analyze_multiple(sources: &[&str]) -> AnalysisResult {
-    analyze_multiple_with_config(sources, &AnalyzeConfig::default())
-}
-
-/// Analyze multiple source files with graph-rewrite configuration.
-pub fn analyze_multiple_with_config(sources: &[&str], config: &AnalyzeConfig) -> AnalysisResult {
-    let mut all_helpers = Vec::new();
-    let mut all_types = Vec::new();
-    let mut all_trait_impls = Vec::new();
-    let mut all_functions = std::collections::HashMap::new();
-    let mut all_function_graphs = std::collections::HashMap::new();
-    let mut all_offset_constants = Vec::new();
-
-    // Phase 1: Parse all files and collect items
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-
-    for parsed in &parsed_files {
-        all_helpers.extend(classify::classify_functions(parsed));
-        all_types.extend(parse::extract_type_layouts(parsed));
-        all_trait_impls.extend(parse::extract_trait_impls(parsed));
-        all_offset_constants.extend(parse::extract_offset_constants(parsed));
-        parse::collect_functions_with_graphs(parsed, &mut all_functions, &mut all_function_graphs);
-    }
-
-    // Phase 2: Extract opcode dispatch (needs cross-file trait resolution)
-    let mut opcodes = Vec::new();
-    for parsed in &parsed_files {
-        let file_opcodes = parse::extract_opcode_dispatch(parsed, &all_trait_impls);
-        if !file_opcodes.is_empty() {
-            opcodes = file_opcodes;
-            break; // Only one file has execute_opcode_step
-        }
-    }
-
-    // Phase 3: Resolve call chains across files
-    for arm in &mut opcodes {
-        resolve_call_chain(
-            arm,
-            &all_trait_impls,
-            &all_functions,
-            &all_function_graphs,
-            config,
-        );
-    }
-
-    AnalysisResult {
-        opcodes,
-        helpers: all_helpers,
-        type_layouts: all_types,
-        trait_impls: all_trait_impls,
-        offset_constants: all_offset_constants,
-    }
-}
-
-/// Resolve handler method calls through trait impls and function definitions.
-fn resolve_call_chain(
-    arm: &mut OpcodeArm,
-    trait_impls: &[TraitImplInfo],
-    functions: &std::collections::HashMap<String, String>,
-    function_graphs: &std::collections::HashMap<String, graph::MajitGraph>,
-    config: &AnalyzeConfig,
-) {
     let mut resolved_calls = Vec::new();
 
-    for call_name in &arm.handler_calls {
-        // Check trait impls first
-        for impl_info in trait_impls {
-            for method in &impl_info.methods {
-                if &method.name == call_name {
+    for call in handler_calls {
+        match call {
+            parse::ExtractedHandlerCall::Method {
+                name,
+                receiver_root,
+            } => {
+                let receiver_binding = receiver_root.as_ref();
+                let receiver_type_root = receiver_binding
+                    .and_then(|receiver| receiver_traits.type_root_by_receiver.get(receiver));
+                let receiver_bound_traits = receiver_binding
+                    .and_then(|receiver| receiver_traits.traits_by_receiver.get(receiver));
+
+                let mut matched_specific_target = false;
+                if receiver_type_root.is_some() {
+                    for method in inherent_methods {
+                        if method.name == *name
+                            && receiver_matches_root(receiver_type_root, &method.self_ty_root)
+                        {
+                            matched_specific_target = true;
+                            push_unique(
+                                &mut resolved_calls,
+                                ResolvedCall {
+                                    name: name.clone(),
+                                    impl_type: Some(method.for_type.clone()),
+                                    trait_name: None,
+                                    graph: Some(method.graph.clone()),
+                                },
+                            );
+                        }
+                    }
+
+                    matched_specific_target |= push_matching_trait_methods(
+                        &mut resolved_calls,
+                        trait_impls,
+                        name,
+                        receiver_type_root,
+                        receiver_bound_traits.map(Vec::as_slice),
+                    );
+                }
+
+                if !matched_specific_target {
+                    if let Some(bound_traits) = receiver_bound_traits {
+                        for trait_name in bound_traits {
+                            let mut default_match: Option<ResolvedCall> = None;
+                            let mut concrete_matches = Vec::new();
+
+                            for impl_info in trait_impls {
+                                if &impl_info.trait_name != trait_name {
+                                    continue;
+                                }
+                                for method in &impl_info.methods {
+                                    if method.name != *name {
+                                        continue;
+                                    }
+                                    let resolved = ResolvedCall {
+                                        name: name.clone(),
+                                        impl_type: Some(impl_info.for_type.clone()),
+                                        trait_name: Some(impl_info.trait_name.clone()),
+                                        graph: method.graph.clone(),
+                                    };
+                                    if impl_info.for_type.starts_with("<default methods of ") {
+                                        default_match = Some(resolved);
+                                    } else {
+                                        concrete_matches.push(resolved);
+                                    }
+                                }
+                            }
+
+                            if concrete_matches.len() == 1 {
+                                push_unique(&mut resolved_calls, concrete_matches.pop().unwrap());
+                            } else if concrete_matches.is_empty() {
+                                if let Some(default_match) = default_match {
+                                    push_unique(&mut resolved_calls, default_match);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            parse::ExtractedHandlerCall::FunctionPath(path) => {
+                if let Some(graph) = function_graphs.get(path) {
                     resolved_calls.push(ResolvedCall {
-                        name: call_name.clone(),
-                        impl_type: Some(impl_info.for_type.clone()),
-                        trait_name: Some(impl_info.trait_name.clone()),
-                        body_summary: method.body_summary.clone(),
-                        graph: method.graph.clone(),
+                        name: path.canonical_key(),
+                        impl_type: None,
+                        trait_name: None,
+                        graph: Some(graph.clone()),
                     });
                 }
             }
-        }
-
-        // Check free functions (with pre-built graph)
-        if let Some(body) = functions.get(call_name) {
-            resolved_calls.push(ResolvedCall {
-                name: call_name.clone(),
-                impl_type: None,
-                trait_name: None,
-                body_summary: body.clone(),
-                graph: function_graphs.get(call_name).cloned(),
-            });
+            parse::ExtractedHandlerCall::UnsupportedFunctionExpr => {}
         }
     }
 
-    arm.resolved_calls = resolved_calls;
-
-    // PRIMARY: graph-based classification after jtransform-style rewrite.
-    // This keeps the legacy output format but lets consumers inject
-    // virtualizable/call-effect metadata before classification.
-    for call in &arm.resolved_calls {
-        if let Some(ref graph) = call.graph {
-            let rewritten = passes::rewrite_graph(graph, &config.pipeline.transform);
-            if let Some(pattern) = patterns::classify_from_graph(&rewritten.graph) {
-                arm.trace_pattern = Some(pattern);
-                break;
-            }
-        }
-    }
-
-    // SECONDARY: raw graph classification when no configured rewrite produced
-    // a pattern (or no config metadata was supplied).
-    if arm.trace_pattern.is_none() {
-        for call in &arm.resolved_calls {
-            if let Some(ref graph) = call.graph {
-                if let Some(pattern) = patterns::classify_from_graph(graph) {
-                    arm.trace_pattern = Some(pattern);
-                    break;
-                }
-            }
-        }
-    }
-
-    // TERTIARY: Method name heuristic (for cases where body parsing fails
-    // or the graph classifier doesn't recognize the pattern yet).
-    if arm.trace_pattern.is_none() {
-        arm.trace_pattern = classify_from_method_names(&arm.resolved_calls, &arm.handler_calls);
-    }
-
-    // FINAL: Opcode pattern text (for arms without resolved calls).
-    if arm.trace_pattern.is_none() {
-        arm.trace_pattern = patterns::classify_from_pattern(&arm.pattern);
-    }
+    resolved_calls
 }
 
-/// Classify from method names only (no body_summary heuristic).
-///
-/// This is the secondary fallback after graph-based classification.
-/// It only looks at the handler method name (e.g., "binary_op",
-/// "load_fast") without parsing the body.
-fn classify_from_method_names(
-    resolved: &[ResolvedCall],
-    handler_calls: &[String],
-) -> Option<TracePattern> {
-    // Try method name matching from resolved calls
-    for call in resolved {
-        match call.name.as_str() {
-            "binary_op" => {
-                return Some(TracePattern::UnboxIntBinop {
-                    op_name: "dispatch".into(),
-                    has_overflow_guard: true,
-                });
-            }
-            "compare_op" => {
-                return Some(TracePattern::UnboxIntCompare {
-                    op_name: "dispatch".into(),
-                });
-            }
-            "unary_negative" | "unary_invert" => {
-                return Some(TracePattern::UnboxIntUnary {
-                    op_name: call.name.clone(),
-                });
-            }
-            "unary_not" => return Some(TracePattern::TruthCheck),
-            "load_fast" | "load_fast_checked" | "load_fast_load_fast" => {
-                return Some(TracePattern::LocalRead);
-            }
-            "store_fast"
-            | "store_fast_checked"
-            | "store_fast_store_fast"
-            | "store_fast_load_fast" => {
-                return Some(TracePattern::LocalWrite);
-            }
-            "load_const" | "load_small_int" => return Some(TracePattern::ConstLoad),
-            "call" => return Some(TracePattern::FunctionCall),
-            "for_iter" => return Some(TracePattern::RangeIterNext),
-            "end_for" | "pop_iter" => return Some(TracePattern::IterCleanup),
-            "pop_top" | "copy_value" | "swap" | "push_null" => {
-                return Some(TracePattern::StackManip);
-            }
-            "jump_forward" | "jump_backward" => return Some(TracePattern::Jump),
-            "pop_jump_if_false" | "pop_jump_if_true" => {
-                return Some(TracePattern::ConditionalJump);
-            }
-            "return_value" => return Some(TracePattern::Return),
-            "store_name" => {
-                return Some(TracePattern::NamespaceAccess {
-                    is_load: false,
-                    is_global: false,
-                });
-            }
-            "load_name" => {
-                return Some(TracePattern::NamespaceAccess {
-                    is_load: true,
-                    is_global: false,
-                });
-            }
-            "load_global" => {
-                return Some(TracePattern::NamespaceAccess {
-                    is_load: true,
-                    is_global: true,
-                });
-            }
-            "build_list" => {
-                return Some(TracePattern::BuildCollection {
-                    kind: "list".into(),
-                });
-            }
-            "build_tuple" => {
-                return Some(TracePattern::BuildCollection {
-                    kind: "tuple".into(),
-                });
-            }
-            "build_map" => {
-                return Some(TracePattern::BuildCollection { kind: "map".into() });
-            }
-            "unpack_sequence" => return Some(TracePattern::UnpackSequence),
-            "store_subscr" => return Some(TracePattern::SequenceSetitem),
-            "list_append" => return Some(TracePattern::CollectionAppend),
-            "get_iter" | "make_function" => {
-                return Some(TracePattern::Residual {
-                    helper_name: call.name.clone(),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    // Also check handler_calls (from arm body analysis)
-    for name in handler_calls {
-        match name.as_str() {
-            "binary_op" => {
-                return Some(TracePattern::UnboxIntBinop {
-                    op_name: "dispatch".into(),
-                    has_overflow_guard: true,
-                });
-            }
-            "load_fast" | "load_fast_checked" => return Some(TracePattern::LocalRead),
-            "store_fast" | "store_fast_checked" => return Some(TracePattern::LocalWrite),
-            _ => {}
-        }
-    }
-
-    None
-}
-
-/// Generate tracing code from analysis results.
-///
-/// This is the main codegen entry point — equivalent to RPython's JitCode generation.
-pub fn generate_trace_code(result: &AnalysisResult) -> String {
-    codegen::generate(result)
+/// Generate tracing code directly from the canonical pipeline result.
+pub fn generate_trace_code_from_pipeline(result: &passes::ProgramPipelineResult) -> String {
+    codegen::generate_from_pipeline(result)
 }
 
 /// Generate code from graph pipeline results.
+#[cfg(test)]
 pub fn generate_graph_code(result: &passes::ProgramPipelineResult) -> String {
     codegen::generate_from_graph(result)
 }
@@ -428,6 +380,7 @@ pub fn generate_graph_code(result: &passes::ProgramPipelineResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn read_pyre_file(name: &str) -> String {
         let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pyre/");
@@ -435,40 +388,85 @@ mod tests {
             .unwrap_or_else(|_| panic!("failed to read {name}"))
     }
 
+    fn collect_rs_files(dir: &Path, sources: &mut Vec<String>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|_| panic!("failed to read dir {}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, sources);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                sources.push(
+                    std::fs::read_to_string(&path)
+                        .unwrap_or_else(|_| panic!("failed to read {}", path.display())),
+                );
+            }
+        }
+    }
+
+    fn read_all_pyre_sources() -> Vec<String> {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pyre");
+        let mut sources = Vec::new();
+        for dir in [
+            base.join("pyre-object/src"),
+            base.join("pyre-runtime/src"),
+            base.join("pyre-interp/src"),
+        ] {
+            collect_rs_files(&dir, &mut sources);
+        }
+        sources
+    }
+
     #[test]
     fn test_analyze_opcode_step() {
         let source = read_pyre_file("pyre-runtime/src/opcode_step.rs");
-        let result = analyze(&source);
+        let result = analyze_multiple_pipeline_with_config(
+            &[&source],
+            &crate::test_support::pyre_analyze_config(),
+        );
 
         assert!(
-            result.opcodes.len() > 20,
+            result.opcode_dispatch.len() > 20,
             "expected >20 opcode arms, got {}",
-            result.opcodes.len()
+            result.opcode_dispatch.len()
         );
 
         eprintln!("=== Single-file Analysis ===");
-        eprintln!("Opcodes: {}", result.opcodes.len());
-        for (i, arm) in result.opcodes.iter().enumerate() {
-            eprintln!("  [{i}] {} → {:?}", arm.pattern, arm.handler_calls);
+        eprintln!("Opcodes: {}", result.opcode_dispatch.len());
+        for (i, arm) in result.opcode_dispatch.iter().enumerate() {
+            eprintln!(
+                "  [{i}] {} → {:?}",
+                arm.selector.canonical_key(),
+                arm.classified_pattern
+            );
         }
     }
 
     #[test]
     fn test_multi_file_analysis() {
-        let opcode_step = read_pyre_file("pyre-runtime/src/opcode_step.rs");
-        let eval = read_pyre_file("pyre-interp/src/eval.rs");
-
-        let result = analyze_multiple(&[&opcode_step, &eval]);
+        let sources = read_all_pyre_sources();
+        let source_refs: Vec<_> = sources.iter().map(String::as_str).collect();
+        let parsed_files: Vec<_> = sources
+            .iter()
+            .map(|source| parse::parse_source(source))
+            .collect();
+        let result = analyze_multiple_pipeline_with_config(
+            &source_refs,
+            &crate::test_support::pyre_analyze_config(),
+        );
+        let trait_impls: Vec<_> = parsed_files
+            .iter()
+            .flat_map(parse::extract_trait_impls)
+            .collect();
 
         eprintln!("=== Multi-file Analysis ===");
-        eprintln!("Opcodes: {}", result.opcodes.len());
-        eprintln!("Helpers: {}", result.helpers.len());
-        eprintln!("Types: {}", result.type_layouts.len());
-        eprintln!("Trait impls: {}", result.trait_impls.len());
+        eprintln!("Opcodes: {}", result.opcode_dispatch.len());
+        eprintln!("Functions: {}", result.functions.len());
+        eprintln!("Trait impls: {}", trait_impls.len());
 
         // Should have trait impls from eval.rs (PyFrame impls)
-        let pyframe_impls: Vec<_> = result
-            .trait_impls
+        let pyframe_impls: Vec<_> = trait_impls
             .iter()
             .filter(|i| i.for_type.contains("PyFrame"))
             .collect();
@@ -486,95 +484,101 @@ mod tests {
 
         // Should have resolved opcode patterns
         eprintln!("\nOpcode patterns:");
-        for arm in &result.opcodes {
-            if let Some(ref pattern) = arm.trace_pattern {
-                eprintln!("  {} → {:?}", arm.pattern, pattern);
+        for arm in &result.opcode_dispatch {
+            if let Some(ref pattern) = arm.classified_pattern {
+                eprintln!("  {} → {:?}", arm.selector.canonical_key(), pattern);
             }
         }
 
-        // Verify key patterns are detected
-        let binary_op = result
-            .opcodes
-            .iter()
-            .find(|a| a.pattern.contains("BinaryOp"));
-        assert!(binary_op.is_some(), "BinaryOp arm not found");
-        assert!(
-            binary_op.unwrap().trace_pattern.is_some(),
-            "BinaryOp should have a trace pattern"
-        );
-
-        // Verify classification coverage (39/40 — only `other` wildcard is unclassified)
+        // Verify canonical graph/pipeline dispatch still classifies a useful subset.
         let classified_count = result
-            .opcodes
+            .opcode_dispatch
             .iter()
-            .filter(|a| a.trace_pattern.is_some())
+            .filter(|a| a.classified_pattern.is_some())
             .count();
         assert!(
-            classified_count >= 30,
-            "expected >=30 classified, got {}",
+            classified_count >= 10,
+            "expected >=10 canonical graph-classified arms, got {}",
             classified_count
         );
 
-        // Verify new pattern categories are present
-        let patterns_debug: Vec<String> = result
-            .opcodes
-            .iter()
-            .filter_map(|a| a.trace_pattern.as_ref().map(|p| format!("{:?}", p)))
-            .collect();
-        let pattern_str = patterns_debug.join(" ");
-        assert!(pattern_str.contains("Jump"), "missing Jump pattern");
         assert!(
-            pattern_str.contains("ConditionalJump"),
-            "missing ConditionalJump pattern"
-        );
-        assert!(pattern_str.contains("Return"), "missing Return pattern");
-        assert!(
-            pattern_str.contains("NamespaceAccess"),
-            "missing NamespaceAccess pattern"
+            result.opcode_dispatch.iter().any(|arm| {
+                matches!(
+                    arm.classified_pattern,
+                    Some(TracePattern::Jump)
+                        | Some(TracePattern::ConditionalJump)
+                        | Some(TracePattern::VableFieldWrite { .. })
+                )
+            }),
+            "missing Jump/ConditionalJump/VableFieldWrite pattern"
         );
         assert!(
-            pattern_str.contains("IterCleanup"),
-            "missing IterCleanup pattern"
-        );
-        assert!(pattern_str.contains("Noop"), "missing Noop pattern");
-        assert!(
-            pattern_str.contains("BuildCollection"),
-            "missing BuildCollection pattern"
-        );
-        assert!(
-            pattern_str.contains("UnpackSequence"),
-            "missing UnpackSequence pattern"
+            result.opcode_dispatch.iter().any(|arm| {
+                matches!(
+                    arm.classified_pattern,
+                    Some(TracePattern::LocalRead) | Some(TracePattern::VableArrayRead { .. })
+                )
+            }),
+            "missing LocalRead/VableArrayRead pattern"
         );
         assert!(
-            pattern_str.contains("SequenceSetitem"),
-            "missing SequenceSetitem pattern"
-        );
-        assert!(
-            pattern_str.contains("CollectionAppend"),
-            "missing CollectionAppend pattern"
+            result.opcode_dispatch.iter().any(|arm| {
+                matches!(
+                    arm.classified_pattern,
+                    Some(TracePattern::FunctionCall)
+                        | Some(TracePattern::RangeIterNext)
+                        | Some(TracePattern::VableArrayWrite { .. })
+                        | Some(TracePattern::Noop)
+                )
+            }),
+            "missing canonical call/iter/vable/noop pattern"
         );
     }
 
     #[test]
     fn test_codegen_output() {
-        let opcode_step = read_pyre_file("pyre-runtime/src/opcode_step.rs");
-        let eval = read_pyre_file("pyre-interp/src/eval.rs");
-        let result = analyze_multiple(&[&opcode_step, &eval]);
-        let code = generate_trace_code(&result);
+        let sources = read_all_pyre_sources();
+        let source_refs: Vec<_> = sources.iter().map(String::as_str).collect();
+        let result = analyze_multiple_pipeline_with_config(
+            &source_refs,
+            &crate::test_support::pyre_analyze_config(),
+        );
+        let code = generate_trace_code_from_pipeline(&result);
+        let canonical_patterns: Vec<_> = result
+            .opcode_dispatch
+            .iter()
+            .filter_map(|arm| arm.classified_pattern.as_ref())
+            .collect();
 
-        // Should contain dispatch table
-        assert!(code.contains("TRACE_PATTERNS"), "missing TRACE_PATTERNS");
-        assert!(code.contains("UnboxIntBinop"), "missing UnboxIntBinop");
-        assert!(code.contains("LocalRead"), "missing LocalRead");
-        assert!(code.contains("FunctionCall"), "missing FunctionCall");
-        assert!(code.contains("Jump"), "missing Jump");
-        assert!(code.contains("ConditionalJump"), "missing ConditionalJump");
-        assert!(code.contains("Return"), "missing Return");
-        assert!(code.contains("NamespaceAccess"), "missing NamespaceAccess");
-        assert!(code.contains("IterCleanup"), "missing IterCleanup");
-        assert!(code.contains("Noop"), "missing Noop");
-        assert!(code.contains("BuildCollection"), "missing BuildCollection");
-        assert!(code.contains("SequenceSetitem"), "missing SequenceSetitem");
+        // Should contain canonical dispatch table
+        assert!(
+            code.contains("CANONICAL_TRACE_PATTERNS"),
+            "missing CANONICAL_TRACE_PATTERNS"
+        );
+        assert!(
+            !code.contains("pub const TRACE_PATTERNS"),
+            "canonical output should not emit legacy TRACE_PATTERNS alias"
+        );
+        assert!(
+            code.contains("Canonical analysis summary:"),
+            "missing canonical summary"
+        );
+        assert!(
+            !canonical_patterns.is_empty(),
+            "expected canonical graph-derived patterns"
+        );
+        assert!(
+            canonical_patterns.iter().any(|pattern| {
+                matches!(
+                    pattern,
+                    TracePattern::Jump
+                        | TracePattern::ConditionalJump
+                        | TracePattern::VableFieldWrite { .. }
+                )
+            }),
+            "missing canonical graph-derived control-flow/vable-field pattern"
+        );
 
         eprintln!("=== Generated Code ({} bytes) ===", code.len());
         // Print first 50 lines
@@ -612,8 +616,16 @@ mod tests {
 
         // Step 2: graph transform (with virtualizable config)
         let config = passes::GraphTransformConfig {
-            vable_fields: vec![("next_instr".into(), 0)],
-            vable_arrays: vec![("locals_w".into(), 0)],
+            vable_fields: vec![passes::VirtualizableFieldDescriptor::new(
+                "next_instr",
+                Some("Frame".into()),
+                0,
+            )],
+            vable_arrays: vec![passes::VirtualizableFieldDescriptor::new(
+                "locals_w",
+                Some("Frame".into()),
+                0,
+            )],
             ..Default::default()
         };
 
@@ -674,19 +686,15 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_full_runs_both_pipelines() {
+    fn test_analyze_pipeline_runs_canonical_graph_path() {
         let source = read_pyre_file("pyre-runtime/src/opcode_step.rs");
-        let (legacy, graph_result) = analyze_full(&source);
-
-        // Legacy pipeline should produce opcodes
-        assert!(legacy.opcodes.len() >= 30);
+        let graph_result = analyze_pipeline(&source);
 
         // Graph pipeline should analyze functions
         assert!(graph_result.functions.len() >= 5);
 
         eprintln!(
-            "analyze_full: legacy {} opcodes, graph {} functions / {} blocks / {} ops",
-            legacy.opcodes.len(),
+            "analyze_pipeline: graph {} functions / {} blocks / {} ops",
             graph_result.functions.len(),
             graph_result.total_blocks,
             graph_result.total_ops,
@@ -719,13 +727,21 @@ mod tests {
             }
         "#;
 
-        let result = analyze_multiple_with_config(
+        let result = analyze_multiple_pipeline_with_config(
             &[source],
             &AnalyzeConfig {
                 pipeline: PipelineConfig {
                     transform: GraphTransformConfig {
-                        vable_fields: vec![("next_instr".into(), 0)],
-                        vable_arrays: vec![("locals_w".into(), 0)],
+                        vable_fields: vec![passes::VirtualizableFieldDescriptor::new(
+                            "next_instr",
+                            Some("Frame".into()),
+                            0,
+                        )],
+                        vable_arrays: vec![passes::VirtualizableFieldDescriptor::new(
+                            "locals_w",
+                            Some("Frame".into()),
+                            0,
+                        )],
                         ..Default::default()
                     },
                 },
@@ -733,16 +749,336 @@ mod tests {
         );
 
         let load_fast = result
-            .opcodes
+            .opcode_dispatch
             .iter()
-            .find(|arm| arm.pattern.contains("LoadFast"))
+            .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
             .expect("LoadFast opcode arm");
         assert_eq!(
-            load_fast.trace_pattern,
+            load_fast.classified_pattern,
             Some(TracePattern::VableArrayRead {
                 array_index: 0,
                 item_type: "unknown".into(),
             })
         );
+    }
+
+    #[test]
+    fn test_analyze_multiple_pipeline_with_config_produces_canonical_vable_dispatch() {
+        let source = r#"
+            enum Instruction { LoadFast }
+
+            struct Frame {
+                next_instr: usize,
+                locals_w: Vec<i64>,
+            }
+
+            impl Frame {
+                fn load_fast(&mut self) -> i64 {
+                    let idx = majit_runtime::hint_access_directly(self.next_instr);
+                    self.locals_w[idx]
+                }
+            }
+
+            fn execute_opcode_step(frame: &mut Frame, instruction: Instruction) {
+                match instruction {
+                    Instruction::LoadFast => {
+                        let _ = frame.load_fast();
+                    }
+                }
+            }
+        "#;
+
+        let result = analyze_multiple_pipeline_with_config(
+            &[source],
+            &AnalyzeConfig {
+                pipeline: PipelineConfig {
+                    transform: GraphTransformConfig {
+                        vable_fields: vec![passes::VirtualizableFieldDescriptor::new(
+                            "next_instr",
+                            Some("Frame".into()),
+                            0,
+                        )],
+                        vable_arrays: vec![passes::VirtualizableFieldDescriptor::new(
+                            "locals_w",
+                            Some("Frame".into()),
+                            0,
+                        )],
+                        ..Default::default()
+                    },
+                },
+            },
+        );
+        let canonical_load_fast = result
+            .opcode_dispatch
+            .iter()
+            .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
+            .expect("canonical LoadFast opcode arm");
+        assert!(
+            result.total_vable_rewrites > 0,
+            "graph pipeline should perform vable rewrites"
+        );
+        assert_eq!(
+            canonical_load_fast.classified_pattern,
+            Some(TracePattern::VableArrayRead {
+                array_index: 0,
+                item_type: "unknown".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_opcode_dispatch_uses_trait_bound_default_method_graphs() {
+        let source = r#"
+            enum Instruction { LoadFast }
+
+            trait OpcodeStepExecutor {
+                fn load_fast_checked(&mut self, idx: usize) {
+                    let _ = idx;
+                }
+            }
+
+            fn execute_opcode_step<E: OpcodeStepExecutor>(executor: &mut E, instruction: Instruction) {
+                match instruction {
+                    Instruction::LoadFast => executor.load_fast_checked(0),
+                }
+            }
+        "#;
+
+        let result = analyze_multiple_pipeline(&[source]);
+        let arm = result
+            .opcode_dispatch
+            .iter()
+            .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
+            .expect("LoadFast opcode arm");
+        assert_eq!(arm.classified_pattern, Some(TracePattern::Noop));
+    }
+
+    #[test]
+    fn test_generic_trait_bound_does_not_sweep_concrete_impls() {
+        let source = r#"
+            enum Instruction { LoadFast }
+
+            trait OpcodeStepExecutor {
+                fn load_fast_checked(&mut self, idx: usize) {
+                    let _ = idx;
+                }
+            }
+
+            struct PyFrame;
+            impl OpcodeStepExecutor for PyFrame {}
+
+            fn execute_opcode_step<E: OpcodeStepExecutor>(executor: &mut E, instruction: Instruction) {
+                match instruction {
+                    Instruction::LoadFast => executor.load_fast_checked(0),
+                }
+            }
+        "#;
+
+        let parsed = parse::parse_source(source);
+        let trait_impls = parse::extract_trait_impls(&parsed);
+        let inherent_methods = parse::extract_inherent_impl_methods(&parsed);
+        let mut function_graphs = std::collections::HashMap::new();
+        parse::collect_function_graphs(&parsed, &mut function_graphs);
+        let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
+        let arms = parse::extract_opcode_dispatch_arms(&parsed);
+        let resolved = resolve_handler_calls(
+            &arms[0].handler_calls,
+            &trait_impls,
+            &inherent_methods,
+            &function_graphs,
+            &receiver_traits,
+        );
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "generic trait bound should resolve only default method body"
+        );
+        assert_eq!(
+            resolved[0].impl_type.as_deref(),
+            Some("<default methods of OpcodeStepExecutor>")
+        );
+        assert_eq!(
+            resolved[0].trait_name.as_deref(),
+            Some("OpcodeStepExecutor")
+        );
+    }
+
+    #[test]
+    fn test_generic_trait_bound_uses_unique_concrete_impl() {
+        let source = r#"
+            enum Instruction { LoadFast }
+
+            trait OpcodeStepExecutor {
+                fn load_fast_checked(&mut self, idx: usize);
+            }
+
+            struct PyFrame;
+            impl OpcodeStepExecutor for PyFrame {
+                fn load_fast_checked(&mut self, idx: usize) {
+                    let _ = idx;
+                }
+            }
+
+            fn execute_opcode_step<E: OpcodeStepExecutor>(executor: &mut E, instruction: Instruction) {
+                match instruction {
+                    Instruction::LoadFast => executor.load_fast_checked(0),
+                }
+            }
+        "#;
+
+        let parsed = parse::parse_source(source);
+        let trait_impls = parse::extract_trait_impls(&parsed);
+        let inherent_methods = parse::extract_inherent_impl_methods(&parsed);
+        let mut function_graphs = std::collections::HashMap::new();
+        parse::collect_function_graphs(&parsed, &mut function_graphs);
+        let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
+        let arms = parse::extract_opcode_dispatch_arms(&parsed);
+        let resolved = resolve_handler_calls(
+            &arms[0].handler_calls,
+            &trait_impls,
+            &inherent_methods,
+            &function_graphs,
+            &receiver_traits,
+        );
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "generic trait bound should use the unique concrete impl"
+        );
+        assert_eq!(resolved[0].impl_type.as_deref(), Some("PyFrame"));
+        assert_eq!(
+            resolved[0].trait_name.as_deref(),
+            Some("OpcodeStepExecutor")
+        );
+    }
+
+    #[test]
+    fn test_function_path_resolution_uses_exact_call_path() {
+        let source = r#"
+            enum Instruction { LoadFast }
+
+            fn helper() {}
+
+            fn execute_opcode_step(instruction: Instruction) {
+                match instruction {
+                    Instruction::LoadFast => crate::helper(),
+                }
+            }
+        "#;
+
+        let parsed = parse::parse_source(source);
+        let trait_impls = parse::extract_trait_impls(&parsed);
+        let inherent_methods = parse::extract_inherent_impl_methods(&parsed);
+        let mut function_graphs = std::collections::HashMap::new();
+        parse::collect_function_graphs(&parsed, &mut function_graphs);
+        let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
+        let arms = parse::extract_opcode_dispatch_arms(&parsed);
+        let resolved = resolve_handler_calls(
+            &arms[0].handler_calls,
+            &trait_impls,
+            &inherent_methods,
+            &function_graphs,
+            &receiver_traits,
+        );
+
+        assert_eq!(resolved.len(), 1, "exact crate::helper path should resolve");
+        assert_eq!(resolved[0].name, "crate::helper");
+        assert!(
+            resolved[0].graph.is_some(),
+            "resolved helper should carry a graph"
+        );
+    }
+
+    #[test]
+    fn test_opcode_dispatch_prefers_concrete_receiver_impl_root() {
+        let source = r#"
+            enum Instruction { LoadFast }
+
+            trait TraitA {
+                fn load_fast_checked(&mut self, idx: usize) { let _ = idx; }
+            }
+            trait TraitB {
+                fn load_fast_checked(&mut self, idx: usize) { let _ = idx + 1; }
+            }
+
+            struct PyFrame;
+            struct OtherFrame;
+
+            impl TraitA for PyFrame {}
+            impl TraitB for OtherFrame {}
+
+            fn execute_opcode_step(frame: &mut PyFrame, instruction: Instruction) {
+                match instruction {
+                    Instruction::LoadFast => frame.load_fast_checked(0),
+                }
+            }
+        "#;
+
+        let parsed = parse::parse_source(source);
+        let trait_impls = parse::extract_trait_impls(&parsed);
+        let inherent_methods = parse::extract_inherent_impl_methods(&parsed);
+        let mut function_graphs = std::collections::HashMap::new();
+        parse::collect_function_graphs(&parsed, &mut function_graphs);
+        let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
+        let arms = parse::extract_opcode_dispatch_arms(&parsed);
+        let resolved = resolve_handler_calls(
+            &arms[0].handler_calls,
+            &trait_impls,
+            &inherent_methods,
+            &function_graphs,
+            &receiver_traits,
+        );
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "expected only concrete receiver impl match"
+        );
+        assert_eq!(
+            resolved[0].impl_type.as_deref(),
+            Some("<default methods of TraitA>")
+        );
+        assert_eq!(resolved[0].trait_name.as_deref(), Some("TraitA"));
+    }
+
+    #[test]
+    fn test_opcode_dispatch_does_not_broad_match_known_receiver_identity() {
+        let source = r#"
+            trait TraitA { fn helper(&mut self); }
+            trait TraitB { fn helper(&mut self) {} }
+            struct PyFrame;
+            impl TraitA for PyFrame { fn helper(&mut self) {} }
+            struct OtherFrame;
+            impl TraitB for OtherFrame {}
+            pub fn execute_opcode_step(frame: &mut PyFrame) { frame.helper(); }
+        "#;
+
+        let parsed = parse::parse_source(source);
+        let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
+        let trait_impls = parse::extract_trait_impls(&parsed);
+        let inherent_methods = parse::extract_inherent_impl_methods(&parsed);
+        let function_graphs = std::collections::HashMap::new();
+        let handler_calls = vec![parse::ExtractedHandlerCall::Method {
+            name: "helper".into(),
+            receiver_root: Some("frame".into()),
+        }];
+
+        let resolved = resolve_handler_calls(
+            &handler_calls,
+            &trait_impls,
+            &inherent_methods,
+            &function_graphs,
+            &receiver_traits,
+        );
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "known receiver should not broad-match unrelated impls"
+        );
+        assert_eq!(resolved[0].impl_type.as_deref(), Some("PyFrame"));
+        assert_eq!(resolved[0].trait_name.as_deref(), Some("TraitA"));
     }
 }

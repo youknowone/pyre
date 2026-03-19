@@ -6,10 +6,7 @@ use crate::resume::{
     ResumeFrameLayoutSummary,
 };
 use crate::trace_ctx::JitDriverStaticData;
-use crate::virtualizable::{
-    clear_vable_token, read_all_virtualizable_boxes, write_all_virtualizable_boxes,
-    VirtualizableInfo,
-};
+use crate::virtualizable::VirtualizableInfo;
 
 /// Layout description for replaying a pending field or array write during deopt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,11 +160,16 @@ pub trait JitState: Sized {
         let Some(obj_ptr) = self.virtualizable_heap_ptr(meta, virtualizable, info) else {
             return true;
         };
-        let Some(lengths) = self.virtualizable_array_lengths(meta, virtualizable, info) else {
-            return true;
+        let lengths = if info.can_read_all_array_lengths_from_heap() {
+            unsafe { info.read_array_lengths_from_heap(obj_ptr.cast_const()) }
+        } else {
+            let Some(lengths) = self.virtualizable_array_lengths(meta, virtualizable, info) else {
+                return true;
+            };
+            lengths
         };
         let (static_boxes, array_boxes) =
-            unsafe { read_all_virtualizable_boxes(info, obj_ptr.cast_const(), &lengths) };
+            unsafe { info.read_all_boxes(obj_ptr.cast_const(), &lengths) };
         self.import_virtualizable_boxes(meta, virtualizable, info, &static_boxes, &array_boxes)
     }
 
@@ -186,8 +188,8 @@ pub trait JitState: Sized {
             return;
         };
         unsafe {
-            write_all_virtualizable_boxes(info, obj_ptr, &static_boxes, &array_boxes);
-            clear_vable_token(info, obj_ptr);
+            info.write_from_resume_data_partial(obj_ptr, &static_boxes, &array_boxes);
+            info.reset_vable_token(obj_ptr);
         }
     }
 

@@ -350,7 +350,11 @@ impl Optimizer {
     pub fn getnullness(ctx: &OptContext, opref: OpRef) -> i8 {
         let resolved = ctx.get_replacement(opref);
         if let Some(val) = ctx.get_constant_int(resolved) {
-            if val != 0 { 1 } else { -1 }
+            if val != 0 {
+                1
+            } else {
+                -1
+            }
         } else {
             0 // unknown
         }
@@ -359,11 +363,7 @@ impl Optimizer {
     /// optimizer.py: make_constant_class(op, class_const)
     /// Record that an OpRef has a known class (type pointer).
     /// This is used by GUARD_CLASS to propagate class info.
-    pub fn make_constant_class(
-        ctx: &mut OptContext,
-        opref: OpRef,
-        class_value: i64,
-    ) {
+    pub fn make_constant_class(ctx: &mut OptContext, opref: OpRef, class_value: i64) {
         // In RPython this creates an InstancePtrInfo with _known_class.
         // In majit we record it as a fact the guard pass can use.
         // The class value is stored so downstream passes can check it.

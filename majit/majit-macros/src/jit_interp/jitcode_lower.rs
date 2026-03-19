@@ -15,40 +15,49 @@ use syn::{
 /// Built from `JitInterpConfig` at proc-macro time and passed to the Lowerer
 /// to recognize compound storage methods, I/O shims, and selector assignments.
 pub struct LowererConfig {
-    /// Normalized pool expression (e.g., "state.storage").
-    pool_str: String,
-    /// Normalized selector expression (e.g., "state.selected").
-    selector_str: String,
-    /// Normalized "pool.get_mut(selector)" receiver pattern.
-    pool_get_mut_sel: String,
+    /// Canonical pool expression segments (e.g., ["state", "storage"]).
+    pool_segments: Option<Vec<String>>,
+    /// Canonical selector expression segments (e.g., ["state", "selected"]).
+    selector_segments: Option<Vec<String>>,
     /// Method name → IR OpCode ident (e.g., "add" → IntAdd).
     binops: HashMap<String, Ident>,
-    /// Normalized I/O func path → shim ident (e.g., "aheui_io::write_number" → jit_write_number).
-    io_shims: Vec<(String, Ident)>,
-    /// Normalized helper func path → explicit or inferred call policy.
-    calls: Vec<(String, CallPolicySpec)>,
+    /// Canonical I/O func path → shim ident.
+    io_shims: Vec<(Vec<String>, Ident)>,
+    /// Canonical helper func path → explicit or inferred call policy.
+    calls: Vec<(Vec<String>, CallPolicySpec)>,
     /// Whether top-level traced calls should auto-infer helper policy.
     auto_calls: bool,
     /// Virtualizable variable name (normalized, e.g., "frame").
     /// RPython jtransform.py: `is_virtualizable_getset()` uses this to check
     /// if a field access target is the virtualizable variable.
     vable_var: Option<String>,
-    /// Field name → (field_index, field_type_str).
+    /// Field name → (field_index, field_type).
     /// RPython: `vinfo.static_field_to_extra_box[fieldname]` → index.
-    vable_fields: HashMap<String, (usize, String)>,
-    /// Array name → (array_index, item_type_str).
+    vable_fields: HashMap<String, (usize, ValueKind)>,
+    /// Array name → (array_index, item_type).
     /// RPython: `vinfo.array_field_counter[fieldname]` → index.
-    vable_arrays: HashMap<String, (usize, String)>,
-    /// State field scalars: field_name → (global_field_index, type_str).
-    state_scalars: HashMap<String, (usize, String)>,
-    /// State field arrays (flattened): field_name → (global_array_index, item_type_str).
-    state_arrays: HashMap<String, (usize, String)>,
-    /// State field virtualizable arrays: field_name → (virt_array_index, item_type_str).
+    vable_arrays: HashMap<String, (usize, ValueKind)>,
+    /// State field scalars: field_name → global_field_index.
+    state_scalars: HashMap<String, usize>,
+    /// State field arrays (flattened): field_name → global_array_index.
+    state_arrays: HashMap<String, usize>,
+    /// State field virtualizable arrays: field_name → virt_array_index.
     /// These emit GETARRAYITEM_RAW_I/SETARRAYITEM_RAW instead of element-level tracking.
-    state_virt_arrays: HashMap<String, (usize, String)>,
+    state_virt_arrays: HashMap<String, usize>,
 }
 
 const MAX_HELPER_CALL_ARITY: usize = 16;
+
+fn classify_virtualizable_hint_syn_path(
+    path: &Path,
+) -> Option<majit_runtime::VirtualizableHintKind> {
+    let segments = path
+        .segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect::<Vec<_>>();
+    majit_runtime::classify_virtualizable_hint_segments(segments.iter().map(String::as_str))
+}
 
 pub(crate) struct InlineHelperJitCode {
     pub body: TokenStream,
@@ -65,7 +74,7 @@ pub(crate) enum InlineReturnKind {
 
 #[derive(Clone)]
 enum CallPolicySpec {
-    Explicit(Ident),
+    Explicit(crate::jit_interp::CallPolicyKind),
     Infer,
 }
 
@@ -75,36 +84,52 @@ enum InferenceFailureMode {
     Panic,
 }
 
+#[derive(Clone, Copy)]
+enum ValueKind {
+    Int,
+    Ref,
+    Float,
+}
+
+impl ValueKind {
+    fn from_ident(ident: &Ident) -> Self {
+        match ident.to_string().as_str() {
+            "ref" => Self::Ref,
+            "float" => Self::Float,
+            _ => Self::Int,
+        }
+    }
+}
+
 impl LowererConfig {
     pub fn new(
-        pool_expr: &Expr,
-        selector_expr: &Expr,
+        pool_expr: Option<&Expr>,
+        selector_expr: Option<&Expr>,
         binops: &[(Ident, Ident)],
         io_shims: &[(Path, Ident)],
-        calls: &[(Path, Option<Ident>)],
+        calls: &[(Path, Option<crate::jit_interp::CallPolicyKind>)],
         auto_calls: bool,
         vable_decl: Option<&crate::jit_interp::VirtualizableDecl>,
         state_fields_cfg: Option<&crate::jit_interp::StateFieldsConfig>,
     ) -> Self {
-        let pool_str = normalize(&quote!(#pool_expr).to_string());
-        let selector_str = normalize(&quote!(#selector_expr).to_string());
-        let pool_get_mut_sel = format!("{}.get_mut({})", pool_str, selector_str);
+        let pool_segments = pool_expr.and_then(canonical_expr_segments);
+        let selector_segments = selector_expr.and_then(canonical_expr_segments);
         let binops = binops
             .iter()
             .map(|(m, o)| (m.to_string(), o.clone()))
             .collect();
         let io_shims = io_shims
             .iter()
-            .map(|(p, s)| (normalize(&quote!(#p).to_string()), s.clone()))
+            .map(|(p, s)| (canonical_path_segments(p), s.clone()))
             .collect();
         let calls = calls
             .iter()
             .map(|(p, k)| {
                 let spec = match k {
-                    Some(kind) => CallPolicySpec::Explicit(kind.clone()),
+                    Some(kind) => CallPolicySpec::Explicit(*kind),
                     None => CallPolicySpec::Infer,
                 };
-                (normalize(&quote!(#p).to_string()), spec)
+                (canonical_path_segments(p), spec)
             })
             .collect();
         let (vable_var, vable_fields, vable_arrays) = if let Some(decl) = vable_decl {
@@ -113,13 +138,18 @@ impl LowererConfig {
                 .fields
                 .iter()
                 .enumerate()
-                .map(|(i, f)| (f.name.to_string(), (i, f.field_type.to_string())))
+                .map(|(i, f)| {
+                    (
+                        f.name.to_string(),
+                        (i, ValueKind::from_ident(&f.field_type)),
+                    )
+                })
                 .collect();
             let arrays = decl
                 .arrays
                 .iter()
                 .enumerate()
-                .map(|(i, a)| (a.name.to_string(), (i, a.item_type.to_string())))
+                .map(|(i, a)| (a.name.to_string(), (i, ValueKind::from_ident(&a.item_type))))
                 .collect();
             (var, fields, arrays)
         } else {
@@ -135,16 +165,16 @@ impl LowererConfig {
             let mut virt_array_idx = 0usize;
             for f in &sf.fields {
                 match &f.kind {
-                    StateFieldKind::Scalar(tp) => {
-                        scalars.insert(f.name.to_string(), (scalar_idx, tp.to_string()));
+                    StateFieldKind::Scalar(_) => {
+                        scalars.insert(f.name.to_string(), scalar_idx);
                         scalar_idx += 1;
                     }
-                    StateFieldKind::Array(tp) => {
-                        arrays.insert(f.name.to_string(), (array_idx, tp.to_string()));
+                    StateFieldKind::Array(_) => {
+                        arrays.insert(f.name.to_string(), array_idx);
                         array_idx += 1;
                     }
-                    StateFieldKind::VirtArray(tp) => {
-                        virt_arrays.insert(f.name.to_string(), (virt_array_idx, tp.to_string()));
+                    StateFieldKind::VirtArray(_) => {
+                        virt_arrays.insert(f.name.to_string(), virt_array_idx);
                         virt_array_idx += 1;
                     }
                 }
@@ -154,9 +184,8 @@ impl LowererConfig {
             (HashMap::new(), HashMap::new(), HashMap::new())
         };
         Self {
-            pool_str,
-            selector_str,
-            pool_get_mut_sel,
+            pool_segments,
+            selector_segments,
             binops,
             io_shims,
             calls,
@@ -171,18 +200,65 @@ impl LowererConfig {
     }
 }
 
-fn normalize(s: &str) -> String {
-    s.replace(' ', "")
+fn canonical_path_segments(path: &Path) -> Vec<String> {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect()
 }
 
-fn normalize_expr(expr: &Expr) -> String {
-    normalize(&quote!(#expr).to_string())
+fn canonical_member_name(member: &syn::Member) -> String {
+    match member {
+        syn::Member::Named(ident) => ident.to_string(),
+        syn::Member::Unnamed(idx) => idx.index.to_string(),
+    }
+}
+
+fn canonical_expr_segments(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Path(path) => Some(canonical_path_segments(&path.path)),
+        Expr::Field(field) => {
+            let mut segments = canonical_expr_segments(&field.base)?;
+            segments.push(canonical_member_name(&field.member));
+            Some(segments)
+        }
+        Expr::Paren(paren) => canonical_expr_segments(&paren.expr),
+        Expr::Reference(reference) => canonical_expr_segments(&reference.expr),
+        _ => None,
+    }
+}
+
+fn expr_matches_segments(expr: &Expr, expected: &[String]) -> bool {
+    canonical_expr_segments(expr)
+        .as_ref()
+        .map(|segments| segments == expected)
+        .unwrap_or(false)
 }
 
 fn unwrap_ref_expr(expr: &Expr) -> &Expr {
     match expr {
         Expr::Reference(ExprReference { expr, .. }) => expr,
         _ => expr,
+    }
+}
+
+fn expr_matches_local_name(expr: &Expr, expected: &str) -> bool {
+    match expr {
+        Expr::Path(path) => path
+            .path
+            .get_ident()
+            .map(|ident| ident == expected)
+            .unwrap_or(false),
+        Expr::Reference(reference) => expr_matches_local_name(&reference.expr, expected),
+        Expr::Paren(paren) => expr_matches_local_name(&paren.expr, expected),
+        _ => false,
+    }
+}
+
+fn named_member(member: &syn::Member) -> Option<String> {
+    match member {
+        syn::Member::Named(ident) => Some(ident.to_string()),
+        _ => None,
     }
 }
 
@@ -208,7 +284,7 @@ struct Lowerer<'c> {
     next_reg: u16,
     next_label: u16,
     config: Option<&'c LowererConfig>,
-    call_policies: Vec<(String, CallPolicySpec)>,
+    call_policies: Vec<(Vec<String>, CallPolicySpec)>,
     inference_failure_mode: InferenceFailureMode,
     auto_calls: bool,
 }
@@ -221,7 +297,7 @@ impl<'c> Lowerer<'c> {
 
     fn new_with_call_policies(
         config: Option<&'c LowererConfig>,
-        call_policies: Vec<(String, CallPolicySpec)>,
+        call_policies: Vec<(Vec<String>, CallPolicySpec)>,
         inference_failure_mode: InferenceFailureMode,
     ) -> Self {
         Self {
@@ -259,11 +335,11 @@ impl<'c> Lowerer<'c> {
     }
 
     fn resolve_call_policy(&self, func: &Expr) -> Option<CallPolicySpec> {
-        let func_str = normalize_expr(func);
+        let func_segments = canonical_expr_segments(func)?;
         if let Some((_, policy)) = self
             .call_policies
             .iter()
-            .find(|(path, _)| *path == func_str)
+            .find(|(path, _)| *path == func_segments)
         {
             return Some(policy.clone());
         }
@@ -353,21 +429,25 @@ impl<'c> Lowerer<'c> {
             Expr::Field(f) => f,
             _ => return None,
         };
-        let receiver_str = normalize(&quote!(#field.base).to_string());
-        if receiver_str != *vable_var {
+        if !expr_matches_local_name(&field.base, vable_var) {
             return None;
         }
-        let member_name = match &field.member {
-            syn::Member::Named(ident) => ident.to_string(),
-            _ => return None,
-        };
-        let &(field_index, _) = config.vable_fields.get(&member_name)?;
+        let member_name = named_member(&field.member)?;
+        let &(field_index, field_type) = config.vable_fields.get(&member_name)?;
         let fi = field_index as u16;
         let binding = self.lower_value_expr(&assign.right)?;
         let src = binding.reg;
-        self.statements.push(quote! {
-            __builder.vable_setfield(#fi, #src);
-        });
+        match field_type {
+            ValueKind::Ref => self.statements.push(quote! {
+                __builder.vable_setfield_ref(#fi, #src);
+            }),
+            ValueKind::Float => self.statements.push(quote! {
+                __builder.vable_setfield_float(#fi, #src);
+            }),
+            ValueKind::Int => self.statements.push(quote! {
+                __builder.vable_setfield_int(#fi, #src);
+            }),
+        }
         Some(())
     }
 
@@ -391,15 +471,11 @@ impl<'c> Lowerer<'c> {
             Expr::Field(f) => f,
             _ => return None,
         };
-        let receiver_str = normalize(&quote!(#field.base).to_string());
-        if receiver_str != *vable_var {
+        if !expr_matches_local_name(&field.base, vable_var) {
             return None;
         }
-        let member_name = match &field.member {
-            syn::Member::Named(ident) => ident.to_string(),
-            _ => return None,
-        };
-        let &(array_index, _) = config.vable_arrays.get(&member_name)?;
+        let member_name = named_member(&field.member)?;
+        let &(array_index, item_type) = config.vable_arrays.get(&member_name)?;
         let ai = array_index as u16;
 
         // Lower index and value
@@ -408,9 +484,17 @@ impl<'c> Lowerer<'c> {
         let val_binding = self.lower_value_expr(&assign.right)?;
         let val_reg = val_binding.reg;
 
-        self.statements.push(quote! {
-            __builder.vable_setarrayitem(#ai, #idx_reg, #val_reg);
-        });
+        match item_type {
+            ValueKind::Ref => self.statements.push(quote! {
+                __builder.vable_setarrayitem_ref(#ai, #idx_reg, #val_reg);
+            }),
+            ValueKind::Float => self.statements.push(quote! {
+                __builder.vable_setarrayitem_float(#ai, #idx_reg, #val_reg);
+            }),
+            ValueKind::Int => self.statements.push(quote! {
+                __builder.vable_setarrayitem_int(#ai, #idx_reg, #val_reg);
+            }),
+        }
         Some(())
     }
 
@@ -426,15 +510,11 @@ impl<'c> Lowerer<'c> {
             _ => return None,
         };
         let base = &field.base;
-        let receiver_str = normalize(&quote!(#base).to_string());
-        if receiver_str != "state" {
+        if !expr_matches_local_name(base, "state") {
             return None;
         }
-        let member_name = match &field.member {
-            syn::Member::Named(ident) => ident.to_string(),
-            _ => return None,
-        };
-        let &(field_index, _) = config.state_scalars.get(&member_name)?;
+        let member_name = named_member(&field.member)?;
+        let &field_index = config.state_scalars.get(&member_name)?;
         let fi = field_index as u16;
         let binding = self.lower_value_expr(&assign.right)?;
         let src = binding.reg;
@@ -460,27 +540,23 @@ impl<'c> Lowerer<'c> {
             _ => return None,
         };
         let base = &field.base;
-        let receiver_str = normalize(&quote!(#base).to_string());
-        if receiver_str != "state" {
+        if !expr_matches_local_name(base, "state") {
             return None;
         }
-        let member_name = match &field.member {
-            syn::Member::Named(ident) => ident.to_string(),
-            _ => return None,
-        };
+        let member_name = named_member(&field.member)?;
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let val_binding = self.lower_value_expr(&assign.right)?;
         let val_reg = val_binding.reg;
 
         // Check virtualizable arrays first, then flattened arrays.
-        if let Some(&(va_idx, _)) = config.state_virt_arrays.get(&member_name) {
+        if let Some(&va_idx) = config.state_virt_arrays.get(&member_name) {
             let ai = va_idx as u16;
             self.statements
                 .push(quote! { __builder.store_state_varray(#ai, #idx_reg, #val_reg); });
             return Some(());
         }
-        let &(array_index, _) = config.state_arrays.get(&member_name)?;
+        let &array_index = config.state_arrays.get(&member_name)?;
         let ai = array_index as u16;
         self.statements
             .push(quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); });
@@ -498,8 +574,8 @@ impl<'c> Lowerer<'c> {
             Expr::Macro(m) => m,
             _ => return None,
         };
-        let seg = mac.mac.path.segments.last()?;
-        if seg.ident != "hint_force_virtualizable" {
+        let hint = classify_virtualizable_hint_syn_path(&mac.mac.path)?;
+        if hint != majit_runtime::VirtualizableHintKind::ForceVirtualizable {
             return None;
         }
         self.statements.push(quote! {
@@ -520,15 +596,14 @@ impl<'c> Lowerer<'c> {
             _ => return None,
         };
         let func_name = match &*call.func {
-            Expr::Path(p) => {
-                let seg = p.path.segments.last()?;
-                seg.ident.to_string()
-            }
+            Expr::Path(p) => classify_virtualizable_hint_syn_path(&p.path),
             _ => return None,
         };
-        match func_name.as_str() {
-            "hint_access_directly" | "hint_fresh_virtualizable" => {
-                // These are identity: return lower(arg)
+        match func_name {
+            Some(
+                majit_runtime::VirtualizableHintKind::AccessDirectly
+                | majit_runtime::VirtualizableHintKind::FreshVirtualizable,
+            ) => {
                 let arg = call.args.first()?;
                 self.lower_value_expr(arg)
             }
@@ -552,9 +627,11 @@ impl<'c> Lowerer<'c> {
             Expr::Macro(m) => m,
             _ => return None,
         };
-        let seg = mac.mac.path.segments.last()?;
-        match seg.ident.to_string().as_str() {
-            "hint_access_directly" | "hint_fresh_virtualizable" => Some(()),
+        match classify_virtualizable_hint_syn_path(&mac.mac.path) {
+            Some(
+                majit_runtime::VirtualizableHintKind::AccessDirectly
+                | majit_runtime::VirtualizableHintKind::FreshVirtualizable,
+            ) => Some(()),
             _ => None,
         }
     }
@@ -663,15 +740,16 @@ impl<'c> Lowerer<'c> {
             return None;
         };
         let config = self.config?;
-        let receiver_str = normalize_expr(&mc.receiver);
-        if receiver_str != config.pool_get_mut_sel {
+        let selected_arg = extract_pool_get_mut_arg(&mc.receiver, config)?;
+        let selector_segments = config.selector_segments.as_ref()?;
+        if !expr_matches_segments(&selected_arg, selector_segments) {
             return None;
         }
         let method_name = mc.method.to_string();
 
         // Compound binop: pop two, operate, push result
         if let Some(opcode) = config.binops.get(&method_name) {
-            let binop_tokens = if opcode.to_string().ends_with("Ovf") {
+            let binop_tokens = if is_overflow_binop(opcode) {
                 quote! {
                     __sub.peek_i(0);
                     __sub.swap_stack();
@@ -730,8 +808,8 @@ impl<'c> Lowerer<'c> {
         }
         let func = &call.func;
         match policy {
-            CallPolicySpec::Explicit(kind) => match kind.to_string().as_str() {
-                "residual_void" => {
+            CallPolicySpec::Explicit(kind) => match kind {
+                crate::jit_interp::CallPolicyKind::ResidualVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -745,7 +823,7 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "may_force_void" => {
+                crate::jit_interp::CallPolicyKind::MayForceVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -759,7 +837,7 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "release_gil_void" => {
+                crate::jit_interp::CallPolicyKind::ReleaseGilVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -773,7 +851,7 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "loopinvariant_void" => {
+                crate::jit_interp::CallPolicyKind::LoopInvariantVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -787,7 +865,7 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "residual_void_wrapped" => {
+                crate::jit_interp::CallPolicyKind::ResidualVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let call_stmt =
@@ -811,19 +889,19 @@ impl<'c> Lowerer<'c> {
                         #call_stmt
                     });
                 }
-                "may_force_void_wrapped"
-                | "release_gil_void_wrapped"
-                | "loopinvariant_void_wrapped" => {
+                crate::jit_interp::CallPolicyKind::MayForceVoidWrapped
+                | crate::jit_interp::CallPolicyKind::ReleaseGilVoidWrapped
+                | crate::jit_interp::CallPolicyKind::LoopInvariantVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
-                    let call_stmt = match kind.to_string().as_str() {
-                        "may_force_void_wrapped" => {
+                    let call_stmt = match kind {
+                        crate::jit_interp::CallPolicyKind::MayForceVoidWrapped => {
                             quote! { __builder.call_may_force_void_typed_args(__fn_idx, #typed_args); }
                         }
-                        "release_gil_void_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ReleaseGilVoidWrapped => {
                             quote! { __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args); }
                         }
-                        "loopinvariant_void_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::LoopInvariantVoidWrapped => {
                             quote! { __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args); }
                         }
                         _ => unreachable!(),
@@ -897,10 +975,10 @@ impl<'c> Lowerer<'c> {
             return None;
         };
         let config = self.config?;
-        let func_str = normalize_expr(&call.func);
+        let func_segments = canonical_expr_segments(&call.func)?;
 
         for (io_path, shim) in &config.io_shims {
-            if func_str == *io_path {
+            if func_segments == *io_path {
                 let arg = unwrap_ref_expr(call.args.first()?);
                 let binding = self.lower_value_expr(arg)?;
                 let reg = binding.reg;
@@ -921,8 +999,8 @@ impl<'c> Lowerer<'c> {
             return None;
         };
         let config = self.config?;
-        let lhs_str = normalize_expr(left);
-        if lhs_str != config.selector_str {
+        let selector_segments = config.selector_segments.as_ref()?;
+        if !expr_matches_segments(left, selector_segments) {
             return None;
         }
         if self.expr_touches_storage(right) || self.expr_uses_stack_bindings(right) {
@@ -946,9 +1024,9 @@ impl<'c> Lowerer<'c> {
         }
         let config = self.config?;
         let target_arg = extract_pool_get_mut_arg(&mc.receiver, config)?;
-        let target_str = normalize_expr(&target_arg);
+        let selector_segments = config.selector_segments.as_ref()?;
         // If target == selector, this is a regular push (handled elsewhere)
-        if target_str == config.selector_str {
+        if expr_matches_segments(&target_arg, selector_segments) {
             return None;
         }
         let arg = &mc.args[0];
@@ -965,47 +1043,231 @@ impl<'c> Lowerer<'c> {
 
     /// Check if a statement modifies JIT-visible state (storage writes).
     fn stmt_modifies_jit_state(&self, stmt: &Stmt) -> bool {
-        let config = match self.config {
-            Some(c) => c,
-            None => return true,
-        };
-        let s = normalize(&quote!(#stmt).to_string());
-        // Storage mutation: pool.get_mut(...)
-        if s.contains(&format!("{}.get_mut", config.pool_str)) {
-            return true;
+        match stmt {
+            Stmt::Expr(expr, _) => self.expr_modifies_jit_state(expr),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| self.expr_modifies_jit_state(&init.expr)),
+            _ => false,
         }
-        // state_fields mode: any assignment to state.field modifies JIT state
-        if !config.state_scalars.is_empty()
-            || !config.state_arrays.is_empty()
-            || !config.state_virt_arrays.is_empty()
-        {
-            if s.contains("state.") {
-                return true;
-            }
-        }
-        false
     }
 
     /// Check if an expression touches the storage pool or state fields.
     fn expr_touches_storage(&self, expr: &Expr) -> bool {
-        let config = match self.config {
-            Some(c) => c,
-            None => return true,
-        };
-        let s = normalize(&quote!(#expr).to_string());
-        if s.contains(&config.pool_str) {
+        self.expr_has_jit_state_reference(expr)
+    }
+
+    fn expr_modifies_jit_state(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Assign(ExprAssign { left, right, .. }) => {
+                self.expr_is_jit_state_place(left)
+                    || self.expr_modifies_jit_state(left)
+                    || self.expr_modifies_jit_state(right)
+            }
+            Expr::MethodCall(ExprMethodCall { receiver, args, .. }) => {
+                self.expr_is_pool_mut_access(receiver)
+                    || self.expr_modifies_jit_state(receiver)
+                    || args.iter().any(|arg| self.expr_modifies_jit_state(arg))
+            }
+            Expr::Block(expr_block) => expr_block
+                .block
+                .stmts
+                .iter()
+                .any(|stmt| self.stmt_modifies_jit_state(stmt)),
+            Expr::If(ExprIf {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            }) => {
+                self.expr_modifies_jit_state(cond)
+                    || then_branch
+                        .stmts
+                        .iter()
+                        .any(|stmt| self.stmt_modifies_jit_state(stmt))
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|(_, expr)| self.expr_modifies_jit_state(expr))
+            }
+            Expr::Call(ExprCall { func, args, .. }) => {
+                self.expr_modifies_jit_state(func)
+                    || args.iter().any(|arg| self.expr_modifies_jit_state(arg))
+            }
+            Expr::Binary(ExprBinary { left, right, .. }) => {
+                self.expr_modifies_jit_state(left) || self.expr_modifies_jit_state(right)
+            }
+            Expr::Cast(ExprCast { expr, .. })
+            | Expr::Paren(ExprParen { expr, .. })
+            | Expr::Reference(ExprReference { expr, .. })
+            | Expr::Unary(ExprUnary { expr, .. }) => self.expr_modifies_jit_state(expr),
+            Expr::Field(_)
+            | Expr::Index(_)
+            | Expr::Path(_)
+            | Expr::Lit(_)
+            | Expr::Try(_)
+            | Expr::Match(_)
+            | Expr::Loop(_)
+            | Expr::While(_)
+            | Expr::ForLoop(_)
+            | Expr::Break(_)
+            | Expr::Continue(_)
+            | Expr::Return(_)
+            | Expr::Macro(_) => false,
+            _ => false,
+        }
+    }
+
+    fn expr_has_jit_state_reference(&self, expr: &Expr) -> bool {
+        if self.expr_is_jit_state_place(expr) || self.expr_is_pool_mut_access(expr) {
             return true;
         }
-        // state_fields mode: expressions referencing `state.` touch JIT state
-        if !config.state_scalars.is_empty()
-            || !config.state_arrays.is_empty()
-            || !config.state_virt_arrays.is_empty()
-        {
-            if s.contains("state.") {
-                return true;
+        match expr {
+            Expr::Assign(ExprAssign { left, right, .. })
+            | Expr::Binary(ExprBinary { left, right, .. }) => {
+                self.expr_has_jit_state_reference(left) || self.expr_has_jit_state_reference(right)
             }
+            Expr::MethodCall(ExprMethodCall { receiver, args, .. }) => {
+                self.expr_has_jit_state_reference(receiver)
+                    || args
+                        .iter()
+                        .any(|arg| self.expr_has_jit_state_reference(arg))
+            }
+            Expr::Call(ExprCall { func, args, .. }) => {
+                self.expr_has_jit_state_reference(func)
+                    || args
+                        .iter()
+                        .any(|arg| self.expr_has_jit_state_reference(arg))
+            }
+            Expr::Block(expr_block) => expr_block
+                .block
+                .stmts
+                .iter()
+                .any(|stmt| self.stmt_touches_jit_state(stmt)),
+            Expr::If(ExprIf {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            }) => {
+                self.expr_has_jit_state_reference(cond)
+                    || then_branch
+                        .stmts
+                        .iter()
+                        .any(|stmt| self.stmt_touches_jit_state(stmt))
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|(_, expr)| self.expr_has_jit_state_reference(expr))
+            }
+            Expr::Cast(ExprCast { expr, .. })
+            | Expr::Paren(ExprParen { expr, .. })
+            | Expr::Reference(ExprReference { expr, .. })
+            | Expr::Unary(ExprUnary { expr, .. })
+            | Expr::Try(syn::ExprTry { expr, .. }) => self.expr_has_jit_state_reference(expr),
+            Expr::Index(syn::ExprIndex { expr, index, .. }) => {
+                self.expr_has_jit_state_reference(expr) || self.expr_has_jit_state_reference(index)
+            }
+            Expr::Field(syn::ExprField { base, .. }) => self.expr_has_jit_state_reference(base),
+            _ => false,
         }
-        false
+    }
+
+    fn stmt_touches_jit_state(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Expr(expr, _) => self.expr_has_jit_state_reference(expr),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| self.expr_has_jit_state_reference(&init.expr)),
+            _ => false,
+        }
+    }
+
+    fn expr_is_jit_state_place(&self, expr: &Expr) -> bool {
+        let config = match self.config {
+            Some(c) => c,
+            None => return false,
+        };
+        match expr {
+            Expr::Field(field) => {
+                if !self.expr_is_state_root(&field.base) {
+                    return false;
+                }
+                let member = match &field.member {
+                    syn::Member::Named(ident) => ident.to_string(),
+                    syn::Member::Unnamed(idx) => idx.index.to_string(),
+                };
+                config.state_scalars.contains_key(&member)
+                    || config.state_arrays.contains_key(&member)
+                    || config.state_virt_arrays.contains_key(&member)
+            }
+            Expr::Index(syn::ExprIndex { expr, .. }) => self.expr_is_jit_state_place(expr),
+            _ => false,
+        }
+    }
+
+    fn expr_is_state_root(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(path) => path.path.is_ident("state"),
+            Expr::Paren(ExprParen { expr, .. }) | Expr::Reference(ExprReference { expr, .. }) => {
+                self.expr_is_state_root(expr)
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_is_pool_mut_access(&self, expr: &Expr) -> bool {
+        let config = match self.config {
+            Some(c) => c,
+            None => return false,
+        };
+        if extract_pool_get_mut_arg(expr, config).is_some() {
+            return true;
+        }
+        match expr {
+            Expr::MethodCall(ExprMethodCall { receiver, args, .. }) => {
+                self.expr_is_pool_mut_access(receiver)
+                    || args.iter().any(|arg| self.expr_is_pool_mut_access(arg))
+            }
+            Expr::Call(ExprCall { func, args, .. }) => {
+                self.expr_is_pool_mut_access(func)
+                    || args.iter().any(|arg| self.expr_is_pool_mut_access(arg))
+            }
+            Expr::Assign(ExprAssign { left, right, .. })
+            | Expr::Binary(ExprBinary { left, right, .. }) => {
+                self.expr_is_pool_mut_access(left) || self.expr_is_pool_mut_access(right)
+            }
+            Expr::Index(syn::ExprIndex { expr, index, .. }) => {
+                self.expr_is_pool_mut_access(expr) || self.expr_is_pool_mut_access(index)
+            }
+            Expr::Field(syn::ExprField { base, .. }) => self.expr_is_pool_mut_access(base),
+            Expr::Block(expr_block) => expr_block
+                .block
+                .stmts
+                .iter()
+                .any(|stmt| self.stmt_touches_jit_state(stmt)),
+            Expr::If(ExprIf {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            }) => {
+                self.expr_is_pool_mut_access(cond)
+                    || then_branch
+                        .stmts
+                        .iter()
+                        .any(|stmt| self.stmt_touches_jit_state(stmt))
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|(_, expr)| self.expr_is_pool_mut_access(expr))
+            }
+            Expr::Cast(ExprCast { expr, .. })
+            | Expr::Paren(ExprParen { expr, .. })
+            | Expr::Reference(ExprReference { expr, .. })
+            | Expr::Unary(ExprUnary { expr, .. })
+            | Expr::Try(syn::ExprTry { expr, .. }) => self.expr_is_pool_mut_access(expr),
+            _ => false,
+        }
     }
 
     fn expr_uses_stack_bindings(&self, expr: &Expr) -> bool {
@@ -1561,32 +1823,28 @@ impl<'c> Lowerer<'c> {
         let vable_var = config.vable_var.as_ref()?;
 
         if let Expr::Field(field) = expr {
-            let receiver_str = normalize(&quote!(#field.base).to_string());
-            if receiver_str != *vable_var {
+            if !expr_matches_local_name(&field.base, vable_var) {
                 return None;
             }
-            let member_name = match &field.member {
-                syn::Member::Named(ident) => ident.to_string(),
-                _ => return None,
-            };
+            let member_name = named_member(&field.member)?;
 
-            if let Some(&(field_index, ref field_type)) = config.vable_fields.get(&member_name) {
+            if let Some(&(field_index, field_type)) = config.vable_fields.get(&member_name) {
                 let reg = self.alloc_reg();
                 let fi = field_index as u16;
-                let kind = match field_type.as_str() {
-                    "ref" => {
+                let kind = match field_type {
+                    ValueKind::Ref => {
                         self.statements.push(quote! {
                             __builder.vable_getfield_ref(#reg, #fi);
                         });
                         BindingKind::Ref
                     }
-                    "float" => {
+                    ValueKind::Float => {
                         self.statements.push(quote! {
                             __builder.vable_getfield_float(#reg, #fi);
                         });
                         BindingKind::Float
                     }
-                    _ => {
+                    ValueKind::Int => {
                         self.statements.push(quote! {
                             __builder.vable_getfield_int(#reg, #fi);
                         });
@@ -1620,15 +1878,11 @@ impl<'c> Lowerer<'c> {
             Expr::Field(f) => f,
             _ => return None,
         };
-        let receiver_str = normalize(&quote!(#field.base).to_string());
-        if receiver_str != *vable_var {
+        if !expr_matches_local_name(&field.base, vable_var) {
             return None;
         }
-        let member_name = match &field.member {
-            syn::Member::Named(ident) => ident.to_string(),
-            _ => return None,
-        };
-        let &(array_index, ref item_type) = config.vable_arrays.get(&member_name)?;
+        let member_name = named_member(&field.member)?;
+        let &(array_index, item_type) = config.vable_arrays.get(&member_name)?;
 
         // Lower the index expression to a register
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
@@ -1636,20 +1890,20 @@ impl<'c> Lowerer<'c> {
 
         let reg = self.alloc_reg();
         let ai = array_index as u16;
-        let kind = match item_type.as_str() {
-            "ref" => {
+        let kind = match item_type {
+            ValueKind::Ref => {
                 self.statements.push(quote! {
                     __builder.vable_getarrayitem_ref(#reg, #ai, #idx_reg);
                 });
                 BindingKind::Ref
             }
-            "float" => {
+            ValueKind::Float => {
                 self.statements.push(quote! {
                     __builder.vable_getarrayitem_float(#reg, #ai, #idx_reg);
                 });
                 BindingKind::Float
             }
-            _ => {
+            ValueKind::Int => {
                 self.statements.push(quote! {
                     __builder.vable_getarrayitem_int(#reg, #ai, #idx_reg);
                 });
@@ -1663,6 +1917,40 @@ impl<'c> Lowerer<'c> {
         })
     }
 
+    /// RPython jtransform.py:815 `arraylen_vable`.
+    ///
+    /// Recognizes `frame.locals_w.len()` for declared virtualizable arrays.
+    fn lower_vable_array_len(&mut self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let vable_var = config.vable_var.as_ref()?;
+        let call = match expr {
+            Expr::MethodCall(call) => call,
+            _ => return None,
+        };
+        if call.method != "len" || !call.args.is_empty() {
+            return None;
+        }
+        let field = match &*call.receiver {
+            Expr::Field(field) => field,
+            _ => return None,
+        };
+        if !expr_matches_local_name(&field.base, vable_var) {
+            return None;
+        }
+        let member_name = named_member(&field.member)?;
+        let &array_index = config.vable_arrays.get(&member_name).map(|(idx, _)| idx)?;
+        let reg = self.alloc_reg();
+        let ai = array_index as u16;
+        self.statements.push(quote! {
+            __builder.vable_arraylen(#reg, #ai);
+        });
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+        })
+    }
+
     /// Recognizes `state.field` for scalar state fields.
     fn lower_state_field_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
@@ -1671,15 +1959,11 @@ impl<'c> Lowerer<'c> {
             _ => return None,
         };
         let base = &field.base;
-        let receiver_str = normalize(&quote!(#base).to_string());
-        if receiver_str != "state" {
+        if !expr_matches_local_name(base, "state") {
             return None;
         }
-        let member_name = match &field.member {
-            syn::Member::Named(ident) => ident.to_string(),
-            _ => return None,
-        };
-        let &(field_index, _) = config.state_scalars.get(&member_name)?;
+        let member_name = named_member(&field.member)?;
+        let &field_index = config.state_scalars.get(&member_name)?;
         let fi = field_index as u16;
         let reg = self.alloc_reg();
         self.statements
@@ -1704,20 +1988,16 @@ impl<'c> Lowerer<'c> {
             _ => return None,
         };
         let base = &field.base;
-        let receiver_str = normalize(&quote!(#base).to_string());
-        if receiver_str != "state" {
+        if !expr_matches_local_name(base, "state") {
             return None;
         }
-        let member_name = match &field.member {
-            syn::Member::Named(ident) => ident.to_string(),
-            _ => return None,
-        };
+        let member_name = named_member(&field.member)?;
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let reg = self.alloc_reg();
 
         // Check virtualizable arrays first, then flattened arrays.
-        if let Some(&(va_idx, _)) = config.state_virt_arrays.get(&member_name) {
+        if let Some(&va_idx) = config.state_virt_arrays.get(&member_name) {
             let ai = va_idx as u16;
             self.statements
                 .push(quote! { __builder.load_state_varray(#ai, #idx_reg, #reg); });
@@ -1727,7 +2007,7 @@ impl<'c> Lowerer<'c> {
                 depends_on_stack: false,
             });
         }
-        let &(array_index, _) = config.state_arrays.get(&member_name)?;
+        let &array_index = config.state_arrays.get(&member_name)?;
         let ai = array_index as u16;
         self.statements
             .push(quote! { __builder.load_state_array(#ai, #idx_reg, #reg); });
@@ -1752,6 +2032,9 @@ impl<'c> Lowerer<'c> {
         }
         // RPython jtransform.py:760 — virtualizable array read rewrite.
         if let Some(binding) = self.lower_vable_array_read(expr) {
+            return Some(binding);
+        }
+        if let Some(binding) = self.lower_vable_array_len(expr) {
             return Some(binding);
         }
         // RPython jtransform.py:655 — suppress hint_access_directly(frame) /
@@ -1840,8 +2123,8 @@ impl<'c> Lowerer<'c> {
         let func = &call.func;
         let mut result_kind = BindingKind::Int;
         match policy {
-            CallPolicySpec::Explicit(kind) => match kind.to_string().as_str() {
-                "residual_int" => {
+            CallPolicySpec::Explicit(kind) => match kind {
+                crate::jit_interp::CallPolicyKind::ResidualInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -1855,7 +2138,7 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "may_force_int" => {
+                crate::jit_interp::CallPolicyKind::MayForceInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -1869,7 +2152,7 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "release_gil_int" => {
+                crate::jit_interp::CallPolicyKind::ReleaseGilInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -1883,7 +2166,7 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "loopinvariant_int" => {
+                crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -1897,7 +2180,7 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "elidable_int" => {
+                crate::jit_interp::CallPolicyKind::ElidableInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.statements.push(quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
@@ -1911,76 +2194,76 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
-                "residual_int_wrapped"
-                | "may_force_int_wrapped"
-                | "release_gil_int_wrapped"
-                | "loopinvariant_int_wrapped"
-                | "elidable_int_wrapped"
-                | "residual_ref_wrapped"
-                | "may_force_ref_wrapped"
-                | "release_gil_ref_wrapped"
-                | "loopinvariant_ref_wrapped"
-                | "elidable_ref_wrapped"
-                | "residual_float_wrapped"
-                | "may_force_float_wrapped"
-                | "release_gil_float_wrapped"
-                | "loopinvariant_float_wrapped"
-                | "elidable_float_wrapped" => {
+                crate::jit_interp::CallPolicyKind::ResidualIntWrapped
+                | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
+                | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
+                | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualRefWrapped
+                | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
+                | crate::jit_interp::CallPolicyKind::ReleaseGilRefWrapped
+                | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
+                | crate::jit_interp::CallPolicyKind::MayForceFloatWrapped
+                | crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped
+                | crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
-                    let call_stmt = match kind.to_string().as_str() {
-                        "residual_int_wrapped" => {
+                    let call_stmt = match kind {
+                        crate::jit_interp::CallPolicyKind::ResidualIntWrapped => {
                             quote! { __builder.call_int_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "may_force_int_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::MayForceIntWrapped => {
                             quote! { __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "release_gil_int_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped => {
                             quote! { __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "loopinvariant_int_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped => {
                             quote! { __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "elidable_int_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ElidableIntWrapped => {
                             quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "residual_ref_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ResidualRefWrapped => {
                             result_kind = BindingKind::Ref;
                             quote! { __builder.call_ref_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "may_force_ref_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::MayForceRefWrapped => {
                             result_kind = BindingKind::Ref;
                             quote! { __builder.call_may_force_ref_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "release_gil_ref_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ReleaseGilRefWrapped => {
                             result_kind = BindingKind::Ref;
                             quote! { __builder.call_release_gil_ref_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "loopinvariant_ref_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped => {
                             result_kind = BindingKind::Ref;
                             quote! { __builder.call_loopinvariant_ref_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "elidable_ref_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ElidableRefWrapped => {
                             result_kind = BindingKind::Ref;
                             quote! { __builder.call_pure_ref_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "residual_float_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ResidualFloatWrapped => {
                             result_kind = BindingKind::Float;
                             quote! { __builder.call_float_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "may_force_float_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::MayForceFloatWrapped => {
                             result_kind = BindingKind::Float;
                             quote! { __builder.call_may_force_float_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "release_gil_float_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped => {
                             result_kind = BindingKind::Float;
                             quote! { __builder.call_release_gil_float_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "loopinvariant_float_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped => {
                             result_kind = BindingKind::Float;
                             quote! { __builder.call_loopinvariant_float_typed(__fn_idx, #typed_args, #reg); }
                         }
-                        "elidable_float_wrapped" => {
+                        crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
                             result_kind = BindingKind::Float;
                             quote! { __builder.call_pure_float_typed(__fn_idx, #typed_args, #reg); }
                         }
@@ -2005,7 +2288,7 @@ impl<'c> Lowerer<'c> {
                         #call_stmt
                     });
                 }
-                "inline_int" => {
+                crate::jit_interp::CallPolicyKind::InlineInt => {
                     let builder_path = inline_builder_path(&call.func)?;
                     let inline_args = typed_inline_arg_tokens(&arg_bindings);
                     self.statements.push(quote! {
@@ -2371,8 +2654,8 @@ fn extract_pool_get_mut_arg(expr: &Expr, config: &LowererConfig) -> Option<Expr>
     if mc.method != "get_mut" || mc.args.len() != 1 {
         return None;
     }
-    let receiver_str = normalize_expr(&mc.receiver);
-    if receiver_str != config.pool_str {
+    let pool_segments = config.pool_segments.as_ref()?;
+    if !expr_matches_segments(&mc.receiver, pool_segments) {
         return None;
     }
     Some(mc.args[0].clone())
@@ -2418,11 +2701,7 @@ fn push_call_arg(expr: &Expr) -> Option<&Expr> {
     let Expr::MethodCall(ExprMethodCall { method, args, .. }) = expr else {
         return None;
     };
-    if matches!(
-        method.to_string().as_str(),
-        "push" | "push_ref" | "push_float"
-    ) && args.len() == 1
-    {
+    if (method == "push" || method == "push_ref" || method == "push_float") && args.len() == 1 {
         Some(&args[0])
     } else {
         None
@@ -2631,6 +2910,10 @@ fn opcode_for_binop(op: &BinOp) -> Option<Ident> {
     Some(Ident::new(name, proc_macro2::Span::call_site()))
 }
 
+fn is_overflow_binop(opcode: &Ident) -> bool {
+    opcode == "IntAddOvf" || opcode == "IntSubOvf" || opcode == "IntMulOvf"
+}
+
 // ── Public entry points ──────────────────────────────────────────────
 
 pub fn try_generate_jitcode_body(body: &Expr) -> Option<TokenStream> {
@@ -2646,7 +2929,7 @@ pub fn try_generate_jitcode_body_with_config(
 
 pub(crate) fn generate_inline_helper_jitcode_with_calls(
     func: &ItemFn,
-    calls: &[(Path, Option<Ident>)],
+    calls: &[(Path, Option<crate::jit_interp::CallPolicyKind>)],
 ) -> syn::Result<Option<InlineHelperJitCode>> {
     if !func.sig.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -2672,10 +2955,10 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         .iter()
         .map(|(path, kind)| {
             let spec = match kind {
-                Some(kind) => CallPolicySpec::Explicit(kind.clone()),
+                Some(kind) => CallPolicySpec::Explicit(*kind),
                 None => CallPolicySpec::Infer,
             };
-            (normalize(&quote!(#path).to_string()), spec)
+            (canonical_path_segments(path), spec)
         })
         .collect();
     let mut lowerer =

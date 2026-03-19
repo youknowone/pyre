@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 smallvec = "1.13"
+serde = { version = "1", features = ["derive"] }

@@ -52,9 +52,6 @@ pub struct JitDriver<S: JitState> {
     bridge_info: Option<(u64, u64, u32)>,
     /// Additional entry points sharing this driver's compiled loops.
     entry_points: Vec<EntryPoint>,
-    /// Key of the loop just compiled — skip first execution to avoid
-    /// re-entering in the same back-edge iteration (RPython compiled_new).
-    just_compiled_key: Option<u64>,
     /// PyPy JitDriver(is_recursive=True): enables max_unroll_recursion
     /// for recursive portal calls (pyjitpl.py _opimpl_recursive_call).
     is_recursive: bool,
@@ -63,14 +60,17 @@ pub struct JitDriver<S: JitState> {
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
+        let mut meta = MetaInterp::new(threshold);
+        if let Some(info) = S::__build_virtualizable_info() {
+            meta.set_virtualizable_info(info);
+        }
         JitDriver {
-            meta: MetaInterp::new(threshold),
+            meta,
             sym: None,
             trace_meta: None,
             descriptor: None,
             bridge_info: None,
             entry_points: Vec::new(),
-            just_compiled_key: None,
             is_recursive: false,
         }
     }
@@ -105,6 +105,12 @@ impl<S: JitState> JitDriver<S> {
     /// Register an interpreter boxing helper for the raw-int finish protocol.
     pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
         self.meta.register_raw_int_box_helper(helper);
+    }
+
+    /// Register a recursive force helper that accepts a raw-int argument and
+    /// can return a raw-int result for raw-int Finish traces.
+    pub fn register_raw_int_force_helper(&mut self, helper: *const ()) {
+        self.meta.register_raw_int_force_helper(helper);
     }
 
     /// Register a create_frame_N → create_frame_N_raw_int mapping for box folding.
@@ -436,6 +442,15 @@ impl<S: JitState> JitDriver<S> {
                 if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
                     return false;
                 }
+                let Some(live_values) = self.extend_compiled_live_values(
+                    green_key,
+                    state,
+                    &compiled_meta,
+                    descriptor.as_ref(),
+                    live_values,
+                ) else {
+                    return false;
+                };
                 live_values
             };
 
@@ -570,6 +585,59 @@ impl<S: JitState> JitDriver<S> {
                 .all(|(var, value)| var.tp == value.get_type())
     }
 
+    fn flatten_virtualizable_values(
+        info: &VirtualizableInfo,
+        static_boxes: &[i64],
+        array_boxes: &[Vec<i64>],
+    ) -> Vec<Value> {
+        let mut values =
+            Vec::with_capacity(static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>());
+        for (field, &raw) in info.static_fields.iter().zip(static_boxes.iter()) {
+            values.push(match field.field_type {
+                Type::Int => Value::Int(raw),
+                Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
+                Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                Type::Void => Value::Void,
+            });
+        }
+        for (array, items) in info.array_fields.iter().zip(array_boxes.iter()) {
+            for &raw in items {
+                values.push(match array.item_type {
+                    Type::Int => Value::Int(raw),
+                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
+                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                    Type::Void => Value::Void,
+                });
+            }
+        }
+        values
+    }
+
+    fn extend_compiled_live_values(
+        &self,
+        green_key: u64,
+        state: &S,
+        meta: &S::Meta,
+        descriptor: Option<&JitDriverStaticData>,
+        mut live_values: Vec<Value>,
+    ) -> Option<Vec<Value>> {
+        let compiled_inputs = self.meta.get_compiled_num_inputs(green_key)?;
+        if compiled_inputs <= live_values.len() {
+            return Some(live_values);
+        }
+        let descriptor = descriptor?;
+        let virtualizable = descriptor.virtualizable()?;
+        let info = self.meta.virtualizable_info()?;
+        let (static_boxes, array_boxes) =
+            state.export_virtualizable_boxes(meta, &virtualizable.name, info)?;
+        let extra_values = Self::flatten_virtualizable_values(info, &static_boxes, &array_boxes);
+        if live_values.len() + extra_values.len() != compiled_inputs {
+            return None;
+        }
+        live_values.extend(extra_values);
+        Some(live_values)
+    }
+
     fn sync_before(
         &mut self,
         state: &mut S,
@@ -590,13 +658,14 @@ impl<S: JitState> JitDriver<S> {
         if !ok {
             return false;
         }
-        // Cache the live virtualizable object and its array lengths for
-        // trace-entry box layout.
+        self.meta.set_vable_ptr(std::ptr::null());
+        self.meta.set_vable_array_lengths(Vec::new());
+        // Cache the live virtualizable object for trace-entry box layout.
         //
         // Keep the long-term source-of-truth aligned with RPython compile.py:
         // use the actual virtualizable object whenever its layout can provide
-        // lengths. Preserve the current interpreter hook as the primary path
-        // for no-header arrays and legacy JitState implementations.
+        // lengths directly. Only fall back to interpreter-supplied lengths for
+        // layouts that cannot be read from the heap object alone.
         let vable_name = virtualizable.name.clone();
         let info_clone = self.meta.virtualizable_info().cloned();
         if let Some(ref info) = info_clone {
@@ -604,17 +673,11 @@ impl<S: JitState> JitDriver<S> {
             if let Some(ptr) = ptr {
                 self.meta.set_vable_ptr(ptr.cast_const());
             }
-            let lengths = state
-                .virtualizable_array_lengths(meta, &vable_name, info)
-                .or_else(|| {
-                    ptr.map(|ptr| {
-                        // Safety: JitState::virtualizable_heap_ptr() returns
-                        // the live virtualizable object pointer.
-                        unsafe { info.load_list_of_boxes(ptr.cast_const()) }.1
-                    })
-                });
-            if let Some(lengths) = lengths {
-                self.meta.set_vable_array_lengths(lengths);
+            if !info.can_read_all_array_lengths_from_heap() {
+                let fallback_lengths = state
+                    .virtualizable_array_lengths(meta, &vable_name, info)
+                    .unwrap_or_default();
+                self.meta.set_vable_array_lengths(fallback_lengths);
             }
         }
         true
@@ -725,6 +788,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.warm_state_ref().is_boosted(callee_key)
     }
 
+    /// Boost a function entry so the next eval-time entry can start tracing.
+    ///
+    /// This mirrors PyPy's warmstate path used when recursive inlining hits
+    /// the depth limit and we want the callee to converge to its own
+    /// function-entry trace quickly.
+    pub fn boost_function_entry(&mut self, callee_key: u64) {
+        self.meta.warm_state_mut().boost_function_entry(callee_key);
+    }
+
     pub fn run_compiled_with_blackhole_fallback_keyed(
         &mut self,
         green_key: u64,
@@ -751,6 +823,18 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
+        let Some(live_values) = self.extend_compiled_live_values(
+            green_key,
+            state,
+            &meta,
+            descriptor.as_ref(),
+            live_values,
+        ) else {
+            return crate::pyjitpl::DriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
         pre_run();
         let Some(result) = self
             .meta
@@ -903,6 +987,18 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
+        let Some(live_values) = self.extend_compiled_live_values(
+            green_key,
+            state,
+            &meta,
+            descriptor.as_ref(),
+            live_values,
+        ) else {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
         pre_run();
         let Some(result) = self
             .meta
@@ -1062,6 +1158,127 @@ impl<S: JitState> JitDriver<S> {
         self.meta.opimpl_hint_force_virtualizable(vable_opref);
     }
 
+    pub fn opimpl_getfield_vable_int(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
+        self.meta
+            .opimpl_getfield_vable_int(vable_opref, field_offset)
+    }
+
+    pub fn opimpl_getfield_vable_ref(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
+        self.meta
+            .opimpl_getfield_vable_ref(vable_opref, field_offset)
+    }
+
+    pub fn opimpl_getfield_vable_float(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+    ) -> OpRef {
+        self.meta
+            .opimpl_getfield_vable_float(vable_opref, field_offset)
+    }
+
+    pub fn opimpl_setfield_vable_int(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+        value: OpRef,
+    ) {
+        self.meta
+            .opimpl_setfield_vable_int(vable_opref, field_offset, value);
+    }
+
+    pub fn opimpl_setfield_vable_ref(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+        value: OpRef,
+    ) {
+        self.meta
+            .opimpl_setfield_vable_ref(vable_opref, field_offset, value);
+    }
+
+    pub fn opimpl_setfield_vable_float(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+        value: OpRef,
+    ) {
+        self.meta
+            .opimpl_setfield_vable_float(vable_opref, field_offset, value);
+    }
+
+    pub fn opimpl_getarrayitem_vable_int(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        self.meta
+            .opimpl_getarrayitem_vable_int(vable_opref, index, array_field_offset)
+    }
+
+    pub fn opimpl_getarrayitem_vable_ref(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        self.meta
+            .opimpl_getarrayitem_vable_ref(vable_opref, index, array_field_offset)
+    }
+
+    pub fn opimpl_getarrayitem_vable_float(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        self.meta
+            .opimpl_getarrayitem_vable_float(vable_opref, index, array_field_offset)
+    }
+
+    pub fn opimpl_setarrayitem_vable_int(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        array_field_offset: usize,
+    ) {
+        self.meta
+            .opimpl_setarrayitem_vable_int(vable_opref, index, value, array_field_offset);
+    }
+
+    pub fn opimpl_setarrayitem_vable_ref(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        array_field_offset: usize,
+    ) {
+        self.meta
+            .opimpl_setarrayitem_vable_ref(vable_opref, index, value, array_field_offset);
+    }
+
+    pub fn opimpl_setarrayitem_vable_float(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        array_field_offset: usize,
+    ) {
+        self.meta
+            .opimpl_setarrayitem_vable_float(vable_opref, index, value, array_field_offset);
+    }
+
+    pub fn opimpl_arraylen_vable(
+        &mut self,
+        vable_opref: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        self.meta
+            .opimpl_arraylen_vable(vable_opref, array_field_offset)
+    }
+
     /// Start bridge tracing from a guard failure point.
     ///
     /// Uses the compiled loop's stored meta so that the sym's
@@ -1132,14 +1349,6 @@ impl<S: JitState> JitDriver<S> {
 
         let key_hash = crate::green_key_hash(green_values);
 
-        // Skip first execution after compilation to avoid re-entering
-        // the loop we just compiled in the same back-edge iteration.
-        // RPython equivalent: warmstate.py compiled_new flag.
-        if self.just_compiled_key == Some(key_hash) {
-            self.just_compiled_key = None;
-            return None;
-        }
-
         if !self.has_compiled_loop(key_hash) {
             // RPython parity: check warm state BEFORE any heap allocation.
             // DONT_TRACE_HERE and cold keys return immediately with zero cost.
@@ -1148,11 +1357,6 @@ impl<S: JitState> JitDriver<S> {
             }
             let green_key = GreenKey::new(green_values.to_vec());
             let ran = self.back_edge_structured(green_key, target_pc, state, env, pre_run);
-            // If tracing just finished and compiled a loop, mark it so the
-            // next back_edge_generic call skips the first execution.
-            if self.has_compiled_loop(key_hash) {
-                self.just_compiled_key = Some(key_hash);
-            }
             return ran.then_some(target_pc);
         }
 
@@ -1161,7 +1365,21 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
         let meta = meta.clone();
+        let descriptor = self.driver_descriptor_for(state, &meta);
+        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+            return None;
+        }
         let live_values = state.extract_live_values(&meta);
+        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            return None;
+        }
+        let live_values = self.extend_compiled_live_values(
+            key_hash,
+            state,
+            &meta,
+            descriptor.as_ref(),
+            live_values,
+        )?;
         pre_run();
 
         let result = self
@@ -1176,6 +1394,7 @@ impl<S: JitState> JitDriver<S> {
 
         if is_finish || fail_index == u32::MAX {
             state.restore_values(&result_meta, &typed_values);
+            self.sync_after(state, &result_meta, descriptor.as_ref());
             return Some(target_pc);
         }
 
@@ -1184,6 +1403,7 @@ impl<S: JitState> JitDriver<S> {
             .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
         if should_bridge {
             if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values) {
+                self.sync_after(state, &result_meta, descriptor.as_ref());
                 self.start_bridge_tracing(
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
                 );
@@ -1192,7 +1412,11 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
 
-        on_guard_failure(state, &result_meta, &raw_values)
+        let resume_pc = on_guard_failure(state, &result_meta, &raw_values);
+        if resume_pc.is_some() {
+            self.sync_after(state, &result_meta, descriptor.as_ref());
+        }
+        resume_pc
     }
 }
 
@@ -1647,6 +1871,51 @@ mod tests {
         // Driver should still work normally after unknown params.
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 0);
+    }
+
+    #[test]
+    fn test_new_auto_registers_virtualizable_info_from_state() {
+        #[derive(Default)]
+        struct AutoVableState;
+
+        impl JitState for AutoVableState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+
+            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                Vec::new()
+            }
+            fn create_sym(_: &(), _: usize) -> () {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                Vec::new()
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+            fn __build_virtualizable_info() -> Option<crate::virtualizable::VirtualizableInfo> {
+                let mut info = crate::virtualizable::VirtualizableInfo::new(24);
+                info.add_field("pc", Type::Int, 8);
+                info.add_array_field("locals_w", Type::Ref, 16);
+                Some(info)
+            }
+        }
+
+        let driver = JitDriver::<AutoVableState>::new(5);
+        let info = driver
+            .meta_interp()
+            .virtualizable_info()
+            .expect("driver should auto-register __build_virtualizable_info");
+        assert_eq!(info.token_offset, 24);
+        assert_eq!(info.static_fields.len(), 1);
+        assert_eq!(info.array_fields.len(), 1);
+        assert_eq!(info.static_fields[0].name, "pc");
+        assert_eq!(info.array_fields[0].name, "locals_w");
     }
 
     // ── Event-driven JitHookInterface parity tests ──

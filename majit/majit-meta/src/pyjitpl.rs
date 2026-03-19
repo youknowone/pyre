@@ -5,13 +5,10 @@ use majit_codegen::{
     TerminalExitLayout,
 };
 use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
-};
+use majit_ir::{GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
 use majit_trace::trace::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
-use std::sync::Arc;
 
 use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionState};
 use crate::io_buffer;
@@ -22,233 +19,6 @@ use crate::resume::{
 };
 use crate::trace_ctx::{JitDriverStaticData, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
-
-// ── Preamble descriptors for virtualizable field loads ────────────────
-
-/// Lightweight field descriptor for virtualizable preamble ops.
-#[derive(Debug)]
-struct VableFieldDescr {
-    offset: usize,
-    field_size: usize,
-    field_type: Type,
-    signed: bool,
-}
-
-impl Descr for VableFieldDescr {
-    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
-        Some(self)
-    }
-}
-
-impl FieldDescr for VableFieldDescr {
-    fn offset(&self) -> usize {
-        self.offset
-    }
-    fn field_size(&self) -> usize {
-        self.field_size
-    }
-    fn field_type(&self) -> Type {
-        self.field_type
-    }
-    fn is_field_signed(&self) -> bool {
-        self.signed
-    }
-}
-
-/// Lightweight array descriptor for virtualizable preamble ops.
-#[derive(Debug)]
-struct VableArrayDescr {
-    base_size: usize,
-    item_size: usize,
-    item_type: Type,
-}
-
-impl Descr for VableArrayDescr {
-    fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
-        Some(self)
-    }
-}
-
-impl ArrayDescr for VableArrayDescr {
-    fn base_size(&self) -> usize {
-        self.base_size
-    }
-    fn item_size(&self) -> usize {
-        self.item_size
-    }
-    fn type_id(&self) -> u32 {
-        0
-    }
-    fn item_type(&self) -> Type {
-        self.item_type
-    }
-}
-
-fn make_vable_field_descr(offset: usize, signed: bool) -> DescrRef {
-    Arc::new(VableFieldDescr {
-        offset,
-        field_size: 8,
-        field_type: Type::Int,
-        signed,
-    })
-}
-
-fn make_vable_array_descr() -> DescrRef {
-    Arc::new(VableArrayDescr {
-        base_size: 0,
-        item_size: 8,
-        item_type: Type::Int,
-    })
-}
-
-/// Patch optimized ops by prepending a virtualizable preamble.
-///
-/// The preamble executes once at loop entry (in the Cranelift entry block),
-/// reading frame fields from memory. The Label defines the loop header's
-/// block parameters. The JUMP at the end of the loop body targets the
-/// Label, carrying the loop-updated values.
-///
-/// `inputargs` is modified in place to contain only `[frame]`.
-/// `constants` is extended with array index constants used by the preamble.
-/// Returns the patched ops (preamble + Label + optimized body).
-fn patch_new_loop_to_load_virtualizable_fields(
-    info: &VirtualizableInfo,
-    original_inputargs: &[InputArg],
-    optimized_ops: Vec<Op>,
-    constants: &mut HashMap<u32, i64>,
-    array_lengths: &[usize],
-) -> (Vec<InputArg>, Vec<Op>) {
-    let num_static = info.num_static_extra_boxes;
-
-    // No virtualizable fields at all → skip preamble patching entirely.
-    if num_static == 0 && info.array_fields.is_empty() {
-        return (original_inputargs.to_vec(), optimized_ops);
-    }
-
-    let effective_lengths = if array_lengths.is_empty() {
-        // No array lengths provided — skip array preamble entirely.
-        // RPython uses translator-known descriptors; we never guess.
-        vec![]
-    } else {
-        array_lengths.to_vec()
-    };
-
-    patch_with_array_lengths(
-        info,
-        original_inputargs,
-        optimized_ops,
-        constants,
-        &effective_lengths,
-    )
-}
-
-/// Core preamble patching with explicit array lengths.
-fn patch_with_array_lengths(
-    info: &VirtualizableInfo,
-    original_inputargs: &[InputArg],
-    optimized_ops: Vec<Op>,
-    constants: &mut HashMap<u32, i64>,
-    array_lengths: &[usize],
-) -> (Vec<InputArg>, Vec<Op>) {
-    let frame_ref = OpRef(0);
-    let array_descr = make_vable_array_descr();
-    let mut preamble = Vec::new();
-    let mut label_args: Vec<OpRef> = vec![frame_ref];
-
-    // Static fields — use typed GETFIELD_RAW based on field descriptor type
-    for (i, field) in info.static_fields.iter().enumerate() {
-        let pos = OpRef((1 + i) as u32);
-        let descr = make_vable_field_descr(field.offset, true);
-        let opcode = OpCode::getfield_raw_for_type(field.field_type);
-        let mut op = Op::with_descr(opcode, &[frame_ref], descr);
-        op.pos = pos;
-        preamble.push(op);
-        label_args.push(pos);
-    }
-
-    // Array fields - use temporary positions for array pointers
-    let mut arg_idx = (1 + info.num_static_extra_boxes) as u32;
-    // Use constant range that won't conflict with existing constants.
-    // Pick a base above 10_000 but separate from user constants.
-    let mut next_const_key = 20_000u32;
-    // Find a safe constant key base that doesn't conflict
-    while constants.contains_key(&next_const_key) {
-        next_const_key += 1000;
-    }
-
-    // Temporary positions for array pointers - must not conflict with any
-    // existing op position in the optimized trace.
-    let max_existing_pos = optimized_ops
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| op.result_type() != Type::Void)
-        .map(|(idx, op)| {
-            if op.pos.is_none() {
-                (original_inputargs.len() + idx) as u32
-            } else {
-                op.pos.0
-            }
-        })
-        .max()
-        .unwrap_or(original_inputargs.len() as u32);
-    let mut tmp_pos = max_existing_pos + 1;
-
-    for (ai, array_field) in info.array_fields.iter().enumerate() {
-        let count = array_lengths.get(ai).copied().unwrap_or(0);
-
-        // Load array pointer from frame — raw pointer stored as i64
-        let array_ptr_descr = make_vable_field_descr(array_field.field_offset, false);
-        let array_ptr_pos = OpRef(tmp_pos);
-        tmp_pos += 1;
-        let mut ptr_op = Op::with_descr(OpCode::GetfieldRawI, &[frame_ref], array_ptr_descr);
-        ptr_op.pos = array_ptr_pos;
-        preamble.push(ptr_op);
-
-        // Load each element — typed by array item_type
-        let elem_opcode = OpCode::getarrayitem_raw_for_type(array_field.item_type);
-        for ei in 0..count {
-            let elem_pos = OpRef(arg_idx);
-            arg_idx += 1;
-
-            let idx_const_key = next_const_key;
-            next_const_key += 1;
-            constants.insert(idx_const_key, ei as i64);
-            let idx_ref = OpRef(idx_const_key);
-
-            let mut elem_op =
-                Op::with_descr(elem_opcode, &[array_ptr_pos, idx_ref], array_descr.clone());
-            elem_op.pos = elem_pos;
-            preamble.push(elem_op);
-            label_args.push(elem_pos);
-        }
-    }
-
-    // Label op defining loop header
-    let mut label = Op::new(OpCode::Label, &label_args);
-    label.pos = OpRef::NONE;
-    preamble.push(label);
-
-    // Combine: preamble + optimized body (skip any existing Label in optimized_ops)
-    let mut result_ops = preamble;
-    for op in optimized_ops {
-        if op.opcode == OpCode::Label {
-            continue; // our Label replaces any existing one
-        }
-        result_ops.push(op);
-    }
-
-    // New inputargs: just [frame], preserving its original type
-    let frame_type = original_inputargs
-        .first()
-        .map(|ia| ia.tp)
-        .unwrap_or(Type::Int);
-    let new_inputargs = vec![InputArg {
-        tp: frame_type,
-        index: 0,
-    }];
-
-    (new_inputargs, result_ops)
-}
 
 /// Result of checking a back-edge.
 pub enum BackEdgeAction {
@@ -481,10 +251,16 @@ pub struct MetaInterp<M: Clone> {
     vable_ptr: *const u8,
     /// Virtualizable array lengths for trace-entry box layout.
     vable_array_lengths: Vec<usize>,
+    /// RPython parity: standard virtualizable that was just forced via
+    /// `hint_force_virtualizable` / `gen_store_back_in_vable`.
+    forced_virtualizable: Option<OpRef>,
     /// Green keys whose compiled Finish returns a raw int (not a boxed pointer).
     raw_int_finish_keys: HashSet<u64>,
     /// Helper function pointers that box raw ints into interpreter objects.
     raw_int_box_helpers: HashSet<i64>,
+    /// Helper function pointers that take a raw int argument and return a
+    /// raw-int result when the callee's Finish protocol is raw.
+    raw_int_force_helpers: HashSet<i64>,
     /// Mapping: create_frame_N_ptr → create_frame_N_raw_int_ptr.
     /// When a box helper feeds directly into create_frame, the box+create
     /// can be folded into a single create_frame_raw_int call.
@@ -837,8 +613,10 @@ impl<M: Clone> MetaInterp<M> {
             stats: JitStatsCounters::default(),
             vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
+            forced_virtualizable: None,
             raw_int_finish_keys: HashSet::new(),
             raw_int_box_helpers: HashSet::new(),
+            raw_int_force_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
             max_unroll_recursion: 3, // CallMayForce + direct dispatch
         }
@@ -849,7 +627,7 @@ impl<M: Clone> MetaInterp<M> {
         self.vable_ptr = ptr;
     }
 
-    /// Cache virtualizable array lengths for preamble patching.
+    /// Cache fallback virtualizable array lengths for trace-entry box setup.
     pub(crate) fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
         self.vable_array_lengths = lengths;
     }
@@ -858,7 +636,10 @@ impl<M: Clone> MetaInterp<M> {
         if !self.vable_ptr.is_null() && info.can_read_all_array_lengths_from_heap() {
             // Safety: vable_ptr is cached from JitState::virtualizable_heap_ptr()
             // for the currently active interpreter state.
-            return unsafe { info.load_list_of_boxes(self.vable_ptr) }.1;
+            let heap_lengths = unsafe { info.read_array_lengths_from_heap(self.vable_ptr) };
+            if heap_lengths.iter().any(|&len| len > 0) || self.vable_array_lengths.is_empty() {
+                return heap_lengths;
+            }
         }
         self.vable_array_lengths.clone()
     }
@@ -917,18 +698,23 @@ impl<M: Clone> MetaInterp<M> {
     /// Virtualizable fields become virtual input args — first reads are
     /// replaced with input references and values flow through JUMP args.
     /// No heap access for these fields on the hot path.
-    fn make_optimizer(&self) -> Optimizer {
-        // Only pass virtualizable config to optimizer when the trace
-        // actually uses virtualizable boxes (init_virtualizable_boxes called).
-        // Without boxes, the optimizer should not treat OpRef(0) as virtualizable.
-        let has_vable_boxes = self
-            .tracing
+    fn current_virtualizable_optimizer_config(&self) -> Option<majit_opt::virtualize::VirtualizableConfig> {
+        // RPython parity: only traces that actually carry the standard
+        // virtualizable state on boxes should hand a virtualizable contract
+        // to the optimizer. Merely registering VirtualizableInfo is not enough.
+        self.tracing
             .as_ref()
-            .is_some_and(|ctx| ctx.has_virtualizable_boxes());
-        if has_vable_boxes {
-            if let Some(ref info) = self.virtualizable_info {
-                return Optimizer::default_pipeline_with_virtualizable(info.to_optimizer_config());
-            }
+            .filter(|ctx| ctx.has_virtualizable_boxes())
+            .and_then(|_| {
+                self.virtualizable_info
+                    .as_ref()
+                    .map(|info| info.to_optimizer_config())
+            })
+    }
+
+    fn make_optimizer(&self) -> Optimizer {
+        if let Some(config) = self.current_virtualizable_optimizer_config() {
+            return Optimizer::default_pipeline_with_virtualizable(config);
         }
         Optimizer::default_pipeline()
     }
@@ -1033,6 +819,7 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                 }
+                self.forced_virtualizable = None;
                 self.tracing = Some(ctx);
                 let pending_num = self.warm_state.alloc_token_number();
                 self.pending_token = Some((green_key, pending_num));
@@ -1107,6 +894,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 }
 
+                self.forced_virtualizable = None;
                 self.tracing = Some(ctx);
                 // Pre-allocate a token number for this trace so that
                 // self-recursive calls can emit call_assembler targeting
@@ -1130,19 +918,377 @@ impl<M: Clone> MetaInterp<M> {
 
     // ── RPython opimpl_* equivalents for virtualizable ──────────────
 
-    /// RPython equivalent: `opimpl_hint_force_virtualizable(box)`
+    fn is_standard_virtualizable(&self, vable_opref: OpRef) -> bool {
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| ctx.standard_virtualizable_box())
+            .is_some_and(|standard| standard == vable_opref)
+    }
+
+    /// RPython equivalent: `MIFrameOpImpl._nonstandard_virtualizable()`.
     ///
-    /// During tracing, emits SETFIELD_GC/SETARRAYITEM_GC ops to flush
-    /// all virtualizable boxes back to the heap. Call this when the
-    /// interpreter encounters `hint_force_virtualizable` during tracing.
+    /// Returns true when `vable_opref` is not the active standard
+    /// virtualizable tracked in `virtualizable_boxes[-1]`.
+    fn nonstandard_virtualizable(&mut self, vable_opref: OpRef) -> bool {
+        if self.forced_virtualizable == Some(vable_opref) {
+            self.forced_virtualizable = None;
+        }
+        !self.is_standard_virtualizable(vable_opref)
+    }
+
+    fn virtualizable_field_index(&self, field_offset: usize) -> Option<usize> {
+        self.virtualizable_info
+            .as_ref()
+            .and_then(|info| info.static_field_index(field_offset))
+    }
+
+    /// RPython equivalent: `_get_arrayitem_vable_index()`.
     ///
-    /// In RPython, jtransform generates a `hint_force_virtualizable`
-    /// bytecode, and the metainterp's opimpl calls `gen_store_back_in_vable`.
-    /// In majit (no translator), the interpreter calls this directly.
-    pub fn opimpl_hint_force_virtualizable(&mut self, vable_opref: OpRef) {
+    /// Returns the flat index into the standard virtualizable box array.
+    fn get_arrayitem_vable_index(
+        &self,
+        array_field_offset: usize,
+        index: OpRef,
+    ) -> Option<usize> {
+        let ctx = self.tracing.as_ref()?;
+        let raw_index = ctx.const_value(index)?;
+        let item_index = usize::try_from(raw_index).ok()?;
+        let info = self.virtualizable_info.as_ref()?;
+        let lengths = ctx.virtualizable_array_lengths()?;
+        let array_index = info.array_field_index(array_field_offset)?;
+        Some(info.get_index_in_array(array_index, item_index, lengths))
+    }
+
+    /// RPython equivalent: `check_synchronized_virtualizable()`.
+    ///
+    /// In translated PyPy this is effectively a no-op. Keep the same contract:
+    /// the active tracing state is the source of truth, and debug builds may
+    /// assert that a standard virtualizable has been initialized.
+    pub fn check_synchronized_virtualizable(&self) {
+        if let Some(ctx) = self.tracing.as_ref() {
+            debug_assert!(
+                !ctx.has_virtualizable_boxes() || ctx.standard_virtualizable_box().is_some()
+            );
+        }
+    }
+
+    /// RPython equivalent: `synchronize_virtualizable()`.
+    ///
+    /// Standard virtualizable writes are materialized back to heap state through
+    /// the existing trace-time store-back path.
+    pub fn synchronize_virtualizable(&mut self, vable_opref: OpRef) {
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.gen_store_back_in_vable(vable_opref);
         }
+    }
+
+    /// RPython equivalent: `opimpl_getfield_vable_i(box, fielddescr, pc)`.
+    pub fn opimpl_getfield_vable_int(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
+        if self.nonstandard_virtualizable(vable_opref) {
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("opimpl_getfield_vable_int requires active tracing");
+            let offset_ref = ctx.const_int(field_offset as i64);
+            return ctx.record_op(OpCode::GetfieldGcI, &[vable_opref, offset_ref]);
+        }
+        self.check_synchronized_virtualizable();
+        let index = self
+            .virtualizable_field_index(field_offset)
+            .expect("unknown standard virtualizable field offset");
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| ctx.virtualizable_box_at(index))
+            .expect("standard virtualizable box missing")
+    }
+
+    /// RPython equivalent: `opimpl_getfield_vable_r(box, fielddescr, pc)`.
+    pub fn opimpl_getfield_vable_ref(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
+        if self.nonstandard_virtualizable(vable_opref) {
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("opimpl_getfield_vable_ref requires active tracing");
+            let offset_ref = ctx.const_int(field_offset as i64);
+            return ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, offset_ref]);
+        }
+        self.check_synchronized_virtualizable();
+        let index = self
+            .virtualizable_field_index(field_offset)
+            .expect("unknown standard virtualizable field offset");
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| ctx.virtualizable_box_at(index))
+            .expect("standard virtualizable box missing")
+    }
+
+    /// RPython equivalent: `opimpl_getfield_vable_f(box, fielddescr, pc)`.
+    pub fn opimpl_getfield_vable_float(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+    ) -> OpRef {
+        if self.nonstandard_virtualizable(vable_opref) {
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("opimpl_getfield_vable_float requires active tracing");
+            let offset_ref = ctx.const_int(field_offset as i64);
+            return ctx.record_op(OpCode::GetfieldGcF, &[vable_opref, offset_ref]);
+        }
+        self.check_synchronized_virtualizable();
+        let index = self
+            .virtualizable_field_index(field_offset)
+            .expect("unknown standard virtualizable field offset");
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| ctx.virtualizable_box_at(index))
+            .expect("standard virtualizable box missing")
+    }
+
+    fn opimpl_setfield_vable_any(&mut self, vable_opref: OpRef, field_offset: usize, value: OpRef) {
+        if self.nonstandard_virtualizable(vable_opref) {
+            if let Some(ctx) = self.tracing.as_mut() {
+                let offset_ref = ctx.const_int(field_offset as i64);
+                ctx.record_op(OpCode::SetfieldGc, &[vable_opref, value, offset_ref]);
+            }
+            return;
+        }
+        let index = self
+            .virtualizable_field_index(field_offset)
+            .expect("unknown standard virtualizable field offset");
+        if let Some(ctx) = self.tracing.as_mut() {
+            let updated = ctx.set_virtualizable_box_at(index, value);
+            debug_assert!(updated, "standard virtualizable box missing");
+        }
+        self.synchronize_virtualizable(vable_opref);
+    }
+
+    /// RPython equivalent: `opimpl_setfield_vable_i`.
+    pub fn opimpl_setfield_vable_int(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+        value: OpRef,
+    ) {
+        self.opimpl_setfield_vable_any(vable_opref, field_offset, value);
+    }
+
+    /// RPython equivalent: `opimpl_setfield_vable_r`.
+    pub fn opimpl_setfield_vable_ref(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+        value: OpRef,
+    ) {
+        self.opimpl_setfield_vable_any(vable_opref, field_offset, value);
+    }
+
+    /// RPython equivalent: `opimpl_setfield_vable_f`.
+    pub fn opimpl_setfield_vable_float(
+        &mut self,
+        vable_opref: OpRef,
+        field_offset: usize,
+        value: OpRef,
+    ) {
+        self.opimpl_setfield_vable_any(vable_opref, field_offset, value);
+    }
+
+    /// RPython equivalent: `_opimpl_getarrayitem_vable`.
+    pub fn opimpl_getarrayitem_vable_int(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        if self.nonstandard_virtualizable(vable_opref) {
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("opimpl_getarrayitem_vable_int requires active tracing");
+            let field_ref = ctx.const_int(array_field_offset as i64);
+            let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
+            let zero = ctx.const_int(0);
+            return ctx.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero]);
+        }
+        self.check_synchronized_virtualizable();
+        let flat_index = self
+            .get_arrayitem_vable_index(array_field_offset, index)
+            .expect("standard virtualizable array index must be constant");
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| ctx.virtualizable_box_at(flat_index))
+            .expect("standard virtualizable array box missing")
+    }
+
+    /// RPython equivalent: `_opimpl_getarrayitem_vable`.
+    pub fn opimpl_getarrayitem_vable_ref(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        if self.nonstandard_virtualizable(vable_opref) {
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("opimpl_getarrayitem_vable_ref requires active tracing");
+            let field_ref = ctx.const_int(array_field_offset as i64);
+            let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
+            let zero = ctx.const_int(0);
+            return ctx.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero]);
+        }
+        self.check_synchronized_virtualizable();
+        let flat_index = self
+            .get_arrayitem_vable_index(array_field_offset, index)
+            .expect("standard virtualizable array index must be constant");
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| ctx.virtualizable_box_at(flat_index))
+            .expect("standard virtualizable array box missing")
+    }
+
+    /// RPython equivalent: `_opimpl_getarrayitem_vable`.
+    pub fn opimpl_getarrayitem_vable_float(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        if self.nonstandard_virtualizable(vable_opref) {
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("opimpl_getarrayitem_vable_float requires active tracing");
+            let field_ref = ctx.const_int(array_field_offset as i64);
+            let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
+            let zero = ctx.const_int(0);
+            return ctx.record_op(OpCode::GetarrayitemGcF, &[array_opref, index, zero]);
+        }
+        self.check_synchronized_virtualizable();
+        let flat_index = self
+            .get_arrayitem_vable_index(array_field_offset, index)
+            .expect("standard virtualizable array index must be constant");
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| ctx.virtualizable_box_at(flat_index))
+            .expect("standard virtualizable array box missing")
+    }
+
+    fn opimpl_setarrayitem_vable_any(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        array_field_offset: usize,
+    ) {
+        if self.nonstandard_virtualizable(vable_opref) {
+            if let Some(ctx) = self.tracing.as_mut() {
+                let field_ref = ctx.const_int(array_field_offset as i64);
+                let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
+                let zero = ctx.const_int(0);
+                ctx.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
+            }
+            return;
+        }
+        let flat_index = self
+            .get_arrayitem_vable_index(array_field_offset, index)
+            .expect("standard virtualizable array index must be constant");
+        if let Some(ctx) = self.tracing.as_mut() {
+            let updated = ctx.set_virtualizable_box_at(flat_index, value);
+            debug_assert!(updated, "standard virtualizable array box missing");
+        }
+        self.synchronize_virtualizable(vable_opref);
+    }
+
+    /// RPython equivalent: `_opimpl_setarrayitem_vable`.
+    pub fn opimpl_setarrayitem_vable_int(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        array_field_offset: usize,
+    ) {
+        self.opimpl_setarrayitem_vable_any(vable_opref, index, value, array_field_offset);
+    }
+
+    /// RPython equivalent: `_opimpl_setarrayitem_vable`.
+    pub fn opimpl_setarrayitem_vable_ref(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        array_field_offset: usize,
+    ) {
+        self.opimpl_setarrayitem_vable_any(vable_opref, index, value, array_field_offset);
+    }
+
+    /// RPython equivalent: `_opimpl_setarrayitem_vable`.
+    pub fn opimpl_setarrayitem_vable_float(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        array_field_offset: usize,
+    ) {
+        self.opimpl_setarrayitem_vable_any(vable_opref, index, value, array_field_offset);
+    }
+
+    /// RPython equivalent: `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
+    pub fn opimpl_arraylen_vable(
+        &mut self,
+        vable_opref: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        if self.nonstandard_virtualizable(vable_opref) {
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("opimpl_arraylen_vable requires active tracing");
+            let field_ref = ctx.const_int(array_field_offset as i64);
+            let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
+            return ctx.record_op(OpCode::ArraylenGc, &[array_opref]);
+        }
+        let ctx = self
+            .tracing
+            .as_ref()
+            .expect("opimpl_arraylen_vable requires active tracing");
+        let info = self
+            .virtualizable_info
+            .as_ref()
+            .expect("standard virtualizable info missing");
+        let array_index = info
+            .array_field_index(array_field_offset)
+            .expect("unknown standard virtualizable array offset");
+        let length = ctx
+            .virtualizable_array_lengths()
+            .and_then(|lengths| lengths.get(array_index).copied())
+            .expect("standard virtualizable array length missing");
+        self.tracing
+            .as_mut()
+            .expect("opimpl_arraylen_vable requires active tracing")
+            .const_int(length as i64)
+    }
+
+    /// RPython equivalent: `emit_force_virtualizable()`.
+    ///
+    /// Standard virtualizables are flushed back to heap state once per
+    /// trace-side force point. Nonstandard virtualizables are ignored here
+    /// and continue through the normal heap fallback path.
+    pub fn emit_force_virtualizable(&mut self, vable_opref: OpRef) {
+        if !self.is_standard_virtualizable(vable_opref) {
+            return;
+        }
+        if self.forced_virtualizable.is_some() {
+            return;
+        }
+        self.forced_virtualizable = Some(vable_opref);
+        self.synchronize_virtualizable(vable_opref);
+    }
+
+    /// RPython equivalent: `opimpl_hint_force_virtualizable(box)`
+    pub fn opimpl_hint_force_virtualizable(&mut self, vable_opref: OpRef) {
+        self.emit_force_virtualizable(vable_opref);
     }
 
     /// Whether the engine is currently tracing.
@@ -1160,6 +1306,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         finish_args: &[OpRef],
     ) -> Option<(TreeLoop, HashMap<u32, i64>)> {
+        self.forced_virtualizable = None;
         let ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
         let mut recorder = ctx.recorder;
@@ -1176,6 +1323,8 @@ impl<M: Clone> MetaInterp<M> {
     /// in the same order as the InputArgs registered during `on_back_edge`.
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
     pub fn close_and_compile(&mut self, jump_args: &[OpRef], meta: M) {
+        let vable_config = self.current_virtualizable_optimizer_config();
+        self.forced_virtualizable = None;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
         let green_key = ctx.green_key;
@@ -1186,9 +1335,16 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut constants = ctx.constants.into_inner();
 
+        let trace_ops = fold_box_into_create_frame(
+            trace.ops.clone(),
+            &mut constants,
+            &self.raw_int_box_helpers,
+            &self.create_frame_raw_map,
+        );
+
         if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
+            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
         }
 
         let num_ops_before = trace.ops.len();
@@ -1198,32 +1354,23 @@ impl<M: Clone> MetaInterp<M> {
         let mut unroll_opt = majit_opt::unroll::UnrollOptimizer::new();
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
-        // pass its config to OptVirtualize so it can track field accesses.
-        // NOTE: disabled — VirtualizableConfig causes OptVirtualize to put
-        // raw ints into frame locals via writeback, crashing compiled code.
-        // Re-enable after fixing virtualizable writeback for raw-int protocol.
-        let _vable_config_disabled = self.virtualizable_info.as_ref().map(|vinfo| {
-            majit_opt::virtualize::VirtualizableConfig {
-                static_field_offsets: vinfo.static_fields.iter().map(|f| f.offset).collect(),
-                static_field_types: vinfo.static_fields.iter().map(|f| f.field_type).collect(),
-                array_field_offsets: vinfo.array_fields.iter().map(|a| a.field_offset).collect(),
-                array_item_types: vinfo.array_fields.iter().map(|a| a.item_type).collect(),
-            }
-        });
-
-        let (optimized_ops, final_num_inputs) =
-            unroll_opt.optimize_trace_with_constants_and_inputs_vable(
-                &trace.ops,
+        // pass its config to OptVirtualize so it can carry frame fields and
+        // array slots through the loop as virtual state instead of heap traffic.
+        let (optimized_ops, final_num_inputs) = unroll_opt
+            .optimize_trace_with_constants_and_inputs_vable(
+                &trace_ops,
                 &mut constants,
                 trace.inputargs.len(),
-                None, // vable_config disabled — see note above
+                vable_config,
             );
         let num_ops_after = optimized_ops.len();
 
         // Extend inputargs if the optimizer added virtual inputs (virtualizable)
         // or if the trace's Jump has more args than InputArgs (depth growth).
         let mut inputargs = trace.inputargs.clone();
-        let jump_arg_count = optimized_ops.iter().rev()
+        let jump_arg_count = optimized_ops
+            .iter()
+            .rev()
             .find(|op| op.opcode == majit_ir::OpCode::Jump)
             .map(|op| op.args.len())
             .unwrap_or(0);
@@ -1250,25 +1397,14 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // Patch: prepend virtualizable field loads as a preamble before the
-        // loop body. Entry block reads fields from frame; Label defines the
-        // loop header block params; JUMP targets them on the back-edge.
-        // Patch: prepend virtualizable field loads as a preamble before the
-        // loop body. Entry block reads fields from frame; Label defines the
-        // loop header block params; JUMP targets them on the back-edge.
-        let (inputargs, optimized_ops) = if let Some(ref info) = self.virtualizable_info {
-            let array_lengths = self.trace_entry_vable_lengths(info);
-            let (new_ia, new_ops) = patch_new_loop_to_load_virtualizable_fields(
-                info,
-                &inputargs,
-                optimized_ops,
-                &mut constants,
-                &array_lengths,
-            );
-            (new_ia, new_ops)
-        } else {
-            (inputargs, optimized_ops)
-        };
+        // RPython virtualizable parity: standard virtualizable fields and
+        // arrays stay in the trace as first-class virtualizable boxes.
+        // Do not prepend raw heap preamble loads here; compiled callers pass
+        // the traced virtualizable values in the live-input layout, and
+        // `vable_*` operations keep the hot path on boxes instead of
+        // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
+        let (inputargs, optimized_ops) = (inputargs, optimized_ops);
+        let optimized_ops = unbox_call_assembler_results(optimized_ops);
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
@@ -1407,6 +1543,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// If `permanent` is true, this location will never be traced again.
     pub fn abort_trace(&mut self, permanent: bool) {
+        self.forced_virtualizable = None;
         if let Some(ctx) = self.tracing.take() {
             self.stats.loops_aborted += 1;
             let green_key = ctx.green_key;
@@ -1434,6 +1571,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_arg_types: Vec<Type>,
         meta: M,
     ) {
+        self.forced_virtualizable = None;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
         let green_key = ctx.green_key;
@@ -1445,9 +1583,16 @@ impl<M: Clone> MetaInterp<M> {
         let mut optimizer = self.make_optimizer();
         let mut constants = ctx.constants.into_inner();
 
-        let num_ops_before = trace.ops.len();
+        let trace_ops = fold_box_into_create_frame(
+            trace.ops.clone(),
+            &mut constants,
+            &self.raw_int_box_helpers,
+            &self.create_frame_raw_map,
+        );
+
+        let num_ops_before = trace_ops.len();
         let optimized_ops = optimizer.optimize_with_constants_and_inputs(
-            &trace.ops,
+            &trace_ops,
             &mut constants,
             trace.inputargs.len(),
         );
@@ -1459,17 +1604,27 @@ impl<M: Clone> MetaInterp<M> {
                 green_key, num_ops_before, num_ops_after
             );
             eprintln!("--- finish trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
+            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
             eprintln!("--- finish trace (after opt, before unbox) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        // raw-int protocol disabled: all Finish ops return boxed results.
-        // This prevents raw ints from leaking into frame locals via
-        // virtualizable writeback, which would corrupt pointer slots.
-        let finish_unboxed = false;
-        self.raw_int_finish_keys.remove(&green_key);
+        // Re-enable raw-int terminal finishes when the trace ends in an
+        // obvious int boxing pattern. Top-level exits re-box in pyre-jit,
+        // while recursive call boundaries can consume the raw int directly.
+        let (optimized_ops, finish_unboxed) =
+            unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers);
+        if finish_unboxed {
+            self.raw_int_finish_keys.insert(green_key);
+        } else {
+            self.raw_int_finish_keys.remove(&green_key);
+        }
         let optimized_ops = unbox_call_assembler_results(optimized_ops);
+        let optimized_ops = if finish_unboxed {
+            unbox_raw_force_results(optimized_ops, &constants, &self.raw_int_force_helpers)
+        } else {
+            optimized_ops
+        };
 
         if crate::majit_log_enabled() {
             eprintln!("--- finish trace (after unbox) ---");
@@ -1611,7 +1766,7 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
     }
 
-    /// Get num_inputs of the compiled loop (after preamble patching).
+    /// Get num_inputs of the compiled loop.
     pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
         self.compiled_loops.get(&green_key).map(|e| e.num_inputs)
     }
@@ -1788,39 +1943,13 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
-        if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
-                });
-            info.fail_count += 1;
-
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard failure at key={}, guard={}, count={}",
-                    green_key, fail_index, info.fail_count
-                );
-            }
-
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, info.fail_count);
-            }
-        }
-
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
         let trace_layout =
             Self::trace_for_exit(compiled, trace_id).and_then(|(trace_id, trace)| {
                 Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
             });
         let exit_layout = result
             .exit_layout
+            .clone()
             .map(|layout| {
                 let mut resume_layout = trace_layout
                     .as_ref()
@@ -1863,10 +1992,42 @@ impl<M: Clone> MetaInterp<M> {
                 recovery_layout: None,
                 resume_layout: None,
             });
+        let effective_is_finish = result.is_finish || exit_layout.is_finish;
+
+        let mut guard_fail_count = None;
+        if !effective_is_finish {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let info = compiled
+                .guard_failures
+                .entry((trace_id, fail_index))
+                .or_insert(GuardFailureInfo {
+                    fail_count: 0,
+                    bridge_compiled: false,
+                });
+            info.fail_count += 1;
+            guard_fail_count = Some(info.fail_count);
+        }
+        if let Some(fail_count) = guard_fail_count {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] guard failure at key={}, guard={}, count={}",
+                    green_key, fail_index, fail_count
+                );
+            }
+
+            self.stats.guard_failures += 1;
+            self.warm_state.log_guard_failure(fail_index);
+
+            if let Some(ref hook) = self.hooks.on_guard_failure {
+                hook(green_key, fail_index, fail_count);
+            }
+        }
+
         let exception = ExceptionState {
             exc_class: result.exception_class,
             exc_value: result.exception_value.0 as i64,
         };
+        let compiled = self.compiled_loops.get(&green_key).unwrap();
 
         Some(RawCompileResult {
             values: result.outputs,
@@ -1874,7 +2035,7 @@ impl<M: Clone> MetaInterp<M> {
             meta: &compiled.meta,
             fail_index,
             trace_id,
-            is_finish: result.is_finish,
+            is_finish: effective_is_finish,
             exit_layout,
             savedata: result.savedata,
             exception,
@@ -1896,39 +2057,13 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
-        if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
-                });
-            info.fail_count += 1;
-
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard failure at key={}, guard={}, count={}",
-                    green_key, fail_index, info.fail_count
-                );
-            }
-
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, info.fail_count);
-            }
-        }
-
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
         let trace_layout =
             Self::trace_for_exit(compiled, trace_id).and_then(|(trace_id, trace)| {
                 Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
             });
         let exit_layout = result
             .exit_layout
+            .clone()
             .map(|layout| {
                 let mut resume_layout = trace_layout
                     .as_ref()
@@ -1971,10 +2106,41 @@ impl<M: Clone> MetaInterp<M> {
                 recovery_layout: None,
                 resume_layout: None,
             });
+        let effective_is_finish = result.is_finish || exit_layout.is_finish;
+
+        let mut guard_fail_count = None;
+        if !effective_is_finish {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let info = compiled
+                .guard_failures
+                .entry((trace_id, fail_index))
+                .or_insert(GuardFailureInfo {
+                    fail_count: 0,
+                    bridge_compiled: false,
+                });
+            info.fail_count += 1;
+            guard_fail_count = Some(info.fail_count);
+        }
+        if let Some(fail_count) = guard_fail_count {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] guard failure at key={}, guard={}, count={}",
+                    green_key, fail_index, fail_count
+                );
+            }
+
+            self.stats.guard_failures += 1;
+            self.warm_state.log_guard_failure(fail_index);
+
+            if let Some(ref hook) = self.hooks.on_guard_failure {
+                hook(green_key, fail_index, fail_count);
+            }
+        }
         let exception = ExceptionState {
             exc_class: result.exception_class,
             exc_value: result.exception_value.0 as i64,
         };
+        let compiled = self.compiled_loops.get(&green_key).unwrap();
 
         Some(RawCompileResult {
             values: result.outputs,
@@ -1982,7 +2148,7 @@ impl<M: Clone> MetaInterp<M> {
             meta: &compiled.meta,
             fail_index,
             trace_id,
-            is_finish: result.is_finish,
+            is_finish: effective_is_finish,
             exit_layout,
             savedata: result.savedata,
             exception,
@@ -2517,6 +2683,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         finish_args: &[OpRef],
     ) -> bool {
+        self.forced_virtualizable = None;
         let ctx = match self.tracing.take() {
             Some(ctx) => ctx,
             None => return false,
@@ -2671,6 +2838,11 @@ impl<M: Clone> MetaInterp<M> {
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
         let bridge_trace_id = self.alloc_trace_id();
+
+        if crate::majit_log_enabled() {
+            eprintln!("--- bridge trace (after opt) ---");
+            eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
+        }
 
         self.backend.set_constants(constants);
         self.backend.set_next_trace_id(bridge_trace_id);
@@ -2832,6 +3004,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // Create a new trace recorder for the retrace
         let recorder = self.warm_state.start_retrace(num_inputs);
+        self.forced_virtualizable = None;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
 
         if let Some(ref hook) = self.hooks.on_trace_start {
@@ -3679,9 +3852,10 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Begin inlining a function call during tracing.
     ///
-    /// Records ENTER_PORTAL_FRAME marker and pushes an inline frame.
-    /// The caller should then trace the callee's body normally.
-    /// Call `leave_inline_frame()` when the callee returns.
+    /// Pushes an inline frame so tracing can continue through the callee body.
+    /// We intentionally avoid recording ENTER_PORTAL_FRAME markers for inline
+    /// calls: unlike a real portal transition, they do not carry runtime
+    /// semantics and only bloat the trace.
     ///
     /// Returns `true` if inlining started, `false` if not tracing or depth exceeded.
     pub fn enter_inline_frame(&mut self, callee_key: u64) -> bool {
@@ -3693,18 +3867,16 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        let key_ref = ctx.const_int(callee_key as i64);
-        ctx.record_op(OpCode::EnterPortalFrame, &[key_ref]);
         ctx.push_inline_frame(callee_key, MAX_INLINE_DEPTH as u32);
         true
     }
 
     /// Leave an inlined function call during tracing.
     ///
-    /// Records LEAVE_PORTAL_FRAME marker and pops the inline frame.
+    /// Pops the inline frame. See `enter_inline_frame()` for why we do not
+    /// record LEAVE_PORTAL_FRAME for inline calls.
     pub fn leave_inline_frame(&mut self) {
         if let Some(ctx) = self.tracing.as_mut() {
-            ctx.record_op(OpCode::LeavePortalFrame, &[]);
             ctx.pop_inline_frame();
         }
     }
@@ -3733,6 +3905,13 @@ impl<M: Clone> MetaInterp<M> {
     /// that are safe to peel away for the raw-int call_assembler protocol.
     pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
         self.raw_int_box_helpers.insert(helper as i64);
+    }
+
+    /// Register a recursive force helper that takes a raw-int argument and
+    /// can return a raw-int result when the callee trace ends with a raw-int
+    /// Finish protocol.
+    pub fn register_raw_int_force_helper(&mut self, helper: *const ()) {
+        self.raw_int_force_helpers.insert(helper as i64);
     }
 
     /// Register a create_frame → create_frame_raw_int mapping.
@@ -4118,7 +4297,7 @@ fn enrich_resume_layout_with_frame_stack(
         .map(ResumeFrameLayoutSummary::from_exit_frame_layout)
         .collect();
 
-    if let Some(ref mut layout) = resume_layout {
+    if let Some(layout) = resume_layout {
         let shared = layout.frame_layouts.len().min(frame_layouts.len());
         for offset in 0..shared {
             let resume_index = layout.frame_layouts.len() - 1 - offset;
@@ -4434,7 +4613,7 @@ mod tests {
     use majit_codegen_cranelift::guard::CraneliftFailDescr;
     use majit_gc::collector::MiniMarkGC;
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
-    use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
+    use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
     use std::sync::{Arc, Mutex, OnceLock};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
@@ -4475,10 +4654,8 @@ mod tests {
         }
 
         fn effect_info(&self) -> &EffectInfo {
-            static EFFECT_INFO: EffectInfo = EffectInfo::const_new(
-                ExtraEffect::CanRaise,
-                majit_ir::OopSpecIndex::None,
-            );
+            static EFFECT_INFO: EffectInfo =
+                EffectInfo::const_new(ExtraEffect::CanRaise, majit_ir::OopSpecIndex::None);
             &EFFECT_INFO
         }
     }
@@ -4621,6 +4798,349 @@ mod tests {
             maybe_force_and_return_void as *const () as usize as i64,
         );
         attach_procedure_to_interp_entry(meta, green_key, &inputargs, ops, constants);
+    }
+
+    fn test_vable_info_static_only() -> VirtualizableInfo {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info
+    }
+
+    fn test_vable_info_with_array() -> VirtualizableInfo {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_array_field_with_layout("stack", Type::Int, 24, 0, 0);
+        info
+    }
+
+    fn start_tracing_with_virtualizable(
+        meta: &mut MetaInterp<()>,
+        info: VirtualizableInfo,
+        live_values: &[Value],
+        array_lengths: Vec<usize>,
+    ) {
+        meta.set_virtualizable_info(info);
+        meta.set_vable_array_lengths(array_lengths);
+        let action = meta.force_start_tracing(777, None, live_values);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+    }
+
+    fn take_recorded_ops(meta: &mut MetaInterp<()>) -> Vec<Op> {
+        let mut ctx = meta.tracing.take().expect("expected active trace context");
+        let num_inputs = ctx.recorder.num_inputargs();
+        let jump_args: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+        ctx.recorder.close_loop(&jump_args);
+        let trace = ctx.recorder.get_trace();
+        trace
+            .ops
+            .into_iter()
+            .filter(|op| op.opcode != OpCode::Jump)
+            .collect()
+    }
+
+    #[test]
+    fn opimpl_getfield_vable_int_reads_standard_box_without_heap_op() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+
+        let result = meta.opimpl_getfield_vable_int(OpRef(0), 8);
+        assert_eq!(result, OpRef(1));
+
+        let ctx = meta.trace_ctx().unwrap();
+        assert_eq!(ctx.recorder.num_ops(), 0);
+    }
+
+    #[test]
+    fn opimpl_setfield_vable_int_synchronizes_standard_virtualizable() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(7)],
+            Vec::new(),
+        );
+
+        let new_val = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(99)
+        };
+        meta.opimpl_setfield_vable_int(OpRef(0), 8, new_val);
+
+        let ctx = meta.trace_ctx().unwrap();
+        let boxes = ctx.collect_virtualizable_boxes().unwrap();
+        assert_eq!(boxes[0], new_val);
+        assert_eq!(ctx.recorder.num_ops(), 2);
+    }
+
+    #[test]
+    fn opimpl_getarrayitem_vable_int_reads_standard_box_without_heap_op() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_with_array(),
+            &[Value::Int(0x1234), Value::Int(11), Value::Int(22)],
+            vec![2],
+        );
+
+        let index = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(1)
+        };
+        let result = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 24);
+        assert_eq!(result, OpRef(2));
+
+        let ctx = meta.trace_ctx().unwrap();
+        assert_eq!(ctx.recorder.num_ops(), 0);
+    }
+
+    #[test]
+    fn opimpl_arraylen_vable_returns_cached_standard_length() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_with_array(),
+            &[Value::Int(0x1234), Value::Int(11), Value::Int(22)],
+            vec![2],
+        );
+
+        let len_ref = meta.opimpl_arraylen_vable(OpRef(0), 24);
+        let ctx = meta.trace_ctx().unwrap();
+        assert_eq!(ctx.const_value(len_ref), Some(2));
+        assert_eq!(ctx.recorder.num_ops(), 0);
+    }
+
+    #[test]
+    fn opimpl_setarrayitem_vable_int_synchronizes_standard_virtualizable() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_with_array(),
+            &[Value::Int(0x1234), Value::Int(11), Value::Int(22)],
+            vec![2],
+        );
+
+        let (index, new_val) = {
+            let ctx = meta.trace_ctx().unwrap();
+            (ctx.const_int(1), ctx.const_int(33))
+        };
+        meta.opimpl_setarrayitem_vable_int(OpRef(0), index, new_val, 24);
+
+        let ctx = meta.trace_ctx().unwrap();
+        let boxes = ctx.collect_virtualizable_boxes().unwrap();
+        assert_eq!(boxes[1], new_val);
+        assert_eq!(ctx.recorder.num_ops(), 5);
+    }
+
+    #[test]
+    fn opimpl_getfield_vable_int_nonstandard_falls_back_to_heap_op() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+
+        let nonstandard_vable = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(0xCAFE)
+        };
+        let _result = meta.opimpl_getfield_vable_int(nonstandard_vable, 8);
+
+        let ops = take_recorded_ops(&mut meta);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
+    }
+
+    #[test]
+    fn opimpl_getarrayitem_vable_int_nonstandard_falls_back_to_heap_ops() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_with_array(),
+            &[Value::Int(0x1234), Value::Int(11), Value::Int(22)],
+            vec![2],
+        );
+
+        let (nonstandard_vable, index) = {
+            let ctx = meta.trace_ctx().unwrap();
+            (ctx.const_int(0xCAFE), ctx.const_int(1))
+        };
+        let _result = meta.opimpl_getarrayitem_vable_int(nonstandard_vable, index, 24);
+
+        let ops = take_recorded_ops(&mut meta);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[1].opcode, OpCode::GetarrayitemGcI);
+    }
+
+    #[test]
+    fn opimpl_hint_force_virtualizable_standard_emits_store_back_only_once() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+
+        meta.opimpl_hint_force_virtualizable(OpRef(0));
+        meta.opimpl_hint_force_virtualizable(OpRef(0));
+
+        let ops = take_recorded_ops(&mut meta);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
+    }
+
+    #[test]
+    fn opimpl_hint_force_virtualizable_ignores_nonstandard_virtualizable() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+
+        let nonstandard_vable = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(0xCAFE)
+        };
+        meta.opimpl_hint_force_virtualizable(nonstandard_vable);
+
+        let ops = take_recorded_ops(&mut meta);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn hint_force_virtualizable_state_is_reset_between_traces() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+        meta.opimpl_hint_force_virtualizable(OpRef(0));
+        let _ = meta.finish_trace_for_parity(&[]);
+
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+        meta.opimpl_hint_force_virtualizable(OpRef(0));
+
+        let ops = take_recorded_ops(&mut meta);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
+    }
+
+    #[test]
+    fn standard_vable_access_consumes_forced_virtualizable_state() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+
+        meta.opimpl_hint_force_virtualizable(OpRef(0));
+        let _ = meta.opimpl_getfield_vable_int(OpRef(0), 8);
+        meta.opimpl_hint_force_virtualizable(OpRef(0));
+
+        let ops = take_recorded_ops(&mut meta);
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[2].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[3].opcode, OpCode::SetfieldGc);
+    }
+
+    #[test]
+    fn compiled_virtualizable_trace_does_not_prepend_raw_heap_preamble() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_with_array(),
+            &[Value::Int(0x1234), Value::Int(10), Value::Int(20)],
+            vec![2],
+        );
+
+        let index = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(1)
+        };
+        let item = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 24);
+        meta.close_and_compile(&[OpRef(0), OpRef(1), OpRef(2)], ());
+
+        let compiled = meta.compiled_loops.get(&777).expect("compiled entry");
+        let trace = compiled
+            .traces
+            .get(&compiled.root_trace_id)
+            .expect("root compiled trace");
+
+        assert!(
+            trace.ops.iter().all(|op| {
+                !matches!(
+                    op.opcode,
+                    OpCode::GetfieldRawI
+                        | OpCode::GetfieldRawR
+                        | OpCode::GetfieldRawF
+                        | OpCode::GetarrayitemRawI
+                        | OpCode::GetarrayitemRawR
+                        | OpCode::GetarrayitemRawF
+                )
+            }),
+            "standard virtualizable loop should use vable boxes, not raw entry preamble: {}",
+            majit_ir::format_trace(&trace.ops, &trace.constants)
+        );
+        assert_eq!(item, OpRef(2));
+    }
+
+    #[test]
+    fn optimizer_vable_config_requires_active_standard_boxes() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.set_virtualizable_info(test_vable_info_with_array());
+        assert!(
+            meta.current_virtualizable_optimizer_config().is_none(),
+            "registered VirtualizableInfo alone must not enable optimizer virtualizable mode"
+        );
+
+        let action = meta.force_start_tracing(777, None, &[Value::Int(0x1234)]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        assert!(
+            meta.current_virtualizable_optimizer_config().is_none(),
+            "traces without init_virtualizable_boxes must not pass vable config to optimizer"
+        );
+    }
+
+    #[test]
+    fn optimizer_vable_config_matches_registered_virtualizable_when_boxes_active() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let info = test_vable_info_with_array();
+        start_tracing_with_virtualizable(
+            &mut meta,
+            info.clone(),
+            &[Value::Int(0x1234), Value::Int(10), Value::Int(20)],
+            vec![2],
+        );
+
+        let config = meta
+            .current_virtualizable_optimizer_config()
+            .expect("standard virtualizable trace should pass config to optimizer");
+        assert_eq!(config.static_field_offsets, info.to_optimizer_config().static_field_offsets);
+        assert_eq!(config.static_field_types, info.to_optimizer_config().static_field_types);
+        assert_eq!(config.array_field_offsets, info.to_optimizer_config().array_field_offsets);
+        assert_eq!(config.array_item_types, info.to_optimizer_config().array_item_types);
     }
 
     #[test]
@@ -7320,7 +7840,9 @@ fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
         let mut ob_type_refs: Vec<(usize, OpRef)> = Vec::new();
 
         for (idx, op) in ops.iter().enumerate() {
-            if op.opcode != OpCode::GetfieldRawI || op.args.first() != Some(ca_ref) {
+            if !matches!(op.opcode, OpCode::GetfieldRawI | OpCode::GetfieldGcI)
+                || op.args.first() != Some(ca_ref)
+            {
                 continue;
             }
             if let Some(ref d) = op.descr {
@@ -7377,6 +7899,103 @@ fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
     ops
 }
 
+/// Strip caller-side unboxing after CallMayForceI results from raw-int helpers.
+///
+/// Pattern:
+///   v1 = CallMayForceI(raw_helper, ...)
+///   v2 = GetfieldGcI(v1, ob_type)
+///   GuardClass(v2, INT_TYPE)
+///   v3 = GetfieldGcI(v1, intval)
+/// becomes:
+///   v1 = CallMayForceI(raw_helper, ...)
+///   ... uses of v3 rewritten to v1 ...
+fn unbox_raw_force_results(
+    mut ops: Vec<Op>,
+    constants: &HashMap<u32, i64>,
+    raw_force_helpers: &HashSet<i64>,
+) -> Vec<Op> {
+    use majit_ir::OpCode;
+
+    let force_results: Vec<OpRef> = ops
+        .iter()
+        .filter(|op| {
+            op.opcode == OpCode::CallMayForceI
+                && op
+                    .args
+                    .first()
+                    .and_then(|func| constants.get(&func.0))
+                    .is_some_and(|ptr| raw_force_helpers.contains(ptr))
+        })
+        .map(|op| op.pos)
+        .collect();
+
+    if force_results.is_empty() {
+        return ops;
+    }
+
+    for force_ref in &force_results {
+        let mut intval_refs: Vec<(usize, OpRef)> = Vec::new();
+        let mut ops_to_remove: Vec<usize> = Vec::new();
+        let mut ob_type_refs: Vec<(usize, OpRef)> = Vec::new();
+
+        for (idx, op) in ops.iter().enumerate() {
+            if op.opcode != OpCode::GetfieldGcI || op.args.first() != Some(force_ref) {
+                continue;
+            }
+            if let Some(ref d) = op.descr {
+                let ds = format!("{d:?}");
+                if ds.contains("offset: 8")
+                    && ds.contains("field_size: 8")
+                    && ds.contains("signed: true")
+                {
+                    intval_refs.push((idx, op.pos));
+                    ops_to_remove.push(idx);
+                } else if ds.contains("offset: 0") {
+                    ob_type_refs.push((idx, op.pos));
+                }
+            }
+        }
+
+        if !intval_refs.is_empty() {
+            for (idx, ob_type_ref) in ob_type_refs {
+                ops_to_remove.push(idx);
+                for (idx2, op2) in ops.iter().enumerate() {
+                    if op2.opcode == OpCode::GuardClass && op2.args.first() == Some(&ob_type_ref) {
+                        ops_to_remove.push(idx2);
+                    }
+                }
+            }
+        }
+
+        for &(_, intval_ref) in &intval_refs {
+            for op in ops.iter_mut() {
+                for arg in op.args.iter_mut() {
+                    if *arg == intval_ref {
+                        *arg = *force_ref;
+                    }
+                }
+                if let Some(ref mut fa) = op.fail_args {
+                    for arg in fa.iter_mut() {
+                        if *arg == intval_ref {
+                            *arg = *force_ref;
+                        }
+                    }
+                }
+            }
+        }
+
+        ops_to_remove.sort_unstable();
+        ops_to_remove.dedup();
+        for &idx in ops_to_remove.iter().rev() {
+            if idx < ops.len() {
+                ops.remove(idx);
+            }
+        }
+    }
+
+    ops
+}
+
 /// Fold boxing into create_frame: when a box helper result feeds directly
 /// into create_frame as the last argument, replace with create_frame_raw_int.
 ///
@@ -7390,11 +8009,19 @@ fn fold_box_into_create_frame(
 ) -> Vec<Op> {
     use majit_ir::OpCode;
 
+    #[derive(Clone)]
+    struct Replacement {
+        create_idx: usize,
+        boxed_ref: OpRef,
+        raw_val: OpRef,
+        removable_indices: Vec<usize>,
+    }
+
     if box_helpers.is_empty() || create_frame_raw_map.is_empty() {
         return ops;
     }
 
-    let mut replacements: Vec<(usize, usize)> = Vec::new(); // (box_idx, create_idx)
+    let mut replacements: Vec<Replacement> = Vec::new();
 
     for (ci, create_op) in ops.iter().enumerate() {
         if create_op.opcode != OpCode::CallI {
@@ -7417,54 +8044,68 @@ fn fold_box_into_create_frame(
             None => continue,
         };
 
-        // Find the boxing op that produced last_arg
+        let mut replacement = None;
+
+        // Pattern 1: CallI(box_fn, raw)
         for (bi, box_op) in ops[..ci].iter().enumerate().rev() {
-            if box_op.pos != last_arg || box_op.opcode != OpCode::CallI {
+            if box_op.pos != last_arg {
                 continue;
             }
-            let box_fn_ptr = box_op
-                .args
-                .first()
-                .and_then(|func| constants.get(&func.0))
-                .copied();
-            if !box_fn_ptr.is_some_and(|p| box_helpers.contains(&p)) {
-                continue;
-            }
-            // Check: box result is only used by create_frame, CallAssemblerI
-            // args, and possibly CallN (drop_frame). No fail_args or other ops.
-            let used_in_fail_args = ops.iter().any(|op| {
-                op.fail_args
-                    .as_ref()
-                    .is_some_and(|fa| fa.contains(&last_arg))
-            });
-            let used_in_non_call = ops.iter().enumerate().any(|(i, op)| {
-                i != ci
-                    && i != bi
-                    && op.args.contains(&last_arg)
-                    && !matches!(
-                        op.opcode,
-                        OpCode::CallAssemblerI
-                            | OpCode::CallAssemblerR
-                            | OpCode::CallAssemblerF
-                            | OpCode::CallAssemblerN
-                            | OpCode::CallN
-                    )
-            });
-            if used_in_non_call || used_in_fail_args {
+            if box_op.opcode == OpCode::CallI {
+                let box_fn_ptr = box_op
+                    .args
+                    .first()
+                    .and_then(|func| constants.get(&func.0))
+                    .copied();
+                if box_fn_ptr.is_some_and(|p| box_helpers.contains(&p)) && box_op.args.len() >= 2 {
+                    replacement = Some(Replacement {
+                        create_idx: ci,
+                        boxed_ref: last_arg,
+                        raw_val: box_op.args[1],
+                        removable_indices: vec![bi],
+                    });
+                }
                 break;
             }
-            if box_op.args.len() >= 2 {
-                replacements.push((bi, ci));
+
+            // Pattern 2: New() + SetfieldGc(box, raw)
+            if box_op.opcode == OpCode::New {
+                let mut raw_val = None;
+                let mut removable_indices = vec![bi];
+                for (si, set_op) in ops[bi + 1..ci].iter().enumerate() {
+                    let idx = bi + 1 + si;
+                    if set_op.opcode != OpCode::SetfieldGc || set_op.args.first() != Some(&last_arg)
+                    {
+                        continue;
+                    }
+                    removable_indices.push(idx);
+                    if let Some(ref d) = set_op.descr {
+                        let ds = format!("{d:?}");
+                        if ds.contains("offset: 8") && ds.contains("signed: true") {
+                            raw_val = set_op.args.get(1).copied();
+                        }
+                    }
+                }
+                if let Some(raw_val) = raw_val {
+                    replacement = Some(Replacement {
+                        create_idx: ci,
+                        boxed_ref: last_arg,
+                        raw_val,
+                        removable_indices,
+                    });
+                }
+                break;
             }
-            break;
+        }
+
+        if let Some(repl) = replacement {
+            replacements.push(repl);
         }
     }
 
     // Apply replacements in reverse order
-    for &(box_idx, create_idx) in replacements.iter().rev() {
-        let boxed_ref = ops[box_idx].pos;
-        let raw_val = ops[box_idx].args[1]; // raw value from box(fn_ptr, raw)
-        let create_fn_ptr = match ops[create_idx]
+    for repl in replacements.iter().rev() {
+        let create_fn_ptr = match ops[repl.create_idx]
             .args
             .first()
             .and_then(|func| constants.get(&func.0))
@@ -7479,18 +8120,31 @@ fn fold_box_into_create_frame(
         };
 
         // Replace last arg of create_frame with raw_val
-        let nargs = ops[create_idx].args.len();
-        ops[create_idx].args[nargs - 1] = raw_val;
+        let nargs = ops[repl.create_idx].args.len();
+        ops[repl.create_idx].args[nargs - 1] = repl.raw_val;
 
         // Replace function pointer: create_frame → create_frame_raw_int
-        let func_ref = ops[create_idx].args[0];
+        let func_ref = ops[repl.create_idx].args[0];
         constants.insert(func_ref.0, raw_fn_ptr);
 
-        // Do NOT replace boxed_ref in CallAssemblerI args — callee expects boxed.
-        // Only the create_frame arg was already updated above.
-
-        // Remove the boxing op
-        ops.remove(box_idx);
+        // Remove the boxing ops only if they are now dead. The raw helper
+        // rewrite is still valuable even when the boxed object remains live
+        // for later virtual field reads.
+        let still_used = ops.iter().enumerate().any(|(i, op)| {
+            if repl.removable_indices.contains(&i) || i == repl.create_idx {
+                return false;
+            }
+            op.args.contains(&repl.boxed_ref)
+                || op
+                    .fail_args
+                    .as_ref()
+                    .is_some_and(|fa| fa.contains(&repl.boxed_ref))
+        });
+        if !still_used {
+            for &idx in repl.removable_indices.iter().rev() {
+                ops.remove(idx);
+            }
+        }
     }
 
     ops
@@ -7498,7 +8152,7 @@ fn fold_box_into_create_frame(
 
 #[cfg(test)]
 mod raw_int_postprocess_tests {
-    use super::{unbox_call_assembler_results, unbox_finish_result};
+    use super::{unbox_call_assembler_results, unbox_finish_result, unbox_raw_force_results};
     use std::collections::{HashMap, HashSet};
 
     use majit_ir::{make_field_descr, Op, OpCode, OpRef, Type};
@@ -7635,5 +8289,77 @@ mod raw_int_postprocess_tests {
         assert_eq!(ops[3].opcode, OpCode::GetfieldRawI);
         assert_eq!(ops[4].opcode, OpCode::IntNe);
         assert_eq!(ops[4].args[0], OpRef(3));
+    }
+
+    #[test]
+    fn unbox_call_assembler_results_rewrites_gc_int_payload_unboxing() {
+        let ca = mk_op_with_descr(
+            OpCode::CallAssemblerI,
+            &[OpRef(0)],
+            1,
+            crate::make_call_assembler_descr(1, &[Type::Int], Type::Int),
+        );
+        let get_type = mk_op_with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(1)],
+            2,
+            make_field_descr(0, 8, Type::Int, false),
+        );
+        let guard = Op::new(OpCode::GuardClass, &[OpRef(2), OpRef(99_999)]);
+        let get_int = mk_op_with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(1)],
+            3,
+            make_field_descr(8, 8, Type::Int, true),
+        );
+        let add = mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(0)], 4);
+
+        let ops = unbox_call_assembler_results(vec![ca, get_type, guard, get_int, add]);
+
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::CallAssemblerI);
+        assert_eq!(ops[1].opcode, OpCode::IntAdd);
+        assert_eq!(ops[1].args[0], OpRef(1));
+    }
+
+    #[test]
+    fn unbox_raw_force_results_rewrites_only_int_payload_unboxing() {
+        let helper_const = OpRef(90_000);
+        let mut constants = HashMap::new();
+        constants.insert(helper_const.0, 0xfeed_beef);
+        let mut helpers = HashSet::new();
+        helpers.insert(0xfeed_beef);
+
+        let call = mk_op_with_descr(
+            OpCode::CallMayForceI,
+            &[helper_const, OpRef(0), OpRef(1), OpRef(2)],
+            3,
+            crate::make_call_descr(&[Type::Int, Type::Int, Type::Int], Type::Int),
+        );
+        let get_type = mk_op_with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(3)],
+            4,
+            make_field_descr(0, 8, Type::Int, false),
+        );
+        let guard = Op::new(OpCode::GuardClass, &[OpRef(4), OpRef(99_999)]);
+        let get_int = mk_op_with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(3)],
+            5,
+            make_field_descr(8, 8, Type::Int, true),
+        );
+        let add = mk_op(OpCode::IntAdd, &[OpRef(5), OpRef(0)], 6);
+
+        let ops = unbox_raw_force_results(
+            vec![call, get_type, guard, get_int, add],
+            &constants,
+            &helpers,
+        );
+
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::CallMayForceI);
+        assert_eq!(ops[1].opcode, OpCode::IntAdd);
+        assert_eq!(ops[1].args[0], OpRef(3));
     }
 }
