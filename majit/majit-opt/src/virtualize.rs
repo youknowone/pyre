@@ -1268,10 +1268,38 @@ impl Optimization for OptVirtualize {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
+                        // virtualize.py: OS_RAW_MALLOC_VARSIZE_CHAR → virtual raw buffer
+                        if ei.oopspec_index == OopSpecIndex::RawMallocVarsizeChar {
+                            if op.num_args() >= 2 {
+                                if let Some(size) = ctx.get_constant_int(op.arg(1)) {
+                                    // Create a virtual raw buffer of known size.
+                                    let info = PtrInfo::VirtualRawBuffer(
+                                        crate::info::VirtualRawBufferInfo {
+                                            size: size as usize,
+                                            entries: Vec::new(),
+                                        },
+                                    );
+                                    self.set_info(op.pos, info);
+                                    return OptimizationResult::Remove;
+                                }
+                            }
+                            // Non-constant size: emit as-is
+                            return self.optimize_escaping_op(op, ctx);
+                        }
+                        // virtualize.py: OS_RAW_FREE → remove if target is virtual raw buffer
+                        if ei.oopspec_index == OopSpecIndex::RawFree {
+                            if op.num_args() >= 2 {
+                                let target = ctx.get_replacement(op.arg(1));
+                                if self.is_virtual(target, ctx) {
+                                    return OptimizationResult::Remove;
+                                }
+                            }
+                            return self.optimize_escaping_op(op, ctx);
+                        }
+                        // virtualize.py: OS_JIT_FORCE_VIRTUALIZABLE
                         if ei.oopspec_index == OopSpecIndex::JitForceVirtualizable {
-                            let arg_idx = if op.opcode == OpCode::CallN { 1 } else { 1 };
-                            if op.num_args() > arg_idx {
-                                let target = ctx.get_replacement(op.arg(arg_idx));
+                            if op.num_args() > 1 {
+                                let target = ctx.get_replacement(op.arg(1));
                                 if self.is_virtual(target, ctx) {
                                     return OptimizationResult::Remove;
                                 }
