@@ -3702,9 +3702,23 @@ impl CraneliftBackend {
         // the loop header's block parameters.
         let label_idx = ops.iter().position(|op| op.opcode == OpCode::Label);
 
-        // Determine loop block parameter count: Label's args if present,
-        // otherwise num_inputs (backwards compatible).
-        let loop_param_count = label_idx.map(|li| ops[li].args.len()).unwrap_or(num_inputs);
+        // Determine loop block parameter count.
+        //
+        // RPython-style traces carry the canonical loop header arity in LABEL.
+        // Legacy no-LABEL traces must still agree with the terminal JUMP. Some
+        // optimizer paths may conservatively grow num_inputs for hidden virtual
+        // state while the actual no-LABEL loop body still jumps with a smaller
+        // visible arity. In that case the loop contract is the JUMP arity, not
+        // the raw num_inputs count.
+        let loop_param_count = if let Some(li) = label_idx {
+            ops[li].args.len()
+        } else {
+            ops.iter()
+                .rev()
+                .find(|op| op.opcode == OpCode::Jump)
+                .map(|op| op.args.len())
+                .unwrap_or(num_inputs)
+        };
 
         // Declare extra variables for Label args beyond num_inputs.
         // This handles depth growth in virtualizable storage loops where
@@ -6856,7 +6870,7 @@ impl CraneliftBackend {
         let mut ctx = Context::for_function(func);
         self.module
             .define_function(func_id, &mut ctx)
-            .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+            .map_err(|e| BackendError::CompilationFailed(format!("{e}\n{e:?}")))?;
         self.module.clear_context(&mut ctx);
         self.module.finalize_definitions().unwrap();
 
@@ -7704,6 +7718,7 @@ mod tests {
     struct TestCallDescr {
         arg_types: Vec<Type>,
         result_type: Type,
+        effect_info: EffectInfo,
     }
 
     impl Descr for TestCallDescr {
@@ -7723,10 +7738,7 @@ mod tests {
             8
         }
         fn effect_info(&self) -> &EffectInfo {
-            &EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
-                oopspec_index: majit_ir::OopSpecIndex::None,
-            }
+            &self.effect_info
         }
     }
 
@@ -7734,6 +7746,11 @@ mod tests {
         Arc::new(TestCallDescr {
             arg_types,
             result_type,
+            effect_info: EffectInfo {
+                extra_effect: ExtraEffect::CanRaise,
+                oopspec_index: majit_ir::OopSpecIndex::None,
+                ..Default::default()
+            },
         })
     }
 
@@ -8228,6 +8245,29 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(10)]);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
+    }
+
+    #[test]
+    fn test_no_label_loop_uses_jump_arity_not_dead_extra_inputs() {
+        let mut backend = CraneliftBackend::new();
+
+        // Legacy no-LABEL traces can still carry stale extra input slots from
+        // optimizer-owned virtual state, while the visible loop contract is the
+        // terminal JUMP arity. This must still compile.
+        let inputargs = vec![
+            InputArg::new_int(0),
+            InputArg::new_int(1),
+            InputArg::new_int(2),
+            InputArg::new_int(3),
+            InputArg::new_int(4),
+        ];
+        let ops = vec![
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 5),
+            mk_op(OpCode::Jump, &[OpRef(0), OpRef(1), OpRef(2)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(70001);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
     }
 
     #[test]

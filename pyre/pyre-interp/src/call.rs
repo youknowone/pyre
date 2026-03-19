@@ -3,7 +3,7 @@
 //! JIT-specific call infrastructure (force/bridge callbacks, callee frame
 //! creation helpers, frame pool) lives in pyre-jit/src/call_jit.rs.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 use pyre_object::PyObjectRef;
@@ -19,22 +19,16 @@ thread_local! {
     /// When trace inlining executes the callee synchronously inside the
     /// trace handler, the concrete result is stored here so that the
     /// concrete CALL_FUNCTION handler can pick it up without re-executing.
-    ///
-    /// A stack is required instead of a single slot: helper-boundary
-    /// fallback execution can re-enter JITted code while an outer inline
-    /// framestack is still live. PyPy's frame switching keeps these result
-    /// channels scoped to the active frame stack; this stack/truncate scheme
-    /// is the pyre-side equivalent.
-    static INLINE_HANDLED_RESULTS: RefCell<Vec<PyObjectRef>> = const { RefCell::new(Vec::new()) };
+    static INLINE_HANDLED_RESULT: Cell<Option<PyObjectRef>> = const { Cell::new(None) };
 }
 
 /// Store an inline-handled result for the concrete handler to pick up.
 pub fn set_inline_handled_result(result: PyObjectRef) {
-    INLINE_HANDLED_RESULTS.with(|results| results.borrow_mut().push(result));
+    INLINE_HANDLED_RESULT.with(|c| c.set(Some(result)));
 }
 
 fn take_inline_handled_result() -> Option<PyObjectRef> {
-    INLINE_HANDLED_RESULTS.with(|results| results.borrow_mut().pop())
+    INLINE_HANDLED_RESULT.with(|c| c.take())
 }
 
 // ── Eval function injection ──────────────────────────────────────
@@ -82,14 +76,11 @@ pub fn inline_call_override_guard() -> InlineCallOverrideGuard {
 
 pub struct SuspendInlineCallOverrideGuard {
     previous_depth: u32,
-    previous_result_depth: usize,
 }
 
 impl Drop for SuspendInlineCallOverrideGuard {
     fn drop(&mut self) {
         INLINE_CALL_OVERRIDE_DEPTH.with(|d| d.set(self.previous_depth));
-        INLINE_HANDLED_RESULTS
-            .with(|results| results.borrow_mut().truncate(self.previous_result_depth));
     }
 }
 
@@ -102,11 +93,7 @@ pub fn suspend_inline_call_override() -> SuspendInlineCallOverrideGuard {
         d.set(0);
         previous
     });
-    let previous_result_depth = INLINE_HANDLED_RESULTS.with(|results| results.borrow().len());
-    SuspendInlineCallOverrideGuard {
-        previous_depth,
-        previous_result_depth,
-    }
+    SuspendInlineCallOverrideGuard { previous_depth }
 }
 
 fn try_inline_call_override(

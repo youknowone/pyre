@@ -1285,9 +1285,7 @@ impl Optimization for OptIntBounds {
             // intbounds.py: postprocess_GETFIELD_RAW_I — integer-bounded fields.
             // If the descriptor indicates a bounded integer field (e.g. u8, u16),
             // narrow the result bound to [min, max].
-            OpCode::GetfieldRawI
-            | OpCode::GetfieldGcI
-            | OpCode::GetinteriorfieldGcI => {
+            OpCode::GetfieldRawI | OpCode::GetfieldGcI | OpCode::GetinteriorfieldGcI => {
                 if let Some(ref d) = op.descr {
                     let (field_size, signed) = d.field_size_and_sign();
                     if field_size > 0 && field_size < 8 {
