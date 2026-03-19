@@ -1184,7 +1184,6 @@ impl<M: Clone> MetaInterp<M> {
         recorder.close_loop(jump_args);
         let trace = recorder.get_trace();
 
-        let mut optimizer = self.make_optimizer();
         let mut constants = ctx.constants.into_inner();
 
         if crate::majit_log_enabled() {
@@ -1193,13 +1192,17 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let num_ops_before = trace.ops.len();
-        let optimized_ops = optimizer.optimize_with_constants_and_inputs(
-            &trace.ops,
-            &mut constants,
-            trace.inputargs.len(),
-        );
+
+        // Use UnrollOptimizer for preamble peeling when available.
+        // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
+        let mut unroll_opt = majit_opt::unroll::UnrollOptimizer::new();
+        let (optimized_ops, final_num_inputs) =
+            unroll_opt.optimize_trace_with_constants_and_inputs(
+                &trace.ops,
+                &mut constants,
+                trace.inputargs.len(),
+            );
         let num_ops_after = optimized_ops.len();
-        let final_num_inputs = optimizer.final_num_inputs();
 
         // Extend inputargs if the optimizer added virtual inputs (virtualizable)
         let mut inputargs = trace.inputargs.clone();
