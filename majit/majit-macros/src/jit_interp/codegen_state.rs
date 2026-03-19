@@ -33,7 +33,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     let untraceable = &config.storage.untraceable;
     let scan_fn = &config.storage.scan_fn;
     let can_trace_guard = &config.storage.can_trace_guard;
-    let virtualizable = config.storage.virtualizable;
     let extra_guard = if let Some(method) = can_trace_guard {
         quote! { && self.#pool_field.#method() }
     } else {
@@ -80,11 +79,11 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             /// Auto-generated from `virtualizable_fields` declaration.
             /// RPython equivalent: VirtualizableInfo.__init__() in virtualizable.py.
             #[allow(non_snake_case)]
-            fn __build_virtualizable_info() -> majit_meta::virtualizable::VirtualizableInfo {
+            fn __build_virtualizable_info() -> Option<majit_meta::virtualizable::VirtualizableInfo> {
                 let mut __info = majit_meta::virtualizable::VirtualizableInfo::new(#token_offset);
                 #(#field_adds)*
                 #(#array_adds)*
-                __info
+                Some(__info)
             }
         }
     });
@@ -108,17 +107,11 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             loop_header_pc: usize,
             /// RPython parity: initial selected at trace header.
             header_selected: usize,
-            /// Virtualizable: data pointer OpRefs (storage_idx → OpRef).
-            vable_array_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
-            /// Virtualizable: length OpRefs (storage_idx → OpRef).
-            vable_len_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
+            /// Skip closing on the first merge_point at the loop header.
+            trace_started: bool,
             /// Number of storages from the original meta layout.
             /// Extra storages added during tracing are ignored in Jump args.
             meta_storage_count: usize,
-            /// Virtualizable: preamble already emitted for this trace.
-            preamble_done: bool,
-            /// Virtualizable: actual depths loaded by preamble (storage_idx → depth).
-            preamble_depths: std::collections::HashMap<usize, usize>,
         }
 
         #[allow(non_camel_case_types)]
@@ -176,20 +169,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
-                if #virtualizable {
-                    // Virtualizable: [ptr_0, len_0, ptr_1, len_1, ...]
-                    let mut args = Vec::new();
-                    for &(sidx, _) in self.storage_layout.iter().take(self.meta_storage_count) {
-                        if let (Some(ptr), Some(len)) = (
-                            self.vable_array_refs.get(&sidx).copied(),
-                            self.vable_len_refs.get(&sidx).copied(),
-                        ) {
-                            args.push(ptr);
-                            args.push(len);
-                        }
-                    }
-                    return Some(args);
-                }
                 let mut args = Vec::new();
                 for &(sidx, _) in &self.storage_layout {
                     args.extend(self.stacks[&sidx].to_jump_args());
@@ -198,38 +177,12 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn fail_storage_lengths(&self) -> Option<Vec<usize>> {
-                if #virtualizable { return None; }
                 Some(
                     self.storage_layout
                         .iter()
                         .map(|&(sidx, _)| self.stacks[&sidx].len())
                         .collect(),
                 )
-            }
-
-            fn is_virtualizable_storage(&self) -> bool {
-                !self.vable_array_refs.is_empty()
-            }
-
-            fn vable_array_ref(&self, storage_idx: usize) -> Option<majit_ir::OpRef> {
-                self.vable_array_refs.get(&storage_idx).copied()
-            }
-
-            fn vable_len_ref(&self, storage_idx: usize) -> Option<majit_ir::OpRef> {
-                self.vable_len_refs.get(&storage_idx).copied()
-            }
-
-            fn set_vable_array_ref(&mut self, storage_idx: usize, opref: majit_ir::OpRef) {
-                self.vable_array_refs.insert(storage_idx, opref);
-            }
-
-            fn set_vable_len_ref(&mut self, storage_idx: usize, opref: majit_ir::OpRef) {
-                self.vable_len_refs.insert(storage_idx, opref);
-            }
-
-            fn init_vable_storage(&mut self, storage_idx: usize, array_ref: majit_ir::OpRef, len_ref: majit_ir::OpRef) {
-                self.vable_array_refs.insert(storage_idx, array_ref);
-                self.vable_len_refs.insert(storage_idx, len_ref);
             }
         }
 
@@ -247,14 +200,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn build_meta(&self, header_pc: usize, program: &#env_type) -> __JitMeta {
                 let storages = #scan_fn(program, header_pc, self.#sel_field);
-                let layout = if #virtualizable {
-                    // Virtualizable: depth=0 for all. Preamble loads from heap.
-                    storages.iter().map(|&s| (s, 0usize)).collect()
-                } else {
-                    storages.iter()
-                        .map(|&s| (s, self.#pool_field.get(s).len()))
-                        .collect()
-                };
+                let layout = storages
+                    .iter()
+                    .map(|&s| (s, self.#pool_field.get(s).len()))
+                    .collect();
                 __JitMeta {
                     storage_layout: layout,
                     initial_selected: self.#sel_field,
@@ -262,47 +211,25 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
-                if #virtualizable {
-                    // Virtualizable: [ptr_0, len_0, ptr_1, len_1, ...]
-                    let mut values = Vec::new();
-                    for &(sidx, _) in &meta.storage_layout {
-                        let store = self.#pool_field.get(sidx);
-                        values.push(store.data_ptr() as i64);
-                        values.push(store.len() as i64);
+                let mut values = Vec::new();
+                for &(sidx, num_slots) in &meta.storage_layout {
+                    let store = self.#pool_field.get(sidx);
+                    for i in 0..num_slots {
+                        values.push(store.peek_at(i));
                     }
-                    values
-                } else {
-                    let mut values = Vec::new();
-                    for &(sidx, num_slots) in &meta.storage_layout {
-                        let store = self.#pool_field.get(sidx);
-                        for i in 0..num_slots {
-                            values.push(store.peek_at(i));
-                        }
-                    }
-                    values
                 }
+                values
             }
 
             fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                 let mut stacks = std::collections::HashMap::new();
-                let mut vable_len_refs = std::collections::HashMap::new();
-                let mut vable_array_refs = std::collections::HashMap::new();
-                if #virtualizable {
-                    // InputArgs = [ptr_0, len_0, ptr_1, len_1, ...]
-                    for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
-                        vable_array_refs.insert(sidx, majit_ir::OpRef((i * 2) as u32));
-                        vable_len_refs.insert(sidx, majit_ir::OpRef((i * 2 + 1) as u32));
-                        stacks.insert(sidx, majit_meta::SymbolicStack::new());
-                    }
-                } else {
-                    let mut offset = 0;
-                    for &(sidx, num_slots) in &meta.storage_layout {
-                        stacks.insert(
-                            sidx,
-                            majit_meta::SymbolicStack::from_input_args(offset, num_slots),
-                        );
-                        offset += num_slots;
-                    }
+                let mut offset = 0;
+                for &(sidx, num_slots) in &meta.storage_layout {
+                    stacks.insert(
+                        sidx,
+                        majit_meta::SymbolicStack::from_input_args(offset, num_slots),
+                    );
+                    offset += num_slots;
                 }
                 __JitSym {
                     stacks,
@@ -311,107 +238,61 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     storage_layout: meta.storage_layout.clone(),
                     loop_header_pc: header_pc,
                     header_selected: meta.initial_selected,
-                    vable_array_refs,
-                    vable_len_refs,
+                    trace_started: false,
                     meta_storage_count: meta.storage_layout.len(),
-                    preamble_done: false,
-                    preamble_depths: std::collections::HashMap::new(),
                 }
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
-                if #virtualizable {
-                    // Virtualizable: only check selected. Depths don't matter
-                    // because preamble re-loads from heap each iteration.
-                    meta.initial_selected == self.#sel_field
-                } else {
-                    meta.initial_selected == self.#sel_field
-                        && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
-                            self.#pool_field.get(sidx).len() == expected_len
-                        })
-                }
+                meta.initial_selected == self.#sel_field
+                    && meta.storage_layout.iter().all(|&(sidx, expected_len)| {
+                        self.#pool_field.get(sidx).len() == expected_len
+                    })
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                if #virtualizable {
-                    // Virtualizable: values = [ptr_0, len_0, ptr_1, len_1, ...]
-                    for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
-                        if let Some(&len_val) = values.get(i * 2 + 1) {
-                            self.#pool_field.get_mut(sidx).force_len(len_val as usize);
+                let mut offset = 0;
+                for &(sidx, num_slots) in &meta.storage_layout {
+                    let end = offset + num_slots;
+                    {
+                        let store = self.#pool_field.get_mut(sidx);
+                        store.clear();
+                        for &value in &values[offset..end] {
+                            store.push(value);
                         }
                     }
-                    self.#sel_field = meta.initial_selected;
-                } else {
-                    let mut offset = 0;
-                    for &(sidx, num_slots) in &meta.storage_layout {
-                        let end = offset + num_slots;
-                        {
-                            let store = self.#pool_field.get_mut(sidx);
-                            store.clear();
-                            for &value in &values[offset..end] {
-                                store.push(value);
-                            }
-                        }
-                        offset = end;
-                    }
-                    self.#sel_field = values
-                        .get(offset)
-                        .copied()
-                        .map(|value| value as usize)
-                        .unwrap_or(meta.initial_selected);
+                    offset = end;
                 }
+                self.#sel_field = values
+                    .get(offset)
+                    .copied()
+                    .map(|value| value as usize)
+                    .unwrap_or(meta.initial_selected);
             }
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
-                if #virtualizable {
-                    // Virtualizable: [ptr_0, len_0, ptr_1, len_1, ...]
-                    // sync_virtualizable_to_heap already updated len_refs.
-                    let mut args = Vec::new();
-                    for &(sidx, _) in sym.storage_layout.iter().take(sym.meta_storage_count) {
-                        if let (Some(ptr), Some(len)) = (
-                            sym.vable_array_refs.get(&sidx).copied(),
-                            sym.vable_len_refs.get(&sidx).copied(),
-                        ) {
-                            args.push(ptr);
-                            args.push(len);
-                        }
-                    }
-                    args
-                } else {
-                    let mut args = Vec::new();
-                    for &(sidx, _) in &sym.storage_layout {
-                        args.extend(sym.stacks[&sidx].to_jump_args());
-                    }
-                    args
+                let mut args = Vec::new();
+                for &(sidx, _) in &sym.storage_layout {
+                    args.extend(sym.stacks[&sidx].to_jump_args());
                 }
+                args
             }
 
             #vable_info_fn
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
-                if #virtualizable {
-                    // Check selected + preamble depths match + extra storages empty.
-                    sym.current_selected == meta.initial_selected
-                        && sym.preamble_depths.iter().all(|(sidx, &depth)| {
-                            sym.stacks.get(sidx).is_some_and(|s| s.len() == depth)
-                        })
-                        && sym.stacks.iter().all(|(sidx, stack)| {
-                            sym.preamble_depths.contains_key(sidx) || stack.len() == 0
-                        })
-                } else {
-                    sym.current_selected == meta.initial_selected
-                        && sym.storage_layout.len() == meta.storage_layout.len()
-                        && sym
-                            .storage_layout
-                            .iter()
-                            .zip(meta.storage_layout.iter())
-                            .all(|(&(sym_idx, _), &(meta_idx, _))| sym_idx == meta_idx)
-                        && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
-                            sym.stacks
-                                .get(&sidx)
-                                .is_some_and(|stack| stack.len() == initial_depth)
-                        })
-                }
+                sym.current_selected == meta.initial_selected
+                    && sym.storage_layout.len() == meta.storage_layout.len()
+                    && sym
+                        .storage_layout
+                        .iter()
+                        .zip(meta.storage_layout.iter())
+                        .all(|(&(sym_idx, _), &(meta_idx, _))| sym_idx == meta_idx)
+                    && meta.storage_layout.iter().all(|&(sidx, initial_depth)| {
+                        sym.stacks
+                            .get(&sidx)
+                            .is_some_and(|stack| stack.len() == initial_depth)
+                    })
             }
         }
     }
@@ -816,6 +697,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             #(#sym_array_fields)*
             #(#sym_virt_array_fields)*
             loop_header_pc: usize,
+            trace_started: bool,
         }
 
         impl majit_meta::JitCodeSym for __JitSym {
@@ -934,6 +816,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                     #(#create_sym_virt_array_ptr_names,)*
                     #(#create_sym_virt_array_len_names,)*
                     loop_header_pc: header_pc,
+                    trace_started: false,
                 }
             }
 
