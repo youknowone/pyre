@@ -7,7 +7,7 @@
 /// Reference: rpython/jit/metainterp/pyjitpl.py MetaInterp.record()
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 
-use crate::trace::TreeLoop;
+use crate::history::TreeLoop;
 
 /// Default maximum number of operations before the trace is considered too long.
 /// Mirrors the configurable warmstate `trace_limit` parameter.

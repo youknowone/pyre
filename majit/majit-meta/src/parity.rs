@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use majit_ir::{Op, OpRef, Type};
-use majit_trace::trace::TreeLoop;
+use majit_trace::history::TreeLoop;
 
 /// A small, stable parity case format for comparing majit traces against
 /// RPython-derived expectations.

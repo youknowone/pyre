@@ -7,7 +7,7 @@ use majit_codegen::{
 use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_opt::optimizer::Optimizer;
-use majit_trace::trace::TreeLoop;
+use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state};

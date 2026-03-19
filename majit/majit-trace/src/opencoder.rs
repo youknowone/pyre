@@ -4,9 +4,9 @@
 /// a compact binary format for serializing and deserializing traces.
 ///
 /// Uses LEB128 variable-length integer encoding for compactness.
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type, OPCODE_COUNT};
+use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type};
 
-use crate::trace::TreeLoop;
+use crate::history::TreeLoop;
 
 /// Encode a u64 as a variable-length integer (LEB128).
 pub fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
