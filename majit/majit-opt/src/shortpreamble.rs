@@ -286,6 +286,53 @@ pub struct PreambleOp {
     pub label_arg_idx: Option<usize>,
 }
 
+impl PreambleOp {
+    /// shortpreamble.py: add_op_to_short(sb) — per-kind logic.
+    ///
+    /// For HeapOp: reconstruct the getfield/getarrayitem with remapped args.
+    /// For PureOp: reconstruct the pure op (promoting to CALL_PURE if call).
+    /// For LoopInvariantOp: reconstruct as CALL_LOOPINVARIANT.
+    pub fn add_op_to_short(&self) -> ProducedShortOp {
+        let preamble_op = match &self.kind {
+            PreambleOpKind::Heap { descr_idx: _ } => {
+                // HeapOp: the op is already a GETFIELD/GETARRAYITEM
+                self.op.clone()
+            }
+            PreambleOpKind::Pure => {
+                // PureOp: if it's a call, promote to CALL_PURE
+                let mut op = self.op.clone();
+                if op.opcode.is_call() {
+                    op.opcode = match op.opcode {
+                        OpCode::CallI => OpCode::CallPureI,
+                        OpCode::CallR => OpCode::CallPureR,
+                        OpCode::CallF => OpCode::CallPureF,
+                        OpCode::CallN => OpCode::CallPureN,
+                        other => other,
+                    };
+                }
+                op
+            }
+            PreambleOpKind::LoopInvariant => {
+                // LoopInvariantOp: promote to CALL_LOOPINVARIANT
+                let mut op = self.op.clone();
+                op.opcode = match op.opcode {
+                    OpCode::CallI => OpCode::CallLoopinvariantI,
+                    OpCode::CallR => OpCode::CallLoopinvariantR,
+                    OpCode::CallF => OpCode::CallLoopinvariantF,
+                    OpCode::CallN => OpCode::CallLoopinvariantN,
+                    other => other,
+                };
+                op
+            }
+            PreambleOpKind::Guard => self.op.clone(),
+        };
+        ProducedShortOp {
+            kind: self.kind.clone(),
+            preamble_op,
+        }
+    }
+}
+
 /// shortpreamble.py: ShortBoxes — tracks which values from the preamble
 /// are "boxed" into the short preamble. Maps label arg indices to
 /// the operations that produce them.
