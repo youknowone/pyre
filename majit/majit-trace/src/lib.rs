@@ -11,5 +11,5 @@ pub mod heapcache;
 pub mod logger;
 pub mod opencoder;
 pub mod recorder;
-pub mod trace;
+pub mod history;
 pub mod warmstate;
