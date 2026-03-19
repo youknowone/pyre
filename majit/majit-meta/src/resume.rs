@@ -870,14 +870,49 @@ pub enum VirtualInfo {
         element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
     },
     /// Virtual raw memory buffer (from raw_malloc).
-    ///
-    /// Stores offset→value mappings for a raw memory region that was
-    /// virtualized during optimization.
     VRawBuffer {
         /// Size of the buffer in bytes.
         size: usize,
         /// Values stored at byte offsets: (offset, size_in_bytes, source).
         entries: Vec<(usize, usize, VirtualFieldSource)>,
+    },
+    /// resume.py: VRawSliceInfo — a slice into a virtual raw buffer.
+    VRawSlice {
+        /// Offset from the parent raw buffer.
+        offset: i64,
+        /// Source of the parent buffer.
+        parent: VirtualFieldSource,
+    },
+    /// resume.py: VStrPlainInfo — virtual string (known characters).
+    VStrPlain {
+        /// Character values (as OpRef sources).
+        chars: Vec<VirtualFieldSource>,
+    },
+    /// resume.py: VStrConcatInfo — virtual string concat (left + right).
+    VStrConcat {
+        left: Box<VirtualFieldSource>,
+        right: Box<VirtualFieldSource>,
+    },
+    /// resume.py: VStrSliceInfo — virtual string slice.
+    VStrSlice {
+        source: Box<VirtualFieldSource>,
+        start: Box<VirtualFieldSource>,
+        length: Box<VirtualFieldSource>,
+    },
+    /// resume.py: VUniPlainInfo — virtual unicode string.
+    VUniPlain {
+        chars: Vec<VirtualFieldSource>,
+    },
+    /// resume.py: VUniConcatInfo — virtual unicode concat.
+    VUniConcat {
+        left: Box<VirtualFieldSource>,
+        right: Box<VirtualFieldSource>,
+    },
+    /// resume.py: VUniSliceInfo — virtual unicode slice.
+    VUniSlice {
+        source: Box<VirtualFieldSource>,
+        start: Box<VirtualFieldSource>,
+        length: Box<VirtualFieldSource>,
     },
 }
 
@@ -888,7 +923,15 @@ impl VirtualInfo {
             VirtualInfo::VStruct { .. } => ResumeVirtualKind::Struct,
             VirtualInfo::VArray { .. } => ResumeVirtualKind::Array,
             VirtualInfo::VArrayStruct { .. } => ResumeVirtualKind::ArrayStruct,
-            VirtualInfo::VRawBuffer { .. } => ResumeVirtualKind::RawBuffer,
+            VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. } => {
+                ResumeVirtualKind::RawBuffer
+            }
+            VirtualInfo::VStrPlain { .. }
+            | VirtualInfo::VStrConcat { .. }
+            | VirtualInfo::VStrSlice { .. }
+            | VirtualInfo::VUniPlain { .. }
+            | VirtualInfo::VUniConcat { .. }
+            | VirtualInfo::VUniSlice { .. } => ResumeVirtualKind::Struct,
         }
     }
 
@@ -958,6 +1001,19 @@ impl VirtualInfo {
                         )
                     })
                     .collect(),
+            },
+            // String/unicode virtual infos — represented as structs
+            // with synthetic field indices for reconstruction.
+            VirtualInfo::VRawSlice { .. }
+            | VirtualInfo::VStrPlain { .. }
+            | VirtualInfo::VStrConcat { .. }
+            | VirtualInfo::VStrSlice { .. }
+            | VirtualInfo::VUniPlain { .. }
+            | VirtualInfo::VUniConcat { .. }
+            | VirtualInfo::VUniSlice { .. } => ResumeVirtualLayoutSummary::Struct {
+                type_id: 0,
+                descr_index: 0,
+                fields: vec![],
             },
         }
     }
@@ -1232,6 +1288,20 @@ impl EncodedResumeData {
                         fail_arg_indices,
                     ));
                 }
+            }
+            // String/unicode/raw-slice virtuals: encode as empty struct
+            // (reconstruction uses the VirtualInfo directly, not encoded form)
+            VirtualInfo::VRawSlice { .. }
+            | VirtualInfo::VStrPlain { .. }
+            | VirtualInfo::VStrConcat { .. }
+            | VirtualInfo::VStrSlice { .. }
+            | VirtualInfo::VUniPlain { .. }
+            | VirtualInfo::VUniConcat { .. }
+            | VirtualInfo::VUniSlice { .. } => {
+                code.push(EncodedVirtualKind::VStruct as i64);
+                code.push(0); // type_id
+                code.push(0); // descr_index
+                code.push(0); // num fields
             }
         }
     }
@@ -1844,6 +1914,17 @@ impl MaterializedVirtual {
                 size: *size,
                 entries: Vec::new(),
             },
+            VirtualInfo::VRawSlice { .. }
+            | VirtualInfo::VStrPlain { .. }
+            | VirtualInfo::VStrConcat { .. }
+            | VirtualInfo::VStrSlice { .. }
+            | VirtualInfo::VUniPlain { .. }
+            | VirtualInfo::VUniConcat { .. }
+            | VirtualInfo::VUniSlice { .. } => MaterializedVirtual::Struct {
+                type_id: 0,
+                descr_index: 0,
+                fields: Vec::new(),
+            },
         }
     }
 
@@ -2303,6 +2384,79 @@ impl ResumeDataLoopMemo {
 impl Default for ResumeDataLoopMemo {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// resume.py: AbstractResumeDataReader — reads resume data to
+/// reconstruct interpreter state after a guard failure.
+///
+/// Two concrete implementations in RPython:
+/// - ResumeDataBoxReader: creates boxes (for blackhole interpreter)
+/// - ResumeDataDirectReader: reads values directly (for fast path)
+pub struct ResumeDataReader<'a> {
+    /// The resume data to read from.
+    resume_data: &'a ResumeData,
+    /// Fail argument values from the guard failure.
+    fail_values: &'a [i64],
+    /// Materialized virtuals (lazily populated).
+    virtuals: Vec<Option<i64>>,
+}
+
+impl<'a> ResumeDataReader<'a> {
+    /// resume.py: AbstractResumeDataReader.__init__
+    pub fn new(resume_data: &'a ResumeData, fail_values: &'a [i64]) -> Self {
+        let num_virtuals = resume_data.virtuals.len();
+        ResumeDataReader {
+            resume_data,
+            fail_values,
+            virtuals: vec![None; num_virtuals],
+        }
+    }
+
+    /// resume.py: _decode_box — decode a tagged value reference.
+    pub fn decode_frame_slot(&self, source: &FrameSlotSource) -> i64 {
+        self.decode_value(source)
+    }
+
+    /// Decode a ResumeValueSource to a concrete value.
+    pub fn decode_value(&self, source: &ResumeValueSource) -> i64 {
+        match source {
+            ResumeValueSource::FailArg(idx) => {
+                self.fail_values.get(*idx).copied().unwrap_or(0)
+            }
+            ResumeValueSource::Constant(val) => *val,
+            ResumeValueSource::Virtual(vidx) => {
+                self.virtuals.get(*vidx).copied().flatten().unwrap_or(0)
+            }
+            ResumeValueSource::Uninitialized | ResumeValueSource::Unavailable => 0,
+        }
+    }
+
+    /// resume.py: consume_boxes — read all frame slots for one frame.
+    pub fn read_frame_slots(&self, frame_idx: usize) -> Vec<i64> {
+        if frame_idx >= self.resume_data.frames.len() {
+            return vec![];
+        }
+        let frame = &self.resume_data.frames[frame_idx];
+        frame
+            .slot_map
+            .iter()
+            .map(|source| self.decode_frame_slot(source))
+            .collect()
+    }
+
+    /// Number of frames in the resume data.
+    pub fn num_frames(&self) -> usize {
+        self.resume_data.frames.len()
+    }
+
+    /// PC for a given frame.
+    pub fn frame_pc(&self, frame_idx: usize) -> u64 {
+        self.resume_data
+            .frames
+            .get(frame_idx)
+            .map(|f| f.pc)
+            .unwrap_or(0)
     }
 }
 
