@@ -755,14 +755,11 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        // Self-recursive direct call_assembler fast-path is not yet compatible
-        // with pyre's concrete framestack/residual-call protocol.  When a
-        // guard fails, the blackholed frame can re-enter plain interpreter
-        // execution with an inconsistent concrete stack and trigger
-        // "stack underflow during interpreter opcode".  Keep self-recursive
-        // force on the stable eval_with_jit re-entry path until frame-switch
-        // tracing fully owns this transition.
-        match pyre_interp::eval::eval_loop_for_force(frame) {
+        // RPython assembler_call_helper: try compiled code first, fall
+        // back to interpreter. eval_with_jit matches this — it calls
+        // try_function_entry_jit (compiled dispatch) then eval_loop_jit.
+        let _recursive_entry = crate::eval::recursive_force_entry_bump();
+        match crate::eval::eval_with_jit(frame) {
             Ok(result) => match protocol {
                 FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
                     w_int_get_value(result)

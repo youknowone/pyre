@@ -124,7 +124,7 @@ pub(crate) struct TraceFrameState {
 pub struct PyreEnv;
 
 fn pyobject_array_descr() -> DescrRef {
-    make_array_descr(0, 8, Type::Int, false)
+    make_array_descr(0, 8, Type::Ref, false)
 }
 
 fn frame_locals_cells_stack_descr() -> DescrRef {
@@ -3243,7 +3243,14 @@ impl JitState for PyreJitState {
         }
 
         if meta.has_virtualizable {
-            // Virtualizable format
+            // Virtualizable exits carry the current frame state, not the
+            // merge-point state from `meta`.
+            //
+            // In particular, GuardNotForced from function-entry traces resumes
+            // the CALL bytecode with a deeper operand stack than
+            // `meta.valuestackdepth`.  Using the merge-point depth here drops
+            // callable/arg slots and resumes the interpreter with a corrupt
+            // stack.  RPython restores from the payload itself.
             let ints: Vec<i64> = values
                 .iter()
                 .map(|v| match v {
