@@ -372,6 +372,11 @@ extern "C" fn jit_bridge_compile_callee(
 
 // ── Callee frame creation for call_assembler ─────────────────────
 
+/// Public wrapper for trace-through inlining.
+pub fn create_callee_frame_impl_pub(caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
+    create_callee_frame_impl(caller_frame, callable, args)
+}
+
 fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
     let callable = callable as PyObjectRef;
     let code_ptr = unsafe { w_func_get_code_ptr(callable) };

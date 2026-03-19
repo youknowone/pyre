@@ -608,6 +608,15 @@ impl TraceFrameState {
     /// PyPy generate_guard + capture_resumedata: uses current_fail_args
     /// which encodes the full framestack for multi-frame resume.
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
+        // If parent_fail_args is set (inlined callee), use parent's
+        // state for guard recovery instead of callee's vable fields.
+        if let Some(ref pfa) = self.parent_fail_args {
+            let types: Vec<majit_ir::Type> =
+                pfa.iter().map(|_| majit_ir::Type::Int).collect();
+            ctx.record_guard_typed_with_fail_args(opcode, args, types, pfa);
+            return;
+        }
+
         self.flush_to_frame(ctx);
         let s = self.sym();
         let stack_only = s.stack_only_depth();
@@ -1602,8 +1611,17 @@ impl TraceFrameState {
                 let (driver, _) = crate::eval::driver_pair();
                 let nargs = args.len();
 
-                // PyPy max_unroll_recursion: inline before CallAssembler
+                // PyPy perform_call: trace INTO callee body for non-recursive calls.
+                // Self-recursive calls use CallMayForce (inline_function_call).
+                let current_green_key = unsafe {
+                    let cf = &*(self.concrete_frame as *const pyre_interp::frame::PyFrame);
+                    cf.code as u64
+                };
+                let is_self_recursive = callee_key == current_green_key;
+
                 if driver.should_inline(callee_key) == majit_meta::InlineDecision::Inline {
+                    // Inline path: always use CallMayForce (safe for finish traces).
+                    // Trace-through is only attempted from CallAssembler path.
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                         return self.inline_function_call(
                             callable,
@@ -1752,13 +1770,101 @@ impl TraceFrameState {
         self.trace_call_callable(callable, args)
     }
 
-    /// Trace-through inline: synchronously trace AND execute callee.
+    /// PyPy perform_call + _interpret: trace INTO callee body.
     ///
-    /// Only used for non-self-recursive calls (should_inline blocks
-    /// self-recursion with ResidualCall + boost). The callee is fully
-    /// traced and executed before returning — like PyPy's perform_call
-    /// PyPy perform_call equivalent: CallMayForce + GuardNotForced.
-    /// Uses fused jit_force_recursive_call_1 for single-arg calls.
+    /// Instead of emitting an opaque CallMayForce, traces each callee
+    /// bytecode instruction into the current trace. Simple functions
+    /// like `add(a,b): return a+b` become `IntAdd(a,b)` in the trace.
+    fn trace_through_callee(
+        &mut self,
+        callable: OpRef,
+        args: &[OpRef],
+        concrete_callable: PyObjectRef,
+        callee_key: u64,
+    ) -> Result<OpRef, PyError> {
+        use pyre_interp::frame::PyFrame;
+
+        // Only trace-through when caller has valid virtualizable state.
+        // Finish traces and nested inlines don't have vable_next_instr set.
+        if self.sym().vable_next_instr.is_none() {
+            return Err(PyError::type_error("no vable state for trace-through"));
+        }
+
+        let (driver, _) = crate::eval::driver_pair();
+        driver.enter_inline_frame(callee_key);
+
+        // Guard callable identity
+        self.with_ctx(|this, ctx| {
+            this.guard_value(ctx, callable, concrete_callable as i64);
+        });
+
+        // Get concrete args using the established helper
+        let concrete_args: Vec<PyObjectRef> = (0..args.len())
+            .map(|i| {
+                self.concrete_call_arg_after_pops(i)
+                    .unwrap_or(pyre_object::PY_NULL)
+            })
+            .collect();
+
+        // Create concrete callee frame
+        let callee_frame_ptr = crate::call_jit::create_callee_frame_impl_pub(
+            self.concrete_frame as i64,
+            concrete_callable as i64,
+            &concrete_args,
+        );
+        let callee_frame = unsafe { &mut *(callee_frame_ptr as *mut PyFrame) };
+
+        // Create symbolic OpRef for callee frame in trace
+        let callee_frame_opref = self.with_ctx(|this, ctx| {
+            if let Some(frame_helper) = crate::call_jit::callee_frame_helper(args.len()) {
+                let mut helper_args = vec![this.frame(), callable];
+                helper_args.extend_from_slice(args);
+                ctx.call_int(frame_helper, &helper_args)
+            } else {
+                panic!("no frame helper for {} args", args.len());
+            }
+        });
+
+        // Initialize callee PyreSym with arg OpRefs as locals
+        let callee_code = unsafe { &*callee_frame.code };
+        let mut callee_sym = PyreSym::new_uninit(callee_frame_opref);
+        callee_sym.nlocals = callee_code.varnames.len();
+        callee_sym.valuestackdepth = callee_sym.nlocals;
+        callee_sym.symbolic_locals = Vec::with_capacity(callee_sym.nlocals);
+        for i in 0..callee_sym.nlocals {
+            if i < args.len() {
+                callee_sym.symbolic_locals.push(args[i]);
+            } else {
+                callee_sym.symbolic_locals.push(OpRef::NONE);
+            }
+        }
+        callee_sym.symbolic_stack = Vec::new();
+        callee_sym.symbolic_initialized = true;
+
+        // Capture parent fail_args for multi-frame guard resume
+        let parent_fail_args = self.build_single_frame_fail_args();
+
+        // Trace and execute callee body (PyPy _interpret loop)
+        let ctx_ptr = self.ctx;
+        let ctx = unsafe { &mut *ctx_ptr };
+        let (result_opref, concrete_result) = inline_trace_and_execute(
+            ctx,
+            callee_frame_opref,
+            unsafe { std::ptr::read(callee_frame as *const PyFrame) },
+            parent_fail_args,
+        )?;
+
+        // Write concrete result to caller's stack for subsequent execution
+        pyre_interp::call::set_inline_handled_result(concrete_result);
+
+        let (driver, _) = crate::eval::driver_pair();
+        driver.leave_inline_frame();
+
+        Ok(result_opref)
+    }
+
+    /// CallMayForce-based inline: opaque helper call.
+    /// Fallback for self-recursion or when trace-through is not available.
     fn inline_function_call(
         &mut self,
         callable: OpRef,
@@ -2992,7 +3098,7 @@ fn inline_trace_and_execute(
                         pyre_interp::call::set_inline_handled_result(concrete_result);
                         continue; // ChangeFrame: resume parent
                     }
-                    _ => {
+                    other => {
                         return Err(pyre_runtime::PyError::type_error(
                             "expected concrete return after trace finish",
                         ));
