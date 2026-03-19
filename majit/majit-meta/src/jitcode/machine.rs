@@ -79,6 +79,11 @@ pub trait JitCodeSym {
         None
     }
 
+    /// Types of fail_args values. When Some, used instead of default all-Int.
+    fn fail_args_types(&self) -> Option<Vec<majit_ir::Type>> {
+        None
+    }
+
     /// Compact storage-pool support: raw data pointer for a traced storage.
     fn compact_storage_ptr(&self, _selected: usize) -> Option<OpRef> {
         None
@@ -143,6 +148,51 @@ pub trait JitCodeSym {
     /// Encode a semantic integer value into the raw compact storage representation.
     fn compact_storage_encode(&self, _ctx: &mut TraceCtx, value: OpRef) -> OpRef {
         value
+    }
+
+    // -- Linked list storage support -----
+    //
+    // RPython parity: rpaheui uses linked list stacks. OptVirtualize
+    // eliminates Node allocations for push/pop within the same trace.
+
+    /// Get the linked list head OpRef for a storage.
+    /// When Some, push/pop emit New/SetfieldGc/GetfieldGc instead of
+    /// compact array or symbolic stack operations.
+    fn linked_list_head(&self, _selected: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Update the linked list head OpRef for a storage.
+    fn set_linked_list_head(&mut self, _selected: usize, _head: OpRef) {}
+
+    /// Ensure linked list head is loaded for a storage.
+    /// Lazily loads from the pool object via GetfieldRawI on first access.
+    fn ensure_linked_list_head(&mut self, _ctx: &mut TraceCtx, selected: usize) -> Option<OpRef> {
+        self.linked_list_head(selected)
+    }
+
+    /// Write new linked list head back to the pool object's head cache.
+    fn linked_list_writeback_head(
+        &mut self,
+        _ctx: &mut TraceCtx,
+        _selected: usize,
+        _new_head: OpRef,
+    ) {
+    }
+
+    /// Node size descriptor for New() IR emission.
+    fn node_size_descr(&self) -> Option<majit_ir::DescrRef> {
+        None
+    }
+
+    /// Node.value field descriptor for SetfieldGc/GetfieldGcI.
+    fn node_value_descr(&self) -> Option<majit_ir::DescrRef> {
+        None
+    }
+
+    /// Node.next field descriptor for SetfieldGc/GetfieldGcR.
+    fn node_next_descr(&self) -> Option<majit_ir::DescrRef> {
+        None
     }
 
     // -- State field support (register/tape machines) -----
@@ -290,6 +340,19 @@ where
         unsafe { active.info.tracing_after_residual_call(active.obj_ptr) }
     }
 
+    fn finalize_standard_virtualizable_may_force(
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        active: Option<ActiveStandardVirtualizable>,
+    ) -> TraceAction {
+        if Self::finish_standard_virtualizable_after_residual_call(active) {
+            TraceAction::Abort
+        } else {
+            ctx.guard_not_forced(sym.total_slots());
+            TraceAction::Continue
+        }
+    }
+
     fn record_state_guard(
         ctx: &mut TraceCtx,
         sym: &mut S,
@@ -298,17 +361,32 @@ where
         extra_fail_args: &[OpRef],
     ) {
         if let Some(mut fail_args) = sym.fail_args_with_ctx(ctx) {
+            let mut fail_types = sym.fail_args_types();
             if let Some(lengths) = sym.fail_storage_lengths() {
+                let n = lengths.len();
                 fail_args.extend(lengths.into_iter().map(|len| ctx.const_int(len as i64)));
+                if let Some(ref mut types) = fail_types {
+                    types.extend(std::iter::repeat(majit_ir::Type::Int).take(n));
+                }
             }
             if !sym.selected_in_fail_args_prefix() {
                 let selected = sym
                     .guard_selected_value()
                     .unwrap_or_else(|| ctx.const_int(sym.guard_selected() as i64));
                 fail_args.push(selected);
+                if let Some(ref mut types) = fail_types {
+                    types.push(majit_ir::Type::Int);
+                }
             }
             fail_args.extend_from_slice(extra_fail_args);
-            ctx.record_guard_with_fail_args(opcode, args, fail_args.len(), &fail_args);
+            if let Some(ref mut types) = fail_types {
+                types.extend(std::iter::repeat(majit_ir::Type::Int).take(extra_fail_args.len()));
+            }
+            if let Some(types) = fail_types {
+                ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
+            } else {
+                ctx.record_guard_with_fail_args(opcode, args, fail_args.len(), &fail_args);
+            }
         } else {
             ctx.record_guard(opcode, args, sym.total_slots());
         }
@@ -470,6 +548,69 @@ where
         let decoded = sym.compact_storage_decode(ctx, raw);
         Ok((decoded, concrete))
     }
+
+    // ── Linked list push/pop (RPython parity: Node virtualization) ──
+
+    /// Emit IR for linked list push: New(Node) + SetfieldGc(value) + SetfieldGc(next).
+    /// OptVirtualize will virtualize the Node allocation when consumed in the same trace.
+    fn linked_list_push(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        selected: usize,
+        value: OpRef,
+        concrete: i64,
+    ) -> Result<(), TraceAction> {
+        let size_descr = sym.node_size_descr().ok_or(TraceAction::Abort)?;
+        let value_descr = sym.node_value_descr().ok_or(TraceAction::Abort)?;
+        let next_descr = sym.node_next_descr().ok_or(TraceAction::Abort)?;
+
+        let old_head = sym.linked_list_head(selected).ok_or(TraceAction::Abort)?;
+
+        // node = New(Node_size_descr)
+        let node = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+        // node.value = value
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[node, value], value_descr);
+        // node.next = old_head
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[node, old_head], next_descr);
+        // stack.head = node (symbolic only — no heap writeback)
+        // RPython parity: head is carried as JUMP arg, not written to heap.
+        // Heap is only written on guard failure (via fail_args).
+        sym.set_linked_list_head(selected, node);
+
+        self.runtime_stack_mut(selected, runtime).push(concrete);
+        Ok(())
+    }
+
+    /// Emit IR for linked list pop: GetfieldGcI(value) + GetfieldGcR(next).
+    fn linked_list_pop(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        selected: usize,
+    ) -> Result<(OpRef, i64), TraceAction> {
+        let value_descr = sym.node_value_descr().ok_or(TraceAction::Abort)?;
+        let next_descr = sym.node_next_descr().ok_or(TraceAction::Abort)?;
+
+        let head = sym.linked_list_head(selected).ok_or(TraceAction::Abort)?;
+
+        // value = head.value
+        let value = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr);
+        // next = head.next
+        let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
+        // stack.head = next (symbolic only — no heap writeback)
+        sym.set_linked_list_head(selected, next);
+
+        let concrete = self
+            .runtime_stack_mut(selected, runtime)
+            .pop()
+            .ok_or(TraceAction::Abort)?;
+        Ok((value, concrete))
+    }
+
+    // ── Compact storage push/pop ──
 
     fn compact_push_int(
         &mut self,
@@ -643,7 +784,14 @@ where
             BC_POP_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if sym.ensure_linked_list_head(ctx, selected).is_some() {
+                    let Ok((symbolic, concrete)) =
+                        self.linked_list_pop(ctx, sym, runtime, selected)
+                    else {
+                        return TraceAction::Abort;
+                    };
+                    self.set_int_reg(dst, Some(symbolic), Some(concrete));
+                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     let Ok((symbolic, concrete)) =
                         self.compact_pop_int(ctx, sym, runtime, selected)
                     else {
@@ -662,7 +810,15 @@ where
             BC_PEEK_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if sym.ensure_linked_list_head(ctx, selected).is_some() {
+                    // Linked list peek: head.value without pop
+                    let value_descr = sym.node_value_descr().expect("node_value_descr");
+                    let head = sym.linked_list_head(selected).expect("linked_list_head");
+                    let symbolic =
+                        ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr);
+                    let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
+                    self.set_int_reg(dst, Some(symbolic), concrete);
+                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     let Ok((symbolic, concrete)) =
                         self.compact_peek_int(ctx, sym, runtime, selected)
                     else {
@@ -683,7 +839,15 @@ where
                 let src = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 let (value, concrete) = self.read_int_reg(src);
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if sym.ensure_linked_list_head(ctx, selected).is_some() {
+                    // Linked list mode: emit New + SetfieldGc (OptVirtualize target)
+                    if self
+                        .linked_list_push(ctx, sym, runtime, selected, value, concrete)
+                        .is_err()
+                    {
+                        return TraceAction::Abort;
+                    }
+                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     if self
                         .compact_push_int(ctx, sym, runtime, selected, value, concrete)
                         .is_err()
@@ -719,7 +883,23 @@ where
             }
             BC_DUP_STACK => {
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if sym.ensure_linked_list_head(ctx, selected).is_some() {
+                    // Linked list dup: peek head.value, then push it
+                    let value_descr = sym.node_value_descr().expect("node_value_descr");
+                    let head = sym.linked_list_head(selected).expect("linked_list_head");
+                    let value = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr);
+                    let concrete = self
+                        .runtime_stack_mut(selected, runtime)
+                        .last()
+                        .copied()
+                        .expect("dup on empty runtime stack");
+                    if self
+                        .linked_list_push(ctx, sym, runtime, selected, value, concrete)
+                        .is_err()
+                    {
+                        return TraceAction::Abort;
+                    }
+                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     let concrete_stack = self.runtime_stack_mut(selected, runtime);
                     let Some(concrete) = concrete_stack.last().copied() else {
                         return TraceAction::Abort;
@@ -752,7 +932,20 @@ where
             }
             BC_SWAP_STACK => {
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if sym.ensure_linked_list_head(ctx, selected).is_some() {
+                    // Linked list swap: swap head.value and head.next.value
+                    let value_descr = sym.node_value_descr().expect("node_value_descr");
+                    let next_descr = sym.node_next_descr().expect("node_next_descr");
+                    let head = sym.linked_list_head(selected).expect("head");
+                    let next_node = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr.clone());
+                    let val_top = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr.clone());
+                    let val_prev = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[next_node], value_descr.clone());
+                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[head, val_prev], value_descr.clone());
+                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[next_node, val_top], value_descr);
+                    let runtime_stack = self.runtime_stack_mut(selected, runtime);
+                    let len = runtime_stack.len();
+                    runtime_stack.swap(len - 1, len - 2);
+                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     let runtime_stack = self.runtime_stack_mut(selected, runtime);
                     let len = runtime_stack.len();
                     assert!(
@@ -1151,6 +1344,13 @@ where
                             return TraceAction::Abort;
                         };
                         (cond, runtime_cond)
+                    } else if sym.linked_list_head(selected).is_some() {
+                        let Ok((cond, runtime_cond)) =
+                            self.linked_list_pop(ctx, sym, runtime, selected)
+                        else {
+                            return TraceAction::Abort;
+                        };
+                        (cond, runtime_cond)
                     } else {
                         let runtime_cond = {
                             let runtime_stack = self.runtime_stack_mut(selected, runtime);
@@ -1336,11 +1536,13 @@ where
                         _ => unreachable!(),
                     }
                     call_void_function(concrete_ptr, &concrete_args);
-                    if bytecode == BC_CALL_MAY_FORCE_VOID {
-                        if Self::finish_standard_virtualizable_after_residual_call(active_vable) {
-                            return TraceAction::Abort;
-                        }
-                        ctx.guard_not_forced(sym.total_slots());
+                    if bytecode == BC_CALL_MAY_FORCE_VOID
+                        && matches!(
+                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                            TraceAction::Abort
+                        )
+                    {
+                        return TraceAction::Abort;
                     }
                 }
             }
@@ -1377,7 +1579,14 @@ where
                     (frame.next_u16() as usize, frame.next_u16() as usize)
                 };
                 let (value, concrete) = self.read_int_reg(src_idx);
-                if Self::compact_storage_refs(ctx, sym, target).is_some() {
+                if sym.ensure_linked_list_head(ctx, target).is_some() {
+                    if self
+                        .linked_list_push(ctx, sym, runtime, target, value, concrete)
+                        .is_err()
+                    {
+                        return TraceAction::Abort;
+                    }
+                } else if Self::compact_storage_refs(ctx, sym, target).is_some() {
                     if self
                         .compact_push_int(ctx, sym, runtime, target, value, concrete)
                         .is_err()
@@ -1478,11 +1687,13 @@ where
                         _ => unreachable!(),
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    if opcode == BC_CALL_MAY_FORCE_INT {
-                        if Self::finish_standard_virtualizable_after_residual_call(active_vable) {
-                            return TraceAction::Abort;
-                        }
-                        ctx.guard_not_forced(sym.total_slots());
+                    if opcode == BC_CALL_MAY_FORCE_INT
+                        && matches!(
+                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                            TraceAction::Abort
+                        )
+                    {
+                        return TraceAction::Abort;
                     }
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                 }
@@ -1597,11 +1808,13 @@ where
                         _ => unreachable!(),
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    if opcode == BC_CALL_MAY_FORCE_REF {
-                        if Self::finish_standard_virtualizable_after_residual_call(active_vable) {
-                            return TraceAction::Abort;
-                        }
-                        ctx.guard_not_forced(sym.total_slots());
+                    if opcode == BC_CALL_MAY_FORCE_REF
+                        && matches!(
+                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                            TraceAction::Abort
+                        )
+                    {
+                        return TraceAction::Abort;
                     }
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                 }
@@ -1716,11 +1929,13 @@ where
                         _ => unreachable!(),
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    if opcode == BC_CALL_MAY_FORCE_FLOAT {
-                        if Self::finish_standard_virtualizable_after_residual_call(active_vable) {
-                            return TraceAction::Abort;
-                        }
-                        ctx.guard_not_forced(sym.total_slots());
+                    if opcode == BC_CALL_MAY_FORCE_FLOAT
+                        && matches!(
+                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                            TraceAction::Abort
+                        )
+                    {
+                        return TraceAction::Abort;
                     }
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 }
@@ -2423,6 +2638,18 @@ mod tests {
 
     extern "C" fn residual_no_force(_vable: i64) {}
 
+    extern "C" fn residual_int_no_force(_vable: i64) -> i64 {
+        7
+    }
+
+    extern "C" fn residual_ref_no_force(vable: i64) -> i64 {
+        vable
+    }
+
+    extern "C" fn residual_float_no_force(_vable: i64) -> i64 {
+        f64::to_bits(3.5) as i64
+    }
+
     extern "C" fn residual_force(vable: i64) {
         unsafe {
             (*(vable as usize as *mut ResidualVable)).token = 0;
@@ -2554,6 +2781,153 @@ mod tests {
         assert_eq!(
             recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
             OpCode::CallMayForceN
+        );
+    }
+
+    #[test]
+    fn jitcode_call_may_force_int_marks_standard_virtualizable_token_and_guards() {
+        let mut obj = ResidualVable { token: 0 };
+        let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, obj_ptr);
+        let fn_idx = builder.add_fn_ptr(residual_int_no_force as *const ());
+        builder.call_may_force_int_typed(fn_idx, &[JitCallArg::reference(0)], 1);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let info = VirtualizableInfo::new(0);
+        let vable_ref = ctx.const_int(obj_ptr);
+        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_sel| 0,
+            |_sel, _idx| 0,
+            |_pc| 0,
+        );
+        assert!(matches!(action, TraceAction::Continue));
+        assert_eq!(obj.token, 0);
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 4);
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            OpCode::ForceToken
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
+            OpCode::SetfieldGc
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            OpCode::CallMayForceI
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
+            OpCode::GuardNotForced
+        );
+    }
+
+    #[test]
+    fn jitcode_call_may_force_ref_marks_standard_virtualizable_token_and_guards() {
+        let mut obj = ResidualVable { token: 0 };
+        let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, obj_ptr);
+        let fn_idx = builder.add_fn_ptr(residual_ref_no_force as *const ());
+        builder.call_may_force_ref_typed(fn_idx, &[JitCallArg::reference(0)], 1);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let info = VirtualizableInfo::new(0);
+        let vable_ref = ctx.const_int(obj_ptr);
+        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_sel| 0,
+            |_sel, _idx| 0,
+            |_pc| 0,
+        );
+        assert!(matches!(action, TraceAction::Continue));
+        assert_eq!(obj.token, 0);
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 4);
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            OpCode::ForceToken
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
+            OpCode::SetfieldGc
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            OpCode::CallMayForceR
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
+            OpCode::GuardNotForced
+        );
+    }
+
+    #[test]
+    fn jitcode_call_may_force_float_marks_standard_virtualizable_token_and_guards() {
+        let mut obj = ResidualVable { token: 0 };
+        let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, obj_ptr);
+        let fn_idx = builder.add_fn_ptr(residual_float_no_force as *const ());
+        builder.call_may_force_float_typed(fn_idx, &[JitCallArg::reference(0)], 1);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let info = VirtualizableInfo::new(0);
+        let vable_ref = ctx.const_int(obj_ptr);
+        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_sel| 0,
+            |_sel, _idx| 0,
+            |_pc| 0,
+        );
+        assert!(matches!(action, TraceAction::Continue));
+        assert_eq!(obj.token, 0);
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 4);
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            OpCode::ForceToken
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
+            OpCode::SetfieldGc
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            OpCode::CallMayForceF
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
+            OpCode::GuardNotForced
         );
     }
 }

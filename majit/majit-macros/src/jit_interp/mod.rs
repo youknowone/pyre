@@ -115,8 +115,9 @@ pub struct VableFieldDecl {
     pub name: Ident,
     /// Field type: `int`, `ref`, or `float`.
     pub field_type: Ident,
-    /// Constant path for the byte offset (e.g., `PYFRAME_NEXT_INSTR_OFFSET`).
-    pub offset: Path,
+    /// Byte offset expression (e.g., `PYFRAME_NEXT_INSTR_OFFSET`,
+    /// `STORAGEPOOL_LENGTHS_OFFSET + 8`).
+    pub offset: Expr,
 }
 
 /// A single virtualizable array field declaration.
@@ -201,6 +202,12 @@ pub struct StorageConfig {
     pub compact_lengths_offset: Option<Expr>,
     /// Byte offset of the compact storage capacity cache array on the pool object.
     pub compact_caps_offset: Option<Expr>,
+    /// Linked list node size in bytes (for New IR emission).
+    pub linked_list_node_size: Option<Expr>,
+    /// Byte offset of the value field within a linked list node.
+    pub linked_list_value_offset: Option<Expr>,
+    /// Byte offset of the next pointer within a linked list node.
+    pub linked_list_next_offset: Option<Expr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,6 +386,9 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut scan_fn = None;
     let mut can_trace_guard = None;
     let mut compact_live = false;
+    let mut linked_list_node_size = None;
+    let mut linked_list_value_offset = None;
+    let mut linked_list_next_offset = None;
     let mut compact_encode = None;
     let mut compact_decode = None;
     let mut compact_min = None;
@@ -437,6 +447,15 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             "compact_caps_offset" => {
                 compact_caps_offset = Some(content.parse::<Expr>()?);
             }
+            "linked_list_node_size" => {
+                linked_list_node_size = Some(content.parse::<Expr>()?);
+            }
+            "linked_list_value_offset" => {
+                linked_list_value_offset = Some(content.parse::<Expr>()?);
+            }
+            "linked_list_next_offset" => {
+                linked_list_next_offset = Some(content.parse::<Expr>()?);
+            }
             "virtualizable" => {
                 let _: LitBool = content.parse()?;
                 return Err(syn::Error::new(
@@ -479,6 +498,9 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         compact_ptrs_offset,
         compact_lengths_offset,
         compact_caps_offset,
+        linked_list_node_size,
+        linked_list_value_offset,
+        linked_list_next_offset,
     })
 }
 
@@ -575,7 +597,13 @@ fn parse_virtualizable_decl(input: ParseStream) -> syn::Result<VirtualizableDecl
                     inner.parse::<Token![:]>()?;
                     let field_type: Ident = inner.call(Ident::parse_any)?;
                     inner.parse::<Token![@]>()?;
-                    let offset: Path = inner.parse()?;
+                    let offset: Expr = if inner.peek(syn::token::Paren) {
+                        let expr_content;
+                        syn::parenthesized!(expr_content in inner);
+                        expr_content.parse::<Expr>()?
+                    } else {
+                        inner.parse::<Expr>()?
+                    };
                     fields.push(VableFieldDecl {
                         name,
                         field_type,
