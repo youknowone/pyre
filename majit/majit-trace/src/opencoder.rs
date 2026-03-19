@@ -786,6 +786,93 @@ impl TraceRecordBuffer {
     pub fn set_max_size(&mut self, size: usize) {
         self.max_size = size;
     }
+
+    /// opencoder.py: capture_resumedata(framestack, vable_boxes, vref_boxes)
+    ///
+    /// Multi-frame version: creates a chain of snapshots for the full
+    /// frame stack, with the topmost frame as a TopSnapshot.
+    pub fn capture_resumedata_framestack(
+        &mut self,
+        frame_pcs: &[u64],
+        frame_slots: &[Vec<u32>],
+        virtualizable_boxes: &[u32],
+        virtualref_boxes: &[u32],
+    ) -> usize {
+        if frame_pcs.is_empty() {
+            let empty_snap = Snapshot {
+                values: vec![],
+                prev: None,
+                jitcode_index: 0,
+                pc: 0,
+            };
+            let top = TopSnapshot {
+                snapshot: empty_snap,
+                vable_array_index: None,
+                vref_array_index: None,
+            };
+            return self.snapshots.add_top_snapshot(top);
+        }
+
+        let n = frame_pcs.len() - 1;
+
+        // Create snapshots bottom-up (outermost first)
+        let mut parent_idx: Option<usize> = None;
+        for i in 0..n {
+            let snapshot = Snapshot {
+                values: if i < frame_slots.len() {
+                    frame_slots[i].clone()
+                } else {
+                    vec![]
+                },
+                prev: parent_idx,
+                jitcode_index: 0,
+                pc: frame_pcs[i] as u32,
+            };
+            parent_idx = Some(self.snapshots.add_snapshot(snapshot));
+        }
+
+        // Top snapshot for innermost frame
+        let top_snap = Snapshot {
+            values: if n < frame_slots.len() {
+                frame_slots[n].clone()
+            } else {
+                vec![]
+            },
+            prev: parent_idx,
+            jitcode_index: 0,
+            pc: frame_pcs[n] as u32,
+        };
+        let top = TopSnapshot {
+            snapshot: top_snap,
+            vable_array_index: None,
+            vref_array_index: None,
+        };
+        self.snapshots.add_top_snapshot(top)
+    }
+
+    /// opencoder.py: get_dead_ranges()
+    ///
+    /// Compute dead ranges: for each op index x, the values that are
+    /// known to be dead before x. Used by the register allocator to
+    /// know when to free registers.
+    pub fn get_dead_ranges(&self, ops: &[majit_ir::Op]) -> Vec<usize> {
+        let live_ranges = self.get_live_ranges(ops);
+        let mut dead_ranges = vec![0usize; live_ranges.len() + 2];
+        for (i, &last_use) in live_ranges.iter().enumerate() {
+            if last_use > 0 && last_use + 1 < dead_ranges.len() {
+                // Value i dies after position last_use.
+                // Record it in dead_ranges[last_use + 1].
+                let mut pos = last_use + 1;
+                while pos < dead_ranges.len() && dead_ranges[pos] != 0 {
+                    pos += 1;
+                }
+                if pos < dead_ranges.len() {
+                    dead_ranges[pos] = i;
+                }
+            }
+        }
+        dead_ranges
+    }
 }
 
 #[cfg(test)]
