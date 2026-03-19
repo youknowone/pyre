@@ -619,9 +619,17 @@ impl OptHeap {
         let key = match Self::arrayitem_key(op, ctx) {
             Some(k) => k,
             None => {
-                // Non-constant index: force all lazy array stores and invalidate array cache.
+                // Non-constant index: force all lazy array stores and invalidate
+                // both constant-index and variable-index caches.
+                // heap.py: ArrayCachedItem.invalidate() calls parent.clear_varindex()
                 self.force_all_lazy_setarrayitems(ctx);
                 self.cached_arrayitems.clear();
+                self.cached_arrayitems_var.clear();
+                // heap.py: cache_varindex_write — cache this write so that
+                // a subsequent read with the same variable index can hit.
+                if let Some(var_key) = Self::arrayitem_key_variable(op) {
+                    self.cached_arrayitems_var.insert(var_key, op.arg(2));
+                }
                 return OptimizationResult::Emit(op.clone());
             }
         };
@@ -643,6 +651,12 @@ impl OptHeap {
         // Write-after-write or new lazy set.
         self.lazy_setarrayitems.insert(key, op.clone());
         self.cached_arrayitems.remove(&key);
+        // heap.py: ArrayCachedItem.invalidate() calls parent.clear_varindex()
+        // — writing to any constant index invalidates variable-index cache
+        // for the same array+descr, since the variable index could match.
+        let (array, descr_idx, _) = key;
+        self.cached_arrayitems_var
+            .retain(|&(a, d, _), _| !(a == array && d == descr_idx));
 
         OptimizationResult::Remove
     }
