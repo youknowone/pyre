@@ -84,9 +84,16 @@ impl Guard {
             return None;
         }
         match cmp_op.opcode {
-            OpCode::IntLt | OpCode::IntLe | OpCode::IntGt | OpCode::IntGe
-            | OpCode::IntEq | OpCode::IntNe
-            | OpCode::UintLt | OpCode::UintLe | OpCode::UintGt | OpCode::UintGe => {}
+            OpCode::IntLt
+            | OpCode::IntLe
+            | OpCode::IntGt
+            | OpCode::IntGe
+            | OpCode::IntEq
+            | OpCode::IntNe
+            | OpCode::UintLt
+            | OpCode::UintLe
+            | OpCode::UintGt
+            | OpCode::UintGe => {}
             _ => return None,
         }
         Some(Guard {
@@ -401,6 +408,17 @@ impl GuardStrengthenOpt {
                 false
             }
             OpCode::GuardNonnull => self.truthy_values.contains(&op.arg(0)),
+            // rewrite.py: optimize_GUARD_CLASS — if the class is already
+            // known for this value, and it matches, remove the guard.
+            OpCode::GuardClass if op.num_args() >= 2 => {
+                if let Some(&known_class) = self.known_classes.get(&op.arg(0)) {
+                    // Check if the expected class matches the known class.
+                    if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                        return known_class.0 as i64 == expected;
+                    }
+                }
+                false
+            }
             // guard.py: GUARD_VALUE subsumed if value is already known to be
             // that exact constant from a previous GuardValue.
             OpCode::GuardValue if op.num_args() >= 2 => {
@@ -459,10 +477,7 @@ impl Optimization for GuardStrengthenOpt {
         // GuardNotForced must reach the Heap pass, which holds the
         // postponed CallMayForce op.  Return PassOn so Heap can emit
         // the call immediately before the guard.
-        if matches!(
-            op.opcode,
-            OpCode::GuardNotForced | OpCode::GuardNotForced2
-        ) {
+        if matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2) {
             return OptimizationResult::PassOn;
         }
 
