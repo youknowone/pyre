@@ -729,7 +729,13 @@ impl Optimizer {
                         let final_ref = ctx.get_replacement(value_ref);
                         let fa_index = extra_start + extra_fail_args.len();
                         extra_fail_args.push(final_ref);
-                        fields.push((field_idx, fa_index));
+                        let descr_idx = vinfo
+                            .field_descrs
+                            .iter()
+                            .find(|(idx, _)| *idx == field_idx)
+                            .map(|(_, d)| d.index())
+                            .unwrap_or(field_idx);
+                        fields.push((descr_idx, fa_index));
                     }
                     virtual_entries.push(GuardVirtualEntry {
                         fail_arg_index: fa_idx,
@@ -745,7 +751,13 @@ impl Optimizer {
                         let final_ref = ctx.get_replacement(value_ref);
                         let fa_index = extra_start + extra_fail_args.len();
                         extra_fail_args.push(final_ref);
-                        fields.push((field_idx, fa_index));
+                        let descr_idx = vinfo
+                            .field_descrs
+                            .iter()
+                            .find(|(idx, _)| *idx == field_idx)
+                            .map(|(_, d)| d.index())
+                            .unwrap_or(field_idx);
+                        fields.push((descr_idx, fa_index));
                     }
                     virtual_entries.push(GuardVirtualEntry {
                         fail_arg_index: fa_idx,
