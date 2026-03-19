@@ -106,6 +106,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             current_selected_value: Option<majit_ir::OpRef>,
             storage_layout: Vec<(usize, usize)>,
             loop_header_pc: usize,
+            /// RPython parity: initial selected at trace header.
+            header_selected: usize,
             /// Virtualizable: data pointer OpRefs (storage_idx → OpRef).
             vable_array_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
             /// Virtualizable: length OpRefs (storage_idx → OpRef).
@@ -158,6 +160,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn loop_header_pc(&self) -> usize {
                 self.loop_header_pc
+            }
+
+            fn header_selected(&self) -> usize {
+                self.header_selected
             }
 
             fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize) {
@@ -304,6 +310,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     current_selected_value: None,
                     storage_layout: meta.storage_layout.clone(),
                     loop_header_pc: header_pc,
+                    header_selected: meta.initial_selected,
                     vable_array_refs,
                     vable_len_refs,
                     meta_storage_count: meta.storage_layout.len(),
@@ -383,9 +390,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
                 if #virtualizable {
-                    // Virtualizable: check selected + preamble-loaded depths must match.
-                    // Unbalanced loops (depth changed) cannot close because sync
-                    // would write wrong number of elements to heap.
+                    // Check selected + preamble depths match + extra storages empty.
                     sym.current_selected == meta.initial_selected
                         && sym.preamble_depths.iter().all(|(sidx, &depth)| {
                             sym.stacks.get(sidx).is_some_and(|s| s.len() == depth)
