@@ -706,7 +706,28 @@ impl OptHeap {
                 _ => {}
             }
 
-            self.force_all_lazy(ctx);
+            // heap.py: guards only force non-virtual lazy sets.
+            // Virtual lazy sets stay deferred — the virtual object hasn't
+            // escaped, so the write can be postponed. RPython stores them
+            // in optimizer.pendingfields for guard resume data; here we
+            // keep them in lazy_setfields/lazy_setarrayitems until the
+            // final JUMP/Finish forces everything.
+            let pending_virtual = self.force_lazy_sets_for_guard(ctx);
+            for pending_op in pending_virtual {
+                if pending_op.opcode == OpCode::SetarrayitemGc {
+                    let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
+                    if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
+                        self.lazy_setarrayitems
+                            .insert((pending_op.arg(0), descr_idx, index), pending_op);
+                    } else {
+                        ctx.emit(pending_op);
+                    }
+                } else {
+                    let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
+                    self.lazy_setfields
+                        .insert((pending_op.arg(0), descr_idx), pending_op);
+                }
+            }
             return OptimizationResult::Emit(op.clone());
         }
 

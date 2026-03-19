@@ -99,14 +99,21 @@ impl Optimizer {
     }
 
     /// optimizer.py: store_final_boxes_in_guard(guard_op, pendingfields)
-    /// Store fail_args in the guard and flush pending field writes.
+    ///
+    /// In RPython, this stores pending field writes into the guard's resume
+    /// data (`rd_pendingfields`) so they can be replayed on guard failure.
+    /// In majit, pending fields are currently emitted as ops before the guard
+    /// (see `emit_guard_operation`) or kept deferred in heap.rs lazy sets.
+    /// This method is reserved for future resume data integration.
     pub fn store_final_boxes_in_guard(&mut self, guard_op: &mut Op) {
-        // Flush pending fields: emit them before the guard
         let pending = std::mem::take(&mut self.pendingfields);
         if guard_op.fail_args.is_none() {
             guard_op.fail_args = Some(Default::default());
         }
-        let _ = pending; // TODO: integrate pending fields into fail_args
+        // Pending fields are emitted before the guard in emit_guard_operation.
+        // When full resume data encoding is implemented, they should be
+        // stored in the guard descriptor as rd_pendingfields instead.
+        let _ = pending;
     }
 
     /// optimizer.py: emit_guard_operation(op, pendingfields)
@@ -494,14 +501,37 @@ impl Optimizer {
                 }
             }
 
-            // Op positions: reassign to start from final_num_inputs
-            // to avoid collision with input positions 0..final_num_inputs
+            // Op positions: reassign ALL ops to start from final_num_inputs.
+            // Partial remapping is incorrect once virtual inputs are added:
+            // original trace positions can already overlap the new
+            // final_num_inputs.. range, which causes SSA collisions in the
+            // optimized trace.
             for (new_idx, op) in ctx.new_operations.iter_mut().enumerate() {
                 let new_pos = fni + new_idx as u32;
-                if op.pos.0 < fni && !op.pos.is_none() {
+                if !op.pos.is_none() {
                     remap.insert(op.pos.0, new_pos);
                     op.pos = OpRef(new_pos);
                 }
+            }
+
+            // Constant-folded operations that were removed from the trace still
+            // have entries in `ctx.constants`. If we leave them at their old
+            // positions, they can collide with the freshly compacted op
+            // positions above (for example old constant v71 vs new live op v71),
+            // and the backend will resolve the live op as the stale constant.
+            // Give every such constant-only opref a fresh slot after the last
+            // live op, mirroring RPython's separate constant identity.
+            let mut next_const_pos = fni + ctx.new_operations.len() as u32;
+            for (idx, val) in ctx.constants.iter().enumerate() {
+                let old_idx = idx as u32;
+                if val.is_none() || remap.contains_key(&old_idx) {
+                    continue;
+                }
+                if old_idx < num_inputs as u32 {
+                    continue;
+                }
+                remap.insert(old_idx, next_const_pos);
+                next_const_pos += 1;
             }
 
             // Apply remap to all args and fail_args
@@ -682,6 +712,43 @@ mod tests {
         }
     }
 
+    struct AddVirtualInputsOnce {
+        added: bool,
+    }
+
+    struct RemoveAsConstant {
+        target: OpRef,
+        value: i64,
+    }
+
+    impl Optimization for AddVirtualInputsOnce {
+        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+            if !self.added {
+                ctx.num_inputs += 2;
+                self.added = true;
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "add_virtual_inputs_once"
+        }
+    }
+
+    impl Optimization for RemoveAsConstant {
+        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+            if op.pos == self.target {
+                ctx.make_constant(op.pos, majit_ir::Value::Int(self.value));
+                return OptimizationResult::Remove;
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "remove_as_constant"
+        }
+    }
+
     #[test]
     fn test_optimizer_passthrough() {
         let mut opt = Optimizer::new();
@@ -716,6 +783,64 @@ mod tests {
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
         // Jump should still be present.
         assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_remaps_all_op_positions_when_virtual_inputs_are_added() {
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
+
+        let mut ops = vec![
+            Op::new(OpCode::GetfieldRawI, &[OpRef(0)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef(0)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef(4)]),
+            Op::new(OpCode::IntGt, &[OpRef(5), OpRef(1)]),
+        ];
+        ops[0].pos = OpRef(3);
+        ops[1].pos = OpRef(4);
+        ops[2].pos = OpRef(5);
+        ops[3].pos = OpRef(6);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(1, 27);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+
+        let positions: Vec<_> = result.iter().map(|op| op.pos).collect();
+        assert_eq!(positions, vec![OpRef(5), OpRef(6), OpRef(7), OpRef(8)]);
+        assert_eq!(result[2].arg(0), OpRef(6));
+        assert_eq!(result[3].arg(0), OpRef(7));
+    }
+
+    #[test]
+    fn test_remaps_removed_constants_away_from_compacted_live_ops() {
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
+        opt.add_pass(Box::new(RemoveAsConstant {
+            target: OpRef(5),
+            value: 123,
+        }));
+
+        let mut ops = vec![
+            Op::new(OpCode::GetfieldRawI, &[OpRef(0)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef(0)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef(0)]),
+            Op::new(OpCode::IntGt, &[OpRef(3), OpRef(1)]),
+        ];
+        ops[0].pos = OpRef(3);
+        ops[1].pos = OpRef(4);
+        ops[2].pos = OpRef(5);
+        ops[3].pos = OpRef(6);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(1, 27);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+
+        assert_eq!(result[0].pos, OpRef(5));
+        assert_eq!(result[1].pos, OpRef(6));
+        assert_eq!(result[2].pos, OpRef(7));
+        assert_eq!(result[2].arg(0), OpRef(5));
+        assert_eq!(constants.get(&5), None);
+        assert_eq!(constants.get(&8), Some(&123));
     }
 
     #[test]
