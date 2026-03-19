@@ -467,6 +467,100 @@ impl PtrInfo {
     }
 
     /// Copy fields from this virtual info to another.
+    /// info.py: _force_elements(op, optforce, descr)
+    ///
+    /// Generate SETFIELD_GC/SETARRAYITEM_GC ops for each field/item
+    /// of a virtual, using field descriptors from the allocation descriptor.
+    /// Returns ops to emit and clears the fields in the virtual.
+    pub fn force_elements(&mut self, obj_opref: OpRef) -> Vec<Op> {
+        let mut ops = Vec::new();
+        match self {
+            PtrInfo::Virtual(v) => {
+                for (field_idx, value) in v.fields.iter_mut() {
+                    if !value.is_none() {
+                        let set_op = Op::new(OpCode::SetfieldGc, &[obj_opref, *value]);
+                        ops.push(set_op);
+                        *value = OpRef::NONE; // clear after forcing
+                    }
+                }
+            }
+            PtrInfo::VirtualStruct(v) => {
+                for (field_idx, value) in v.fields.iter_mut() {
+                    if !value.is_none() {
+                        let set_op = Op::new(OpCode::SetfieldGc, &[obj_opref, *value]);
+                        ops.push(set_op);
+                        *value = OpRef::NONE;
+                    }
+                }
+            }
+            PtrInfo::VirtualArray(v) => {
+                for (i, item) in v.items.iter_mut().enumerate() {
+                    if !item.is_none() {
+                        let idx_ref = OpRef(10000 + i as u32);
+                        let set_op =
+                            Op::new(OpCode::SetarrayitemGc, &[obj_opref, idx_ref, *item]);
+                        ops.push(set_op);
+                        *item = OpRef::NONE;
+                    }
+                }
+            }
+            PtrInfo::VirtualArrayStruct(v) => {
+                for (elem_idx, fields) in v.element_fields.iter_mut().enumerate() {
+                    for (field_idx, value) in fields.iter_mut() {
+                        if !value.is_none() {
+                            let idx_ref = OpRef(10000 + elem_idx as u32);
+                            let set_op = Op::new(
+                                OpCode::SetinteriorfieldGc,
+                                &[obj_opref, idx_ref, *value],
+                            );
+                            ops.push(set_op);
+                            *value = OpRef::NONE;
+                        }
+                    }
+                }
+            }
+            PtrInfo::VirtualRawBuffer(v) => {
+                for entry in v.entries.iter_mut() {
+                    let (offset, _len, ref mut value) = *entry;
+                    if !value.is_none() {
+                        let offset_ref = OpRef(10000 + offset as u32);
+                        let set_op =
+                            Op::new(OpCode::RawStore, &[obj_opref, offset_ref, *value]);
+                        ops.push(set_op);
+                        *value = OpRef::NONE;
+                    }
+                }
+            }
+            _ => {}
+        }
+        ops
+    }
+
+    /// info.py: produce_short_preamble_ops(structbox, descr, index, optimizer, shortboxes)
+    ///
+    /// Add cached field values to the short preamble builder.
+    /// For each non-null field in the virtual, register a GETFIELD read
+    /// so the bridge can re-populate the optimizer's field cache.
+    pub fn produce_short_preamble_ops(&self, structbox: OpRef) -> Vec<(OpCode, OpRef, u32)> {
+        let mut result = Vec::new();
+        // Fields are accessed per-variant below
+        if let PtrInfo::Virtual(v) = self {
+            for &(field_idx, value) in &v.fields {
+                if !value.is_none() {
+                    result.push((OpCode::GetfieldGcI, structbox, field_idx));
+                }
+            }
+        }
+        if let PtrInfo::VirtualStruct(v) = self {
+            for &(field_idx, value) in &v.fields {
+                if !value.is_none() {
+                    result.push((OpCode::GetfieldGcI, structbox, field_idx));
+                }
+            }
+        }
+        result
+    }
+
     /// info.py: copy_fields_to_const()
     pub fn copy_fields_to(&self, other: &mut PtrInfo) {
         match (self, other) {
