@@ -322,6 +322,13 @@ pub trait JitState: Sized {
         false // Default: no multi-frame support
     }
 
+    /// RPython virtualizable.py: build VirtualizableInfo.
+    /// Override when the interpreter has a virtualizable object.
+    #[allow(non_snake_case)]
+    fn __build_virtualizable_info() -> Option<crate::virtualizable::VirtualizableInfo> {
+        None
+    }
+
     /// Check if multi-frame caller-stack restore is supported.
     fn supports_multi_frame_restore(&self) -> bool {
         false
