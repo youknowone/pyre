@@ -5,7 +5,7 @@
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Op, OpCode, OpRef, Value};
 
-use crate::{intdiv, OptContext, Optimization, OptimizationResult};
+use crate::{OptContext, Optimization, OptimizationResult, intdiv};
 
 /// Check if a float is an exact power of 2 (±2^n).
 /// rewrite.py: uses frexp; mantissa==0.5 means exact power of 2.

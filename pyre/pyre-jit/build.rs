@@ -1,3 +1,5 @@
+#[path = "src/jit/call_spec.rs"]
+mod call_spec;
 #[path = "src/jit/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
@@ -41,75 +43,61 @@ fn main() {
     // `locals_cells_stack_w[*]` as virtualizable accesses before legacy
     // TracePattern classification runs.
     let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
-    let result = majit_analyze::analyze_multiple_full_with_config(
+    let pipeline = majit_analyze::analyze_multiple_pipeline_with_config(
         &source_refs,
         &majit_analyze::AnalyzeConfig {
             pipeline: majit_analyze::PipelineConfig {
                 transform: majit_analyze::GraphTransformConfig {
                     vable_fields: virtualizable_spec::PYFRAME_VABLE_FIELDS
                         .iter()
-                        .map(|(name, idx)| ((*name).to_string(), *idx))
+                        .map(|(name, idx)| {
+                            majit_analyze::VirtualizableFieldDescriptor::new(
+                                *name,
+                                Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
+                                *idx,
+                            )
+                        })
                         .collect(),
                     vable_arrays: virtualizable_spec::PYFRAME_VABLE_ARRAYS
                         .iter()
-                        .map(|(name, idx)| ((*name).to_string(), *idx))
+                        .map(|(name, idx)| {
+                            majit_analyze::VirtualizableFieldDescriptor::new(
+                                *name,
+                                Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
+                                *idx,
+                            )
+                        })
                         .collect(),
+                    call_effects: build_call_effect_overrides(),
                     ..Default::default()
                 },
+                classify: build_classification_config(),
             },
         },
     );
 
     // Generate tracing code from the canonical graph-first analysis result.
-    let code = majit_analyze::generate_trace_code_from_full(&result);
+    let code = majit_analyze::generate_trace_code_from_pipeline(&pipeline);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
-    // ── New path: extract opcode match from pyre-runtime and generate
-    //    JIT mainloop via codewriter (like aheui-mjit). ──
-    //    RPython equivalent: codewriter.transform_graph_to_jitcode()
-    let opcode_step_path = format!("{pyre_base}/pyre-runtime/src/opcode_step.rs");
-    if let Ok(opcode_src) = std::fs::read_to_string(&opcode_step_path) {
-        if let Ok(file) = syn::parse_str::<syn::File>(&opcode_src) {
-            use majit_analyze::interp_extract::{find_function, find_opcode_match};
-            if let Some(func) = find_function(&file, "execute_opcode_step") {
-                if let Some(opcode_match) = find_opcode_match(func) {
-                    eprintln!(
-                        "[pyre-jit build.rs] extracted opcode match: {} arms from execute_opcode_step",
-                        opcode_match.arms.len()
-                    );
-                    // TODO: construct JitDriverConfig for pyre and call
-                    // codewriter::generate_jitcode(opcode_match, &binops, &config)
-                    // to generate jit_mainloop_gen.rs
-                } else {
-                    eprintln!(
-                        "[pyre-jit build.rs] warning: no opcode match found in execute_opcode_step"
-                    );
-                }
-            } else {
-                eprintln!("[pyre-jit build.rs] warning: execute_opcode_step not found");
-            }
-        }
-    }
-
     // JSON metadata for debugging
-    let json = serde_json::to_string_pretty(&result).unwrap();
+    let json = serde_json::to_string_pretty(&pipeline).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
 
     // Report
     eprintln!(
-        "[pyre-jit build.rs] analyzed {} opcodes ({} classified), {} helpers, {} types, {} trait impls, generated {} bytes",
-        result.legacy.opcodes.len(),
-        result
-            .legacy
-            .opcodes
+        "[pyre-jit build.rs] canonical analysis: {} opcode arms ({} graph-classified), {} functions, {} blocks, {} flat ops, generated {} bytes",
+        pipeline.opcode_dispatch.len(),
+        pipeline
+            .opcode_dispatch
             .iter()
-            .filter(|a| a.trace_pattern.is_some())
+            .filter(|arm| arm.classified_pattern.is_some())
             .count(),
-        result.legacy.helpers.len(),
-        result.legacy.type_layouts.len(),
-        result.legacy.trait_impls.len(),
+        pipeline.functions.len(),
+        pipeline.total_blocks,
+        pipeline.total_ops,
         code.len(),
     );
 
@@ -118,6 +106,128 @@ fn main() {
         println!("cargo::rerun-if-changed={path}");
     }
     println!("cargo::rerun-if-changed=src/jit/virtualizable_spec.rs");
+    println!("cargo::rerun-if-changed=src/jit/call_spec.rs");
+}
+
+fn build_call_effect_overrides() -> Vec<majit_analyze::CallEffectOverride> {
+    call_spec::PYFRAME_CALL_EFFECTS
+        .iter()
+        .map(|spec| {
+            let target = match spec.target {
+                call_spec::CallTargetSpec::Method {
+                    name,
+                    receiver_root,
+                } => majit_analyze::CallTarget::method(name, Some(receiver_root.to_string())),
+                call_spec::CallTargetSpec::FunctionPath(segments) => {
+                    majit_analyze::CallTarget::function_path(segments.iter().copied())
+                }
+            };
+            let effect = match spec.effect {
+                call_spec::CallEffectKind::Elidable => majit_analyze::CallEffectKind::Elidable,
+                call_spec::CallEffectKind::Residual => majit_analyze::CallEffectKind::Residual,
+            };
+            majit_analyze::CallEffectOverride::new(target, effect)
+        })
+        .collect()
+}
+
+fn build_classification_config() -> majit_analyze::ClassificationConfig {
+    majit_analyze::ClassificationConfig {
+        field_roles: virtualizable_spec::PYFRAME_FIELD_ROLES
+            .iter()
+            .map(|spec| {
+                let role = match spec.role {
+                    virtualizable_spec::FieldPatternRole::LocalArray => {
+                        majit_analyze::FieldPatternRole::LocalArray
+                    }
+                    virtualizable_spec::FieldPatternRole::InstructionPosition => {
+                        majit_analyze::FieldPatternRole::InstructionPosition
+                    }
+                    virtualizable_spec::FieldPatternRole::ConstantPool => {
+                        majit_analyze::FieldPatternRole::ConstantPool
+                    }
+                };
+                majit_analyze::FieldRoleDescriptor::new(
+                    spec.name,
+                    Some(spec.owner_root.to_string()),
+                    role,
+                )
+            })
+            .collect(),
+        call_roles: call_spec::PYFRAME_CALL_EFFECTS
+            .iter()
+            .filter_map(|spec| {
+                let role = spec.role?;
+                let target = match spec.target {
+                    call_spec::CallTargetSpec::Method {
+                        name,
+                        receiver_root,
+                    } => majit_analyze::CallTarget::method(name, Some(receiver_root.to_string())),
+                    call_spec::CallTargetSpec::FunctionPath(segments) => {
+                        majit_analyze::CallTarget::function_path(segments.iter().copied())
+                    }
+                };
+                let role = match role {
+                    call_spec::CallPatternRole::IntArithmetic => {
+                        majit_analyze::CallPatternRole::IntArithmetic
+                    }
+                    call_spec::CallPatternRole::FloatArithmetic => {
+                        majit_analyze::CallPatternRole::FloatArithmetic
+                    }
+                    call_spec::CallPatternRole::LocalRead => {
+                        majit_analyze::CallPatternRole::LocalRead
+                    }
+                    call_spec::CallPatternRole::LocalWrite => {
+                        majit_analyze::CallPatternRole::LocalWrite
+                    }
+                    call_spec::CallPatternRole::FunctionCall => {
+                        majit_analyze::CallPatternRole::FunctionCall
+                    }
+                    call_spec::CallPatternRole::TruthCheck => {
+                        majit_analyze::CallPatternRole::TruthCheck
+                    }
+                    call_spec::CallPatternRole::StackManip => {
+                        majit_analyze::CallPatternRole::StackManip
+                    }
+                    call_spec::CallPatternRole::NamespaceLoadLocal => {
+                        majit_analyze::CallPatternRole::NamespaceLoadLocal
+                    }
+                    call_spec::CallPatternRole::NamespaceLoadGlobal => {
+                        majit_analyze::CallPatternRole::NamespaceLoadGlobal
+                    }
+                    call_spec::CallPatternRole::NamespaceStoreLocal => {
+                        majit_analyze::CallPatternRole::NamespaceStoreLocal
+                    }
+                    call_spec::CallPatternRole::NamespaceStoreGlobal => {
+                        majit_analyze::CallPatternRole::NamespaceStoreGlobal
+                    }
+                    call_spec::CallPatternRole::RangeIterNext => {
+                        majit_analyze::CallPatternRole::RangeIterNext
+                    }
+                    call_spec::CallPatternRole::IterCleanup => {
+                        majit_analyze::CallPatternRole::IterCleanup
+                    }
+                    call_spec::CallPatternRole::Return => majit_analyze::CallPatternRole::Return,
+                    call_spec::CallPatternRole::BuildList => {
+                        majit_analyze::CallPatternRole::BuildList
+                    }
+                    call_spec::CallPatternRole::BuildTuple => {
+                        majit_analyze::CallPatternRole::BuildTuple
+                    }
+                    call_spec::CallPatternRole::UnpackSequence => {
+                        majit_analyze::CallPatternRole::UnpackSequence
+                    }
+                    call_spec::CallPatternRole::SequenceSetitem => {
+                        majit_analyze::CallPatternRole::SequenceSetitem
+                    }
+                    call_spec::CallPatternRole::CollectionAppend => {
+                        majit_analyze::CallPatternRole::CollectionAppend
+                    }
+                };
+                Some(majit_analyze::CallRoleDescriptor::new(target, role))
+            })
+            .collect(),
+    }
 }
 
 /// Recursively collect all .rs files from a directory.

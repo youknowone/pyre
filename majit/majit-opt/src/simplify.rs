@@ -198,9 +198,11 @@ mod tests {
         ];
         let result = run_pass(&ops);
         // GUARD_FUTURE_CONDITION should be removed
-        assert!(!result
-            .iter()
-            .any(|o| o.opcode == OpCode::GuardFutureCondition));
+        assert!(
+            !result
+                .iter()
+                .any(|o| o.opcode == OpCode::GuardFutureCondition)
+        );
         assert_eq!(result.len(), 2);
     }
 

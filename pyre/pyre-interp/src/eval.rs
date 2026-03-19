@@ -590,7 +590,10 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── SetFunctionAttribute ──
-    fn set_function_attribute_with_flag(&mut self, flag: pyre_bytecode::bytecode::MakeFunctionFlag) -> Result<(), Self::Error> {
+    fn set_function_attribute_with_flag(
+        &mut self,
+        flag: pyre_bytecode::bytecode::MakeFunctionFlag,
+    ) -> Result<(), Self::Error> {
         use pyre_bytecode::bytecode::MakeFunctionFlag;
         let attr = self.pop();
         match flag {
@@ -771,10 +774,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── unary_positive ──
     // PyPy: UNARY_POSITIVE → space.pos(w_value)
-    fn unary_positive(
-        &mut self,
-        val: PyObjectRef,
-    ) -> Result<PyObjectRef, Self::Error> {
+    fn unary_positive(&mut self, val: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
         unsafe {
             if pyre_object::is_int(val) || pyre_object::is_float(val) {
                 return Ok(val);
@@ -785,10 +785,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── list_to_tuple ──
     // PyPy intrinsic: convert list to tuple (used in star unpacking).
-    fn list_to_tuple(
-        &mut self,
-        val: PyObjectRef,
-    ) -> Result<PyObjectRef, Self::Error> {
+    fn list_to_tuple(&mut self, val: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
         unsafe {
             if pyre_object::is_list(val) {
                 let list = &*(val as *const pyre_object::listobject::W_ListObject);
@@ -914,7 +911,10 @@ impl OpcodeStepExecutor for PyFrame {
     // ── unpack_ex ──
     // PyPy: UNPACK_SEQUENCE with star; CPython: UNPACK_EX
     // `a, *b, c = iterable`
-    fn unpack_ex(&mut self, args: pyre_bytecode::bytecode::UnpackExArgs) -> Result<(), Self::Error> {
+    fn unpack_ex(
+        &mut self,
+        args: pyre_bytecode::bytecode::UnpackExArgs,
+    ) -> Result<(), Self::Error> {
         let before = args.before as usize;
         let after = args.after as usize;
         let value = self.pop();
@@ -987,7 +987,10 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── BuildSlice ──
     // CPython 3.13: BUILD_SLICE creates a slice object from 2 or 3 stack items
-    fn build_slice(&mut self, argc: pyre_bytecode::bytecode::BuildSliceArgCount) -> Result<(), Self::Error> {
+    fn build_slice(
+        &mut self,
+        argc: pyre_bytecode::bytecode::BuildSliceArgCount,
+    ) -> Result<(), Self::Error> {
         use pyre_bytecode::bytecode::BuildSliceArgCount;
         let step = match argc {
             BuildSliceArgCount::Three => self.pop(),
@@ -2180,13 +2183,17 @@ result = f.x + g.x";
     #[test]
     fn test_is_op() {
         let result = run_eval("None is None").unwrap();
-        unsafe { assert!(w_bool_get_value(result)); }
+        unsafe {
+            assert!(w_bool_get_value(result));
+        }
     }
 
     #[test]
     fn test_is_not_op() {
         let result = run_eval("1 is not None").unwrap();
-        unsafe { assert!(w_bool_get_value(result)); }
+        unsafe {
+            assert!(w_bool_get_value(result));
+        }
     }
 
     #[test]
@@ -2228,13 +2235,17 @@ result = f.x + g.x";
     #[test]
     fn test_to_bool() {
         let result = run_eval("not 0").unwrap();
-        unsafe { assert!(w_bool_get_value(result)); }
+        unsafe {
+            assert!(w_bool_get_value(result));
+        }
     }
 
     #[test]
     fn test_none_is_none() {
         let result = run_eval("None is None").unwrap();
-        unsafe { assert!(w_bool_get_value(result)); }
+        unsafe {
+            assert!(w_bool_get_value(result));
+        }
     }
 
     #[test]
@@ -2432,7 +2443,9 @@ result = fib(10)";
     #[test]
     fn test_string_multiply() {
         let result = run_eval("'ab' * 3").unwrap();
-        unsafe { assert_eq!(w_str_get_value(result), "ababab"); }
+        unsafe {
+            assert_eq!(w_str_get_value(result), "ababab");
+        }
     }
 
     #[test]
@@ -2704,25 +2717,33 @@ result = add5(10)";
     #[test]
     fn test_power_operator() {
         let result = run_eval("2 ** 10").unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 1024); }
+        unsafe {
+            assert_eq!(w_int_get_value(result), 1024);
+        }
     }
 
     #[test]
     fn test_modulo() {
         let result = run_eval("17 % 5").unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 2); }
+        unsafe {
+            assert_eq!(w_int_get_value(result), 2);
+        }
     }
 
     #[test]
     fn test_floor_division() {
         let result = run_eval("17 // 3").unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 5); }
+        unsafe {
+            assert_eq!(w_int_get_value(result), 5);
+        }
     }
 
     #[test]
     fn test_bitwise_ops() {
         let result = run_eval("(0xFF & 0x0F) | 0x30").unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 0x3F); }
+        unsafe {
+            assert_eq!(w_int_get_value(result), 0x3F);
+        }
     }
 
     #[test]

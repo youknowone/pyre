@@ -237,11 +237,7 @@ impl OptString {
         match info {
             VStringInfo::Plain { chars } => {
                 let idx = index as usize;
-                if idx < chars.len() {
-                    chars[idx]
-                } else {
-                    None
-                }
+                if idx < chars.len() { chars[idx] } else { None }
             }
             VStringInfo::Concat { left, right } => {
                 // Need to know the left length to decide which side.

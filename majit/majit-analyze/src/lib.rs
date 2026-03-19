@@ -38,7 +38,10 @@ pub use passes::{
     PipelineResult, ProgramPipelineResult, TypeResolutionState, VirtualizableFieldDescriptor,
     analyze_function, analyze_program, annotate_graph, resolve_types, rewrite_graph,
 };
-pub use patterns::{TracePattern, classify_from_graph};
+pub use patterns::{
+    CallPatternRole, CallRoleDescriptor, ClassificationConfig, FieldPatternRole,
+    FieldRoleDescriptor, TracePattern, classify_from_graph, classify_from_graph_with_config,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -186,7 +189,7 @@ fn classify_resolved_call_graph(
 ) -> Option<TracePattern> {
     let graph = call.graph.as_ref()?;
     let rewritten = passes::rewrite_graph(graph, &pipeline_config.transform);
-    patterns::classify_from_graph(&rewritten.graph)
+    patterns::classify_from_graph_with_config(&rewritten.graph, &pipeline_config.classify)
 }
 
 fn resolve_handler_calls(
@@ -744,6 +747,7 @@ mod tests {
                         )],
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
             },
         );
@@ -805,6 +809,7 @@ mod tests {
                         )],
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
             },
         );

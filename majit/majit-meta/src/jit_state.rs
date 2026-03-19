@@ -4,11 +4,11 @@
 use majit_ir::{GcRef, OpRef, Type, Value};
 
 use crate::blackhole::ExceptionState;
+use crate::jitdriver::JitDriverStaticData;
 use crate::resume::{
     MaterializedValue, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
     ResumeFrameLayoutSummary,
 };
-use crate::jitdriver::JitDriverStaticData;
 use crate::virtualizable::VirtualizableInfo;
 
 /// Layout description for replaying a pending field or array write during deopt.

@@ -14,6 +14,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
     Expr, Ident, ItemFn, LitBool, Path, Token, braced, bracketed,
+    ext::IdentExt,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
 };
@@ -87,7 +88,14 @@ pub struct JitInterpConfig {
 ///     var: frame,
 ///     token_offset: PYFRAME_VABLE_TOKEN_OFFSET,
 ///     fields: { next_instr: int @ NEXT_INSTR_OFFSET, ... },
-///     arrays: { locals_w: ref @ LOCALS_OFFSET, ... },
+///     arrays: {
+///         locals_w: ref @ LOCALS_OFFSET,
+///         stack: int @ (DATA_PTR_OFFSET + SLOT_OFFSET) {
+///             ptr_offset: 0,
+///             length_offset: LENGTH_OFFSET_MINUS_DATA_PTR,
+///             items_offset: 0,
+///         },
+///     },
 /// }
 /// ```
 pub struct VirtualizableDecl {
@@ -117,8 +125,22 @@ pub struct VableArrayDecl {
     pub name: Ident,
     /// Item type: `int`, `ref`, or `float`.
     pub item_type: Ident,
-    /// Constant path for the byte offset of the array pointer field.
-    pub offset: Path,
+    /// Physical layout of the array field inside the virtualizable object.
+    pub layout: VableArrayLayoutDecl,
+}
+
+/// Layout description for a virtualizable array field.
+pub enum VableArrayLayoutDecl {
+    /// Direct pointer field: the virtualizable stores a pointer to the array.
+    Direct { field_offset: Expr },
+    /// Embedded container layout: pointer/length live in sibling fields or
+    /// an inline container relative to the declared field offset.
+    Embedded {
+        field_offset: Expr,
+        ptr_offset: Expr,
+        length_offset: Expr,
+        items_offset: Expr,
+    },
 }
 
 /// State field declaration for register/tape machines.
@@ -551,7 +573,7 @@ fn parse_virtualizable_decl(input: ParseStream) -> syn::Result<VirtualizableDecl
                 while !inner.is_empty() {
                     let name: Ident = inner.parse()?;
                     inner.parse::<Token![:]>()?;
-                    let field_type: Ident = inner.parse()?;
+                    let field_type: Ident = inner.call(Ident::parse_any)?;
                     inner.parse::<Token![@]>()?;
                     let offset: Path = inner.parse()?;
                     fields.push(VableFieldDecl {
@@ -568,13 +590,73 @@ fn parse_virtualizable_decl(input: ParseStream) -> syn::Result<VirtualizableDecl
                 while !inner.is_empty() {
                     let name: Ident = inner.parse()?;
                     inner.parse::<Token![:]>()?;
-                    let item_type: Ident = inner.parse()?;
+                    let item_type: Ident = inner.call(Ident::parse_any)?;
                     inner.parse::<Token![@]>()?;
-                    let offset: Path = inner.parse()?;
+                    let field_offset: Expr = if inner.peek(syn::token::Paren) {
+                        let expr_content;
+                        syn::parenthesized!(expr_content in inner);
+                        expr_content.parse::<Expr>()?
+                    } else {
+                        inner.parse::<Expr>()?
+                    };
+                    let layout = if inner.peek(syn::token::Brace) {
+                        let layout_content;
+                        braced!(layout_content in inner);
+                        let mut ptr_offset = None;
+                        let mut length_offset = None;
+                        let mut items_offset = None;
+                        while !layout_content.is_empty() {
+                            let layout_key: Ident = layout_content.parse()?;
+                            layout_content.parse::<Token![:]>()?;
+                            match layout_key.to_string().as_str() {
+                                "ptr_offset" => {
+                                    ptr_offset = Some(layout_content.parse::<Expr>()?);
+                                }
+                                "length_offset" => {
+                                    length_offset = Some(layout_content.parse::<Expr>()?);
+                                }
+                                "items_offset" => {
+                                    items_offset = Some(layout_content.parse::<Expr>()?);
+                                }
+                                other => {
+                                    return Err(syn::Error::new(
+                                        layout_key.span(),
+                                        format!(
+                                            "unknown virtualizable array layout parameter: `{other}`"
+                                        ),
+                                    ));
+                                }
+                            }
+                            let _ = layout_content.parse::<Token![,]>();
+                        }
+                        VableArrayLayoutDecl::Embedded {
+                            field_offset,
+                            ptr_offset: ptr_offset.ok_or_else(|| {
+                                syn::Error::new(
+                                    inner.span(),
+                                    "missing `ptr_offset` in embedded virtualizable array layout",
+                                )
+                            })?,
+                            length_offset: length_offset.ok_or_else(|| {
+                                syn::Error::new(
+                                    inner.span(),
+                                    "missing `length_offset` in embedded virtualizable array layout",
+                                )
+                            })?,
+                            items_offset: items_offset.ok_or_else(|| {
+                                syn::Error::new(
+                                    inner.span(),
+                                    "missing `items_offset` in embedded virtualizable array layout",
+                                )
+                            })?,
+                        }
+                    } else {
+                        VableArrayLayoutDecl::Direct { field_offset }
+                    };
                     arrays.push(VableArrayDecl {
                         name,
                         item_type,
-                        offset,
+                        layout,
                     });
                     let _ = inner.parse::<Token![,]>();
                 }
@@ -1126,6 +1208,13 @@ mod tests {
         }
     }
 
+    struct VirtualizableWrapper(VirtualizableDecl);
+    impl Parse for VirtualizableWrapper {
+        fn parse(input: ParseStream) -> syn::Result<Self> {
+            Ok(Self(parse_virtualizable_decl(input)?))
+        }
+    }
+
     #[test]
     fn parse_storage_config_rejects_legacy_virtualizable_flag() {
         let tokens: proc_macro2::TokenStream = parse_quote! {
@@ -1146,5 +1235,69 @@ mod tests {
             err.to_string().contains("storage.virtualizable"),
             "unexpected error: {err}",
         );
+    }
+
+    #[test]
+    fn parse_virtualizable_decl_keeps_direct_array_layout() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            {
+                var: frame,
+                token_offset: FRAME_TOKEN_OFFSET,
+                fields: { next_instr: int @ NEXT_INSTR_OFFSET },
+                arrays: { locals_w: ref @ LOCALS_OFFSET },
+            }
+        };
+        let parsed = syn::parse2::<VirtualizableWrapper>(tokens).unwrap().0;
+        assert_eq!(parsed.arrays.len(), 1);
+        match &parsed.arrays[0].layout {
+            VableArrayLayoutDecl::Direct { field_offset } => {
+                assert_eq!(quote::quote!(#field_offset).to_string(), "LOCALS_OFFSET");
+            }
+            VableArrayLayoutDecl::Embedded { .. } => {
+                panic!("expected direct array layout");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_virtualizable_decl_supports_embedded_array_layout() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            {
+                var: frame,
+                token_offset: FRAME_TOKEN_OFFSET,
+                fields: {},
+                arrays: {
+                    stack: int @ (STORAGEPOOL_DATA_PTRS_OFFSET + SLOT) {
+                        ptr_offset: 0,
+                        length_offset: STORAGEPOOL_LENGTHS_OFFSET - STORAGEPOOL_DATA_PTRS_OFFSET,
+                        items_offset: 0,
+                    },
+                },
+            }
+        };
+        let parsed = syn::parse2::<VirtualizableWrapper>(tokens).unwrap().0;
+        assert_eq!(parsed.arrays.len(), 1);
+        match &parsed.arrays[0].layout {
+            VableArrayLayoutDecl::Embedded {
+                field_offset,
+                ptr_offset,
+                length_offset,
+                items_offset,
+            } => {
+                assert_eq!(
+                    quote::quote!(#field_offset).to_string(),
+                    "STORAGEPOOL_DATA_PTRS_OFFSET + SLOT"
+                );
+                assert_eq!(quote::quote!(#ptr_offset).to_string(), "0");
+                assert_eq!(
+                    quote::quote!(#length_offset).to_string(),
+                    "STORAGEPOOL_LENGTHS_OFFSET - STORAGEPOOL_DATA_PTRS_OFFSET"
+                );
+                assert_eq!(quote::quote!(#items_offset).to_string(), "0");
+            }
+            VableArrayLayoutDecl::Direct { .. } => {
+                panic!("expected embedded array layout");
+            }
+        }
     }
 }

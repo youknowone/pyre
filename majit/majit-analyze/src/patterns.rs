@@ -10,6 +10,83 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldPatternRole {
+    LocalArray,
+    InstructionPosition,
+    ConstantPool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldRoleDescriptor {
+    pub field: crate::graph::FieldDescriptor,
+    pub role: FieldPatternRole,
+}
+
+impl FieldRoleDescriptor {
+    pub fn new(
+        name: impl Into<String>,
+        owner_root: Option<String>,
+        role: FieldPatternRole,
+    ) -> Self {
+        Self {
+            field: crate::graph::FieldDescriptor::new(name, owner_root),
+            role,
+        }
+    }
+
+    fn matches(&self, field: &crate::graph::FieldDescriptor) -> bool {
+        &self.field == field
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallPatternRole {
+    IntArithmetic,
+    FloatArithmetic,
+    LocalRead,
+    LocalWrite,
+    FunctionCall,
+    TruthCheck,
+    StackManip,
+    NamespaceLoadLocal,
+    NamespaceLoadGlobal,
+    NamespaceStoreLocal,
+    NamespaceStoreGlobal,
+    RangeIterNext,
+    IterCleanup,
+    Return,
+    BuildList,
+    BuildTuple,
+    UnpackSequence,
+    SequenceSetitem,
+    CollectionAppend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRoleDescriptor {
+    pub target: crate::graph::CallTarget,
+    pub role: CallPatternRole,
+}
+
+impl CallRoleDescriptor {
+    pub fn new(target: crate::graph::CallTarget, role: CallPatternRole) -> Self {
+        Self { target, role }
+    }
+
+    fn matches(&self, target: &crate::graph::CallTarget) -> bool {
+        &self.target == target
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassificationConfig {
+    #[serde(default)]
+    pub field_roles: Vec<FieldRoleDescriptor>,
+    #[serde(default)]
+    pub call_roles: Vec<CallRoleDescriptor>,
+}
+
 /// Recognized trace patterns for automatic IR generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TracePattern {
@@ -134,7 +211,96 @@ pub enum TracePattern {
 /// Instead of matching substrings in body_summary, it analyzes the
 /// actual ops in the MajitGraph.
 pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
+    classify_from_graph_with_config(graph, &ClassificationConfig::default())
+}
+
+pub fn classify_from_graph_with_config(
+    graph: &crate::MajitGraph,
+    config: &ClassificationConfig,
+) -> Option<TracePattern> {
     use crate::graph::OpKind;
+
+    fn field_has_role(
+        config: &ClassificationConfig,
+        field: &crate::graph::FieldDescriptor,
+        role: FieldPatternRole,
+    ) -> bool {
+        config
+            .field_roles
+            .iter()
+            .any(|descriptor| descriptor.role == role && descriptor.matches(field))
+            || match role {
+                FieldPatternRole::LocalArray => crate::field_match::is_local_array_field(field),
+                FieldPatternRole::InstructionPosition => {
+                    crate::field_match::is_instruction_position_field(field)
+                }
+                FieldPatternRole::ConstantPool => crate::field_match::is_constant_pool_field(field),
+            }
+    }
+
+    fn call_has_role(
+        config: &ClassificationConfig,
+        target: &crate::graph::CallTarget,
+        role: CallPatternRole,
+    ) -> bool {
+        config
+            .call_roles
+            .iter()
+            .any(|descriptor| descriptor.role == role && descriptor.matches(target))
+            || match role {
+                CallPatternRole::IntArithmetic => {
+                    crate::call_match::is_int_arithmetic_target(target)
+                }
+                CallPatternRole::FloatArithmetic => {
+                    crate::call_match::is_float_arithmetic_target(target)
+                }
+                CallPatternRole::LocalRead => crate::call_match::is_local_read_target(target),
+                CallPatternRole::LocalWrite => crate::call_match::is_local_write_target(target),
+                CallPatternRole::FunctionCall => {
+                    crate::call_match::is_function_invoke_target(target)
+                }
+                CallPatternRole::TruthCheck => crate::call_match::is_truth_check_target(target),
+                CallPatternRole::StackManip => crate::call_match::is_stack_manip_target(target),
+                CallPatternRole::NamespaceLoadLocal => {
+                    crate::call_match::namespace_access_kind(target)
+                        == Some(crate::call_match::NamespaceAccessKind::LoadLocal)
+                }
+                CallPatternRole::NamespaceLoadGlobal => {
+                    crate::call_match::namespace_access_kind(target)
+                        == Some(crate::call_match::NamespaceAccessKind::LoadGlobal)
+                }
+                CallPatternRole::NamespaceStoreLocal => {
+                    crate::call_match::namespace_access_kind(target)
+                        == Some(crate::call_match::NamespaceAccessKind::StoreLocal)
+                }
+                CallPatternRole::NamespaceStoreGlobal => {
+                    crate::call_match::namespace_access_kind(target)
+                        == Some(crate::call_match::NamespaceAccessKind::StoreGlobal)
+                }
+                CallPatternRole::RangeIterNext => {
+                    crate::call_match::is_range_iter_next_target(target)
+                }
+                CallPatternRole::IterCleanup => crate::call_match::is_iter_cleanup_target(target),
+                CallPatternRole::Return => crate::call_match::is_return_target(target),
+                CallPatternRole::BuildList => {
+                    crate::call_match::build_collection_kind(target)
+                        == Some(crate::call_match::BuildCollectionKind::List)
+                }
+                CallPatternRole::BuildTuple => {
+                    crate::call_match::build_collection_kind(target)
+                        == Some(crate::call_match::BuildCollectionKind::Tuple)
+                }
+                CallPatternRole::UnpackSequence => {
+                    crate::call_match::is_unpack_sequence_target(target)
+                }
+                CallPatternRole::SequenceSetitem => {
+                    crate::call_match::is_sequence_setitem_target(target)
+                }
+                CallPatternRole::CollectionAppend => {
+                    crate::call_match::is_collection_append_target(target)
+                }
+            }
+    }
 
     let entry = graph.block(graph.entry);
     let ops = &entry.ops;
@@ -225,7 +391,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Integer binary operations
     if call_descriptors
         .iter()
-        .any(|descriptor| crate::call_match::is_int_arithmetic_target(&descriptor.target))
+        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::IntArithmetic))
     {
         return Some(TracePattern::UnboxIntBinop {
             op_name: "dispatch".into(),
@@ -234,10 +400,9 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Float binary operations
-    if call_descriptors
-        .iter()
-        .any(|descriptor| crate::call_match::is_float_arithmetic_target(&descriptor.target))
-    {
+    if call_descriptors.iter().any(|descriptor| {
+        call_has_role(config, &descriptor.target, CallPatternRole::FloatArithmetic)
+    }) {
         return Some(TracePattern::UnboxFloatBinop {
             op_name: "FloatAdd".into(),
         });
@@ -246,12 +411,12 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Local read: reads from locals_w array (field read + array read, or push call)
     if (field_reads
         .iter()
-        .any(crate::field_match::is_local_array_field)
+        .any(|field| field_has_role(config, field, FieldPatternRole::LocalArray))
         && array_reads > 0)
         || (array_reads > 0
-            && call_descriptors
-                .iter()
-                .any(|descriptor| crate::call_match::is_local_read_target(&descriptor.target)))
+            && call_descriptors.iter().any(|descriptor| {
+                call_has_role(config, &descriptor.target, CallPatternRole::LocalRead)
+            }))
     {
         return Some(TracePattern::LocalRead);
     }
@@ -259,15 +424,15 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Local write: writes to locals_w array (field write + array write, or pop call)
     if (field_writes
         .iter()
-        .any(crate::field_match::is_local_array_field)
+        .any(|field| field_has_role(config, field, FieldPatternRole::LocalArray))
         && array_writes > 0)
         || field_writes
             .iter()
-            .any(crate::field_match::is_local_array_field)
+            .any(|field| field_has_role(config, field, FieldPatternRole::LocalArray))
         || (array_writes > 0
-            && call_descriptors
-                .iter()
-                .any(|descriptor| crate::call_match::is_local_write_target(&descriptor.target)))
+            && call_descriptors.iter().any(|descriptor| {
+                call_has_role(config, &descriptor.target, CallPatternRole::LocalWrite)
+            }))
     {
         return Some(TracePattern::LocalWrite);
     }
@@ -275,7 +440,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Constant load (reads from constants/co_consts)
     if field_reads
         .iter()
-        .any(crate::field_match::is_constant_pool_field)
+        .any(|field| field_has_role(config, field, FieldPatternRole::ConstantPool))
     {
         return Some(TracePattern::ConstLoad);
     }
@@ -283,7 +448,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Function call
     if call_descriptors
         .iter()
-        .any(|descriptor| crate::call_match::is_function_invoke_target(&descriptor.target))
+        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::FunctionCall))
     {
         return Some(TracePattern::FunctionCall);
     }
@@ -291,7 +456,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Truth check
     if call_descriptors
         .iter()
-        .any(|descriptor| crate::call_match::is_truth_check_target(&descriptor.target))
+        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::TruthCheck))
     {
         return Some(TracePattern::TruthCheck);
     }
@@ -299,7 +464,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Stack manipulation (pop/swap/peek without array access)
     if call_descriptors
         .iter()
-        .any(|descriptor| crate::call_match::is_stack_manip_target(&descriptor.target))
+        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::StackManip))
         && array_reads == 0
         && array_writes == 0
     {
@@ -307,39 +472,55 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Namespace access (load/store name/global)
-    let namespace_kinds: Vec<_> = call_descriptors
-        .iter()
-        .filter_map(|descriptor| crate::call_match::namespace_access_kind(&descriptor.target))
-        .collect();
-    if !namespace_kinds.is_empty() {
+    let has_namespace_load_local = call_descriptors.iter().any(|descriptor| {
+        call_has_role(
+            config,
+            &descriptor.target,
+            CallPatternRole::NamespaceLoadLocal,
+        )
+    });
+    let has_namespace_load_global = call_descriptors.iter().any(|descriptor| {
+        call_has_role(
+            config,
+            &descriptor.target,
+            CallPatternRole::NamespaceLoadGlobal,
+        )
+    });
+    let has_namespace_store_local = call_descriptors.iter().any(|descriptor| {
+        call_has_role(
+            config,
+            &descriptor.target,
+            CallPatternRole::NamespaceStoreLocal,
+        )
+    });
+    let has_namespace_store_global = call_descriptors.iter().any(|descriptor| {
+        call_has_role(
+            config,
+            &descriptor.target,
+            CallPatternRole::NamespaceStoreGlobal,
+        )
+    });
+    if has_namespace_load_local
+        || has_namespace_load_global
+        || has_namespace_store_local
+        || has_namespace_store_global
+    {
         return Some(TracePattern::NamespaceAccess {
-            is_load: namespace_kinds.iter().any(|kind| {
-                matches!(
-                    kind,
-                    crate::call_match::NamespaceAccessKind::LoadLocal
-                        | crate::call_match::NamespaceAccessKind::LoadGlobal
-                )
-            }),
-            is_global: namespace_kinds.iter().any(|kind| {
-                matches!(
-                    kind,
-                    crate::call_match::NamespaceAccessKind::LoadGlobal
-                        | crate::call_match::NamespaceAccessKind::StoreGlobal
-                )
-            }),
+            is_load: has_namespace_load_local || has_namespace_load_global,
+            is_global: has_namespace_load_global || has_namespace_store_global,
         });
     }
 
     // Iterator
     if call_descriptors
         .iter()
-        .any(|descriptor| crate::call_match::is_range_iter_next_target(&descriptor.target))
+        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::RangeIterNext))
     {
         return Some(TracePattern::RangeIterNext);
     }
     if call_descriptors
         .iter()
-        .any(|descriptor| crate::call_match::is_iter_cleanup_target(&descriptor.target))
+        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::IterCleanup))
     {
         return Some(TracePattern::IterCleanup);
     }
@@ -348,7 +529,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     if matches!(&entry.terminator, crate::graph::Terminator::Return(Some(_))) && ops.len() <= 5 {
         if call_descriptors
             .iter()
-            .any(|descriptor| crate::call_match::is_return_target(&descriptor.target))
+            .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::Return))
         {
             return Some(TracePattern::Return);
         }
@@ -358,7 +539,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     if has_guard
         && field_writes
             .iter()
-            .any(crate::field_match::is_instruction_position_field)
+            .any(|field| field_has_role(config, field, FieldPatternRole::InstructionPosition))
     {
         return Some(TracePattern::ConditionalJump);
     }
@@ -367,42 +548,42 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     if !has_guard
         && field_writes
             .iter()
-            .any(crate::field_match::is_instruction_position_field)
+            .any(|field| field_has_role(config, field, FieldPatternRole::InstructionPosition))
     {
         return Some(TracePattern::Jump);
     }
 
     // Build collection
-    if let Some(kind) = call_descriptors
+    let has_build_list = call_descriptors
         .iter()
-        .find_map(|descriptor| crate::call_match::build_collection_kind(&descriptor.target))
-    {
+        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::BuildList));
+    let has_build_tuple = call_descriptors
+        .iter()
+        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::BuildTuple));
+    if has_build_list || has_build_tuple {
         return Some(TracePattern::BuildCollection {
-            kind: match kind {
-                crate::call_match::BuildCollectionKind::List => "list",
-                crate::call_match::BuildCollectionKind::Tuple => "tuple",
-            }
-            .into(),
+            kind: if has_build_list { "list" } else { "tuple" }.into(),
         });
     }
 
     // Sequence operations
-    if call_descriptors
-        .iter()
-        .any(|descriptor| crate::call_match::is_unpack_sequence_target(&descriptor.target))
-    {
+    if call_descriptors.iter().any(|descriptor| {
+        call_has_role(config, &descriptor.target, CallPatternRole::UnpackSequence)
+    }) {
         return Some(TracePattern::UnpackSequence);
     }
-    if call_descriptors
-        .iter()
-        .any(|descriptor| crate::call_match::is_sequence_setitem_target(&descriptor.target))
-    {
+    if call_descriptors.iter().any(|descriptor| {
+        call_has_role(config, &descriptor.target, CallPatternRole::SequenceSetitem)
+    }) {
         return Some(TracePattern::SequenceSetitem);
     }
-    if call_descriptors
-        .iter()
-        .any(|descriptor| crate::call_match::is_collection_append_target(&descriptor.target))
-    {
+    if call_descriptors.iter().any(|descriptor| {
+        call_has_role(
+            config,
+            &descriptor.target,
+            CallPatternRole::CollectionAppend,
+        )
+    }) {
         return Some(TracePattern::CollectionAppend);
     }
 

@@ -39,12 +39,12 @@ impl std::fmt::Display for VirtualStatesCantMatch {
 
 impl std::error::Error for VirtualStatesCantMatch {}
 
+use crate::OptContext;
 use crate::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
     VirtualStructInfo,
 };
 use crate::intutils::IntBound;
-use crate::OptContext;
 
 /// virtualstate.py: GenerateGuardState — context for guard generation
 /// during virtual state comparison.
@@ -880,6 +880,15 @@ fn export_single_value(
                     class_ptr: *class_ptr,
                 };
             }
+            PtrInfo::ForcedVirtual(vinfo) => {
+                if let Some(class_ptr) = vinfo.known_class {
+                    return VirtualStateInfo::KnownClass { class_ptr };
+                }
+                return VirtualStateInfo::NonNull;
+            }
+            PtrInfo::ForcedStruct(_) => {
+                return VirtualStateInfo::NonNull;
+            }
             PtrInfo::NonNull => {
                 return VirtualStateInfo::NonNull;
             }
@@ -1309,19 +1318,23 @@ mod tests {
     #[test]
     fn test_is_virtual() {
         let descr = test_descr(1);
-        assert!(VirtualStateInfo::Virtual {
-            descr: descr.clone(),
-            known_class: None,
-            fields: vec![],
-        }
-        .is_virtual());
+        assert!(
+            VirtualStateInfo::Virtual {
+                descr: descr.clone(),
+                known_class: None,
+                fields: vec![],
+            }
+            .is_virtual()
+        );
 
-        assert!(VirtualStateInfo::VirtualArray {
-            descr: descr.clone(),
-            items: vec![],
-            lenbound: None,
-        }
-        .is_virtual());
+        assert!(
+            VirtualStateInfo::VirtualArray {
+                descr: descr.clone(),
+                items: vec![],
+                lenbound: None,
+            }
+            .is_virtual()
+        );
 
         assert!(!VirtualStateInfo::NonNull.is_virtual());
         assert!(!VirtualStateInfo::Unknown.is_virtual());

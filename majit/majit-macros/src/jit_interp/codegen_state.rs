@@ -4,7 +4,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::Expr;
 
-use super::{JitInterpConfig, StateFieldKind};
+use super::{JitInterpConfig, StateFieldKind, VableArrayLayoutDecl};
 
 /// Extract the member field name from a field access expression.
 /// e.g., `state.storage` → `storage`, `state.selected` → `selected`.
@@ -42,6 +42,133 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     } else {
         quote! {}
     };
+    let vable_info_fn = config.virtualizable_decl.as_ref().map(|decl| {
+        let token_offset = &decl.token_offset;
+        let field_adds: Vec<TokenStream> = decl
+            .fields
+            .iter()
+            .map(|f| {
+                let name = f.name.to_string();
+                let offset = &f.offset;
+                let tp = if f.field_type == "ref" {
+                    quote! { majit_ir::Type::Ref }
+                } else if f.field_type == "float" {
+                    quote! { majit_ir::Type::Float }
+                } else {
+                    quote! { majit_ir::Type::Int }
+                };
+                quote! {
+                    __info.add_field(#name, #tp, #offset);
+                }
+            })
+            .collect();
+        let array_adds: Vec<TokenStream> = decl
+            .arrays
+            .iter()
+            .map(|a| {
+                let name = a.name.to_string();
+                let tp = if a.item_type == "ref" {
+                    quote! { majit_ir::Type::Ref }
+                } else if a.item_type == "float" {
+                    quote! { majit_ir::Type::Float }
+                } else {
+                    quote! { majit_ir::Type::Int }
+                };
+                match &a.layout {
+                    VableArrayLayoutDecl::Direct { field_offset } => quote! {
+                        __info.add_array_field(#name, #tp, #field_offset);
+                    },
+                    VableArrayLayoutDecl::Embedded {
+                        field_offset,
+                        ptr_offset,
+                        length_offset,
+                        items_offset,
+                    } => quote! {
+                        __info.add_embedded_array_field_with_layout(
+                            #name,
+                            #tp,
+                            #field_offset,
+                            #ptr_offset,
+                            #length_offset,
+                            #items_offset,
+                        );
+                    },
+                }
+            })
+            .collect();
+        quote! {
+            #[allow(non_snake_case)]
+            fn __build_virtualizable_info() -> Option<majit_meta::virtualizable::VirtualizableInfo> {
+                let mut __info = majit_meta::virtualizable::VirtualizableInfo::new(#token_offset);
+                #(#field_adds)*
+                #(#array_adds)*
+                Some(__info)
+            }
+        }
+    });
+    let vable_state_hooks = config.virtualizable_decl.as_ref().map(|decl| {
+        let virtualizable_name = decl.var_name.to_string();
+        quote! {
+            fn virtualizable_heap_ptr(
+                &self,
+                _meta: &Self::Meta,
+                virtualizable: &str,
+                _info: &majit_meta::virtualizable::VirtualizableInfo,
+            ) -> Option<*mut u8> {
+                if virtualizable == #virtualizable_name {
+                    Some((&self.#pool_field as *const _ as *mut u8).cast::<u8>())
+                } else {
+                    None
+                }
+            }
+
+            fn virtualizable_array_lengths(
+                &self,
+                _meta: &Self::Meta,
+                virtualizable: &str,
+                info: &majit_meta::virtualizable::VirtualizableInfo,
+            ) -> Option<Vec<usize>> {
+                if virtualizable != #virtualizable_name {
+                    return None;
+                }
+                if info.can_read_all_array_lengths_from_heap() {
+                    let obj_ptr = (&self.#pool_field as *const _).cast::<u8>();
+                    Some(unsafe { info.read_array_lengths_from_heap(obj_ptr) })
+                } else {
+                    None
+                }
+            }
+
+            fn import_virtualizable_boxes(
+                &mut self,
+                _meta: &Self::Meta,
+                _virtualizable: &str,
+                _info: &majit_meta::virtualizable::VirtualizableInfo,
+                _static_boxes: &[i64],
+                _array_boxes: &[Vec<i64>],
+            ) -> bool {
+                true
+            }
+
+            fn export_virtualizable_boxes(
+                &self,
+                meta: &Self::Meta,
+                virtualizable: &str,
+                info: &majit_meta::virtualizable::VirtualizableInfo,
+            ) -> Option<(Vec<i64>, Vec<Vec<i64>>)> {
+                if virtualizable != #virtualizable_name {
+                    return None;
+                }
+                let obj_ptr = (&self.#pool_field as *const _).cast::<u8>();
+                let lengths = if info.can_read_all_array_lengths_from_heap() {
+                    unsafe { info.read_array_lengths_from_heap(obj_ptr) }
+                } else {
+                    self.virtualizable_array_lengths(meta, virtualizable, info)?
+                };
+                Some(unsafe { info.read_all_boxes(obj_ptr, &lengths) })
+            }
+        }
+    });
     let compact_encode = storage
         .compact_encode
         .as_ref()
@@ -547,6 +674,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         }
                     }
 
+                    #vable_info_fn
+                    #vable_state_hooks
+
                     fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
                         let selected = majit_meta::JitCodeSym::current_selected_value(sym)
                             .unwrap_or_else(|| majit_ir::OpRef::NONE);
@@ -783,60 +913,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
         };
     }
-    // ── Frame virtualizable (VirtualizableDecl) code generation ──
-    let vable_info_fn = config.virtualizable_decl.as_ref().map(|decl| {
-        let token_offset = &decl.token_offset;
-        let field_adds: Vec<TokenStream> = decl
-            .fields
-            .iter()
-            .map(|f| {
-                let name = f.name.to_string();
-                let offset = &f.offset;
-                let tp = if f.field_type == "ref" {
-                    quote! { majit_ir::Type::Ref }
-                } else if f.field_type == "float" {
-                    quote! { majit_ir::Type::Float }
-                } else {
-                    quote! { majit_ir::Type::Int }
-                };
-                quote! {
-                    __info.add_field(#name, #tp, #offset);
-                }
-            })
-            .collect();
-        let array_adds: Vec<TokenStream> = decl
-            .arrays
-            .iter()
-            .map(|a| {
-                let name = a.name.to_string();
-                let offset = &a.offset;
-                let tp = if a.item_type == "ref" {
-                    quote! { majit_ir::Type::Ref }
-                } else if a.item_type == "float" {
-                    quote! { majit_ir::Type::Float }
-                } else {
-                    quote! { majit_ir::Type::Int }
-                };
-                quote! {
-                    __info.add_array_field(#name, #tp, #offset);
-                }
-            })
-            .collect();
-        quote! {
-            /// Build VirtualizableInfo for the interpreter frame.
-            ///
-            /// Auto-generated from `virtualizable_fields` declaration.
-            /// RPython equivalent: VirtualizableInfo.__init__() in virtualizable.py.
-            #[allow(non_snake_case)]
-            fn __build_virtualizable_info() -> Option<majit_meta::virtualizable::VirtualizableInfo> {
-                let mut __info = majit_meta::virtualizable::VirtualizableInfo::new(#token_offset);
-                #(#field_adds)*
-                #(#array_adds)*
-                Some(__info)
-            }
-        }
-    });
-
     quote! {
         /// Compiled loop metadata: which storages and how many slots each had.
         #[derive(Clone)]
@@ -1000,12 +1076,47 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                let mut offset = 0;
-                for &(sidx, num_slots) in &meta.storage_layout {
-                    let end = offset + num_slots;
-                    {
+                // Two possible formats:
+                // 1. JUMP args (loop finish): [stack_elems...] — length == sum(num_slots)
+                // 2. Guard fail_args: [stack_elems..., lengths..., selected, resume_pc]
+                let total_meta_slots: usize = meta.storage_layout.iter().map(|&(_, n)| n).sum();
+                if values.len() == total_meta_slots {
+                    // Format 1: simple JUMP args — restore stacks from meta depths
+                    let mut offset = 0;
+                    for &(sidx, num_slots) in &meta.storage_layout {
+                        let end = offset + num_slots;
                         let store = self.#pool_field.get_mut(sidx);
                         store.clear();
+                        for &value in &values[offset..end] {
+                            store.push(value);
+                        }
+                        offset = end;
+                    }
+                    self.#sel_field = meta.initial_selected;
+                    return;
+                }
+                // Format 2: guard fail_args with suffix
+                let n_storages = meta.storage_layout.len();
+                let suffix_len = n_storages + 2; // lengths + selected + resume_pc
+                if values.len() < suffix_len {
+                    self.#sel_field = meta.initial_selected;
+                    return;
+                }
+                let total_stack_elems = values.len() - suffix_len;
+                let lengths_offset = total_stack_elems;
+                let selected_offset = lengths_offset + n_storages;
+
+                let mut offset = 0;
+                for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
+                    let current_len = values
+                        .get(lengths_offset + i)
+                        .copied()
+                        .and_then(|v| usize::try_from(v).ok())
+                        .unwrap_or(0);
+                    let end = offset + current_len;
+                    let store = self.#pool_field.get_mut(sidx);
+                    store.clear();
+                    if end <= total_stack_elems {
                         for &value in &values[offset..end] {
                             store.push(value);
                         }
@@ -1013,9 +1124,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     offset = end;
                 }
                 self.#sel_field = values
-                    .get(offset)
+                    .get(selected_offset)
                     .copied()
-                    .map(|value| value as usize)
+                    .and_then(|v| usize::try_from(v).ok())
                     .unwrap_or(meta.initial_selected);
             }
 
@@ -1031,6 +1142,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             #vable_info_fn
+            #vable_state_hooks
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
                 sym.current_selected == meta.initial_selected
@@ -1589,5 +1701,81 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                 true #(#validate_array_checks)*
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_jit_state;
+    use crate::jit_interp::JitInterpConfig;
+    use quote::quote;
+
+    fn render(config: proc_macro2::TokenStream) -> String {
+        let parsed = syn::parse2::<JitInterpConfig>(config).expect("valid jit_interp config");
+        generate_jit_state(&parsed).to_string()
+    }
+
+    #[test]
+    fn storage_mode_generates_virtualizable_sync_hooks() {
+        let generated = render(quote! {
+            state = State,
+            env = Program,
+            storage = {
+                pool: state.storage,
+                pool_type: StoragePool,
+                selector: state.selected,
+                untraceable: [],
+                scan: scan_storages,
+            },
+            virtualizable_fields = {
+                var: frame,
+                token_offset: VABLE_TOKEN_OFFSET,
+                fields: { next_instr: int @ NEXT_INSTR_OFFSET },
+                arrays: { locals_w: ref @ LOCALS_OFFSET },
+            }
+        });
+
+        assert!(generated.contains("fn __build_virtualizable_info"));
+        assert!(generated.contains("__info . add_array_field"));
+        assert!(generated.contains("fn virtualizable_heap_ptr"));
+        assert!(generated.contains("fn virtualizable_array_lengths"));
+        assert!(generated.contains("fn import_virtualizable_boxes"));
+        assert!(generated.contains("fn export_virtualizable_boxes"));
+    }
+
+    #[test]
+    fn compact_storage_mode_generates_embedded_array_vable_info_and_hooks() {
+        let generated = render(quote! {
+            state = State,
+            env = Program,
+            storage = {
+                pool: state.storage,
+                pool_type: StoragePool,
+                selector: state.selected,
+                untraceable: [],
+                scan: scan_storages,
+                compact_live: true,
+                compact_ptrs_offset: STORAGEPOOL_DATA_PTRS_OFFSET,
+                compact_lengths_offset: STORAGEPOOL_LENGTHS_OFFSET,
+                compact_caps_offset: STORAGEPOOL_CAPS_OFFSET,
+            },
+            virtualizable_fields = {
+                var: storage,
+                token_offset: STORAGEPOOL_VABLE_TOKEN_OFFSET,
+                fields: {},
+                arrays: {
+                    stack: int @ (STORAGEPOOL_DATA_PTRS_OFFSET + SLOT_OFFSET) {
+                        ptr_offset: 0,
+                        length_offset: STORAGEPOOL_LENGTHS_OFFSET - STORAGEPOOL_DATA_PTRS_OFFSET,
+                        items_offset: 0,
+                    },
+                },
+            }
+        });
+
+        assert!(generated.contains("fn __build_virtualizable_info"));
+        assert!(generated.contains("__info . add_embedded_array_field_with_layout"));
+        assert!(generated.contains("fn virtualizable_heap_ptr"));
+        assert!(generated.contains("fn export_virtualizable_boxes"));
     }
 }

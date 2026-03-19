@@ -1230,17 +1230,20 @@ mod tests {
         pass.pure_from_args(OpCode::IntAdd, &[OpRef(10), OpRef(20)], OpRef(30));
 
         // lookup2 should find it
-        assert!(pass
-            .lookup2(OpCode::IntAdd, OpRef(10), OpRef(20), false)
-            .is_some());
+        assert!(
+            pass.lookup2(OpCode::IntAdd, OpRef(10), OpRef(20), false)
+                .is_some()
+        );
         // lookup2 with commutative should find swapped
-        assert!(pass
-            .lookup2(OpCode::IntAdd, OpRef(20), OpRef(10), true)
-            .is_some());
+        assert!(
+            pass.lookup2(OpCode::IntAdd, OpRef(20), OpRef(10), true)
+                .is_some()
+        );
         // Non-commutative swapped should NOT find it
-        assert!(pass
-            .lookup2(OpCode::IntAdd, OpRef(20), OpRef(10), false)
-            .is_none());
+        assert!(
+            pass.lookup2(OpCode::IntAdd, OpRef(20), OpRef(10), false)
+                .is_none()
+        );
 
         // lookup1 for a unary op
         pass.pure_from_args(OpCode::IntNeg, &[OpRef(10)], OpRef(40));

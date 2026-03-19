@@ -17,7 +17,7 @@ pub use crate::{
 pub fn is_traceable(pattern_name: &str) -> bool {
     CANONICAL_TRACE_PATTERNS
         .iter()
-        .any(|(_, cls)| *cls != "Unclassified" && cls.contains(pattern_name))
+        .any(|(_, cls)| *cls != "Unclassified" && *cls == pattern_name)
 }
 
 /// Get the trace classification for an opcode pattern.
@@ -43,12 +43,11 @@ mod tests {
 
     #[test]
     fn test_classification_lookup() {
-        // Find BinaryOp pattern
         let cls = CANONICAL_TRACE_PATTERNS
             .iter()
-            .find(|(pat, _)| pat.contains("BinaryOp"))
+            .find(|(pat, _)| *pat == "Instruction::BinaryOp")
             .map(|(_, cls)| *cls);
         assert!(cls.is_some());
-        assert!(cls.unwrap().contains("UnboxIntBinop"));
+        assert_eq!(cls.unwrap(), "UnboxIntBinop");
     }
 }

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use majit_ir::{OpCode, OpRef};
 use majit_macros::jit_interp;
 use majit_meta::{
-    assert_trace_parity, BackEdgeAction, JitState, MetaInterp, TraceAction, TraceParityCase,
+    BackEdgeAction, JitState, MetaInterp, TraceAction, TraceParityCase, assert_trace_parity,
 };
 
 const UNTRACEABLE: usize = 99;
@@ -235,8 +235,7 @@ fn jit_interp_selector_and_push_to_route_value_to_other_stack() {
     let (trace, constants) = interp.finish_trace_for_parity(&[result]).unwrap();
     let case = TraceParityCase {
         name: "jit_interp_selector_and_push_to",
-        rpython_reference:
-            "rpython/jit/metainterp/pyjitpl.py: stateful helper side effects without IR ops",
+        rpython_reference: "rpython/jit/metainterp/pyjitpl.py: stateful helper side effects without IR ops",
         expected_lines: &["Finish(99)"],
     };
     assert_trace_parity(&trace, &constants, &case);

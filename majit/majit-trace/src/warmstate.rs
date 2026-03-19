@@ -1738,7 +1738,7 @@ mod tests {
         let mut aging = LoopAging::new(2);
 
         aging.register_loop(1); // gen 0
-                                // Advance until eviction
+        // Advance until eviction
         aging.next_generation(); // gen 1
         aging.next_generation(); // gen 2
         let evicted = aging.next_generation(); // gen 3: threshold=1, 0 < 1 → evict

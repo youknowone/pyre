@@ -9,8 +9,8 @@ pub mod noneobject;
 pub mod object_array;
 pub mod pyobject;
 pub mod rangeobject;
-pub mod strobject;
 pub mod sliceobject;
+pub mod strobject;
 pub mod tupleobject;
 
 pub use boolobject::*;

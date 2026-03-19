@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use majit_codegen::JitCellToken;
 use majit_ir::{GcRef, OpCode, Type};
 use majit_meta::{
-    assert_trace_parity, trace_jitcode, BackEdgeAction, JitCallArg, JitCodeBuilder, JitCodeMachine,
-    JitCodeSym, MIFrame, MetaInterp, SymbolicStack, TraceAction, TraceParityCase,
+    BackEdgeAction, JitCallArg, JitCodeBuilder, JitCodeMachine, JitCodeSym, MIFrame, MetaInterp,
+    SymbolicStack, TraceAction, TraceParityCase, assert_trace_parity, trace_jitcode,
 };
 
 static LAST_RAW_VOID_SUM: AtomicI64 = AtomicI64::new(-1);

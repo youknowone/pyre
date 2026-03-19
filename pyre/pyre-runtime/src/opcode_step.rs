@@ -906,13 +906,19 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Err(crate::PyError::type_error("convert_value not implemented").into())
     }
 
-    fn get_len(&mut self, _obj: <Self as SharedOpcodeHandler>::Value) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+    fn get_len(
+        &mut self,
+        _obj: <Self as SharedOpcodeHandler>::Value,
+    ) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
         Err(crate::PyError::type_error("get_len not implemented").into())
     }
     fn load_fast_and_clear(&mut self, _idx: usize) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("load_fast_and_clear not implemented").into())
     }
-    fn set_function_attribute_with_flag(&mut self, _flag: pyre_bytecode::bytecode::MakeFunctionFlag) -> Result<(), Self::Error> {
+    fn set_function_attribute_with_flag(
+        &mut self,
+        _flag: pyre_bytecode::bytecode::MakeFunctionFlag,
+    ) -> Result<(), Self::Error> {
         // Default: pop the attribute value and discard
         let _attr = self.pop_value().map_err(Into::into)?;
         Ok(())
@@ -926,15 +932,15 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn match_stub(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("pattern matching not implemented").into())
     }
-    fn unpack_ex(&mut self, _args: pyre_bytecode::bytecode::UnpackExArgs) -> Result<(), Self::Error> {
+    fn unpack_ex(
+        &mut self,
+        _args: pyre_bytecode::bytecode::UnpackExArgs,
+    ) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("unpack_ex not implemented").into())
     }
 
     /// CALL_INTRINSIC_1: single-argument intrinsic operations.
-    fn call_intrinsic_1(
-        &mut self,
-        func: IntrinsicFunction1,
-    ) -> Result<(), Self::Error> {
+    fn call_intrinsic_1(&mut self, func: IntrinsicFunction1) -> Result<(), Self::Error> {
         match func {
             IntrinsicFunction1::UnaryPositive => {
                 // PyPy: UNARY_POSITIVE → space.pos(w_value)
@@ -964,17 +970,16 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 self.push_value(none).map_err(Into::into)?;
                 Ok(())
             }
-            _ => Err(crate::PyError::type_error(
-                &format!("intrinsic function {:?} not implemented", func),
-            ).into()),
+            _ => Err(crate::PyError::type_error(&format!(
+                "intrinsic function {:?} not implemented",
+                func
+            ))
+            .into()),
         }
     }
 
     /// CALL_INTRINSIC_2: two-argument intrinsic operations.
-    fn call_intrinsic_2(
-        &mut self,
-        func: IntrinsicFunction2,
-    ) -> Result<(), Self::Error> {
+    fn call_intrinsic_2(&mut self, func: IntrinsicFunction2) -> Result<(), Self::Error> {
         match func {
             IntrinsicFunction2::SetFunctionTypeParams => {
                 // arg2 = type_params, arg1 = function
@@ -983,20 +988,31 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 // just leave the function on the stack
                 Ok(())
             }
-            _ => Err(crate::PyError::type_error(
-                &format!("intrinsic function {:?} not implemented", func),
-            ).into()),
+            _ => Err(crate::PyError::type_error(&format!(
+                "intrinsic function {:?} not implemented",
+                func
+            ))
+            .into()),
         }
     }
 
     // ── Intrinsic helper methods ──
-    fn unary_positive(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+    fn unary_positive(
+        &mut self,
+        _val: <Self as SharedOpcodeHandler>::Value,
+    ) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
         Err(crate::PyError::type_error("unary_positive not implemented").into())
     }
-    fn list_to_tuple(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+    fn list_to_tuple(
+        &mut self,
+        _val: <Self as SharedOpcodeHandler>::Value,
+    ) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
         Err(crate::PyError::type_error("list_to_tuple not implemented").into())
     }
-    fn print_expr(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<(), Self::Error> {
+    fn print_expr(
+        &mut self,
+        _val: <Self as SharedOpcodeHandler>::Value,
+    ) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("print_expr not implemented").into())
     }
     fn none_value(&mut self) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
@@ -1048,7 +1064,11 @@ where
 
         Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
             let idx = var_num.get(op_arg).as_usize();
-            let name = code.varnames.get(idx).map(|s| s.as_ref()).unwrap_or("<cell>");
+            let name = code
+                .varnames
+                .get(idx)
+                .map(|s| s.as_ref())
+                .unwrap_or("<cell>");
             executor.load_fast_checked(idx, name)?;
             Ok(StepResult::Continue)
         }
@@ -1073,7 +1093,11 @@ where
 
         Instruction::LoadFastCheck { var_num } => {
             let idx = var_num.get(op_arg).as_usize();
-            let name = code.varnames.get(idx).map(|s| s.as_ref()).unwrap_or("<cell>");
+            let name = code
+                .varnames
+                .get(idx)
+                .map(|s| s.as_ref())
+                .unwrap_or("<cell>");
             executor.load_fast_checked(idx, name)?;
             Ok(StepResult::Continue)
         }
@@ -1578,9 +1602,14 @@ where
         }
 
         // ── Async stubs ──
-        Instruction::GetAwaitable { .. } | Instruction::GetAIter | Instruction::GetANext
-        | Instruction::EndAsyncFor | Instruction::Send { .. } | Instruction::EndSend
-        | Instruction::GetYieldFromIter | Instruction::CleanupThrow => {
+        Instruction::GetAwaitable { .. }
+        | Instruction::GetAIter
+        | Instruction::GetANext
+        | Instruction::EndAsyncFor
+        | Instruction::Send { .. }
+        | Instruction::EndSend
+        | Instruction::GetYieldFromIter
+        | Instruction::CleanupThrow => {
             Err(crate::PyError::type_error("async/generator send not yet implemented").into())
         }
 

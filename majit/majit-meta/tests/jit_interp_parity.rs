@@ -1,6 +1,6 @@
 use majit_macros::jit_interp;
 use majit_meta::{
-    assert_trace_parity, BackEdgeAction, JitState, MetaInterp, TraceAction, TraceParityCase,
+    BackEdgeAction, JitState, MetaInterp, TraceAction, TraceParityCase, assert_trace_parity,
 };
 
 const UNTRACEABLE: usize = 99;
@@ -225,8 +225,7 @@ fn jit_interp_inline_complex_expr_matches_runtime_parity_seam() {
     let (trace, constants) = interp.finish_trace_for_parity(&[result]).unwrap();
     let case = TraceParityCase {
         name: "jit_interp_inline_complex_expr",
-        rpython_reference:
-            "rpython/jit/metainterp/pyjitpl.py: opimpl_int_add / opimpl_int_sub / opimpl_int_mul",
+        rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_add / opimpl_int_sub / opimpl_int_mul",
         expected_lines: &[
             "v2 = IntAdd(v1, 1)",
             "v3 = IntSub(v0, 2)",
@@ -258,8 +257,7 @@ fn jit_interp_shift_and_compare_matches_runtime_parity_seam() {
     let (trace, constants) = interp.finish_trace_for_parity(&[result]).unwrap();
     let case = TraceParityCase {
         name: "jit_interp_shift_and_compare",
-        rpython_reference:
-            "rpython/jit/metainterp/pyjitpl.py: opimpl_int_lshift / opimpl_int_rshift / opimpl_int_ge",
+        rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_lshift / opimpl_int_rshift / opimpl_int_ge",
         expected_lines: &[
             "v2 = IntLshift(v1, 1)",
             "v3 = IntRshift(v0, 2)",

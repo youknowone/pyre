@@ -395,7 +395,6 @@ pub fn emit_box_int_inline(
     intval_descr: majit_ir::DescrRef,
     int_type_addr: i64,
 ) -> OpRef {
-    use crate::jit::descr::w_int_size_descr;
     // Emit: v = New(W_Int)
     let new_op = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
     // Emit: SetfieldGc(v, ob_type, INT_TYPE)

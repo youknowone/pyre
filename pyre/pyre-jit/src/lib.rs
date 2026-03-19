@@ -45,17 +45,17 @@ mod tests {
         // Check key patterns exist
         let has_binary = CANONICAL_TRACE_PATTERNS
             .iter()
-            .any(|(_, p)| p.contains("UnboxIntBinop"));
+            .any(|(_, p)| *p == "UnboxIntBinop");
         assert!(has_binary, "missing UnboxIntBinop pattern");
 
         let has_local_read = CANONICAL_TRACE_PATTERNS
             .iter()
-            .any(|(_, p)| p.contains("LocalRead"));
+            .any(|(_, p)| *p == "LocalRead");
         assert!(has_local_read, "missing LocalRead pattern");
 
         let has_call = CANONICAL_TRACE_PATTERNS
             .iter()
-            .any(|(_, p)| p.contains("FunctionCall"));
+            .any(|(_, p)| *p == "FunctionCall");
         assert!(has_call, "missing FunctionCall pattern");
 
         eprintln!(

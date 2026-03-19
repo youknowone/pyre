@@ -317,10 +317,14 @@ unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let len_b = w_list_len(b);
     let mut items = Vec::with_capacity(len_a + len_b);
     for i in 0..len_a {
-        if let Some(item) = w_list_getitem(a, i as i64) { items.push(item); }
+        if let Some(item) = w_list_getitem(a, i as i64) {
+            items.push(item);
+        }
     }
     for i in 0..len_b {
-        if let Some(item) = w_list_getitem(b, i as i64) { items.push(item); }
+        if let Some(item) = w_list_getitem(b, i as i64) {
+            items.push(item);
+        }
     }
     Ok(w_list_new(items))
 }
@@ -330,10 +334,14 @@ unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let len_b = w_tuple_len(b);
     let mut items = Vec::with_capacity(len_a + len_b);
     for i in 0..len_a {
-        if let Some(item) = w_tuple_getitem(a, i as i64) { items.push(item); }
+        if let Some(item) = w_tuple_getitem(a, i as i64) {
+            items.push(item);
+        }
     }
     for i in 0..len_b {
-        if let Some(item) = w_tuple_getitem(b, i as i64) { items.push(item); }
+        if let Some(item) = w_tuple_getitem(b, i as i64) {
+            items.push(item);
+        }
     }
     Ok(w_tuple_new(items))
 }
@@ -803,8 +811,16 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 let len = w_list_len(obj) as i64;
                 let start = w_slice_get_start(index);
                 let stop = w_slice_get_stop(index);
-                let s = if is_none(start) { 0 } else { w_int_get_value(start) };
-                let e = if is_none(stop) { len } else { w_int_get_value(stop) };
+                let s = if is_none(start) {
+                    0
+                } else {
+                    w_int_get_value(start)
+                };
+                let e = if is_none(stop) {
+                    len
+                } else {
+                    w_int_get_value(stop)
+                };
                 let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
                 let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
                 let mut items = Vec::new();
@@ -816,7 +832,9 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 return Ok(w_list_new(items));
             }
             if !is_int(index) {
-                return Err(PyError::type_error("list indices must be integers or slices"));
+                return Err(PyError::type_error(
+                    "list indices must be integers or slices",
+                ));
             }
             let idx = w_int_get_value(index);
             match w_list_getitem(obj, idx) {
@@ -1220,7 +1238,11 @@ mod tests {
         let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         let needle = w_int_new(1);
         unsafe {
-            assert!(is_list(list), "should be list, got type: {}", (*(*list).ob_type).tp_name);
+            assert!(
+                is_list(list),
+                "should be list, got type: {}",
+                (*(*list).ob_type).tp_name
+            );
         }
         let result = super::py_contains(list, needle).expect("py_contains failed");
         assert!(result, "1 should be in [1, 2, 3]");
@@ -1266,7 +1288,9 @@ pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, P
         loop {
             match py_getitem(haystack, pyre_object::w_int_new(i)) {
                 Ok(item) => {
-                    if py_eq_bool(item, needle) { return Ok(true); }
+                    if py_eq_bool(item, needle) {
+                        return Ok(true);
+                    }
                     i += 1;
                 }
                 Err(_) => return Ok(false), // IndexError → not found

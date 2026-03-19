@@ -12,12 +12,12 @@ use majit_trace::warmstate::{HotResult, WarmEnterState};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state};
 use crate::io_buffer;
+use crate::jitdriver::JitDriverStaticData;
 use crate::resume::{
     EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
     ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
     ResumeLayoutSummary,
 };
-use crate::jitdriver::JitDriverStaticData;
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
 
