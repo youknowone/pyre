@@ -2257,6 +2257,73 @@ impl ResumeDataVirtualAdder {
         });
     }
 
+    /// resume.py: visit_vrawslice(offset) — add virtual raw slice.
+    pub fn add_virtual_raw_slice(&mut self, offset: i64, parent: VirtualFieldSource) -> usize {
+        self.add_virtual(VirtualInfo::VRawSlice { offset, parent })
+    }
+
+    /// resume.py: visit_vstrplain() — add virtual plain string.
+    pub fn add_virtual_str_plain(&mut self, chars: Vec<VirtualFieldSource>) -> usize {
+        self.add_virtual(VirtualInfo::VStrPlain { chars })
+    }
+
+    /// resume.py: visit_vstrconcat() — add virtual string concat.
+    pub fn add_virtual_str_concat(
+        &mut self,
+        left: VirtualFieldSource,
+        right: VirtualFieldSource,
+    ) -> usize {
+        self.add_virtual(VirtualInfo::VStrConcat {
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    /// resume.py: visit_vstrslice() — add virtual string slice.
+    pub fn add_virtual_str_slice(
+        &mut self,
+        source: VirtualFieldSource,
+        start: VirtualFieldSource,
+        length: VirtualFieldSource,
+    ) -> usize {
+        self.add_virtual(VirtualInfo::VStrSlice {
+            source: Box::new(source),
+            start: Box::new(start),
+            length: Box::new(length),
+        })
+    }
+
+    /// resume.py: visit_vuniplain() — add virtual unicode string.
+    pub fn add_virtual_uni_plain(&mut self, chars: Vec<VirtualFieldSource>) -> usize {
+        self.add_virtual(VirtualInfo::VUniPlain { chars })
+    }
+
+    /// resume.py: visit_vuniconcat() — add virtual unicode concat.
+    pub fn add_virtual_uni_concat(
+        &mut self,
+        left: VirtualFieldSource,
+        right: VirtualFieldSource,
+    ) -> usize {
+        self.add_virtual(VirtualInfo::VUniConcat {
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    /// resume.py: visit_vunislice() — add virtual unicode slice.
+    pub fn add_virtual_uni_slice(
+        &mut self,
+        source: VirtualFieldSource,
+        start: VirtualFieldSource,
+        length: VirtualFieldSource,
+    ) -> usize {
+        self.add_virtual(VirtualInfo::VUniSlice {
+            source: Box::new(source),
+            start: Box::new(start),
+            length: Box::new(length),
+        })
+    }
+
     /// Build the final ResumeData.
     pub fn build(self) -> ResumeData {
         ResumeData {
