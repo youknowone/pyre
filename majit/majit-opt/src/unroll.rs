@@ -231,6 +231,169 @@ impl Default for UnrollOptimizer {
     }
 }
 
+/// unroll.py: ExportedState — snapshot of optimizer state at the end of
+/// the preamble, used to initialize the peeled loop body.
+///
+/// Contains the virtual state, short preamble boxes, arg mappings,
+/// and exported infos needed to resume optimization after peeling.
+#[derive(Clone, Debug)]
+pub struct ExportedState {
+    /// Label args at the end of the preamble (after forcing).
+    pub end_args: Vec<OpRef>,
+    /// Args for the next iteration (before forcing).
+    pub next_iteration_args: Vec<OpRef>,
+    /// Virtual state at the loop boundary.
+    pub virtual_state: crate::virtualstate::VirtualState,
+    /// Short preamble builder for bridge entry.
+    pub short_preamble: Option<crate::shortpreamble::ShortPreamble>,
+    /// Renamed inputargs from the preamble.
+    pub renamed_inputargs: Vec<OpRef>,
+    /// Short inputargs for the short preamble.
+    pub short_inputargs: Vec<OpRef>,
+}
+
+impl ExportedState {
+    /// unroll.py: ExportedState.__init__
+    pub fn new(
+        end_args: Vec<OpRef>,
+        next_iteration_args: Vec<OpRef>,
+        virtual_state: crate::virtualstate::VirtualState,
+        renamed_inputargs: Vec<OpRef>,
+        short_inputargs: Vec<OpRef>,
+    ) -> Self {
+        ExportedState {
+            end_args,
+            next_iteration_args,
+            virtual_state,
+            short_preamble: None,
+            renamed_inputargs,
+            short_inputargs,
+        }
+    }
+
+    /// unroll.py: final() — ExportedState is never final (loop continues).
+    pub fn is_final(&self) -> bool {
+        false
+    }
+}
+
+impl OptUnroll {
+    /// unroll.py: export_state — capture optimizer state at end of preamble.
+    ///
+    /// After the preamble is optimized, snapshot:
+    /// - end_args: forced versions of label args
+    /// - virtual_state: abstract info for loop-carried values
+    /// - short boxes: mapping of preamble ops to label args
+    pub fn export_state(
+        &self,
+        original_label_args: &[OpRef],
+        renamed_inputargs: &[OpRef],
+        ctx: &OptContext,
+    ) -> ExportedState {
+        let end_args: Vec<OpRef> = original_label_args
+            .iter()
+            .map(|&a| ctx.get_replacement(a))
+            .collect();
+
+        let virtual_state = crate::virtualstate::VirtualState::new(
+            end_args.iter().map(|_| crate::virtualstate::VirtualStateInfo::Unknown).collect(),
+        );
+
+        let label_args = virtual_state.make_inputargs(&end_args);
+
+        ExportedState::new(
+            label_args.clone(),
+            end_args,
+            virtual_state,
+            renamed_inputargs.to_vec(),
+            label_args,
+        )
+    }
+
+    /// unroll.py: inline_short_preamble — replay short preamble ops
+    /// to re-populate the optimizer's cache when entering from a bridge.
+    ///
+    /// Maps short preamble input args to the jump args, then emits
+    /// each short preamble op with remapped arguments.
+    pub fn inline_short_preamble(
+        jump_args: &[OpRef],
+        short_preamble: &crate::shortpreamble::ShortPreamble,
+        ctx: &mut OptContext,
+    ) -> Vec<OpRef> {
+        let mut mapping: HashMap<OpRef, OpRef> = HashMap::new();
+
+        // Map short preamble input args to jump args
+        // (short_preamble.ops[i].arg_mapping tells us which args to remap)
+        for sp_op in &short_preamble.ops {
+            let mut new_op = sp_op.op.clone();
+            // Remap args from arg_mapping (label idx → jump arg)
+            for &(arg_pos, label_idx) in &sp_op.arg_mapping {
+                if arg_pos < new_op.args.len() && label_idx < jump_args.len() {
+                    new_op.args[arg_pos] = jump_args[label_idx];
+                }
+            }
+            // Remap remaining args from the mapping table
+            for arg in &mut new_op.args {
+                if let Some(&mapped) = mapping.get(arg) {
+                    *arg = mapped;
+                }
+            }
+            let new_ref = ctx.emit(new_op.clone());
+            mapping.insert(sp_op.op.pos, new_ref);
+        }
+
+        // Return remapped jump args
+        jump_args
+            .iter()
+            .map(|&a| *mapping.get(&a).unwrap_or(&a))
+            .collect()
+    }
+
+    /// unroll.py: jump_to_existing_trace — check if a compiled trace
+    /// exists for this loop and redirect the jump to it.
+    pub fn jump_to_existing_trace(
+        jump_op: &Op,
+        exported_state: &ExportedState,
+    ) -> Option<Op> {
+        // Check if virtual states are compatible
+        // (simplified: just check arg count matches)
+        if jump_op.args.len() != exported_state.end_args.len() {
+            return None;
+        }
+        Some(jump_op.clone())
+    }
+
+    /// unroll.py: import_state — restore optimizer state for peeled loop.
+    ///
+    /// Maps target args (from the new label) to the exported state's
+    /// next_iteration_args, carrying forward type info and virtuals.
+    pub fn import_state(
+        &self,
+        targetargs: &[OpRef],
+        exported_state: &ExportedState,
+        ctx: &mut OptContext,
+    ) -> Vec<OpRef> {
+        assert_eq!(
+            exported_state.next_iteration_args.len(),
+            targetargs.len(),
+            "import_state: arg count mismatch"
+        );
+
+        // Map each source arg to its target via forwarding
+        for (i, &target) in exported_state.next_iteration_args.iter().enumerate() {
+            let source = targetargs[i];
+            if source != target {
+                ctx.replace_op(source, target);
+            }
+        }
+
+        // Create label args from virtual state
+        exported_state
+            .virtual_state
+            .make_inputargs(targetargs)
+    }
+}
+
 pub struct OptUnroll {
     /// Buffer of ops received before the Jump back-edge.
     buffer: Vec<Op>,
