@@ -545,6 +545,8 @@ impl OptHeap {
         }
 
         // Cache miss: emit the load and cache the result.
+        // heap.py line 652: make_nonnull(op.getarg(0))
+        self.known_nonnull.insert(ctx.get_replacement(op.arg(0)));
         self.cached_fields.insert(key, op.pos);
         OptimizationResult::Emit(op.clone())
     }
@@ -601,6 +603,8 @@ impl OptHeap {
                 return OptimizationResult::Remove;
             }
             self.cached_arrayitems.insert(key, op.pos);
+            // heap.py line 701: make_nonnull(op.getarg(0))
+            self.known_nonnull.insert(ctx.get_replacement(op.arg(0)));
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -614,6 +618,8 @@ impl OptHeap {
             self.cached_arrayitems_var.insert(var_key, op.pos);
         }
 
+        // heap.py line 701: make_nonnull(op.getarg(0))
+        self.known_nonnull.insert(ctx.get_replacement(op.arg(0)));
         OptimizationResult::Emit(op.clone())
     }
 
