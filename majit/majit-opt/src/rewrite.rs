@@ -1373,11 +1373,26 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Emit(new_op)
             }
 
-            // ── rewrite.py: CALL_LOOPINVARIANT demote ──
+            // rewrite.py: optimize_CALL_LOOPINVARIANT_I
+            // Check loop_invariant_results cache first. If the same
+            // function pointer was already called, reuse the result.
+            // Otherwise demote to a plain CALL and cache the result.
             OpCode::CallLoopinvariantI
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantF
             | OpCode::CallLoopinvariantN => {
+                // arg(0) is the function pointer — use as cache key
+                if let Some(func_val) = ctx.get_constant_int(op.arg(0)) {
+                    if let Some(&cached_result) = self.loop_invariant_results.get(&func_val) {
+                        // Cache hit: reuse previous result
+                        let cached_result = ctx.get_replacement(cached_result);
+                        ctx.replace_op(op.pos, cached_result);
+                        self.last_op_removed = true;
+                        return OptimizationResult::Remove;
+                    }
+                    // Cache miss: demote and record result
+                    self.loop_invariant_results.insert(func_val, op.pos);
+                }
                 let call_opcode = OpCode::call_for_type(op.result_type());
                 let mut new_op = Op::new(call_opcode, &op.args);
                 new_op.pos = op.pos;
