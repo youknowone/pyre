@@ -20,6 +20,10 @@ use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
 use majit_meta::DetailedDriverRunOutcome;
 
 /// Function-entry tracing threshold.
+/// Function-entry tracing threshold.
+/// PyPy uses WarmEnterState.function_threshold (default 1619).
+/// We use a lower value for faster JIT warmup in pyre's use case.
+/// TODO: read from driver.warm_state().function_threshold() instead.
 const FUNC_ENTRY_THRESHOLD: u32 = 7;
 
 use crate::jit::frame_layout::build_pyframe_virtualizable_info;
@@ -38,6 +42,8 @@ thread_local! {
         let mut d = JitDriver::new(JIT_THRESHOLD);
         d.set_virtualizable_info(info.clone());
         d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
+        d.register_raw_int_force_helper(crate::call_jit::jit_force_recursive_call_raw_1 as *const ());
+        d.register_raw_int_force_helper(crate::call_jit::jit_force_self_recursive_call_raw_1 as *const ());
         d.register_create_frame_raw(
             crate::call_jit::jit_create_callee_frame_1 as *const (),
             crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),
@@ -59,6 +65,7 @@ thread_local! {
 
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
     static JIT_TRACING: Cell<bool> = Cell::new(false);
+    static RECURSIVE_FORCE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
 }
 
 #[inline]
@@ -75,6 +82,14 @@ impl Drop for JitCallDepthGuard {
     }
 }
 
+pub(crate) struct RecursiveForceEntryGuard;
+
+impl Drop for RecursiveForceEntryGuard {
+    fn drop(&mut self) {
+        RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
 /// Bump the JIT call depth. Returns a guard that restores the
 /// depth when dropped.
 #[inline]
@@ -88,6 +103,17 @@ pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
     }
 }
 
+#[inline]
+pub(crate) fn recursive_force_entry_bump() -> RecursiveForceEntryGuard {
+    RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.set(d.get() + 1));
+    RecursiveForceEntryGuard
+}
+
+#[inline]
+pub(crate) fn in_recursive_force_entry() -> bool {
+    RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.get() > 0)
+}
+
 /// Evaluate a Python frame with JIT compilation.
 ///
 /// This is the main entry point for pyre-jit.
@@ -98,6 +124,9 @@ fn depth_bump_callback() -> Option<Box<dyn std::any::Any>> {
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     pyre_interp::call::register_eval_override(eval_with_jit);
     pyre_interp::call::register_depth_bump(depth_bump_callback);
+    pyre_interp::call::register_inline_call_override(
+        crate::call_jit::maybe_handle_inline_concrete_call,
+    );
     crate::call_jit::install_jit_call_bridge();
     frame.fix_array_ptrs();
 
@@ -205,7 +234,22 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
 
     // Also check if the warm state boosted this function (e.g., from
     // recursive inline depth limit). If so, fast-track to tracing.
-    let boosted = driver.is_function_boosted(green_key);
+    let boosted = if driver.is_function_boosted(green_key) {
+        true
+    } else if *count == 1
+        && in_recursive_force_entry()
+        && crate::call_jit::self_recursive_function_entry_candidate(frame)
+    {
+        // PyPy converges recursive hot paths by boosting the callee toward a
+        // separate function-entry trace once recursion becomes obvious.  We
+        // only fast-track entries reached through our recursive force helper,
+        // not the outermost user call, so warmup stays close to PyPy's
+        // "recursion became hot" behavior.
+        driver.boost_function_entry(green_key);
+        true
+    } else {
+        false
+    };
 
     if *count < FUNC_ENTRY_THRESHOLD && !boosted {
         return None;
@@ -353,8 +397,54 @@ result = fib(12)";
             );
             assert!(
                 driver.has_raw_int_finish(fib_key),
-                "recursive fib compiled finish should use the raw-int call_assembler protocol"
+                "recursive fib compiled finish should use the raw-int protocol"
             );
+        }
+    }
+
+    #[test]
+    fn test_recursive_global_reads_do_not_reuse_force_cache_across_global_mutation() {
+        let source = "\
+factor = 1
+def g(n):
+    if n < 2:
+        return n * factor
+    return g(n - 1) + g(n - 2) + factor
+
+first = g(12)
+factor = 2
+second = g(12)";
+        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let first = *(*frame.namespace).get("first").unwrap();
+            let second = *(*frame.namespace).get("second").unwrap();
+            assert_eq!(pyre_object::intobject::w_int_get_value(first), 376);
+            assert_eq!(pyre_object::intobject::w_int_get_value(second), 752);
+        }
+    }
+
+    #[test]
+    fn test_inline_residual_user_call_with_many_args_stays_correct() {
+        let source = "\
+def helper(a, b, c, d, e):
+    return a + b + c + d + e
+
+def outer(x):
+    return helper(x, x, x, x, x)
+
+s = 0
+i = 0
+while i < 300:
+    s = s + outer(i)
+    i = i + 1";
+        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let s = *(*frame.namespace).get("s").unwrap();
+            assert_eq!(pyre_object::intobject::w_int_get_value(s), 224_250);
         }
     }
 }
