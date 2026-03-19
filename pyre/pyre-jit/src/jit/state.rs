@@ -1619,9 +1619,20 @@ impl TraceFrameState {
                 };
                 let is_self_recursive = callee_key == current_green_key;
 
+                // RPython perform_call: non-recursive helper calls are always
+                // inlined (jtransform.py handle_regular_call → inline_call).
+                // Recursive portal calls go through should_inline for
+                // unroll/call_assembler decisions below.
+                if !is_self_recursive && nargs <= 4 {
+                    if let Ok(result) = self.trace_through_callee(
+                        callable, args, concrete_callable, callee_key,
+                    ) {
+                        return Ok(result);
+                    }
+                    // trace_through failed: fall through to CallMayForce
+                }
+
                 if driver.should_inline(callee_key) == majit_meta::InlineDecision::Inline {
-                    // Inline path: always use CallMayForce (safe for finish traces).
-                    // Trace-through is only attempted from CallAssembler path.
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                         return self.inline_function_call(
                             callable,
