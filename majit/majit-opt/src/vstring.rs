@@ -227,6 +227,24 @@ impl OptString {
         ctx.emit(strlen_op)
     }
 
+    /// Get the strlen OpRef if already known, without emitting a new op.
+    fn get_or_emit_strlen_if_known(&self, opref: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
+        let resolved = ctx.get_replacement(opref);
+        if let Some(&len_ref) = self.known_lengths.get(&resolved) {
+            return Some(ctx.get_replacement(len_ref));
+        }
+        if let Some(info) = self.vstrings.get(&resolved) {
+            match info {
+                VStringInfo::Plain { chars } => {
+                    let len = chars.len() as i64;
+                    return Some(self.emit_constant_int(len, ctx));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Try to get a character from a virtual string at a constant index.
     fn try_get_char(&self, opref: OpRef, index: i64, ctx: &OptContext) -> Option<OpRef> {
         let resolved = ctx.get_replacement(opref);
@@ -542,13 +560,50 @@ impl OptString {
                 OptimizationResult::PassOn
             }
             OopSpecIndex::StrEqual => {
-                // STR_EQUAL(a, b): if both are the same OpRef → always true.
+                // vstring.py: opt_call_stroruni_STR_EQUAL
                 if op.num_args() >= 3 {
                     let a = ctx.get_replacement(op.arg(1));
                     let b = ctx.get_replacement(op.arg(2));
+                    // Same ref → always equal
                     if a == b {
                         ctx.make_constant(op.pos, Value::Int(1));
                         return OptimizationResult::Remove;
+                    }
+                    let l1 = self.get_known_length(a, ctx);
+                    let l2 = self.get_known_length(b, ctx);
+                    // Different known lengths → always unequal
+                    if let (Some(len1), Some(len2)) = (l1, l2) {
+                        if len1 != len2 {
+                            ctx.make_constant(op.pos, Value::Int(0));
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                    // handle_str_equal_level1: length-0 string
+                    if l2 == Some(0) {
+                        if let Some(len_ref) = self.get_or_emit_strlen_if_known(a, ctx) {
+                            let zero = self.emit_constant_int(0, ctx);
+                            let mut eq_op = Op::new(OpCode::IntEq, &[len_ref, zero]);
+                            eq_op.pos = op.pos;
+                            return OptimizationResult::Emit(eq_op);
+                        }
+                    }
+                    if l1 == Some(0) {
+                        if let Some(len_ref) = self.get_or_emit_strlen_if_known(b, ctx) {
+                            let zero = self.emit_constant_int(0, ctx);
+                            let mut eq_op = Op::new(OpCode::IntEq, &[len_ref, zero]);
+                            eq_op.pos = op.pos;
+                            return OptimizationResult::Emit(eq_op);
+                        }
+                    }
+                    // handle_str_equal_level1: both length 1 → compare chars
+                    if l1 == Some(1) && l2 == Some(1) {
+                        let c1 = self.try_get_char(a, 0, ctx);
+                        let c2 = self.try_get_char(b, 0, ctx);
+                        if let (Some(ch1), Some(ch2)) = (c1, c2) {
+                            let mut eq_op = Op::new(OpCode::IntEq, &[ch1, ch2]);
+                            eq_op.pos = op.pos;
+                            return OptimizationResult::Emit(eq_op);
+                        }
                     }
                 }
                 self.force_args_if_virtual(op, ctx);
