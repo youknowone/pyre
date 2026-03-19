@@ -235,7 +235,7 @@ impl Optimizer {
     /// a new operation from the trace. Used by passes that need to
     /// inject additional operations.
     pub fn send_extra_operation(&mut self, op: &Op, ctx: &mut OptContext) {
-        self.propagate_one(op, ctx);
+        self.propagate_from_pass(0, op, ctx);
     }
 
     /// optimizer.py: force_box(opref, ctx) — force a virtual to be materialized.
@@ -581,6 +581,35 @@ impl Optimizer {
     /// and OptContext. Adding automatic replacement mapping here
     /// causes spurious forwarding that breaks heap/guard tests.
     fn propagate_one(&mut self, op: &Op, ctx: &mut OptContext) {
+        self.propagate_from_pass(0, op, ctx);
+    }
+
+    fn drain_extra_operations_from(&mut self, start_pass: usize, ctx: &mut OptContext) {
+        let end_pass = self.extra_operation_end_pass();
+        while let Some(op) = ctx.pop_extra_operation() {
+            self.propagate_from_pass_range(start_pass, end_pass, &op, ctx);
+        }
+    }
+
+    fn propagate_from_pass(&mut self, start_pass: usize, op: &Op, ctx: &mut OptContext) {
+        self.propagate_from_pass_range(start_pass, self.passes.len(), op, ctx);
+    }
+
+    fn extra_operation_end_pass(&self) -> usize {
+        let mut end = self.passes.len();
+        while end > 0 && self.passes[end - 1].name() == "unroll" {
+            end -= 1;
+        }
+        end
+    }
+
+    fn propagate_from_pass_range(
+        &mut self,
+        start_pass: usize,
+        end_pass: usize,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) {
         // Resolve forwarded arguments
         let mut resolved_op = op.clone();
         for arg in &mut resolved_op.args {
@@ -594,8 +623,13 @@ impl Optimizer {
 
         let mut current_op = resolved_op;
 
-        for pass in &mut self.passes {
-            match pass.propagate_forward(&current_op, ctx) {
+        for pass_idx in start_pass..end_pass {
+            let result = {
+                let pass = &mut self.passes[pass_idx];
+                pass.propagate_forward(&current_op, ctx)
+            };
+            self.drain_extra_operations_from(pass_idx + 1, ctx);
+            match result {
                 OptimizationResult::Emit(op) => {
                     self.emit_with_guard_check(op, ctx);
                     return;
