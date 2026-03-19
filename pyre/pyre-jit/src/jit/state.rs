@@ -403,21 +403,9 @@ impl TraceFrameState {
     }
 
     /// PyPy interp_jit.py:89 — hint(self.valuestackdepth, promote=True).
-    /// Emits GuardValue on valuestackdepth to force it to a compile-time constant.
-    /// This is a no-op if symbolic state isn't ready or if vsd is already constant.
-    /// PyPy interp_jit.py:89 — hint(self.valuestackdepth, promote=True).
-    ///
-    /// Should emit GUARD_VALUE on valuestackdepth to force it to a
-    /// compile-time constant. Currently a no-op because finish traces
-    /// have incomplete vable state that causes fail_args corruption.
-    ///
-    /// Prerequisite: fix virtualizable writeback (raw int leak) so
-    /// vable_valuestackdepth is always valid in all trace types.
-    pub(crate) fn promote_valuestackdepth(&mut self, _concrete_frame: usize) {
-        // No-op until virtualizable writeback is fixed.
-        // The virtualizable mechanism carries valuestackdepth as a JUMP
-        // arg, providing implicit promotion for loop traces.
-    }
+    /// No-op: GuardValue on vsd causes segfault in finish traces.
+    /// The virtualizable mechanism implicitly promotes via JUMP args.
+    pub(crate) fn promote_valuestackdepth(&mut self, _concrete_frame: usize) {}
 
     /// Build fail_args for the current frame only (no multi-frame header).
     /// PyPy opencoder.py create_snapshot().

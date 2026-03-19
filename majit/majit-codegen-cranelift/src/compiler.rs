@@ -3312,11 +3312,9 @@ fn infer_fail_arg_types(
     let mut fail_arg_types = Vec::with_capacity(fail_arg_refs.len());
     for &opref in fail_arg_refs {
         if opref.is_none() {
-            // Uninitialized slot — treat as integer zero for recovery.
-            // This can happen when inlined callee guards use parent fail_args
-            // that include uninitialized frame slots.
-            fail_arg_types.push(Type::Int);
-            continue;
+            return Err(BackendError::Unsupported(
+                "guard/finish fail args cannot contain OpRef::NONE".to_string(),
+            ));
         }
         // Backend constant slots are currently integer-only. If a fail arg
         // doesn't correspond to an input arg or operation result, treat it as
