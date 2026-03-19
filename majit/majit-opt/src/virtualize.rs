@@ -968,13 +968,9 @@ impl OptVirtualize {
     /// rd_virtuals for lazy reconstruction). majit currently forces because
     /// pyre hasn't implemented materialize_virtual_ref yet. When it does,
     /// this method should skip forcing and let encode_guard_virtuals handle it.
+    /// RPython parity: virtualize.py does NOT force fail_args.
+    /// encode_guard_virtuals in optimizer.rs handles virtual encoding at emit time.
     fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        if let Some(ref fail_args) = op.fail_args {
-            for &fa in fail_args {
-                let resolved = ctx.get_replacement(fa);
-                self.force_virtual(resolved, ctx);
-            }
-        }
         let mut guard_op = op.clone();
         if let Some(ref mut fa) = guard_op.fail_args {
             for arg in fa.iter_mut() {
@@ -1611,16 +1607,9 @@ impl Optimization for OptVirtualize {
                     self.force_virtual(arg, ctx);
                 }
 
-                // Guards: force fail_args virtuals
+                // Guards: don't force fail_args — encode_guard_virtuals handles it
                 if is_guard {
                     let mut guard_op = op.clone();
-
-                    if let Some(ref fail_args) = guard_op.fail_args {
-                        for &fa in fail_args {
-                            let resolved = ctx.get_replacement(fa);
-                            self.force_virtual(resolved, ctx);
-                        }
-                    }
 
                     for arg in &mut guard_op.args {
                         *arg = ctx.get_replacement(*arg);
@@ -3184,7 +3173,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires materialize_virtual_ref in pyre"]
     fn test_guard_fail_args_virtual_not_forced() {
         // resume.py parity: virtual objects in guard fail_args should NOT be
         // forced. Instead, rd_virtuals metadata should be recorded.
@@ -3262,7 +3250,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires materialize_virtual_ref in pyre"]
     fn test_guard_fail_args_mixed_virtual_and_non_virtual() {
         // Guard with both virtual and non-virtual fail_args.
         //
@@ -3336,7 +3323,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires materialize_virtual_ref in pyre"]
     fn test_guard_fail_args_virtual_struct_not_forced() {
         // VirtualStruct (New) in guard fail_args should also use resume data.
         let sd = size_descr(1);
@@ -3372,7 +3358,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires materialize_virtual_ref in pyre"]
     fn test_guard_fail_args_virtual_with_multiple_fields() {
         // Virtual with two fields in guard fail_args.
         let sd = size_descr(1);

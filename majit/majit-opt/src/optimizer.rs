@@ -686,14 +686,13 @@ impl Optimizer {
     /// in guard fail_args as rd_virtuals for lazy reconstruction on guard
     /// failure. RPython does this in the optimizer's store_final_boxes_in_guard,
     /// which runs for every guard regardless of which pass emits it.
-    fn encode_guard_virtuals(op: Op, _ctx: &mut OptContext) -> Op {
-        // Virtual fail_arg encoding is implemented (encode_guard_virtuals_impl)
-        // but disabled until pyre implements materialize_virtual_ref in JitState.
-        // Without it, guard failure cannot reconstruct virtual objects → SIGSEGV.
-        //
-        // To enable: implement materialize_virtual_ref in pyre-jit/src/jit/state.rs,
-        // then change this to call encode_guard_virtuals_impl.
-        op
+    fn encode_guard_virtuals(op: Op, ctx: &mut OptContext) -> Op {
+        // Skip encoding for GuardNotForced — these guards have special
+        // fail_args handling tied to CALL_MAY_FORCE and must not be modified.
+        if op.opcode == OpCode::GuardNotForced || op.opcode == OpCode::GuardNotForced2 {
+            return op;
+        }
+        Self::encode_guard_virtuals_impl(op, ctx)
     }
 
     #[allow(dead_code)]
