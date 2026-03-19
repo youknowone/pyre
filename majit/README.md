@@ -62,7 +62,7 @@ RPython's codewriter **fully translates** RPython source into JitCode (bytecode)
 
 majit **auto-generates and injects trace code at build time**. There are two paths:
 
-1. **`majit-analyze` path (used by pyre-mjit)**: `build.rs` calls `majit_analyze::analyze_multiple()` to parse interpreter sources, then `generate_trace_code()` to produce trace helper functions, writing them to `OUT_DIR/jit_trace_gen.rs`. The main crate pulls them in via `include!`. This path extracts opcode dispatch arms, resolves cross-file trait impls, classifies helpers, and collects type layouts.
+1. **`majit-analyze` path (used by pyre-jit)**: `build.rs` calls `majit_analyze::analyze_multiple_pipeline_with_config()` to parse interpreter sources and run the canonical graph pipeline, then `generate_trace_code_from_pipeline()` to produce trace helper functions, writing them to `OUT_DIR/jit_trace_gen.rs`. The main crate pulls them in via `include!`. This path extracts opcode dispatch arms, resolves cross-file trait impls, classifies helpers, collects type layouts, and treats the graph pipeline as the single translator source-of-truth.
 
 2. **`#[jit_interp]` proc-macro path (used by aheui-mjit)**: `build.rs` reads the interpreter source, extracts opcode match arms, and auto-generates a JIT mainloop annotated with `#[jit_interp]`, writing it to `OUT_DIR/jit_mainloop_gen.rs`. The proc macro lowers `while`/`loop` to branch bytecodes, `match` to guard chains, and `for` loops to abort fallback (equivalent to RPython's `@dont_look_inside`).
 

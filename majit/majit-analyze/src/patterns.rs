@@ -118,126 +118,9 @@ pub enum TracePattern {
 }
 
 // String-based classify_from_resolved, classify_method_body,
-// classify_method_body_with_vable, and VirtualizableClassifyConfig
-// have been removed. Use classify_from_graph() instead.
-
-/// Classify from the opcode pattern text (fallback when call chain resolution fails).
-///
-/// Handles cases where the match arm body doesn't call a named handler method
-/// (e.g., no-op arms that just return `Ok(StepResult::Continue)`).
-pub fn classify_from_pattern(pattern: &str) -> Option<TracePattern> {
-    // No-op instructions
-    if pattern.contains("ExtendedArg")
-        || pattern.contains("Resume")
-        || pattern.contains("Nop")
-        || pattern.contains("Cache")
-        || pattern.contains("NotTaken")
-    {
-        return Some(TracePattern::Noop);
-    }
-
-    // Local variable access (superword instructions)
-    if pattern.contains("LoadFastBorrowLoadFastBorrow") || pattern.contains("LoadFastLoadFast") {
-        return Some(TracePattern::LocalRead);
-    }
-    if pattern.contains("StoreFastStoreFast") {
-        return Some(TracePattern::LocalWrite);
-    }
-    if pattern.contains("StoreFastLoadFast") {
-        return Some(TracePattern::LocalWrite);
-    }
-
-    // Namespace
-    if pattern.contains("StoreName") || pattern.contains("StoreGlobal") {
-        return Some(TracePattern::NamespaceAccess {
-            is_load: false,
-            is_global: pattern.contains("Global"),
-        });
-    }
-    if pattern.contains("LoadGlobal") {
-        return Some(TracePattern::NamespaceAccess {
-            is_load: true,
-            is_global: true,
-        });
-    }
-    if pattern.contains("LoadName") {
-        return Some(TracePattern::NamespaceAccess {
-            is_load: true,
-            is_global: false,
-        });
-    }
-
-    // Stack
-    if pattern.contains("PopTop")
-        || pattern.contains("PushNull")
-        || pattern.contains("Copy")
-        || pattern.contains("Swap")
-    {
-        return Some(TracePattern::StackManip);
-    }
-
-    // Jumps
-    if pattern.contains("JumpForward") || pattern.contains("JumpBackward") {
-        return Some(TracePattern::Jump);
-    }
-    if pattern.contains("PopJumpIf") {
-        return Some(TracePattern::ConditionalJump);
-    }
-
-    // Return
-    if pattern.contains("ReturnValue") {
-        return Some(TracePattern::Return);
-    }
-
-    // Iterator cleanup
-    if pattern.contains("EndFor") || pattern.contains("PopIter") {
-        return Some(TracePattern::IterCleanup);
-    }
-
-    // Constants
-    if pattern.contains("LoadSmallInt") {
-        return Some(TracePattern::ConstLoad);
-    }
-
-    // Collection construction
-    if pattern.contains("BuildList") {
-        return Some(TracePattern::BuildCollection {
-            kind: "list".into(),
-        });
-    }
-    if pattern.contains("BuildTuple") {
-        return Some(TracePattern::BuildCollection {
-            kind: "tuple".into(),
-        });
-    }
-    if pattern.contains("BuildMap") {
-        return Some(TracePattern::BuildCollection { kind: "map".into() });
-    }
-
-    // Unpack sequence
-    if pattern.contains("UnpackSequence") {
-        return Some(TracePattern::UnpackSequence);
-    }
-
-    // Collection item write
-    if pattern.contains("StoreSubscr") {
-        return Some(TracePattern::SequenceSetitem);
-    }
-
-    // Collection append
-    if pattern.contains("ListAppend") {
-        return Some(TracePattern::CollectionAppend);
-    }
-
-    // MakeFunction (true residual)
-    if pattern.contains("MakeFunction") {
-        return Some(TracePattern::Residual {
-            helper_name: "make_function".into(),
-        });
-    }
-
-    None
-}
+// classify_method_body_with_vable, VirtualizableClassifyConfig, and
+// opcode-pattern-text fallback have been removed. Use classify_from_graph()
+// and pipeline opcode dispatch instead.
 
 // ── Graph-based classification ──────────────────────────────────
 //
@@ -257,11 +140,11 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     let ops = &entry.ops;
 
     // Count op kinds
-    let mut field_reads: Vec<String> = Vec::new();
-    let mut field_writes: Vec<String> = Vec::new();
+    let mut field_reads: Vec<crate::graph::FieldDescriptor> = Vec::new();
+    let mut field_writes: Vec<crate::graph::FieldDescriptor> = Vec::new();
     let mut array_reads = 0usize;
     let mut array_writes = 0usize;
-    let mut calls: Vec<String> = Vec::new();
+    let mut call_descriptors: Vec<crate::call_match::CallDescriptor> = Vec::new();
     let mut has_guard = false;
 
     let mut first_vable_field_read: Option<(usize, crate::graph::ValueType)> = None;
@@ -277,10 +160,11 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
                 OpKind::FieldWrite { field, .. } => field_writes.push(field.clone()),
                 OpKind::ArrayRead { .. } => array_reads += 1,
                 OpKind::ArrayWrite { .. } => array_writes += 1,
-                OpKind::Call { target, .. }
-                | OpKind::CallElidable { target, .. }
-                | OpKind::CallResidual { target, .. }
-                | OpKind::CallMayForce { target, .. } => calls.push(target.clone()),
+                OpKind::CallElidable { descriptor, .. }
+                | OpKind::CallResidual { descriptor, .. }
+                | OpKind::CallMayForce { descriptor, .. } => {
+                    call_descriptors.push(descriptor.clone());
+                }
                 OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => has_guard = true,
                 OpKind::BinOp { .. } | OpKind::UnaryOp { .. } => {}
                 OpKind::VableFieldRead { field_index, ty } => {
@@ -311,7 +195,6 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Classify based on op patterns (RPython jtransform-level analysis)
-
     // Virtualizable-specialized ops come from the graph rewrite pass and
     // should take precedence over legacy local/heap classifications.
     if let Some((array_index, item_ty)) = first_vable_array_read {
@@ -340,9 +223,9 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Integer binary operations
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c.contains("w_int_add") || c.contains("w_int_sub") || c.contains("w_int_mul"))
+        .any(|descriptor| crate::call_match::is_int_arithmetic_target(&descriptor.target))
     {
         return Some(TracePattern::UnboxIntBinop {
             op_name: "dispatch".into(),
@@ -351,9 +234,9 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Float binary operations
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c.contains("w_float_add") || c.contains("w_float_sub"))
+        .any(|descriptor| crate::call_match::is_float_arithmetic_target(&descriptor.target))
     {
         return Some(TracePattern::UnboxFloatBinop {
             op_name: "FloatAdd".into(),
@@ -361,16 +244,30 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Local read: reads from locals_w array (field read + array read, or push call)
-    if (field_reads.iter().any(|f| f == "locals_w") && array_reads > 0)
-        || (array_reads > 0 && calls.iter().any(|c| c == "push" || c == "push_value"))
+    if (field_reads
+        .iter()
+        .any(crate::field_match::is_local_array_field)
+        && array_reads > 0)
+        || (array_reads > 0
+            && call_descriptors
+                .iter()
+                .any(|descriptor| crate::call_match::is_local_read_target(&descriptor.target)))
     {
         return Some(TracePattern::LocalRead);
     }
 
     // Local write: writes to locals_w array (field write + array write, or pop call)
-    if (field_writes.iter().any(|f| f == "locals_w") && array_writes > 0)
-        || field_writes.iter().any(|f| f == "locals_w")
-        || (array_writes > 0 && calls.iter().any(|c| c == "pop" || c == "pop_value"))
+    if (field_writes
+        .iter()
+        .any(crate::field_match::is_local_array_field)
+        && array_writes > 0)
+        || field_writes
+            .iter()
+            .any(crate::field_match::is_local_array_field)
+        || (array_writes > 0
+            && call_descriptors
+                .iter()
+                .any(|descriptor| crate::call_match::is_local_write_target(&descriptor.target)))
     {
         return Some(TracePattern::LocalWrite);
     }
@@ -378,31 +275,31 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     // Constant load (reads from constants/co_consts)
     if field_reads
         .iter()
-        .any(|f| f.contains("constants") || f.contains("co_consts"))
+        .any(crate::field_match::is_constant_pool_field)
     {
         return Some(TracePattern::ConstLoad);
     }
 
     // Function call
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c.contains("call_function") || c.contains("invoke"))
+        .any(|descriptor| crate::call_match::is_function_invoke_target(&descriptor.target))
     {
         return Some(TracePattern::FunctionCall);
     }
 
     // Truth check
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c.contains("truth") || c.contains("bool") || c.contains("is_true"))
+        .any(|descriptor| crate::call_match::is_truth_check_target(&descriptor.target))
     {
         return Some(TracePattern::TruthCheck);
     }
 
     // Stack manipulation (pop/swap/peek without array access)
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c == "pop_value" || c == "swap_values" || c == "peek_at" || c == "copy_value")
+        .any(|descriptor| crate::call_match::is_stack_manip_target(&descriptor.target))
         && array_reads == 0
         && array_writes == 0
     {
@@ -410,35 +307,48 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     }
 
     // Namespace access (load/store name/global)
-    if calls
+    let namespace_kinds: Vec<_> = call_descriptors
         .iter()
-        .any(|c| c.contains("load_name") || c.contains("store_name"))
-    {
+        .filter_map(|descriptor| crate::call_match::namespace_access_kind(&descriptor.target))
+        .collect();
+    if !namespace_kinds.is_empty() {
         return Some(TracePattern::NamespaceAccess {
-            is_load: calls.iter().any(|c| c.contains("load")),
-            is_global: calls.iter().any(|c| c.contains("global")),
+            is_load: namespace_kinds.iter().any(|kind| {
+                matches!(
+                    kind,
+                    crate::call_match::NamespaceAccessKind::LoadLocal
+                        | crate::call_match::NamespaceAccessKind::LoadGlobal
+                )
+            }),
+            is_global: namespace_kinds.iter().any(|kind| {
+                matches!(
+                    kind,
+                    crate::call_match::NamespaceAccessKind::LoadGlobal
+                        | crate::call_match::NamespaceAccessKind::StoreGlobal
+                )
+            }),
         });
     }
 
     // Iterator
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c.contains("iter_next") || c.contains("for_iter"))
+        .any(|descriptor| crate::call_match::is_range_iter_next_target(&descriptor.target))
     {
         return Some(TracePattern::RangeIterNext);
     }
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c.contains("end_for") || c.contains("pop_iter"))
+        .any(|descriptor| crate::call_match::is_iter_cleanup_target(&descriptor.target))
     {
         return Some(TracePattern::IterCleanup);
     }
 
     // Return (few ops ending in Return terminator)
     if matches!(&entry.terminator, crate::graph::Terminator::Return(Some(_))) && ops.len() <= 5 {
-        if calls
+        if call_descriptors
             .iter()
-            .any(|c| c.contains("finish") || c.contains("return"))
+            .any(|descriptor| crate::call_match::is_return_target(&descriptor.target))
         {
             return Some(TracePattern::Return);
         }
@@ -448,7 +358,7 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     if has_guard
         && field_writes
             .iter()
-            .any(|f| f.contains("next_instr") || f.contains("pc"))
+            .any(crate::field_match::is_instruction_position_field)
     {
         return Some(TracePattern::ConditionalJump);
     }
@@ -457,42 +367,41 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     if !has_guard
         && field_writes
             .iter()
-            .any(|f| f.contains("next_instr") || f.contains("pc"))
+            .any(crate::field_match::is_instruction_position_field)
     {
         return Some(TracePattern::Jump);
     }
 
     // Build collection
-    if calls
+    if let Some(kind) = call_descriptors
         .iter()
-        .any(|c| c.contains("build_list") || c.contains("new_list"))
+        .find_map(|descriptor| crate::call_match::build_collection_kind(&descriptor.target))
     {
         return Some(TracePattern::BuildCollection {
-            kind: "list".into(),
-        });
-    }
-    if calls
-        .iter()
-        .any(|c| c.contains("build_tuple") || c.contains("new_tuple"))
-    {
-        return Some(TracePattern::BuildCollection {
-            kind: "tuple".into(),
+            kind: match kind {
+                crate::call_match::BuildCollectionKind::List => "list",
+                crate::call_match::BuildCollectionKind::Tuple => "tuple",
+            }
+            .into(),
         });
     }
 
     // Sequence operations
-    if calls.iter().any(|c| c.contains("unpack")) {
+    if call_descriptors
+        .iter()
+        .any(|descriptor| crate::call_match::is_unpack_sequence_target(&descriptor.target))
+    {
         return Some(TracePattern::UnpackSequence);
     }
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c.contains("store_subscr") || c.contains("setitem"))
+        .any(|descriptor| crate::call_match::is_sequence_setitem_target(&descriptor.target))
     {
         return Some(TracePattern::SequenceSetitem);
     }
-    if calls
+    if call_descriptors
         .iter()
-        .any(|c| c.contains("list_append") || c.contains("append"))
+        .any(|descriptor| crate::call_match::is_collection_append_target(&descriptor.target))
     {
         return Some(TracePattern::CollectionAppend);
     }
@@ -501,7 +410,6 @@ pub fn classify_from_graph(graph: &crate::MajitGraph) -> Option<TracePattern> {
     if ops
         .iter()
         .all(|op| matches!(&op.kind, OpKind::Input { .. } | OpKind::Unknown { .. }))
-        && ops.len() <= 2
     {
         return Some(TracePattern::Noop);
     }
@@ -523,7 +431,8 @@ fn value_type_name(ty: &crate::graph::ValueType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{MajitGraph, OpKind, Terminator, ValueType};
+    use crate::graph::{CallTarget, MajitGraph, OpKind, Terminator, ValueType};
+    use crate::passes::{GraphTransformConfig, rewrite_graph};
 
     #[test]
     fn classify_int_binop_from_graph() {
@@ -532,7 +441,7 @@ mod tests {
         graph.push_op(
             entry,
             OpKind::Call {
-                target: "w_int_add".into(),
+                target: CallTarget::function_path(["w_int_add"]),
                 args: vec![],
                 result_ty: ValueType::Int,
             },
@@ -540,7 +449,8 @@ mod tests {
         );
         graph.set_terminator(entry, Terminator::Return(None));
 
-        let pattern = classify_from_graph(&graph);
+        let rewritten = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let pattern = classify_from_graph(&rewritten.graph);
         assert!(
             matches!(pattern, Some(TracePattern::UnboxIntBinop { .. })),
             "w_int_add call should classify as UnboxIntBinop, got {:?}",
@@ -557,7 +467,7 @@ mod tests {
             entry,
             OpKind::FieldRead {
                 base,
-                field: "locals_w".into(),
+                field: crate::graph::FieldDescriptor::new("locals_w", Some("Frame".into())),
                 ty: ValueType::Unknown,
             },
             true,
@@ -580,13 +490,69 @@ mod tests {
     }
 
     #[test]
+    fn classify_pyframe_local_read_from_graph() {
+        let mut graph = MajitGraph::new("load_fast");
+        let entry = graph.entry;
+        let base = graph.alloc_value();
+        graph.push_op(
+            entry,
+            OpKind::FieldRead {
+                base,
+                field: crate::graph::FieldDescriptor::new(
+                    "locals_cells_stack_w",
+                    Some("PyFrame".into()),
+                ),
+                ty: ValueType::Unknown,
+            },
+            true,
+        );
+        let arr = graph.alloc_value();
+        let idx = graph.alloc_value();
+        graph.push_op(
+            entry,
+            OpKind::ArrayRead {
+                base: arr,
+                index: idx,
+                item_ty: ValueType::Unknown,
+            },
+            true,
+        );
+        graph.set_terminator(entry, Terminator::Return(None));
+
+        let pattern = classify_from_graph(&graph);
+        assert_eq!(pattern, Some(TracePattern::LocalRead));
+    }
+
+    #[test]
+    fn classify_rpython_last_instr_jump_from_graph() {
+        let mut graph = MajitGraph::new("jump_absolute");
+        let entry = graph.entry;
+        let base = graph.alloc_value();
+        let value = graph.alloc_value();
+        graph.push_op(
+            entry,
+            OpKind::FieldWrite {
+                base,
+                field: crate::graph::FieldDescriptor::new("last_instr", Some("PyFrame".into())),
+                value,
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_terminator(entry, Terminator::Return(None));
+
+        let pattern = classify_from_graph(&graph);
+        assert_eq!(pattern, Some(TracePattern::Jump));
+    }
+
+    #[test]
     fn classify_truth_check_from_graph() {
         let mut graph = MajitGraph::new("unary_not");
         let entry = graph.entry;
         graph.push_op(
             entry,
             OpKind::Call {
-                target: "is_true".into(),
+                target: CallTarget::method("truth_value", Some("PyFrame".into())),
                 args: vec![],
                 result_ty: ValueType::Int,
             },
@@ -594,7 +560,14 @@ mod tests {
         );
         graph.set_terminator(entry, Terminator::Return(None));
 
-        assert_eq!(classify_from_graph(&graph), Some(TracePattern::TruthCheck));
+        let rewritten = rewrite_graph(
+            &graph,
+            &crate::test_support::pyre_pipeline_config().transform,
+        );
+        assert_eq!(
+            classify_from_graph(&rewritten.graph),
+            Some(TracePattern::TruthCheck)
+        );
     }
 
     #[test]

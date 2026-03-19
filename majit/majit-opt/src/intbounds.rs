@@ -328,10 +328,14 @@ impl OptIntBounds {
         let c0 = ctx.get_constant_int(arg0);
         let c1 = ctx.get_constant_int(arg1);
         let (inv_const, other) = if let Some(c) = c0 {
-            if c == i64::MIN { return; }
+            if c == i64::MIN {
+                return;
+            }
             (c, arg1)
         } else if let Some(c) = c1 {
-            if c == i64::MIN { return; }
+            if c == i64::MIN {
+                return;
+            }
             (c, arg0)
         } else {
             return;

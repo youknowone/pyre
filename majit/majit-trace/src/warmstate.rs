@@ -254,7 +254,7 @@ const DEFAULT_FUNCTION_THRESHOLD: u32 = 1619;
 const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
 
 /// PyPy default: trace_limit = 6000
-const DEFAULT_TRACE_LIMIT: u32 = 6000;
+const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
 
 /// Maximum number of non-permanent trace aborts before giving up on a green key.
 /// RPython warmstate.py: retrace_limit (default 5).
@@ -483,16 +483,16 @@ impl WarmEnterState {
         // Threshold reached: start tracing
         self.counter.reset(green_key_hash);
         self.tracing_generation += 1;
-        let gen = self.tracing_generation;
+        let current_generation = self.tracing_generation;
         let cell = self
             .cells
             .entry(green_key_hash)
             .or_insert_with(BaseJitCell::new);
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
         cell.state = BaseJitCellState::Tracing;
-        cell.tracing_generation = gen;
+        cell.tracing_generation = current_generation;
 
-        HotResult::StartTracing(Trace::new())
+        HotResult::StartTracing(Trace::with_limit(self.trace_limit as usize))
     }
 
     /// Force-start tracing for a green key, bypassing the hot counter.
@@ -514,16 +514,16 @@ impl WarmEnterState {
 
         self.counter.reset(green_key_hash);
         self.tracing_generation += 1;
-        let gen = self.tracing_generation;
+        let current_generation = self.tracing_generation;
         let cell = self
             .cells
             .entry(green_key_hash)
             .or_insert_with(BaseJitCell::new);
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
         cell.state = BaseJitCellState::Tracing;
-        cell.tracing_generation = gen;
+        cell.tracing_generation = current_generation;
 
-        HotResult::StartTracing(Trace::new())
+        HotResult::StartTracing(Trace::with_limit(self.trace_limit as usize))
     }
 
     /// Start a retrace from a guard failure point.
@@ -532,7 +532,7 @@ impl WarmEnterState {
     /// fresh trace but from a guard's failure inputs.
     pub fn start_retrace(&mut self, num_inputs: usize) -> Trace {
         self.reset_function_counts();
-        Trace::with_num_inputs(num_inputs)
+        Trace::with_num_inputs_and_limit(num_inputs, self.trace_limit as usize)
     }
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
@@ -941,7 +941,11 @@ impl WarmEnterState {
                 "unroll".to_string(),
             ]
         } else {
-            value.split(':').filter(|s| !s.is_empty()).map(String::from).collect()
+            value
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
         };
     }
 

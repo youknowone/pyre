@@ -130,27 +130,10 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
             args,
             ..
         } => {
-            // Infer from target name heuristic
             if result_ty != &ValueType::Unknown {
                 return result_ty.clone();
             }
-            // Known operations that return Int
-            if target.contains("+")
-                || target.contains("-")
-                || target.contains("*")
-                || target.contains("len")
-                || target.contains("size")
-            {
-                return ValueType::Int;
-            }
-            // If all args are Int and it's an arithmetic-like op, result is Int
-            if !args.is_empty()
-                && args.iter().all(|a| state.get(*a) == &ValueType::Int)
-                && (target.contains("add") || target.contains("sub") || target.contains("mul"))
-            {
-                return ValueType::Int;
-            }
-            ValueType::Unknown
+            infer_call_result_type(target, args, state)
         }
         OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => ValueType::Void,
         OpKind::VableFieldRead { ty, .. } => ty.clone(),
@@ -170,6 +153,17 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         | OpKind::CallMayForce { result_ty, .. } => result_ty.clone(),
         OpKind::Unknown { .. } => ValueType::Unknown,
     }
+}
+
+fn infer_call_result_type(
+    target: &crate::graph::CallTarget,
+    _args: &[ValueId],
+    _state: &AnnotationState,
+) -> ValueType {
+    if crate::call_match::is_int_arithmetic_target(target) {
+        return ValueType::Int;
+    }
+    ValueType::Unknown
 }
 
 /// Merge two annotations (RPython `unionof()`).
@@ -194,7 +188,7 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{MajitGraph, OpKind, Terminator, ValueType};
+    use crate::graph::{CallTarget, MajitGraph, OpKind, Terminator, ValueType};
 
     #[test]
     fn annotates_const_int() {
@@ -217,7 +211,7 @@ mod tests {
                 entry,
                 OpKind::FieldRead {
                     base,
-                    field: "x".into(),
+                    field: crate::graph::FieldDescriptor::new("x", None),
                     ty: ValueType::Int,
                 },
                 true,
@@ -239,7 +233,7 @@ mod tests {
             .push_op(
                 entry,
                 OpKind::Call {
-                    target: "+".into(),
+                    target: CallTarget::function_path(["w_int_add"]),
                     args: vec![a, b],
                     result_ty: ValueType::Unknown,
                 },
@@ -251,6 +245,29 @@ mod tests {
         let state = annotate(&graph);
         assert_eq!(state.get(a), &ValueType::Int);
         assert_eq!(state.get(b), &ValueType::Int);
+        assert_eq!(state.get(result), &ValueType::Int);
+    }
+
+    #[test]
+    fn annotates_path_like_int_helper_call() {
+        let mut graph = MajitGraph::new("test");
+        let entry = graph.entry;
+        let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let result = graph
+            .push_op(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["crate", "math", "w_int_add"]),
+                    args: vec![a, b],
+                    result_ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_terminator(entry, Terminator::Return(Some(result)));
+
+        let state = annotate(&graph);
         assert_eq!(state.get(result), &ValueType::Int);
     }
 

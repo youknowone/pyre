@@ -50,14 +50,14 @@ pub struct JitInterpConfig {
     /// The environment type (e.g., `Program`).
     pub env_type: Ident,
     /// Multi-storage configuration.
-    pub storage: StorageConfig,
+    pub storage: Option<StorageConfig>,
     /// Method name → IR opcode mapping for binary operations.
     pub binops: Vec<(Ident, Ident)>,
     /// Interpreter I/O function → JIT shim function mapping.
     pub io_shims: Vec<(Path, Ident)>,
     /// Interpreter function call policies for helper calls.
     /// Populated from both `calls = { ... }` and `helpers = [...]`.
-    pub calls: Vec<(Path, Option<Ident>)>,
+    pub calls: Vec<(Path, Option<CallPolicyKind>)>,
     /// Whether direct helper calls should be auto-inferred from sidecar metadata.
     pub auto_calls: bool,
     /// Optional structured green-key expressions for marker rewrite.
@@ -163,8 +163,90 @@ pub struct StorageConfig {
     /// Optional method on StoragePool to check JIT compatibility of all values.
     /// When set, `can_trace` additionally calls `pool.method()`.
     pub can_trace_guard: Option<Ident>,
-    /// RPython virtualizable: storage contents live on heap, only lengths are InputArgs.
-    pub virtualizable: bool,
+    /// Track storage state as compact ptr/len/cap triples instead of flattening contents.
+    pub compact_live: bool,
+    /// Optional helper to encode a semantic i64 value for raw storage writes.
+    pub compact_encode: Option<Path>,
+    /// Optional helper to decode a raw storage word to semantic i64.
+    pub compact_decode: Option<Path>,
+    /// Optional lower bound for values representable in compact storage.
+    pub compact_min: Option<Expr>,
+    /// Optional upper bound for values representable in compact storage.
+    pub compact_max: Option<Expr>,
+    /// Byte offset of the compact storage pointer cache array on the pool object.
+    pub compact_ptrs_offset: Option<Expr>,
+    /// Byte offset of the compact storage length cache array on the pool object.
+    pub compact_lengths_offset: Option<Expr>,
+    /// Byte offset of the compact storage capacity cache array on the pool object.
+    pub compact_caps_offset: Option<Expr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallPolicyKind {
+    ResidualVoid,
+    ResidualVoidWrapped,
+    MayForceVoid,
+    MayForceVoidWrapped,
+    ReleaseGilVoid,
+    ReleaseGilVoidWrapped,
+    LoopInvariantVoid,
+    LoopInvariantVoidWrapped,
+    ResidualInt,
+    ResidualIntWrapped,
+    MayForceInt,
+    MayForceIntWrapped,
+    ReleaseGilInt,
+    ReleaseGilIntWrapped,
+    LoopInvariantInt,
+    LoopInvariantIntWrapped,
+    ElidableInt,
+    ElidableIntWrapped,
+    ResidualRefWrapped,
+    MayForceRefWrapped,
+    ReleaseGilRefWrapped,
+    LoopInvariantRefWrapped,
+    ElidableRefWrapped,
+    ResidualFloatWrapped,
+    MayForceFloatWrapped,
+    ReleaseGilFloatWrapped,
+    LoopInvariantFloatWrapped,
+    ElidableFloatWrapped,
+    InlineInt,
+}
+
+pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
+    Some(match kind.to_string().as_str() {
+        "residual_void" => CallPolicyKind::ResidualVoid,
+        "residual_void_wrapped" => CallPolicyKind::ResidualVoidWrapped,
+        "may_force_void" => CallPolicyKind::MayForceVoid,
+        "may_force_void_wrapped" => CallPolicyKind::MayForceVoidWrapped,
+        "release_gil_void" => CallPolicyKind::ReleaseGilVoid,
+        "release_gil_void_wrapped" => CallPolicyKind::ReleaseGilVoidWrapped,
+        "loopinvariant_void" => CallPolicyKind::LoopInvariantVoid,
+        "loopinvariant_void_wrapped" => CallPolicyKind::LoopInvariantVoidWrapped,
+        "residual_int" => CallPolicyKind::ResidualInt,
+        "residual_int_wrapped" => CallPolicyKind::ResidualIntWrapped,
+        "may_force_int" => CallPolicyKind::MayForceInt,
+        "may_force_int_wrapped" => CallPolicyKind::MayForceIntWrapped,
+        "release_gil_int" => CallPolicyKind::ReleaseGilInt,
+        "release_gil_int_wrapped" => CallPolicyKind::ReleaseGilIntWrapped,
+        "loopinvariant_int" => CallPolicyKind::LoopInvariantInt,
+        "loopinvariant_int_wrapped" => CallPolicyKind::LoopInvariantIntWrapped,
+        "elidable_int" => CallPolicyKind::ElidableInt,
+        "elidable_int_wrapped" => CallPolicyKind::ElidableIntWrapped,
+        "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
+        "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,
+        "release_gil_ref_wrapped" => CallPolicyKind::ReleaseGilRefWrapped,
+        "loopinvariant_ref_wrapped" => CallPolicyKind::LoopInvariantRefWrapped,
+        "elidable_ref_wrapped" => CallPolicyKind::ElidableRefWrapped,
+        "residual_float_wrapped" => CallPolicyKind::ResidualFloatWrapped,
+        "may_force_float_wrapped" => CallPolicyKind::MayForceFloatWrapped,
+        "release_gil_float_wrapped" => CallPolicyKind::ReleaseGilFloatWrapped,
+        "loopinvariant_float_wrapped" => CallPolicyKind::LoopInvariantFloatWrapped,
+        "elidable_float_wrapped" => CallPolicyKind::ElidableFloatWrapped,
+        "inline_int" => CallPolicyKind::InlineInt,
+        _ => return None,
+    })
 }
 
 impl Parse for JitInterpConfig {
@@ -174,7 +256,7 @@ impl Parse for JitInterpConfig {
         let mut storage = None;
         let mut binops = None;
         let mut io_shims = None;
-        let mut calls: Vec<(Path, Option<Ident>)> = Vec::new();
+        let mut calls: Vec<(Path, Option<CallPolicyKind>)> = Vec::new();
         let mut auto_calls = None;
         let mut greens = None;
         let mut virtualizable_decl = None;
@@ -234,29 +316,12 @@ impl Parse for JitInterpConfig {
         let env_type =
             env_type.ok_or_else(|| syn::Error::new(input.span(), "missing `env` parameter"))?;
 
-        // storage is required unless state_fields is provided.
-        let storage = match (storage, &state_fields) {
-            (Some(s), _) => s,
-            (None, Some(_)) => {
-                // Create a dummy StorageConfig for state_fields mode.
-                // __DummyPool is a unit struct auto-generated in codegen output.
-                StorageConfig {
-                    pool: syn::parse_quote!(__DummyPool),
-                    pool_type: syn::parse_quote!(__DummyPool),
-                    selector: syn::parse_quote!(0usize),
-                    untraceable: Vec::new(),
-                    scan_fn: syn::parse_str("__dummy_scan").unwrap(),
-                    can_trace_guard: None,
-                    virtualizable: false,
-                }
-            }
-            (None, None) => {
-                return Err(syn::Error::new(
-                    input.span(),
-                    "missing `storage` or `state_fields` parameter",
-                ));
-            }
-        };
+        if storage.is_none() && state_fields.is_none() {
+            return Err(syn::Error::new(
+                input.span(),
+                "missing `storage` or `state_fields` parameter",
+            ));
+        }
 
         Ok(JitInterpConfig {
             state_type,
@@ -291,7 +356,14 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut untraceable = Vec::new();
     let mut scan_fn = None;
     let mut can_trace_guard = None;
-    let mut virtualizable = false;
+    let mut compact_live = false;
+    let mut compact_encode = None;
+    let mut compact_decode = None;
+    let mut compact_min = None;
+    let mut compact_max = None;
+    let mut compact_ptrs_offset = None;
+    let mut compact_lengths_offset = None;
+    let mut compact_caps_offset = None;
     while !content.is_empty() {
         let key: Ident = content.parse()?;
         content.parse::<Token![:]>()?;
@@ -319,9 +391,36 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             "can_trace_guard" => {
                 can_trace_guard = Some(content.parse::<Ident>()?);
             }
+            "compact_live" => {
+                compact_live = content.parse::<LitBool>()?.value;
+            }
+            "compact_encode" => {
+                compact_encode = Some(content.parse::<Path>()?);
+            }
+            "compact_decode" => {
+                compact_decode = Some(content.parse::<Path>()?);
+            }
+            "compact_min" => {
+                compact_min = Some(content.parse::<Expr>()?);
+            }
+            "compact_max" => {
+                compact_max = Some(content.parse::<Expr>()?);
+            }
+            "compact_ptrs_offset" => {
+                compact_ptrs_offset = Some(content.parse::<Expr>()?);
+            }
+            "compact_lengths_offset" => {
+                compact_lengths_offset = Some(content.parse::<Expr>()?);
+            }
+            "compact_caps_offset" => {
+                compact_caps_offset = Some(content.parse::<Expr>()?);
+            }
             "virtualizable" => {
-                let lit: LitBool = content.parse()?;
-                virtualizable = lit.value;
+                let _: LitBool = content.parse()?;
+                return Err(syn::Error::new(
+                    key.span(),
+                    "storage.virtualizable is no longer supported; use `virtualizable_fields` or `state_fields`",
+                ));
             }
             other => {
                 return Err(syn::Error::new(
@@ -350,13 +449,21 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         untraceable,
         scan_fn,
         can_trace_guard,
-        virtualizable,
+        compact_live,
+        compact_encode,
+        compact_decode,
+        compact_min,
+        compact_max,
+        compact_ptrs_offset,
+        compact_lengths_offset,
+        compact_caps_offset,
     })
 }
 
 /// Parse virtualizable_fields = { var: IDENT, token_offset: PATH, fields: { ... }, arrays: { ... } }
 ///
-/// Parse `state_fields = { name: type, ... }` where type is `int` or `[int]`.
+/// Parse `state_fields = { name: type, ... }` where type is `int`, `[int]`,
+/// or `[int; virt]`.
 fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
     let content;
     braced!(content in input);
@@ -367,10 +474,19 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
         content.parse::<Token![:]>()?;
 
         let kind = if content.peek(syn::token::Bracket) {
-            // Array: [int], [ref], [float] or virtualizable: [int; virt]
+            // Array: [int] or virtualizable: [int; virt]
             let inner;
             bracketed!(inner in content);
             let item_type: Ident = inner.parse()?;
+            if item_type != "int" {
+                return Err(syn::Error::new(
+                    item_type.span(),
+                    format!(
+                        "state_fields array `{name}` uses unsupported item type `{item_type}`; \
+                         only `int` is currently supported"
+                    ),
+                ));
+            }
             if inner.peek(Token![;]) {
                 inner.parse::<Token![;]>()?;
                 let flag: Ident = inner.parse()?;
@@ -386,8 +502,17 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
                 StateFieldKind::Array(item_type)
             }
         } else {
-            // Scalar: int, ref, float
+            // Scalar: int
             let field_type: Ident = content.parse()?;
+            if field_type != "int" {
+                return Err(syn::Error::new(
+                    field_type.span(),
+                    format!(
+                        "state_fields scalar `{name}` uses unsupported type `{field_type}`; \
+                         only `int` is currently supported"
+                    ),
+                ));
+            }
             StateFieldKind::Scalar(field_type)
         };
 
@@ -512,7 +637,7 @@ fn parse_io_shim_map(input: ParseStream) -> syn::Result<Vec<(Path, Ident)>> {
 }
 
 /// Parse `{ path::func, path::func => residual_int, ... }`.
-fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>> {
+fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<CallPolicyKind>)>> {
     let content;
     braced!(content in input);
     let mut map = Vec::new();
@@ -521,44 +646,12 @@ fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>>
         let kind = if content.peek(Token![=>]) {
             content.parse::<Token![=>]>()?;
             let kind: Ident = content.parse()?;
-            match kind.to_string().as_str() {
-                "residual_void"
-                | "residual_void_wrapped"
-                | "may_force_void"
-                | "may_force_void_wrapped"
-                | "release_gil_void"
-                | "release_gil_void_wrapped"
-                | "loopinvariant_void"
-                | "loopinvariant_void_wrapped"
-                | "residual_int"
-                | "residual_int_wrapped"
-                | "may_force_int"
-                | "may_force_int_wrapped"
-                | "release_gil_int"
-                | "release_gil_int_wrapped"
-                | "loopinvariant_int"
-                | "loopinvariant_int_wrapped"
-                | "elidable_int"
-                | "elidable_int_wrapped"
-                | "residual_ref_wrapped"
-                | "may_force_ref_wrapped"
-                | "release_gil_ref_wrapped"
-                | "loopinvariant_ref_wrapped"
-                | "elidable_ref_wrapped"
-                | "residual_float_wrapped"
-                | "may_force_float_wrapped"
-                | "release_gil_float_wrapped"
-                | "loopinvariant_float_wrapped"
-                | "elidable_float_wrapped"
-                | "inline_int" => {}
-                _ => {
-                    return Err(syn::Error::new(
-                        kind.span(),
-                        "call policy must be a supported residual/may_force/release_gil/loopinvariant policy or inline_int",
-                    ));
-                }
-            }
-            Some(kind)
+            Some(parse_call_policy_kind(&kind).ok_or_else(|| {
+                syn::Error::new(
+                    kind.span(),
+                    "call policy must be a supported residual/may_force/release_gil/loopinvariant policy or inline_int",
+                )
+            })?)
         } else {
             None
         };
@@ -569,7 +662,7 @@ fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>>
 }
 
 /// Parse `[func_a, func_b, func_c]` — shorthand helper list with auto-inferred policies.
-fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<(Path, Option<Ident>)>> {
+fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<(Path, Option<CallPolicyKind>)>> {
     let content;
     bracketed!(content in input);
     let paths: Punctuated<Path, Token![,]> = content.parse_terminated(Path::parse, Token![,])?;
@@ -601,65 +694,62 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
     let trace_fn_name = quote::format_ident!("__trace_{}", fn_name);
     let state_type = &config.state_type;
     let env_type = &config.env_type;
-    let pool_type = &config.storage.pool_type;
-
-    quote! {
-        #[cold]
-        #[inline(never)]
-        #[allow(non_snake_case)]
-        fn #merge_fn_name(
-            __driver: &mut majit_meta::JitDriver<#state_type>,
-            __env: &#env_type,
-            __pc: usize,
-            __pool: &#pool_type,
-            __sel: usize,
-        ) {
-            __driver.merge_point(|__ctx, __sym| {
-                // RPython parity: reached_loop_header checks green keys.
-                // Skip the first merge_point (trace header itself).
-                // Only close when we return to the SAME green key after
-                // executing at least one iteration.
-                // RPython parity: reached_loop_header checks green keys.
-                // After at least one instruction, if greens match header → close.
-                use majit_meta::JitCodeSym;
-                if __sym.preamble_done
-                    && __pc == __sym.loop_header_pc()
-                    && __sel == __sym.header_selected()
-                {
-                    // Virtualizable: sync to heap before close.
-                    if __sym.is_virtualizable_storage() {
-                        let const_1 = __ctx.const_int(1);
-                        for __sidx in 0..28usize {
-                            let (__arr, __len) = match (__sym.vable_array_ref(__sidx), __sym.vable_len_ref(__sidx)) {
-                                (Some(a), Some(l)) => (a, l),
-                                _ => continue,
-                            };
-                            let __stack = match __sym.stack(__sidx) {
-                                Some(s) => s,
-                                None => continue,
-                            };
-                            let __vals = __stack.to_jump_args();
-                            let __new_len = __ctx.const_int(__vals.len() as i64);
-                            for (__j, &__val) in __vals.iter().enumerate() {
-                                let __off = __ctx.const_int((__j as i64) * 8);
-                                let __sh = __ctx.record_op(majit_ir::OpCode::IntLshift, &[__val, const_1]);
-                                let __tag = __ctx.record_op(majit_ir::OpCode::IntOr, &[__sh, const_1]);
-                                __ctx.record_op_with_descr(
-                                    majit_ir::OpCode::SetarrayitemRaw,
-                                    &[__arr, __off, __tag],
-                                    majit_meta::raw_i64_array_descr(),
-                                );
-                            }
-                            __sym.set_vable_len_ref(__sidx, __new_len);
-                        }
+    if config.state_fields.is_some() {
+        quote! {
+            #[cold]
+            #[inline(never)]
+            #[allow(non_snake_case)]
+            fn #merge_fn_name(
+                __driver: &mut majit_meta::JitDriver<#state_type>,
+                __env: &#env_type,
+                __pc: usize,
+            ) {
+                __driver.merge_point(|__ctx, __sym| {
+                    use majit_meta::JitCodeSym;
+                    if __sym.trace_started && __pc == __sym.loop_header_pc() {
+                        return majit_meta::TraceAction::CloseLoop;
                     }
-                    return majit_meta::TraceAction::CloseLoop;
-                }
-                let __result = #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel);
-                // Mark that at least one instruction has been traced.
-                __sym.preamble_done = true;
-                __result
-            });
+                    let __result = #trace_fn_name(__ctx, __sym, __env, __pc);
+                    __sym.trace_started = true;
+                    __result
+                });
+            }
+        }
+    } else {
+        let storage = config
+            .storage
+            .as_ref()
+            .expect("storage config required in storage mode");
+        let pool_type = &storage.pool_type;
+        let close_selected_check = if storage.compact_live {
+            quote! {}
+        } else {
+            quote! { && __sel == __sym.header_selected() }
+        };
+        quote! {
+            #[cold]
+            #[inline(never)]
+            #[allow(non_snake_case)]
+            fn #merge_fn_name(
+                __driver: &mut majit_meta::JitDriver<#state_type>,
+                __env: &#env_type,
+                __pc: usize,
+                __pool: &#pool_type,
+                __sel: usize,
+            ) {
+                __driver.merge_point(|__ctx, __sym| {
+                    use majit_meta::JitCodeSym;
+                    if __sym.trace_started
+                        && __pc == __sym.loop_header_pc()
+                        #close_selected_check
+                    {
+                        return majit_meta::TraceAction::CloseLoop;
+                    }
+                    let __result = #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel);
+                    __sym.trace_started = true;
+                    __result
+                });
+            }
         }
     }
 }
@@ -673,8 +763,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let trace_fn_name = quote::format_ident!("__trace_{}", fn_name);
     let merge_fn_name = quote::format_ident!("__merge_{}", fn_name);
 
-    let pool_expr = &config.storage.pool;
-    let sel_expr = &config.storage.selector;
+    let pool_expr = config.storage.as_ref().map(|s| &s.pool);
+    let sel_expr = config.storage.as_ref().map(|s| &s.selector);
 
     let is_state_fields = config.state_fields.is_some();
 
@@ -702,8 +792,8 @@ fn rewrite_body(
     block: &syn::Block,
     trace_fn_name: &Ident,
     merge_fn_name: &Ident,
-    pool_expr: &Expr,
-    sel_expr: &Expr,
+    pool_expr: Option<&Expr>,
+    sel_expr: Option<&Expr>,
     default_greens: &[Expr],
     is_state_fields: bool,
 ) -> TokenStream {
@@ -809,8 +899,8 @@ fn rewrite_body(
     struct MarkerRewriter {
         trace_fn_name: Ident,
         merge_fn_name: Ident,
-        pool_expr: Expr,
-        sel_expr: Expr,
+        pool_expr: Option<Expr>,
+        sel_expr: Option<Expr>,
         default_greens: Vec<Expr>,
         is_state_fields: bool,
     }
@@ -838,11 +928,19 @@ fn rewrite_body(
                     let driver = args.driver.unwrap_or_else(|| syn::parse_quote!(driver));
                     let env = args.env.unwrap_or_else(|| syn::parse_quote!(program));
                     let pc = args.pc.unwrap_or_else(|| syn::parse_quote!(pc));
-                    let pool = &self.pool_expr;
-                    let sel = &self.sel_expr;
-                    let new_tokens: TokenStream = quote! {
-                        if #driver.is_tracing() {
-                            #merge_fn(&mut #driver, #env, #pc, &#pool, #sel);
+                    let new_tokens: TokenStream = if self.is_state_fields {
+                        quote! {
+                            if #driver.is_tracing() {
+                                #merge_fn(&mut #driver, #env, #pc);
+                            }
+                        }
+                    } else {
+                        let pool = self.pool_expr.as_ref().expect("storage pool expr");
+                        let sel = self.sel_expr.as_ref().expect("storage selector expr");
+                        quote! {
+                            if #driver.is_tracing() {
+                                #merge_fn(&mut #driver, #env, #pc, &#pool, #sel);
+                            }
                         }
                     };
                     *stmt =
@@ -903,13 +1001,12 @@ fn rewrite_body(
                             } else {
                                 args.greens.clone()
                             };
-                            let pool = &pool_expr;
-                            let sel = &sel_expr;
                             let is_sf = self.is_state_fields;
                             let stacksize_update: TokenStream = if is_sf {
-                                // state_fields mode: no storage pool
                                 quote! { #stacksize_expr = 0i32; }
                             } else {
+                                let pool = pool_expr.as_ref().expect("storage pool expr");
+                                let sel = sel_expr.as_ref().expect("storage selector expr");
                                 quote! { #stacksize_expr = #pool.get(#sel).len() as i32; }
                             };
                             let back_edge: TokenStream = if let Some(green_key) =
@@ -953,8 +1050,8 @@ fn rewrite_body(
     let mut rewriter = MarkerRewriter {
         trace_fn_name: trace_fn_name.clone(),
         merge_fn_name: merge_fn_name.clone(),
-        pool_expr: pool_expr.clone(),
-        sel_expr: sel_expr.clone(),
+        pool_expr: pool_expr.cloned(),
+        sel_expr: sel_expr.cloned(),
         default_greens: default_greens.to_vec(),
         is_state_fields,
     };
@@ -974,7 +1071,7 @@ mod tests {
         let tokens: proc_macro2::TokenStream = parse_quote! {
             [helper_add, helper_sub, helper_mul]
         };
-        let result: Vec<(Path, Option<Ident>)> =
+        let result: Vec<(Path, Option<CallPolicyKind>)> =
             syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
         assert_eq!(result.len(), 3);
         assert_eq!(
@@ -995,7 +1092,7 @@ mod tests {
     #[test]
     fn parse_helpers_list_empty() {
         let tokens: proc_macro2::TokenStream = parse_quote! { [] };
-        let result: Vec<(Path, Option<Ident>)> =
+        let result: Vec<(Path, Option<CallPolicyKind>)> =
             syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
         assert!(result.is_empty());
     }
@@ -1005,7 +1102,7 @@ mod tests {
         let tokens: proc_macro2::TokenStream = parse_quote! {
             [module::helper_a, helper_b]
         };
-        let result: Vec<(Path, Option<Ident>)> =
+        let result: Vec<(Path, Option<CallPolicyKind>)> =
             syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
         assert_eq!(result.len(), 2);
         // First has two path segments
@@ -1015,7 +1112,7 @@ mod tests {
     }
 
     /// Wrapper to make `parse_helpers_list` testable via `syn::parse2`.
-    struct HelpersListWrapper(Vec<(Path, Option<Ident>)>);
+    struct HelpersListWrapper(Vec<(Path, Option<CallPolicyKind>)>);
     impl Parse for HelpersListWrapper {
         fn parse(input: ParseStream) -> syn::Result<Self> {
             Ok(Self(parse_helpers_list(input)?))

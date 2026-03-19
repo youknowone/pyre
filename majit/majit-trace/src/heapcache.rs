@@ -169,7 +169,12 @@ impl HeapCache {
     /// Replace tracking for an old box with a new one (e.g., after constant folding).
     pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
         // Transfer field cache entries
-        let keys: Vec<_> = self.field_cache.keys().filter(|k| k.0 == old).cloned().collect();
+        let keys: Vec<_> = self
+            .field_cache
+            .keys()
+            .filter(|k| k.0 == old)
+            .cloned()
+            .collect();
         for key in keys {
             if let Some(val) = self.field_cache.remove(&key) {
                 self.field_cache.insert((new, key.1), val);

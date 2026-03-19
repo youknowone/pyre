@@ -1253,8 +1253,14 @@ mod tests {
         // COND_CALL_VALUE_I(cond, func, arg) → CSE using args[1..]
         // A second COND_CALL_VALUE_I with same func+arg should reuse result.
         let mut ops = vec![
-            Op::new(OpCode::CondCallValueI, &[OpRef(100), OpRef(200), OpRef(300)]),
-            Op::new(OpCode::CondCallValueI, &[OpRef(101), OpRef(200), OpRef(300)]),
+            Op::new(
+                OpCode::CondCallValueI,
+                &[OpRef(100), OpRef(200), OpRef(300)],
+            ),
+            Op::new(
+                OpCode::CondCallValueI,
+                &[OpRef(101), OpRef(200), OpRef(300)],
+            ),
         ];
         assign_positions(&mut ops);
 

@@ -869,7 +869,7 @@ fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) ->
 
         // ── SameAs / Copy ──
         OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => {
-            let a = unop(values, op);
+            let a = same_as_value(values, op);
             OpResult::Value(a)
         }
 
@@ -1278,6 +1278,16 @@ fn binop(values: &HashMap<u32, i64>, op: &Op) -> (i64, i64) {
 
 fn unop(values: &HashMap<u32, i64>, op: &Op) -> i64 {
     resolve(values, op.args[0])
+}
+
+fn same_as_value(values: &HashMap<u32, i64>, op: &Op) -> i64 {
+    if op.num_args() > 0 {
+        unop(values, op)
+    } else if !op.pos.is_none() {
+        resolve(values, op.pos)
+    } else {
+        0
+    }
 }
 
 fn float_binop(values: &HashMap<u32, i64>, op: &Op) -> (f64, f64) {
@@ -2049,6 +2059,18 @@ mod tests {
     fn test_executor_same_as() {
         assert_eq!(exec_unop(OpCode::SameAsI, 42), 42);
         assert_eq!(exec_unop(OpCode::SameAsR, 0xDEAD), 0xDEAD);
+    }
+
+    #[test]
+    fn test_executor_same_as_zero_arg_constant_placeholder() {
+        let op = mk_op(OpCode::SameAsI, &[], 8);
+        let mut values = HashMap::new();
+        values.insert(8, 123);
+        let mut exc = ExceptionState::default();
+        match execute_one(&op, &values, &mut exc) {
+            OpResult::Value(v) => assert_eq!(v, 123),
+            _ => panic!("zero-arg SameAsI should resolve through its constant slot"),
+        }
     }
 
     // ── UintMulHigh ──

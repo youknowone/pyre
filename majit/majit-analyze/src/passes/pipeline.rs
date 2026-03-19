@@ -8,12 +8,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::OpcodeDispatchSelector;
 use crate::front::SemanticFunction;
 use crate::graph::MajitGraph;
 use crate::passes::annotate::{AnnotationState, annotate};
 use crate::passes::flatten::{self, FlattenedFunction};
 use crate::passes::jtransform::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
 use crate::passes::rtype::{TypeResolutionState, resolve_types};
+use crate::patterns::TracePattern;
 
 /// Configuration for the full analysis pipeline.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -36,14 +38,24 @@ pub struct PipelineResult {
     pub vable_rewrites: usize,
     pub calls_classified: usize,
     pub transform_notes: Vec<super::jtransform::GraphTransformNote>,
+    /// Canonical graph-derived trace classification for this function.
+    pub classified_pattern: Option<TracePattern>,
     /// Flattened output.
     pub flattened: FlattenedFunction,
+}
+
+/// Canonical opcode dispatch metadata derived for generated consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineOpcodeArm {
+    pub selector: OpcodeDispatchSelector,
+    pub classified_pattern: Option<TracePattern>,
 }
 
 /// Result of running the pipeline on a full program.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramPipelineResult {
     pub functions: Vec<PipelineResult>,
+    pub opcode_dispatch: Vec<PipelineOpcodeArm>,
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
@@ -70,6 +82,7 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     let vable_rewrites = transform_result.vable_rewrites;
     let calls_classified = transform_result.calls_classified;
     let transform_notes = transform_result.notes.clone();
+    let classified_pattern = crate::patterns::classify_from_graph(&transform_result.graph);
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
     let flattened = flatten::flatten_with_types(&transform_result.graph, &types);
@@ -82,6 +95,7 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
         vable_rewrites,
         calls_classified,
         transform_notes,
+        classified_pattern,
         flattened,
     }
 }
@@ -106,6 +120,7 @@ pub fn analyze_program(
 
     ProgramPipelineResult {
         functions,
+        opcode_dispatch: Vec::new(),
         total_blocks,
         total_ops,
         total_vable_rewrites,
@@ -153,8 +168,16 @@ mod tests {
         let program = front::build_semantic_program(&parsed);
         let config = PipelineConfig {
             transform: GraphTransformConfig {
-                vable_fields: vec![("next_instr".into(), 0)],
-                vable_arrays: vec![("locals_w".into(), 0)],
+                vable_fields: vec![crate::passes::VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                vable_arrays: vec![crate::passes::VirtualizableFieldDescriptor::new(
+                    "locals_w",
+                    Some("Frame".into()),
+                    0,
+                )],
                 ..Default::default()
             },
         };

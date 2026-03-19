@@ -3104,7 +3104,10 @@ impl PyreJitState {
         let (static_boxes, array_boxes) = self.export_virtualizable_state();
         unsafe {
             info.write_from_resume_data_partial(frame_ptr, &static_boxes, &array_boxes);
-            info.clear_vable_token(frame_ptr);
+            info.clear_vable_token(frame_ptr, |_token| {
+                // Force callback — in RPython this forces the virtualizable.
+                // In pyre, the frame is already restored above.
+            });
         }
         true
     }

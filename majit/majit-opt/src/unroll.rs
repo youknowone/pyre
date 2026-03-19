@@ -211,7 +211,10 @@ impl UnrollOptimizer {
     /// unroll.py: _map_args(mapping, arglist)
     /// Remap a list of OpRefs through a forwarding mapping.
     /// Constants (OpRef >= 10000) are left unchanged.
-    pub fn map_args(mapping: &std::collections::HashMap<OpRef, OpRef>, args: &[OpRef]) -> Vec<OpRef> {
+    pub fn map_args(
+        mapping: &std::collections::HashMap<OpRef, OpRef>,
+        args: &[OpRef],
+    ) -> Vec<OpRef> {
         args.iter()
             .map(|&arg| {
                 if arg.0 >= 10_000 {
@@ -241,10 +244,7 @@ impl UnrollOptimizer {
     /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
     /// If the trace has too many guards, disable retracing for this location.
     /// Returns true if retracing was disabled.
-    pub fn disable_retracing_if_max_retrace_guards(
-        ops: &[Op],
-        max_retrace_guards: u32,
-    ) -> bool {
+    pub fn disable_retracing_if_max_retrace_guards(ops: &[Op], max_retrace_guards: u32) -> bool {
         let guard_count = Self::count_guards(ops);
         guard_count > max_retrace_guards
     }
@@ -331,7 +331,10 @@ impl OptUnroll {
             .collect();
 
         let virtual_state = crate::virtualstate::VirtualState::new(
-            end_args.iter().map(|_| crate::virtualstate::VirtualStateInfo::Unknown).collect(),
+            end_args
+                .iter()
+                .map(|_| crate::virtualstate::VirtualStateInfo::Unknown)
+                .collect(),
         );
 
         let label_args = virtual_state.make_inputargs(&end_args);
@@ -386,10 +389,7 @@ impl OptUnroll {
 
     /// unroll.py: jump_to_existing_trace — check if a compiled trace
     /// exists for this loop and redirect the jump to it.
-    pub fn jump_to_existing_trace(
-        jump_op: &Op,
-        exported_state: &ExportedState,
-    ) -> Option<Op> {
+    pub fn jump_to_existing_trace(jump_op: &Op, exported_state: &ExportedState) -> Option<Op> {
         // Check if virtual states are compatible
         // (simplified: just check arg count matches)
         if jump_op.args.len() != exported_state.end_args.len() {
@@ -423,9 +423,7 @@ impl OptUnroll {
         }
 
         // Create label args from virtual state
-        exported_state
-            .virtual_state
-            .make_inputargs(targetargs)
+        exported_state.virtual_state.make_inputargs(targetargs)
     }
 }
 

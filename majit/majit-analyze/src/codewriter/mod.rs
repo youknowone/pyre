@@ -8,10 +8,14 @@
 //! ```
 
 pub mod codegen;
+#[cfg(test)]
 pub mod jtransform;
 
 pub use codegen::{
-    ArmTransformer, IdentityTransformer, IoShim, JitDriverConfig, StorageConfig,
+    BinopMapping, CodegenValueKind, IoShim, JitDriverConfig, StorageConfig,
     VirtualizableCodegenConfig, generate_jitcode,
 };
-pub use jtransform::{LoweringRecipe, TransformConfig, transform_all, transform_pattern};
+#[cfg(test)]
+pub use jtransform::transform_all;
+#[cfg(test)]
+pub use jtransform::{LoweringRecipe, TransformConfig, transform_pattern};

@@ -5,6 +5,39 @@
 //
 // Reference: rpython/rlib/jit.py
 
+/// Canonical virtualizable hint kinds understood by the framework.
+///
+/// These are the Rust-facing equivalents of RPython's
+/// `hint(..., access_directly=True)`, `hint(..., fresh_virtualizable=True)`,
+/// and `hint(..., force_virtualizable=True)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualizableHintKind {
+    AccessDirectly,
+    FreshVirtualizable,
+    ForceVirtualizable,
+}
+
+/// Classify a function-like symbol as a virtualizable hint.
+///
+/// The translator owns the semantics, but the vocabulary itself lives in the
+/// runtime crate so proc-macros, analyzers, and interpreters share the same
+/// canonical surface.
+pub fn classify_virtualizable_hint_segments<'a, I>(segments: I) -> Option<VirtualizableHintKind>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    match segments.into_iter().last().unwrap_or_default() {
+        "hint_access_directly" => Some(VirtualizableHintKind::AccessDirectly),
+        "hint_fresh_virtualizable" => Some(VirtualizableHintKind::FreshVirtualizable),
+        "hint_force_virtualizable" => Some(VirtualizableHintKind::ForceVirtualizable),
+        _ => None,
+    }
+}
+
+pub fn classify_virtualizable_hint_path(path: &str) -> Option<VirtualizableHintKind> {
+    classify_virtualizable_hint_segments(path.split("::"))
+}
+
 /// Hint to the JIT that this value should be treated as a compile-time constant.
 ///
 /// In RPython this is `jit.promote(x)`. During tracing, the tracer records
@@ -304,6 +337,36 @@ mod tests {
         assert_eq!(hint_promote(42i64), 42);
         assert_eq!(hint_promote(3.14f64), 3.14);
         assert_eq!(hint_promote(true), true);
+    }
+
+    #[test]
+    fn classify_virtualizable_hint_path_uses_last_segment() {
+        assert_eq!(
+            classify_virtualizable_hint_path("hint_access_directly"),
+            Some(VirtualizableHintKind::AccessDirectly)
+        );
+        assert_eq!(
+            classify_virtualizable_hint_path("majit_runtime::hint_fresh_virtualizable"),
+            Some(VirtualizableHintKind::FreshVirtualizable)
+        );
+        assert_eq!(
+            classify_virtualizable_hint_path("crate::jit::hint_force_virtualizable"),
+            Some(VirtualizableHintKind::ForceVirtualizable)
+        );
+        assert_eq!(classify_virtualizable_hint_path("other_hint"), None);
+    }
+
+    #[test]
+    fn classify_virtualizable_hint_segments_uses_last_segment() {
+        assert_eq!(
+            classify_virtualizable_hint_segments(["majit_runtime", "hint_access_directly"]),
+            Some(VirtualizableHintKind::AccessDirectly)
+        );
+        assert_eq!(
+            classify_virtualizable_hint_segments(["crate", "jit", "hint_force_virtualizable"]),
+            Some(VirtualizableHintKind::ForceVirtualizable)
+        );
+        assert_eq!(classify_virtualizable_hint_segments(["other_hint"]), None);
     }
 
     #[test]

@@ -112,6 +112,7 @@ pub trait DeclarativeJitDriver {
 /// `field_descr_idx` identifies the field descriptor, `value` is the current
 /// symbolic value (OpRef) that should be written to the heap before the call.
 /// `field_type` determines which GETFIELD_GC variant to use when re-reading.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct VableSyncField {
     /// Descriptor index identifying the virtualizable field.
@@ -266,6 +267,11 @@ impl TraceCtx {
     /// Get or create a constant OpRef for a given i64 value.
     pub fn const_int(&mut self, value: i64) -> OpRef {
         self.constants.get_or_insert(value)
+    }
+
+    /// Return the concrete value for a constant OpRef, if it is a pooled constant.
+    pub fn const_value(&self, opref: OpRef) -> Option<i64> {
+        self.constants.as_ref().get(&opref.0).copied()
     }
 
     /// Record a regular IR operation.
@@ -437,9 +443,47 @@ impl TraceCtx {
         self.virtualizable_boxes.clone()
     }
 
+    /// Read a standard virtualizable box by flat index.
+    ///
+    /// The last slot is the standard virtualizable identity itself
+    /// (`virtualizable_boxes[-1]` in RPython terms).
+    pub fn virtualizable_box_at(&self, index: usize) -> Option<OpRef> {
+        self.virtualizable_boxes
+            .as_ref()
+            .and_then(|boxes| boxes.get(index).copied())
+    }
+
+    /// Update a standard virtualizable box by flat index.
+    pub fn set_virtualizable_box_at(&mut self, index: usize, value: OpRef) -> bool {
+        if let Some(boxes) = &mut self.virtualizable_boxes {
+            if let Some(slot) = boxes.get_mut(index) {
+                *slot = value;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return the standard virtualizable identity (`virtualizable_boxes[-1]`).
+    pub fn standard_virtualizable_box(&self) -> Option<OpRef> {
+        self.virtualizable_boxes
+            .as_ref()
+            .and_then(|boxes| boxes.last().copied())
+    }
+
     /// Whether standard virtualizable boxes are active.
     pub fn has_virtualizable_boxes(&self) -> bool {
         self.virtualizable_boxes.is_some()
+    }
+
+    /// Canonical virtualizable metadata for the active standard virtualizable.
+    pub fn virtualizable_info(&self) -> Option<&VirtualizableInfo> {
+        self.virtualizable_info.as_ref()
+    }
+
+    /// Cached array lengths for the active standard virtualizable.
+    pub fn virtualizable_array_lengths(&self) -> Option<&[usize]> {
+        self.virtualizable_array_lengths.as_deref()
     }
 
     // ── hint API consumption (RPython annotator/codewriter equivalent) ──
@@ -480,80 +524,43 @@ impl TraceCtx {
     /// `vable_opref` matching the frame reference in boxes). Nonstandard
     /// or virtual virtualizables are ignored (RPython parity).
     pub fn gen_store_back_in_vable(&mut self, vable_opref: OpRef) {
-        // Collect data to emit without holding borrows on self
-        let ops_to_emit: Vec<(OpCode, Vec<i64>, OpRef)> = {
-            let info = match &self.virtualizable_info {
-                Some(info) => info,
-                None => return,
-            };
-            let boxes = match &self.virtualizable_boxes {
-                Some(boxes) => boxes,
-                None => return,
-            };
-            // RPython parity: only force the standard virtualizable.
-            // virtualizable_boxes[-1] is the vable identity (frame ref).
-            // If vable_opref != boxes[-1], this is nonstandard/virtual — skip.
-            if let Some(&vbox) = boxes.last() {
-                if vbox != vable_opref {
-                    return;
-                }
-            }
-
-            let mut ops = Vec::new();
-
-            // Static fields: SETFIELD_GC(vable, field_value, descr=offset)
-            for (i, field) in info.static_fields.iter().enumerate() {
-                if i < boxes.len() {
-                    ops.push((OpCode::SetfieldGc, vec![field.offset as i64], boxes[i]));
-                }
-            }
-
-            // Array fields: GETFIELD_GC_R to get array ptr, then SETARRAYITEM_GC
-            let mut box_idx = info.static_fields.len();
-            if let Some(ref lengths) = self.virtualizable_array_lengths {
-                for (ai, afield) in info.array_fields.iter().enumerate() {
-                    let len = lengths.get(ai).copied().unwrap_or(0);
-                    for ei in 0..len {
-                        if box_idx < boxes.len() {
-                            ops.push((
-                                OpCode::SetarrayitemGc,
-                                vec![afield.field_offset as i64, ei as i64],
-                                boxes[box_idx],
-                            ));
-                        }
-                        box_idx += 1;
-                    }
-                }
-            }
-
-            ops
+        let (info, boxes, lengths) = match (
+            self.virtualizable_info.clone(),
+            self.virtualizable_boxes.clone(),
+            self.virtualizable_array_lengths.clone(),
+        ) {
+            (Some(info), Some(boxes), Some(lengths)) => (info, boxes, lengths),
+            _ => return,
         };
 
-        // Emit all collected operations
-        for (opcode, metadata, value) in ops_to_emit {
-            match opcode {
-                OpCode::SetfieldGc => {
-                    let offset_ref = self.const_int(metadata[0]);
-                    self.record_op(OpCode::SetfieldGc, &[vable_opref, value, offset_ref]);
-                }
-                OpCode::SetarrayitemGc => {
-                    let arr_offset_ref = self.const_int(metadata[0]);
-                    let arr_ptr =
-                        self.record_op(OpCode::GetfieldGcR, &[vable_opref, arr_offset_ref]);
-                    let idx_ref = self.const_int(metadata[1]);
-                    let zero = self.const_int(0);
-                    self.record_op(OpCode::SetarrayitemGc, &[arr_ptr, idx_ref, value, zero]);
-                }
-                _ => {}
+        if boxes.last().copied() != Some(vable_opref) {
+            return;
+        }
+
+        for field_index in 0..info.static_fields.len() {
+            if let Some(&value) = boxes.get(field_index) {
+                let descr = info.static_field_descr(field_index);
+                self.vable_setfield_descr(vable_opref, value, descr);
             }
         }
 
-        // SETFIELD_GC(vable, NULL, vable_token_descr) — clear token
-        if let Some(ref info) = self.virtualizable_info {
-            let token_offset = self.const_int(info.token_offset as i64);
-            let null = self.const_int(0);
-            self.record_op(OpCode::SetfieldGc, &[vable_opref, null, token_offset]);
+        let mut flat_box_index = info.static_fields.len();
+        for array_index in 0..info.array_fields.len() {
+            let len = lengths.get(array_index).copied().unwrap_or(0);
+            let field_descr = info.array_pointer_field_descr(array_index);
+            let array_descr = info.array_item_descr(array_index);
+            let array_ref = self.vable_getfield_ref_descr(vable_opref, field_descr);
+            for item_index in 0..len {
+                if let Some(&value) = boxes.get(flat_box_index) {
+                    let index = self.const_int(item_index as i64);
+                    self.vable_setarrayitem_descr(array_ref, index, value, array_descr.clone());
+                }
+                flat_box_index += 1;
+            }
         }
+
+        let null = self.const_int(0);
+        self.vable_setfield_descr(vable_opref, null, info.token_field_descr());
     }
 
     /// RPython pyjitpl.py:1114 `_nonstandard_virtualizable()`.
@@ -683,6 +690,35 @@ impl TraceCtx {
         self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
     }
 
+    /// Virtualizable array item read with an index OpRef.
+    ///
+    /// If the index is a known constant and the vable is standard, reads
+    /// directly from `virtualizable_boxes`. Otherwise falls back to heap ops.
+    pub fn vable_getarrayitem_int_indexed(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        if let Some(item_index) = self
+            .const_value(index)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            if !self.is_nonstandard_virtualizable(vable_opref) {
+                if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index)
+                {
+                    if let Some(boxes) = &self.virtualizable_boxes {
+                        return boxes[flat_idx];
+                    }
+                }
+            }
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            return self.vable_getarrayitem_int_vable(array_opref, array_field_offset, item_index);
+        }
+        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        self.vable_getarrayitem_int(array_opref, index)
+    }
+
     /// Standard virtualizable array item read (ref).
     pub fn vable_getarrayitem_ref_vable(
         &mut self,
@@ -700,6 +736,32 @@ impl TraceCtx {
         self.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero])
     }
 
+    /// Virtualizable array ref item read with an index OpRef.
+    pub fn vable_getarrayitem_ref_indexed(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        if let Some(item_index) = self
+            .const_value(index)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            if !self.is_nonstandard_virtualizable(vable_opref) {
+                if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index)
+                {
+                    if let Some(boxes) = &self.virtualizable_boxes {
+                        return boxes[flat_idx];
+                    }
+                }
+            }
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            return self.vable_getarrayitem_ref_vable(array_opref, array_field_offset, item_index);
+        }
+        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        self.vable_getarrayitem_ref(array_opref, index)
+    }
+
     /// Standard virtualizable array item read (float).
     pub fn vable_getarrayitem_float_vable(
         &mut self,
@@ -715,6 +777,36 @@ impl TraceCtx {
         let index = self.const_int(item_index as i64);
         let zero = self.const_int(0);
         self.record_op(OpCode::GetarrayitemGcF, &[array_opref, index, zero])
+    }
+
+    /// Virtualizable array float item read with an index OpRef.
+    pub fn vable_getarrayitem_float_indexed(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+    ) -> OpRef {
+        if let Some(item_index) = self
+            .const_value(index)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            if !self.is_nonstandard_virtualizable(vable_opref) {
+                if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index)
+                {
+                    if let Some(boxes) = &self.virtualizable_boxes {
+                        return boxes[flat_idx];
+                    }
+                }
+            }
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            return self.vable_getarrayitem_float_vable(
+                array_opref,
+                array_field_offset,
+                item_index,
+            );
+        }
+        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        self.vable_getarrayitem_float(array_opref, index)
     }
 
     /// Standard virtualizable array item write.
@@ -737,6 +829,54 @@ impl TraceCtx {
         let index = self.const_int(item_index as i64);
         let zero = self.const_int(0);
         self.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
+    }
+
+    /// Virtualizable array item write with an index OpRef.
+    pub fn vable_setarrayitem_indexed(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        array_field_offset: usize,
+        value: OpRef,
+    ) {
+        if let Some(item_index) = self
+            .const_value(index)
+            .and_then(|raw| usize::try_from(raw).ok())
+        {
+            if !self.is_nonstandard_virtualizable(vable_opref) {
+                if let Some(idx) = self.vable_array_flat_index(array_field_offset, item_index) {
+                    if let Some(boxes) = &mut self.virtualizable_boxes {
+                        boxes[idx] = value;
+                        return;
+                    }
+                }
+            }
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            self.vable_setarrayitem_vable(array_opref, array_field_offset, item_index, value);
+            return;
+        }
+        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        self.vable_setarrayitem(array_opref, index, value);
+    }
+
+    /// Virtualizable array length.
+    ///
+    /// Standard virtualizable reads the cached array length directly.
+    /// Nonstandard virtualizable falls back to heap array length.
+    pub fn vable_arraylen_vable(&mut self, vable_opref: OpRef, array_field_offset: usize) -> OpRef {
+        if !self.is_nonstandard_virtualizable(vable_opref) {
+            if let (Some(info), Some(lengths)) =
+                (&self.virtualizable_info, &self.virtualizable_array_lengths)
+            {
+                if let Some(array_idx) = info.array_field_index(array_field_offset) {
+                    if let Some(&length) = lengths.get(array_idx) {
+                        return self.const_int(length as i64);
+                    }
+                }
+            }
+        }
+        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        self.record_op(OpCode::ArraylenGc, &[array_opref])
     }
 
     /// Compute the flat index into virtualizable_boxes for an array element.
@@ -850,6 +990,7 @@ impl TraceCtx {
     /// contains the new OpRefs for each virtualizable field after the
     /// call. The caller must use these new OpRefs for subsequent
     /// operations instead of the stale pre-call values.
+    #[cfg(test)]
     pub fn call_may_force_with_vable_sync_int(
         &mut self,
         func_ptr: *const (),
@@ -870,6 +1011,7 @@ impl TraceCtx {
     }
 
     /// Typed variant of [`call_may_force_with_vable_sync_int`].
+    #[cfg(test)]
     pub fn call_may_force_with_vable_sync_int_typed(
         &mut self,
         func_ptr: *const (),
@@ -887,6 +1029,7 @@ impl TraceCtx {
     }
 
     /// Ref-returning variant of call_may_force with virtualizable sync.
+    #[cfg(test)]
     pub fn call_may_force_with_vable_sync_ref(
         &mut self,
         func_ptr: *const (),
@@ -907,6 +1050,7 @@ impl TraceCtx {
     }
 
     /// Typed ref-returning variant.
+    #[cfg(test)]
     pub fn call_may_force_with_vable_sync_ref_typed(
         &mut self,
         func_ptr: *const (),
@@ -924,6 +1068,7 @@ impl TraceCtx {
     }
 
     /// Void-returning variant of call_may_force with virtualizable sync.
+    #[cfg(test)]
     pub fn call_may_force_with_vable_sync_void(
         &mut self,
         func_ptr: *const (),
@@ -944,6 +1089,7 @@ impl TraceCtx {
     }
 
     /// Typed void-returning variant.
+    #[cfg(test)]
     pub fn call_may_force_with_vable_sync_void_typed(
         &mut self,
         func_ptr: *const (),
@@ -961,6 +1107,7 @@ impl TraceCtx {
     }
 
     /// Float-returning variant of call_may_force with virtualizable sync.
+    #[cfg(test)]
     pub fn call_may_force_with_vable_sync_float(
         &mut self,
         func_ptr: *const (),
@@ -981,6 +1128,7 @@ impl TraceCtx {
     }
 
     /// Typed float-returning variant.
+    #[cfg(test)]
     pub fn call_may_force_with_vable_sync_float_typed(
         &mut self,
         func_ptr: *const (),
@@ -998,6 +1146,7 @@ impl TraceCtx {
     }
 
     /// Emit SETFIELD_GC for each virtualizable field before a residual call.
+    #[cfg(test)]
     fn emit_vable_sync_before(&mut self, vable_ref: OpRef, sync_fields: &[VableSyncField]) {
         for field in sync_fields {
             let descr = crate::fail_descr::make_fail_descr(field.field_descr_idx as usize);
@@ -1008,6 +1157,7 @@ impl TraceCtx {
     /// Emit GETFIELD_GC for each virtualizable field after a residual call.
     ///
     /// Returns updated (field_descr_idx, new_opref) pairs.
+    #[cfg(test)]
     fn emit_vable_sync_after(
         &mut self,
         vable_ref: OpRef,
@@ -2388,5 +2538,67 @@ mod tests {
         ctx.vable_setfield(vable, 8, new_val);
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes, vec![new_val, box1, vable]);
+    }
+
+    #[test]
+    fn gen_store_back_in_vable_uses_field_and_array_descrs() {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field("locals", Type::Ref, 24);
+
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Ref);
+        let box_arr1 = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(recorder, 0);
+        ctx.init_virtualizable_boxes(&info, vable, &[box_pc, box_arr0, box_arr1], &[2]);
+
+        ctx.gen_store_back_in_vable(vable);
+
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops.len(), 5);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(
+            ops[0].descr.as_ref().map(|d| d.index()),
+            Some(info.static_field_descr(0).index())
+        );
+        assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
+        assert_eq!(
+            ops[1].descr.as_ref().map(|d| d.index()),
+            Some(info.array_pointer_field_descr(0).index())
+        );
+        assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
+        assert_eq!(
+            ops[2].descr.as_ref().map(|d| d.index()),
+            Some(info.array_item_descr(0).index())
+        );
+        assert_eq!(ops[3].opcode, OpCode::SetarrayitemGc);
+        assert_eq!(
+            ops[3].descr.as_ref().map(|d| d.index()),
+            Some(info.array_item_descr(0).index())
+        );
+        assert_eq!(ops[4].opcode, OpCode::SetfieldGc);
+        assert_eq!(
+            ops[4].descr.as_ref().map(|d| d.index()),
+            Some(info.token_field_descr().index())
+        );
+    }
+
+    #[test]
+    fn gen_store_back_in_vable_ignores_nonstandard_virtualizable() {
+        let info = make_test_vable_info_with_array();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let other_vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(recorder, 0);
+        ctx.init_virtualizable_boxes(&info, vable, &[box_pc, box_arr0], &[1]);
+
+        ctx.gen_store_back_in_vable(other_vable);
+
+        let ops = take_all_ops(ctx);
+        assert!(ops.is_empty(), "nonstandard virtualizable must not use standard store-back path");
     }
 }

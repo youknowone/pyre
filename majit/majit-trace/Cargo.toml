@@ -1,7 +1,7 @@
 [package]
 name = "majit-trace"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [dependencies]
 majit-ir = { path = "../majit-ir" }

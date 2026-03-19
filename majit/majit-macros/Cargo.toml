@@ -10,6 +10,7 @@ proc-macro = true
 syn = { version = "2", features = ["full", "visit-mut"] }
 quote = "1"
 proc-macro2 = "1"
+majit-runtime = { path = "../majit-runtime" }
 
 [dev-dependencies]
 majit-ir = { path = "../majit-ir" }

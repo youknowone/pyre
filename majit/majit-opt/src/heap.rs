@@ -161,9 +161,10 @@ impl OptHeap {
         // heap.py: check if any lazy set references the postponed op
         if let Some(ref postponed) = self.postponed_op {
             let postponed_pos = postponed.pos;
-            let needs_postponed = self.lazy_setfields.values().any(|op| {
-                op.args.iter().any(|a| *a == postponed_pos)
-            });
+            let needs_postponed = self
+                .lazy_setfields
+                .values()
+                .any(|op| op.args.iter().any(|a| *a == postponed_pos));
             if needs_postponed {
                 if let Some(p) = self.postponed_op.take() {
                     ctx.emit(p);
@@ -381,11 +382,7 @@ impl OptHeap {
     /// Instead of invalidating all caches, only force/invalidate
     /// fields and arrays that the call may read or write.
     fn force_from_effectinfo(&mut self, op: &Op, ctx: &mut OptContext) {
-        let ei = match op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_call_descr())
-        {
+        let ei = match op.descr.as_ref().and_then(|d| d.as_call_descr()) {
             Some(cd) => cd.effect_info().clone(),
             None => {
                 self.force_all_lazy(ctx);
@@ -403,8 +400,7 @@ impl OptHeap {
         if !has_bitstrings {
             self.force_all_lazy(ctx);
             self.cached_fields.retain(|&(obj, descr_idx), _| {
-                self.immutable_field_descrs.contains(&descr_idx)
-                    || self.unescaped.contains(&obj)
+                self.immutable_field_descrs.contains(&descr_idx) || self.unescaped.contains(&obj)
             });
             self.cached_arrayitems
                 .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
@@ -823,27 +819,37 @@ impl Optimization for OptHeap {
                 self.optimize_getfield(op, ctx)
             }
 
-            // ── Raw field reads (heap.py: same cache as GC fields) ──
+            // ── Raw field reads/writes ──
+            // These are used by compact storage / virtualizable-like live
+            // state in interpreters such as Aheui. Treating them like normal
+            // heap.py cached fields is unsound here because the state is
+            // intentionally carried outside Jump args and reloaded from heap
+            // each iteration. Caching or lazifying them lets loop-optimizing
+            // passes turn dynamic lengths/indices into stale constants.
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF => {
-                self.optimize_getfield(op, ctx)
+                OptimizationResult::Emit(op.clone())
             }
-
-            // ── Raw field writes ──
-            OpCode::SetfieldRaw => self.optimize_setfield(op, ctx),
+            OpCode::SetfieldRaw => OptimizationResult::Emit(op.clone()),
 
             // ── Field writes ──
             OpCode::SetfieldGc => self.optimize_setfield(op, ctx),
 
             // ── Array item reads ──
-            OpCode::GetarrayitemGcI
-            | OpCode::GetarrayitemGcR
-            | OpCode::GetarrayitemGcF
-            | OpCode::GetarrayitemRawI
-            | OpCode::GetarrayitemRawR
-            | OpCode::GetarrayitemRawF => self.optimize_getarrayitem(op, ctx),
+            OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => {
+                self.optimize_getarrayitem(op, ctx)
+            }
+
+            // ── Raw array item reads/writes ──
+            // Same rationale as raw fields above: keep exact ordering and
+            // dynamic indices visible until we have RPython-style virtualizable
+            // handling for these buffers.
+            OpCode::GetarrayitemRawI | OpCode::GetarrayitemRawR | OpCode::GetarrayitemRawF => {
+                OptimizationResult::Emit(op.clone())
+            }
 
             // ── Array item writes ──
-            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => self.optimize_setarrayitem(op, ctx),
+            OpCode::SetarrayitemGc => self.optimize_setarrayitem(op, ctx),
+            OpCode::SetarrayitemRaw => OptimizationResult::Emit(op.clone()),
 
             // ── heap.py: Interior field reads (array-of-structs pattern) ──
             OpCode::GetinteriorfieldGcI

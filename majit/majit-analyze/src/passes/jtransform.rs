@@ -10,7 +10,37 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
+use crate::call_match::CallDescriptor;
+use crate::graph::{
+    BasicBlockId, CallTarget, FieldDescriptor, MajitGraph, Op, OpKind, Terminator, ValueId,
+    ValueType,
+};
+use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualizableFieldDescriptor {
+    pub name: String,
+    pub owner_root: Option<String>,
+    pub index: usize,
+}
+
+impl VirtualizableFieldDescriptor {
+    pub fn new(name: impl Into<String>, owner_root: Option<String>, index: usize) -> Self {
+        Self {
+            name: name.into(),
+            owner_root,
+            index,
+        }
+    }
+
+    fn matches(&self, field: &FieldDescriptor) -> bool {
+        self.name == field.name
+            && self
+                .owner_root
+                .as_ref()
+                .is_none_or(|owner| field.owner_root.as_ref() == Some(owner))
+    }
+}
 
 /// Configuration for the graph rewrite pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,12 +49,18 @@ pub struct GraphTransformConfig {
     pub lower_virtualizable: bool,
     /// Whether to classify function calls by effect.
     pub classify_calls: bool,
-    /// Field names that are virtualizable (field_name → field_index).
+    /// Virtualizable scalar field descriptors.
     #[serde(default)]
-    pub vable_fields: Vec<(String, usize)>,
-    /// Array names that are virtualizable (array_name → array_index).
+    pub vable_fields: Vec<VirtualizableFieldDescriptor>,
+    /// Virtualizable array field descriptors.
     #[serde(default)]
-    pub vable_arrays: Vec<(String, usize)>,
+    pub vable_arrays: Vec<VirtualizableFieldDescriptor>,
+    /// Explicit call effect overrides.
+    ///
+    /// RPython equivalent: effect classification travels on call descriptors
+    /// rather than being rediscovered from source text.
+    #[serde(default)]
+    pub call_effects: Vec<CallEffectOverride>,
 }
 
 impl Default for GraphTransformConfig {
@@ -34,7 +70,39 @@ impl Default for GraphTransformConfig {
             classify_calls: true,
             vable_fields: Vec::new(),
             vable_arrays: Vec::new(),
+            call_effects: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallEffectKind {
+    Elidable,
+    Residual,
+    MayForce,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallEffectOverride {
+    pub descriptor: CallDescriptor,
+}
+
+impl CallEffectOverride {
+    pub fn new(target: CallTarget, effect: CallEffectKind) -> Self {
+        Self {
+            descriptor: CallDescriptor::override_effect(target, effect_info_for_kind(effect)),
+        }
+    }
+}
+
+fn effect_info_for_kind(effect: CallEffectKind) -> EffectInfo {
+    match effect {
+        CallEffectKind::Elidable => EffectInfo::elidable(),
+        CallEffectKind::Residual => EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+        CallEffectKind::MayForce => EffectInfo::new(
+            ExtraEffect::ForcesVirtualOrVirtualizable,
+            OopSpecIndex::None,
+        ),
     }
 }
 
@@ -70,17 +138,6 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
     let mut aliases: std::collections::HashMap<ValueId, ValueId> = std::collections::HashMap::new();
 
     // Build lookup sets for virtualizable fields/arrays
-    let vable_field_set: std::collections::HashMap<&str, usize> = config
-        .vable_fields
-        .iter()
-        .map(|(name, idx)| (name.as_str(), *idx))
-        .collect();
-    let vable_array_set: std::collections::HashMap<&str, usize> = config
-        .vable_arrays
-        .iter()
-        .map(|(name, idx)| (name.as_str(), *idx))
-        .collect();
-
     // Track which ValueIds are results of reading a virtualizable array field.
     // RPython jtransform.py tracks vable_array_vars for this purpose.
     let mut vable_array_values: std::collections::HashMap<crate::graph::ValueId, usize> =
@@ -128,21 +185,32 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                 // RPython jtransform.py:832 `rewrite_op_getfield`
                 OpKind::FieldRead { field, ty, .. } if config.lower_virtualizable => {
                     // Track if this field read is on a virtualizable array
-                    if let Some(&arr_idx) = vable_array_set.get(field.as_str()) {
+                    if let Some(array_field) = config
+                        .vable_arrays
+                        .iter()
+                        .find(|candidate| candidate.matches(field))
+                    {
                         if let Some(result) = op.result {
-                            vable_array_values.insert(result, arr_idx);
+                            vable_array_values.insert(result, array_field.index);
                         }
                     }
-                    if let Some(&idx) = vable_field_set.get(field.as_str()) {
+                    if let Some(vable_field) = config
+                        .vable_fields
+                        .iter()
+                        .find(|candidate| candidate.matches(field))
+                    {
                         notes.push(GraphTransformNote {
                             function: graph.name.clone(),
-                            detail: format!("rewrite: {field} → VableFieldRead[{idx}]"),
+                            detail: format!(
+                                "rewrite: {} → VableFieldRead[{}]",
+                                field.name, vable_field.index
+                            ),
                         });
                         vable_rewrites += 1;
                         new_ops.push(Op {
                             result: op.result,
                             kind: OpKind::VableFieldRead {
-                                field_index: idx,
+                                field_index: vable_field.index,
                                 ty: ty.clone(),
                             },
                         });
@@ -155,16 +223,23 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                 OpKind::FieldWrite {
                     field, value, ty, ..
                 } if config.lower_virtualizable => {
-                    if let Some(&idx) = vable_field_set.get(field.as_str()) {
+                    if let Some(vable_field) = config
+                        .vable_fields
+                        .iter()
+                        .find(|candidate| candidate.matches(field))
+                    {
                         notes.push(GraphTransformNote {
                             function: graph.name.clone(),
-                            detail: format!("rewrite: {field} = ... → VableFieldWrite[{idx}]"),
+                            detail: format!(
+                                "rewrite: {} = ... → VableFieldWrite[{}]",
+                                field.name, vable_field.index
+                            ),
                         });
                         vable_rewrites += 1;
                         new_ops.push(Op {
                             result: op.result,
                             kind: OpKind::VableFieldWrite {
-                                field_index: idx,
+                                field_index: vable_field.index,
                                 value: *value,
                                 ty: ty.clone(),
                             },
@@ -232,30 +307,29 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                     args,
                     result_ty,
                 } if config.classify_calls => {
-                    let effect = classify_call_effect(target);
-                    if effect != "unknown" {
+                    if let Some((descriptor, effect)) = classify_call(target, &config.call_effects)
+                    {
                         notes.push(GraphTransformNote {
                             function: graph.name.clone(),
-                            detail: format!("call {target} → {effect}"),
+                            detail: format!("call {target} → {}", effect.as_str()),
                         });
                         calls_classified += 1;
                         let rewritten_kind = match effect {
-                            "elidable" => OpKind::CallElidable {
-                                target: target.clone(),
+                            CallEffectKind::Elidable => OpKind::CallElidable {
+                                descriptor,
                                 args: args.clone(),
                                 result_ty: result_ty.clone(),
                             },
-                            "residual" => OpKind::CallResidual {
-                                target: target.clone(),
+                            CallEffectKind::Residual => OpKind::CallResidual {
+                                descriptor,
                                 args: args.clone(),
                                 result_ty: result_ty.clone(),
                             },
-                            "io" => OpKind::CallMayForce {
-                                target: target.clone(),
+                            CallEffectKind::MayForce => OpKind::CallMayForce {
+                                descriptor,
                                 args: args.clone(),
                                 result_ty: result_ty.clone(),
                             },
-                            _ => op.kind.clone(),
                         };
                         new_ops.push(Op {
                             result: op.result,
@@ -266,10 +340,10 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
                 }
 
                 // ── Unknown ops ──
-                OpKind::Unknown { summary } => {
+                OpKind::Unknown { kind } => {
                     notes.push(GraphTransformNote {
                         function: graph.name.clone(),
-                        detail: format!("unknown op: {}", truncate(summary, 60)),
+                        detail: format!("unknown op: {:?}", kind),
                     });
                 }
 
@@ -427,11 +501,11 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
             result_ty: result_ty.clone(),
         },
         OpKind::CallElidable {
-            target,
+            descriptor,
             args,
             result_ty,
         } => OpKind::CallElidable {
-            target: target.clone(),
+            descriptor: descriptor.clone(),
             args: args
                 .iter()
                 .copied()
@@ -440,11 +514,11 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
             result_ty: result_ty.clone(),
         },
         OpKind::CallResidual {
-            target,
+            descriptor,
             args,
             result_ty,
         } => OpKind::CallResidual {
-            target: target.clone(),
+            descriptor: descriptor.clone(),
             args: args
                 .iter()
                 .copied()
@@ -453,11 +527,11 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
             result_ty: result_ty.clone(),
         },
         OpKind::CallMayForce {
-            target,
+            descriptor,
             args,
             result_ty,
         } => OpKind::CallMayForce {
-            target: target.clone(),
+            descriptor: descriptor.clone(),
             args: args
                 .iter()
                 .copied()
@@ -514,55 +588,74 @@ fn remap_terminator(
     }
 }
 
-fn is_vable_identity_hint(target: &str) -> bool {
-    let last = target.split("::").last().unwrap_or(target);
-    matches!(last, "hint_access_directly" | "hint_fresh_virtualizable")
+fn classify_vable_hint(target: &CallTarget) -> Option<majit_runtime::VirtualizableHintKind> {
+    target
+        .path_segments()
+        .and_then(|segments| majit_runtime::classify_virtualizable_hint_segments(segments))
 }
 
-fn is_vable_force_hint(target: &str) -> bool {
-    target.split("::").last().unwrap_or(target) == "hint_force_virtualizable"
+fn is_vable_identity_hint(target: &CallTarget) -> bool {
+    matches!(
+        classify_vable_hint(target),
+        Some(
+            majit_runtime::VirtualizableHintKind::AccessDirectly
+                | majit_runtime::VirtualizableHintKind::FreshVirtualizable
+        )
+    )
+}
+
+fn is_vable_force_hint(target: &CallTarget) -> bool {
+    matches!(
+        classify_vable_hint(target),
+        Some(majit_runtime::VirtualizableHintKind::ForceVirtualizable)
+    )
+}
+
+impl CallEffectKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            CallEffectKind::Elidable => "elidable",
+            CallEffectKind::Residual => "residual",
+            CallEffectKind::MayForce => "may_force",
+        }
+    }
 }
 
 /// Classify a call's side-effect level.
 ///
 /// RPython equivalent: jtransform.py effect classification
 /// (EF_ELIDABLE, EF_FORCES_VIRTUAL, etc.)
-fn classify_call_effect(target: &str) -> &'static str {
-    // Known pure/elidable functions
-    if target.contains("len")
-        || target.contains("is_empty")
-        || target.contains("get")
-        || target.contains("peek")
-    {
-        return "elidable";
+fn classify_call(
+    target: &CallTarget,
+    overrides: &[CallEffectOverride],
+) -> Option<(CallDescriptor, CallEffectKind)> {
+    fn classify_effect_info(info: &majit_ir::descr::EffectInfo) -> CallEffectKind {
+        if info.forces_virtual_or_virtualizable() {
+            CallEffectKind::MayForce
+        } else if info.is_elidable() {
+            CallEffectKind::Elidable
+        } else {
+            CallEffectKind::Residual
+        }
     }
-    // Known may-force functions (can trigger GC/exceptions)
-    if target.contains("push")
-        || target.contains("pop")
-        || target.contains("insert")
-        || target.contains("remove")
-    {
-        return "residual";
-    }
-    // Known I/O
-    if target.contains("print") || target.contains("write") || target.contains("read") {
-        return "io";
-    }
-    "unknown"
-}
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}...", &s[..max])
-    } else {
-        s.to_string()
+    if let Some(descriptor) = overrides
+        .iter()
+        .find(|override_| override_.descriptor.target == *target)
+        .map(|override_| override_.descriptor.clone())
+    {
+        let effect = classify_effect_info(&descriptor.effect_info());
+        return Some((descriptor, effect));
     }
+    let descriptor = crate::call_match::describe_call(target)?;
+    let effect = classify_effect_info(&descriptor.effect_info());
+    Some((descriptor, effect))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{MajitGraph, OpKind, ValueId, ValueType};
+    use crate::graph::{CallTarget, MajitGraph, OpKind, ValueId, ValueType};
 
     #[test]
     fn rewrite_graph_tags_vable_fields() {
@@ -572,7 +665,7 @@ mod tests {
             graph.entry,
             OpKind::FieldRead {
                 base,
-                field: "next_instr".into(),
+                field: crate::graph::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
             },
             true,
@@ -580,7 +673,11 @@ mod tests {
         graph.set_terminator(graph.entry, Terminator::Return(None));
 
         let config = GraphTransformConfig {
-            vable_fields: vec![("next_instr".into(), 0)],
+            vable_fields: vec![VirtualizableFieldDescriptor::new(
+                "next_instr",
+                Some("Frame".into()),
+                0,
+            )],
             ..Default::default()
         };
         let result = rewrite_graph(&graph, &config);
@@ -598,21 +695,89 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_graph_requires_matching_field_owner_root() {
+        let mut graph = MajitGraph::new("test");
+        let base = graph.alloc_value();
+        graph.push_op(
+            graph.entry,
+            OpKind::FieldRead {
+                base,
+                field: crate::graph::FieldDescriptor::new("next_instr", Some("OtherFrame".into())),
+                ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_terminator(graph.entry, Terminator::Return(None));
+
+        let config = GraphTransformConfig {
+            vable_fields: vec![VirtualizableFieldDescriptor::new(
+                "next_instr",
+                Some("Frame".into()),
+                0,
+            )],
+            ..Default::default()
+        };
+        let result = rewrite_graph(&graph, &config);
+        assert_eq!(result.vable_rewrites, 0);
+        assert!(matches!(
+            result.graph.block(graph.entry).ops[0].kind,
+            OpKind::FieldRead { .. }
+        ));
+    }
+
+    #[test]
     fn rewrite_graph_classifies_calls() {
         let mut graph = MajitGraph::new("test");
         graph.push_op(
             graph.entry,
             OpKind::Call {
-                target: "vec_push".into(),
+                target: CallTarget::method("call_callable", Some("PyFrame".into())),
                 args: vec![],
-                result_ty: ValueType::Void,
+                result_ty: ValueType::Ref,
             },
             false,
         );
         graph.set_terminator(graph.entry, Terminator::Return(None));
 
-        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let result = rewrite_graph(
+            &graph,
+            &crate::test_support::pyre_pipeline_config().transform,
+        );
         assert_eq!(result.calls_classified, 1);
+        assert!(matches!(
+            result.graph.block(graph.entry).ops[0].kind,
+            OpKind::CallResidual { .. }
+        ));
+    }
+
+    #[test]
+    fn rewrite_graph_uses_explicit_call_effect_overrides() {
+        let mut graph = MajitGraph::new("test");
+        graph.push_op(
+            graph.entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["custom_reader"]),
+                args: vec![],
+                result_ty: ValueType::Ref,
+            },
+            true,
+        );
+        graph.set_terminator(graph.entry, Terminator::Return(None));
+
+        let result = rewrite_graph(
+            &graph,
+            &GraphTransformConfig {
+                call_effects: vec![CallEffectOverride::new(
+                    CallTarget::function_path(["custom_reader"]),
+                    CallEffectKind::MayForce,
+                )],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            result.graph.block(graph.entry).ops[0].kind,
+            OpKind::CallMayForce { .. }
+        ));
     }
 
     #[test]
@@ -621,7 +786,7 @@ mod tests {
         graph.push_op(
             graph.entry,
             OpKind::Unknown {
-                summary: "complex expression".into(),
+                kind: crate::graph::UnknownKind::UnsupportedExpr,
             },
             false,
         );
@@ -644,7 +809,7 @@ mod tests {
         graph.push_op(
             graph.entry,
             OpKind::Call {
-                target: "hint_access_directly".into(),
+                target: CallTarget::function_path(["hint_access_directly"]),
                 args: vec![frame],
                 result_ty: ValueType::Ref,
             },
@@ -655,7 +820,7 @@ mod tests {
             graph.entry,
             OpKind::FieldRead {
                 base: hinted,
-                field: "next_instr".into(),
+                field: crate::graph::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
             },
             true,
@@ -665,7 +830,11 @@ mod tests {
         let result = rewrite_graph(
             &graph,
             &GraphTransformConfig {
-                vable_fields: vec![("next_instr".into(), 0)],
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
                 ..Default::default()
             },
         );
@@ -686,7 +855,7 @@ mod tests {
         graph.push_op(
             graph.entry,
             OpKind::Call {
-                target: "hint_force_virtualizable".into(),
+                target: CallTarget::function_path(["hint_force_virtualizable"]),
                 args: vec![frame],
                 result_ty: ValueType::Ref,
             },
@@ -697,7 +866,7 @@ mod tests {
             graph.entry,
             OpKind::FieldRead {
                 base: forced,
-                field: "next_instr".into(),
+                field: crate::graph::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
             },
             true,
@@ -707,7 +876,11 @@ mod tests {
         let result = rewrite_graph(
             &graph,
             &GraphTransformConfig {
-                vable_fields: vec![("next_instr".into(), 0)],
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
                 ..Default::default()
             },
         );

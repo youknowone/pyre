@@ -14,7 +14,8 @@
 //!
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
-use majit_ir::Type;
+use majit_ir::descr::make_array_descr;
+use majit_ir::{make_field_descr, DescrRef, Type};
 
 /// Sentinel value for TOKEN_TRACING_RESCALL.
 ///
@@ -86,12 +87,26 @@ pub struct VableArrayInfo {
     pub item_type: Type,
     /// Byte offset of the array pointer in the heap object.
     pub field_offset: usize,
+    /// Storage model for the array field.
+    pub storage: VableArrayStorage,
     /// Offset of the length field within the array object.
-    /// Default: 0 (length stored at start of array).
+    /// For `DirectPointer`, this is relative to the pointee.
+    /// For `EmbeddedArray`, this is relative to the embedded container.
     pub length_offset: usize,
     /// Offset of the first item within the array object.
-    /// Default: 8 (items start after the length field).
+    /// For `DirectPointer`, this is relative to the pointee.
+    /// For `EmbeddedArray`, this is relative to the active data pointer.
     pub items_offset: usize,
+}
+
+/// Physical storage strategy for a virtualizable array field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VableArrayStorage {
+    /// The frame field stores a raw pointer to an array object.
+    DirectPointer,
+    /// The frame field stores an embedded array container with a separate
+    /// data pointer and length, e.g. `PyObjectArray`.
+    EmbeddedArray { ptr_offset: usize },
 }
 
 /// Complete description of a virtualizable type.
@@ -165,6 +180,31 @@ impl VirtualizableInfo {
             name: name.into(),
             item_type,
             field_offset,
+            storage: VableArrayStorage::DirectPointer,
+            length_offset,
+            items_offset,
+        });
+    }
+
+    /// Add an embedded array field with explicit pointer/length/data layout.
+    ///
+    /// This matches Rust containers embedded by value inside the virtualizable
+    /// object, where the logical data pointer and length live in the container
+    /// rather than in a separate heap array header.
+    pub fn add_embedded_array_field_with_layout(
+        &mut self,
+        name: impl Into<String>,
+        item_type: Type,
+        field_offset: usize,
+        ptr_offset: usize,
+        length_offset: usize,
+        items_offset: usize,
+    ) {
+        self.array_fields.push(VableArrayInfo {
+            name: name.into(),
+            item_type,
+            field_offset,
+            storage: VableArrayStorage::EmbeddedArray { ptr_offset },
             length_offset,
             items_offset,
         });
@@ -253,6 +293,75 @@ impl VirtualizableInfo {
         *token_ptr = token.to_raw();
     }
 
+    /// RPython parity surface: descriptor list for static fields.
+    pub fn static_field_descrs(&self) -> &[VableFieldInfo] {
+        &self.static_fields
+    }
+
+    /// RPython parity surface: descriptor list for array fields.
+    pub fn array_field_descrs(&self) -> &[VableArrayInfo] {
+        &self.array_fields
+    }
+
+    /// RPython equivalent: `vinfo.static_field_by_descrs[descr]`.
+    pub fn static_field_by_descr_offset(&self, offset: usize) -> Option<(usize, &VableFieldInfo)> {
+        self.static_fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.offset == offset)
+    }
+
+    /// RPython equivalent: `vinfo.array_field_by_descrs[descr]`.
+    pub fn array_field_by_descr_offset(&self, offset: usize) -> Option<(usize, &VableArrayInfo)> {
+        self.array_fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.field_offset == offset)
+    }
+
+    /// RPython parity surface: reset the virtualizable token to TOKEN_NONE.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn reset_vable_token(&self, obj_ptr: *mut u8) {
+        self.write_token(obj_ptr, VableToken::None);
+    }
+
+    /// RPython parity surface: reset token from a GCREF/object pointer path.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn reset_token_gcref(&self, obj_ptr: *mut u8) {
+        self.reset_vable_token(obj_ptr);
+    }
+
+    /// RPython parity surface: force only if a token is still attached.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn force_virtualizable_if_necessary(
+        &self,
+        obj_ptr: *mut u8,
+        force_fn: impl FnOnce(u64),
+    ) {
+        if !matches!(self.read_token(obj_ptr), VableToken::None) {
+            self.force_now(obj_ptr, force_fn);
+        }
+    }
+
+    /// RPython parity surface: clear the virtualizable token, forcing first
+    /// if JIT state is still attached.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn clear_vable_token(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
+        self.force_virtualizable_if_necessary(obj_ptr, force_fn);
+        assert!(
+            matches!(self.read_token(obj_ptr), VableToken::None),
+            "clear_vable_token must leave TOKEN_NONE"
+        );
+    }
+
     /// Convert to optimizer-level config (byte offsets only).
     /// Bridges the descriptor-driven model (majit-meta) with the
     /// optimizer's offset-based tracking (majit-opt).
@@ -269,7 +378,8 @@ impl VirtualizableInfo {
     ///
     /// RPython equivalent: `vinfo.static_field_by_descrs[descr]`
     pub fn static_field_index(&self, offset: usize) -> Option<usize> {
-        self.static_fields.iter().position(|f| f.offset == offset)
+        self.static_field_by_descr_offset(offset)
+            .map(|(idx, _)| idx)
     }
 
     /// Get the index of a static field by name.
@@ -281,14 +391,52 @@ impl VirtualizableInfo {
     ///
     /// RPython equivalent: `vinfo.array_field_by_descrs[descr]`
     pub fn array_field_index(&self, field_offset: usize) -> Option<usize> {
-        self.array_fields
-            .iter()
-            .position(|a| a.field_offset == field_offset)
+        self.array_field_by_descr_offset(field_offset)
+            .map(|(idx, _)| idx)
     }
 
     /// Get the index of an array field by name.
     pub fn array_field_index_by_name(&self, name: &str) -> Option<usize> {
         self.array_fields.iter().position(|a| a.name == name)
+    }
+
+    /// Descriptor for a static virtualizable field.
+    pub fn static_field_descr(&self, field_index: usize) -> DescrRef {
+        let field = &self.static_fields[field_index];
+        make_field_descr(
+            field.offset,
+            item_size_for_type(field.field_type),
+            field.field_type,
+            field.field_type != Type::Ref,
+        )
+    }
+
+    /// Descriptor for the token field on the virtualizable object.
+    pub fn token_field_descr(&self) -> DescrRef {
+        make_field_descr(self.token_offset, 8, Type::Int, false)
+    }
+
+    /// Descriptor for the field that yields the backing array pointer.
+    ///
+    /// For embedded-array containers, this is the container's internal data
+    /// pointer field, not the container field itself.
+    pub fn array_pointer_field_descr(&self, array_index: usize) -> DescrRef {
+        let array = &self.array_fields[array_index];
+        let offset = match array.storage {
+            VableArrayStorage::DirectPointer => array.field_offset,
+            VableArrayStorage::EmbeddedArray { ptr_offset } => array.field_offset + ptr_offset,
+        };
+        make_field_descr(offset, 8, Type::Ref, false)
+    }
+
+    /// Descriptor for array element accesses on a virtualizable array field.
+    pub fn array_item_descr(&self, array_index: usize) -> DescrRef {
+        let array = &self.array_fields[array_index];
+        make_array_descr(
+            array.items_offset,
+            item_size_for_type(array.item_type),
+            array.item_type,
+        )
     }
 
     /// Minimum number of boxes needed (static fields only, no arrays).
@@ -302,6 +450,13 @@ impl VirtualizableInfo {
     /// `array_lengths` must have one entry per array field.
     pub fn get_total_size(&self, array_lengths: &[usize]) -> usize {
         self.num_static_extra_boxes + array_lengths.iter().sum::<usize>()
+    }
+
+    /// Whether all array lengths can be derived from the heap object alone.
+    pub fn can_read_all_array_lengths_from_heap(&self) -> bool {
+        self.array_fields
+            .iter()
+            .all(VableArrayInfo::can_read_length_from_heap)
     }
 
     /// Get the index into the flat box array for a specific array element.
@@ -378,11 +533,18 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn get_array_length(&self, obj_ptr: *const u8, array_index: usize) -> usize {
         let ai = &self.array_fields[array_index];
-        let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *const u8);
-        if array_ptr.is_null() {
-            0
-        } else {
-            *(array_ptr.add(ai.length_offset) as *const usize)
+        match ai.storage {
+            VableArrayStorage::DirectPointer => {
+                let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *const u8);
+                if array_ptr.is_null() {
+                    0
+                } else {
+                    *(array_ptr.add(ai.length_offset) as *const usize)
+                }
+            }
+            VableArrayStorage::EmbeddedArray { .. } => {
+                *(obj_ptr.add(ai.field_offset + ai.length_offset) as *const usize)
+            }
         }
     }
 
@@ -399,7 +561,7 @@ impl VirtualizableInfo {
         item_index: usize,
     ) -> i64 {
         let ai = &self.array_fields[array_index];
-        let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *const u8);
+        let array_ptr = ai.data_ptr(obj_ptr);
         let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
         match ai.item_type {
             Type::Float => {
@@ -427,7 +589,7 @@ impl VirtualizableInfo {
         value: i64,
     ) {
         let ai = &self.array_fields[array_index];
-        let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *mut u8);
+        let array_ptr = ai.data_ptr(obj_ptr.cast_const()) as *mut u8;
         let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
         match ai.item_type {
             Type::Float => {
@@ -471,6 +633,85 @@ impl VirtualizableInfo {
         (boxes, array_lengths)
     }
 
+    /// Read only the array lengths from the heap object.
+    ///
+    /// RPython equivalent: `vinfo.get_array_length(vable, i)` for every array.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn read_array_lengths_from_heap(&self, obj_ptr: *const u8) -> Vec<usize> {
+        self.array_fields
+            .iter()
+            .enumerate()
+            .map(|(index, _)| self.get_array_length(obj_ptr, index))
+            .collect()
+    }
+
+    /// RPython parity surface: read static boxes only.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn read_boxes(&self, obj_ptr: *const u8) -> Vec<i64> {
+        self.static_fields
+            .iter()
+            .enumerate()
+            .map(|(index, _)| self.read_field(obj_ptr, index))
+            .collect()
+    }
+
+    /// RPython parity surface: write static boxes only.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+        for (index, &value) in boxes.iter().enumerate() {
+            if index >= self.static_fields.len() {
+                break;
+            }
+            self.write_field(obj_ptr, index, value);
+        }
+    }
+
+    /// Read static boxes and array boxes from the heap object.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn read_all_boxes(
+        &self,
+        obj_ptr: *const u8,
+        array_lengths: &[usize],
+    ) -> (Vec<i64>, Vec<Vec<i64>>) {
+        let static_boxes = self.read_boxes(obj_ptr);
+        let mut array_boxes = Vec::with_capacity(self.array_fields.len());
+        for (index, _) in self.array_fields.iter().enumerate() {
+            let length = array_lengths.get(index).copied().unwrap_or(0);
+            let mut values = Vec::with_capacity(length);
+            for item_index in 0..length {
+                values.push(self.read_array_item(obj_ptr, index, item_index));
+            }
+            array_boxes.push(values);
+        }
+        (static_boxes, array_boxes)
+    }
+
+    /// Write static boxes and array boxes back to the heap object.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn write_all_boxes(
+        &self,
+        obj_ptr: *mut u8,
+        static_boxes: &[i64],
+        array_boxes: &[Vec<i64>],
+    ) {
+        self.write_boxes(obj_ptr, static_boxes);
+        for (array_index, values) in array_boxes.iter().enumerate() {
+            for (item_index, &value) in values.iter().enumerate() {
+                self.write_array_item(obj_ptr, array_index, item_index, value);
+            }
+        }
+    }
+
     /// Write all boxes back to the heap object (force direction).
     ///
     /// RPython equivalent: `vinfo.write_from_resume_data_partial(virtualizable, ...)`
@@ -502,6 +743,23 @@ impl VirtualizableInfo {
         }
     }
 
+    /// RPython equivalent: `vinfo.write_from_resume_data_partial(...)`.
+    ///
+    /// The boxed data is already split into static and per-array slices, so the
+    /// implementation only writes the provided data back and leaves token
+    /// handling to the caller.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn write_from_resume_data_partial(
+        &self,
+        obj_ptr: *mut u8,
+        static_boxes: &[i64],
+        array_boxes: &[Vec<i64>],
+    ) {
+        self.write_all_boxes(obj_ptr, static_boxes, array_boxes);
+    }
+
     /// Force virtualizable: write boxes to heap and clear token.
     ///
     /// RPython equivalent: the combined force_now + write_from_resume_data flow.
@@ -515,7 +773,29 @@ impl VirtualizableInfo {
         array_lengths: &[usize],
     ) {
         self.write_boxes_to_heap(obj_ptr, boxes, array_lengths);
-        self.write_token(obj_ptr, VableToken::None);
+        self.reset_vable_token(obj_ptr);
+    }
+}
+
+impl VableArrayInfo {
+    pub fn can_read_length_from_heap(&self) -> bool {
+        match self.storage {
+            VableArrayStorage::EmbeddedArray { .. } => true,
+            VableArrayStorage::DirectPointer => {
+                !(self.length_offset == 0 && self.items_offset == 0)
+            }
+        }
+    }
+
+    unsafe fn data_ptr(&self, obj_ptr: *const u8) -> *const u8 {
+        match self.storage {
+            VableArrayStorage::DirectPointer => {
+                *(obj_ptr.add(self.field_offset) as *const *const u8)
+            }
+            VableArrayStorage::EmbeddedArray { ptr_offset } => {
+                *(obj_ptr.add(self.field_offset + ptr_offset) as *const *const u8)
+            }
+        }
     }
 }
 
@@ -529,7 +809,8 @@ impl VirtualizableInfo {
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object with the
 /// layout described by `info`.
-pub unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<i64> {
+#[cfg(test)]
+unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<i64> {
     let mut boxes = Vec::with_capacity(info.num_static_extra_boxes);
 
     // Read static fields
@@ -562,7 +843,8 @@ pub unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object with the
 /// layout described by `info`.
-pub unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, boxes: &[i64]) {
+#[cfg(test)]
+unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, boxes: &[i64]) {
     for (i, field) in info.static_fields.iter().enumerate() {
         if i >= boxes.len() {
             break;
@@ -581,14 +863,15 @@ pub unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut 
     }
 }
 
-/// Clear the vable_token on a virtualizable object (unconditional).
+/// Reset the vable_token on a virtualizable object (unconditional).
 ///
 /// Sets the token to TOKEN_NONE without forcing. Use `force_virtualizable`
 /// or `VirtualizableInfo::force_now` if you need to flush JIT state first.
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
-pub unsafe fn clear_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
+#[cfg(test)]
+unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
     let token_ptr = obj_ptr.add(info.token_offset) as *mut u64;
     *token_ptr = 0;
 }
@@ -612,7 +895,8 @@ pub unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> 
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
-pub unsafe fn force_virtualizable(
+#[cfg(test)]
+unsafe fn force_virtualizable(
     info: &VirtualizableInfo,
     obj_ptr: *mut u8,
     force_fn: impl FnOnce(u64),
@@ -627,20 +911,9 @@ pub unsafe fn force_virtualizable(
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid virtualizable object.
-pub unsafe fn read_array_lengths(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<usize> {
-    info.array_fields
-        .iter()
-        .map(|array_info| {
-            let array_ptr_ptr = obj_ptr.add(array_info.field_offset) as *const *const u8;
-            let array_ptr = *array_ptr_ptr;
-            if array_ptr.is_null() {
-                0
-            } else {
-                let len_ptr = array_ptr.add(array_info.length_offset) as *const usize;
-                *len_ptr
-            }
-        })
-        .collect()
+#[cfg(test)]
+unsafe fn read_array_lengths(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<usize> {
+    info.read_array_lengths_from_heap(obj_ptr)
 }
 
 /// Read a virtualizable's array field contents from the heap.
@@ -650,26 +923,19 @@ pub unsafe fn read_array_lengths(info: &VirtualizableInfo, obj_ptr: *const u8) -
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` is valid and the array has at least `length` elements.
-pub unsafe fn read_virtualizable_array(
+#[cfg(test)]
+unsafe fn read_virtualizable_array(
     array_info: &VableArrayInfo,
     obj_ptr: *const u8,
     length: usize,
 ) -> Vec<i64> {
-    let array_ptr_ptr = obj_ptr.add(array_info.field_offset) as *const *const u8;
-    let array_ptr = *array_ptr_ptr;
-    let item_size = item_size_for_type(array_info.item_type);
-
     let mut values = Vec::with_capacity(length);
     for i in 0..length {
+        let array_ptr = array_info.data_ptr(obj_ptr);
+        let item_offset = array_info.items_offset + i * item_size_for_type(array_info.item_type);
         let val = match array_info.item_type {
-            Type::Int | Type::Ref => {
-                let ptr = array_ptr.add(array_info.items_offset + i * item_size) as *const i64;
-                *ptr
-            }
-            Type::Float => {
-                let ptr = array_ptr.add(array_info.items_offset + i * item_size) as *const f64;
-                f64::to_bits(*ptr) as i64
-            }
+            Type::Int | Type::Ref => *(array_ptr.add(item_offset) as *const i64),
+            Type::Float => f64::to_bits(*(array_ptr.add(item_offset) as *const f64)) as i64,
             Type::Void => 0,
         };
         values.push(val);
@@ -689,23 +955,18 @@ fn item_size_for_type(ty: Type) -> usize {
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` is valid and the array has sufficient space.
-pub unsafe fn write_virtualizable_array(
-    array_info: &VableArrayInfo,
-    obj_ptr: *mut u8,
-    values: &[i64],
-) {
-    let array_ptr_ptr = obj_ptr.add(array_info.field_offset) as *const *mut u8;
-    let array_ptr = *array_ptr_ptr;
-    let item_size = item_size_for_type(array_info.item_type);
-
+#[cfg(test)]
+unsafe fn write_virtualizable_array(array_info: &VableArrayInfo, obj_ptr: *mut u8, values: &[i64]) {
     for (i, &val) in values.iter().enumerate() {
+        let array_ptr = array_info.data_ptr(obj_ptr.cast_const()) as *mut u8;
+        let item_offset = array_info.items_offset + i * item_size_for_type(array_info.item_type);
         match array_info.item_type {
             Type::Int | Type::Ref => {
-                let ptr = array_ptr.add(array_info.items_offset + i * item_size) as *mut i64;
+                let ptr = array_ptr.add(item_offset) as *mut i64;
                 *ptr = val;
             }
             Type::Float => {
-                let ptr = array_ptr.add(array_info.items_offset + i * item_size) as *mut f64;
+                let ptr = array_ptr.add(item_offset) as *mut f64;
                 *ptr = f64::from_bits(val as u64);
             }
             Type::Void => {}
@@ -719,40 +980,27 @@ pub unsafe fn write_virtualizable_array(
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` is valid and arrays have the specified lengths.
-pub unsafe fn read_all_virtualizable_boxes(
+#[cfg(test)]
+unsafe fn read_all_virtualizable_boxes(
     info: &VirtualizableInfo,
     obj_ptr: *const u8,
     array_lengths: &[usize],
 ) -> (Vec<i64>, Vec<Vec<i64>>) {
-    let static_boxes = read_virtualizable_boxes(info, obj_ptr);
-
-    let mut array_boxes = Vec::with_capacity(info.array_fields.len());
-    for (i, afield) in info.array_fields.iter().enumerate() {
-        let length = array_lengths.get(i).copied().unwrap_or(0);
-        let values = read_virtualizable_array(afield, obj_ptr, length);
-        array_boxes.push(values);
-    }
-
-    (static_boxes, array_boxes)
+    info.read_all_boxes(obj_ptr, array_lengths)
 }
 
 /// Write all virtualizable state back to the heap.
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` is valid and arrays have sufficient space.
-pub unsafe fn write_all_virtualizable_boxes(
+#[cfg(test)]
+unsafe fn write_all_virtualizable_boxes(
     info: &VirtualizableInfo,
     obj_ptr: *mut u8,
     static_boxes: &[i64],
     array_boxes: &[Vec<i64>],
 ) {
-    write_virtualizable_boxes(info, obj_ptr, static_boxes);
-
-    for (i, afield) in info.array_fields.iter().enumerate() {
-        if let Some(values) = array_boxes.get(i) {
-            write_virtualizable_array(afield, obj_ptr, values);
-        }
-    }
+    info.write_all_boxes(obj_ptr, static_boxes, array_boxes);
 }
 
 /// Generate accessor functions for virtualizable field access from JIT code.
@@ -843,8 +1091,8 @@ mod tests {
             *(obj_ptr as *mut u64) = 0xDEAD;
             assert!(is_token_nonnull(&info, obj_ptr));
 
-            // Clear it
-            clear_vable_token(&info, obj_ptr);
+            // Reset it
+            reset_vable_token(&info, obj_ptr);
             assert!(!is_token_nonnull(&info, obj_ptr));
         }
     }
@@ -1014,6 +1262,47 @@ mod tests {
     }
 
     #[test]
+    fn test_read_array_lengths_from_embedded_array_container() {
+        #[repr(C)]
+        struct InlineArray {
+            ptr: *mut i64,
+            len: usize,
+        }
+
+        #[repr(C)]
+        struct Obj {
+            token: usize,
+            arr: InlineArray,
+        }
+
+        let mut backing = vec![10i64, 20, 30];
+        let obj = Obj {
+            token: 0,
+            arr: InlineArray {
+                ptr: backing.as_mut_ptr(),
+                len: backing.len(),
+            },
+        };
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_embedded_array_field_with_layout(
+            "arr",
+            Type::Int,
+            std::mem::offset_of!(Obj, arr),
+            std::mem::offset_of!(InlineArray, ptr),
+            std::mem::offset_of!(InlineArray, len),
+            0,
+        );
+
+        let lengths = unsafe { read_array_lengths(&info, (&obj as *const Obj).cast()) };
+        assert_eq!(lengths, vec![3]);
+        let (boxes, array_lengths) =
+            unsafe { info.load_list_of_boxes((&obj as *const Obj).cast()) };
+        assert_eq!(array_lengths, vec![3]);
+        assert_eq!(boxes, vec![10, 20, 30]);
+    }
+
+    #[test]
     fn test_auto_sync_reads_all_fields() {
         // Build a complete virtualizable heap object with static fields + arrays.
         //
@@ -1155,6 +1444,43 @@ mod tests {
             assert_eq!(*(array_data.as_ptr().add(8) as *const i64), 100);
             assert_eq!(*(array_data.as_ptr().add(16) as *const i64), 200);
             assert_eq!(*(array_data.as_ptr().add(24) as *const i64), 300);
+        }
+    }
+
+    #[test]
+    fn test_virtualizable_with_ref_array_preserves_pointer_values() {
+        // RPython parity: Ref-typed virtualizable arrays stay pointer-typed
+        // through heap load and writeback. They must not degrade into raw ints.
+
+        let mut array_data = vec![0u8; 8 + 3 * 8];
+        unsafe {
+            *(array_data.as_mut_ptr() as *mut usize) = 3;
+            *(array_data.as_mut_ptr().add(8) as *mut usize) = 0x1000;
+            *(array_data.as_mut_ptr().add(16) as *mut usize) = 0;
+            *(array_data.as_mut_ptr().add(24) as *mut usize) = 0x2000;
+        }
+
+        let mut obj = vec![0u8; 16];
+        unsafe {
+            *(obj.as_mut_ptr().add(8) as *mut *const u8) = array_data.as_ptr();
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_array_field_with_layout("locals_w", Type::Ref, 8, 0, 8);
+
+        let (boxes, lengths) = unsafe { info.load_list_of_boxes(obj.as_ptr()) };
+        assert_eq!(lengths, vec![3]);
+        assert_eq!(boxes, vec![0x1000, 0, 0x2000]);
+
+        let new_array_boxes = vec![vec![0x3000_i64, 0, 0x4000_i64]];
+        unsafe {
+            info.write_from_resume_data_partial(obj.as_mut_ptr(), &[], &new_array_boxes);
+        }
+
+        unsafe {
+            assert_eq!(*(array_data.as_ptr().add(8) as *const usize), 0x3000);
+            assert_eq!(*(array_data.as_ptr().add(16) as *const usize), 0);
+            assert_eq!(*(array_data.as_ptr().add(24) as *const usize), 0x4000);
         }
     }
 
@@ -1509,6 +1835,74 @@ mod tests {
             });
 
             assert!(!called, "force_fn should NOT be called for TOKEN_NONE");
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_clear_vable_token_forces_active_jit_token() {
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            *(obj_ptr as *mut u64) = 0xCAFE_BABE;
+
+            let mut received = 0u64;
+            info.clear_vable_token(obj_ptr, |token| {
+                received = token;
+                *(obj_ptr as *mut u64) = 0;
+            });
+
+            assert_eq!(received, 0xCAFE_BABE);
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_clear_vable_token_clears_tracing_rescall_without_force() {
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            *(obj_ptr as *mut u64) = TOKEN_TRACING_RESCALL;
+
+            let mut called = false;
+            info.clear_vable_token(obj_ptr, |_| {
+                called = true;
+            });
+
+            assert!(!called);
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_force_virtualizable_if_necessary_skips_none_token() {
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            let mut called = false;
+            info.force_virtualizable_if_necessary(obj_ptr, |_| {
+                called = true;
+            });
+            assert!(!called);
+            assert_eq!(info.read_token(obj_ptr), VableToken::None);
+        }
+    }
+
+    #[test]
+    fn test_reset_token_gcref_resets_active_token() {
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+
+        unsafe {
+            *(obj_ptr as *mut u64) = 0xABCD;
+            info.reset_token_gcref(obj_ptr);
             assert_eq!(info.read_token(obj_ptr), VableToken::None);
         }
     }

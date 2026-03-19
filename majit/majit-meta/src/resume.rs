@@ -900,9 +900,7 @@ pub enum VirtualInfo {
         length: Box<VirtualFieldSource>,
     },
     /// resume.py: VUniPlainInfo — virtual unicode string.
-    VUniPlain {
-        chars: Vec<VirtualFieldSource>,
-    },
+    VUniPlain { chars: Vec<VirtualFieldSource> },
     /// resume.py: VUniConcatInfo — virtual unicode concat.
     VUniConcat {
         left: Box<VirtualFieldSource>,
@@ -2488,9 +2486,7 @@ impl<'a> ResumeDataReader<'a> {
     /// Decode a ResumeValueSource to a concrete value.
     pub fn decode_value(&self, source: &ResumeValueSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(idx) => {
-                self.fail_values.get(*idx).copied().unwrap_or(0)
-            }
+            ResumeValueSource::FailArg(idx) => self.fail_values.get(*idx).copied().unwrap_or(0),
             ResumeValueSource::Constant(val) => *val,
             ResumeValueSource::Virtual(vidx) => {
                 self.virtuals.get(*vidx).copied().flatten().unwrap_or(0)

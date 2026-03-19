@@ -349,19 +349,20 @@ fn default_classify_call_effect(_name: &str) -> &'static str {
 }
 
 /// Transform all opcodes in an analysis result.
+#[cfg(test)]
 pub fn transform_all(
-    opcodes: &[crate::OpcodeArm],
+    opcodes: &[crate::passes::PipelineOpcodeArm],
     config: &TransformConfig,
 ) -> Vec<(String, LoweringRecipe)> {
     opcodes
         .iter()
         .map(|arm| {
             let recipe = arm
-                .trace_pattern
+                .classified_pattern
                 .as_ref()
                 .map(|p| transform_pattern(p, config))
                 .unwrap_or(LoweringRecipe::Abort);
-            (arm.pattern.clone(), recipe)
+            (arm.selector.canonical_key(), recipe)
         })
         .collect()
 }
@@ -478,29 +479,28 @@ mod tests {
 
     #[test]
     fn test_transform_all_produces_recipes_for_all_arms() {
-        let arms = vec![
-            crate::OpcodeArm {
-                pattern: "BinaryOp".into(),
-                handler_calls: vec![],
-                resolved_calls: vec![],
-                trace_pattern: Some(TracePattern::UnboxIntBinop {
-                    op_name: "add".into(),
-                    has_overflow_guard: false,
-                }),
-            },
-            crate::OpcodeArm {
-                pattern: "LoadFast".into(),
-                handler_calls: vec![],
-                resolved_calls: vec![],
-                trace_pattern: Some(TracePattern::LocalRead),
-            },
-            crate::OpcodeArm {
-                pattern: "Unknown".into(),
-                handler_calls: vec![],
-                resolved_calls: vec![],
-                trace_pattern: None,
-            },
-        ];
+        let arms =
+            vec![
+                crate::passes::PipelineOpcodeArm {
+                    selector: crate::OpcodeDispatchSelector::Path(crate::CallPath::from_segments(
+                        ["Instruction", "BinaryOp"],
+                    )),
+                    classified_pattern: Some(TracePattern::UnboxIntBinop {
+                        op_name: "add".into(),
+                        has_overflow_guard: false,
+                    }),
+                },
+                crate::passes::PipelineOpcodeArm {
+                    selector: crate::OpcodeDispatchSelector::Path(crate::CallPath::from_segments(
+                        ["Instruction", "LoadFast"],
+                    )),
+                    classified_pattern: Some(TracePattern::LocalRead),
+                },
+                crate::passes::PipelineOpcodeArm {
+                    selector: crate::OpcodeDispatchSelector::Unsupported,
+                    classified_pattern: None,
+                },
+            ];
         let config = TransformConfig::default();
         let recipes = transform_all(&arms, &config);
         assert_eq!(recipes.len(), 3);

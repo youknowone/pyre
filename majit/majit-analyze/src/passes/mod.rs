@@ -13,9 +13,11 @@ pub mod rtype;
 pub use annotate::{AnnotationState, annotate as annotate_graph};
 pub use flatten::{FlatOp, FlattenedFunction, Label, RegKind, flatten, flatten_with_types};
 pub use jtransform::{
-    GraphTransformConfig, GraphTransformNote, GraphTransformResult, rewrite_graph,
+    CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformNote,
+    GraphTransformResult, VirtualizableFieldDescriptor, rewrite_graph,
 };
 pub use pipeline::{
-    PipelineConfig, PipelineResult, ProgramPipelineResult, analyze_function, analyze_program,
+    PipelineConfig, PipelineOpcodeArm, PipelineResult, ProgramPipelineResult, analyze_function,
+    analyze_program,
 };
 pub use rtype::{ConcreteType, TypeResolutionState, resolve_types};

@@ -706,12 +706,7 @@ impl VectorLoop {
             OpCode::DebugMergePoint,
         ];
 
-        let base_offset = original_body
-            .iter()
-            .map(|op| op.pos.0)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let base_offset = original_body.iter().map(|op| op.pos.0).max().unwrap_or(0) + 1;
 
         for u in 0..count {
             let offset = base_offset + (u as u32) * (original_body.len() as u32);
