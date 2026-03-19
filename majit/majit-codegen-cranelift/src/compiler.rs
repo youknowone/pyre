@@ -2543,6 +2543,10 @@ fn normalize_ops_for_codegen(
                     }
                 }
             }
+            // Remap rd_virtuals field fail_arg indices to match renumbered fail_args.
+            // rd_virtuals entries reference fail_arg positions by index, not OpRef,
+            // so they don't need OpRef remapping — only fail_arg_index adjustment
+            // if fail_args were reordered (they aren't in dense renumbering).
             n
         })
         .collect();
@@ -3686,6 +3690,21 @@ impl CraneliftBackend {
                     cl_types::I64
                 };
                 builder.declare_var(var(vi as u32), cl_type);
+            }
+            // Ensure all fail_arg OpRefs are declared as variables.
+            // Virtual resume data may add extra fail_args whose OpRefs
+            // reference ops that don't produce a result_type (constants
+            // handled separately by resolve_opref).
+            if let Some(ref fa) = op.fail_args {
+                for &arg in fa.iter() {
+                    if !arg.is_none()
+                        && !declared_vars.contains(&arg.0)
+                        && !constants.contains_key(&arg.0)
+                    {
+                        declared_vars.insert(arg.0);
+                        builder.declare_var(var(arg.0), cl_types::I64);
+                    }
+                }
             }
         }
 
@@ -7018,7 +7037,10 @@ fn collect_guards(
                     .fields
                     .iter()
                     .map(|&(field_descr_idx, field_fail_arg_idx)| {
-                        (field_descr_idx, ExitValueSourceLayout::ExitValue(field_fail_arg_idx))
+                        (
+                            field_descr_idx,
+                            ExitValueSourceLayout::ExitValue(field_fail_arg_idx),
+                        )
                     })
                     .collect();
                 let descr_index = entry.descr.index();
