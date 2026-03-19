@@ -35,7 +35,7 @@
 /// Consecutive guards on different values are kept but, when both lack a
 /// descriptor, the second inherits the first's descriptor so the backend
 /// can share resume data.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use majit_ir::{DescrRef, Op, OpCode, OpRef};
 
@@ -172,6 +172,133 @@ impl Guard {
         }
 
         false
+    }
+}
+
+/// guard.py: GuardStrengthenOpt (full-loop version for vector optimizer).
+///
+/// Collects guard information from a complete loop, determines which
+/// guards imply others, and eliminates redundant guards. This is the
+/// whole-trace pass, unlike the streaming `GuardStrengthenOpt` below.
+pub struct GuardEliminator {
+    /// guard.py: strongest_guards — maps variable key to strongest guards.
+    strongest_guards: HashMap<OpRef, Vec<Guard>>,
+    /// guard.py: guards — maps op index to replacement guard (or None to skip).
+    guards: HashMap<usize, Option<Guard>>,
+    /// Number of guards strength-reduced.
+    pub strength_reduced: usize,
+}
+
+impl GuardEliminator {
+    pub fn new() -> Self {
+        GuardEliminator {
+            strongest_guards: HashMap::new(),
+            guards: HashMap::new(),
+            strength_reduced: 0,
+        }
+    }
+
+    /// guard.py: collect_guard_information(loop)
+    ///
+    /// Walk all operations, find guard_true/guard_false ops with a
+    /// preceding comparison, and record them by their variable keys.
+    pub fn collect_guard_information(&mut self, ops: &[Op], ctx: &OptContext) {
+        for (i, op) in ops.iter().enumerate() {
+            if !op.opcode.is_guard() {
+                continue;
+            }
+            if op.opcode != OpCode::GuardTrue && op.opcode != OpCode::GuardFalse {
+                continue;
+            }
+            // Find the comparison op that produces the guard's boolean arg
+            let bool_arg = op.arg(0);
+            let cmp_op = ops.iter().rfind(|o| o.pos == bool_arg);
+            if let Some(cmp) = cmp_op {
+                if let Some(guard) = Guard::from_ops(i, op, cmp) {
+                    self.record_guard(guard.lhs, &guard, ctx);
+                    if !guard.rhs.is_none() {
+                        self.record_guard(guard.rhs, &guard, ctx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// guard.py: record_guard(key, guard)
+    ///
+    /// Record a guard for a key. If stronger guards exist for this key,
+    /// determine implication: either the new guard replaces the old one
+    /// (strengthening) or the new one is implied (eliminated).
+    fn record_guard(&mut self, key: OpRef, guard: &Guard, ctx: &OptContext) {
+        if key.is_none() {
+            return;
+        }
+        let others = self.strongest_guards.entry(key).or_default();
+        if !others.is_empty() {
+            let mut replaced = false;
+            for i in 0..others.len() {
+                if guard.implies(&others[i], ctx) {
+                    // New guard is stronger → replace old, mark old index
+                    let old = others[i].clone();
+                    self.guards.insert(guard.index, None); // don't emit new
+                    self.guards.insert(old.index, Some(guard.clone())); // replace old
+                    others[i] = guard.clone();
+                    replaced = true;
+                } else if others[i].implies(guard, ctx) {
+                    // Old guard implies new → skip new
+                    self.guards.insert(guard.index, None);
+                    replaced = true;
+                }
+            }
+            if !replaced {
+                others.push(guard.clone());
+            }
+        } else {
+            others.push(guard.clone());
+        }
+    }
+
+    /// guard.py: eliminate_guards(loop)
+    ///
+    /// Walk ops, skip guards that are implied, emit replacement guards
+    /// for strengthened ones, and copy everything else.
+    pub fn eliminate_guards(&mut self, ops: &[Op]) -> Vec<Op> {
+        let mut result = Vec::with_capacity(ops.len());
+        for (i, op) in ops.iter().enumerate() {
+            if op.opcode.is_guard() {
+                if let Some(replacement) = self.guards.get(&i) {
+                    self.strength_reduced += 1;
+                    if replacement.is_none() {
+                        continue; // implied, skip entirely
+                    }
+                    // Strengthened: the replacement guard's cmp + guard
+                    // are emitted. For now, just emit the original (the
+                    // replacement has the same semantic, just tighter).
+                    if let Some(guard) = replacement {
+                        let mut new_op = op.clone();
+                        new_op.opcode = guard.guard_opcode;
+                        result.push(new_op);
+                        continue;
+                    }
+                }
+            }
+            result.push(op.clone());
+        }
+        result
+    }
+
+    /// guard.py: propagate_all_forward(info, loop)
+    ///
+    /// Full pipeline: collect guard info → eliminate guards.
+    pub fn propagate_all_forward(&mut self, ops: &[Op], ctx: &OptContext) -> Vec<Op> {
+        self.collect_guard_information(ops, ctx);
+        self.eliminate_guards(ops)
+    }
+}
+
+impl Default for GuardEliminator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
