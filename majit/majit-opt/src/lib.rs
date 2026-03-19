@@ -25,6 +25,8 @@ pub mod virtualstate;
 pub mod vstring;
 pub mod walkvirtual;
 
+use std::collections::HashMap;
+
 use info::PtrInfo;
 use majit_ir::{Op, OpRef, Value};
 use std::collections::VecDeque;
@@ -67,6 +69,12 @@ pub struct OptContext {
     /// `op.set_forwarded(info)`. majit uses an indexed Vec instead.
     /// All passes can read/write this to share virtual/class/nonnull info.
     pub ptr_info: Vec<Option<PtrInfo>>,
+    /// Known lower bounds for integer-typed OpRefs, shared across passes.
+    ///
+    /// heap.py: arrayinfo.getlenbound().make_gt_const(index) records that
+    /// an ARRAYLEN_GC result >= index+1. intbounds.py uses this to
+    /// eliminate redundant length guards.
+    pub int_lower_bounds: HashMap<OpRef, i64>,
 }
 
 impl OptContext {
@@ -79,6 +87,7 @@ impl OptContext {
             next_pos: 0,
             extra_operations: VecDeque::new(),
             ptr_info: Vec::new(),
+            int_lower_bounds: HashMap::new(),
         }
     }
 
@@ -91,7 +100,12 @@ impl OptContext {
             next_pos: num_inputs as u32,
             extra_operations: VecDeque::new(),
             ptr_info: Vec::new(),
+            int_lower_bounds: HashMap::new(),
         }
+    }
+
+    pub fn num_inputs(&self) -> usize {
+        self.num_inputs as usize
     }
 
     pub(crate) fn reserve_pos(&mut self) -> OpRef {
