@@ -1771,19 +1771,23 @@ mod tests {
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
+                    // Drain extra ops (from force_virtual) BEFORE the triggering op,
+                    // matching RPython's emit_extra which processes immediately.
+                    ctx.flush_extra_operations_raw();
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Replace(replaced) => {
+                    ctx.flush_extra_operations_raw();
                     ctx.emit(replaced);
                 }
                 OptimizationResult::Remove => {
-                    // removed, nothing to do
+                    ctx.flush_extra_operations_raw();
                 }
                 OptimizationResult::PassOn => {
+                    ctx.flush_extra_operations_raw();
                     ctx.emit(resolved_op);
                 }
             }
-            ctx.flush_extra_operations_raw();
         }
 
         pass.flush();
@@ -2657,17 +2661,21 @@ mod tests {
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
+                    ctx.flush_extra_operations_raw();
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Replace(replaced) => {
+                    ctx.flush_extra_operations_raw();
                     ctx.emit(replaced);
                 }
-                OptimizationResult::Remove => {}
+                OptimizationResult::Remove => {
+                    ctx.flush_extra_operations_raw();
+                }
                 OptimizationResult::PassOn => {
+                    ctx.flush_extra_operations_raw();
                     ctx.emit(resolved_op);
                 }
             }
-            ctx.flush_extra_operations_raw();
         }
 
         pass.flush();
