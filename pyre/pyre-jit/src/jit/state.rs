@@ -3377,6 +3377,49 @@ impl JitState for PyreJitState {
         let expected = 3 + meta.num_locals + stack_only;
         jump_args.len() == expected
     }
+
+    /// RPython resume.py: materialize a virtual object from resume data.
+    ///
+    /// Called during guard failure recovery when the optimizer kept an
+    /// object virtual (New + SetfieldGc eliminated). The resume mechanism
+    /// reconstructs the object so the interpreter can use it.
+    fn materialize_virtual_ref(
+        &mut self,
+        _meta: &Self::Meta,
+        _virtual_index: usize,
+        materialized: &majit_meta::resume::MaterializedVirtual,
+    ) -> Option<majit_ir::GcRef> {
+        use majit_meta::resume::{MaterializedValue, MaterializedVirtual};
+        match materialized {
+            MaterializedVirtual::Struct { fields, .. }
+            | MaterializedVirtual::Obj { fields, .. } => {
+                // Pyre virtual objects are W_IntObject (16 bytes: ob_type + intval).
+                // Field layout: offset 0 = ob_type (*const PyType), offset 8 = intval (i64).
+                let mut ob_type: usize = 0;
+                let mut intval: i64 = 0;
+                for (field_idx, value) in fields {
+                    let offset = extract_pyre_field_offset(*field_idx);
+                    let concrete = match value {
+                        MaterializedValue::Value(v) => *v,
+                        MaterializedValue::VirtualRef(_) => return None,
+                    };
+                    match offset {
+                        Some(0) => ob_type = concrete as usize,
+                        Some(8) => intval = concrete,
+                        _ => {}
+                    }
+                }
+                if ob_type == &INT_TYPE as *const _ as usize {
+                    let ptr = pyre_object::intobject::w_int_new(intval);
+                    Some(majit_ir::GcRef(ptr as usize))
+                } else {
+                    // Unknown type — allocate raw and fill fields
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 fn value_to_ptr(value: &Value) -> PyObjectRef {
@@ -3393,6 +3436,16 @@ fn value_to_usize(value: &Value) -> usize {
         Value::Int(n) => *n as usize,
         _ => 0,
     }
+}
+
+/// Extract byte offset from a pyre field descriptor index.
+/// Mirrors `extract_field_offset` in majit-opt/virtualize.rs.
+fn extract_pyre_field_offset(descr_idx: u32) -> Option<usize> {
+    const FIELD_DESCR_TAG: u32 = 0x1000_0000;
+    if descr_idx & 0xF000_0000 != FIELD_DESCR_TAG {
+        return None;
+    }
+    Some(((descr_idx >> 4) & 0x000f_ffff) as usize)
 }
 
 // ── Virtualizable configuration ──────────────────────────────────────
