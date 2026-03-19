@@ -1404,6 +1404,31 @@ impl Optimization for OptRewrite {
             // ── rewrite.py: ASSERT_NOT_NONE → no-op ──
             OpCode::AssertNotNone => OptimizationResult::Remove,
 
+            // rewrite.py: optimize_CALL_N — dispatch arraycopy/arraymove
+            OpCode::CallN | OpCode::CallI | OpCode::CallR => {
+                if let Some(ref descr) = op.descr {
+                    if let Some(cd) = descr.as_call_descr() {
+                        let ei = cd.effect_info();
+                        match ei.oopspec_index {
+                            majit_ir::OopSpecIndex::Arraycopy
+                            | majit_ir::OopSpecIndex::Arraymove => {
+                                // rewrite.py: _optimize_CALL_ARRAYCOPY
+                                // Zero-length copy/move → remove
+                                if op.num_args() >= 6 {
+                                    let length_arg = op.arg(5);
+                                    if let Some(0) = ctx.get_constant_int(length_arg) {
+                                        return OptimizationResult::Remove;
+                                    }
+                                }
+                                return OptimizationResult::PassOn;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                OptimizationResult::PassOn
+            }
+
             // Everything else: pass on to next optimization pass
             _ => OptimizationResult::PassOn,
         }
