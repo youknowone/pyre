@@ -220,9 +220,15 @@ impl OptHeap {
             }
         }
 
-        // Force lazy setarrayitems: same logic
+        // Force lazy setarrayitems: same logic.
+        // heap.py line 631-632: the struct/array pointer must NOT be virtual
+        // (only the stored value can be virtual/unescaped).
         let array_entries: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
         for (key, op) in array_entries {
+            debug_assert!(
+                !self.unescaped.contains(&op.arg(0)),
+                "lazy setarrayitem target must not be virtual/unescaped"
+            );
             let value_ref = op.arg(2);
             if self.unescaped.contains(&value_ref) {
                 pendingfields.push(op);
@@ -1012,26 +1018,18 @@ impl Optimization for OptHeap {
                 }
             }
 
-            // ── Quasi-immutable field: treat as read + guard_not_invalidated ──
-            // The QUASIIMMUT_FIELD op marks a field that rarely changes.
-            // The optimizer replaces the field read with the cached value and
-            // emits GUARD_NOT_INVALIDATED to ensure validity.
+            // heap.py: optimize_QUASIIMMUT_FIELD
+            //
+            // Records the quasi-immutable dependency so that future
+            // GETFIELD_GC on this (obj, field) is treated as pure.
+            // Does NOT emit GUARD_NOT_INVALIDATED here — the trace
+            // already contains one where needed.
             OpCode::QuasiimmutField => {
-                if !self.seen_guard_not_invalidated {
-                    self.seen_guard_not_invalidated = true;
-                    // Emit a GUARD_NOT_INVALIDATED for the quasi-immutable promise.
-                    let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
-                    self.force_all_lazy(ctx);
-                    ctx.emit(guard_op);
-                }
-                // Mark this (obj, field) as quasi-immutable for subsequent GETFIELD.
-                // The value is not yet known; it will be captured on the first read.
                 let obj = op.arg(0);
                 if let Some(descr) = &op.descr {
                     let field_idx = descr.index();
                     self.quasi_immut_cache.insert((obj, field_idx), OpRef::NONE);
                 }
-                // The QUASIIMMUT_FIELD itself is a no-op marker.
                 OptimizationResult::Remove
             }
 
@@ -2690,13 +2688,18 @@ mod tests {
 
     #[test]
     fn test_quasiimmut_field_caches_value() {
+        // heap.py: QUASIIMMUT_FIELD records the dependency, does NOT emit
+        // GUARD_NOT_INVALIDATED. The trace itself already contains the guard.
+        //
         // quasiimmut_field(p0, descr=d0)
+        // guard_not_invalidated()             <- from the trace
         // i1 = getfield_gc_i(p0, descr=d0)   <- first read, cached as quasi-immut
         // call_n(some_func)                   <- would normally invalidate, but quasi-immut survives
         // i2 = getfield_gc_i(p0, descr=d0)   <- reuses cached value
         let d = descr(0);
         let mut ops = vec![
             Op::with_descr(OpCode::QuasiimmutField, &[OpRef(100)], d.clone()),
+            Op::new(OpCode::GuardNotInvalidated, &[]),
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
             Op::new(OpCode::CallN, &[OpRef(200)]),
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
@@ -2714,12 +2717,12 @@ mod tests {
             get_count, 1,
             "second GETFIELD after call should be eliminated for quasi-immutable field"
         );
-        // GUARD_NOT_INVALIDATED should be emitted.
+        // GUARD_NOT_INVALIDATED from the trace should survive.
         let gni_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNotInvalidated)
             .count();
-        assert_eq!(gni_count, 1, "GUARD_NOT_INVALIDATED should be emitted");
+        assert_eq!(gni_count, 1, "GUARD_NOT_INVALIDATED should survive");
     }
 
     // ── Test 50: GC_LOAD forces lazy setfields ──
