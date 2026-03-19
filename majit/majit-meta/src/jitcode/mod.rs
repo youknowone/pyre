@@ -1,3 +1,5 @@
+mod frame;
+
 use std::cmp::max;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -436,79 +438,8 @@ where
     }
 }
 
-pub struct MIFrame<'a> {
-    pub jitcode: &'a JitCode,
-    pub pc: usize,
-    pub code_cursor: usize,
-    pub int_regs: Vec<Option<OpRef>>,
-    pub int_values: Vec<Option<i64>>,
-    pub ref_regs: Vec<Option<OpRef>>,
-    pub ref_values: Vec<Option<i64>>,
-    pub float_regs: Vec<Option<OpRef>>,
-    pub float_values: Vec<Option<i64>>,
-    pub inline_frame: bool,
-    pub return_i: Option<(usize, usize)>,
-    pub return_r: Option<(usize, usize)>,
-    pub return_f: Option<(usize, usize)>,
-}
-
-impl<'a> MIFrame<'a> {
-    pub fn new(jitcode: &'a JitCode, pc: usize) -> Self {
-        Self {
-            jitcode,
-            pc,
-            code_cursor: 0,
-            int_regs: vec![None; jitcode.num_regs[0] as usize],
-            int_values: vec![None; jitcode.num_regs[0] as usize],
-            ref_regs: vec![None; jitcode.num_regs[1] as usize],
-            ref_values: vec![None; jitcode.num_regs[1] as usize],
-            float_regs: vec![None; jitcode.num_regs[2] as usize],
-            float_values: vec![None; jitcode.num_regs[2] as usize],
-            inline_frame: false,
-            return_i: None,
-            return_r: None,
-            return_f: None,
-        }
-    }
-
-    pub fn next_u8(&mut self) -> u8 {
-        read_u8(&self.jitcode.code, &mut self.code_cursor)
-    }
-
-    pub fn next_u16(&mut self) -> u16 {
-        read_u16(&self.jitcode.code, &mut self.code_cursor)
-    }
-
-    pub fn finished(&self) -> bool {
-        self.code_cursor >= self.jitcode.code.len()
-    }
-}
-
-pub struct MIFrameStack<'a> {
-    frames: Vec<MIFrame<'a>>,
-}
-
-impl<'a> MIFrameStack<'a> {
-    pub fn new(root: MIFrame<'a>) -> Self {
-        Self { frames: vec![root] }
-    }
-
-    pub fn current_mut(&mut self) -> &mut MIFrame<'a> {
-        self.frames.last_mut().expect("empty JitCode frame stack")
-    }
-
-    pub fn push(&mut self, frame: MIFrame<'a>) {
-        self.frames.push(frame);
-    }
-
-    pub fn pop(&mut self) -> Option<MIFrame<'a>> {
-        self.frames.pop()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
-    }
-}
+// MIFrame and MIFrameStack are in frame.rs (RPython pyjitpl.py parity).
+pub use frame::{MIFrame, MIFrameStack};
 
 pub struct JitCodeMachine<'a, S, R> {
     frames: MIFrameStack<'a>,
@@ -3214,13 +3145,13 @@ where
     machine.run_to_end(ctx, sym, &runtime)
 }
 
-fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
+pub(crate) fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
     let value = *code.get(*cursor).expect("truncated jitcode");
     *cursor += 1;
     value
 }
 
-fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {
+pub(crate) fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {
     let lo = *code.get(*cursor).expect("truncated jitcode");
     let hi = *code.get(*cursor + 1).expect("truncated jitcode");
     *cursor += 2;
