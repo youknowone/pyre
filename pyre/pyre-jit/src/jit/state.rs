@@ -408,15 +408,13 @@ impl TraceFrameState {
     pub(crate) fn promote_valuestackdepth(&mut self, _concrete_frame: usize) {}
 
     /// Build fail_args for the current frame only (no multi-frame header).
-    /// PyPy opencoder.py create_snapshot().
+    /// RPython opencoder.py create_snapshot(): always includes locals + stack.
     fn build_single_frame_fail_args(&self) -> Vec<OpRef> {
         let s = self.sym();
         let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
-        if s.vable_array_base.is_none() {
-            let stack_only = s.stack_only_depth();
-            fa.extend_from_slice(&s.symbolic_locals);
-            fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
-        }
+        let stack_only = s.stack_only_depth();
+        fa.extend_from_slice(&s.symbolic_locals);
+        fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         fa
     }
 
@@ -657,23 +655,16 @@ impl TraceFrameState {
     }
 
     /// Build the current fail_args for guards: [frame, ni, vsd, locals..., stack...]
+    /// RPython pyjitpl.py capture_resumedata: always captures full frame state.
     pub(crate) fn current_fail_args(&self, _ctx: &mut TraceCtx) -> Vec<OpRef> {
         if let Some(ref pfa) = self.parent_fail_args {
             return pfa.clone();
         }
         let s = self.sym();
         let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
-        // When virtualizable array is active (vable_array_base is set),
-        // DON'T include symbolic locals/stack in fail_args. PyPy's
-        // resumedata carries the frame plus virtualizable field snapshots,
-        // and majit's augment_guard_with_virtualizable() appends the
-        // unified locals/stack array after optimization. Including the
-        // symbolic stack here would prematurely force virtual W_Int boxes.
-        if s.vable_array_base.is_none() {
-            let stack_only = s.stack_only_depth();
-            fa.extend_from_slice(&s.symbolic_locals);
-            fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
-        }
+        let stack_only = s.stack_only_depth();
+        fa.extend_from_slice(&s.symbolic_locals);
+        fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         fa
     }
 
@@ -690,15 +681,10 @@ impl TraceFrameState {
 
         self.flush_to_frame(ctx);
         let s = self.sym();
-        let fail_args = if s.vable_array_base.is_some() {
-            vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth]
-        } else {
-            let stack_only = s.stack_only_depth();
-            let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
-            fa.extend_from_slice(&s.symbolic_locals);
-            fa.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
-            fa
-        };
+        let stack_only = s.stack_only_depth();
+        let mut fail_args = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
+        fail_args.extend_from_slice(&s.symbolic_locals);
+        fail_args.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
         let fail_arg_types = vec![majit_ir::Type::Int; fail_args.len()];
         ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
     }
@@ -2096,7 +2082,26 @@ impl TraceFrameState {
             (sym, Some(callee_frame_opref))
         };
 
+        // GuardNotForced in callee → interpreter must re-execute the CALL.
+        // Temporarily restore callable+args to parent stack and set PC to CALL.
+        let call_pc = self.fallthrough_pc.saturating_sub(1);
+        let null_opref = self.with_ctx(|_, ctx| ctx.const_int(pyre_object::PY_NULL as i64));
+        {
+            let s = self.sym_mut();
+            s.symbolic_stack.push(callable);
+            s.symbolic_stack.push(null_opref);
+            for &a in args { s.symbolic_stack.push(a); }
+            s.valuestackdepth += 2 + args.len();
+            s.pending_next_instr = Some(call_pc);
+        }
+        self.with_ctx(|this, ctx| this.flush_to_frame(ctx));
         let parent_fail_args = self.build_single_frame_fail_args();
+        {
+            let s = self.sym_mut();
+            for _ in 0..(2 + args.len()) { s.symbolic_stack.pop(); }
+            s.valuestackdepth -= 2 + args.len();
+            s.pending_next_instr = None;
+        }
         Ok(PendingInlineFrame {
             sym: callee_sym,
             concrete_frame: callee_frame,
@@ -2153,6 +2158,8 @@ impl TraceFrameState {
         } else {
             None
         };
+        // Save CALL instruction PC so GuardNotForced can resume the CALL.
+        let call_pc = self.fallthrough_pc.saturating_sub(1);
 
         let result = self.with_ctx(|this, ctx| {
             this.guard_value(ctx, callable, concrete_callable as i64);
@@ -2166,7 +2173,8 @@ impl TraceFrameState {
                     let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
                     let is_self_recursive = callee_key
                         == unsafe {
-                            (*(this.concrete_frame as *const pyre_interp::frame::PyFrame)).code as u64
+                            (*(this.concrete_frame as *const pyre_interp::frame::PyFrame)).code
+                                as u64
                         };
                     let force_fn = if is_self_recursive
                         && crate::call_jit::recursive_force_cache_safe(concrete_callable)
@@ -2196,7 +2204,28 @@ impl TraceFrameState {
                     let force_fn = crate::call_jit::jit_force_recursive_call_1 as *const ();
                     ctx.call_may_force_int(force_fn, &[this.frame(), callable, args[0]])
                 };
+                // GuardNotForced fail → interpreter must re-execute CALL.
+                // Temporarily restore callable+args to stack and set PC to CALL.
+                {
+                    let s = this.sym_mut();
+                    s.symbolic_stack.push(callable);
+                    s.symbolic_stack
+                        .push(ctx.const_int(pyre_object::PY_NULL as i64));
+                    for &a in args {
+                        s.symbolic_stack.push(a);
+                    }
+                    s.valuestackdepth += 2 + args.len();
+                    s.pending_next_instr = Some(call_pc);
+                }
                 this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                {
+                    let s = this.sym_mut();
+                    for _ in 0..(2 + args.len()) {
+                        s.symbolic_stack.pop();
+                    }
+                    s.valuestackdepth -= 2 + args.len();
+                    s.pending_next_instr = None;
+                }
                 Ok(result)
             } else {
                 let mut helper_args = vec![this.frame(), callable];
@@ -2204,7 +2233,27 @@ impl TraceFrameState {
                 let callee_frame = ctx.call_int(frame_helper, &helper_args);
                 let force_fn = crate::call_jit::jit_force_callee_frame as *const ();
                 let result = ctx.call_may_force_int(force_fn, &[callee_frame]);
+                // GuardNotForced fail → interpreter must re-execute CALL.
+                {
+                    let s = this.sym_mut();
+                    s.symbolic_stack.push(callable);
+                    s.symbolic_stack
+                        .push(ctx.const_int(pyre_object::PY_NULL as i64));
+                    for &a in args {
+                        s.symbolic_stack.push(a);
+                    }
+                    s.valuestackdepth += 2 + args.len();
+                    s.pending_next_instr = Some(call_pc);
+                }
                 this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                {
+                    let s = this.sym_mut();
+                    for _ in 0..(2 + args.len()) {
+                        s.symbolic_stack.pop();
+                    }
+                    s.valuestackdepth -= 2 + args.len();
+                    s.pending_next_instr = None;
+                }
                 ctx.call_void(
                     crate::call_jit::jit_drop_callee_frame as *const (),
                     &[callee_frame],
@@ -2920,6 +2969,8 @@ impl PyreJitState {
                 idx += 1;
             }
         }
+        // Write next_instr and valuestackdepth back to the concrete PyFrame.
+        let _ = self.sync_scalar_fields_to_frame();
     }
 
     pub fn local_at(&self, idx: usize) -> Option<PyObjectRef> {

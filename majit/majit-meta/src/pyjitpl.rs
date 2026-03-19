@@ -10,7 +10,7 @@ use majit_opt::optimizer::Optimizer;
 use majit_trace::trace::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
 
-use crate::blackhole::{blackhole_execute_with_state, BlackholeResult, ExceptionState};
+use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state};
 use crate::io_buffer;
 use crate::resume::{
     EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
@@ -698,7 +698,9 @@ impl<M: Clone> MetaInterp<M> {
     /// Virtualizable fields become virtual input args — first reads are
     /// replaced with input references and values flow through JUMP args.
     /// No heap access for these fields on the hot path.
-    fn current_virtualizable_optimizer_config(&self) -> Option<majit_opt::virtualize::VirtualizableConfig> {
+    fn current_virtualizable_optimizer_config(
+        &self,
+    ) -> Option<majit_opt::virtualize::VirtualizableConfig> {
         // RPython parity: only traces that actually carry the standard
         // virtualizable state on boxes should hand a virtualizable contract
         // to the optimizer. Merely registering VirtualizableInfo is not enough.
@@ -945,11 +947,7 @@ impl<M: Clone> MetaInterp<M> {
     /// RPython equivalent: `_get_arrayitem_vable_index()`.
     ///
     /// Returns the flat index into the standard virtualizable box array.
-    fn get_arrayitem_vable_index(
-        &self,
-        array_field_offset: usize,
-        index: OpRef,
-    ) -> Option<usize> {
+    fn get_arrayitem_vable_index(&self, array_field_offset: usize, index: OpRef) -> Option<usize> {
         let ctx = self.tracing.as_ref()?;
         let raw_index = ctx.const_value(index)?;
         let item_index = usize::try_from(raw_index).ok()?;
@@ -1571,6 +1569,8 @@ impl<M: Clone> MetaInterp<M> {
         finish_arg_types: Vec<Type>,
         meta: M,
     ) {
+        // Cache vable_config before take() clears self.tracing.
+        let vable_config = self.current_virtualizable_optimizer_config();
         self.forced_virtualizable = None;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
@@ -1580,7 +1580,6 @@ impl<M: Clone> MetaInterp<M> {
         recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
         let trace = recorder.get_trace();
 
-        let mut optimizer = self.make_optimizer();
         let mut constants = ctx.constants.into_inner();
 
         let trace_ops = fold_box_into_create_frame(
@@ -1591,6 +1590,11 @@ impl<M: Clone> MetaInterp<M> {
         );
 
         let num_ops_before = trace_ops.len();
+        let mut optimizer = if let Some(config) = vable_config {
+            Optimizer::default_pipeline_with_virtualizable(config)
+        } else {
+            Optimizer::default_pipeline()
+        };
         let optimized_ops = optimizer.optimize_with_constants_and_inputs(
             &trace_ops,
             &mut constants,
@@ -5137,10 +5141,22 @@ mod tests {
         let config = meta
             .current_virtualizable_optimizer_config()
             .expect("standard virtualizable trace should pass config to optimizer");
-        assert_eq!(config.static_field_offsets, info.to_optimizer_config().static_field_offsets);
-        assert_eq!(config.static_field_types, info.to_optimizer_config().static_field_types);
-        assert_eq!(config.array_field_offsets, info.to_optimizer_config().array_field_offsets);
-        assert_eq!(config.array_item_types, info.to_optimizer_config().array_item_types);
+        assert_eq!(
+            config.static_field_offsets,
+            info.to_optimizer_config().static_field_offsets
+        );
+        assert_eq!(
+            config.static_field_types,
+            info.to_optimizer_config().static_field_types
+        );
+        assert_eq!(
+            config.array_field_offsets,
+            info.to_optimizer_config().array_field_offsets
+        );
+        assert_eq!(
+            config.array_item_types,
+            info.to_optimizer_config().array_item_types
+        );
     }
 
     #[test]
@@ -8155,7 +8171,7 @@ mod raw_int_postprocess_tests {
     use super::{unbox_call_assembler_results, unbox_finish_result, unbox_raw_force_results};
     use std::collections::{HashMap, HashSet};
 
-    use majit_ir::{make_field_descr, Op, OpCode, OpRef, Type};
+    use majit_ir::{Op, OpCode, OpRef, Type, make_field_descr};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
