@@ -1060,6 +1060,30 @@ impl OptIntBounds {
                 let bounds = bres.neg_bound();
                 let _ = self.get_bound_mut(op.arg(0)).intersect(&bounds);
             }
+            // intbounds.py: propagate_bounds_INT_EQ
+            // If result is known 1 (true): arg0 == arg1 → intersect bounds
+            // If result is known 0 (false): no bounds propagation for !=
+            OpCode::IntEq => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() && r.lower == 1 {
+                    // make_eq: intersect arg0 with arg1's bounds and vice versa
+                    let b0 = self.getintbound(op.arg(0), ctx);
+                    let b1 = self.getintbound(op.arg(1), ctx);
+                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b1);
+                    let _ = self.get_bound_mut(op.arg(1)).intersect(&b0);
+                }
+            }
+            // intbounds.py: propagate_bounds_INT_NE
+            // If result is known 0 (false): arg0 == arg1 → intersect bounds
+            OpCode::IntNe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() && r.lower == 0 {
+                    let b0 = self.getintbound(op.arg(0), ctx);
+                    let b1 = self.getintbound(op.arg(1), ctx);
+                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b1);
+                    let _ = self.get_bound_mut(op.arg(1)).intersect(&b0);
+                }
+            }
             _ => {}
         }
     }
