@@ -1145,10 +1145,11 @@ impl Optimization for OptRewrite {
                         return OptimizationResult::Remove;
                     }
                 }
-                // rewrite.py postprocess_GUARD_NONNULL: after guard passes,
-                // downstream code can assume arg(0) is non-null.
-                // (PtrInfo tracking would record this; here we note the
-                // guard survived, so the value is live and non-null.)
+                // rewrite.py postprocess_GUARD_NONNULL: make_nonnull(arg(0))
+                let obj = ctx.get_replacement(op.arg(0));
+                if ctx.get_ptr_info(obj).is_none() {
+                    ctx.set_ptr_info(obj, crate::info::PtrInfo::NonNull);
+                }
                 OptimizationResult::PassOn
             }
             OpCode::GuardIsnull => {
@@ -1162,23 +1163,68 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
             OpCode::GuardClass => {
-                // GUARD_CLASS(obj, expected_class): if obj's class is already
-                // known from a previous guard, remove duplicate.
-                // For now: if obj is constant, the guard is redundant after
-                // the first successful execution.
+                // rewrite.py: optimize_GUARD_CLASS
+                // If the class is already known, check match → Remove or abort.
+                let obj = ctx.get_replacement(op.arg(0));
+                if let Some(known_class) = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class()).cloned() {
+                    if op.num_args() >= 2 {
+                        if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                            if known_class.0 as i64 == expected {
+                                return OptimizationResult::Remove;
+                            }
+                            // Different class → guard will always fail.
+                            // RPython raises InvalidLoop; we abort.
+                            return OptimizationResult::PassOn;
+                        }
+                    }
+                }
+                // postprocess_GUARD_CLASS: record known class for arg(0)
+                if op.num_args() >= 2 {
+                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
+                        ctx.set_ptr_info(
+                            obj,
+                            crate::info::PtrInfo::known_class(
+                                majit_ir::GcRef(class_val as usize),
+                                true,
+                            ),
+                        );
+                    }
+                }
                 OptimizationResult::PassOn
             }
             OpCode::GuardNonnullClass => {
                 // GUARD_NONNULL_CLASS(obj, cls): combines GUARD_NONNULL + GUARD_CLASS.
-                // If obj is known non-null constant, can downgrade to GUARD_CLASS.
+                let obj = ctx.get_replacement(op.arg(0));
+                // If already known class, check match.
+                if let Some(known_class) = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class()).cloned() {
+                    if op.num_args() >= 2 {
+                        if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                            if known_class.0 as i64 == expected {
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
+                }
+                // If obj is known non-null constant, downgrade to GUARD_CLASS.
                 if let Some(v) = ctx.get_constant_int(op.arg(0)) {
                     if v != 0 {
-                        // Known non-null — downgrade to GUARD_CLASS
                         let mut new_op = Op::new(OpCode::GuardClass, &op.args);
                         new_op.pos = op.pos;
                         new_op.descr = op.descr.clone();
                         new_op.fail_args = op.fail_args.clone();
                         return OptimizationResult::Replace(new_op);
+                    }
+                }
+                // postprocess: record known class
+                if op.num_args() >= 2 {
+                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
+                        ctx.set_ptr_info(
+                            obj,
+                            crate::info::PtrInfo::known_class(
+                                majit_ir::GcRef(class_val as usize),
+                                true,
+                            ),
+                        );
                     }
                 }
                 OptimizationResult::PassOn
