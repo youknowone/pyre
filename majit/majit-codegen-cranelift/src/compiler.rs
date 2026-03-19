@@ -22,7 +22,7 @@ use cranelift_codegen::ir::Value as CValue;
 
 use majit_codegen::{
     AsmInfo, BackendError, CompiledTraceInfo, DeadFrame, ExitFrameLayout, ExitRecoveryLayout,
-    ExitValueSourceLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
+    ExitValueSourceLayout, ExitVirtualLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
@@ -6997,13 +6997,54 @@ fn collect_guards(
             .filter_map(|(slot, opref)| force_tokens.contains(&opref.0).then_some(slot))
             .collect();
 
-        let recovery_layout = Some(identity_recovery_layout(
+        let mut recovery_layout = identity_recovery_layout(
             trace_id,
             header_pc,
             source_guard,
             &fail_arg_types,
             caller_layout,
-        ));
+        );
+        // resume.py parity: encode rd_virtuals into recovery layout.
+        // Virtual objects in fail_args are NOT materialized at compile time;
+        // their field values are stored as extra fail_args and reconstructed
+        // lazily on guard failure.
+        if let Some(ref rd_virtuals) = op.rd_virtuals {
+            for entry in rd_virtuals {
+                let virtual_index = recovery_layout.virtual_layouts.len();
+                // Convert field fail_arg positions to ExitValueSourceLayout
+                let fields: Vec<(u32, ExitValueSourceLayout)> = entry
+                    .fields
+                    .iter()
+                    .map(|&(field_descr_idx, field_fail_arg_idx)| {
+                        (field_descr_idx, ExitValueSourceLayout::ExitValue(field_fail_arg_idx))
+                    })
+                    .collect();
+                let descr_index = entry.descr.index();
+                let type_id = entry.known_class.map_or(0, |gc| gc.0 as u32);
+                let layout = if entry.known_class.is_some() {
+                    ExitVirtualLayout::Object {
+                        type_id,
+                        descr_index,
+                        fields,
+                    }
+                } else {
+                    ExitVirtualLayout::Struct {
+                        type_id,
+                        descr_index,
+                        fields,
+                    }
+                };
+                recovery_layout.virtual_layouts.push(layout);
+                // Update the frame slot for this fail_arg to Virtual(index)
+                if let Some(frame) = recovery_layout.frames.last_mut() {
+                    if entry.fail_arg_index < frame.slots.len() {
+                        frame.slots[entry.fail_arg_index] =
+                            ExitValueSourceLayout::Virtual(virtual_index);
+                    }
+                }
+            }
+        }
+        let recovery_layout = Some(recovery_layout);
         let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
             fail_index,
             trace_id,
