@@ -90,16 +90,21 @@ impl OptVirtualize {
     /// traces that stay on boxes should not grow inputargs just because a
     /// virtualizable config exists, so allocate these only when the first
     /// tracked raw field read is seen.
-    fn init_virtualizable(&mut self, ctx: &mut OptContext) {
-        if let Some(ref config) = self.vable_config {
-            for (i, &_offset) in config.static_field_offsets.iter().enumerate() {
-                let virt_ref = OpRef(ctx.num_inputs);
-                ctx.num_inputs += 1;
-                self.vable_virtual_inputs.push((i, virt_ref));
-            }
-            // vstate.fields is populated lazily on first GetfieldRawI,
-            // which forwards to the virtual input ref.
-        }
+    /// RPython _init_virtualizable: map static field values to existing
+    /// trace input args.
+    ///
+    /// In RPython, jit_merge_point passes virtualizable field values as
+    /// part of the live values — they are already input args at positions
+    /// 1..N (after the frame ref at position 0). The optimizer does NOT
+    /// allocate new inputs; it maps existing ones.
+    ///
+    /// In pyre, the same holds: input args are [frame, ni, vsd, ...] and
+    /// the trace carries ni/vsd as const_int values via flush_to_frame.
+    /// No additional optimizer-owned inputs are needed.
+    fn init_virtualizable(&mut self, _ctx: &mut OptContext) {
+        // Static field values are already in the trace as input args.
+        // Array-level tracking is handled by vable_array_ptrs, populated
+        // in handle_virtualizable_first_read when array pointer reads are seen.
     }
 
     // ── PtrInfo accessors ──
@@ -235,13 +240,15 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OpRef {
         // Mark as no longer virtual FIRST (avoids infinite recursion on nested virtuals)
-        self.set_info(
-            opref,
+        let placeholder = if let Some(class_ptr) = vinfo.known_class {
             PtrInfo::KnownClass {
-                class_ptr: vinfo.known_class.unwrap_or(majit_ir::GcRef::NULL),
+                class_ptr,
                 is_nonnull: true,
-            },
-        );
+            }
+        } else {
+            PtrInfo::NonNull
+        };
+        self.set_info(opref, placeholder);
 
         // Emit the NEW_WITH_VTABLE
         let mut alloc_op = Op::new(OpCode::NewWithVtable, &[]);
@@ -253,13 +260,10 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        let mut forced_fields = Vec::with_capacity(vinfo.fields.len());
-
         // Emit SETFIELD_GC for each tracked field
         for (field_idx, value_ref) in vinfo.fields {
             let value_ref = self.force_virtual(value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
-            forced_fields.push((field_idx, value_ref));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(
                 get_field_descr(&vinfo.field_descrs, field_idx)
@@ -267,16 +271,6 @@ impl OptVirtualize {
             );
             ctx.emit(set_op);
         }
-
-        self.set_info(
-            alloc_ref,
-            PtrInfo::ForcedVirtual(VirtualInfo {
-                descr: vinfo.descr,
-                known_class: vinfo.known_class,
-                fields: forced_fields,
-                field_descrs: vinfo.field_descrs,
-            }),
-        );
 
         alloc_ref
     }
@@ -333,28 +327,16 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        let mut forced_fields = Vec::with_capacity(vinfo.fields.len());
-
         // Emit SETFIELD_GC for each tracked field
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
-            forced_fields.push((*field_idx, value_ref));
             let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(descr);
             ctx.emit(set_op);
         }
-
-        self.set_info(
-            alloc_ref,
-            PtrInfo::ForcedStruct(VirtualStructInfo {
-                descr: vinfo.descr,
-                fields: forced_fields,
-                field_descrs: vinfo.field_descrs,
-            }),
-        );
 
         alloc_ref
     }
@@ -558,20 +540,6 @@ impl OptVirtualize {
 
         if let Some(info) = self.get_info_mut(struct_ref) {
             match info {
-                PtrInfo::ForcedVirtual(vinfo) => {
-                    set_field(&mut vinfo.fields, field_idx, value_ref);
-                    if let Some(descr) = &op.descr {
-                        set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
-                    }
-                    return OptimizationResult::PassOn;
-                }
-                PtrInfo::ForcedStruct(vinfo) => {
-                    set_field(&mut vinfo.fields, field_idx, value_ref);
-                    if let Some(descr) = &op.descr {
-                        set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
-                    }
-                    return OptimizationResult::PassOn;
-                }
                 _ => {}
             }
             if info.is_virtual() {
@@ -613,8 +581,6 @@ impl OptVirtualize {
             let field_val = match info {
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
-                PtrInfo::ForcedVirtual(vinfo) => get_field(&vinfo.fields, field_idx),
-                PtrInfo::ForcedStruct(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::Virtualizable(vstate) => get_field(&vstate.fields, field_idx),
                 _ => None,
             };
@@ -1168,10 +1134,16 @@ impl OptVirtualize {
                 continue;
             };
             *slot = Some(match info {
-                PtrInfo::ForcedVirtual(vinfo) => PtrInfo::KnownClass {
-                    class_ptr: vinfo.known_class.unwrap_or(majit_ir::GcRef::NULL),
-                    is_nonnull: true,
-                },
+                PtrInfo::ForcedVirtual(vinfo) => {
+                    if let Some(class_ptr) = vinfo.known_class {
+                        PtrInfo::KnownClass {
+                            class_ptr,
+                            is_nonnull: true,
+                        }
+                    } else {
+                        PtrInfo::NonNull
+                    }
+                }
                 PtrInfo::ForcedStruct(_) => PtrInfo::NonNull,
                 other => other,
             });
@@ -2309,45 +2281,10 @@ mod tests {
         assert_eq!(result.last().unwrap().opcode, OpCode::CallN);
     }
 
-    #[test]
-    fn test_forced_virtual_struct_keeps_field_cache_after_guard() {
-        // p0 = new(descr=size1)
-        // setfield_gc(p0, i10, descr=field1)
-        // guard_value(i0, i1) [p0]   <- force p0 into fail_args, but no side effect
-        // i2 = getfield_gc_i(p0, descr=field1)
-        //
-        // After forcing, the concrete struct should still carry cached field
-        // info so the trailing GETFIELD can forward to i10.
-        let sd = size_descr(1);
-        let fd = field_descr(10);
-        let mut guard = Op::new(OpCode::GuardValue, &[OpRef(200), OpRef(201)]);
-        guard.fail_args = Some(Default::default());
-        guard.fail_args.as_mut().unwrap().push(OpRef(0));
-
-        let mut ops = vec![
-            Op::with_descr(OpCode::New, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            guard,
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd.clone()),
-        ];
-        assign_positions(&mut ops);
-
-        let result = run_pass(&ops);
-        let getfield_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::GetfieldGcI)
-            .count();
-        assert_eq!(
-            getfield_count,
-            0,
-            "forced struct field cache should remove trailing GETFIELD; got ops: {:?}",
-            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
-        );
-        assert!(
-            result.iter().any(|o| o.opcode == OpCode::GuardValue),
-            "guard should still be emitted"
-        );
-    }
+    // Note: forced struct field forwarding is handled by heap.rs caching,
+    // not by virtualize.rs PtrInfo tracking. RPython's info.py doesn't
+    // have a "ForcedVirtual" state — force_box just materializes the
+    // object and heap.py caches the field values independently.
 
     #[test]
     fn test_virtual_array_forced_at_jump() {
