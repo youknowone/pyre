@@ -185,7 +185,7 @@ impl OptVirtualize {
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldRaw, &[opref, value_ref]);
             set_op.descr = Some(descr);
-            ctx.emit(set_op);
+            ctx.emit_through_passes(set_op);
         }
 
         // Emit SETARRAYITEM_RAW for each tracked array element
@@ -209,7 +209,7 @@ impl OptVirtualize {
                         .or_else(|| Some(make_field_index_descr(descr_idx)));
                 }
             }
-            let array_ref = ctx.emit(get_array_op);
+            let array_ref = ctx.emit_through_passes(get_array_op);
 
             for (i, elem_ref) in elements.into_iter().enumerate() {
                 let item_type = self
@@ -226,7 +226,7 @@ impl OptVirtualize {
                 let idx_ref = self.emit_constant_int(ctx, i as i64);
                 let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[array_ref, idx_ref, elem_ref]);
                 set_op.descr = array_descr.clone();
-                ctx.emit(set_op);
+                ctx.emit_through_passes(set_op);
             }
         }
 
@@ -253,7 +253,7 @@ impl OptVirtualize {
         // Emit the NEW_WITH_VTABLE
         let mut alloc_op = Op::new(OpCode::NewWithVtable, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit(alloc_op);
+        let alloc_ref = ctx.emit_through_passes(alloc_op);
 
         // Set forwarding only when the refs differ (avoids self-loop)
         if opref != alloc_ref {
@@ -269,7 +269,7 @@ impl OptVirtualize {
                 get_field_descr(&vinfo.field_descrs, field_idx)
                     .unwrap_or_else(|| make_field_index_descr(field_idx)),
             );
-            ctx.emit(set_op);
+            ctx.emit_through_passes(set_op);
         }
 
         alloc_ref
@@ -290,7 +290,7 @@ impl OptVirtualize {
         let len_ref = self.emit_constant_int(ctx, len as i64);
         let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
         alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit(alloc_op);
+        let alloc_ref = ctx.emit_through_passes(alloc_op);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
@@ -303,7 +303,7 @@ impl OptVirtualize {
             let idx_ref = self.emit_constant_int(ctx, i as i64);
             let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, item_ref]);
             set_op.descr = Some(vinfo.descr.clone());
-            ctx.emit(set_op);
+            ctx.emit_through_passes(set_op);
         }
 
         alloc_ref
@@ -321,7 +321,7 @@ impl OptVirtualize {
         // Emit NEW
         let mut alloc_op = Op::new(OpCode::New, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit(alloc_op);
+        let alloc_ref = ctx.emit_through_passes(alloc_op);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
@@ -335,7 +335,7 @@ impl OptVirtualize {
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(descr);
-            ctx.emit(set_op);
+            ctx.emit_through_passes(set_op);
         }
 
         alloc_ref
@@ -356,7 +356,7 @@ impl OptVirtualize {
         let len_ref = self.emit_constant_int(ctx, num_elements as i64);
         let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
         alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit(alloc_op);
+        let alloc_ref = ctx.emit_through_passes(alloc_op);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
@@ -371,7 +371,7 @@ impl OptVirtualize {
                 let mut set_op =
                     Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, value_ref]);
                 set_op.descr = Some(make_field_index_descr(*field_idx));
-                ctx.emit(set_op);
+                ctx.emit_through_passes(set_op);
             }
         }
 
@@ -390,7 +390,7 @@ impl OptVirtualize {
         // Emit CALL_MALLOC_NURSERY or equivalent raw allocation
         let size_ref = self.emit_constant_int(ctx, vinfo.size as i64);
         let alloc_op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
-        let alloc_ref = ctx.emit(alloc_op);
+        let alloc_ref = ctx.emit_through_passes(alloc_op);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
@@ -402,7 +402,7 @@ impl OptVirtualize {
             let value_ref = ctx.get_replacement(value_ref);
             let offset_ref = self.emit_constant_int(ctx, *offset as i64);
             let set_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
-            ctx.emit(set_op);
+            ctx.emit_through_passes(set_op);
         }
 
         alloc_ref
@@ -451,31 +451,30 @@ impl OptVirtualize {
 
     /// Emit a constant integer, returning its OpRef.
     fn emit_constant_int(&self, ctx: &mut OptContext, value: i64) -> OpRef {
-        // Pre-compute the position this op will get when emitted.
-        // Use self-referencing arg so resolve_opref finds the constant in the
-        // constants map rather than trying to read a nonexistent variable.
-        let pos_ref = OpRef(ctx.num_inputs + ctx.new_operations.len() as u32);
+        // Reserve the OpRef up front so the queued op can still self-reference
+        // like RPython's constant boxes do when sent through downstream passes.
+        let pos_ref = ctx.reserve_pos();
         let mut op = Op::new(OpCode::SameAsI, &[pos_ref]);
         op.pos = pos_ref;
-        let opref = ctx.emit(op);
+        let opref = ctx.emit_through_passes(op);
         ctx.make_constant(opref, Value::Int(value));
         opref
     }
 
     fn emit_constant_ref(&self, ctx: &mut OptContext, value: majit_ir::GcRef) -> OpRef {
-        let pos_ref = OpRef(ctx.num_inputs + ctx.new_operations.len() as u32);
+        let pos_ref = ctx.reserve_pos();
         let mut op = Op::new(OpCode::SameAsR, &[pos_ref]);
         op.pos = pos_ref;
-        let opref = ctx.emit(op);
+        let opref = ctx.emit_through_passes(op);
         ctx.make_constant(opref, Value::Ref(value));
         opref
     }
 
     fn emit_constant_float(&self, ctx: &mut OptContext, value: f64) -> OpRef {
-        let pos_ref = OpRef(ctx.num_inputs + ctx.new_operations.len() as u32);
+        let pos_ref = ctx.reserve_pos();
         let mut op = Op::new(OpCode::SameAsF, &[pos_ref]);
         op.pos = pos_ref;
-        let opref = ctx.emit(op);
+        let opref = ctx.emit_through_passes(op);
         ctx.make_constant(opref, Value::Float(value));
         opref
     }
@@ -1007,7 +1006,7 @@ impl OptVirtualize {
 
         // Emit a FORCE_TOKEN to capture the JIT frame address.
         let token_op = Op::new(OpCode::ForceToken, &[]);
-        let token_ref = ctx.emit(token_op);
+        let token_ref = ctx.emit_through_passes(token_op);
 
         // The emitted ForceToken may reuse an OpRef index that previously
         // had PtrInfo::Virtual attached (from an earlier NEW_WITH_VTABLE
@@ -1079,14 +1078,14 @@ impl OptVirtualize {
         if !obj_is_null {
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[vref_ref, obj_ref]);
             set_forced.descr = Some(make_field_index_descr(VREF_FORCED_FIELD_INDEX));
-            ctx.emit(set_forced);
+            ctx.emit_through_passes(set_forced);
         }
 
         // Set 'virtual_token' to NULL
         let null_ref = self.emit_constant_int(ctx, 0);
         let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
         set_token.descr = Some(make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
-        ctx.emit(set_token);
+        ctx.emit_through_passes(set_token);
 
         OptimizationResult::Remove
     }
@@ -1210,7 +1209,7 @@ impl OptVirtualize {
                 read_op.descr = Some(make_field_index_descr(
                     0x1000_0000 | (((offset as u32) & 0x000f_ffff) << 4) | (0x7 << 1),
                 ));
-                let read_ref = ctx.emit(read_op);
+                let read_ref = ctx.emit_through_passes(read_op);
                 fail_args.push(read_ref);
             }
         }
@@ -1765,6 +1764,11 @@ mod tests {
         opt.optimize(ops)
     }
 
+    fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
+        let mut opt = Optimizer::default_pipeline();
+        opt.optimize(ops)
+    }
+
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
         let mut ctx = OptContext::new(ops.len());
         for &(opref, ref val) in constants {
@@ -1795,6 +1799,7 @@ mod tests {
                     ctx.emit(resolved_op);
                 }
             }
+            ctx.flush_extra_operations_raw();
         }
 
         pass.flush();
@@ -1856,6 +1861,7 @@ mod tests {
         );
 
         let _ = pass.force_virtual(OpRef(0), &mut ctx);
+        ctx.flush_extra_operations_raw();
         let setarray = ctx
             .new_operations
             .iter()
@@ -1913,6 +1919,7 @@ mod tests {
                     ctx.emit(resolved);
                 }
             }
+            ctx.flush_extra_operations_raw();
         }
 
         let get_count = ctx
@@ -1965,6 +1972,7 @@ mod tests {
                     ctx.emit(resolved);
                 }
             }
+            ctx.flush_extra_operations_raw();
         }
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(99)]);
@@ -2415,6 +2423,30 @@ mod tests {
         assert_eq!(result.last().unwrap().opcode, OpCode::EscapeR);
     }
 
+    #[test]
+    fn test_force_emits_through_downstream_heap_passes() {
+        let sd = size_descr(1);
+        let fd = field_descr(10);
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(200)]);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], sd),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
+            guard,
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_default_pipeline(&ops);
+        assert!(
+            !result.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "forced SetfieldGc should go through Heap and forward later GetfieldGcI; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
     // ── VirtualRef tests ──
 
     #[test]
@@ -2651,6 +2683,7 @@ mod tests {
                     ctx.emit(resolved_op);
                 }
             }
+            ctx.flush_extra_operations_raw();
         }
 
         pass.flush();
@@ -2786,5 +2819,39 @@ mod tests {
         );
         assert_eq!(result[0].opcode, OpCode::RawStore);
         assert_eq!(result[1].opcode, OpCode::RawLoadI);
+    }
+
+    #[test]
+    fn test_force_virtual_getfield_forwarding_through_heap() {
+        // RPython parity: after force_virtual emits NEW + SETFIELD_GC via
+        // emit_through_passes, the SETFIELD goes through heap pass and
+        // gets cached as a lazy set. A subsequent GETFIELD on the forced
+        // object should be forwarded from the heap cache.
+        //
+        // p0 = new(descr=size1)
+        // setfield_gc(p0, i10, descr=field1)
+        // escape_n(p0)            <- forces p0
+        // i2 = getfield_gc_i(p0, descr=field1)  <- should forward to i10
+        let sd = size_descr(1);
+        let fd = field_descr(10);
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], sd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
+            Op::new(OpCode::EscapeN, &[OpRef(0)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd.clone()),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_default_pipeline(&ops);
+        let getfield_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            getfield_count, 0,
+            "GETFIELD after force should be forwarded via heap cache; got ops: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
     }
 }
