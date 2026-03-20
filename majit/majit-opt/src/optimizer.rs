@@ -507,15 +507,8 @@ impl Optimizer {
         // RPython unroll.py:479-504: import_state — inject virtual info from Phase 1.
         // Tells OptVirtualize that certain inputargs are virtual objects.
         if !self.imported_virtuals.is_empty() {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[jit] import_state: {} imported virtuals", self.imported_virtuals.len());
-            }
             for iv in &self.imported_virtuals {
                 let opref = OpRef(iv.inputarg_index as u32);
-                if std::env::var_os("MAJIT_LOG").is_some() {
-                    let field_info: Vec<_> = iv.fields.iter().map(|(d, idx)| format!("descr={} -> inputarg {}", d.index(), idx)).collect();
-                    eprintln!("[jit]   v{} = VirtualStruct(size={}, fields=[{}])", iv.inputarg_index, iv.size_descr.index(), field_info.join(", "));
-                }
                 let mut fields = Vec::new();
                 let mut field_descrs = Vec::new();
                 for (descr, field_inputarg_idx) in &iv.fields {
