@@ -182,7 +182,11 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        for (key, op) in pending {
+        for (key, mut op) in pending {
+            // Resolve forwarding — virtual refs may have been forced by now
+            for arg in &mut op.args {
+                *arg = ctx.get_replacement(*arg);
+            }
             let value_ref = op.arg(1);
             ctx.emit(op);
             self.cached_fields.insert(key, value_ref);
@@ -192,8 +196,10 @@ impl OptHeap {
     /// Force all pending lazy setarrayitems: emit the stored ops and cache their values.
     fn force_all_lazy_setarrayitems(&mut self, ctx: &mut OptContext) {
         let pending: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
-        for (key, op) in pending {
-            // The written value is the third arg of SETARRAYITEM_GC.
+        for (key, mut op) in pending {
+            for arg in &mut op.args {
+                *arg = ctx.get_replacement(*arg);
+            }
             let value_ref = op.arg(2);
             ctx.emit(op);
             self.cached_arrayitems.insert(key, value_ref);
@@ -220,9 +226,13 @@ impl OptHeap {
         // Force lazy setfields: virtual values → pendingfields, rest → emit
         let field_entries: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
         for (key, op) in field_entries {
-            let value_ref = op.arg(1);
-            // Check if the value being set is virtual (unescaped allocation)
-            if self.unescaped.contains(&value_ref) {
+            let value_ref = ctx.get_replacement(op.arg(1));
+            // heap.py: if value is virtual or unescaped, defer to pendingfields
+            let is_virtual = matches!(
+                ctx.get_ptr_info(value_ref),
+                Some(info) if info.is_virtual()
+            );
+            if is_virtual || self.unescaped.contains(&value_ref) {
                 pendingfields.push(op);
             } else {
                 ctx.emit(op);
@@ -235,12 +245,12 @@ impl OptHeap {
         // (only the stored value can be virtual/unescaped).
         let array_entries: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
         for (key, op) in array_entries {
-            debug_assert!(
-                !self.unescaped.contains(&op.arg(0)),
-                "lazy setarrayitem target must not be virtual/unescaped"
+            let value_ref = ctx.get_replacement(op.arg(2));
+            let is_virtual = matches!(
+                ctx.get_ptr_info(value_ref),
+                Some(info) if info.is_virtual()
             );
-            let value_ref = op.arg(2);
-            if self.unescaped.contains(&value_ref) {
+            if is_virtual || self.unescaped.contains(&value_ref) {
                 pendingfields.push(op);
             } else {
                 ctx.emit(op);
@@ -540,6 +550,7 @@ impl OptHeap {
         }
 
         if let Some(&cached) = ctx.imported_short_fields.get(&key) {
+            ctx.note_imported_short_use(cached);
             self.cached_fields.entry(key).or_insert(cached);
         }
 
@@ -644,6 +655,7 @@ impl OptHeap {
                 return OptimizationResult::Remove;
             }
             if let Some(&cached) = ctx.imported_short_arrayitems.get(&key) {
+                ctx.note_imported_short_use(cached);
                 self.cached_arrayitems.entry(key).or_insert(cached);
             }
             if let Some(&cached) = self.cached_arrayitems.get(&key) {
@@ -1193,27 +1205,13 @@ impl Optimization for OptHeap {
     }
 
     fn flush(&mut self) {
-        // All lazy sets should have been forced by the final op (Jump/Finish).
-        // Clear state as a safety measure.
+        // RPython parity: flush pending state without discarding the heap cache.
+        // export_state() runs after flush() and still expects cached field/array
+        // reads to be available for short preamble construction.
         debug_assert!(
             self.lazy_setfields.is_empty() && self.lazy_setarrayitems.is_empty(),
             "OptHeap: unflushed lazy sets at end of trace"
         );
-        self.cached_fields.clear();
-        self.immutable_cached_fields.clear();
-        self.lazy_setfields.clear();
-        self.cached_arrayitems.clear();
-        self.lazy_setarrayitems.clear();
-        self.immutable_field_descrs.clear();
-        self.seen_allocation.clear();
-        self.unescaped.clear();
-        self.known_nonnull.clear();
-        self.loopinvariant_cache.clear();
-        self.last_call_did_not_raise = false;
-        self.quasi_immut_cache.clear();
-        self.cached_arraylens.clear();
-        self.cached_arrayitems_var.clear();
-        self.array_min_lengths.clear();
     }
 
     /// heap.py: produce_potential_short_preamble_ops(sb)
@@ -1225,31 +1223,25 @@ impl Optimization for OptHeap {
             if cached_val.is_none() || obj.is_none() {
                 continue;
             }
-            let Some(label_arg_idx) = sb.lookup_label_arg(cached_val) else {
-                continue;
-            };
             if sb.lookup_label_arg(obj).is_none() {
                 continue;
             }
             let mut op = Op::new(OpCode::GetfieldGcI, &[obj]);
             op.pos = cached_val;
-            sb.add_heap_op(label_arg_idx, op, descr_idx);
+            sb.add_heap_op(op, descr_idx);
         }
 
         for (&(obj, descr_idx, index), &cached_val) in &self.cached_arrayitems {
             if cached_val.is_none() || obj.is_none() {
                 continue;
             }
-            let Some(label_arg_idx) = sb.lookup_label_arg(cached_val) else {
-                continue;
-            };
             if sb.lookup_label_arg(obj).is_none() {
                 continue;
             }
             let idx_ref = OpRef(index as u32);
             let mut op = Op::new(OpCode::GetarrayitemGcI, &[obj, idx_ref]);
             op.pos = cached_val;
-            sb.add_heap_op(label_arg_idx, op, descr_idx);
+            sb.add_heap_op(op, descr_idx);
         }
     }
 
