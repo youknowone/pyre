@@ -255,7 +255,7 @@ pub fn trace_int_compare(
     ctx.record_op(opcode, &[a_val, b_val])
 }
 
-/// Unbox a Python float object: emit GuardClass + GetfieldRawF.
+/// Unbox a Python float object: emit GuardClass + GetfieldGcF.
 ///
 /// Returns the raw f64 OpRef.
 pub fn trace_unbox_float(
@@ -267,16 +267,16 @@ pub fn trace_unbox_float(
     fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let ob_type = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], ob_type_descr);
+    let ob_type = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], ob_type_descr);
     let type_const = ctx.const_int(float_type_addr);
     ctx.record_guard_typed_with_fail_args(
         OpCode::GuardClass, &[ob_type, type_const],
         vec![majit_ir::Type::Int; fail_args.len()], fail_args,
     );
-    ctx.record_op_with_descr(OpCode::GetfieldRawF, &[obj], floatval_descr)
+    ctx.record_op_with_descr(OpCode::GetfieldGcF, &[obj], floatval_descr)
 }
 
-/// Box a raw f64 into a Python float object: emit ConvertFloatBytesToLonglong + New + SetfieldRaw.
+/// Box a raw f64 into a Python float object: emit New + SetfieldGc.
 pub fn trace_box_float(
     ctx: &mut majit_meta::TraceCtx,
     value: majit_ir::OpRef,
@@ -286,11 +286,10 @@ pub fn trace_box_float(
     float_type_addr: i64,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let bits = ctx.record_op(OpCode::ConvertFloatBytesToLonglong, &[value]);
     let obj = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
     let type_ptr = ctx.const_int(float_type_addr);
-    ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, type_ptr], ob_type_descr);
-    ctx.record_op_with_descr(OpCode::SetfieldRaw, &[obj, bits], floatval_descr);
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, type_ptr], ob_type_descr);
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], floatval_descr);
     obj
 }
 

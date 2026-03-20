@@ -13,7 +13,7 @@ use majit_trace::warmstate::{HotResult, WarmEnterState};
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state};
 use crate::compile;
 pub use crate::compile::{
-    CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout, CompileResult,
+    CompileResult, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
     DeadFrameArtifacts, RawCompileResult,
 };
 use crate::io_buffer;
@@ -37,7 +37,6 @@ pub enum BackEdgeAction {
     /// Compiled code exists. Call `run_compiled()`.
     RunCompiled,
 }
-
 
 /// Per-guard failure tracking for bridge compilation decisions.
 pub(crate) struct GuardFailureInfo {
@@ -1220,18 +1219,27 @@ impl<M: Clone> MetaInterp<M> {
         // inputargs. Extra boxes introduced by peeling live at the loop
         // LABEL/JUMP boundary, not at the external entry point.
         let mut inputargs = trace.inputargs.clone();
-        let jump_arg_count = optimized_ops
+        let last_jump = optimized_ops
             .iter()
             .rev()
-            .find(|op| op.opcode == majit_ir::OpCode::Jump)
-            .map(|op| op.args.len())
-            .unwrap_or(0);
-
-        let label_arg_count = optimized_ops
+            .find(|op| op.opcode == majit_ir::OpCode::Jump);
+        let jump_arg_count = last_jump.map(|op| op.args.len()).unwrap_or(0);
+        let label_op = optimized_ops
             .iter()
-            .find(|op| op.opcode == majit_ir::OpCode::Label)
-            .map(|op| op.args.len())
-            .unwrap_or(0);
+            .rev()
+            .find(|op| op.opcode == majit_ir::OpCode::Label);
+        let label_arg_count = label_op.map(|op| op.args.len()).unwrap_or(0);
+        let label_descr_index = label_op
+            .and_then(|op| op.descr.as_ref())
+            .map(|descr| descr.index());
+        let jump_targets_current_loop = last_jump.is_some_and(|op| {
+            let jump_descr_index = op.descr.as_ref().map(|descr| descr.index());
+            match (jump_descr_index, label_descr_index) {
+                (Some(jump_idx), Some(label_idx)) => jump_idx == label_idx,
+                (None, None) => true,
+                _ => false,
+            }
+        });
         // When preamble peeling is not active, there's no Label op.
         // In that case, inputargs serve as the loop entry contract.
         // Extend Label or insert one to match Jump arity.
@@ -1250,7 +1258,7 @@ impl<M: Clone> MetaInterp<M> {
                     index: inputargs.len() as u32,
                 });
             }
-        } else if label_arg_count != jump_arg_count {
+        } else if jump_targets_current_loop && label_arg_count != jump_arg_count {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] abort compile: optimized label/jump arity mismatch label={} jump={}",

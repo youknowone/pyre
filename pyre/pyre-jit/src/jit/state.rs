@@ -105,6 +105,11 @@ pub struct PyreSym {
     /// When set, symbolic_locals[i] = OpRef(vable_array_base + i),
     /// symbolic_stack[j] = OpRef(vable_array_base + nlocals + j).
     pub(crate) vable_array_base: Option<u32>,
+    /// RPython goto_if_not fusion: cached raw truth OpRef from the
+    /// most recent int/float comparison. POP_JUMP_IF_FALSE/TRUE
+    /// consumes this to emit GUARD_TRUE/GUARD_FALSE directly,
+    /// bypassing bool object creation.
+    pub(crate) last_comparison_truth: Option<OpRef>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -439,6 +444,7 @@ impl PyreSym {
             vable_valuestackdepth: OpRef::NONE,
             symbolic_namespace_slots: std::collections::HashMap::new(),
             vable_array_base: None,
+            last_comparison_truth: None,
         }
     }
 
@@ -1014,6 +1020,44 @@ impl TraceFrameState {
         self.guard_value(ctx, strategy, expected);
     }
 
+    /// PyPy list strategies index directly into unwrapped storage with the
+    /// runtime integer index; they do not specialize every list access to an
+    /// exact constant key. We follow that model here and only guard the
+    /// key's sign/bounds for the current trace.
+    fn trace_dynamic_list_index(
+        &mut self,
+        ctx: &mut TraceCtx,
+        key: OpRef,
+        len: OpRef,
+        concrete_key: i64,
+    ) -> OpRef {
+        let fail_args = self.current_fail_args(ctx);
+        let raw_index = crate::jit::generated::trace_unbox_int(
+            ctx,
+            key,
+            &INT_TYPE as *const _ as i64,
+            ob_type_descr(),
+            int_intval_descr(),
+            &fail_args,
+        );
+        let zero = ctx.const_int(0);
+        if concrete_key >= 0 {
+            let nonnegative = ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
+            self.record_guard(ctx, OpCode::GuardTrue, &[nonnegative]);
+            let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, len]);
+            self.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+            raw_index
+        } else {
+            let negative = ctx.record_op(OpCode::IntLt, &[raw_index, zero]);
+            self.record_guard(ctx, OpCode::GuardTrue, &[negative]);
+            let normalized = ctx.record_op(OpCode::IntAddOvf, &[len, raw_index]);
+            self.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
+            let in_bounds = ctx.record_op(OpCode::IntGe, &[normalized, zero]);
+            self.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+            normalized
+        }
+    }
+
     fn trace_direct_tuple_getitem(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1072,12 +1116,10 @@ impl TraceFrameState {
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 0);
-        self.guard_int_object_value(ctx, key, concrete_index as i64);
         let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_len_descr());
-        self.guard_len_gt_index(ctx, len, concrete_index);
+        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_ptr_descr());
-        let index = ctx.const_int(concrete_index as i64);
         trace_raw_array_getitem_value(ctx, items_ptr, index)
     }
 
@@ -1087,20 +1129,17 @@ impl TraceFrameState {
         obj: OpRef,
         key: OpRef,
         concrete_key: i64,
-        concrete_len: usize,
+        _concrete_len: usize,
     ) -> OpRef {
-        let normalized = (concrete_len as i64 + concrete_key) as usize;
         let actual_type =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 0);
-        self.guard_int_object_value(ctx, key, concrete_key);
         let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_len_descr());
-        self.guard_len_eq(ctx, len, concrete_len);
+        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_ptr_descr());
-        let index = ctx.const_int(normalized as i64);
         trace_raw_array_getitem_value(ctx, items_ptr, index)
     }
 
@@ -1116,13 +1155,11 @@ impl TraceFrameState {
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 1);
-        self.guard_int_object_value(ctx, key, concrete_index as i64);
         let len =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_len_descr());
-        self.guard_len_gt_index(ctx, len, concrete_index);
+        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_ptr_descr());
-        let index = ctx.const_int(concrete_index as i64);
         let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
         box_traced_raw_int(ctx, raw)
     }
@@ -1133,21 +1170,18 @@ impl TraceFrameState {
         obj: OpRef,
         key: OpRef,
         concrete_key: i64,
-        concrete_len: usize,
+        _concrete_len: usize,
     ) -> OpRef {
-        let normalized = (concrete_len as i64 + concrete_key) as usize;
         let actual_type =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 1);
-        self.guard_int_object_value(ctx, key, concrete_key);
         let len =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_len_descr());
-        self.guard_len_eq(ctx, len, concrete_len);
+        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_ptr_descr());
-        let index = ctx.const_int(normalized as i64);
         let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
         box_traced_raw_int(ctx, raw)
     }
@@ -1164,13 +1198,11 @@ impl TraceFrameState {
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 2);
-        self.guard_int_object_value(ctx, key, concrete_index as i64);
         let len =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_len_descr());
-        self.guard_len_gt_index(ctx, len, concrete_index);
+        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_ptr_descr());
-        let index = ctx.const_int(concrete_index as i64);
         let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
         box_traced_raw_float(ctx, raw)
     }
@@ -1181,21 +1213,18 @@ impl TraceFrameState {
         obj: OpRef,
         key: OpRef,
         concrete_key: i64,
-        concrete_len: usize,
+        _concrete_len: usize,
     ) -> OpRef {
-        let normalized = (concrete_len as i64 + concrete_key) as usize;
         let actual_type =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 2);
-        self.guard_int_object_value(ctx, key, concrete_key);
         let len =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_len_descr());
-        self.guard_len_eq(ctx, len, concrete_len);
+        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_ptr_descr());
-        let index = ctx.const_int(normalized as i64);
         let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
         box_traced_raw_float(ctx, raw)
     }
@@ -1535,6 +1564,9 @@ impl TraceFrameState {
                         int_intval_descr(),
                         &fail_args,
                     );
+                    // RPython goto_if_not fusion: cache truth for
+                    // the next POP_JUMP_IF to consume directly.
+                    this.sym_mut().last_comparison_truth = Some(truth);
                     Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
                 });
             }
@@ -1560,6 +1592,7 @@ impl TraceFrameState {
                         float_floatval_descr(),
                         &fail_args,
                     );
+                    this.sym_mut().last_comparison_truth = Some(truth);
                     Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
                 });
             }
@@ -1604,19 +1637,17 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 0);
-                            this.guard_int_object_value(ctx, key, index as i64);
                             let len = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
                                 list_items_len_descr(),
                             );
-                            this.guard_len_gt_index(ctx, len, index);
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
                             let items_ptr = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
                                 list_items_ptr_descr(),
                             );
-                            let index = ctx.const_int(index as i64);
                             trace_raw_array_setitem_value(ctx, items_ptr, index, value);
                             Ok(())
                         });
@@ -1626,7 +1657,6 @@ impl TraceFrameState {
                     .and_then(|value| usize::try_from(value).ok())
                 {
                     if abs_index <= concrete_len {
-                        let normalized = concrete_len - abs_index;
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
@@ -1641,19 +1671,17 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 0);
-                            this.guard_int_object_value(ctx, key, index);
                             let len = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
                                 list_items_len_descr(),
                             );
-                            this.guard_len_eq(ctx, len, concrete_len);
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
                             let items_ptr = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
                                 list_items_ptr_descr(),
                             );
-                            let index = ctx.const_int(normalized as i64);
                             trace_raw_array_setitem_value(ctx, items_ptr, index, value);
                             Ok(())
                         });
@@ -1683,13 +1711,12 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 1);
-                            this.guard_int_object_value(ctx, key, index as i64);
                             let len = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
                                 list_int_items_len_descr(),
                             );
-                            this.guard_len_gt_index(ctx, len, index);
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
                             let items_ptr = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
@@ -1704,7 +1731,6 @@ impl TraceFrameState {
                                 int_intval_descr(),
                                 &fail_args,
                             );
-                            let index = ctx.const_int(index as i64);
                             trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
                         });
@@ -1714,7 +1740,6 @@ impl TraceFrameState {
                     .and_then(|value| usize::try_from(value).ok())
                 {
                     if abs_index <= concrete_len {
-                        let normalized = concrete_len - abs_index;
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
@@ -1729,13 +1754,12 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 1);
-                            this.guard_int_object_value(ctx, key, index);
                             let len = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
                                 list_int_items_len_descr(),
                             );
-                            this.guard_len_eq(ctx, len, concrete_len);
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
                             let items_ptr = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
@@ -1750,7 +1774,6 @@ impl TraceFrameState {
                                 int_intval_descr(),
                                 &fail_args,
                             );
-                            let index = ctx.const_int(normalized as i64);
                             trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
                         });
@@ -1780,13 +1803,12 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 2);
-                            this.guard_int_object_value(ctx, key, index as i64);
                             let len = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
                                 list_float_items_len_descr(),
                             );
-                            this.guard_len_gt_index(ctx, len, index);
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
                             let items_ptr = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
@@ -1801,7 +1823,6 @@ impl TraceFrameState {
                                 float_floatval_descr(),
                                 &fail_args,
                             );
-                            let index = ctx.const_int(index as i64);
                             trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
                         });
@@ -1811,7 +1832,6 @@ impl TraceFrameState {
                     .and_then(|value| usize::try_from(value).ok())
                 {
                     if abs_index <= concrete_len {
-                        let normalized = concrete_len - abs_index;
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
@@ -1826,13 +1846,12 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 2);
-                            this.guard_int_object_value(ctx, key, index);
                             let len = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
                                 list_float_items_len_descr(),
                             );
-                            this.guard_len_eq(ctx, len, concrete_len);
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
                             let items_ptr = ctx.record_op_with_descr(
                                 OpCode::GetfieldRawI,
                                 &[obj],
@@ -1847,7 +1866,6 @@ impl TraceFrameState {
                                 float_floatval_descr(),
                                 &fail_args,
                             );
-                            let index = ctx.const_int(normalized as i64);
                             trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
                         });
@@ -3019,6 +3037,14 @@ impl TraceFrameState {
     }
 
     pub(crate) fn truth_value_direct(&mut self, value: OpRef) -> Result<OpRef, PyError> {
+        // RPython goto_if_not fusion: if the previous op was a comparison,
+        // use the cached raw truth (0/1) directly instead of unboxing the
+        // bool object. This eliminates the CallI(bool_helper) + GetfieldGcI
+        // round-trip, matching RPython's fused goto_if_not_int_lt pattern.
+        if let Some(truth) = self.sym_mut().last_comparison_truth.take() {
+            return Ok(truth);
+        }
+
         let Some(concrete_value) = self.concrete_popped_value() else {
             return self.trace_truth_value(value);
         };
@@ -3183,6 +3209,19 @@ impl TraceFrameState {
             return TraceAction::Abort;
         };
 
+        // RPython goto_if_not fusion: invalidate comparison truth cache
+        // unless this instruction is POP_JUMP_IF_FALSE/TRUE (the consumer).
+        // RPython's codewriter fuses COMPARE+BRANCH into one op, so there's
+        // no intermediate instruction. In pyre they're separate bytecodes,
+        // so we keep the cache alive only for the immediately following jump.
+        if !matches!(
+            instruction,
+            pyre_bytecode::bytecode::Instruction::PopJumpIfFalse { .. }
+                | pyre_bytecode::bytecode::Instruction::PopJumpIfTrue { .. }
+        ) {
+            self.sym_mut().last_comparison_truth = None;
+        }
+
         self.prepare_fallthrough();
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
         self.into_trace_action(step_result)
@@ -3200,6 +3239,15 @@ impl TraceFrameState {
         let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
             return InlineTraceStepAction::Trace(TraceAction::Abort);
         };
+
+        // RPython goto_if_not: invalidate truth cache for non-jump instructions.
+        if !matches!(
+            instruction,
+            pyre_bytecode::bytecode::Instruction::PopJumpIfFalse { .. }
+                | pyre_bytecode::bytecode::Instruction::PopJumpIfTrue { .. }
+        ) {
+            self.sym_mut().last_comparison_truth = None;
+        }
 
         self.prepare_fallthrough();
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);

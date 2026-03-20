@@ -12,10 +12,17 @@ mod tests {
     fn intval_descr() -> majit_ir::DescrRef {
         make_field_descr(8, 8, majit_ir::Type::Int, true)
     }
+    fn floatval_descr() -> majit_ir::DescrRef {
+        make_field_descr(8, 8, majit_ir::Type::Float, false)
+    }
     fn w_int_size_descr() -> majit_ir::DescrRef {
         make_size_descr(16)
     }
+    fn w_float_size_descr() -> majit_ir::DescrRef {
+        make_size_descr(16)
+    }
     const FAKE_INT_TYPE: i64 = 0x1234_5678;
+    const FAKE_FLOAT_TYPE: i64 = 0x1234_9876;
 
     /// Get ops from TraceCtx, excluding the dummy Finish we add for finalization.
     fn get_ops(ctx: TraceCtx) -> Vec<OpCode> {
@@ -47,9 +54,9 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                OpCode::GetfieldRawI,
+                OpCode::GetfieldGcI,
                 OpCode::GuardClass,
-                OpCode::GetfieldRawI,
+                OpCode::GetfieldGcI,
             ]
         );
         eprintln!("✓ trace_unbox_int: {:?}", ops);
@@ -69,7 +76,7 @@ mod tests {
         let ops = get_ops(ctx);
         assert_eq!(
             ops,
-            vec![OpCode::New, OpCode::SetfieldRaw, OpCode::SetfieldRaw,]
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::SetfieldGc,]
         );
         eprintln!("✓ trace_box_int: {:?}", ops);
     }
@@ -92,19 +99,95 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                OpCode::GetfieldRawI,
+                OpCode::GetfieldGcI,
                 OpCode::GuardClass,
-                OpCode::GetfieldRawI, // unbox a
-                OpCode::GetfieldRawI,
+                OpCode::GetfieldGcI, // unbox a
+                OpCode::GetfieldGcI,
                 OpCode::GuardClass,
-                OpCode::GetfieldRawI, // unbox b
+                OpCode::GetfieldGcI, // unbox b
                 OpCode::IntAddOvf,
                 OpCode::GuardNoOverflow, // add + guard
                 OpCode::New,
-                OpCode::SetfieldRaw,
-                OpCode::SetfieldRaw, // box
+                OpCode::SetfieldGc,
+                OpCode::SetfieldGc, // box
             ]
         );
         eprintln!("✓ trace_int_binop_ovf: {} ops", ops.len());
+    }
+
+    #[test]
+    fn test_unbox_float_ops() {
+        let mut ctx = TraceCtx::for_test(1);
+        let obj = OpRef(0);
+        let _floatval = crate::trace_unbox_float(
+            &mut ctx,
+            obj,
+            FAKE_FLOAT_TYPE,
+            ob_type_descr(),
+            floatval_descr(),
+            &[obj],
+        );
+        let ops = get_ops(ctx);
+        assert_eq!(
+            ops,
+            vec![
+                OpCode::GetfieldGcI,
+                OpCode::GuardClass,
+                OpCode::GetfieldGcF,
+            ]
+        );
+        eprintln!("✓ trace_unbox_float: {:?}", ops);
+    }
+
+    #[test]
+    fn test_box_float_ops() {
+        let mut ctx = TraceCtx::for_test(1);
+        let _obj = crate::trace_box_float(
+            &mut ctx,
+            OpRef(0),
+            w_float_size_descr(),
+            ob_type_descr(),
+            floatval_descr(),
+            FAKE_FLOAT_TYPE,
+        );
+        let ops = get_ops(ctx);
+        assert_eq!(
+            ops,
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::SetfieldGc,]
+        );
+        eprintln!("✓ trace_box_float: {:?}", ops);
+    }
+
+    #[test]
+    fn test_float_binop_ops() {
+        let mut ctx = TraceCtx::for_test(2);
+        let _result = crate::trace_float_binop(
+            &mut ctx,
+            OpRef(0),
+            OpRef(1),
+            OpCode::FloatAdd,
+            FAKE_FLOAT_TYPE,
+            ob_type_descr(),
+            floatval_descr(),
+            w_float_size_descr(),
+            &[OpRef(0), OpRef(1)],
+        );
+        let ops = get_ops(ctx);
+        assert_eq!(
+            ops,
+            vec![
+                OpCode::GetfieldGcI,
+                OpCode::GuardClass,
+                OpCode::GetfieldGcF, // unbox a
+                OpCode::GetfieldGcI,
+                OpCode::GuardClass,
+                OpCode::GetfieldGcF, // unbox b
+                OpCode::FloatAdd,
+                OpCode::New,
+                OpCode::SetfieldGc,
+                OpCode::SetfieldGc, // box
+            ]
+        );
+        eprintln!("✓ trace_float_binop: {} ops", ops.len());
     }
 }
