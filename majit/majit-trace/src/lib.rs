@@ -10,6 +10,7 @@ pub mod counter;
 pub mod heapcache;
 pub mod history;
 pub mod logger;
+pub mod memmgr;
 pub mod opencoder;
 pub mod recorder;
 pub mod warmstate;

@@ -14,17 +14,7 @@
 /// - tmask: 1 where the bit is unknown, 0 where it's known
 /// - the combination tvalue=1, tmask=1 at the same bit position is forbidden
 
-/// Raised when an intersection or constraint leads to an empty set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidLoop(pub &'static str);
-
-impl std::fmt::Display for InvalidLoop {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "InvalidLoop: {}", self.0)
-    }
-}
-
-impl std::error::Error for InvalidLoop {}
+pub use crate::optimize::InvalidLoop;
 
 // ── Free helper functions ──
 
