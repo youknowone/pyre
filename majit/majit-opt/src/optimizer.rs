@@ -50,8 +50,8 @@ pub struct Optimizer {
     /// Populated by OptVirtualize.export_virtual_for_preamble().
     pub exported_jump_virtuals: Vec<ExportedJumpVirtual>,
     /// RPython unroll.py: import_state — virtual structures to inject at Phase 2 start.
-    /// Maps inputarg index → (size_descr, [(field_descr, field_inputarg_index)]).
-    /// OptVirtualize reads this during setup to mark inputargs as virtual.
+    /// Maps the original loop-carried input slot to a recursive abstract
+    /// description of the virtual's field values.
     pub imported_virtuals: Vec<ImportedVirtual>,
     /// RPython unroll.py: export_state — exported optimizer facts at the end
     /// of the preamble, adapted to majit's slot-based inputarg model.
@@ -69,11 +69,19 @@ pub struct ImportedVirtual {
     pub inputarg_index: usize,
     /// Size descriptor for the virtual's New().
     pub size_descr: majit_ir::DescrRef,
-    /// Fields: (field_descr, inputarg_index_of_field_value).
-    pub fields: Vec<(majit_ir::DescrRef, usize)>,
+    /// Whether this imported virtual is an instance or a plain struct.
+    pub kind: ImportedVirtualKind,
+    /// Fields: (field_descr, exported abstract info for the field value).
+    pub fields: Vec<(majit_ir::DescrRef, crate::virtualstate::VirtualStateInfo)>,
     /// Descr index of the GetfieldGcR(pool) that loads this head.
     /// OptVirtualize forwards this load result to the virtual head.
     pub head_load_descr_index: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ImportedVirtualKind {
+    Instance { known_class: Option<majit_ir::GcRef> },
+    Struct,
 }
 
 /// RPython unroll.py: ExportedState virtual field info.
@@ -84,13 +92,200 @@ pub struct ExportedJumpVirtual {
     pub jump_arg_index: usize,
     /// Size descriptor for New().
     pub size_descr: majit_ir::DescrRef,
+    /// Whether this exported virtual is an instance or a plain struct.
+    pub kind: ImportedVirtualKind,
     /// Descr index of the pool GetfieldGcR that loaded this head.
     pub head_load_descr_index: Option<u32>,
-    /// Fields: (field_descr, concrete_i64_value).
-    pub fields: Vec<(majit_ir::DescrRef, i64)>,
+    /// Fields: (field_descr, exported abstract info for the field value).
+    pub fields: Vec<(majit_ir::DescrRef, crate::virtualstate::VirtualStateInfo)>,
 }
 
 impl Optimizer {
+    fn import_virtual_state_value(
+        info: &crate::virtualstate::VirtualStateInfo,
+        ctx: &mut OptContext,
+    ) -> OpRef {
+        let opref = ctx.alloc_op_position();
+        Self::apply_imported_virtual_state(info, opref, ctx);
+        opref
+    }
+
+    fn apply_imported_virtual_state(
+        info: &crate::virtualstate::VirtualStateInfo,
+        opref: OpRef,
+        ctx: &mut OptContext,
+    ) {
+        use crate::virtualstate::VirtualStateInfo;
+
+        match info {
+            VirtualStateInfo::Constant(value) => {
+                ctx.make_constant(opref, value.clone());
+            }
+            VirtualStateInfo::Virtual {
+                descr,
+                known_class,
+                fields,
+            } => {
+                let mut imported_fields = Vec::new();
+                let mut field_descrs = Vec::new();
+                for (field_idx, field_info) in fields {
+                    let field_ref = Self::import_virtual_state_value(field_info, ctx);
+                    imported_fields.push((*field_idx, field_ref));
+                    field_descrs.push((
+                        *field_idx,
+                        crate::virtualize::make_field_index_descr(*field_idx),
+                    ));
+                }
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::Virtual(crate::info::VirtualInfo {
+                        descr: descr.clone(),
+                        known_class: *known_class,
+                        fields: imported_fields,
+                        field_descrs,
+                    }),
+                );
+            }
+            VirtualStateInfo::VirtualArray { descr, items, .. } => {
+                let imported_items = items
+                    .iter()
+                    .map(|item_info| Self::import_virtual_state_value(item_info, ctx))
+                    .collect();
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualArray(crate::info::VirtualArrayInfo {
+                        descr: descr.clone(),
+                        items: imported_items,
+                    }),
+                );
+            }
+            VirtualStateInfo::VirtualStruct { descr, fields } => {
+                let mut imported_fields = Vec::new();
+                let mut field_descrs = Vec::new();
+                for (field_idx, field_info) in fields {
+                    let field_ref = Self::import_virtual_state_value(field_info, ctx);
+                    imported_fields.push((*field_idx, field_ref));
+                    field_descrs.push((
+                        *field_idx,
+                        crate::virtualize::make_field_index_descr(*field_idx),
+                    ));
+                }
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualStruct(crate::info::VirtualStructInfo {
+                        descr: descr.clone(),
+                        fields: imported_fields,
+                        field_descrs,
+                    }),
+                );
+            }
+            VirtualStateInfo::VirtualArrayStruct {
+                descr,
+                element_fields,
+            } => {
+                let imported_elements = element_fields
+                    .iter()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|(field_idx, field_info)| {
+                                (*field_idx, Self::import_virtual_state_value(field_info, ctx))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualArrayStruct(
+                        crate::info::VirtualArrayStructInfo {
+                            descr: descr.clone(),
+                            element_fields: imported_elements,
+                        },
+                    ),
+                );
+            }
+            VirtualStateInfo::VirtualRawBuffer { size, entries } => {
+                let imported_entries = entries
+                    .iter()
+                    .map(|(offset, length, entry_info)| {
+                        (
+                            *offset,
+                            *length,
+                            Self::import_virtual_state_value(entry_info, ctx),
+                        )
+                    })
+                    .collect();
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualRawBuffer(crate::info::VirtualRawBufferInfo {
+                        size: *size,
+                        entries: imported_entries,
+                    }),
+                );
+            }
+            VirtualStateInfo::KnownClass { class_ptr } => {
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::KnownClass {
+                        class_ptr: *class_ptr,
+                        is_nonnull: true,
+                    },
+                );
+            }
+            VirtualStateInfo::NonNull => {
+                ctx.set_ptr_info(opref, crate::info::PtrInfo::NonNull);
+            }
+            VirtualStateInfo::IntBounded(bound) => {
+                let widened = bound.widen();
+                if widened.lower > i64::MIN {
+                    ctx.int_lower_bounds.insert(opref, widened.lower);
+                }
+                ctx.imported_int_bounds.insert(opref, widened);
+            }
+            VirtualStateInfo::Unknown => {}
+        }
+    }
+
+    fn install_imported_virtuals(&self, ctx: &mut OptContext) {
+        for iv in &self.imported_virtuals {
+            let virtual_head = OpRef(iv.inputarg_index as u32);
+            let mut fields = Vec::new();
+            let mut field_descrs = Vec::new();
+            for (descr, field_info) in &iv.fields {
+                let field_ref = Self::import_virtual_state_value(field_info, ctx);
+                fields.push((descr.index(), field_ref));
+                field_descrs.push((descr.index(), descr.clone()));
+            }
+            match &iv.kind {
+                ImportedVirtualKind::Instance { known_class } => {
+                    ctx.set_ptr_info(
+                        virtual_head,
+                        crate::info::PtrInfo::Virtual(crate::info::VirtualInfo {
+                            descr: iv.size_descr.clone(),
+                            known_class: *known_class,
+                            fields,
+                            field_descrs,
+                        }),
+                    );
+                }
+                ImportedVirtualKind::Struct => {
+                    ctx.set_ptr_info(
+                        virtual_head,
+                        crate::info::PtrInfo::VirtualStruct(crate::info::VirtualStructInfo {
+                            descr: iv.size_descr.clone(),
+                            fields,
+                            field_descrs,
+                        }),
+                    );
+                }
+            }
+            if let Some(descr_idx) = iv.head_load_descr_index {
+                ctx.imported_virtual_heads
+                    .push((descr_idx as usize, virtual_head));
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Optimizer {
             passes: Vec::new(),
@@ -524,43 +719,15 @@ impl Optimizer {
             }
         }
 
-        // RPython unroll.py:479-504: import_state — reconstruct virtuals.
-        // For each imported virtual, allocate a FRESH OpRef as the virtual head.
-        // Set VirtualStruct on it with fields pointing to the field inputargs.
-        // Store the fresh OpRef in ctx.imported_virtual_heads so the JitCodeSym's
-        // ensure_linked_list_head can return it instead of loading from pool.
-        if !self.imported_virtuals.is_empty() {
-            for iv in &self.imported_virtuals {
-                let mut fields = Vec::new();
-                let mut field_descrs = Vec::new();
-                for (descr, field_inputarg_idx) in &iv.fields {
-                    let field_ref = OpRef(*field_inputarg_idx as u32);
-                    fields.push((descr.index(), field_ref));
-                    field_descrs.push((descr.index(), descr.clone()));
-                }
-                // Allocate fresh OpRef for the virtual head node
-                let virtual_head = ctx.alloc_op_position();
-                ctx.set_ptr_info(
-                    virtual_head,
-                    crate::info::PtrInfo::VirtualStruct(crate::info::VirtualStructInfo {
-                        descr: iv.size_descr.clone(),
-                        fields,
-                        field_descrs,
-                    }),
-                );
-                // Store: (head_load_descr_index, virtual_head_opref)
-                // OptVirtualize uses this to forward GetfieldGcR(pool) → virtual head.
-                if let Some(descr_idx) = iv.head_load_descr_index {
-                    ctx.imported_virtual_heads.push((descr_idx as usize, virtual_head));
-                }
-            }
-        }
-
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
             let targetargs: Vec<OpRef> = (0..exported_state.next_iteration_args.len())
                 .map(|i| OpRef(i as u32))
                 .collect();
             crate::unroll::import_state(&targetargs, exported_state, &mut ctx);
+        }
+
+        if !self.imported_virtuals.is_empty() {
+            self.install_imported_virtuals(&mut ctx);
         }
 
         // Process each operation through the pass chain
@@ -575,26 +742,33 @@ impl Optimizer {
 
         // Transfer exported virtual state from context to optimizer
         let exported_jump_virtuals = std::mem::take(&mut ctx.exported_jump_virtuals);
-        self.exported_loop_state = ctx
+        let jump = ctx
             .new_operations
             .iter()
             .rfind(|op| op.opcode == OpCode::Jump)
-            .map(|jump| {
-                let flattened_args = crate::unroll::export_flatten_jump_args(
-                    &ctx.new_operations,
-                    jump,
-                    &exported_jump_virtuals,
-                );
-                let exported_int_bounds = self.collect_exported_int_bounds(&flattened_args, &ctx);
-                let renamed_inputargs: Vec<OpRef> =
-                    (0..num_inputs).map(|i| OpRef(i as u32)).collect();
-                crate::unroll::export_state(
-                    &flattened_args,
-                    &renamed_inputargs,
-                    &ctx,
-                    Some(&exported_int_bounds),
-                )
-            });
+            .cloned();
+        self.exported_loop_state = jump.map(|jump| {
+            let preview_virtual_state =
+                crate::virtualstate::export_state(&jump.args, &ctx, &ctx.ptr_info);
+            let preview_label_args = preview_virtual_state.make_inputargs(&jump.args, &ctx);
+            let mut short_boxes =
+                crate::shortpreamble::ShortBoxes::with_label_args(&preview_label_args);
+            self.produce_potential_short_preamble_ops(&mut short_boxes);
+            ctx.exported_short_boxes = short_boxes
+                .non_empty_ops()
+                .map(|(_, op)| op.clone())
+                .collect();
+            let exported_int_bounds =
+                self.collect_exported_int_bounds(&jump.args, &ctx);
+            let renamed_inputargs: Vec<OpRef> =
+                (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+            crate::unroll::export_state(
+                &jump.args,
+                &renamed_inputargs,
+                &ctx,
+                Some(&exported_int_bounds),
+            )
+        });
         self.exported_jump_virtuals = exported_jump_virtuals;
 
         // final_num_inputs = original inputs + virtual inputs added by passes.
