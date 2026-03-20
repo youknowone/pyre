@@ -322,13 +322,55 @@ impl PtrInfo {
     }
 
     /// info.py: force_at_the_end_of_preamble(op, optforce, rec)
-    /// Force a virtual object at the end of the preamble iteration.
-    /// This is called when loop peeling discovers that a virtual must
-    /// be materialized before the loop body begins.
     ///
-    /// Returns the materialized OpRef, or None if not virtual.
-    pub fn force_at_the_end_of_preamble(&self) -> bool {
-        self.is_virtual()
+    /// RPython does not blindly materialize every virtual at the end of the
+    /// preamble. Struct-like virtuals recurse into pointer children and update
+    /// those field/item boxes in place, while leaving the top-level virtual in
+    /// the exported virtual state.
+    pub fn force_at_the_end_of_preamble<F>(&mut self, mut recurse: F)
+    where
+        F: FnMut(OpRef) -> OpRef,
+    {
+        match self {
+            PtrInfo::Virtual(v) => {
+                for (_, field) in &mut v.fields {
+                    if !field.is_none() {
+                        *field = recurse(*field);
+                    }
+                }
+            }
+            PtrInfo::VirtualStruct(v) => {
+                for (_, field) in &mut v.fields {
+                    if !field.is_none() {
+                        *field = recurse(*field);
+                    }
+                }
+            }
+            PtrInfo::VirtualArray(v) => {
+                for item in &mut v.items {
+                    if !item.is_none() {
+                        *item = recurse(*item);
+                    }
+                }
+            }
+            PtrInfo::VirtualArrayStruct(v) => {
+                for fields in &mut v.element_fields {
+                    for (_, field) in fields {
+                        if !field.is_none() {
+                            *field = recurse(*field);
+                        }
+                    }
+                }
+            }
+            PtrInfo::VirtualRawBuffer(v) => {
+                for (_, _, field) in &mut v.entries {
+                    if !field.is_none() {
+                        *field = recurse(*field);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// info.py: make_guards(op, short_boxes, optimizer)

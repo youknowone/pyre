@@ -65,15 +65,12 @@ pub struct OptVirtualize {
     /// Whether setup needs to initialize virtualizable PtrInfo on ctx.
     /// Set in setup(), applied in first propagate_forward().
     needs_vable_setup: bool,
-    /// RPython: Phase 2 mode — JUMP flattens virtuals instead of forcing.
-    flatten_virtuals_at_jump: bool,
 }
 
 impl OptVirtualize {
     pub fn new() -> Self {
         OptVirtualize {
             vable_config: None,
-            flatten_virtuals_at_jump: false,
             vable_array_ptrs: HashMap::new(),
             vable_initialized: false,
             needs_vable_setup: false,
@@ -84,7 +81,6 @@ impl OptVirtualize {
     pub fn with_virtualizable(config: VirtualizableConfig) -> Self {
         OptVirtualize {
             vable_config: Some(config),
-            flatten_virtuals_at_jump: false,
             vable_array_ptrs: HashMap::new(),
             vable_initialized: false,
             needs_vable_setup: false,
@@ -1908,34 +1904,7 @@ impl Optimization for OptVirtualize {
                     }
                 }
 
-                if self.flatten_virtuals_at_jump {
-                    // Phase 2: flatten virtual fields into JUMP args (no force)
-                    let mut extra_flattened: Vec<(usize, Vec<OpRef>)> = Vec::new();
-                    for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
-                        let resolved = ctx.get_replacement(*arg);
-                        if Self::is_virtual(resolved, ctx) {
-                            let flattened = self.flatten_virtual_fields(resolved, ctx);
-                            if !flattened.is_empty() {
-                                *arg = resolved;
-                                extra_flattened.push((arg_idx, flattened));
-                                continue;
-                            }
-                        }
-                    }
-                    if !extra_flattened.is_empty() {
-                        for (idx, fields) in extra_flattened.into_iter().rev() {
-                            if let Some(first) = fields.first() {
-                                jump_op.args[idx] = *first;
-                            }
-                            for (i, &field) in fields.iter().skip(1).enumerate() {
-                                jump_op.args.insert(idx + 1 + i, field);
-                            }
-                        }
-                    }
-                    OptimizationResult::Replace(jump_op)
-                } else {
-                    self.optimize_escaping_op(&jump_op, ctx)
-                }
+                self.optimize_escaping_op(&jump_op, ctx)
             }
 
             // Escape ops (testing)
@@ -2040,9 +2009,6 @@ impl Optimization for OptVirtualize {
         "virtualize"
     }
 
-    fn set_flatten_virtuals_at_jump(&mut self, enabled: bool) {
-        self.flatten_virtuals_at_jump = enabled;
-    }
 }
 
 // PtrInfo helpers (is_nonnull, is_virtual, etc.) are in info.rs.

@@ -579,4 +579,37 @@ while i < 300:
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 224_250);
         }
     }
+
+    #[test]
+    fn test_dynamic_int_list_indexing_stays_correct() {
+        let source = "\
+q = [0, 1, 2, 3, 4]
+i = 0
+s = 0
+while i < 200:
+    q0 = i % 5
+    s = s + q[q0]
+    q[q0] = q[q0] + 1
+    i = i + 1";
+        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let s = *(*frame.namespace).get("s").unwrap();
+            let q = *(*frame.namespace).get("q").unwrap();
+            assert_eq!(pyre_object::intobject::w_int_get_value(s), 4_300);
+            assert_eq!(
+                pyre_object::intobject::w_int_get_value(
+                    pyre_object::listobject::w_list_getitem(q, 0).unwrap()
+                ),
+                40
+            );
+            assert_eq!(
+                pyre_object::intobject::w_int_get_value(
+                    pyre_object::listobject::w_list_getitem(q, 4).unwrap()
+                ),
+                44
+            );
+        }
+    }
 }
