@@ -568,6 +568,18 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     // blackhole execution, including nested calls through bh_call_fn.
     let _force_guard = crate::eval::blackhole_entry_bump();
     let code = unsafe { &*frame.code };
+    let py_pc = frame.next_instr;
+
+    // RPython handles guard failure recovery via bridge compilation
+    // (compile.py:696-728). Until proper bridge tracing is implemented,
+    // use eval_frame_plain for force_fn calls. This is faster than the
+    // full blackhole path because it avoids JitCode compilation and
+    // BlackholeInterpreter setup. in_blackhole_entry() prevents JIT
+    // re-entry from nested calls.
+    match pyre_interp::eval::eval_frame_plain(frame) {
+        Ok(result) => return result,
+        Err(_) => return pyre_object::PY_NULL,
+    }
 
     // RPython: blackhole_from_resumedata() → setposition + consume_one_section
     // For pyre, we compile Python bytecodes to JitCode and load frame state.
@@ -582,7 +594,6 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
     // Map Python PC → JitCode PC
-    let py_pc = frame.next_instr;
     let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
         pyjitcode.pc_map[py_pc]
     } else {
@@ -590,7 +601,13 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     };
 
     // RPython: blackholeinterp = builder.acquire_interp()
-    let mut bh = majit_meta::blackhole::BlackholeInterpreter::new();
+    // Use thread-local builder pool to avoid per-call allocation.
+    thread_local! {
+        static BH_BUILDER: std::cell::UnsafeCell<majit_meta::blackhole::BlackholeInterpBuilder> =
+            std::cell::UnsafeCell::new(majit_meta::blackhole::BlackholeInterpBuilder::new());
+    }
+    let builder = BH_BUILDER.with(|cell| unsafe { &mut *cell.get() });
+    let mut bh = builder.acquire_interp();
     // RPython: blackholeinterp.setposition(jitcode, pc)
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
@@ -631,17 +648,10 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
 
     // Return value is in registers_i[0] (set by RETURN_VALUE → move_i(0, tmp0))
     let result = bh.registers_i[0] as PyObjectRef;
-    if majit_meta::majit_log_enabled() {
-        let int_val = if !result.is_null() && unsafe { is_int(result) } {
-            Some(unsafe { w_int_get_value(result) })
-        } else {
-            None
-        };
-        eprintln!(
-            "[jit][blackhole] resume result raw={} int_val={:?} pc={}",
-            bh.registers_i[0], int_val, py_pc
-        );
-    }
+
+    // RPython: builder.release_interp(blackholeinterp) — return to pool
+    builder.release_interp(bh);
+
     result
 }
 
