@@ -186,11 +186,6 @@ impl UnrollOptimizer {
                 .collect();
         }
         self.ensure_preamble_target_token();
-        // RPython import_state/export_state preserve the original loop-header
-        // contract. Virtual structure is restored through VirtualState, not by
-        // flattening jump args into field-value slots.
-        let exported_label_args = exported_state.end_args.clone();
-
         // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
         // RPython import_state: phase 2 starts from the original trace input
         // contract. The optimizer state is imported from ExportedState; the
@@ -199,7 +194,7 @@ impl UnrollOptimizer {
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[jit] preamble peeling: {} virtual(s), exported label_args={}",
+                "[jit] preamble peeling: {} virtual(s), phase1 end_args={}",
                 jump_virtuals.len(),
                 exported_state.end_args.len(),
             );
@@ -237,6 +232,10 @@ impl UnrollOptimizer {
             body_num_inputs,
         );
         let p2_ni = opt_p2.final_num_inputs();
+        let label_args = opt_p2
+            .imported_label_args
+            .clone()
+            .expect("phase 2 missing import_state label_args");
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let nc = p2_ops
@@ -255,59 +254,8 @@ impl UnrollOptimizer {
 
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
         // Build the virtual state at end of Phase 2 body.
-        let p2_exported = opt_p2.exported_loop_state.clone();
         let imported_short_preamble_builder = opt_p2.imported_short_preamble_builder.clone();
         let imported_short_aliases = opt_p2.imported_short_aliases.clone();
-        let imported_short_sources = opt_p2.imported_short_sources.clone();
-
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            let imported_map: HashMap<OpRef, OpRef> = imported_short_sources
-                .iter()
-                .map(|entry| (entry.result, entry.source))
-                .collect();
-            let mut defined: std::collections::HashSet<OpRef> =
-                (0..body_num_inputs as u32).map(OpRef).collect();
-            for op in &p2_ops {
-                if !op.pos.is_none() {
-                    defined.insert(op.pos);
-                }
-            }
-            let mut unresolved = Vec::new();
-            for op in &p2_ops {
-                for &arg in &op.args {
-                    if arg.is_none() || defined.contains(&arg) {
-                        continue;
-                    }
-                    if unresolved.contains(&arg) {
-                        continue;
-                    }
-                    unresolved.push(arg);
-                }
-                if let Some(fail_args) = &op.fail_args {
-                    for &arg in fail_args {
-                        if arg.is_none() || defined.contains(&arg) {
-                            continue;
-                        }
-                        if unresolved.contains(&arg) {
-                            continue;
-                        }
-                        unresolved.push(arg);
-                    }
-                }
-            }
-            eprintln!(
-                "[jit] phase 2 imported_short_sources={}, unresolved_refs={:?}",
-                imported_short_sources.len(),
-                unresolved
-            );
-            for unresolved_ref in unresolved {
-                if let Some(source) = imported_map.get(&unresolved_ref) {
-                    eprintln!(
-                        "[jit] unresolved imported ref {unresolved_ref:?} -> preamble {source:?}"
-                    );
-                }
-            }
-        }
 
         // finalize_short_preamble: create TargetToken for this loop version
         let initial_sp = opt_p2.imported_short_preamble.clone().unwrap_or_else(|| {
@@ -344,6 +292,8 @@ impl UnrollOptimizer {
                 .rfind(|o| o.opcode == OpCode::Jump)
                 .map(|j| j.args.to_vec())
                 .unwrap_or_default();
+            let mut current_label_args = label_args.clone();
+            current_label_args.extend(initial_sp.used_boxes.iter().copied());
             let opt_unroll = OptUnroll::new();
             // Use Phase 2's final context for virtual state matching.
             let mut jump_ctx = opt_p2
@@ -353,6 +303,7 @@ impl UnrollOptimizer {
             let mut jumped = opt_unroll
                 .jump_to_existing_trace(
                     &body_jump_args,
+                    Some(&current_label_args),
                     &mut self.target_tokens,
                     &mut opt_p2,
                     &mut jump_ctx,
@@ -363,6 +314,7 @@ impl UnrollOptimizer {
                 jumped = opt_unroll
                     .jump_to_existing_trace(
                         &body_jump_args,
+                        Some(&current_label_args),
                         &mut self.target_tokens,
                         &mut opt_p2,
                         &mut jump_ctx,
@@ -381,11 +333,6 @@ impl UnrollOptimizer {
             .last()
             .and_then(|target| target.short_preamble.clone())
             .unwrap_or(initial_sp);
-        let rewritten_jump_args = p2_exported.as_ref().map(|s| {
-            let mut args = s.end_args.clone();
-            args.extend(sp.used_boxes.iter().copied());
-            args
-        });
         if !sp.is_empty() {
             self.short_preamble = Some(sp.clone());
         }
@@ -411,18 +358,13 @@ impl UnrollOptimizer {
         let combined = assemble_peeled_trace(
             &p1_ops,
             &body_ops,
-            &exported_label_args,
+            &label_args,
             &exported_state.renamed_inputargs,
             &sp.used_boxes,
-            if jump_to_self && redirected_tail_ops.is_empty() {
-                rewritten_jump_args.as_deref()
-            } else {
-                None
-            },
             p2_ni,
             jump_to_self,
             &imported_short_aliases,
-            &imported_short_sources,
+            &consts_p2,
             self.target_tokens
                 .first()
                 .map(|target| target.as_jump_target_descr()),
@@ -853,16 +795,9 @@ impl OptUnroll {
         &self,
         token_id: u64,
         virtual_state: crate::virtualstate::VirtualState,
-        mut short_preamble: crate::shortpreamble::ShortPreamble,
+        short_preamble: crate::shortpreamble::ShortPreamble,
         short_preamble_builder: Option<&crate::shortpreamble::ShortPreambleBuilder>,
     ) -> TargetToken {
-        if let Some(builder) = short_preamble_builder {
-            for &used in builder.used_boxes() {
-                if !short_preamble.used_boxes.contains(&used) {
-                    short_preamble.used_boxes.push(used);
-                }
-            }
-        }
         let mut target_token = TargetToken::new();
         target_token.token_id = token_id;
         target_token.virtual_state = Some(virtual_state);
@@ -881,14 +816,21 @@ impl OptUnroll {
     pub fn jump_to_existing_trace(
         &self,
         jump_args: &[OpRef],
+        current_label_args: Option<&[OpRef]>,
         target_tokens: &mut [TargetToken],
         optimizer: &mut crate::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
     ) -> Option<crate::virtualstate::VirtualState> {
         optimizer.disable_guard_replacement();
-        let result =
-            self.jump_to_existing_trace_impl(jump_args, target_tokens, optimizer, ctx, force_boxes);
+        let result = self.jump_to_existing_trace_impl(
+            jump_args,
+            current_label_args,
+            target_tokens,
+            optimizer,
+            ctx,
+            force_boxes,
+        );
         optimizer.enable_guard_replacement();
         result
     }
@@ -896,6 +838,7 @@ impl OptUnroll {
     fn jump_to_existing_trace_impl(
         &self,
         jump_args: &[OpRef],
+        current_label_args: Option<&[OpRef]>,
         target_tokens: &mut [TargetToken],
         optimizer: &mut crate::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -941,19 +884,29 @@ impl OptUnroll {
             let mut extra = Vec::new();
             if let Some(sp) = target_token.short_preamble.clone() {
                 if let Some(mut builder) = target_token.short_preamble_producer.take() {
-                    let mut label_args = sp.inputargs.clone();
-                    label_args.extend(sp.used_boxes.iter().copied());
-                    builder.setup(&sp, &label_args);
-                    ctx.activate_short_preamble_producer(builder);
-                    extra = Self::inline_short_preamble(
-                        &short_jump_args,
-                        &target_args,
-                        &sp,
-                        optimizer,
-                        ctx,
-                    );
-                    if let Some(builder) = ctx.take_active_short_preamble_producer() {
-                        target_token.short_preamble = Some(builder.build_short_preamble_struct());
+                    if let Some(label_args) = current_label_args {
+                        builder.setup(&sp, label_args);
+                        ctx.activate_short_preamble_producer(builder);
+                        extra = Self::inline_short_preamble(
+                            &short_jump_args,
+                            &target_args,
+                            &sp,
+                            optimizer,
+                            ctx,
+                        );
+                        if let Some(builder) = ctx.take_active_short_preamble_producer() {
+                            target_token.short_preamble =
+                                Some(builder.build_short_preamble_struct());
+                            target_token.short_preamble_producer = Some(builder);
+                        }
+                    } else {
+                        extra = Self::inline_short_preamble(
+                            &short_jump_args,
+                            &target_args,
+                            &sp,
+                            optimizer,
+                            ctx,
+                        );
                         target_token.short_preamble_producer = Some(builder);
                     }
                 } else {
@@ -1041,11 +994,11 @@ impl OptUnroll {
                 break;
             };
             let old_len = current_short.ops.len();
-            let old_jump_args = current_short.used_boxes.len();
+            let old_jump_args = current_short.jump_args.len();
             let mapped_jump_args: Vec<OpRef> = active_short
-                .used_boxes
+                .jump_args
                 .iter()
-                .map(|used_box| *mapping.get(used_box).unwrap_or(used_box))
+                .map(|jump_arg| *mapping.get(jump_arg).unwrap_or(jump_arg))
                 .collect();
             for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
                 let _ = optimizer.force_box(arg, ctx);
@@ -1055,15 +1008,15 @@ impl OptUnroll {
                 break;
             };
             active_short = builder.build_short_preamble_struct();
-            if active_short.ops.len() == old_len && active_short.used_boxes.len() == old_jump_args {
+            if active_short.ops.len() == old_len && active_short.jump_args.len() == old_jump_args {
                 break;
             }
         }
 
         active_short
-            .used_boxes
+            .jump_args
             .iter()
-            .map(|&used_box| *mapping.get(&used_box).unwrap_or(&used_box))
+            .map(|&jump_arg| *mapping.get(&jump_arg).unwrap_or(&jump_arg))
             .collect()
     }
 
@@ -1416,7 +1369,11 @@ impl OptUnroll {
         let mut next_temp = 0usize;
         let mut exported = Vec::new();
         for entry in &ctx.exported_short_boxes {
-            let result = if let Some(slot) = short_boxes.lookup_label_arg(entry.op.pos) {
+            let current_result = match entry.kind {
+                crate::shortpreamble::PreambleOpKind::Heap => entry.op.pos,
+                _ => entry.op.pos,
+            };
+            let result = if let Some(slot) = short_boxes.lookup_label_arg(current_result) {
                 ExportedShortResult::Slot(slot)
             } else {
                 let temp = next_temp;
@@ -1472,7 +1429,7 @@ impl OptUnroll {
                     match entry.op.opcode {
                         OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
                             Some(ExportedShortOp::HeapField {
-                                source: entry.op.pos,
+                                source: current_result,
                                 object_slot,
                                 descr_idx,
                                 result_type: entry.op.result_type(),
@@ -1486,7 +1443,7 @@ impl OptUnroll {
                         | OpCode::GetarrayitemGcF => {
                             let index = entry.op.arg(1).0 as i64;
                             Some(ExportedShortOp::HeapArrayItem {
-                                source: entry.op.pos,
+                                source: current_result,
                                 object_slot,
                                 descr_idx,
                                 index,
@@ -1590,7 +1547,7 @@ impl OptUnroll {
                         });
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: result_opref,
-                        source: same_as_source.unwrap_or(source),
+                        source,
                     });
                     if invented_name {
                         if let Some(source) = same_as_source {
@@ -1626,7 +1583,7 @@ impl OptUnroll {
                     }
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: value,
-                        source: same_as_source.unwrap_or(source),
+                        source,
                     });
                     if invented_name {
                         if let Some(source) = same_as_source {
@@ -1659,7 +1616,7 @@ impl OptUnroll {
                         .insert((obj, descr_idx, index), value);
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: value,
-                        source: same_as_source.unwrap_or(source),
+                        source,
                     });
                     if invented_name {
                         if let Some(source) = same_as_source {
@@ -1686,7 +1643,7 @@ impl OptUnroll {
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: value,
-                        source: same_as_source.unwrap_or(source),
+                        source,
                     });
                     if invented_name {
                         if let Some(source) = same_as_source {
@@ -1760,63 +1717,23 @@ fn assemble_peeled_trace(
     label_args: &[OpRef],
     start_label_args: &[OpRef],
     extra_label_args: &[OpRef],
-    rewritten_jump_args: Option<&[OpRef]>,
     body_num_inputs: usize,
     jump_to_self: bool,
     imported_short_aliases: &[crate::ImportedShortAlias],
-    imported_short_sources: &[crate::ImportedShortSource],
+    constants: &std::collections::HashMap<u32, i64>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
-    let imported_short_sources: HashMap<OpRef, OpRef> = imported_short_sources
-        .iter()
-        .map(|entry| (entry.result, entry.source))
-        .collect();
-    let imported_short_source_values: std::collections::HashSet<OpRef> =
-        imported_short_sources.values().copied().collect();
-    let preamble_positions: std::collections::HashSet<OpRef> = p1_ops
-        .iter()
-        .take_while(|op| op.opcode != OpCode::Jump)
-        .filter_map(|op| (!op.pos.is_none()).then_some(op.pos))
-        .collect();
-    let body_defined_positions: std::collections::HashSet<OpRef> = p2_ops
-        .iter()
-        .filter_map(|op| (!op.pos.is_none()).then_some(op.pos))
-        .collect();
-    let mut carried_preamble_refs = Vec::new();
-    let mut maybe_add_carried_preamble = |opref: OpRef| {
-        if !imported_short_sources.contains_key(&opref)
-            && !imported_short_source_values.contains(&opref)
-            && !preamble_positions.contains(&opref)
-        {
-            return;
+
+    let mut next_free_pos = |mut next: u32| {
+        next = next.max(body_num_inputs as u32);
+        while constants.contains_key(&next) {
+            next += 1;
         }
-        if label_args.contains(&opref)
-            || extra_label_args.contains(&opref)
-            || carried_preamble_refs.contains(&opref)
-            || body_defined_positions.contains(&opref)
-        {
-            return;
-        }
-        carried_preamble_refs.push(opref);
+        next
     };
-    for op in p2_ops {
-        for &arg in &op.args {
-            maybe_add_carried_preamble(arg);
-        }
-        if let Some(fail_args) = &op.fail_args {
-            for &arg in fail_args {
-                maybe_add_carried_preamble(arg);
-            }
-        }
-    }
-    if let Some(forced_jump_args) = rewritten_jump_args {
-        for &arg in forced_jump_args {
-            maybe_add_carried_preamble(arg);
-        }
-    }
 
     if let Some(start_label_descr) = start_label_descr {
         let mut start_label = Op::new(OpCode::Label, start_label_args);
@@ -1840,57 +1757,81 @@ fn assemble_peeled_trace(
         .map(|op| op.pos.0)
         .filter(|&p| p != u32::MAX)
         .max()
-        .unwrap_or(0);
-    let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
+        .unwrap_or(body_num_inputs as u32);
+    max_pos = next_free_pos(max_pos.saturating_add(1));
+    let mut alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
     for alias in imported_short_aliases {
-        let pos = OpRef((max_pos + 1).max(body_num_inputs as u32));
-        max_pos = pos.0;
+        let pos = OpRef(max_pos);
+        max_pos = next_free_pos(max_pos.saturating_add(1));
         let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
         op.pos = pos;
-        remap.insert(alias.result, pos);
+        alias_remap.insert(alias.result, pos);
         result.push(op);
     }
 
     // Label position
-    let label_pos = (max_pos + 1).max(body_num_inputs as u32);
+    let label_pos = next_free_pos(max_pos);
     let mut full_label_args = label_args.to_vec();
     full_label_args.extend(extra_label_args.iter().map(|arg| {
-        remap
+        alias_remap
             .get(arg)
             .copied()
             .unwrap_or(*arg)
     }));
-    full_label_args.extend(carried_preamble_refs.iter().copied());
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
     label_op.pos = OpRef(label_pos);
     label_op.descr = loop_label_descr;
     result.push(label_op);
 
-    // Body: 2-pass remap (inputarg refs → label_args, op positions → after label)
-    let body_base = label_pos + 1;
+    // Body: 2-pass remap (inputarg refs → label_args, op positions → fresh boxes)
+    let mut next_body_pos = next_free_pos(label_pos.saturating_add(1));
+    let mut input_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut visible_before_label: std::collections::HashSet<OpRef> =
+        full_label_args.iter().copied().collect();
+    for op in &result {
+        if op.result_type() != Type::Void && !op.pos.is_none() {
+            visible_before_label.insert(op.pos);
+        }
+    }
 
     // Pass 1: collect all remappings
     for (i, &la) in label_args.iter().enumerate() {
         if (i as u32) < body_num_inputs as u32 {
-            remap.insert(OpRef(i as u32), la);
+            input_remap.insert(OpRef(i as u32), la);
         }
     }
     for (idx, op) in p2_ops.iter().enumerate() {
         if op.pos.0 != u32::MAX {
-            remap.insert(op.pos, OpRef(body_base + idx as u32));
+            let fresh = OpRef(next_body_pos);
+            next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
+            body_result_remap.insert(op.pos, fresh);
         }
     }
     // Pass 2: apply
-    for (idx, op) in p2_ops.iter().enumerate() {
+    let mut seen_body_defs = std::collections::HashSet::new();
+    for op in p2_ops.iter() {
         let mut new_op = op.clone();
         let original_args = op.args.clone();
-        if new_op.pos.0 != u32::MAX {
-            new_op.pos = OpRef(body_base + idx as u32);
+        if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
+            new_op.pos = mapped_pos;
         }
-        for arg in &mut new_op.args {
-            if let Some(&m) = remap.get(arg) {
-                *arg = m;
+        let mut remap_body_arg = |arg: OpRef| -> OpRef {
+            if let Some(&mapped) = input_remap.get(&arg) {
+                return mapped;
             }
+            if let Some(&mapped) = alias_remap.get(&arg) {
+                return mapped;
+            }
+            if let Some(&mapped) = body_result_remap.get(&arg) {
+                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
+                    return mapped;
+                }
+            }
+            arg
+        };
+        for arg in &mut new_op.args {
+            *arg = remap_body_arg(*arg);
         }
         if new_op.opcode == OpCode::Jump {
             let mapped_base_args: Vec<OpRef> = if !jump_to_self {
@@ -1903,40 +1844,26 @@ fn assemble_peeled_trace(
                     .iter()
                     .map(|arg| start_remap.get(arg).copied().unwrap_or(*arg))
                     .collect()
-            } else if let Some(forced_jump_args) = rewritten_jump_args {
-                forced_jump_args
-                    .iter()
-                    .map(|arg| remap.get(arg).copied().unwrap_or(*arg))
-                    .collect()
             } else {
-                new_op
-                    .args
-                    .iter()
-                    .map(|arg| remap.get(arg).copied().unwrap_or(*arg))
-                    .collect()
+                new_op.args.iter().copied().collect()
             };
             let mut jump_args = mapped_base_args;
             // When Jump targets the start label (jump_to_preamble), trim
             // args to match the start label's contract and skip carried refs.
             if !jump_to_self {
                 jump_args.truncate(start_label_args.len());
-            } else {
-                for &carried in &carried_preamble_refs {
-                    if !jump_args.contains(&carried) {
-                        jump_args.push(carried);
-                    }
-                }
             }
             new_op.args = jump_args.into();
         }
         if let Some(ref mut fa) = new_op.fail_args {
             for a in fa.iter_mut() {
-                if let Some(&m) = remap.get(a) {
-                    *a = m;
-                }
+                *a = remap_body_arg(*a);
             }
         }
         result.push(new_op);
+        if op.result_type() != Type::Void && !op.pos.is_none() {
+            seen_body_defs.insert(op.pos);
+        }
     }
 
     result
@@ -2950,6 +2877,90 @@ mod tests {
     }
 
     #[test]
+    fn test_exported_state_reimports_short_heap_ref_field_facts() {
+        let mut ctx = crate::OptContext::with_num_inputs(4, 0);
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::with_descr(
+                        OpCode::GetfieldGcR,
+                        &[OpRef(10)],
+                        majit_ir::descr::make_field_descr_full(
+                            56,
+                            8,
+                            8,
+                            majit_ir::Type::Ref,
+                            false,
+                        ),
+                    );
+                    op.pos = OpRef(11);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Heap,
+                label_arg_idx: Some(1),
+                invented_name: false,
+                same_as_source: None,
+            });
+
+        let exported = export_state(&[OpRef(10), OpRef(11)], &[], &ctx, None);
+        assert_eq!(
+            exported.exported_short_ops,
+            vec![ExportedShortOp::HeapField {
+                source: OpRef(11),
+                object_slot: 0,
+                descr_idx: 56,
+                result_type: Type::Ref,
+                result: ExportedShortResult::Slot(1),
+                invented_name: false,
+                same_as_source: None,
+            }]
+        );
+
+        let mut ctx2 = crate::OptContext::with_num_inputs(4, 2);
+        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
+        assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
+        assert_eq!(
+            ctx2.imported_short_fields.get(&(OpRef(10), 56)).copied(),
+            Some(OpRef(11))
+        );
+    }
+
+    #[test]
+    fn test_exported_short_heap_field_uses_preamble_result_as_source() {
+        use majit_ir::descr::make_field_descr_full;
+
+        let mut ctx = crate::OptContext::with_num_inputs(8, 0);
+        let head_descr = make_field_descr_full(56, 0, 8, Type::Ref, false);
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op =
+                        Op::with_descr(OpCode::GetfieldGcR, &[OpRef(10)], head_descr);
+                    op.pos = OpRef(26);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Heap,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            });
+
+        let exported = export_state(&[OpRef(10)], &[], &ctx, None);
+        assert_eq!(
+            exported.exported_short_ops,
+            vec![ExportedShortOp::HeapField {
+                source: OpRef(26),
+                object_slot: 0,
+                descr_idx: 56,
+                result_type: Type::Ref,
+                result: ExportedShortResult::Temporary(0),
+                invented_name: false,
+                same_as_source: None,
+            }]
+        );
+    }
+
+    #[test]
     fn test_exported_state_reimports_loopinvariant_short_fact() {
         let mut ctx = crate::OptContext::with_num_inputs(4, 0);
         ctx.make_constant(OpRef(10), Value::Int(0x1234));
@@ -3262,6 +3273,49 @@ mod tests {
     }
 
     #[test]
+    fn test_force_op_from_preamble_maps_imported_result_back_to_preamble_source() {
+        let mut ctx = crate::OptContext::with_num_inputs(32, 4);
+        ctx.initialize_imported_short_preamble_builder(
+            &[OpRef(0), OpRef(1), OpRef(2), OpRef(3)],
+            &[OpRef(10), OpRef(11), OpRef(12), OpRef(13)],
+            &[crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::with_descr(
+                        OpCode::GetfieldGcR,
+                        &[OpRef(3)],
+                        majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
+                    );
+                    op.pos = OpRef(19);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Heap,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            }],
+        );
+        ctx.imported_short_sources.push(crate::ImportedShortSource {
+            result: OpRef(14),
+            source: OpRef(19),
+        });
+
+        let forced = ctx.force_op_from_preamble(OpRef(14));
+        assert_eq!(forced, OpRef(19));
+
+        let sp = ctx.build_imported_short_preamble().unwrap();
+        assert_eq!(sp.ops.len(), 1);
+        assert!(sp.used_boxes.is_empty());
+        assert!(sp.jump_args.is_empty());
+
+        let mut optimizer = crate::optimizer::Optimizer::new();
+        let _ = optimizer.force_box(forced, &mut ctx);
+
+        let sp = ctx.build_imported_short_preamble().unwrap();
+        assert_eq!(sp.used_boxes, vec![OpRef(19)]);
+        assert_eq!(sp.jump_args, vec![OpRef(19)]);
+    }
+
+    #[test]
     fn test_exported_state_reimports_invented_short_alias_metadata() {
         let mut ctx = crate::OptContext::with_num_inputs(6, 0);
         ctx.exported_short_boxes
@@ -3293,11 +3347,23 @@ mod tests {
 
         let mut ctx2 = crate::OptContext::with_num_inputs(6, 3);
         import_state(&[OpRef(0), OpRef(1), OpRef(2)], &exported, &mut ctx2);
+        let imported_result = ctx2.imported_short_pure_ops[0].result;
+        let forced = ctx2.force_op_from_preamble(imported_result);
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
         assert_eq!(
             ctx2.imported_short_aliases,
             vec![crate::ImportedShortAlias {
-                result: ctx2.imported_short_pure_ops[0].result,
+                result: imported_result,
+                same_as_source: OpRef(14),
+                same_as_opcode: OpCode::SameAsI,
+            }]
+        );
+        let mut optimizer = crate::optimizer::Optimizer::new();
+        let _ = optimizer.force_box(forced, &mut ctx2);
+        assert_eq!(
+            ctx2.used_imported_short_aliases(),
+            vec![crate::ImportedShortAlias {
+                result: OpRef(30),
                 same_as_source: OpRef(14),
                 same_as_opcode: OpCode::SameAsI,
             }]
@@ -3326,7 +3392,6 @@ mod tests {
             &[OpRef(10)],
             &[OpRef(0)],
             &[],
-            None,
             1,
             true,
             &[crate::ImportedShortAlias {
@@ -3334,10 +3399,7 @@ mod tests {
                 same_as_source: OpRef(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &[crate::ImportedShortSource {
-                result: OpRef(50),
-                source: OpRef(10),
-            }],
+            &std::collections::HashMap::new(),
             None,
             None,
         );
@@ -3350,6 +3412,116 @@ mod tests {
         assert_eq!(combined[3].args[0], combined[1].pos);
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(combined[4].args[0], combined[1].pos);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_preserves_visible_label_arg_until_body_redef() {
+        let p1_ops = vec![{
+            let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+            op.pos = OpRef(11);
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntGe, &[OpRef(11), OpRef(10000)]);
+                op.pos = OpRef(4);
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(11), OpRef(10001)]);
+                op.pos = OpRef(11);
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(11)]),
+        ];
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 2);
+        constants.insert(10_001, 1);
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef(11)],
+            &[OpRef(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &constants,
+            None,
+            None,
+        );
+
+        assert_eq!(combined[1].opcode, OpCode::Label);
+        assert_eq!(combined[1].args.as_slice(), &[OpRef(11)]);
+        assert_eq!(combined[2].opcode, OpCode::IntGe);
+        assert_eq!(combined[2].args[0], OpRef(11));
+        assert_eq!(combined[3].opcode, OpCode::IntAdd);
+        assert_eq!(combined[3].args[0], OpRef(11));
+        assert_ne!(combined[3].pos, OpRef(11));
+        assert_eq!(combined[4].opcode, OpCode::Jump);
+        assert_eq!(combined[4].args[0], combined[3].pos);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_preserves_visible_preamble_box_over_body_collision() {
+        let p1_ops = vec![{
+            let mut op = Op::new(OpCode::GetfieldGcR, &[OpRef(3)]);
+            op.pos = OpRef(19);
+            op.descr = Some(majit_ir::descr::make_field_descr_full(
+                56,
+                0,
+                8,
+                Type::Ref,
+                false,
+            ));
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::SetfieldGc, &[OpRef(25), OpRef(19)]);
+                op.descr = Some(majit_ir::descr::make_field_descr_full(
+                    57,
+                    8,
+                    8,
+                    Type::Ref,
+                    false,
+                ));
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10001)]);
+                op.pos = OpRef(19);
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(19)]),
+        ];
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_001, 1);
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef(0)],
+            &[OpRef(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &constants,
+            None,
+            None,
+        );
+
+        assert_eq!(combined[1].opcode, OpCode::Label);
+        assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
+        assert_eq!(combined[2].args[1], OpRef(19));
+        assert_eq!(combined[3].opcode, OpCode::IntAdd);
+        assert_ne!(combined[3].pos, OpRef(19));
+        assert_eq!(combined[4].opcode, OpCode::Jump);
+        assert_eq!(combined[4].args[0], combined[3].pos);
     }
 
     #[test]
@@ -3388,6 +3560,37 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_short_preamble_returns_short_jump_args_not_used_boxes() {
+        let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        op.pos = OpRef(7);
+        let sp = crate::shortpreamble::ShortPreamble {
+            ops: vec![crate::shortpreamble::ShortPreambleOp {
+                op,
+                arg_mapping: vec![(0, 0), (1, 1)],
+                fail_arg_mapping: Vec::new(),
+            }],
+            inputargs: vec![OpRef(0), OpRef(1)],
+            used_boxes: vec![OpRef(99)],
+            jump_args: vec![OpRef(7)],
+            exported_state: None,
+        };
+
+        let mut ctx = crate::OptContext::with_num_inputs(8, 2);
+        let mut optimizer = crate::optimizer::Optimizer::new();
+        let extra = OptUnroll::inline_short_preamble(
+            &[OpRef(10), OpRef(11)],
+            &[OpRef(10), OpRef(11)],
+            &sp,
+            &mut optimizer,
+            &mut ctx,
+        );
+
+        assert_eq!(ctx.new_operations.len(), 1);
+        assert_eq!(ctx.new_operations[0].opcode, OpCode::IntAdd);
+        assert_eq!(extra, vec![ctx.new_operations[0].pos]);
+    }
+
+    #[test]
     fn test_assemble_peeled_trace_extends_label_with_used_boxes() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
@@ -3409,7 +3612,6 @@ mod tests {
             &[OpRef(10)],
             &[OpRef(0)],
             &[OpRef(50)],
-            None,
             1,
             true,
             &[crate::ImportedShortAlias {
@@ -3417,10 +3619,7 @@ mod tests {
                 same_as_source: OpRef(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &[crate::ImportedShortSource {
-                result: OpRef(50),
-                source: OpRef(10),
-            }],
+            &std::collections::HashMap::new(),
             None,
             None,
         );
@@ -3432,7 +3631,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assemble_peeled_trace_carries_imported_short_refs_via_label_and_jump() {
+    fn test_assemble_peeled_trace_does_not_carry_plain_preamble_refs() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::New, &[]);
             op.pos = OpRef(50);
@@ -3449,97 +3648,20 @@ mod tests {
             &[OpRef(10)],
             &[OpRef(0)],
             &[],
-            None,
             1,
             true,
             &[],
-            &[crate::ImportedShortSource {
-                result: OpRef(50),
-                source: OpRef(7),
-            }],
+            &std::collections::HashMap::new(),
             None,
             None,
         );
 
         assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef(10), OpRef(50)]);
+        assert_eq!(combined[1].args.as_slice(), &[OpRef(10)]);
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
         assert_eq!(combined[2].args.as_slice(), &[OpRef(10), OpRef(50)]);
         assert_eq!(combined[3].opcode, OpCode::Jump);
-        assert_eq!(combined[3].args.as_slice(), &[OpRef(10), OpRef(50)]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_carries_imported_short_source_refs_via_label_and_jump() {
-        let p1_ops = vec![{
-            let mut op = Op::new(OpCode::New, &[]);
-            op.pos = OpRef(50);
-            op
-        }];
-        let p2_ops = vec![
-            Op::new(OpCode::SetfieldGc, &[OpRef(10), OpRef(50)]),
-            Op::new(OpCode::Jump, &[OpRef(10)]),
-        ];
-
-        let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef(10)],
-            &[OpRef(0)],
-            &[],
-            None,
-            1,
-            true,
-            &[],
-            &[crate::ImportedShortSource {
-                result: OpRef(70),
-                source: OpRef(50),
-            }],
-            None,
-            None,
-        );
-
-        assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef(10), OpRef(50)]);
-        assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].args.as_slice(), &[OpRef(10), OpRef(50)]);
-        assert_eq!(combined[3].opcode, OpCode::Jump);
-        assert_eq!(combined[3].args.as_slice(), &[OpRef(10), OpRef(50)]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_carries_plain_preamble_refs_via_label_and_jump() {
-        let p1_ops = vec![{
-            let mut op = Op::new(OpCode::New, &[]);
-            op.pos = OpRef(50);
-            op
-        }];
-        let p2_ops = vec![
-            Op::new(OpCode::SetfieldGc, &[OpRef(10), OpRef(50)]),
-            Op::new(OpCode::Jump, &[OpRef(10)]),
-        ];
-
-        let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef(10)],
-            &[OpRef(0)],
-            &[],
-            None,
-            1,
-            true,
-            &[],
-            &[],
-            None,
-            None,
-        );
-
-        assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef(10), OpRef(50)]);
-        assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].args.as_slice(), &[OpRef(10), OpRef(50)]);
-        assert_eq!(combined[3].opcode, OpCode::Jump);
-        assert_eq!(combined[3].args.as_slice(), &[OpRef(10), OpRef(50)]);
+        assert_eq!(combined[3].args.as_slice(), &[OpRef(10)]);
     }
 
     #[test]
@@ -3560,11 +3682,10 @@ mod tests {
             &[OpRef(10), OpRef(11), OpRef(12), OpRef(13), OpRef(14)],
             &[OpRef(100), OpRef(101), OpRef(102)],
             &[OpRef(13), OpRef(14)],
-            None,
             5,
             false,
             &[],
-            &[],
+            &std::collections::HashMap::new(),
             Some(start_descr),
             None,
         );
@@ -3576,6 +3697,41 @@ mod tests {
             combined[2].args.as_slice(),
             &[OpRef(100), OpRef(101), OpRef(102)]
         );
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_skips_constant_slots_for_new_body_positions() {
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::New, &[]);
+                op.pos = OpRef(1);
+                op
+            },
+            Op::new(OpCode::SetfieldGc, &[OpRef(1), OpRef(0)]),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        let constants = std::collections::HashMap::from([(2_u32, 606_i64), (4_u32, 611_i64)]);
+
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &[OpRef(10)],
+            &[OpRef(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &constants,
+            None,
+            None,
+        );
+
+        assert_eq!(combined[0].opcode, OpCode::Label);
+        assert_eq!(combined[1].opcode, OpCode::New);
+        assert_ne!(combined[1].pos, OpRef(2));
+        assert_ne!(combined[1].pos, OpRef(4));
+        assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
+        assert_eq!(combined[2].args[0], combined[1].pos);
     }
 
     #[test]

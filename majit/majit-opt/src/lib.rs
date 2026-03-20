@@ -327,21 +327,35 @@ impl OptContext {
         let _ = self.force_op_from_preamble(result);
     }
 
+    fn imported_short_source(&self, result: OpRef) -> OpRef {
+        self.imported_short_sources
+            .iter()
+            .find_map(|entry| (entry.result == result).then_some(entry.source))
+            .unwrap_or(result)
+    }
+
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
         let result = self.get_replacement(result);
-        let is_constant = self.get_constant(result).is_some();
-        if self.imported_short_preamble_used.insert(result) {
+        let preamble_result = self.imported_short_source(result);
+        let is_constant = self.get_constant(preamble_result).is_some();
+        if self.imported_short_preamble_used.insert(preamble_result) {
             if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                let tracked = builder.use_box(result).is_some();
+                let tracked = builder.use_box(preamble_result).is_some();
                 if tracked && !is_constant {
-                    if let Some(produced) = builder.produced_short_op(result) {
+                    if let Some(produced) = builder.produced_short_op(preamble_result) {
                         self.potential_extra_ops
-                            .insert(result, TrackedPreambleUse { result, produced });
+                            .insert(
+                                preamble_result,
+                                TrackedPreambleUse {
+                                    result: preamble_result,
+                                    produced,
+                                },
+                            );
                     }
                 }
             }
         }
-        result
+        preamble_result
     }
 
     pub fn take_potential_extra_op(&mut self, result: OpRef) -> Option<TrackedPreambleUse> {
@@ -400,7 +414,6 @@ impl OptContext {
         self.extra_operations.pop_front()
     }
 
-    #[cfg(test)]
     pub(crate) fn flush_extra_operations_raw(&mut self) {
         while let Some(op) = self.extra_operations.pop_front() {
             self.emit(op);
@@ -572,7 +585,7 @@ pub trait Optimization {
     fn setup(&mut self) {}
 
     /// Called after all operations have been processed.
-    fn flush(&mut self) {}
+    fn flush(&mut self, _ctx: &mut OptContext) {}
 
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;

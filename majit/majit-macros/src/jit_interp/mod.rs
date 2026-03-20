@@ -175,10 +175,19 @@ pub enum StateFieldKind {
 pub struct StorageConfig {
     /// Expression to access the storage pool (e.g., `state.storage`).
     pub pool: Expr,
+    /// Optional expression yielding the JIT-visible GC storage object reference.
+    ///
+    /// Linked-list interpreters can use this to pass a real GC ref as a red
+    /// variable instead of leaking a raw host pointer into GETFIELD_GC.
+    pub pool_ref: Option<Expr>,
+    /// Optional expression yielding the JIT-visible GC selected-storage ref.
+    pub selected_ref: Option<Expr>,
     /// Type of the storage pool (e.g., `StoragePool`).
     pub pool_type: Path,
     /// Expression to access the selected index (e.g., `state.selected`).
     pub selector: Expr,
+    /// Optional expression to access the selected stack size red variable.
+    pub stacksize: Option<Expr>,
     /// Storage indices that cannot be traced (e.g., `[VAL_QUEUE, VAL_PORT]`).
     pub untraceable: Vec<Path>,
     /// Function to scan for used storages (e.g., `find_used_storages`).
@@ -208,6 +217,12 @@ pub struct StorageConfig {
     pub linked_list_value_offset: Option<Expr>,
     /// Byte offset of the next pointer within a linked list node.
     pub linked_list_next_offset: Option<Expr>,
+    /// Byte offset of the storage refs array on the shadow storage object.
+    pub linked_list_storage_offset: Option<Expr>,
+    /// Byte offset of the head field on the shadow stack object.
+    pub linked_list_stack_head_offset: Option<Expr>,
+    /// Byte offset of the size field on the shadow stack object.
+    pub linked_list_stack_size_offset: Option<Expr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,8 +395,11 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     braced!(content in input);
 
     let mut pool = None;
+    let mut pool_ref = None;
+    let mut selected_ref = None;
     let mut pool_type = None;
     let mut selector = None;
+    let mut stacksize = None;
     let mut untraceable = Vec::new();
     let mut scan_fn = None;
     let mut can_trace_guard = None;
@@ -389,6 +407,9 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut linked_list_node_size = None;
     let mut linked_list_value_offset = None;
     let mut linked_list_next_offset = None;
+    let mut linked_list_storage_offset = None;
+    let mut linked_list_stack_head_offset = None;
+    let mut linked_list_stack_size_offset = None;
     let mut compact_encode = None;
     let mut compact_decode = None;
     let mut compact_min = None;
@@ -404,11 +425,20 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             "pool" => {
                 pool = Some(content.parse::<Expr>()?);
             }
+            "pool_ref" => {
+                pool_ref = Some(content.parse::<Expr>()?);
+            }
+            "selected_ref" => {
+                selected_ref = Some(content.parse::<Expr>()?);
+            }
             "pool_type" => {
                 pool_type = Some(content.parse::<Path>()?);
             }
             "selector" => {
                 selector = Some(content.parse::<Expr>()?);
+            }
+            "stacksize" => {
+                stacksize = Some(content.parse::<Expr>()?);
             }
             "untraceable" => {
                 let inner;
@@ -456,6 +486,15 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             "linked_list_next_offset" => {
                 linked_list_next_offset = Some(content.parse::<Expr>()?);
             }
+            "linked_list_storage_offset" => {
+                linked_list_storage_offset = Some(content.parse::<Expr>()?);
+            }
+            "linked_list_stack_head_offset" => {
+                linked_list_stack_head_offset = Some(content.parse::<Expr>()?);
+            }
+            "linked_list_stack_size_offset" => {
+                linked_list_stack_size_offset = Some(content.parse::<Expr>()?);
+            }
             "virtualizable" => {
                 let _: LitBool = content.parse()?;
                 return Err(syn::Error::new(
@@ -485,8 +524,11 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
 
     Ok(StorageConfig {
         pool,
+        pool_ref,
+        selected_ref,
         pool_type,
         selector,
+        stacksize,
         untraceable,
         scan_fn,
         can_trace_guard,
@@ -501,6 +543,9 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         linked_list_node_size,
         linked_list_value_offset,
         linked_list_next_offset,
+        linked_list_storage_offset,
+        linked_list_stack_head_offset,
+        linked_list_stack_size_offset,
     })
 }
 

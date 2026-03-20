@@ -298,10 +298,7 @@ pub enum PreambleOpKind {
     /// shortpreamble.py: HeapOp — a heap read (GETFIELD_GC, GETARRAYITEM_GC)
     /// that was cached during the preamble. On bridge entry, the field/array
     /// must be re-read to populate the cache.
-    Heap {
-        /// The field/array descriptor index.
-        descr_idx: u32,
-    },
+    Heap,
     /// shortpreamble.py: PureOp — a pure operation whose result was used
     /// in the loop body. On bridge entry, the pure op is re-computed.
     Pure,
@@ -338,7 +335,7 @@ impl PreambleOp {
     pub fn add_op_to_short(&self, sb: &mut ShortBoxes) -> Option<ProducedShortOp> {
         let preamble_op = match &self.kind {
             PreambleOpKind::InputArg | PreambleOpKind::Guard => self.op.clone(),
-            PreambleOpKind::Heap { descr_idx: _ } => {
+            PreambleOpKind::Heap => {
                 let args = self
                     .op
                     .args
@@ -503,50 +500,35 @@ impl ShortBoxes {
     /// shortpreamble.py: sb.add_pure_op(op)
     pub fn add_pure_op(&mut self, op: Op) {
         let result = op.pos;
-        self.add_op(
-            result,
-            PotentialShortOp::Preamble(PreambleOp {
-                op,
-                kind: PreambleOpKind::Pure,
-                label_arg_idx: self.lookup_label_arg(result),
-                invented_name: false,
-                same_as_source: None,
-            }),
+        self.add_potential_op(
+            self.lookup_label_arg(result),
+            op,
+            PreambleOpKind::Pure,
         );
     }
 
     /// Add a heap read as a short-box candidate.
-    /// shortpreamble.py: sb.add_heap_op(op, descr)
-    pub fn add_heap_op(&mut self, op: Op, descr_idx: u32) {
+    /// shortpreamble.py: sb.add_heap_op(op, getfield_op)
+    pub fn add_heap_op(&mut self, op: Op) {
         let result = op.pos;
-        self.add_op(
-            result,
-            PotentialShortOp::Preamble(PreambleOp {
-                op,
-                kind: PreambleOpKind::Heap { descr_idx },
-                label_arg_idx: self.lookup_label_arg(result),
-                invented_name: false,
-                same_as_source: None,
-            }),
+        self.add_potential_op(
+            self.lookup_label_arg(result),
+            op,
+            PreambleOpKind::Heap,
         );
     }
 
     /// Add a loop-invariant call as a short-box candidate.
     pub fn add_loopinvariant_op(&mut self, op: Op) {
         let result = op.pos;
-        self.add_op(
-            result,
-            PotentialShortOp::Preamble(PreambleOp {
-                op,
-                kind: PreambleOpKind::LoopInvariant,
-                label_arg_idx: self.lookup_label_arg(result),
-                invented_name: false,
-                same_as_source: None,
-            }),
+        self.add_potential_op(
+            self.lookup_label_arg(result),
+            op,
+            PreambleOpKind::LoopInvariant,
         );
     }
 
-    fn add_short_input_arg(&mut self, arg: OpRef) {
+    pub(crate) fn add_short_input_arg(&mut self, arg: OpRef) {
         let label_arg_idx = self.lookup_label_arg(arg);
         let op = match majit_ir::Type::Int {
             _ => {
@@ -555,18 +537,19 @@ impl ShortBoxes {
                 same_as
             }
         };
-        self.potential_ops
-            .entry(arg)
-            .or_insert(PotentialShortOp::Preamble(PreambleOp {
+        if !self.potential_order.contains(&arg) {
+            self.potential_order.push(arg);
+        }
+        self.potential_ops.insert(
+            arg,
+            PotentialShortOp::Preamble(PreambleOp {
                 op,
                 kind: PreambleOpKind::InputArg,
                 label_arg_idx,
                 invented_name: false,
                 same_as_source: None,
-            }));
-        if !self.potential_order.contains(&arg) {
-            self.potential_order.push(arg);
-        }
+            }),
+        );
     }
 
     fn produce_arg(&mut self, opref: OpRef) -> Option<OpRef> {
@@ -587,7 +570,7 @@ impl ShortBoxes {
     fn pick_produced_op_index(candidates: &[ProducedShortOp], pick_other: bool) -> usize {
         let mut index: Option<usize> = None;
         for (i, item) in candidates.iter().enumerate() {
-            let prefer = !matches!(item.kind, PreambleOpKind::Heap { .. })
+            let prefer = !matches!(item.kind, PreambleOpKind::Heap)
                 && (pick_other || item.kind == PreambleOpKind::InputArg);
             if prefer {
                 if index.is_some() && pick_other {
@@ -646,12 +629,12 @@ impl ShortBoxes {
 
     /// shortpreamble.py: add_potential_op(op, pop)
     /// Add a produced operation to the short boxes at the given position.
-    pub fn add_potential_op(&mut self, label_arg_idx: usize, op: Op, kind: PreambleOpKind) {
+    pub fn add_potential_op(&mut self, label_arg_idx: Option<usize>, op: Op, kind: PreambleOpKind) {
         let result = op.pos;
         let pop = PotentialShortOp::Preamble(PreambleOp {
             op,
             kind,
-            label_arg_idx: Some(label_arg_idx),
+            label_arg_idx,
             invented_name: false,
             same_as_source: None,
         });
@@ -750,11 +733,11 @@ impl CollectedExtendedShortPreambleBuilder {
     }
 
     /// Add a heap read.
-    pub fn add_heap_op(&mut self, op: Op, descr_idx: u32) {
+    pub fn add_heap_op(&mut self, op: Op) {
         let label_arg_idx = self.preamble_to_label_arg.get(&op.pos).copied();
         self.heap_ops.push(PreambleOp {
             op,
-            kind: PreambleOpKind::Heap { descr_idx },
+            kind: PreambleOpKind::Heap,
             label_arg_idx,
             invented_name: false,
             same_as_source: None,
@@ -926,6 +909,7 @@ pub struct ProducedShortOp {
 struct AbstractShortPreambleBuilderState {
     short: Vec<Op>,
     short_results: HashSet<OpRef>,
+    label_args: Vec<OpRef>,
     used_boxes: Vec<OpRef>,
     short_preamble_jump: Vec<Op>,
     extra_same_as: Vec<Op>,
@@ -934,9 +918,6 @@ struct AbstractShortPreambleBuilderState {
 
 impl AbstractShortPreambleBuilderState {
     fn record_preamble_use(&mut self, result: OpRef, produced: &ProducedShortOp) {
-        if self.used_boxes.contains(&result) {
-            return;
-        }
         if produced.invented_name {
             let source = produced.same_as_source.unwrap_or(result);
             let mut op = Op::new(
@@ -1041,6 +1022,7 @@ impl ShortPreambleBuilder {
         let produced_short_boxes = short_boxes.iter().cloned().collect();
         ShortPreambleBuilder {
             state: AbstractShortPreambleBuilderState {
+                label_args: label_args.to_vec(),
                 short_inputargs: if short_inputargs.is_empty() {
                     label_args.to_vec()
                 } else {
@@ -1159,6 +1141,7 @@ impl ExtendedShortPreambleBuilder {
             base_results: HashSet::new(),
             base_extra_same_as: sb.extra_same_as().to_vec(),
             extra_state: AbstractShortPreambleBuilderState {
+                label_args: Vec::new(),
                 short_inputargs: sb.short_inputargs().to_vec(),
                 extra_same_as: sb.extra_same_as().to_vec(),
                 ..AbstractShortPreambleBuilderState::default()
@@ -1181,6 +1164,7 @@ impl ExtendedShortPreambleBuilder {
         self.extra_state.used_boxes.clear();
         self.extra_state.short_preamble_jump.clear();
         self.extra_state.extra_same_as = self.base_extra_same_as.clone();
+        self.extra_state.label_args = label_args.to_vec();
         self.extra_state.short_inputargs = self.short_inputargs.clone();
         self.label_args = label_args.to_vec();
         self.used_boxes = short_preamble.used_boxes.clone();
@@ -1842,7 +1826,13 @@ mod tests {
         builder.set_label_args(&[OpRef(100), OpRef(101)]);
         builder.add_guard(Op::new(OpCode::GuardTrue, &[OpRef(100)]));
         builder.add_pure_op(Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]));
-        builder.add_heap_op(Op::new(OpCode::GetfieldGcI, &[OpRef(100)]), 42);
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(100)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+        );
+        heap.pos = OpRef(102);
+        builder.add_heap_op(heap);
         builder.add_loopinvariant_op(Op::new(OpCode::CallI, &[OpRef(100)]));
         assert_eq!(builder.num_ops(), 4);
     }
@@ -1856,9 +1846,13 @@ mod tests {
         let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         pure.pos = OpRef(10);
         sb.add_pure_op(pure);
-        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(0)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+        );
         heap.pos = OpRef(11);
-        sb.add_heap_op(heap, 5);
+        sb.add_heap_op(heap);
         let produced = sb.produced_ops();
         assert_eq!(produced.len(), 2);
     }
@@ -1867,13 +1861,17 @@ mod tests {
     fn test_short_boxes_compound_prefers_non_heap_and_emits_invented_alias() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(10)]);
 
-        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(0)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+        );
         heap.pos = OpRef(10);
-        sb.add_potential_op(0, heap, PreambleOpKind::Heap { descr_idx: 55 });
+        sb.add_potential_op(Some(0), heap, PreambleOpKind::Heap);
 
         let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         pure.pos = OpRef(10);
-        sb.add_potential_op(0, pure, PreambleOpKind::Pure);
+        sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops();
         assert_eq!(produced.len(), 2);
@@ -1889,7 +1887,7 @@ mod tests {
             .iter()
             .find(|(result, _)| *result != OpRef(10))
             .unwrap();
-        assert_eq!(alias.1.kind, PreambleOpKind::Heap { descr_idx: 55 });
+        assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
         assert_eq!(alias.1.same_as_source, Some(OpRef(10)));
     }
@@ -1898,17 +1896,21 @@ mod tests {
     fn test_short_boxes_nested_compound_emits_multiple_invented_aliases() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(20)]);
 
-        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(0)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+        );
         heap.pos = OpRef(20);
-        sb.add_potential_op(0, heap, PreambleOpKind::Heap { descr_idx: 60 });
+        sb.add_potential_op(Some(0), heap, PreambleOpKind::Heap);
 
         let mut loopinv = Op::new(OpCode::CallI, &[OpRef(0)]);
         loopinv.pos = OpRef(20);
-        sb.add_potential_op(0, loopinv, PreambleOpKind::LoopInvariant);
+        sb.add_potential_op(Some(0), loopinv, PreambleOpKind::LoopInvariant);
 
         let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         pure.pos = OpRef(20);
-        sb.add_potential_op(0, pure, PreambleOpKind::Pure);
+        sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops();
         assert_eq!(produced.len(), 3);
@@ -1934,12 +1936,44 @@ mod tests {
     }
 
     #[test]
+    fn test_rpython_create_short_boxes_prefers_short_inputarg_over_heap_result() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(10)]);
+        sb.add_short_input_arg(OpRef(10));
+
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(0)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+        );
+        heap.pos = OpRef(10);
+        sb.add_heap_op(heap);
+
+        let produced = sb.produced_ops();
+        assert_eq!(produced.len(), 2);
+
+        let chosen = produced
+            .iter()
+            .find(|(result, _)| *result == OpRef(10))
+            .unwrap();
+        assert_eq!(chosen.1.kind, PreambleOpKind::InputArg);
+        assert!(!chosen.1.invented_name);
+
+        let alias = produced
+            .iter()
+            .find(|(result, _)| *result != OpRef(10))
+            .unwrap();
+        assert_eq!(alias.1.kind, PreambleOpKind::Heap);
+        assert!(alias.1.invented_name);
+        assert_eq!(alias.1.same_as_source, Some(OpRef(10)));
+    }
+
+    #[test]
     fn test_rpython_short_preamble_builder_use_box_builds_label_short_and_jump() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(10)]);
 
         let mut ovf = Op::new(OpCode::IntAddOvf, &[OpRef(0), OpRef(1)]);
         ovf.pos = OpRef(10);
-        sb.add_potential_op(0, ovf, PreambleOpKind::Pure);
+        sb.add_potential_op(Some(0), ovf, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops();
         let mut builder = ShortPreambleBuilder::new(&[OpRef(10)], &produced, &[OpRef(10)]);
@@ -1958,16 +1992,61 @@ mod tests {
     }
 
     #[test]
+    fn test_rpython_short_preamble_builder_carries_used_box_in_struct() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(10)]);
+
+        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        pure.pos = OpRef(10);
+        sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
+
+        let produced = sb.produced_ops();
+        let mut builder = ShortPreambleBuilder::new(&[OpRef(10)], &produced, &[OpRef(10)]);
+        assert!(builder.add_preamble_op(OpRef(10)));
+
+        let sp = builder.build_short_preamble_struct();
+        assert_eq!(sp.used_boxes, vec![OpRef(10)]);
+        assert_eq!(sp.jump_args, vec![OpRef(10)]);
+    }
+
+    #[test]
+    fn test_rpython_short_preamble_builder_tracks_existing_label_arg_use() {
+        let produced = vec![(
+            OpRef(20),
+            ProducedShortOp {
+                kind: PreambleOpKind::Pure,
+                preamble_op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                    op.pos = OpRef(30);
+                    op
+                },
+                invented_name: false,
+                same_as_source: None,
+            },
+        )];
+        let mut builder = ShortPreambleBuilder::new(&[OpRef(20)], &produced, &[OpRef(10)]);
+
+        assert!(builder.add_preamble_op(OpRef(20)));
+        assert_eq!(builder.used_boxes(), &[OpRef(20)]);
+        let sp = builder.build_short_preamble_struct();
+        assert_eq!(sp.used_boxes, vec![OpRef(20)]);
+        assert_eq!(sp.jump_args, vec![OpRef(30)]);
+    }
+
+    #[test]
     fn test_rpython_short_preamble_builder_tracks_extra_same_as() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(20)]);
 
-        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(0)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+        );
         heap.pos = OpRef(20);
-        sb.add_potential_op(0, heap, PreambleOpKind::Heap { descr_idx: 61 });
+        sb.add_potential_op(Some(0), heap, PreambleOpKind::Heap);
 
         let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         pure.pos = OpRef(20);
-        sb.add_potential_op(0, pure, PreambleOpKind::Pure);
+        sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops();
         let alias_result = produced
@@ -1989,13 +2068,17 @@ mod tests {
     fn test_rpython_extended_builder_appends_label_and_jump_for_alias() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(30)]);
 
-        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[OpRef(0)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+        );
         heap.pos = OpRef(30);
-        sb.add_potential_op(0, heap, PreambleOpKind::Heap { descr_idx: 71 });
+        sb.add_potential_op(Some(0), heap, PreambleOpKind::Heap);
 
         let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         pure.pos = OpRef(30);
-        sb.add_potential_op(0, pure, PreambleOpKind::Pure);
+        sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops();
         let alias_result = produced
@@ -2024,4 +2107,5 @@ mod tests {
         assert_eq!(ext.extra_same_as()[0].opcode, OpCode::SameAsI);
         assert_eq!(ext.extra_same_as()[0].pos, alias_result);
     }
+
 }

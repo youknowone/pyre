@@ -69,6 +69,9 @@ pub struct Optimizer {
     /// Preserved so finalize_short_preamble can create the live extended
     /// producer for the target token currently being compiled.
     pub imported_short_preamble_builder: Option<crate::shortpreamble::ShortPreambleBuilder>,
+    /// RPython unroll.py: `label_args = import_state(...)`.
+    /// The peeled loop's LABEL must use these args, not the phase-1 end_args.
+    pub imported_label_args: Option<Vec<OpRef>>,
     /// simplify.py: patchguardop recorded from GUARD_FUTURE_CONDITION.
     pub patchguardop: Option<Op>,
     /// RPython: propagate_all_forward(trace, flush=False) for Phase 2.
@@ -120,6 +123,23 @@ pub struct ExportedJumpVirtual {
 }
 
 impl Optimizer {
+    fn is_constant_placeholder_op(
+        op: &Op,
+        constants: &[Option<majit_ir::Value>],
+    ) -> bool {
+        if !matches!(
+            op.opcode,
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
+        ) {
+            return false;
+        }
+        let idx = op.pos.0 as usize;
+        if idx >= constants.len() || constants[idx].is_none() {
+            return false;
+        }
+        op.args.is_empty() || op.args.iter().all(|arg| arg.is_none())
+    }
+
     fn import_virtual_state_value(
         info: &crate::virtualstate::VirtualStateInfo,
         ctx: &mut OptContext,
@@ -355,6 +375,7 @@ impl Optimizer {
             imported_short_aliases: Vec::new(),
             imported_short_preamble: None,
             imported_short_preamble_builder: None,
+            imported_label_args: None,
             patchguardop: None,
             skip_flush: false,
             final_ctx: None,
@@ -524,9 +545,16 @@ impl Optimizer {
 
     /// optimizer.py: flush()
     /// Flush all passes' postponed state.
-    pub fn flush(&mut self) {
-        for pass in &mut self.passes {
-            pass.flush();
+    pub fn flush(&mut self, ctx: &mut OptContext) {
+        for pass_idx in 0..self.passes.len() {
+            let pass = &mut self.passes[pass_idx];
+            pass.flush(ctx);
+            // RPython Optimization.emit_extra() routes newly forced ops to
+            // optimizer.send_extra_operation(op, self.next_optimization).
+            // During flush we must preserve that contract: each pass's flush
+            // output is processed only by downstream passes, never by the
+            // flushing pass again.
+            self.drain_extra_operations_from(pass_idx + 1, ctx);
         }
     }
 
@@ -794,6 +822,7 @@ impl Optimizer {
         num_inputs: usize,
     ) -> Vec<Op> {
         use majit_ir::{OpRef, Value};
+        self.imported_label_args = None;
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.
@@ -837,7 +866,8 @@ impl Optimizer {
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
             let targetargs: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
-            crate::unroll::import_state(&targetargs, exported_state, &mut ctx);
+            self.imported_label_args =
+                Some(crate::unroll::import_state(&targetargs, exported_state, &mut ctx));
         }
 
         if !self.imported_virtuals.is_empty() {
@@ -851,7 +881,7 @@ impl Optimizer {
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Phase 2 leaves lazy sets pending so virtuals aren't forced.
         if !self.skip_flush {
-            self.flush();
+            self.flush(&mut ctx);
             self.drain_extra_operations_from(0, &mut ctx);
         }
 
@@ -892,6 +922,9 @@ impl Optimizer {
             preview_short_args.extend(preview_virtuals);
             let mut short_boxes =
                 crate::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
+            for &arg in &preview_short_args {
+                short_boxes.add_short_input_arg(arg);
+            }
             self.produce_potential_short_preamble_ops(&mut short_boxes);
             let produced = short_boxes.produced_ops();
             ctx.exported_short_boxes = produced
@@ -904,6 +937,18 @@ impl Optimizer {
                     same_as_source: produced.same_as_source,
                 })
                 .collect();
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                for entry in &ctx.exported_short_boxes {
+                    eprintln!(
+                        "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?}",
+                        entry.kind,
+                        entry.op.pos,
+                        entry.op.opcode,
+                        entry.op.args,
+                        entry.op.descr.as_ref().map(|d| d.index()),
+                    );
+                }
+            }
             let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &ctx);
             // RPython unroll.py passes optimize_preamble()'s inputargs here,
             // i.e. the external loop-entry contract, not the optimizer's
@@ -955,6 +1000,13 @@ impl Optimizer {
             }
         }
 
+
+        // RPython keeps constants as Const boxes, not SameAs placeholder ops in
+        // the final trace. Drop constant-only SameAs placeholders before the
+        // backend sees the trace; their OpRefs remain available through the
+        // constants table.
+        ctx.new_operations
+            .retain(|op| !Self::is_constant_placeholder_op(op, &ctx.constants));
 
         // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
         // and all op positions are reassigned to start from final_num_inputs.
@@ -1426,7 +1478,7 @@ mod tests {
             OptimizationResult::PassOn
         }
 
-        fn flush(&mut self) {
+        fn flush(&mut self, _ctx: &mut OptContext) {
             self.hits.set(self.hits.get() + 1);
         }
 
@@ -1562,6 +1614,28 @@ mod tests {
     }
 
     #[test]
+    fn test_drops_constant_placeholder_same_as_from_final_trace_without_virtual_inputs() {
+        let mut opt = Optimizer::new();
+
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::IntAdd, &[OpRef(2), OpRef(0)]),
+        ];
+        ops[0].pos = OpRef(2);
+        ops[1].pos = OpRef(3);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(2, 1);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::IntAdd);
+        assert_eq!(result[0].pos, OpRef(3));
+        assert_eq!(result[0].arg(0), OpRef(2));
+        assert_eq!(constants.get(&2), Some(&1));
+    }
+
+    #[test]
     fn test_get_count_of_ops_and_guards() {
         let mut opt = Optimizer::default_pipeline();
         let mut ops = vec![
@@ -1586,7 +1660,8 @@ mod tests {
         opt.add_pass(Box::new(FlushCounter { hits: hits.clone() }));
         opt.add_pass(Box::new(FlushCounter { hits: hits.clone() }));
 
-        opt.flush();
+        let mut ctx = OptContext::new(0);
+        opt.flush(&mut ctx);
 
         assert_eq!(hits.get(), 2);
     }

@@ -763,6 +763,7 @@ pub(crate) fn normalize_closing_jump_args(
 ) -> Vec<Op> {
     let Some(label_args) = ops
         .iter()
+        .rev()
         .find(|op| op.opcode == OpCode::Label)
         .map(|op| op.args.clone())
     else {

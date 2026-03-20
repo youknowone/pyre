@@ -786,7 +786,7 @@ mod tests {
             }
         }
 
-        pass.flush();
+        pass.flush(&mut ctx);
         ctx.new_operations
     }
 

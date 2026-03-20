@@ -2267,7 +2267,7 @@ mod tests {
             }
         }
 
-        pass.flush();
+        pass.flush(&mut ctx);
         ctx.new_operations
     }
 
@@ -3401,7 +3401,7 @@ mod tests {
             }
         }
 
-        pass.flush();
+        pass.flush(&mut ctx);
         ctx.new_operations
     }
 
@@ -3568,6 +3568,62 @@ mod tests {
             0,
             "GETFIELD after force should be forwarded via heap cache; got ops: {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_jump_forces_virtual_value_stored_into_nonvirtual_field() {
+        // RPython parity:
+        // - heap.py force_lazy_set() replays lazy SETFIELD_GC through emit_extra()
+        // - virtualize.py forces a virtual value before it escapes into the heap
+        //
+        // [p0]
+        // p1 = new(descr=node)
+        // setfield_gc(p0, p1, descr=next)
+        // jump(p0)
+        //
+        // The final trace must materialize p1 and the SETFIELD must store the
+        // emitted allocation, not the original virtual OpRef.
+        let node_sd = size_descr(1);
+        let next_fd = ref_field_descr(11);
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], node_sd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], next_fd.clone()),
+            Op::new(OpCode::Jump, &[OpRef(0)]),
+        ];
+        ops[0].pos = OpRef(1);
+        ops[1].pos = OpRef(2);
+        ops[2].pos = OpRef(3);
+
+        let mut opt = Optimizer::default_pipeline();
+        let mut constants = HashMap::new();
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+
+        let new_positions: std::collections::HashSet<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::New)
+            .map(|op| op.pos)
+            .collect();
+        assert!(
+            !new_positions.is_empty(),
+            "expected forced allocation before Jump; got {result:?}"
+        );
+
+        let stored_values: Vec<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::SetfieldGc && op.arg(0) == OpRef(0))
+            .map(|op| op.arg(1))
+            .collect();
+        assert!(
+            !stored_values.is_empty(),
+            "expected SetfieldGc to the non-virtual base; got {result:?}"
+        );
+        assert!(
+            stored_values.iter().all(|value| new_positions.contains(value)),
+            "stored value must be an emitted allocation, got values {:?} with News {:?} in {:?}",
+            stored_values,
+            new_positions,
+            result
         );
     }
 
