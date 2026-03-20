@@ -358,20 +358,6 @@ impl Optimizer {
         }
     }
 
-    /// RPython unroll.py: set Phase 2 flatten mode on OptVirtualize.
-    pub fn set_flatten_virtuals_at_jump(&mut self, enabled: bool) {
-        for pass in &mut self.passes {
-            pass.set_flatten_virtuals_at_jump(enabled);
-        }
-    }
-
-    /// RPython: Phase 2 (flush=False) — don't force lazy sets on JUMP.
-    pub fn set_skip_flush_on_final(&mut self, enabled: bool) {
-        for pass in &mut self.passes {
-            pass.set_skip_flush_on_final(enabled);
-        }
-    }
-
     /// Record a CALL_PURE result for cross-iteration constant folding.
     /// RPython optimizer.py: `call_pure_results[key] = value`
     pub fn record_call_pure_result(&mut self, args: Vec<majit_ir::OpRef>, value: majit_ir::Value) {
@@ -624,7 +610,6 @@ impl Optimizer {
         resolved
     }
 
-
     /// optimizer.py: protect_speculative_operation(op, ctx)
     /// When constant-folding a pure operation, verify that the folded
     /// constant doesn't cause a memory safety issue (e.g., null deref in
@@ -851,8 +836,18 @@ impl Optimizer {
             self.install_imported_virtuals(&mut ctx);
         }
 
-        // Process each operation through the pass chain
+        let stop_before_terminal = self.skip_flush && self.imported_loop_state.is_some();
+        let mut deferred_terminal_op: Option<Op> = None;
+
+        // RPython optimize_preamble()/optimize_peeled_loop():
+        // propagate_all_forward(..., flush=False) stops when it reaches the
+        // terminal JUMP/FINISH and leaves that op to the unroll/finalize
+        // logic instead of sending it through the optimization chain.
         for op in ops {
+            if stop_before_terminal && matches!(op.opcode, OpCode::Jump | OpCode::Finish) {
+                deferred_terminal_op = Some(op.clone());
+                break;
+            }
             self.propagate_one(op, &mut ctx);
         }
 
@@ -869,11 +864,16 @@ impl Optimizer {
         self.imported_short_preamble = ctx.build_imported_short_preamble();
         self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
         self.patchguardop = ctx.patchguardop.clone();
-        let jump = ctx
-            .new_operations
-            .iter()
-            .rfind(|op| op.opcode == OpCode::Jump)
-            .cloned();
+        let jump = if stop_before_terminal {
+            deferred_terminal_op
+                .clone()
+                .filter(|op| op.opcode == OpCode::Jump)
+        } else {
+            ctx.new_operations
+                .iter()
+                .rfind(|op| op.opcode == OpCode::Jump)
+                .cloned()
+        };
         self.exported_loop_state = jump.map(|jump| {
             let original_jump_args = ctx
                 .pre_force_jump_args
@@ -912,6 +912,10 @@ impl Optimizer {
                 })
                 .collect();
             let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &ctx);
+            // RPython unroll.py passes optimize_preamble()'s inputargs here,
+            // i.e. the external loop-entry contract, not the optimizer's
+            // internal position base (`ctx.num_inputs`), which may be widened
+            // to avoid collisions with existing op positions.
             let renamed_inputargs: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
             crate::unroll::export_state(
                 &original_jump_args,
@@ -952,9 +956,31 @@ impl Optimizer {
             }
         }
 
+        // Remove ops with args pointing to undefined positions (intermediate
+        // forwarding positions from force_virtual that weren't drained).
+        // RPython doesn't need this due to in-place Box forwarding.
+        {
+            let defined: std::collections::HashSet<u32> = ctx.new_operations
+                .iter()
+                .filter(|o| !o.pos.is_none())
+                .map(|o| o.pos.0)
+                .chain((0..num_inputs as u32))
+                .chain(ctx.constants.iter().enumerate().filter_map(|(i, v)| v.as_ref().map(|_| i as u32)))
+                .collect();
+            ctx.new_operations.retain(|op| {
+                op.args.iter().all(|a| a.is_none() || a.0 < 10_000 && defined.contains(&a.0) || a.0 >= 10_000)
+            });
+        }
+
         // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
         // and all op positions are reassigned to start from final_num_inputs.
         // This ensures no position collisions between input block params and ops.
+        // Drain extra_operations left by exported_loop_state computation.
+        // force_box_for_end_of_preamble → force_virtual → emit_through_passes
+        // pushes to extra_operations, but no pass-chain drain runs afterward.
+        while let Some(op) = ctx.pop_extra_operation() {
+            ctx.emit(op);
+        }
         if num_virtual_inputs > 0 {
             let fni = self.final_num_inputs as u32;
             let mut remap = std::collections::HashMap::new();
@@ -969,6 +995,12 @@ impl Optimizer {
             }
 
             // Op positions: reassign ALL ops to start from final_num_inputs.
+            if crate::majit_log_enabled() {
+                let fwd_1995 = if 1995 < ctx.forwarding.len() { ctx.forwarding[1995] } else { OpRef::NONE };
+                let in_ops = ctx.new_operations.iter().any(|o| o.pos.0 == 1995);
+                let in_args = ctx.new_operations.iter().any(|o| o.args.iter().any(|a| a.0 == 1995));
+                eprintln!("[remap] v1995: fwd={fwd_1995:?} in_ops={in_ops} in_args={in_args}");
+            }
             for (new_idx, op) in ctx.new_operations.iter_mut().enumerate() {
                 let new_pos = fni + new_idx as u32;
                 if !op.pos.is_none() {
@@ -1889,6 +1921,7 @@ mod tests {
         opt.enable_guard_replacement();
         assert!(opt.can_replace_guards);
     }
+
     #[test]
     fn test_force_box_for_end_of_preamble_recurses_virtual_fields() {
         use crate::info::{PtrInfo, VirtualStructInfo};
