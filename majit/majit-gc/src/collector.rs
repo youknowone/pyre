@@ -298,7 +298,6 @@ impl MiniMarkGC {
             let gcref = unsafe { *root_ptr };
             if !gcref.is_null() && self.is_in_nursery(gcref.0) {
                 if self.pinned_objects.contains(&gcref.0) {
-                    // Pinned: leave the object in the nursery.
                     continue;
                 }
                 let new_ref = self.copy_nursery_object(gcref.0);
@@ -307,6 +306,17 @@ impl MiniMarkGC {
                 }
             }
         }
+
+        // Phase 1b: Process shadow stack roots.
+        // RPython gc.py: GcRootMap_shadowstack — walk the thread-local
+        // shadow stack to find GC refs pushed by compiled JIT code.
+        crate::shadow_stack::walk_roots(|gcref| {
+            if self.is_in_nursery(gcref.0) {
+                if !self.pinned_objects.contains(&gcref.0) {
+                    *gcref = self.copy_nursery_object(gcref.0);
+                }
+            }
+        });
 
         // Phase 2: Process remembered set and transitive closure.
         // Objects copied to old gen may reference other nursery objects,
@@ -1168,6 +1178,10 @@ impl GcAllocator for MiniMarkGC {
         self.alloc_with_type(0, size)
     }
 
+    fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        self.alloc_with_type(type_id, size)
+    }
+
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         self.alloc_with_type_no_collect(0, size)
     }
@@ -1175,6 +1189,17 @@ impl GcAllocator for MiniMarkGC {
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef {
         let payload_size = base_size + item_size * length;
         self.alloc_with_type(0, payload_size)
+    }
+
+    fn alloc_varsize_typed(
+        &mut self,
+        type_id: u32,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> GcRef {
+        let payload_size = base_size + item_size * length;
+        self.alloc_with_type(type_id, payload_size)
     }
 
     fn alloc_varsize_no_collect(
