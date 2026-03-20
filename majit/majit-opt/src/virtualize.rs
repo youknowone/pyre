@@ -328,10 +328,17 @@ impl OptVirtualize {
                         (descr, val)
                     })
                     .collect();
+                // Find the GetfieldGcR descr that loaded this head from pool
+                let head_load_descr_index = ctx.new_operations.iter()
+                    .find(|op| op.pos == resolved
+                        && (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR))
+                    .and_then(|op| op.descr.as_ref())
+                    .map(|d| d.index());
                 ctx.exported_jump_virtuals
                     .push(crate::optimizer::ExportedJumpVirtual {
                         jump_arg_index,
                         size_descr: vinfo.descr.clone(),
+                        head_load_descr_index,
                         fields,
                     });
             }
@@ -352,10 +359,16 @@ impl OptVirtualize {
                         (descr, val)
                     })
                     .collect();
+                let head_load_descr_index = ctx.new_operations.iter()
+                    .find(|op| op.pos == resolved
+                        && (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR))
+                    .and_then(|op| op.descr.as_ref())
+                    .map(|d| d.index());
                 ctx.exported_jump_virtuals
                     .push(crate::optimizer::ExportedJumpVirtual {
                         jump_arg_index,
                         size_descr: vinfo.descr.clone(),
+                        head_load_descr_index,
                         fields,
                     });
             }
@@ -730,6 +743,20 @@ impl OptVirtualize {
             op.opcode,
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
         );
+
+        // RPython import_state: if this is a GetfieldGcR(pool) that loads a head
+        // which was virtual in the preamble, forward to the imported virtual head.
+        if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {
+            let pool_ref = ctx.get_replacement(OpRef(0)); // pool is always inputarg 0
+            if struct_ref == pool_ref {
+                for &(descr_idx, virtual_head) in &ctx.imported_virtual_heads {
+                    if field_idx == descr_idx as u32 {
+                        ctx.replace_op(op.pos, virtual_head);
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
+        }
 
         if is_raw_op && self.is_standard_virtualizable_ref(struct_ref, ctx) {
             return OptimizationResult::PassOn;
@@ -1470,6 +1497,16 @@ impl OptVirtualize {
             None => return,
         };
         let fail_args = op.fail_args.get_or_insert_with(Default::default);
+
+        // RPython standard virtualizable guards already carry the live frame
+        // payload in fail_args. Do not append a second virtualizable payload
+        // on top of that; only seed synthetic/empty guard payloads.
+        if self.is_standard_virtualizable_ref(frame_ref, ctx)
+            && fail_args.len() >= 3
+            && fail_args.first().copied() == Some(frame_ref)
+        {
+            return;
+        }
 
         // Static fields (e.g., next_instr, stack_depth)
         for &offset in &config.static_field_offsets {
@@ -2402,6 +2439,34 @@ mod tests {
                 .all(|op| op.opcode != OpCode::SetfieldRaw),
             "standard virtualizable guard should not force frame writeback"
         );
+    }
+
+    #[test]
+    fn test_standard_virtualizable_guard_with_full_frame_payload_is_not_reaugmented() {
+        let mut ctx = OptContext::with_num_inputs(8, 3);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![8],
+            static_field_types: vec![Type::Int],
+            array_field_offsets: vec![24],
+            array_item_types: vec![Type::Int],
+            array_lengths: vec![1],
+        });
+        pass.setup();
+
+        let pc = OpRef(50);
+        let vsd = OpRef(51);
+        ctx.make_constant(pc, Value::Int(6));
+        ctx.make_constant(vsd, Value::Int(1));
+        let local0 = OpRef(2);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(99)]);
+        guard.fail_args = Some(vec![OpRef(0), pc, vsd, local0].into());
+
+        let replaced = match pass.propagate_forward(&guard, &mut ctx) {
+            OptimizationResult::Replace(op) => op,
+            other => panic!("expected guard replacement, got {other:?}"),
+        };
+        let fail_args = replaced.fail_args.expect("guard should have fail args");
+        assert_eq!(fail_args.as_slice(), &[OpRef(0), pc, vsd, local0]);
     }
 
     #[test]
