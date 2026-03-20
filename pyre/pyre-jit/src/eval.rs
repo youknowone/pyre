@@ -408,12 +408,12 @@ fn handle_jit_outcome(
             None
         }
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            // RPython parity: guard failure → resume_in_blackhole().
-            // The remaining execution runs in the blackhole with NO
-            // JIT re-entry.
+            // Guard failure: restore frame state and return to interpreter.
+            // RPython uses resume_in_blackhole here, but the interpreter
+            // fallback is sufficient when in_blackhole_entry() prevents
+            // JIT re-entry from nested calls.
             sync_jit_state_to_frame(jit_state, frame, info);
-            let result = crate::call_jit::resume_in_blackhole_pub(frame);
-            Some(Ok(result))
+            None
         }
         DetailedDriverRunOutcome::GuardFailure {
             restored: false, ..
