@@ -194,12 +194,24 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     let code = unsafe { &*frame.code };
 
-    // RPython parity: JIT only runs inside functions (nlocals > 0).
-    // Module-level code (nlocals=0) uses STORE_NAME/LOAD_NAME to
-    // access variables via the namespace dict, not fast locals.
-    // Without fast locals, variables cannot be carried as JUMP args,
-    // causing GC stale pointer issues when nursery objects are
-    // allocated in compiled loops.
+    // TODO: re-enable JIT for module-level code (nlocals=0).
+    //
+    // PyPy DOES JIT-compile module-level loops — jit_merge_point fires
+    // for all frames (interp_jit.py:85). Variables are accessed via
+    // STORE_NAME/LOAD_NAME (dict-based w_locals), not STORE_FAST/LOAD_FAST
+    // (virtualizable locals_cells_stack_w). The JIT compiles the loop but
+    // each iteration still pays dict lookup overhead.
+    //
+    // Currently disabled because:
+    // 1. nlocals=0 → variables not in JUMP args → GC stale nursery pointers
+    // 2. STORE_NAME/LOAD_NAME not yet traced as residual calls
+    //
+    // To re-enable:
+    // 1. Trace STORE_NAME/LOAD_NAME as residual dict operations
+    // 2. Either carry namespace values as JUMP args, or ensure New() results
+    //    written to the namespace dict are GC-visible across JUMP back-edges
+    // 3. Alternatively, detect module-level loops and promote variables to
+    //    synthetic fast locals during compilation (like CPython's MAKE_FUNCTION)
     if code.varnames.is_empty() {
         return pyre_interp::eval::eval_frame_plain(frame);
     }
