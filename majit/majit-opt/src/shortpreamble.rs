@@ -31,7 +31,7 @@
 /// processes the preamble and finds guards/operations that establish facts
 /// the body depends on, it records them. At the Label, the builder finalizes
 /// into a `ShortPreamble` that is stored alongside the compiled loop.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use majit_ir::{Op, OpCode, OpRef};
 
@@ -252,11 +252,13 @@ impl Default for ShortPreambleBuilder {
 ///
 /// shortpreamble.py: PreambleOp, HeapOp, PureOp, LoopInvariantOp, GuardOp
 /// Each type determines how the operation is replayed when a bridge enters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreambleOpKind {
     /// shortpreamble.py: PreambleOp — base class for all preamble operations.
     /// A generic preamble operation (guard or other).
     Guard,
+    /// shortpreamble.py: ShortInputArg — renamed inputarg for a label slot.
+    InputArg,
     /// shortpreamble.py: HeapOp — a heap read (GETFIELD_GC, GETARRAYITEM_GC)
     /// that was cached during the preamble. On bridge entry, the field/array
     /// must be re-read to populate the cache.
@@ -294,6 +296,7 @@ impl PreambleOp {
     /// For LoopInvariantOp: reconstruct as CALL_LOOPINVARIANT.
     pub fn add_op_to_short(&self) -> ProducedShortOp {
         let preamble_op = match &self.kind {
+            PreambleOpKind::InputArg => self.op.clone(),
             PreambleOpKind::Heap { descr_idx: _ } => {
                 // HeapOp: the op is already a GETFIELD/GETARRAYITEM
                 self.op.clone()
@@ -338,9 +341,18 @@ impl PreambleOp {
 /// the operations that produce them.
 #[derive(Clone, Debug, Default)]
 pub struct ShortBoxes {
-    /// Operations that produce values for each label arg.
-    /// Index = label arg index, value = the PreambleOp producing it.
-    pub producers: Vec<Option<PreambleOp>>,
+    /// Mapping from exported label arg box to its position.
+    pub label_arg_positions: HashMap<OpRef, usize>,
+    /// shortpreamble.py: potential_ops
+    potential_ops: HashMap<OpRef, Vec<PreambleOp>>,
+    /// shortpreamble.py: produced_short_boxes
+    produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
+    /// shortpreamble.py: const_short_boxes
+    const_short_boxes: Vec<PreambleOp>,
+    /// shortpreamble.py: short_inputargs
+    short_inputargs: Vec<OpRef>,
+    /// shortpreamble.py: boxes_in_production
+    boxes_in_production: HashSet<OpRef>,
     /// The number of label args.
     pub num_label_args: usize,
 }
@@ -348,45 +360,138 @@ pub struct ShortBoxes {
 impl ShortBoxes {
     pub fn new(num_label_args: usize) -> Self {
         ShortBoxes {
-            producers: vec![None; num_label_args],
+            label_arg_positions: HashMap::new(),
+            potential_ops: HashMap::new(),
+            produced_short_boxes: HashMap::new(),
+            const_short_boxes: Vec::new(),
+            short_inputargs: Vec::new(),
+            boxes_in_production: HashSet::new(),
             num_label_args,
         }
     }
 
-    /// Record that `label_arg_idx` is produced by `op` with the given kind.
-    pub fn add_op(&mut self, label_arg_idx: usize, op: Op, kind: PreambleOpKind) {
-        if label_arg_idx < self.producers.len() {
-            self.producers[label_arg_idx] = Some(PreambleOp {
-                op,
-                kind,
-                label_arg_idx: Some(label_arg_idx),
-            });
+    pub fn with_label_args(label_args: &[OpRef]) -> Self {
+        let mut boxes = Self::new(label_args.len());
+        for (idx, &arg) in label_args.iter().enumerate() {
+            boxes.label_arg_positions.insert(arg, idx);
+            boxes.short_inputargs.push(arg);
         }
+        boxes
+    }
+
+    pub fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
+        self.label_arg_positions.get(&opref).copied()
+    }
+
+    fn add_op(&mut self, result: OpRef, pop: PreambleOp) {
+        self.potential_ops.entry(result).or_default().push(pop);
     }
 
     /// Add a pure operation that produces a label arg value.
     /// shortpreamble.py: sb.add_pure_op(op)
     pub fn add_pure_op(&mut self, label_arg_idx: usize, op: Op) {
-        self.add_op(label_arg_idx, op, PreambleOpKind::Pure);
+        let result = op.pos;
+        self.add_op(
+            result,
+            PreambleOp {
+                op,
+                kind: PreambleOpKind::Pure,
+                label_arg_idx: Some(label_arg_idx),
+            },
+        );
     }
 
     /// Add a heap read that produces a label arg value.
     /// shortpreamble.py: sb.add_heap_op(op, descr)
     pub fn add_heap_op(&mut self, label_arg_idx: usize, op: Op, descr_idx: u32) {
-        self.add_op(label_arg_idx, op, PreambleOpKind::Heap { descr_idx });
+        let result = op.pos;
+        self.add_op(
+            result,
+            PreambleOp {
+                op,
+                kind: PreambleOpKind::Heap { descr_idx },
+                label_arg_idx: Some(label_arg_idx),
+            },
+        );
     }
 
     /// Add a loop-invariant call that produces a label arg value.
     pub fn add_loopinvariant_op(&mut self, label_arg_idx: usize, op: Op) {
-        self.add_op(label_arg_idx, op, PreambleOpKind::LoopInvariant);
+        let result = op.pos;
+        self.add_op(
+            result,
+            PreambleOp {
+                op,
+                kind: PreambleOpKind::LoopInvariant,
+                label_arg_idx: Some(label_arg_idx),
+            },
+        );
     }
 
-    /// Get all operations that have producers (non-None).
-    pub fn non_empty_ops(&self) -> impl Iterator<Item = (usize, &PreambleOp)> {
-        self.producers
+    fn add_short_input_arg(&mut self, arg: OpRef) {
+        let label_arg_idx = self.lookup_label_arg(arg);
+        let op = match majit_ir::Type::Int {
+            _ => {
+                let mut same_as = Op::new(OpCode::SameAsI, &[arg]);
+                same_as.pos = arg;
+                same_as
+            }
+        };
+        self.potential_ops.entry(arg).or_insert(vec![PreambleOp {
+            op,
+            kind: PreambleOpKind::InputArg,
+            label_arg_idx,
+        }]);
+    }
+
+    fn pick_producer_index(candidates: &[PreambleOp], pick_other: bool) -> usize {
+        let mut index: Option<usize> = None;
+        for (i, item) in candidates.iter().enumerate() {
+            let prefer = !matches!(item.kind, PreambleOpKind::Heap { .. })
+                && (pick_other || item.kind == PreambleOpKind::InputArg);
+            if prefer {
+                if index.is_some() && pick_other {
+                    return Self::pick_producer_index(candidates, false);
+                }
+                index = Some(i);
+            }
+        }
+        index.unwrap_or(0)
+    }
+
+    fn materialize_one(&mut self, result: OpRef) -> Option<ProducedShortOp> {
+        if let Some(existing) = self.produced_short_boxes.get(&result) {
+            return Some(existing.clone());
+        }
+        if self.boxes_in_production.contains(&result) {
+            return None;
+        }
+        let candidates = self.potential_ops.get(&result)?.clone();
+        self.boxes_in_production.insert(result);
+        let produced = if candidates.len() == 1 {
+            candidates[0].add_op_to_short()
+        } else {
+            let index = Self::pick_producer_index(&candidates, true);
+            candidates[index].add_op_to_short()
+        };
+        self.produced_short_boxes.insert(result, produced.clone());
+        self.boxes_in_production.remove(&result);
+        Some(produced)
+    }
+
+    /// shortpreamble.py: produced_short_boxes after add_op_to_short().
+    pub fn produced_ops(&mut self) -> Vec<(OpRef, ProducedShortOp)> {
+        let keys: Vec<OpRef> = self.potential_ops.keys().copied().collect();
+        for key in keys {
+            let _ = self.materialize_one(key);
+        }
+        let mut out: Vec<_> = self
+            .produced_short_boxes
             .iter()
-            .enumerate()
-            .filter_map(|(i, p)| p.as_ref().map(|op| (i, op)))
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        out.sort_by_key(|(k, _)| self.lookup_label_arg(*k).unwrap_or(usize::MAX));
+        out
     }
 
     /// shortpreamble.py: create_short_inputargs(label_args)
@@ -394,24 +499,25 @@ impl ShortBoxes {
     /// Returns OpRefs for each label arg that has a producer, or the
     /// original label arg if no producer exists.
     pub fn create_short_inputargs(&self, label_args: &[OpRef]) -> Vec<OpRef> {
-        label_args
-            .iter()
-            .enumerate()
-            .map(|(i, &arg)| {
-                if i < self.producers.len() {
-                    if let Some(ref pop) = self.producers[i] {
-                        return pop.op.pos;
-                    }
-                }
-                arg
-            })
-            .collect()
+        if self.short_inputargs.is_empty() {
+            label_args.to_vec()
+        } else {
+            self.short_inputargs.clone()
+        }
     }
 
     /// shortpreamble.py: add_potential_op(op, pop)
     /// Add a produced operation to the short boxes at the given position.
     pub fn add_potential_op(&mut self, label_arg_idx: usize, op: Op, kind: PreambleOpKind) {
-        self.add_op(label_arg_idx, op, kind);
+        let result = op.pos;
+        self.add_op(
+            result,
+            PreambleOp {
+                op,
+                kind,
+                label_arg_idx: Some(label_arg_idx),
+            },
+        );
     }
 }
 
@@ -423,30 +529,15 @@ impl ShortBoxes {
 pub fn create_short_boxes(
     short_boxes: &mut ShortBoxes,
     label_args: &[OpRef],
-    optimizer_ops: &[Op],
+    _optimizer_ops: &[Op],
 ) -> Vec<ProducedShortOp> {
-    // Step 1: register each label arg as a ShortInputArg
-    for (i, &arg) in label_args.iter().enumerate() {
-        if i < short_boxes.num_label_args {
-            let short_input = ShortInputArg {
-                res: arg,
-                preamble_op: Op::new(majit_ir::OpCode::SameAsI, &[arg]),
-            };
-            let produced = short_input.add_op_to_short();
-            short_boxes.add_op(i, produced.preamble_op, produced.kind);
-        }
+    for &arg in label_args {
+        short_boxes.add_short_input_arg(arg);
     }
-
-    // Step 2: collect produced short boxes from optimizer passes
-    // (done externally via produce_potential_short_preamble_ops)
-
-    // Step 3: collect all produced ops
     short_boxes
-        .non_empty_ops()
-        .map(|(_, pop)| ProducedShortOp {
-            kind: pop.kind.clone(),
-            preamble_op: pop.op.clone(),
-        })
+        .produced_ops()
+        .into_iter()
+        .map(|(_, op)| op)
         .collect()
 }
 
@@ -1041,9 +1132,15 @@ mod tests {
     fn test_short_boxes() {
         let mut sb = ShortBoxes::new(3);
         assert_eq!(sb.num_label_args, 3);
-        sb.add_pure_op(0, Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]));
-        sb.add_heap_op(1, Op::new(OpCode::GetfieldGcI, &[OpRef(0)]), 5);
-        let non_empty: Vec<_> = sb.non_empty_ops().collect();
-        assert_eq!(non_empty.len(), 2);
+        sb.label_arg_positions.insert(OpRef(10), 0);
+        sb.label_arg_positions.insert(OpRef(11), 1);
+        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        pure.pos = OpRef(10);
+        sb.add_pure_op(0, pure);
+        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        heap.pos = OpRef(11);
+        sb.add_heap_op(1, heap, 5);
+        let produced = sb.produced_ops();
+        assert_eq!(produced.len(), 2);
     }
 }

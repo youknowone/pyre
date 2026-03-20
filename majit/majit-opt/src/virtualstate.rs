@@ -14,7 +14,7 @@
 /// - State comparison determines if a compiled loop body can be reused
 use std::collections::HashMap;
 
-use majit_ir::{DescrRef, GcRef, OpRef, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
 /// are incompatible and cannot be merged for bridge compilation.
@@ -382,10 +382,41 @@ impl VirtualState {
         }
     }
 
+    fn count_forced_boxes_for_entry(info: &VirtualStateInfo) -> usize {
+        match info {
+            VirtualStateInfo::Constant(_) => 0,
+            VirtualStateInfo::Virtual { fields, .. }
+            | VirtualStateInfo::VirtualStruct { fields, .. } => fields
+                .iter()
+                .map(|(_, child)| Self::count_forced_boxes_for_entry(child))
+                .sum(),
+            VirtualStateInfo::VirtualArray { items, .. } => items
+                .iter()
+                .map(|child| Self::count_forced_boxes_for_entry(child))
+                .sum(),
+            VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => element_fields
+                .iter()
+                .flat_map(|fields| fields.iter().map(|(_, child)| child))
+                .map(|child| Self::count_forced_boxes_for_entry(child))
+                .sum(),
+            VirtualStateInfo::VirtualRawBuffer { entries, .. } => entries
+                .iter()
+                .map(|(_, _, child)| Self::count_forced_boxes_for_entry(child))
+                .sum(),
+            VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull
+            | VirtualStateInfo::IntBounded(_)
+            | VirtualStateInfo::Unknown => 1,
+        }
+    }
+
     /// Number of non-virtual values (need concrete OpRefs at loop entry).
     /// virtualstate.py: num_boxes()
     pub fn num_boxes(&self) -> usize {
-        self.state.iter().filter(|s| !s.is_virtual()).count()
+        self.state
+            .iter()
+            .map(Self::count_forced_boxes_for_entry)
+            .sum()
     }
 
     /// Total number of entries (virtual + non-virtual).
@@ -405,42 +436,121 @@ impl VirtualState {
 
     /// Generate input argument OpRefs from this state.
     ///
-    /// RPython: `VirtualState.make_inputargs()` — creates the OpRef list
-    /// for the loop header Label, skipping virtual values (which live in
-    /// the optimizer's PtrInfo, not as explicit args).
+    /// RPython: `VirtualState.make_inputargs()` — creates the non-virtual
+    /// inputarg list for the loop header Label.
     ///
-    /// `concrete_refs` provides OpRefs for the non-virtual entries.
-    pub fn make_inputargs(&self, concrete_refs: &[OpRef]) -> Vec<OpRef> {
-        let mut args = Vec::new();
-        let mut concrete_idx = 0;
-        for info in &self.state {
-            if info.is_virtual() {
-                args.push(OpRef::NONE);
-            } else {
-                let opref = concrete_refs
-                    .get(concrete_idx)
-                    .copied()
-                    .unwrap_or(OpRef::NONE);
-                args.push(opref);
-                concrete_idx += 1;
-            }
+    /// `concrete_refs` is the full loop-carried value list. Virtual entries
+    /// recursively contribute the concrete boxes of their forced fields/items.
+    pub fn make_inputargs(&self, concrete_refs: &[OpRef], ctx: &OptContext) -> Vec<OpRef> {
+        let mut args = vec![OpRef::NONE; self.num_boxes()];
+        let mut next_slot = 0usize;
+        for (idx, info) in self.state.iter().enumerate() {
+            let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
+            Self::enum_forced_boxes_for_entry(info, opref, ctx, &mut args, &mut next_slot);
         }
-        args
+        args.into_iter().filter(|opref| !opref.is_none()).collect()
     }
 
     /// virtualstate.py: make_inputargs_and_virtuals(oprefs)
-    /// Returns (inputargs, virtual_indices) where virtual_indices lists
-    /// the positions of virtual entries in the state.
-    pub fn make_inputargs_and_virtuals(&self, concrete_refs: &[OpRef]) -> (Vec<OpRef>, Vec<usize>) {
-        let inputargs = self.make_inputargs(concrete_refs);
-        let virtual_indices: Vec<usize> = self
+    /// Returns `(inputargs, virtuals)` where `inputargs` contains the
+    /// non-virtual boxes and `virtuals` contains the original virtual boxes.
+    pub fn make_inputargs_and_virtuals(
+        &self,
+        concrete_refs: &[OpRef],
+        ctx: &OptContext,
+    ) -> (Vec<OpRef>, Vec<OpRef>) {
+        let inputargs = self.make_inputargs(concrete_refs, ctx);
+        let virtuals: Vec<OpRef> = self
             .state
             .iter()
             .enumerate()
             .filter(|(_, info)| info.is_virtual())
-            .map(|(i, _)| i)
+            .filter_map(|(i, _)| concrete_refs.get(i).copied())
             .collect();
-        (inputargs, virtual_indices)
+        (inputargs, virtuals)
+    }
+
+    fn enum_forced_boxes_for_entry(
+        info: &VirtualStateInfo,
+        opref: OpRef,
+        ctx: &OptContext,
+        boxes: &mut [OpRef],
+        next_slot: &mut usize,
+    ) {
+        match info {
+            VirtualStateInfo::Constant(_) => {}
+            VirtualStateInfo::Virtual { fields, .. }
+            | VirtualStateInfo::VirtualStruct { fields, .. } => {
+                let resolved = ctx.get_replacement(opref);
+                let ptr_info = ctx.get_ptr_info(resolved);
+                for (field_idx, field_state) in fields {
+                    let field_ref = ptr_info
+                        .and_then(|info| info.get_field(*field_idx))
+                        .unwrap_or(OpRef::NONE);
+                    Self::enum_forced_boxes_for_entry(field_state, field_ref, ctx, boxes, next_slot);
+                }
+            }
+            VirtualStateInfo::VirtualArray { items, .. } => {
+                let resolved = ctx.get_replacement(opref);
+                let ptr_info = ctx.get_ptr_info(resolved);
+                for (index, item_state) in items.iter().enumerate() {
+                    let item_ref = ptr_info
+                        .and_then(|info| info.get_item(index))
+                        .unwrap_or(OpRef::NONE);
+                    Self::enum_forced_boxes_for_entry(item_state, item_ref, ctx, boxes, next_slot);
+                }
+            }
+            VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => {
+                let resolved = ctx.get_replacement(opref);
+                let ptr_info = ctx.get_ptr_info(resolved);
+                let mut flat_index = 0usize;
+                for fields in element_fields {
+                    for (_, field_state) in fields {
+                        let item_ref = ptr_info
+                            .and_then(|info| info.get_item(flat_index))
+                            .unwrap_or(OpRef::NONE);
+                        Self::enum_forced_boxes_for_entry(
+                            field_state,
+                            item_ref,
+                            ctx,
+                            boxes,
+                            next_slot,
+                        );
+                        flat_index += 1;
+                    }
+                }
+            }
+            VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
+                let resolved = ctx.get_replacement(opref);
+                let ptr_info = ctx.get_ptr_info(resolved);
+                for (index, (_, _, entry_state)) in entries.iter().enumerate() {
+                    let entry_ref = ptr_info
+                        .and_then(|info| match info {
+                            PtrInfo::VirtualRawBuffer(vinfo) => {
+                                vinfo.entries.get(index).map(|(_, _, value)| *value)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(OpRef::NONE);
+                    Self::enum_forced_boxes_for_entry(
+                        entry_state,
+                        entry_ref,
+                        ctx,
+                        boxes,
+                        next_slot,
+                    );
+                }
+            }
+            VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull
+            | VirtualStateInfo::IntBounded(_)
+            | VirtualStateInfo::Unknown => {
+                if let Some(slot) = boxes.get_mut(*next_slot) {
+                    *slot = ctx.get_replacement(opref);
+                }
+                *next_slot += 1;
+            }
+        }
     }
 
     /// Check if another VirtualState is compatible (can reuse the optimized loop body).
@@ -721,6 +831,46 @@ pub enum GuardRequirement {
     GuardBounds { arg_index: usize, bounds: IntBound },
 }
 
+impl GuardRequirement {
+    /// Convert this guard requirement into a concrete Op, given the
+    /// concrete args vector. Returns None if the arg_index is out of bounds.
+    pub fn to_op(&self, args: &[OpRef]) -> Option<Op> {
+        match self {
+            GuardRequirement::GuardClass {
+                arg_index,
+                expected_class,
+            } => {
+                let arg = *args.get(*arg_index)?;
+                let class_const = OpRef(10_000 + *arg_index as u32); // placeholder
+                let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
+                op.fail_args = Some(Default::default());
+                Some(op)
+            }
+            GuardRequirement::GuardNonnull { arg_index } => {
+                let arg = *args.get(*arg_index)?;
+                let mut op = Op::new(OpCode::GuardNonnull, &[arg]);
+                op.fail_args = Some(Default::default());
+                Some(op)
+            }
+            GuardRequirement::GuardValue {
+                arg_index,
+                expected_value,
+            } => {
+                let arg = *args.get(*arg_index)?;
+                let val_const = OpRef(10_000 + *arg_index as u32); // placeholder
+                let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
+                op.fail_args = Some(Default::default());
+                Some(op)
+            }
+            GuardRequirement::GuardBounds { arg_index, bounds } => {
+                // IntBound guards are emitted as int_ge/int_le pairs
+                // For now, skip — intbounds pass handles these
+                None
+            }
+        }
+    }
+}
+
 /// virtualstate.py: VirtualStateConstructor — visitor-based factory
 /// for building VirtualState from optimizer state.
 ///
@@ -745,7 +895,7 @@ impl<'a> VirtualStateConstructor<'a> {
     /// the non-virtual inputargs.
     pub fn build_with_inputargs(&self, oprefs: &[OpRef]) -> (VirtualState, Vec<OpRef>) {
         let state = self.build(oprefs);
-        let inputargs = state.make_inputargs(oprefs);
+        let inputargs = state.make_inputargs(oprefs, self.ctx);
         (state, inputargs)
     }
 }
@@ -769,6 +919,19 @@ pub fn export_state(
         })
         .collect();
     VirtualState::new(state)
+}
+
+pub(crate) fn export_value_state(
+    opref: OpRef,
+    ctx: &OptContext,
+    ptr_info: &[Option<PtrInfo>],
+) -> VirtualStateInfo {
+    export_single_value(
+        ctx.get_replacement(opref),
+        ctx,
+        ptr_info,
+        &mut HashMap::new(),
+    )
 }
 
 /// Export abstract info for a single value.
@@ -888,6 +1051,9 @@ fn export_single_value(
             }
             PtrInfo::Virtualizable(_) => {
                 // Virtualizable objects are treated as non-null in virtual state
+                return VirtualStateInfo::NonNull;
+            }
+            PtrInfo::Instance(_) | PtrInfo::Struct(_) | PtrInfo::Array(_) => {
                 return VirtualStateInfo::NonNull;
             }
         }
@@ -1329,6 +1495,68 @@ mod tests {
 
         assert!(!VirtualStateInfo::NonNull.is_virtual());
         assert!(!VirtualStateInfo::Unknown.is_virtual());
+    }
+
+    #[test]
+    fn test_make_inputargs_skips_virtual_entries() {
+        let descr = test_descr(7);
+        let state = VirtualState::new(vec![
+            VirtualStateInfo::Unknown,
+            VirtualStateInfo::VirtualStruct {
+                descr,
+                fields: vec![],
+            },
+            VirtualStateInfo::NonNull,
+        ]);
+
+        let ctx = OptContext::new(16);
+        let inputargs = state.make_inputargs(&[OpRef(10), OpRef(11), OpRef(12)], &ctx);
+        assert_eq!(inputargs, vec![OpRef(10), OpRef(12)]);
+    }
+
+    #[test]
+    fn test_make_inputargs_and_virtuals_returns_virtual_boxes() {
+        let descr = test_descr(9);
+        let state = VirtualState::new(vec![
+            VirtualStateInfo::Unknown,
+            VirtualStateInfo::VirtualStruct {
+                descr,
+                fields: vec![],
+            },
+            VirtualStateInfo::NonNull,
+        ]);
+
+        let ctx = OptContext::new(16);
+        let (inputargs, virtuals) =
+            state.make_inputargs_and_virtuals(&[OpRef(20), OpRef(21), OpRef(22)], &ctx);
+        assert_eq!(inputargs, vec![OpRef(20), OpRef(22)]);
+        assert_eq!(virtuals, vec![OpRef(21)]);
+    }
+
+    #[test]
+    fn test_make_inputargs_recursively_extracts_virtual_fields() {
+        let descr = test_descr(11);
+        let field_value = OpRef(21);
+        let virtual_ref = OpRef(20);
+        let state = VirtualState::new(vec![VirtualStateInfo::VirtualStruct {
+            descr: descr.clone(),
+            fields: vec![
+                (0, Box::new(VirtualStateInfo::Constant(Value::Int(7)))),
+                (8, Box::new(VirtualStateInfo::NonNull)),
+            ],
+        }]);
+        let mut ctx = OptContext::new(32);
+        ctx.set_ptr_info(
+            virtual_ref,
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr,
+                fields: vec![(0, OpRef::NONE), (8, field_value)],
+                field_descrs: Vec::new(),
+            }),
+        );
+
+        let inputargs = state.make_inputargs(&[virtual_ref], &ctx);
+        assert_eq!(inputargs, vec![field_value]);
     }
 
     #[test]

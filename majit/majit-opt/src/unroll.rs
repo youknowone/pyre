@@ -39,15 +39,19 @@ pub struct UnrollOptimizer {
     pub short_preamble: Option<crate::shortpreamble::ShortPreamble>,
     /// The exported virtual state at the loop header.
     pub exported_state: Option<crate::virtualstate::VirtualState>,
+    /// history.py: JitCellToken.target_tokens — compiled versions of this loop.
+    /// Each TargetToken has its own virtual state and short preamble.
+    pub target_tokens: Vec<TargetToken>,
 }
 
 impl UnrollOptimizer {
     pub fn new() -> Self {
         UnrollOptimizer {
-            retrace_limit: 5, // warmstate.py default
+            retrace_limit: 0, // rlib/jit.py:595 default
             bridge_guard_count: 0,
             short_preamble: None,
             exported_state: None,
+            target_tokens: Vec::new(),
         }
     }
 
@@ -491,6 +495,35 @@ impl ExportedState {
     }
 }
 
+/// history.py: TargetToken — describes one compiled version of a loop.
+///
+/// Each peeled loop body creates a TargetToken that records the virtual state
+/// and short preamble needed for bridge entry. Multiple TargetTokens can exist
+/// per loop (from retracing with different virtual states).
+#[derive(Clone, Debug)]
+pub struct TargetToken {
+    /// Virtual state at this loop entry point.
+    /// Used by _jump_to_existing_trace to check compatibility.
+    pub virtual_state: Option<crate::virtualstate::VirtualState>,
+    /// Short preamble: ops to replay when entering from a bridge.
+    pub short_preamble: Option<crate::shortpreamble::ShortPreamble>,
+    /// The exported state from the preamble (for retracing).
+    pub exported_state: Option<ExportedState>,
+    /// Number of times this target has been retraced.
+    pub retraced_count: u32,
+}
+
+impl TargetToken {
+    pub fn new() -> Self {
+        TargetToken {
+            virtual_state: None,
+            short_preamble: None,
+            exported_state: None,
+            retraced_count: 0,
+        }
+    }
+}
+
 /// unroll.py: UnrollInfo(BasicLoopInfo) — return type from optimize_peeled_loop.
 ///
 /// Carries the target_token, label_op, and extra_same_as needed to
@@ -614,6 +647,71 @@ impl OptUnroll {
         }
     }
 
+    /// unroll.py:284-301: finalize_short_preamble — create a TargetToken
+    /// and attach the short preamble to it. Called at the end of
+    /// optimize_peeled_loop after the loop body is optimized.
+    ///
+    /// Returns the new TargetToken with virtual_state and short_preamble set.
+    pub fn finalize_short_preamble(
+        &self,
+        virtual_state: crate::virtualstate::VirtualState,
+        short_preamble: crate::shortpreamble::ShortPreamble,
+    ) -> TargetToken {
+        let mut target_token = TargetToken::new();
+        target_token.virtual_state = Some(virtual_state);
+        target_token.short_preamble = Some(short_preamble);
+        target_token
+    }
+
+    /// unroll.py:320-362: _jump_to_existing_trace — check if any existing
+    /// compiled trace (target_token) has a compatible virtual state.
+    /// If so, generate extra guards, inline short preamble, and redirect jump.
+    ///
+    /// Returns None if jumped successfully, Some(virtual_state) otherwise.
+    pub fn jump_to_existing_trace(
+        &self,
+        jump_args: &[OpRef],
+        target_tokens: &[TargetToken],
+        ctx: &mut OptContext,
+    ) -> Option<crate::virtualstate::VirtualState> {
+        let virtual_state = crate::virtualstate::export_state(jump_args, ctx, &ctx.ptr_info);
+        let args: Vec<OpRef> = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
+
+        for target_token in target_tokens {
+            let target_vs = match &target_token.virtual_state {
+                Some(vs) => vs,
+                None => continue,
+            };
+
+            // unroll.py:330-332: generate_guards — check compatibility
+            if !virtual_state.is_compatible(target_vs) {
+                continue;
+            }
+            let extra_guards = target_vs.generate_guards(&virtual_state);
+            for guard_req in &extra_guards {
+                if let Some(guard_op) = guard_req.to_op(&args) {
+                    ctx.emit(guard_op);
+                }
+            }
+
+            // unroll.py:346-347: make_inputargs_and_virtuals
+            let (target_args, _virtuals) =
+                target_vs.make_inputargs_and_virtuals(&args, ctx);
+
+            // unroll.py:353-356: inline short preamble
+            if let Some(sp) = &target_token.short_preamble {
+                let _remapped = Self::inline_short_preamble(&target_args, sp, ctx);
+            }
+
+            // unroll.py:357-359: emit JUMP to target
+            let jump = Op::new(OpCode::Jump, &target_args);
+            ctx.emit(jump);
+            return None; // successfully jumped
+        }
+
+        Some(virtual_state)
+    }
+
     /// unroll.py: inline_short_preamble — replay short preamble ops
     /// to re-populate the optimizer's cache when entering from a bridge.
     ///
@@ -651,17 +749,6 @@ impl OptUnroll {
             .iter()
             .map(|&a| *mapping.get(&a).unwrap_or(&a))
             .collect()
-    }
-
-    /// unroll.py: jump_to_existing_trace — check if a compiled trace
-    /// exists for this loop and redirect the jump to it.
-    pub fn jump_to_existing_trace(jump_op: &Op, exported_state: &ExportedState) -> Option<Op> {
-        // Check if virtual states are compatible
-        // (simplified: just check arg count matches)
-        if jump_op.args.len() != exported_state.end_args.len() {
-            return None;
-        }
-        Some(jump_op.clone())
     }
 
     /// unroll.py: import_state — restore optimizer state for peeled loop.
@@ -1746,16 +1833,18 @@ mod tests {
 
     #[test]
     fn test_unroll_optimizer_should_give_up() {
-        let opt = UnrollOptimizer::new();
+        let mut opt = UnrollOptimizer::new();
+        opt.retrace_limit = 5;
         assert!(!opt.should_give_up(0));
         assert!(!opt.should_give_up(4));
-        assert!(opt.should_give_up(5)); // default retrace_limit = 5
+        assert!(opt.should_give_up(5));
         assert!(opt.should_give_up(10));
     }
 
     #[test]
     fn test_unroll_optimizer_too_many_guards() {
         let mut opt = UnrollOptimizer::new();
+        opt.retrace_limit = 5;
         opt.bridge_guard_count = 20;
         assert!(opt.too_many_guards_for_retrace(0, 15));
         assert!(!opt.too_many_guards_for_retrace(0, 25));
@@ -2045,6 +2134,59 @@ mod tests {
                 args: vec![
                     crate::ImportedShortPureArg::OpRef(OpRef(0)),
                     crate::ImportedShortPureArg::Const(Value::Int(7)),
+                ],
+                result: OpRef(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_exported_state_reimports_short_call_pure_fact() {
+        let mut ctx = crate::OptContext::with_num_inputs(8, 0);
+        ctx.make_constant(OpRef(10), Value::Int(0x1234));
+        let call_descr = majit_ir::descr::make_call_descr_full(
+            77,
+            vec![majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            8,
+            majit_ir::EffectInfo::elidable(),
+        );
+        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::CallI, &[OpRef(10), OpRef(12)]);
+                op.pos = OpRef(11);
+                op.descr = Some(call_descr);
+                op
+            },
+            kind: crate::shortpreamble::PreambleOpKind::Pure,
+            label_arg_idx: Some(1),
+        });
+
+        let exported = export_state(&[OpRef(12), OpRef(11)], &[], &ctx, None);
+        assert_eq!(
+            exported.exported_short_ops,
+            vec![ExportedShortOp::Pure {
+                opcode: OpCode::CallPureI,
+                descr_idx: Some(77),
+                args: vec![
+                    ExportedShortArg::Const(Value::Int(0x1234)),
+                    ExportedShortArg::Slot(0),
+                ],
+                result_slot: 1,
+            }]
+        );
+
+        let mut ctx2 = crate::OptContext::with_num_inputs(8, 2);
+        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
+        assert_eq!(label_args, vec![OpRef(0), OpRef(1)]);
+        assert_eq!(
+            ctx2.imported_short_pure_ops,
+            vec![crate::ImportedShortPureOp {
+                opcode: OpCode::CallPureI,
+                descr_idx: Some(77),
+                args: vec![
+                    crate::ImportedShortPureArg::Const(Value::Int(0x1234)),
+                    crate::ImportedShortPureArg::OpRef(OpRef(0)),
                 ],
                 result: OpRef(1),
             }]
