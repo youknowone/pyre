@@ -373,6 +373,54 @@ impl PtrInfo {
         }
     }
 
+    /// info.py:148-155: force_box → emit New + SetfieldGc directly.
+    /// Used by force_box_for_end_of_preamble when outside the pass chain.
+    /// Emits ops via ctx.emit (not emit_through_passes) since no drain runs.
+    pub fn force_to_ops(&mut self, opref: OpRef, ctx: &mut crate::OptContext) -> OpRef {
+        use majit_ir::{Op, OpCode};
+        match self {
+            PtrInfo::VirtualStruct(vinfo) => {
+                ctx.set_ptr_info(opref, PtrInfo::NonNull);
+                let mut new_op = Op::new(OpCode::New, &[]);
+                new_op.descr = Some(vinfo.descr.clone());
+                let alloc_ref = ctx.emit(new_op);
+                if opref != alloc_ref {
+                    ctx.replace_op(opref, alloc_ref);
+                }
+                for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
+                    let value_ref = ctx.get_replacement(value_ref);
+                    let descr = vinfo.field_descrs.iter()
+                        .find(|(idx, _)| *idx == field_idx)
+                        .map(|(_, d)| d.clone());
+                    let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+                    set_op.descr = descr;
+                    ctx.emit(set_op);
+                }
+                alloc_ref
+            }
+            PtrInfo::Virtual(vinfo) => {
+                ctx.set_ptr_info(opref, PtrInfo::NonNull);
+                let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
+                new_op.descr = Some(vinfo.descr.clone());
+                let alloc_ref = ctx.emit(new_op);
+                if opref != alloc_ref {
+                    ctx.replace_op(opref, alloc_ref);
+                }
+                for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
+                    let value_ref = ctx.get_replacement(value_ref);
+                    let descr = vinfo.field_descrs.iter()
+                        .find(|(idx, _)| *idx == field_idx)
+                        .map(|(_, d)| d.clone());
+                    let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+                    set_op.descr = descr;
+                    ctx.emit(set_op);
+                }
+                alloc_ref
+            }
+            _ => opref,
+        }
+    }
+
     /// info.py: make_guards(op, short_boxes, optimizer)
     /// Generate guard operations to verify this pointer info.
     /// Returns a list of opcodes and expected values for guards.
