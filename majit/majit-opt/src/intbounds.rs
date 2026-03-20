@@ -1292,10 +1292,27 @@ impl Optimization for OptIntBounds {
                 OptimizationResult::PassOn
             }
 
+            // intbounds.py: postprocess_UNICODEGETITEM — result >= 0.
+            OpCode::Unicodegetitem => {
+                self.intersect_bound(op.pos, &IntBound::nonnegative());
+                OptimizationResult::PassOn
+            }
+
             // intbounds.py: postprocess_GETFIELD_RAW_I — integer-bounded fields.
             // If the descriptor indicates a bounded integer field (e.g. u8, u16),
             // narrow the result bound to [min, max].
-            OpCode::GetfieldRawI | OpCode::GetfieldGcI | OpCode::GetinteriorfieldGcI => {
+            // RPython aliases all GETFIELD/GETINTERIORFIELD variants (I/R/F)
+            // to the same handler; is_integer_bounded() returns false for
+            // non-integer fields so the intersect is effectively a no-op.
+            OpCode::GetfieldRawI
+            | OpCode::GetfieldGcI
+            | OpCode::GetinteriorfieldGcI
+            | OpCode::GetfieldRawR
+            | OpCode::GetfieldGcR
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetfieldRawF
+            | OpCode::GetfieldGcF
+            | OpCode::GetinteriorfieldGcF => {
                 if let Some(ref d) = op.descr {
                     let (field_size, signed) = d.field_size_and_sign();
                     if field_size > 0 && field_size < 8 {
@@ -1312,7 +1329,8 @@ impl Optimization for OptIntBounds {
             }
 
             // intbounds.py: postprocess_GETARRAYITEM_RAW_I — bounded array items.
-            OpCode::GetarrayitemRawI => {
+            // RPython aliases all GETARRAYITEM variants to the same handler.
+            OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcI => {
                 if let Some(ref d) = op.descr {
                     if let Some(ad) = d.as_array_descr() {
                         let item_size = ad.item_size();
