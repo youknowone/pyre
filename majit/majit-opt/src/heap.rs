@@ -106,6 +106,9 @@ pub struct OptHeap {
     /// When GETARRAYITEM_GC with constant index N is seen, the array
     /// must have length >= N+1. Tracked per array OpRef.
     array_min_lengths: HashMap<OpRef, i64>,
+    /// RPython: Phase 2 (flush=False) — don't force lazy sets on JUMP.
+    /// In RPython OptUnroll intercepts JUMP before OptHeap sees it.
+    skip_flush_on_final: bool,
 }
 
 impl OptHeap {
@@ -116,6 +119,7 @@ impl OptHeap {
             lazy_setfields: HashMap::new(),
             cached_arrayitems: HashMap::new(),
             lazy_setarrayitems: HashMap::new(),
+            skip_flush_on_final: false,
             seen_guard_not_invalidated: false,
             postponed_op: None,
             immutable_field_descrs: HashSet::new(),
@@ -550,7 +554,7 @@ impl OptHeap {
         }
 
         if let Some(&cached) = ctx.imported_short_fields.get(&key) {
-            ctx.note_imported_short_use(cached);
+            let cached = ctx.force_op_from_preamble(cached);
             self.cached_fields.entry(key).or_insert(cached);
         }
 
@@ -655,7 +659,7 @@ impl OptHeap {
                 return OptimizationResult::Remove;
             }
             if let Some(&cached) = ctx.imported_short_arrayitems.get(&key) {
-                ctx.note_imported_short_use(cached);
+                let cached = ctx.force_op_from_preamble(cached);
                 self.cached_arrayitems.entry(key).or_insert(cached);
             }
             if let Some(&cached) = self.cached_arrayitems.get(&key) {
@@ -842,8 +846,12 @@ impl OptHeap {
         }
 
         // Final operations (Jump, Finish): force everything.
+        // RPython Phase 2 (flush=False): OptUnroll intercepts JUMP before OptHeap.
+        // Skip lazy set flush to keep virtuals alive.
         if opcode.is_final() {
-            self.force_all_lazy(ctx);
+            if !self.skip_flush_on_final {
+                self.force_all_lazy(ctx);
+            }
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -1247,6 +1255,10 @@ impl Optimization for OptHeap {
 
     fn name(&self) -> &'static str {
         "heap"
+    }
+
+    fn set_skip_flush_on_final(&mut self, enabled: bool) {
+        self.skip_flush_on_final = enabled;
     }
 }
 

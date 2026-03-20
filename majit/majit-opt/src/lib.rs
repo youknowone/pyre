@@ -6,6 +6,7 @@
 /// Operations flow through the chain: IntBounds → Rewrite → Virtualize → String →
 /// Pure → Guard → Simplify → Heap (configurable).
 pub mod bridgeopt;
+pub mod dependency;
 pub mod earlyforce;
 pub mod guard;
 pub mod heap;
@@ -13,13 +14,16 @@ pub mod info;
 pub mod intbounds;
 pub mod intdiv;
 pub mod intutils;
+pub mod optimize;
 pub mod optimizer;
 pub mod pure;
 pub mod rewrite;
+pub mod schedule;
 pub mod shortpreamble;
 pub mod simplify;
 pub mod unroll;
 pub mod vector;
+pub mod version;
 pub mod virtualize;
 pub mod virtualstate;
 pub mod vstring;
@@ -137,6 +141,12 @@ pub struct OptContext {
     pub imported_short_preamble_builder: Option<crate::shortpreamble::ShortPreambleBuilder>,
     /// Dedup imported short fact uses so the builder stays in first-use order.
     imported_short_preamble_used: HashSet<OpRef>,
+    /// RPython unroll.py: potential_extra_ops populated by force_op_from_preamble
+    /// and later consumed by optimizer.force_box().
+    potential_extra_ops: HashSet<OpRef>,
+    /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
+    /// existing target token's short preamble.
+    active_short_preamble_producer: Option<crate::shortpreamble::ExtendedShortPreambleBuilder>,
     /// RPython unroll.py: virtual structures at JUMP for preamble peeling.
     pub exported_jump_virtuals: Vec<crate::optimizer::ExportedJumpVirtual>,
     /// RPython shortpreamble.py: pass-collected preamble producers aligned to
@@ -180,6 +190,8 @@ impl OptContext {
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
             imported_short_preamble_used: HashSet::new(),
+            potential_extra_ops: HashSet::new(),
+            active_short_preamble_producer: None,
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
@@ -209,6 +221,8 @@ impl OptContext {
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
             imported_short_preamble_used: HashSet::new(),
+            potential_extra_ops: HashSet::new(),
+            active_short_preamble_producer: None,
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
@@ -298,12 +312,50 @@ impl OptContext {
     }
 
     pub fn note_imported_short_use(&mut self, result: OpRef) {
-        if !self.imported_short_preamble_used.insert(result) {
-            return;
+        let _ = self.force_op_from_preamble(result);
+    }
+
+    pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
+        let result = self.get_replacement(result);
+        let mut tracked = false;
+        if self.imported_short_preamble_used.insert(result) {
+            if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+                tracked = builder.use_box(result).is_some();
+            }
         }
-        if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-            let _ = builder.use_box(result);
+        if tracked && self.get_constant(result).is_none() {
+            self.potential_extra_ops.insert(result);
         }
+        result
+    }
+
+    pub fn take_potential_extra_op(&mut self, result: OpRef) -> bool {
+        self.potential_extra_ops.remove(&result)
+    }
+
+    pub fn activate_short_preamble_producer(
+        &mut self,
+        builder: crate::shortpreamble::ExtendedShortPreambleBuilder,
+    ) {
+        self.active_short_preamble_producer = Some(builder);
+    }
+
+    pub fn active_short_preamble_producer_mut(
+        &mut self,
+    ) -> Option<&mut crate::shortpreamble::ExtendedShortPreambleBuilder> {
+        self.active_short_preamble_producer.as_mut()
+    }
+
+    pub fn build_active_short_preamble(&self) -> Option<crate::shortpreamble::ShortPreamble> {
+        self.active_short_preamble_producer
+            .as_ref()
+            .map(|builder| builder.build_short_preamble_struct())
+    }
+
+    pub fn take_active_short_preamble_producer(
+        &mut self,
+    ) -> Option<crate::shortpreamble::ExtendedShortPreambleBuilder> {
+        self.active_short_preamble_producer.take()
     }
 
     pub fn build_imported_short_preamble(&self) -> Option<crate::shortpreamble::ShortPreamble> {
@@ -512,6 +564,9 @@ pub trait Optimization {
 
     /// RPython unroll.py: set Phase 2 flatten mode (only OptVirtualize uses this).
     fn set_flatten_virtuals_at_jump(&mut self, _enabled: bool) {}
+
+    /// RPython: Phase 2 (flush=False) — don't force lazy sets on JUMP/FINISH.
+    fn set_skip_flush_on_final(&mut self, _enabled: bool) {}
 
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
     /// Contribute operations to the short preamble builder.

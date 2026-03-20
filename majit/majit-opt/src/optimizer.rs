@@ -365,6 +365,13 @@ impl Optimizer {
         }
     }
 
+    /// RPython: Phase 2 (flush=False) — don't force lazy sets on JUMP.
+    pub fn set_skip_flush_on_final(&mut self, enabled: bool) {
+        for pass in &mut self.passes {
+            pass.set_skip_flush_on_final(enabled);
+        }
+    }
+
     /// Record a CALL_PURE result for cross-iteration constant folding.
     /// RPython optimizer.py: `call_pure_results[key] = value`
     pub fn record_call_pure_result(&mut self, args: Vec<majit_ir::OpRef>, value: majit_ir::Value) {
