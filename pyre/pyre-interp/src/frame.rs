@@ -17,6 +17,13 @@ const _: () = assert!(
         == std::mem::size_of::<Rc<PyExecutionContext>>()
 );
 
+#[derive(Debug, Clone, Copy)]
+pub enum PendingInlineResult {
+    Ref(PyObjectRef),
+    Int(i64),
+    Float(f64),
+}
+
 /// Execution frame for a single Python code block.
 ///
 /// Unified `locals_cells_stack_w` array layout:
@@ -64,7 +71,7 @@ pub struct PyFrame {
     /// PyPy's frame switching keeps concrete call results scoped to the
     /// active frame transition. We keep the pending replay result on the
     /// concrete caller frame instead of a thread-global side channel.
-    pub pending_inline_result: Option<PyObjectRef>,
+    pub pending_inline_result: Option<PendingInlineResult>,
 }
 
 /// Exception handler block — pushed by SETUP_FINALLY/SETUP_EXCEPT, popped by POP_BLOCK.

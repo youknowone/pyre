@@ -2592,7 +2592,7 @@ impl TraceFrameState {
                 let is_self_recursive = callee_key == current_green_key;
                 let inline_decision = driver.should_inline(callee_key);
                 let inline_framestack_active = self.parent_fail_args.is_some();
-
+                
                 // RPython traces through regular callees, but recursive
                 // calls converge to separate functraces + call_assembler.
                 //
