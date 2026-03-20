@@ -179,12 +179,15 @@ impl UnrollOptimizer {
         self.optimize_trace_with_constants_and_inputs_vable(ops, constants, num_inputs, None)
     }
 
-    /// compile.py: compile_loop with optional virtualizable config.
+    /// compile.py:275-308: compile_loop — 2-phase preamble peeling.
     ///
-    /// RPython parity: 2-pass preamble peeling.
-    /// Pass 1: optimize with OptUnroll → discover virtual structures at JUMP
-    /// Pass 2: if virtuals found → re-optimize with virtual reconstruction
-    ///         at loop body start, enabling OptVirtualize to eliminate allocations
+    /// RPython processes the SAME trace twice:
+    ///   Phase 1: optimize(trace) → preamble_ops + export_state(virtual_state)
+    ///   Phase 2: optimize(trace) + import_state → body_ops
+    ///   Result:  [preamble_ops] + Label(inputargs) + [body_ops] + Jump(...)
+    ///
+    /// Phase 1 discovers virtual structures at JUMP (New+SetfieldGc).
+    /// Phase 2 reconstructs them at body start so OptVirtualize eliminates them.
     pub fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
         ops: &[Op],
@@ -192,61 +195,98 @@ impl UnrollOptimizer {
         num_inputs: usize,
         vable_config: Option<crate::virtualize::VirtualizableConfig>,
     ) -> (Vec<Op>, usize) {
-        // Pass 1: standard optimization with peeling
-        let mut constants_pass1 = constants.clone();
-        let mut optimizer = if let Some(ref config) = vable_config {
+        // ── Phase 1: PreambleCompileData.optimize() ──
+        // compile.py:275-276: optimize the trace → preamble ops
+        let mut constants_p1 = constants.clone();
+        let mut opt_preamble = if let Some(ref config) = vable_config {
             crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config.clone())
         } else {
             crate::optimizer::Optimizer::default_pipeline()
         };
-        optimizer.add_pass(Box::new(OptUnroll::new()));
-        let result =
-            optimizer.optimize_with_constants_and_inputs(ops, &mut constants_pass1, num_inputs);
-        let final_num_inputs = optimizer.final_num_inputs();
+        // NO OptUnroll — we handle peeling manually via 2-phase
+        let preamble_result = opt_preamble.optimize_with_constants_and_inputs(
+            ops,
+            &mut constants_p1,
+            num_inputs,
+        );
+        let preamble_num_inputs = opt_preamble.final_num_inputs();
 
-        // Check if any JUMP args were virtual (exported by OptVirtualize)
-        let jump_virtuals = std::mem::take(&mut optimizer.exported_jump_virtuals);
+        // unroll.py:452-477: export_state — collect virtual structures at JUMP
+        let jump_virtuals = std::mem::take(&mut opt_preamble.exported_jump_virtuals);
 
         if jump_virtuals.is_empty() {
-            // No virtuals at JUMP — single pass suffices
-            *constants = constants_pass1;
-            let sp = crate::shortpreamble::extract_short_preamble(&result);
+            // No virtuals — single phase suffices
+            *constants = constants_p1;
+            let sp = crate::shortpreamble::extract_short_preamble(&preamble_result);
             if !sp.is_empty() {
                 self.short_preamble = Some(sp);
             }
-            return (result, final_num_inputs);
+            return (preamble_result, preamble_num_inputs);
         }
 
-        // Pass 2: RPython parity — re-optimize with virtual awareness
-        // The peeled trace has New+SetfieldGc in the body that OptVirtualize
-        // can now identify and virtualize, since the preamble established
-        // the virtual structure. This eliminates per-iteration allocation.
-        //
-        // TODO: implement full export_state/import_state for Pass 2.
-        // For now, Pass 1 result is used (with materialized virtuals).
-        // This is functionally correct but doesn't eliminate allocations.
+        // ── Phase 2: UnrolledLoopData.optimize() ──
+        // compile.py:291-292: optimize the SAME trace again, with imported state.
+        // unroll.py:make_inputargs_and_virtuals — flatten virtual fields.
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[jit] preamble peeling: found {} virtual(s) at JUMP, pass 2 needed",
+                "[jit] preamble peeling phase 2: {} virtual(s) at JUMP",
                 jump_virtuals.len(),
             );
         }
 
-        // Store jump virtuals info for future use
-        self.exported_state = Some(crate::virtualstate::VirtualState::new(
-            jump_virtuals
-                .iter()
-                .map(|_| crate::virtualstate::VirtualStateInfo::Unknown)
-                .collect(),
-        ));
+        // Build body trace: prepend New+SetfieldGc reconstruction, then original ops
+        let body_trace =
+            build_body_trace_with_virtual_import(ops, &jump_virtuals, num_inputs);
 
-        // For now, return Pass 1 result. Full 2-pass will be implemented next.
-        *constants = constants_pass1;
-        let sp = crate::shortpreamble::extract_short_preamble(&result);
+        if let Some((body_ops, body_num_inputs)) = body_trace {
+            let mut constants_p2 = constants_p1.clone();
+            let mut opt_body = if let Some(ref config) = vable_config {
+                crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config.clone())
+            } else {
+                crate::optimizer::Optimizer::default_pipeline()
+            };
+            let body_result = opt_body.optimize_with_constants_and_inputs(
+                &body_ops,
+                &mut constants_p2,
+                body_num_inputs,
+            );
+            let body_final = opt_body.final_num_inputs();
+
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                let new_count = body_result
+                    .iter()
+                    .filter(|op| op.opcode == OpCode::New || op.opcode == OpCode::NewWithVtable)
+                    .count();
+                eprintln!(
+                    "[jit] phase 2: {} ops, {} New remaining (0 = fully virtualized)",
+                    body_result.len(),
+                    new_count,
+                );
+            }
+
+            // compile.py:310-338: combine preamble + Label + body
+            let combined = combine_preamble_and_body(
+                &preamble_result,
+                &body_result,
+                preamble_num_inputs,
+                body_final,
+            );
+
+            *constants = constants_p2;
+            let sp = crate::shortpreamble::extract_short_preamble(&combined);
+            if !sp.is_empty() {
+                self.short_preamble = Some(sp);
+            }
+            return (combined, body_final);
+        }
+
+        // Import failed — fall back to Phase 1
+        *constants = constants_p1;
+        let sp = crate::shortpreamble::extract_short_preamble(&preamble_result);
         if !sp.is_empty() {
             self.short_preamble = Some(sp);
         }
-        (result, final_num_inputs)
+        (preamble_result, preamble_num_inputs)
     }
 
     /// Count the guards in an optimized trace (for retrace_limit checks).
@@ -478,6 +518,345 @@ impl OptUnroll {
 /// Given the current virtual state and available target tokens,
 /// find a compatible target to jump to. Returns the target index
 /// or None if no match.
+/// RPython unroll.py: import_state + _generate_virtual.
+///
+/// Build a modified trace for Phase 2 optimization by prepending
+/// New+SetfieldGc reconstruction ops that rebuild virtual objects
+/// from flattened field inputargs.
+///
+/// Input:  original trace [ops..., Jump(args)]
+///         + exported virtual structures from Phase 1
+/// Output: modified trace [New, SetfieldGc, ..., ops (with refs replaced), Jump(field_values)]
+///         with extra inputargs for the flattened fields
+fn build_body_trace_with_virtual_import(
+    ops: &[Op],
+    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
+    num_inputs: usize,
+) -> Option<(Vec<Op>, usize)> {
+    // Find the Jump op
+    let jump_idx = ops.iter().rposition(|op| op.opcode == OpCode::Jump)?;
+    let jump_op = &ops[jump_idx];
+
+    let mut next_pos = num_inputs as u32;
+    for op in ops {
+        if op.pos.0 != u32::MAX {
+            next_pos = next_pos.max(op.pos.0 + 1);
+        }
+    }
+
+    // For each virtual JUMP arg, add extra inputargs for field values
+    let mut extra_inputarg_count = 0;
+    let mut virtual_to_reconstructed: HashMap<usize, (OpRef, Vec<OpRef>)> = HashMap::new();
+
+    for virt in jump_virtuals {
+        if virt.jump_arg_index >= jump_op.args.len() {
+            continue;
+        }
+        let mut field_inputargs = Vec::new();
+        for _ in &virt.fields {
+            let field_ref = OpRef((num_inputs + extra_inputarg_count) as u32);
+            field_inputargs.push(field_ref);
+            extra_inputarg_count += 1;
+        }
+
+        // New op to reconstruct virtual
+        let new_ref = OpRef(next_pos);
+        next_pos += 1;
+
+        virtual_to_reconstructed.insert(
+            virt.jump_arg_index,
+            (new_ref, field_inputargs),
+        );
+    }
+
+    if virtual_to_reconstructed.is_empty() {
+        return None;
+    }
+
+    let mut result = Vec::with_capacity(ops.len() + extra_inputarg_count * 2 + jump_virtuals.len());
+
+    // Emit New+SetfieldGc reconstruction at trace start (before original ops)
+    for virt in jump_virtuals {
+        if let Some((new_ref, field_refs)) = virtual_to_reconstructed.get(&virt.jump_arg_index)
+        {
+            let mut new_op = Op::new(OpCode::New, &[]);
+            new_op.pos = *new_ref;
+            new_op.descr = Some(virt.size_descr.clone());
+            result.push(new_op);
+
+            for (i, (descr, _concrete)) in virt.fields.iter().enumerate() {
+                let mut set_op = Op::new(OpCode::SetfieldGc, &[*new_ref, field_refs[i]]);
+                set_op.pos = OpRef(next_pos);
+                next_pos += 1;
+                set_op.descr = Some(descr.clone());
+                result.push(set_op);
+            }
+        }
+    }
+
+    // Original ops with virtual refs replaced by reconstructed refs
+    // The original JUMP arg at virt.jump_arg_index is an inputarg (< num_inputs).
+    // In the body, any op that reads from this inputarg should read from
+    // the reconstructed virtual instead.
+    let mut inputarg_replacement: HashMap<OpRef, OpRef> = HashMap::new();
+    for virt in jump_virtuals {
+        if virt.jump_arg_index >= jump_op.args.len() {
+            continue;
+        }
+        let original_inputarg = OpRef(virt.jump_arg_index as u32);
+        if let Some((new_ref, _)) = virtual_to_reconstructed.get(&virt.jump_arg_index) {
+            inputarg_replacement.insert(original_inputarg, *new_ref);
+        }
+    }
+
+    for (idx, op) in ops.iter().enumerate() {
+        if idx == jump_idx {
+            // Modified Jump: add field values as extra args
+            let mut new_jump = op.clone();
+            // Replace virtual refs with field OpRefs
+            for virt in jump_virtuals {
+                if let Some((_, field_refs)) =
+                    virtual_to_reconstructed.get(&virt.jump_arg_index)
+                {
+                    // Original JUMP arg is the virtual — keep it, add fields too
+                    for &fr in field_refs {
+                        new_jump.args.push(fr);
+                    }
+                }
+            }
+            result.push(new_jump);
+            continue;
+        }
+
+        let mut new_op = op.clone();
+        for arg in &mut new_op.args {
+            if let Some(&repl) = inputarg_replacement.get(arg) {
+                *arg = repl;
+            }
+        }
+        if let Some(ref mut fa) = new_op.fail_args {
+            for arg in fa.iter_mut() {
+                if let Some(&repl) = inputarg_replacement.get(arg) {
+                    *arg = repl;
+                }
+            }
+        }
+        result.push(new_op);
+    }
+
+    Some((result, num_inputs + extra_inputarg_count))
+}
+
+/// compile.py:310-338: combine preamble + Label + body into final trace.
+fn combine_preamble_and_body(
+    preamble: &[Op],
+    body: &[Op],
+    preamble_num_inputs: usize,
+    body_num_inputs: usize,
+) -> Vec<Op> {
+    let mut result = Vec::with_capacity(preamble.len() + body.len() + 1);
+
+    // Preamble ops (Phase 1 result, up to but not including Jump)
+    for op in preamble {
+        if op.opcode == OpCode::Jump {
+            break;
+        }
+        result.push(op.clone());
+    }
+
+    // Label between preamble and body
+    // Label args = Jump args from preamble (the values entering the loop)
+    if let Some(jump) = preamble.iter().rfind(|op| op.opcode == OpCode::Jump) {
+        let mut label = Op::new(OpCode::Label, &jump.args);
+        label.pos = OpRef(result.len() as u32 + body_num_inputs as u32);
+        result.push(label);
+    }
+
+    // Body ops (Phase 2 result)
+    result.extend_from_slice(body);
+
+    result
+}
+
+/// RPython unroll.py: make_inputargs_and_virtuals + _generate_virtual.
+///
+/// Transform the Phase 1 peeled trace to flatten virtual JUMP args into
+/// their constituent field values, and insert reconstruction ops at body start.
+///
+/// Input:  Phase 1 optimized peeled trace with materialized virtuals at JUMP
+/// Output: Modified trace where:
+///   - JUMP carries field VALUES instead of virtual pointer
+///   - LABEL has extra field-value inputargs
+///   - Body start has New+SetfieldGc that reconstruct the virtual
+///   - Body refs to old virtual replaced with reconstructed ref
+///
+/// Phase 2 optimizer will then virtualize the reconstruction ops.
+fn flatten_virtuals_in_peeled_trace(
+    ops: &[Op],
+    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
+    num_inputs: usize,
+) -> Option<(Vec<Op>, usize)> {
+    let label_idx = ops.iter().position(|op| op.opcode == OpCode::Label)?;
+    let jump_idx = ops.iter().rposition(|op| op.opcode == OpCode::Jump)?;
+    if label_idx >= jump_idx {
+        return None;
+    }
+
+    let label_op = &ops[label_idx];
+    let jump_op = &ops[jump_idx];
+
+    // Map each virtual JUMP arg → (New position, [SetfieldGc field value OpRefs])
+    let mut virtual_info: HashMap<usize, (OpRef, Vec<(majit_ir::DescrRef, OpRef)>)> =
+        HashMap::new();
+    let mut new_positions: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+
+    for virt in jump_virtuals {
+        if virt.jump_arg_index >= jump_op.args.len() {
+            continue;
+        }
+        let jump_arg = jump_op.args[virt.jump_arg_index];
+
+        // Find New op that produced this JUMP arg
+        let new_op = ops[label_idx + 1..jump_idx]
+            .iter()
+            .find(|op| op.pos == jump_arg && op.opcode == OpCode::New)?;
+        new_positions.insert(new_op.pos);
+
+        // Collect SetfieldGc field values for this New
+        let mut field_values = Vec::new();
+        for op in &ops[label_idx + 1..jump_idx] {
+            if op.opcode == OpCode::SetfieldGc
+                && op.args.first() == Some(&new_op.pos)
+                && op.args.len() >= 2
+            {
+                if let Some(descr) = &op.descr {
+                    field_values.push((descr.clone(), op.args[1]));
+                }
+            }
+        }
+        if field_values.is_empty() {
+            continue;
+        }
+        virtual_info.insert(virt.jump_arg_index, (new_op.pos, field_values));
+    }
+
+    if virtual_info.is_empty() {
+        return None;
+    }
+
+    // Compute next available OpRef position
+    let mut next_pos = num_inputs as u32;
+    for op in ops.iter() {
+        if op.pos.0 != u32::MAX {
+            next_pos = next_pos.max(op.pos.0 + 1);
+        }
+    }
+
+    let mut result = Vec::with_capacity(ops.len() + virtual_info.len() * 4);
+    let mut virtual_to_reconstructed: HashMap<OpRef, OpRef> = HashMap::new();
+    let label_orig_len = label_op.args.len();
+
+    // ── Preamble ops (before Label) — unchanged ──
+    for op in &ops[..label_idx] {
+        result.push(op.clone());
+    }
+
+    // ── Modified Label: add extra field-value inputargs ──
+    let mut new_label = label_op.clone();
+    let mut extra_field_count = 0;
+    // Track: for each virtual, which extra Label arg indices hold its fields
+    let mut virt_field_label_indices: HashMap<usize, Vec<usize>> = HashMap::new();
+
+    for (&virt_idx, (_new_pos, fields)) in &virtual_info {
+        let mut indices = Vec::new();
+        for _ in fields {
+            let idx = label_orig_len + extra_field_count;
+            new_label.args.push(OpRef(idx as u32));
+            indices.push(idx);
+            extra_field_count += 1;
+        }
+        virt_field_label_indices.insert(virt_idx, indices);
+    }
+    result.push(new_label);
+
+    // ── Reconstruction: New+SetfieldGc after Label ──
+    // RPython unroll.py: _generate_virtual — rebuild virtual from flattened fields
+    for (&virt_idx, (_new_pos, fields)) in &virtual_info {
+        let original_label_arg = label_op.args.get(virt_idx).copied()?;
+
+        // Find size_descr from the original New op
+        let orig_new = ops[label_idx + 1..jump_idx]
+            .iter()
+            .find(|op| op.pos == *_new_pos)?;
+        let size_descr = orig_new.descr.clone()?;
+
+        // Emit New
+        let reconstructed_ref = OpRef(next_pos);
+        next_pos += 1;
+        let mut new_op = Op::new(OpCode::New, &[]);
+        new_op.pos = reconstructed_ref;
+        new_op.descr = Some(size_descr);
+        result.push(new_op);
+
+        // Emit SetfieldGc for each field, using the extra Label args
+        let field_indices = virt_field_label_indices.get(&virt_idx)?;
+        for (i, (descr, _orig_value)) in fields.iter().enumerate() {
+            let field_input_ref = OpRef(field_indices[i] as u32);
+            let mut set_op = Op::new(OpCode::SetfieldGc, &[reconstructed_ref, field_input_ref]);
+            set_op.pos = OpRef(next_pos);
+            next_pos += 1;
+            set_op.descr = Some(descr.clone());
+            result.push(set_op);
+        }
+
+        virtual_to_reconstructed.insert(original_label_arg, reconstructed_ref);
+    }
+
+    // ── Body ops: replace refs to old virtual with reconstructed ──
+    for op in &ops[label_idx + 1..jump_idx] {
+        // Skip the original New+SetfieldGc for the virtual (now reconstructed above)
+        if new_positions.contains(&op.pos) {
+            continue;
+        }
+        if op.opcode == OpCode::SetfieldGc {
+            if let Some(&first) = op.args.first() {
+                if new_positions.contains(&first) {
+                    continue;
+                }
+            }
+        }
+
+        let mut new_op = op.clone();
+        for arg in &mut new_op.args {
+            if let Some(&r) = virtual_to_reconstructed.get(arg) {
+                *arg = r;
+            }
+        }
+        if let Some(ref mut fa) = new_op.fail_args {
+            for arg in fa.iter_mut() {
+                if let Some(&r) = virtual_to_reconstructed.get(arg) {
+                    *arg = r;
+                }
+            }
+        }
+        result.push(new_op);
+    }
+
+    // ── Modified Jump: replace virtual ref with field values ──
+    let mut new_jump = jump_op.clone();
+    // Replace virtual args with placeholder and add field values as extra args
+    for (&virt_idx, (_new_pos, fields)) in &virtual_info {
+        for (_descr, value_ref) in fields {
+            new_jump.args.push(*value_ref);
+        }
+    }
+    new_jump.pos = OpRef(next_pos);
+    result.push(new_jump);
+
+    let new_num_inputs = num_inputs + extra_field_count;
+    Some((result, new_num_inputs))
+}
+
 pub fn pick_virtual_state(
     my_vs: &crate::virtualstate::VirtualState,
     target_states: &[crate::virtualstate::VirtualState],

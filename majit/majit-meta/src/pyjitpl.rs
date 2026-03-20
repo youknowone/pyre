@@ -6244,6 +6244,94 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_bridge_runs_with_many_ref_inputs_and_new_ref_outputs() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.backend.set_gc_allocator(Box::new(MiniMarkGC::new()));
+        let green_key = 155;
+
+        let mut inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        for idx in 2..28 {
+            inputargs.push(InputArg::new_ref(idx as u32));
+        }
+        let label_args: Vec<OpRef> = (0..28).map(OpRef).collect();
+        let mut root_guard = mk_op(OpCode::GuardFalse, &[OpRef(1)], OpRef::NONE.0);
+        root_guard.fail_args = Some(label_args.clone().into());
+        let root_ops = vec![
+            mk_op(OpCode::Label, &label_args, OpRef::NONE.0),
+            root_guard,
+            mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            root_ops,
+            HashMap::new(),
+        );
+
+        let live_values: Vec<i64> = std::iter::once(7)
+            .chain(std::iter::once(1))
+            .chain((2..28).map(|idx| 0x1000 + idx as i64 * 16))
+            .collect();
+        let root_failure = meta
+            .run_compiled_detailed(green_key, &live_values)
+            .expect("root guard should fail");
+        let root_fail_index = root_failure.fail_index;
+        let root_trace_id = root_failure.trace_id;
+        let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            root_fail_index,
+            root_trace_id,
+            inputargs.iter().map(|arg| arg.tp).collect(),
+            false,
+            Vec::new(),
+            None,
+        );
+
+        let value_field = majit_ir::make_field_descr(0, 8, Type::Int, true);
+        let next_field = majit_ir::make_field_descr(8, 8, Type::Ref, false);
+        let node_size = majit_ir::descr::make_size_descr(16);
+        let mut finish_args = label_args.clone();
+        finish_args[3] = OpRef(31);
+        finish_args[6] = OpRef(28);
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &label_args, OpRef::NONE.0),
+            mk_op_with_descr(OpCode::New, &[], 28, node_size.clone()),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(28), OpRef(0)], 29, value_field.clone()),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(28), OpRef(6)], 30, next_field.clone()),
+            mk_op_with_descr(OpCode::New, &[], 31, node_size),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(31), OpRef(1)], 32, value_field),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(31), OpRef(3)], 33, next_field),
+            mk_op(OpCode::Finish, &finish_args, OpRef::NONE.0),
+        ];
+        assert!(meta.compile_bridge(
+            green_key,
+            root_fail_index,
+            &bridge_fail_descr,
+            &bridge_ops,
+            &inputargs,
+            HashMap::new(),
+        ));
+
+        let bridge_trace_id = meta.compiled_loops[&green_key]
+            .traces
+            .keys()
+            .copied()
+            .find(|&trace_id| trace_id != root_trace_id)
+            .expect("bridge trace should exist");
+        let bridge_exit = meta
+            .run_compiled_detailed(green_key, &live_values)
+            .expect("bridge should run and exit");
+        assert_eq!(bridge_exit.trace_id, bridge_trace_id);
+        assert_eq!(bridge_exit.exit_layout.exit_types.len(), 28);
+        assert_eq!(bridge_exit.values[0], 7);
+        assert_eq!(bridge_exit.values[1], 1);
+        assert_ne!(bridge_exit.values[3], live_values[3]);
+        assert_ne!(bridge_exit.values[6], live_values[6]);
+        assert_ne!(bridge_exit.values[3], 0);
+        assert_ne!(bridge_exit.values[6], 0);
+    }
+
+    #[test]
     fn test_bridge_attach_resume_data_patches_backend_recovery_layout_preserving_caller_prefix() {
         let mut meta = MetaInterp::<()>::new(10);
         let green_key = 151;

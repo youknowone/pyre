@@ -862,7 +862,20 @@ where
             }
             BC_POP_DISCARD => {
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if sym.ensure_linked_list_head(ctx, selected).is_some() {
+                    let Some(next_descr) = sym.node_next_descr() else {
+                        return TraceAction::Abort;
+                    };
+                    let Some(head) = sym.linked_list_head(selected) else {
+                        return TraceAction::Abort;
+                    };
+                    let next =
+                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
+                    sym.set_linked_list_head(selected, next);
+                    if self.runtime_stack_mut(selected, runtime).pop().is_none() {
+                        return TraceAction::Abort;
+                    }
+                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     if self.runtime_stack_mut(selected, runtime).pop().is_none() {
                         return TraceAction::Abort;
                     }

@@ -46,28 +46,26 @@ pub struct Optimizer {
     /// In RPython this is `resume.ResumeDataLoopMemo`; here we use a simple
     /// HashMap since the full type lives in majit-meta (no circular dep).
     resumedata_memo_consts: std::collections::HashMap<i64, u32>,
-    /// RPython parity: virtual structures discovered at JUMP (end of preamble).
-    /// Each entry: (jump_arg_index, VirtualFieldInfo { descr, fields: [(field_descr, opref)] })
-    /// Used by the 2-pass preamble peeling to reconstruct virtuals in the body.
+    /// RPython unroll.py: virtual structures found in JUMP args during preamble.
+    /// Populated by OptVirtualize.export_virtual_for_preamble().
     pub exported_jump_virtuals: Vec<ExportedJumpVirtual>,
 }
 
-/// A virtual object found in JUMP args during preamble optimization.
-/// RPython unroll.py: part of ExportedState.virtual_state.
+/// RPython unroll.py: ExportedState virtual field info.
+/// Records a virtual object's structure at JUMP for preamble peeling phase 2.
 #[derive(Clone, Debug)]
 pub struct ExportedJumpVirtual {
-    /// Index in the JUMP args where this virtual was.
+    /// Index in JUMP args where this virtual was.
     pub jump_arg_index: usize,
     /// Size descriptor for New().
     pub size_descr: majit_ir::DescrRef,
-    /// Fields: (field_descr, concrete_value_i64)
+    /// Fields: (field_descr, concrete_i64_value).
     pub fields: Vec<(majit_ir::DescrRef, i64)>,
 }
 
 impl Optimizer {
     pub fn new() -> Self {
         Optimizer {
-            exported_jump_virtuals: Vec::new(),
             passes: Vec::new(),
             final_num_inputs: 0,
             call_pure_results: std::collections::HashMap::new(),
@@ -77,6 +75,7 @@ impl Optimizer {
             can_replace_guards: true,
             quasi_immutable_deps: std::collections::HashSet::new(),
             resumedata_memo_consts: std::collections::HashMap::new(),
+            exported_jump_virtuals: Vec::new(),
         }
     }
 
@@ -497,6 +496,9 @@ impl Optimizer {
         for pass in &mut self.passes {
             pass.flush();
         }
+
+        // Transfer exported virtual state from context to optimizer
+        self.exported_jump_virtuals = std::mem::take(&mut ctx.exported_jump_virtuals);
 
         // final_num_inputs = original inputs + virtual inputs added by passes.
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
