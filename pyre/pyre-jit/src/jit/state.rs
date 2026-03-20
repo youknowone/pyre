@@ -29,6 +29,7 @@ use pyre_runtime::{
     TruthOpcodeHandler, decode_instruction_at, execute_opcode_step, is_builtin_func, is_func,
     range_iter_continues, w_builtin_func_name, w_func_get_code_ptr, w_func_get_globals,
 };
+use pyre_interp::frame::PendingInlineResult;
 
 use crate::jit::descr::{
     bool_boolval_descr, dict_len_descr, float_floatval_descr, int_intval_descr,
@@ -207,6 +208,32 @@ fn box_traced_raw_float(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
         float_floatval_descr(),
         &FLOAT_TYPE as *const _ as i64,
     )
+}
+
+fn box_value_for_python_helper(
+    state: &mut TraceFrameState,
+    ctx: &mut TraceCtx,
+    value: OpRef,
+) -> OpRef {
+    match state.value_type(value) {
+        Type::Int => box_traced_raw_int(ctx, value),
+        Type::Float => box_traced_raw_float(ctx, value),
+        Type::Ref | Type::Void => value,
+    }
+}
+
+fn box_args_for_python_helper(
+    state: &mut TraceFrameState,
+    ctx: &mut TraceCtx,
+    args: &[OpRef],
+) -> Vec<OpRef> {
+    args.iter()
+        .map(|&arg| box_value_for_python_helper(state, ctx, arg))
+        .collect()
+}
+
+fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
+    ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], descr)
 }
 
 pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
@@ -391,17 +418,47 @@ fn virtualizable_fail_arg_types(slot_types: impl IntoIterator<Item = Type>) -> V
 }
 
 fn concrete_value_type(value: PyObjectRef) -> Type {
+    // RPython virtualizable.py:69 — arrayitem_extra_types = [getkind(ARRAY.OF)]
+    // For locals_cells_stack_w: ARRAY.OF = GCREF → kind = 'ref'.
+    // Frame slots always hold boxed object pointers (Ref), never raw ints.
+    // A boxed W_Int is still Ref — unboxing via GetfieldGcI produces Int.
     if value.is_null() {
         return Type::Ref;
     }
-    unsafe {
-        if is_int(value) {
-            Type::Int
-        } else if is_float(value) {
-            Type::Float
-        } else {
-            Type::Ref
+    if !looks_like_heap_ref(value) {
+        // Non-heap value (e.g. PY_NULL sentinel or leaked raw int)
+        return Type::Int;
+    }
+    Type::Ref
+}
+
+fn looks_like_heap_ref(value: PyObjectRef) -> bool {
+    let addr = value as usize;
+    let word_align = std::mem::align_of::<usize>() - 1;
+    addr >= 0x1_0000 && addr < (1usize << 56) && (addr & word_align) == 0
+}
+
+fn extract_concrete_typed_value(slot_type: Type, value: PyObjectRef) -> Value {
+    match slot_type {
+        Type::Int => {
+            if value.is_null() {
+                Value::Int(0)
+            } else if looks_like_heap_ref(value) && unsafe { is_int(value) } {
+                Value::Int(unsafe { w_int_get_value(value) })
+            } else {
+                Value::Int(value as i64)
+            }
         }
+        Type::Float => {
+            if value.is_null() {
+                Value::Float(0.0)
+            } else if looks_like_heap_ref(value) && unsafe { is_float(value) } {
+                Value::Float(unsafe { pyre_object::floatobject::w_float_get_value(value) })
+            } else {
+                Value::Float(f64::from_bits(value as u64))
+            }
+        }
+        Type::Ref | Type::Void => Value::Ref(majit_ir::GcRef(value as usize)),
     }
 }
 
@@ -445,6 +502,27 @@ fn boxed_slot_value_for_type(slot_type: Type, value: &Value) -> PyObjectRef {
         (_, Value::Int(v)) => *v as PyObjectRef,
         (_, Value::Float(v)) => v.to_bits() as PyObjectRef,
         (_, Value::Void) => PY_NULL,
+    }
+}
+
+fn pending_inline_result_from_concrete(
+    result_type: Type,
+    concrete_result: PyObjectRef,
+) -> PendingInlineResult {
+    match result_type {
+        Type::Int => PendingInlineResult::Int(unsafe { w_int_get_value(concrete_result) }),
+        Type::Float => PendingInlineResult::Float(unsafe {
+            pyre_object::floatobject::w_float_get_value(concrete_result)
+        }),
+        Type::Ref | Type::Void => PendingInlineResult::Ref(concrete_result),
+    }
+}
+
+fn materialize_pending_inline_result(result: PendingInlineResult) -> PyObjectRef {
+    match result {
+        PendingInlineResult::Ref(result) => result,
+        PendingInlineResult::Int(value) => w_int_new(value),
+        PendingInlineResult::Float(value) => pyre_object::floatobject::w_float_new(value),
     }
 }
 
@@ -613,6 +691,34 @@ impl PyreSym {
     pub(crate) fn stack_only_depth(&self) -> usize {
         self.valuestackdepth.saturating_sub(self.nlocals)
     }
+
+    pub(crate) fn value_type_of(&self, value: OpRef) -> Type {
+        if value.is_none() {
+            return Type::Ref;
+        }
+        if let Some(value_type) = self.transient_value_types.get(&value).copied() {
+            return value_type;
+        }
+        if let Some(idx) = self.symbolic_locals.iter().position(|&slot| slot == value) {
+            return self
+                .symbolic_local_types
+                .get(idx)
+                .copied()
+                .unwrap_or(Type::Ref);
+        }
+        let stack_only = self.stack_only_depth().min(self.symbolic_stack.len());
+        if let Some(idx) = self.symbolic_stack[..stack_only]
+            .iter()
+            .position(|&slot| slot == value)
+        {
+            return self
+                .symbolic_stack_types
+                .get(idx)
+                .copied()
+                .unwrap_or(Type::Ref);
+        }
+        Type::Ref
+    }
 }
 
 impl TraceFrameState {
@@ -704,21 +810,7 @@ impl TraceFrameState {
         if value.is_none() {
             return Type::Ref;
         }
-        let s = self.sym();
-        if let Some(value_type) = s.transient_value_types.get(&value).copied() {
-            return value_type;
-        }
-        if let Some(idx) = s.symbolic_locals.iter().position(|&slot| slot == value) {
-            return s.symbolic_local_types.get(idx).copied().unwrap_or(Type::Ref);
-        }
-        let stack_only = s.stack_only_depth().min(s.symbolic_stack.len());
-        if let Some(idx) = s.symbolic_stack[..stack_only]
-            .iter()
-            .position(|&slot| slot == value)
-        {
-            return s.symbolic_stack_types.get(idx).copied().unwrap_or(Type::Ref);
-        }
-        Type::Ref
+        self.sym().value_type_of(value)
     }
 
     fn push_typed_value(&mut self, _ctx: &mut TraceCtx, value: OpRef, value_type: Type) {
@@ -1108,8 +1200,7 @@ impl TraceFrameState {
 
     pub(crate) fn guard_range_iter(&mut self, ctx: &mut TraceCtx, obj: OpRef) {
         let range_iter_type_ptr = &RANGE_ITER_TYPE as *const PyType as usize as i64;
-        let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+        let actual_type = trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected = ctx.const_int(range_iter_type_ptr);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected]);
     }
@@ -1120,6 +1211,12 @@ impl TraceFrameState {
         next: OpRef,
         continues: bool,
     ) {
+        // RPython range/xrange iter traces carry the next value as a raw int,
+        // not an optional boxed object. Only ref-typed iterators need the
+        // optional-value guard here.
+        if self.value_type(next) != Type::Ref {
+            return;
+        }
         let opcode = if continues {
             OpCode::GuardNonnull
         } else {
@@ -1170,6 +1267,14 @@ impl TraceFrameState {
         self.guard_value(ctx, actual_value, expected);
     }
 
+    fn guard_int_like_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
+        if self.value_type(value) == Type::Int {
+            self.guard_value(ctx, value, expected);
+        } else {
+            self.guard_int_object_value(ctx, value, expected);
+        }
+    }
+
     fn guard_object_class(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected_type: *const PyType) {
         let actual_type =
             ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], self.ob_type_fd.clone());
@@ -1178,6 +1283,9 @@ impl TraceFrameState {
     }
 
     fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
+        if self.value_type(int_obj) == Type::Int {
+            return int_obj;
+        }
         self.guard_object_class(ctx, int_obj, &INT_TYPE as *const PyType);
         ctx.record_op_with_descr(OpCode::GetfieldGcI, &[int_obj], int_intval_descr())
     }
@@ -1222,8 +1330,7 @@ impl TraceFrameState {
     }
 
     fn guard_list_strategy(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected: i64) {
-        let strategy =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_strategy_descr());
+        let strategy = trace_gc_object_int_field(ctx, obj, list_strategy_descr());
         self.guard_value(ctx, strategy, expected);
     }
 
@@ -1238,15 +1345,19 @@ impl TraceFrameState {
         len: OpRef,
         concrete_key: i64,
     ) -> OpRef {
-        let fail_args = self.current_fail_args(ctx);
-        let raw_index = crate::jit::generated::trace_unbox_int(
-            ctx,
-            key,
-            &INT_TYPE as *const _ as i64,
-            ob_type_descr(),
-            int_intval_descr(),
-            &fail_args,
-        );
+        let raw_index = if self.value_type(key) == Type::Int {
+            key
+        } else {
+            let fail_args = self.current_fail_args(ctx);
+            crate::jit::generated::trace_unbox_int(
+                ctx,
+                key,
+                &INT_TYPE as *const _ as i64,
+                ob_type_descr(),
+                int_intval_descr(),
+                &fail_args,
+            )
+        };
         let zero = ctx.const_int(0);
         if concrete_key >= 0 {
             let nonnegative = ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
@@ -1276,13 +1387,13 @@ impl TraceFrameState {
         concrete_index: usize,
     ) -> OpRef {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(expected_type as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
-        self.guard_int_object_value(ctx, key, concrete_index as i64);
-        let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], items_len_descr);
+        self.guard_int_like_value(ctx, key, concrete_index as i64);
+        let len = trace_gc_object_int_field(ctx, obj, items_len_descr);
         self.guard_len_gt_index(ctx, len, concrete_index);
-        let items_ptr = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], items_ptr_descr);
+        let items_ptr = trace_gc_object_int_field(ctx, obj, items_ptr_descr);
         let index = ctx.const_int(concrete_index as i64);
         trace_raw_array_getitem_value(ctx, items_ptr, index)
     }
@@ -1300,13 +1411,13 @@ impl TraceFrameState {
     ) -> OpRef {
         let normalized = (concrete_len as i64 + concrete_key) as usize;
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(expected_type as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
-        self.guard_int_object_value(ctx, key, concrete_key);
-        let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], items_len_descr);
+        self.guard_int_like_value(ctx, key, concrete_key);
+        let len = trace_gc_object_int_field(ctx, obj, items_len_descr);
         self.guard_len_eq(ctx, len, concrete_len);
-        let items_ptr = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], items_ptr_descr);
+        let items_ptr = trace_gc_object_int_field(ctx, obj, items_ptr_descr);
         let index = ctx.const_int(normalized as i64);
         trace_raw_array_getitem_value(ctx, items_ptr, index)
     }
@@ -1319,14 +1430,13 @@ impl TraceFrameState {
         concrete_index: usize,
     ) -> OpRef {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 0);
-        let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_len_descr());
+        let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
-        let items_ptr =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_ptr_descr());
+        let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
         trace_raw_array_getitem_value(ctx, items_ptr, index)
     }
 
@@ -1339,14 +1449,13 @@ impl TraceFrameState {
         _concrete_len: usize,
     ) -> OpRef {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 0);
-        let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_len_descr());
+        let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
-        let items_ptr =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_ptr_descr());
+        let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
         trace_raw_array_getitem_value(ctx, items_ptr, index)
     }
 
@@ -1358,15 +1467,13 @@ impl TraceFrameState {
         concrete_index: usize,
     ) -> OpRef {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 1);
-        let len =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_len_descr());
+        let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
-        let items_ptr =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_ptr_descr());
+        let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
         let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
         self.remember_value_type(raw, Type::Int);
         raw
@@ -1381,15 +1488,13 @@ impl TraceFrameState {
         _concrete_len: usize,
     ) -> OpRef {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 1);
-        let len =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_len_descr());
+        let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
-        let items_ptr =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_ptr_descr());
+        let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
         let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
         self.remember_value_type(raw, Type::Int);
         raw
@@ -1403,15 +1508,13 @@ impl TraceFrameState {
         concrete_index: usize,
     ) -> OpRef {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 2);
-        let len =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_len_descr());
+        let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
-        let items_ptr =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_ptr_descr());
+        let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
         let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
         self.remember_value_type(raw, Type::Float);
         raw
@@ -1426,15 +1529,13 @@ impl TraceFrameState {
         _concrete_len: usize,
     ) -> OpRef {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
         self.guard_list_strategy(ctx, obj, 2);
-        let len =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_len_descr());
+        let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
-        let items_ptr =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_ptr_descr());
+        let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
         let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
         self.remember_value_type(raw, Type::Float);
         raw
@@ -1450,14 +1551,14 @@ impl TraceFrameState {
         items_len_descr: DescrRef,
     ) -> Vec<OpRef> {
         let actual_type =
-            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[seq], self.ob_type_fd.clone());
+            trace_gc_object_int_field(ctx, seq, self.ob_type_fd.clone());
         let expected = ctx.const_int(expected_type as usize as i64);
         self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected]);
 
-        let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[seq], items_len_descr);
+        let len = trace_gc_object_int_field(ctx, seq, items_len_descr);
         self.guard_value(ctx, len, count as i64);
 
-        let items_ptr = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[seq], items_ptr_descr);
+        let items_ptr = trace_gc_object_int_field(ctx, seq, items_ptr_descr);
         (0..count)
             .map(|idx| {
                 let idx = ctx.const_int(idx as i64);
@@ -1885,7 +1986,7 @@ impl TraceFrameState {
                     if index < concrete_len {
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
+                                OpCode::GetfieldGcI,
                                 &[obj],
                                 this.ob_type_fd.clone(),
                             );
@@ -1897,17 +1998,9 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 0);
-                            let len = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_items_len_descr(),
-                            );
+                            let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                            let items_ptr = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_items_ptr_descr(),
-                            );
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
                             trace_raw_array_setitem_value(ctx, items_ptr, index, value);
                             Ok(())
                         });
@@ -1919,7 +2012,7 @@ impl TraceFrameState {
                     if abs_index <= concrete_len {
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
+                                OpCode::GetfieldGcI,
                                 &[obj],
                                 this.ob_type_fd.clone(),
                             );
@@ -1931,17 +2024,9 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 0);
-                            let len = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_items_len_descr(),
-                            );
+                            let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
-                            let items_ptr = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_items_ptr_descr(),
-                            );
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
                             trace_raw_array_setitem_value(ctx, items_ptr, index, value);
                             Ok(())
                         });
@@ -1959,7 +2044,7 @@ impl TraceFrameState {
                     if index < concrete_len {
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
+                                OpCode::GetfieldGcI,
                                 &[obj],
                                 this.ob_type_fd.clone(),
                             );
@@ -1971,17 +2056,9 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 1);
-                            let len = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_int_items_len_descr(),
-                            );
+                            let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                            let items_ptr = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_int_items_ptr_descr(),
-                            );
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
                             let fail_args = this.current_fail_args(ctx);
                             let raw = if this.value_type(value) == Type::Int {
                                 value
@@ -2006,7 +2083,7 @@ impl TraceFrameState {
                     if abs_index <= concrete_len {
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
+                                OpCode::GetfieldGcI,
                                 &[obj],
                                 this.ob_type_fd.clone(),
                             );
@@ -2018,17 +2095,9 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 1);
-                            let len = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_int_items_len_descr(),
-                            );
+                            let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
-                            let items_ptr = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_int_items_ptr_descr(),
-                            );
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
                             let fail_args = this.current_fail_args(ctx);
                             let raw = if this.value_type(value) == Type::Int {
                                 value
@@ -2059,7 +2128,7 @@ impl TraceFrameState {
                     if index < concrete_len {
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
+                                OpCode::GetfieldGcI,
                                 &[obj],
                                 this.ob_type_fd.clone(),
                             );
@@ -2071,17 +2140,9 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 2);
-                            let len = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_float_items_len_descr(),
-                            );
+                            let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                            let items_ptr = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_float_items_ptr_descr(),
-                            );
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
                             let fail_args = this.current_fail_args(ctx);
                             let raw = if this.value_type(value) == Type::Float {
                                 value
@@ -2106,7 +2167,7 @@ impl TraceFrameState {
                     if abs_index <= concrete_len {
                         return self.with_ctx(|this, ctx| {
                             let actual_type = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
+                                OpCode::GetfieldGcI,
                                 &[obj],
                                 this.ob_type_fd.clone(),
                             );
@@ -2118,17 +2179,9 @@ impl TraceFrameState {
                                 &[actual_type, expected_type],
                             );
                             this.guard_list_strategy(ctx, obj, 2);
-                            let len = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_float_items_len_descr(),
-                            );
+                            let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
-                            let items_ptr = ctx.record_op_with_descr(
-                                OpCode::GetfieldRawI,
-                                &[obj],
-                                list_float_items_ptr_descr(),
-                            );
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
                             let fail_args = this.current_fail_args(ctx);
                             let raw = if this.value_type(value) == Type::Float {
                                 value
@@ -2166,7 +2219,7 @@ impl TraceFrameState {
                 let concrete_len = w_list_len(concrete_list);
                 return self.with_ctx(|this, ctx| {
                     let actual_type = ctx.record_op_with_descr(
-                        OpCode::GetfieldRawI,
+                        OpCode::GetfieldGcI,
                         &[list],
                         this.ob_type_fd.clone(),
                     );
@@ -2175,29 +2228,21 @@ impl TraceFrameState {
                     this.guard_list_strategy(ctx, list, 0);
                     if w_list_is_inline_storage(concrete_list) {
                         let heap_cap = ctx.record_op_with_descr(
-                            OpCode::GetfieldRawI,
+                            OpCode::GetfieldGcI,
                             &[list],
                             list_items_heap_cap_descr(),
                         );
                         this.guard_value(ctx, heap_cap, 0);
                     } else {
-                        let len = ctx.record_op_with_descr(
-                            OpCode::GetfieldRawI,
-                            &[list],
-                            list_items_len_descr(),
-                        );
+                        let len = trace_gc_object_int_field(ctx, list, list_items_len_descr());
                         this.guard_value(ctx, len, concrete_len as i64);
                     }
-                    let items_ptr = ctx.record_op_with_descr(
-                        OpCode::GetfieldRawI,
-                        &[list],
-                        list_items_ptr_descr(),
-                    );
+                    let items_ptr = trace_gc_object_int_field(ctx, list, list_items_ptr_descr());
                     let index = ctx.const_int(concrete_len as i64);
                     trace_raw_array_setitem_value(ctx, items_ptr, index, value);
                     let new_len = ctx.const_int((concrete_len + 1) as i64);
                     ctx.record_op_with_descr(
-                        OpCode::SetfieldRaw,
+                        OpCode::SetfieldGc,
                         &[list, new_len],
                         list_items_len_descr(),
                     );
@@ -2227,113 +2272,86 @@ impl TraceFrameState {
         )
     }
 
+    fn trace_known_builtin_call(
+        &mut self,
+        callable: OpRef,
+        args: &[OpRef],
+    ) -> Result<OpRef, PyError> {
+        self.with_ctx(|this, ctx| {
+            let boxed_args = box_args_for_python_helper(this, ctx, args);
+            crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
+        })
+    }
+
     fn direct_len_value(&mut self, callable: OpRef, value: OpRef) -> Result<OpRef, PyError> {
         let Some(concrete_value) = self.concrete_call_arg_after_pops(0) else {
-            return self.with_ctx(|_this, ctx| {
-                crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[value])
-            });
+            return self.trace_known_builtin_call(callable, &[value]);
         };
 
         unsafe {
             if is_str(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &pyre_object::STR_TYPE as *const PyType);
-                    let len =
-                        ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], str_len_descr());
-                    Ok({
-                        let int_type_addr = &INT_TYPE as *const _ as i64;
-                        crate::jit::generated::trace_box_int(
-                            ctx,
-                            len,
-                            w_int_size_descr(),
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            int_type_addr,
-                        )
-                    })
+                    let len = trace_gc_object_int_field(ctx, value, str_len_descr());
+                    this.remember_value_type(len, Type::Int);
+                    Ok(len)
                 });
             }
             if is_dict(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &DICT_TYPE as *const PyType);
-                    let len =
-                        ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], dict_len_descr());
-                    Ok({
-                        let int_type_addr = &INT_TYPE as *const _ as i64;
-                        crate::jit::generated::trace_box_int(
-                            ctx,
-                            len,
-                            w_int_size_descr(),
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            int_type_addr,
-                        )
-                    })
+                    let len = trace_gc_object_int_field(ctx, value, dict_len_descr());
+                    this.remember_value_type(len, Type::Int);
+                    Ok(len)
                 });
             }
-            if is_list(concrete_value) && w_list_uses_object_storage(concrete_value) {
+            if is_list(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &LIST_TYPE as *const PyType);
-                    let len = ctx.record_op_with_descr(
-                        OpCode::GetfieldRawI,
-                        &[value],
-                        list_items_len_descr(),
-                    );
-                    Ok({
-                        let int_type_addr = &INT_TYPE as *const _ as i64;
-                        crate::jit::generated::trace_box_int(
+                    let len = if w_list_uses_object_storage(concrete_value) {
+                        this.guard_list_strategy(ctx, value, 0);
+                        trace_gc_object_int_field(ctx, value, list_items_len_descr())
+                    } else if w_list_uses_int_storage(concrete_value) {
+                        this.guard_list_strategy(ctx, value, 1);
+                        trace_gc_object_int_field(ctx, value, list_int_items_len_descr())
+                    } else if w_list_uses_float_storage(concrete_value) {
+                        this.guard_list_strategy(ctx, value, 2);
+                        trace_gc_object_int_field(ctx, value, list_float_items_len_descr())
+                    } else {
+                        let boxed_value = box_value_for_python_helper(this, ctx, value);
+                        return crate::jit::helpers::emit_trace_call_known_builtin(
                             ctx,
-                            len,
-                            w_int_size_descr(),
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            int_type_addr,
-                        )
-                    })
+                            callable,
+                            &[boxed_value],
+                        );
+                    };
+                    this.remember_value_type(len, Type::Int);
+                    Ok(len)
                 });
             }
             if is_tuple(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &TUPLE_TYPE as *const PyType);
-                    let len = ctx.record_op_with_descr(
-                        OpCode::GetfieldRawI,
-                        &[value],
-                        tuple_items_len_descr(),
-                    );
-                    Ok({
-                        let int_type_addr = &INT_TYPE as *const _ as i64;
-                        crate::jit::generated::trace_box_int(
-                            ctx,
-                            len,
-                            w_int_size_descr(),
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            int_type_addr,
-                        )
-                    })
+                    let len = trace_gc_object_int_field(ctx, value, tuple_items_len_descr());
+                    this.remember_value_type(len, Type::Int);
+                    Ok(len)
                 });
             }
         }
 
-        self.with_ctx(|_this, ctx| {
-            crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[value])
-        })
+        self.trace_known_builtin_call(callable, &[value])
     }
 
     fn direct_abs_value(&mut self, callable: OpRef, value: OpRef) -> Result<OpRef, PyError> {
         let Some(concrete_value) = self.concrete_call_arg_after_pops(0) else {
-            return self.with_ctx(|_this, ctx| {
-                crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[value])
-            });
+            return self.trace_known_builtin_call(callable, &[value]);
         };
 
         unsafe {
             if is_int(concrete_value) {
                 let concrete_int = w_int_get_value(concrete_value);
                 if concrete_int == i64::MIN {
-                    return self.with_ctx(|_this, ctx| {
-                        crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[value])
-                    });
+                    return self.trace_known_builtin_call(callable, &[value]);
                 }
                 return self.with_ctx(|this, ctx| {
                     let int_value = this.trace_guarded_int_payload(ctx, value);
@@ -2359,16 +2377,12 @@ impl TraceFrameState {
             }
         }
 
-        self.with_ctx(|_this, ctx| {
-            crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[value])
-        })
+        self.trace_known_builtin_call(callable, &[value])
     }
 
     fn direct_type_value(&mut self, callable: OpRef, value: OpRef) -> Result<OpRef, PyError> {
         let Some(concrete_value) = self.concrete_call_arg_after_pops(0) else {
-            return self.with_ctx(|_this, ctx| {
-                crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[value])
-            });
+            return self.trace_known_builtin_call(callable, &[value]);
         };
 
         unsafe {
@@ -2391,9 +2405,7 @@ impl TraceFrameState {
             self.concrete_call_arg_after_pops(0),
             self.concrete_call_arg_after_pops(1),
         ) else {
-            return self.with_ctx(|_this, ctx| {
-                crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[obj, type_name])
-            });
+            return self.trace_known_builtin_call(callable, &[obj, type_name]);
         };
 
         unsafe {
@@ -2409,9 +2421,7 @@ impl TraceFrameState {
             }
         }
 
-        self.with_ctx(|_this, ctx| {
-            crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[obj, type_name])
-        })
+        self.trace_known_builtin_call(callable, &[obj, type_name])
     }
 
     fn direct_minmax_value(
@@ -2425,9 +2435,7 @@ impl TraceFrameState {
             self.concrete_call_arg_after_pops(0),
             self.concrete_call_arg_after_pops(1),
         ) else {
-            return self.with_ctx(|_this, ctx| {
-                crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[a, b])
-            });
+            return self.trace_known_builtin_call(callable, &[a, b]);
         };
 
         unsafe {
@@ -2447,9 +2455,7 @@ impl TraceFrameState {
                     concrete_b
                 };
                 if w_int_new(concrete_result) != concrete_obj {
-                    return self.with_ctx(|_this, ctx| {
-                        crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[a, b])
-                    });
+                    return self.trace_known_builtin_call(callable, &[a, b]);
                 }
                 return self.with_ctx(|this, ctx| {
                     let lhs = this.trace_guarded_int_payload(ctx, a);
@@ -2479,9 +2485,7 @@ impl TraceFrameState {
             }
         }
 
-        self.with_ctx(|_this, ctx| {
-            crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &[a, b])
-        })
+        self.trace_known_builtin_call(callable, &[a, b])
     }
 
     pub(crate) fn call_callable_value(
@@ -2531,7 +2535,8 @@ impl TraceFrameState {
                 }
                 return self.with_ctx(|this, ctx| {
                     this.guard_value(ctx, callable, concrete_callable as i64);
-                    crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, args)
+                    let boxed_args = box_args_for_python_helper(this, ctx, args);
+                    crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
                 });
             }
             if is_func(concrete_callable) {
@@ -2587,10 +2592,19 @@ impl TraceFrameState {
                 }
 
                 // PyPy converges self-recursion to separate functrace +
-                // call_assembler once compiled code exists. Our current
-                // self-recursive "Inline" path is still helper-boundary,
-                // so prefer direct CallAssembler as soon as a compiled token
-                // exists instead of paying that extra helper layer.
+                // call_assembler once compiled code exists. However,
+                // `_opimpl_recursive_call` still goes through `perform_call()`
+                // while tracing the current portal, and only switches to the
+                // assembler-call path after recursion is no longer being
+                // unrolled in the active trace.
+                //
+                // pyre does not yet have the full `ChangeFrame`-style
+                // self-recursive framestack needed to trace through that path
+                // safely. If we emit CALL_ASSEMBLER here for a pending
+                // self-recursive token, the backend sees a transient
+                // descriptor/input mismatch and rejects the trace. Keep
+                // self-recursion on the helper-boundary path below until the
+                // framestack implementation is complete.
                 if majit_meta::majit_log_enabled() {
                     eprintln!(
                         "[jit][call-check] is_self={} cache_safe={} inline_active={} callee_key={}",
@@ -2599,126 +2613,6 @@ impl TraceFrameState {
                         inline_framestack_active,
                         callee_key
                     );
-                }
-                if is_self_recursive
-                    && crate::call_jit::recursive_force_cache_safe(concrete_callable)
-                {
-                    // RPython parity: compiled code calls compiled code
-                    // directly via CALL_ASSEMBLER. Guard failures in the
-                    // callee are handled by force_fn → resume_in_blackhole.
-                    // This is the fast path matching RPython's
-                    // call_assembler / assembler_call_helper pattern.
-                    // RPython warmstate.py:714 get_assembler_token: use
-                    // compiled token or pending token (compile_tmp_callback).
-                    if let Some(token_number) = driver
-                        .get_loop_token_number(callee_key)
-                        .or_else(|| driver.get_pending_token_number(callee_key))
-                    {
-                        // For pending token (not yet compiled), use current
-                        // trace's own metadata since it's self-recursive.
-                        let (callee_nlocals, callee_vsd, target_num_inputs, callee_slot_types) =
-                            if let Some(callee_meta) = driver.get_compiled_meta(callee_key) {
-                                (
-                                    callee_meta.num_locals,
-                                    callee_meta.valuestackdepth,
-                                    driver.get_compiled_num_inputs(callee_key).unwrap_or(1),
-                                    callee_meta.slot_types.clone(),
-                                )
-                            } else {
-                                // Pending token: self-recursive, use caller's info
-                                let code = unsafe {
-                                    &*(w_func_get_code_ptr(concrete_callable) as *const CodeObject)
-                                };
-                                let arg_slot_types: Vec<Type> =
-                                    args.iter().map(|&arg| self.value_type(arg)).collect();
-                                let callee_nlocals = code.varnames.len();
-                                let callee_stack_only = 0;
-                                (
-                                    callee_nlocals,
-                                    callee_nlocals + callee_stack_only,
-                                    4,
-                                    pending_entry_slot_types_from_args(
-                                        &arg_slot_types,
-                                        callee_nlocals,
-                                        callee_stack_only,
-                                    ),
-                                )
-                            };
-                        let callee_stack_only = callee_vsd.saturating_sub(callee_nlocals);
-
-                        if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
-                            return self.with_ctx(|this, ctx| {
-                                this.guard_value(ctx, callable, concrete_callable as i64);
-                                let callee_frame = if nargs == 1 {
-                                    let (helper, helper_arg_types) =
-                                        one_arg_callee_frame_helper(this.value_type(args[0]), true);
-                                    ctx.call_ref_typed(helper, &[this.frame(), args[0]], &helper_arg_types)
-                                } else {
-                                    let mut helper_args = vec![this.frame(), callable];
-                                    helper_args.extend_from_slice(args);
-                                    let helper_arg_types = frame_callable_arg_types(args.len());
-                                    ctx.call_ref_typed(
-                                        frame_helper,
-                                        &helper_args,
-                                        &helper_arg_types,
-                                    )
-                                };
-
-                                let ca_args = if target_num_inputs <= 1 {
-                                    vec![callee_frame]
-                                } else if callee_stack_only == 0 {
-                                    synthesize_fresh_callee_entry_args(
-                                        ctx,
-                                        callee_frame,
-                                        args,
-                                        callee_nlocals,
-                                    )
-                                } else {
-                                    let callee_ni = frame_get_next_instr(ctx, callee_frame);
-                                    let callee_sd = frame_get_stack_depth(ctx, callee_frame);
-                                    let mut a = vec![callee_frame, callee_ni, callee_sd];
-                                    let callee_arr =
-                                        frame_locals_cells_stack_array(ctx, callee_frame);
-                                    for i in 0..callee_nlocals {
-                                        let idx = ctx.const_int(i as i64);
-                                        let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemGcR,
-                                            &[callee_arr, idx],
-                                            pyobject_array_descr(),
-                                        );
-                                        a.push(val);
-                                    }
-                                    for i in 0..callee_stack_only {
-                                        let idx = ctx.const_int((callee_nlocals + i) as i64);
-                                        let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemGcR,
-                                            &[callee_arr, idx],
-                                            pyobject_array_descr(),
-                                        );
-                                        a.push(val);
-                                    }
-                                    a
-                                };
-                                let ca_arg_types =
-                                    frame_entry_arg_types_from_slot_types(&callee_slot_types);
-                                let result = ctx.call_assembler_int_by_number_typed(
-                                    token_number,
-                                    &ca_args,
-                                    &ca_arg_types,
-                                );
-                                ctx.call_void(
-                                    crate::call_jit::jit_drop_callee_frame as *const (),
-                                    &[callee_frame],
-                                );
-                                let result = if inline_framestack_active {
-                                    box_traced_raw_int(ctx, result)
-                                } else {
-                                    result
-                                };
-                                Ok(result)
-                            });
-                        }
-                    }
                 }
 
                 if inline_decision == majit_meta::InlineDecision::Inline {
@@ -2914,7 +2808,8 @@ impl TraceFrameState {
                                     &[callee_frame],
                                 );
                                 let result = if inline_framestack_active
-                                    && driver.has_raw_int_finish(callee_key)
+                                    && (driver.has_raw_int_finish(callee_key)
+                                        || crate::eval::has_finish_protocol_hint(callee_key))
                                 {
                                     box_traced_raw_int(ctx, result)
                                 } else {
@@ -2941,11 +2836,12 @@ impl TraceFrameState {
                 let call_pc = self.fallthrough_pc.saturating_sub(1);
                 return self.with_ctx(|this, ctx| {
                     this.guard_value(ctx, callable, concrete_callable as i64);
+                    let boxed_args = box_args_for_python_helper(this, ctx, args);
                     let result = crate::jit::helpers::emit_trace_call_known_function(
                         ctx,
                         this.frame(),
                         callable,
-                        args,
+                        &boxed_args,
                     )?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.record_guard(ctx, OpCode::GuardNotForced, &[]);
@@ -3108,14 +3004,18 @@ impl TraceFrameState {
         let result = inline_trace_and_execute(ctx, pending);
         let (driver, _) = crate::eval::driver_pair();
         driver.leave_inline_frame();
-        let (result_opref, concrete_result) = result?;
+        let (result_opref, result_type, concrete_result) = result?;
+        self.remember_value_type(result_opref, result_type);
 
         // Write the concrete result onto the owning caller frame so the
         // following concrete CALL replay can consume it without a
         // thread-global side channel.
         let caller_frame =
             unsafe { &mut *(self.concrete_frame as *mut pyre_interp::frame::PyFrame) };
-        pyre_interp::call::set_pending_inline_result(caller_frame, concrete_result);
+        pyre_interp::call::set_pending_inline_result(
+            caller_frame,
+            pending_inline_result_from_concrete(result_type, concrete_result),
+        );
 
         Ok(result_opref)
     }
@@ -3131,7 +3031,6 @@ impl TraceFrameState {
         frame_helper: *const (),
     ) -> Result<OpRef, PyError> {
         let (driver, _) = crate::eval::driver_pair();
-        let raw_finish_ready = driver.has_raw_int_finish(callee_key);
         let concrete_arg0 = if args.len() == 1 {
             self.concrete_call_arg_after_pops(0)
         } else {
@@ -3153,102 +3052,40 @@ impl TraceFrameState {
                                 0,
                             )
                         };
-                    if raw_finish_ready {
-                        let force_fn = if is_self_recursive
-                            && crate::call_jit::recursive_force_cache_safe(concrete_callable)
-                        {
-                            crate::call_jit::jit_force_self_recursive_call_raw_1 as *const ()
-                        } else {
-                            crate::call_jit::jit_force_recursive_call_raw_1 as *const ()
-                        };
-                        if force_fn
-                            == crate::call_jit::jit_force_self_recursive_call_raw_1 as *const ()
-                        {
-                            this.sync_standard_virtualizable_before_residual_call(ctx);
-                            let raw = ctx.call_may_force_int_typed(
-                                force_fn,
-                                &[this.frame(), raw_arg],
-                                &[Type::Ref, Type::Int],
-                            );
-                            let forced = this.sync_standard_virtualizable_after_residual_call();
-                            if this.parent_fail_args.is_some() {
-                                let result = box_traced_raw_int(ctx, raw);
-                                if !forced {
-                                    this.push_call_replay_stack(ctx, callable, args, call_pc);
-                                    this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                                    this.pop_call_replay_stack(ctx, args.len())?;
-                                }
-                                result
-                            } else {
-                                if !forced {
-                                    this.push_call_replay_stack(ctx, callable, args, call_pc);
-                                    this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                                    this.pop_call_replay_stack(ctx, args.len())?;
-                                }
-                                raw
-                            }
-                        } else {
-                            this.sync_standard_virtualizable_before_residual_call(ctx);
-                            let raw = ctx.call_may_force_int_typed(
-                                force_fn,
-                                &[this.frame(), callable, raw_arg],
-                                &[Type::Ref, Type::Ref, Type::Int],
-                            );
-                            let forced = this.sync_standard_virtualizable_after_residual_call();
-                            if this.parent_fail_args.is_some() {
-                                let result = box_traced_raw_int(ctx, raw);
-                                if !forced {
-                                    this.push_call_replay_stack(ctx, callable, args, call_pc);
-                                    this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                                    this.pop_call_replay_stack(ctx, args.len())?;
-                                }
-                                result
-                            } else {
-                                if !forced {
-                                    this.push_call_replay_stack(ctx, callable, args, call_pc);
-                                    this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                                    this.pop_call_replay_stack(ctx, args.len())?;
-                                }
-                                raw
-                            }
-                        }
+                    // RPython parity: an opaque helper-boundary Python CALL
+                    // still produces a boxed object result.  Even if the
+                    // callee itself can finish with a raw int, the helper
+                    // boxes at the boundary and the trace records a Ref.
+                    let force_fn = if is_self_recursive
+                        && crate::call_jit::recursive_force_cache_safe(concrete_callable)
+                    {
+                        crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1 as *const ()
                     } else {
-                        // Keep the helper's return protocol stable for the
-                        // lifetime of this trace. Before the callee has a raw
-                        // int finish, use the boxed helper with a Ref result,
-                        // matching RPython's call_assembler result kind.
-                        let force_fn = if is_self_recursive
-                            && crate::call_jit::recursive_force_cache_safe(concrete_callable)
-                        {
-                            crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1
-                                as *const ()
-                        } else {
-                            crate::call_jit::jit_force_recursive_call_argraw_boxed_1 as *const ()
-                        };
-                        this.sync_standard_virtualizable_before_residual_call(ctx);
-                        let result = if force_fn
-                            == crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1
-                                as *const ()
-                        {
-                            ctx.call_may_force_ref_typed(
-                                force_fn,
-                                &[this.frame(), raw_arg],
-                                &[Type::Ref, Type::Int],
-                            )
-                        } else {
-                            ctx.call_may_force_ref_typed(
-                                force_fn,
-                                &[this.frame(), callable, raw_arg],
-                                &[Type::Ref, Type::Ref, Type::Int],
-                            )
-                        };
-                        if !this.sync_standard_virtualizable_after_residual_call() {
-                            this.push_call_replay_stack(ctx, callable, args, call_pc);
-                            this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                            this.pop_call_replay_stack(ctx, args.len())?;
-                        }
-                        result
+                        crate::call_jit::jit_force_recursive_call_argraw_boxed_1 as *const ()
+                    };
+                    this.sync_standard_virtualizable_before_residual_call(ctx);
+                    let result = if force_fn
+                        == crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1
+                            as *const ()
+                    {
+                        ctx.call_may_force_ref_typed(
+                            force_fn,
+                            &[this.frame(), raw_arg],
+                            &[Type::Ref, Type::Int],
+                        )
+                    } else {
+                        ctx.call_may_force_ref_typed(
+                            force_fn,
+                            &[this.frame(), callable, raw_arg],
+                            &[Type::Ref, Type::Ref, Type::Int],
+                        )
+                    };
+                    if !this.sync_standard_virtualizable_after_residual_call() {
+                        this.push_call_replay_stack(ctx, callable, args, call_pc);
+                        this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                        this.pop_call_replay_stack(ctx, args.len())?;
                     }
+                    result
                 } else {
                     let force_fn = crate::call_jit::jit_force_recursive_call_1 as *const ();
                     this.sync_standard_virtualizable_before_residual_call(ctx);
@@ -3311,12 +3148,9 @@ impl TraceFrameState {
         self.with_ctx(|this, ctx| {
             TraceFrameState::guard_range_iter(this, ctx, iter);
 
-            let current =
-                ctx.record_op_with_descr(OpCode::GetfieldRawI, &[iter], range_iter_current_descr());
-            let stop =
-                ctx.record_op_with_descr(OpCode::GetfieldRawI, &[iter], range_iter_stop_descr());
-            let step =
-                ctx.record_op_with_descr(OpCode::GetfieldRawI, &[iter], range_iter_step_descr());
+            let current = trace_gc_object_int_field(ctx, iter, range_iter_current_descr());
+            let stop = trace_gc_object_int_field(ctx, iter, range_iter_stop_descr());
+            let step = trace_gc_object_int_field(ctx, iter, range_iter_step_descr());
             let zero = ctx.const_int(0);
             let step_positive = ctx.record_op(OpCode::IntGt, &[step, zero]);
             this.guard_value(ctx, step_positive, concrete_step_positive as i64);
@@ -3329,25 +3163,19 @@ impl TraceFrameState {
             this.guard_value(ctx, continues, concrete_continues as i64);
 
             if !concrete_continues {
+                this.remember_value_type(zero, Type::Int);
                 return Ok(zero);
             }
 
             let next_current = ctx.record_op(OpCode::IntAddOvf, &[current, step]);
             this.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
             ctx.record_op_with_descr(
-                OpCode::SetfieldRaw,
+                OpCode::SetfieldGc,
                 &[iter, next_current],
                 range_iter_current_descr(),
             );
-            let int_type_addr = &INT_TYPE as *const _ as i64;
-            Ok(crate::jit::generated::trace_box_int(
-                ctx,
-                current,
-                w_int_size_descr(),
-                ob_type_descr(),
-                int_intval_descr(),
-                int_type_addr,
-            ))
+            this.remember_value_type(current, Type::Int);
+            Ok(current)
         })
     }
 
@@ -3530,7 +3358,7 @@ impl TraceFrameState {
         &mut self,
         result: Result<pyre_runtime::StepResult<OpRef>, PyError>,
     ) -> TraceAction {
-        trace_step_result_to_action(self.ctx(), result)
+        trace_step_result_to_action(self, result)
     }
 
     pub(crate) fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
@@ -3606,12 +3434,12 @@ impl TraceFrameState {
 }
 
 pub(crate) fn trace_step_result_to_action(
-    ctx: &TraceCtx,
+    state: &mut TraceFrameState,
     result: Result<pyre_runtime::StepResult<OpRef>, PyError>,
 ) -> TraceAction {
     match result {
         Ok(pyre_runtime::StepResult::Continue) => {
-            if ctx.is_too_long() {
+            if state.ctx().is_too_long() {
                 TraceAction::Abort
             } else {
                 TraceAction::Continue
@@ -3621,13 +3449,46 @@ pub(crate) fn trace_step_result_to_action(
             TraceAction::CloseLoopWithArgs { jump_args }
         }
         Ok(pyre_runtime::StepResult::Return(value)) => TraceAction::Finish {
-            finish_args: vec![value],
-            // Python function returns are always boxed PyObjectRef (GC reference).
-            finish_arg_types: vec![Type::Ref],
+            finish_args: {
+                let finish_type = match state.value_type(value) {
+                    Type::Int => Type::Int,
+                    Type::Float => Type::Float,
+                    Type::Ref | Type::Void => Type::Ref,
+                };
+                crate::eval::note_finish_protocol_hint(
+                    state.ctx().green_key(),
+                    matches!(finish_type, Type::Int),
+                );
+                vec![value]
+            },
+            // RPython parity: finishframe uses the typed result register
+            // produced by make_result_of_lastop().  The terminal finish layout
+            // must follow the traced value kind instead of assuming every
+            // Python return is already a boxed ref.
+            finish_arg_types: vec![match state.value_type(value) {
+                Type::Int => Type::Int,
+                Type::Float => Type::Float,
+                Type::Ref | Type::Void => Type::Ref,
+            }],
         },
         Ok(pyre_runtime::StepResult::Yield(value)) => TraceAction::Finish {
-            finish_args: vec![value],
-            finish_arg_types: vec![Type::Ref],
+            finish_args: {
+                let finish_type = match state.value_type(value) {
+                    Type::Int => Type::Int,
+                    Type::Float => Type::Float,
+                    Type::Ref | Type::Void => Type::Ref,
+                };
+                crate::eval::note_finish_protocol_hint(
+                    state.ctx().green_key(),
+                    matches!(finish_type, Type::Int),
+                );
+                vec![value]
+            },
+            finish_arg_types: vec![match state.value_type(value) {
+                Type::Int => Type::Int,
+                Type::Float => Type::Float,
+                Type::Ref | Type::Void => Type::Ref,
+            }],
         },
         Err(_) => TraceAction::Abort,
     }
@@ -3650,6 +3511,29 @@ impl TraceHelperAccess for TraceFrameState {
         self.with_ctx(|this, ctx| {
             this.record_guard(ctx, OpCode::GuardNotForced, &[]);
         });
+    }
+
+    fn trace_call_callable(&mut self, callable: OpRef, args: &[OpRef]) -> Result<OpRef, PyError> {
+        let frame = self.trace_frame();
+        let result = self.with_ctx(|this, ctx| {
+            let boxed_args = box_args_for_python_helper(this, ctx, args);
+            crate::jit::helpers::emit_trace_call_callable(ctx, frame, callable, &boxed_args)
+        })?;
+        self.trace_record_not_forced_guard();
+        Ok(result)
+    }
+
+    fn trace_binary_value(
+        &mut self,
+        a: OpRef,
+        b: OpRef,
+        op: pyre_bytecode::bytecode::BinaryOperator,
+    ) -> Result<OpRef, PyError> {
+        self.with_ctx(|this, ctx| {
+            let lhs = box_value_for_python_helper(this, ctx, a);
+            let rhs = box_value_for_python_helper(this, ctx, b);
+            crate::jit::helpers::emit_trace_binary_value(ctx, lhs, rhs, op)
+        })
     }
 }
 
@@ -3740,6 +3624,20 @@ impl SharedOpcodeHandler for TraceFrameState {
 impl LocalOpcodeHandler for TraceFrameState {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
         self.with_ctx(|this, ctx| TraceFrameState::load_local_value(this, ctx, idx))
+    }
+
+    fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
+        let _ = name;
+        let value = self.with_ctx(|this, ctx| TraceFrameState::load_local_value(this, ctx, idx))?;
+        // RPython MIFrame keeps int/ref/float registers in separate typed arrays.
+        // Only ref-typed locals can be null/unbound at load time; raw int/float
+        // locals must not pick up a spurious GuardNonnull.
+        if self.value_type(value) == Type::Ref {
+            self.with_ctx(|this, ctx| {
+                TraceFrameState::guard_nonnull(this, ctx, value);
+            });
+        }
+        Ok(value)
     }
 
     fn store_local_value(&mut self, idx: usize, value: Self::Value) -> Result<(), PyError> {
@@ -4270,11 +4168,7 @@ impl JitState for PyreJitState {
         for i in 0..nlocals {
             let value = self.local_at(i).unwrap_or(PY_NULL);
             let slot_type = meta.slot_types.get(i).copied().unwrap_or(Type::Ref);
-            vals.push(match slot_type {
-                Type::Int => Value::Int(unsafe { w_int_get_value(value) }),
-                Type::Float => Value::Float(unsafe { pyre_object::floatobject::w_float_get_value(value) }),
-                Type::Ref | Type::Void => Value::Ref(majit_ir::GcRef(value as usize)),
-            });
+            vals.push(extract_concrete_typed_value(slot_type, value));
         }
         for i in 0..stack_only {
             let value = self.stack_at(i).unwrap_or(PY_NULL);
@@ -4283,11 +4177,7 @@ impl JitState for PyreJitState {
                 .get(nlocals + i)
                 .copied()
                 .unwrap_or(Type::Ref);
-            vals.push(match slot_type {
-                Type::Int => Value::Int(unsafe { w_int_get_value(value) }),
-                Type::Float => Value::Float(unsafe { pyre_object::floatobject::w_float_get_value(value) }),
-                Type::Ref | Type::Void => Value::Ref(majit_ir::GcRef(value as usize)),
-            });
+            vals.push(extract_concrete_typed_value(slot_type, value));
         }
         vals
     }
@@ -4894,6 +4784,364 @@ mod tests {
             Some(vec![7])
         );
     }
+
+    #[test]
+    fn test_load_local_checked_value_skips_nonnull_guard_for_typed_int_local() {
+        let mut ctx = TraceCtx::for_test(1);
+        let local = OpRef(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![local];
+        sym.symbolic_local_types = vec![Type::Int];
+        sym.nlocals = 1;
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: 1,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let loaded =
+            <TraceFrameState as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "j")
+                .expect("typed int local should load without guard");
+        assert_eq!(loaded, local);
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 0);
+    }
+
+    #[test]
+    fn test_load_local_checked_value_keeps_nonnull_guard_for_ref_local() {
+        let mut ctx = TraceCtx::for_test(1);
+        let local = OpRef(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![local];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.nlocals = 1;
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: 1,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let loaded =
+            <TraceFrameState as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "b")
+                .expect("ref local should load with guard");
+        assert_eq!(loaded, local);
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 1);
+        assert_eq!(recorder.last_op().map(|op| op.opcode), Some(OpCode::GuardNonnull));
+    }
+
+    #[test]
+    fn test_trace_dynamic_list_index_typed_int_skips_object_unbox() {
+        let mut ctx = TraceCtx::for_test(2);
+        let key = OpRef(0);
+        let len = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![key];
+        sym.symbolic_local_types = vec![Type::Int];
+        sym.nlocals = 1;
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: 1,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let raw_index = state.with_ctx(|this, ctx| this.trace_dynamic_list_index(ctx, key, len, 2));
+        assert_eq!(raw_index, key);
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_ops(), 4);
+        assert_eq!(recorder.num_guards(), 2);
+    }
+
+    #[test]
+    fn test_trace_binary_value_boxes_typed_raw_operands_for_python_helper() {
+        let mut ctx = TraceCtx::for_test(2);
+        let lhs = OpRef(0);
+        let rhs = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![lhs, rhs];
+        sym.symbolic_local_types = vec![Type::Float, Type::Int];
+        sym.nlocals = 2;
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: 1,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let _ = <TraceFrameState as TraceHelperAccess>::trace_binary_value(
+            &mut state,
+            lhs,
+            rhs,
+            BinaryOperator::Power,
+        )
+        .expect("generic helper call should box raw operands first");
+
+        let recorder = ctx.into_recorder();
+        let call = recorder.last_op().expect("call op should be present");
+        assert_eq!(call.opcode, OpCode::CallI);
+        assert_ne!(call.args[0], lhs);
+        assert_ne!(call.args[1], rhs);
+    }
+
+    #[test]
+    fn test_trace_known_builtin_call_boxes_typed_raw_args_for_python_helper_boundary() {
+        let mut ctx = TraceCtx::for_test(2);
+        let callable = OpRef(0);
+        let arg = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![callable, arg];
+        sym.symbolic_local_types = vec![Type::Ref, Type::Int];
+        sym.nlocals = 2;
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: 1,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let _ = state
+            .trace_known_builtin_call(callable, &[arg])
+            .expect("known builtin helper boundary should box raw int args");
+
+        let recorder = ctx.into_recorder();
+        let call = recorder.last_op().expect("call op should be present");
+        assert!(matches!(
+            call.opcode,
+            OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
+        ));
+        assert_ne!(call.args.last().copied(), Some(arg));
+    }
+
+    #[test]
+    fn test_direct_len_value_returns_typed_raw_len_for_integer_list() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("len(x)").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+        }
+        let arg_idx = frame.stack_base() + 2;
+        frame.locals_cells_stack_w[arg_idx] = list;
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(2);
+        let value = OpRef(0);
+        let callable = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![value, callable];
+        sym.symbolic_local_types = vec![Type::Ref, Type::Ref];
+        sym.nlocals = 2;
+        sym.valuestackdepth = frame.stack_base();
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let len = state
+            .direct_len_value(callable, value)
+            .expect("integer-list len fast path should trace");
+        assert!(
+            state.sym().transient_value_types.contains_key(&len),
+            "len fast path should remember the typed raw result"
+        );
+        let len_type = state.value_type(len);
+
+        let recorder = ctx.into_recorder();
+        assert_ne!(
+            recorder.last_op().map(|op| op.opcode),
+            Some(OpCode::CallI),
+            "len(list) should not fall back to the builtin helper call path"
+        );
+        let mut saw_len_field = false;
+        let mut saw_new = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if op.opcode == OpCode::New {
+                saw_new = true;
+            }
+            if op.opcode == OpCode::GetfieldGcI
+                && op.descr.as_ref().map(|d| d.index()) == Some(list_int_items_len_descr().index())
+            {
+                saw_len_field = true;
+            }
+        }
+        assert_eq!(len_type, Type::Int);
+        assert!(saw_len_field, "list len fast path should read the integer-list length field");
+        assert!(!saw_new, "len(list) should not allocate a W_Int box in the trace");
+    }
+
+    #[test]
+    fn test_trace_direct_float_list_getitem_uses_gc_field_loads_for_list_object() {
+        let mut ctx = TraceCtx::for_test(2);
+        let list = OpRef(0);
+        let key = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![list, key];
+        sym.symbolic_local_types = vec![Type::Ref, Type::Int];
+        sym.nlocals = 2;
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: 1,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let result = state.with_ctx(|this, ctx| this.trace_direct_float_list_getitem(ctx, list, key, 2));
+        assert_eq!(state.value_type(result), Type::Float);
+
+        let recorder = ctx.into_recorder();
+        let mut saw_gc_field = false;
+        let mut saw_raw_field = false;
+        let mut saw_raw_array = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            match op.opcode {
+                OpCode::GetfieldGcI => saw_gc_field = true,
+                OpCode::GetfieldRawI => saw_raw_field = true,
+                OpCode::GetarrayitemRawF => saw_raw_array = true,
+                _ => {}
+            }
+        }
+        assert!(saw_gc_field, "list object fields should use GetfieldGcI");
+        assert!(
+            !saw_raw_field,
+            "float-list fast path should not use raw field loads on GC list objects"
+        );
+        assert!(saw_raw_array, "payload array access stays raw");
+    }
+
+    #[test]
+    fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+        use pyre_object::w_range_iter_new;
+
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        frame.push(w_range_iter_new(0, 2, 1));
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(1);
+        let iter = OpRef(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_stack = vec![iter];
+        sym.symbolic_stack_types = vec![Type::Ref];
+        sym.valuestackdepth = 1;
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let next = TraceFrameState::iter_next_value(&mut state, iter)
+            .expect("range iterator fast path should trace");
+        assert_eq!(state.value_type(next), Type::Int);
+        <TraceFrameState as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
+            .expect("typed range next should not need optional guard");
+
+        let recorder = ctx.into_recorder();
+        let mut saw_getfield_gc = false;
+        let mut saw_setfield_gc = false;
+        let mut saw_setfield_raw = false;
+        let mut saw_getfield_raw = false;
+        let mut saw_new = false;
+        let mut saw_optional_guard = false;
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            match op.opcode {
+                OpCode::GetfieldGcI => saw_getfield_gc = true,
+                OpCode::SetfieldGc => saw_setfield_gc = true,
+                OpCode::SetfieldRaw => saw_setfield_raw = true,
+                OpCode::GetfieldRawI => saw_getfield_raw = true,
+                OpCode::New => saw_new = true,
+                OpCode::GuardNonnull | OpCode::GuardIsnull => saw_optional_guard = true,
+                _ => {}
+            }
+        }
+        assert!(saw_getfield_gc, "range iterator fields should use GetfieldGcI");
+        assert!(saw_setfield_gc, "range iterator current update should use SetfieldGc");
+        assert!(
+            !saw_setfield_raw,
+            "range iterator fast path should not use raw stores on GC iterator objects"
+        );
+        assert!(
+            !saw_getfield_raw,
+            "range iterator fast path should not use raw field loads on GC iterator objects"
+        );
+        assert!(!saw_new, "range iterator fast path should not box the yielded int");
+        assert!(
+            !saw_optional_guard,
+            "raw-int range iteration should not emit optional-value guards"
+        );
+    }
 }
 
 // ── Virtualizable configuration ──────────────────────────────────────
@@ -4981,7 +5229,7 @@ fn execute_inline_residual_call(
 fn inline_trace_and_execute(
     ctx: &mut majit_meta::TraceCtx,
     pending: PendingInlineFrame,
-) -> Result<(OpRef, PyObjectRef), pyre_runtime::PyError> {
+) -> Result<(OpRef, Type, PyObjectRef), pyre_runtime::PyError> {
     use pyre_runtime::StepResult;
     let _inline_call_override = pyre_interp::call::inline_call_override_guard();
     let mut framestack: Vec<MIFrame> = vec![MIFrame {
@@ -5088,6 +5336,12 @@ fn inline_trace_and_execute(
                     StepResult::Return(concrete_result) => {
                         // popframe()
                         let popped = framestack.pop().unwrap();
+                        let result_type = popped.sym.value_type_of(result_opref);
+                        let concrete_result =
+                            materialize_pending_inline_result(pending_inline_result_from_concrete(
+                                result_type,
+                                concrete_result,
+                            ));
 
                         // Drop callee frame in trace
                         if let Some(frame_opref) = popped.drop_frame_opref {
@@ -5102,7 +5356,7 @@ fn inline_trace_and_execute(
                             if majit_meta::majit_log_enabled() {
                                 eprintln!("[jit][inline] return outermost");
                             }
-                            return Ok((result_opref, concrete_result));
+                            return Ok((result_opref, result_type, concrete_result));
                         }
 
                         let (driver, _) = crate::eval::driver_pair();
@@ -5125,6 +5379,17 @@ fn inline_trace_and_execute(
                             .get_mut(result_idx)
                             .expect("inline caller result slot out of bounds");
                         *slot = result_opref;
+                        if result_idx >= parent.sym.symbolic_stack_types.len() {
+                            parent
+                                .sym
+                                .symbolic_stack_types
+                                .resize(result_idx + 1, Type::Ref);
+                        }
+                        parent.sym.symbolic_stack_types[result_idx] = result_type;
+                        parent
+                            .sym
+                            .transient_value_types
+                            .insert(result_opref, result_type);
                         parent.concrete_frame.push(concrete_result);
                         continue; // ChangeFrame: resume parent
                     }
