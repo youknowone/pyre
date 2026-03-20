@@ -167,6 +167,40 @@ impl OptHeap {
     /// heap.py: force_lazy_set — emit lazy setfields.
     /// If any lazy setfield argument references the postponed_op,
     /// emit the postponed_op first (RPython heap.py exact logic).
+    /// Emit a lazy setfield, resolving forwarding and skipping if the
+    /// value points to an undefined position (intermediate forwarding
+    /// from force_virtual outside pass chain). RPython resolves this
+    /// via in-place Box forwarding; majit needs explicit check.
+    /// RPython heap.py:force_lazy_set → emit_extra(op, emit=False).
+    /// Resolves forwarding and forces virtual values if needed.
+    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext) -> bool {
+        for arg in op.args.iter_mut() {
+            *arg = ctx.get_replacement(*arg);
+        }
+        let val = op.arg(1);
+        // If value points to a position not in output, check if it's virtual
+        // and force it. RPython's emit_extra resolves this via Box forwarding.
+        if !val.is_none()
+            && val.0 >= ctx.num_inputs() as u32
+            && val.0 < 10_000
+            && !ctx.new_operations.iter().any(|o| o.pos == val)
+        {
+            // Try to force the virtual value directly
+            if let Some(info) = ctx.get_ptr_info(val).cloned() {
+                if info.is_virtual() {
+                    let mut info_mut = info;
+                    let forced = info_mut.force_to_ops(val, ctx);
+                    op.args[1] = forced;
+                    ctx.emit(op.clone());
+                    return true;
+                }
+            }
+            return false; // truly undefined — skip
+        }
+        ctx.emit(op.clone());
+        true
+    }
+
     fn force_all_lazy_setfields(&mut self, ctx: &mut OptContext) {
         // heap.py: check if any lazy set references the postponed op
         if let Some(ref postponed) = self.postponed_op {
@@ -476,7 +510,7 @@ impl OptHeap {
                     {
                         // Value points to undrained force position — skip
                     } else {
-                        ctx.emit(lazy_op);
+                        Self::emit_lazy_setfield(&mut lazy_op, ctx);
                     }
                 }
             }
@@ -492,7 +526,7 @@ impl OptHeap {
                     {
                         // Value points to undrained force position — skip
                     } else {
-                        ctx.emit(lazy_op);
+                        Self::emit_lazy_setfield(&mut lazy_op, ctx);
                     }
                 }
                 if !self.immutable_field_descrs.contains(&descr_idx) {
@@ -505,13 +539,13 @@ impl OptHeap {
         let array_keys: Vec<(OpRef, u32, i64)> = self.cached_arrayitems.keys().copied().collect();
         for (obj, descr_idx, index) in array_keys {
             if ei.check_readonly_descr_array(descr_idx) {
-                if let Some(lazy_op) = self.lazy_setarrayitems.remove(&(obj, descr_idx, index)) {
-                    ctx.emit(lazy_op);
+                if let Some(mut lazy_op) = self.lazy_setarrayitems.remove(&(obj, descr_idx, index)) {
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx);
                 }
             }
             if ei.check_write_descr_array(descr_idx) {
-                if let Some(lazy_op) = self.lazy_setarrayitems.remove(&(obj, descr_idx, index)) {
-                    ctx.emit(lazy_op);
+                if let Some(mut lazy_op) = self.lazy_setarrayitems.remove(&(obj, descr_idx, index)) {
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx);
                 }
                 self.cached_arrayitems.remove(&(obj, descr_idx, index));
             }
