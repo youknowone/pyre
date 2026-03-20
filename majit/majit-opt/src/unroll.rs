@@ -156,10 +156,10 @@ impl UnrollOptimizer {
             Some(c) => crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone()),
             None => crate::optimizer::Optimizer::default_pipeline(),
         };
-        // RPython unroll.py optimize_preamble(): propagate_all_forward(..., flush=False)
-        // Keep phase 1 in the same mode so pending optimizer state is exported
-        // before final lazy-set flushing mutates the loop boundary shape.
-        opt_p1.skip_flush = true;
+        // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
+        // that only skips the final cleanup flush — JUMP-time force_all_lazy
+        // still runs. In majit skip_flush also prevents JUMP lazy_set emit
+        // which breaks force_virtual.
         let p1_ops = opt_p1.optimize_with_constants_and_inputs(ops, &mut consts_p1, num_inputs);
         let p1_ni = opt_p1.final_num_inputs();
         let jump_virtuals = std::mem::take(&mut opt_p1.exported_jump_virtuals);
@@ -354,17 +354,12 @@ impl UnrollOptimizer {
         // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
         let mut body_ops = p2_ops;
         let mut redirected_tail_ops = Vec::new();
-        let body_jump_args = p2_exported
-            .as_ref()
-            .map(|state| state.end_args.clone())
-            .or_else(|| {
-                body_ops
-                    .iter()
-                    .rfind(|o| o.opcode == OpCode::Jump)
-                    .map(|j| j.args.to_vec())
-            })
-            .unwrap_or_default();
         let jump_to_self = {
+            let body_jump_args: Vec<OpRef> = body_ops
+                .iter()
+                .rfind(|o| o.opcode == OpCode::Jump)
+                .map(|j| j.args.to_vec())
+                .unwrap_or_default();
             let opt_unroll = OptUnroll::new();
             let mut jump_ctx = crate::OptContext::with_num_inputs(32, body_num_inputs);
             let mut jumped = opt_unroll
@@ -414,11 +409,7 @@ impl UnrollOptimizer {
                 .first()
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
-            body_ops = if body_ops.iter().any(|op| op.opcode == OpCode::Jump) {
-                Self::jump_to_preamble(&body_ops, &preamble_target)
-            } else {
-                append_jump_to_target(&body_ops, &body_jump_args, &preamble_target)
-            };
+            body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!("[jit] jump_to_preamble: body JUMP retargeted to start descr");
             }
@@ -1917,14 +1908,6 @@ fn splice_redirected_tail(body_ops: &[Op], redirected_tail_ops: &[Op]) -> Vec<Op
         .unwrap_or(body_ops.len());
     result.extend_from_slice(&body_ops[..split_idx]);
     result.extend_from_slice(redirected_tail_ops);
-    result
-}
-
-fn append_jump_to_target(body_ops: &[Op], jump_args: &[OpRef], target: &TargetToken) -> Vec<Op> {
-    let mut result = body_ops.to_vec();
-    let mut jump = Op::new(OpCode::Jump, jump_args);
-    jump.descr = Some(target.as_jump_target_descr());
-    result.push(jump);
     result
 }
 
