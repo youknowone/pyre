@@ -19,26 +19,11 @@ use pyre_runtime::{
 
 use pyre_interp::frame::PyFrame;
 
-// ── Force cache (memoization for recursive force results) ────────
-//
-// PyPy doesn't need this (compiled code dispatches directly), but
-// our force_fn path benefits from caching intermediate fib results.
-// Our helper-based recursive path behaves much closer to PyPy if the
-// memo table stops evicting nearby small-int fib arguments. `fib(35)`
-// only touches 36 distinct integer inputs, so 256 slots removes the
-// direct-mapped wraparound collisions we hit with 64.
-const FORCE_CACHE_SIZE: usize = 256;
-//
-// Keep raw-int and boxed-object results in separate caches. Mixing them
-// corrupts recursive calls because:
-// - CallMayForce helper paths expect BOXED PyObjectRef results
-// - execute_call_assembler_direct / bridge fallback paths expect RAW i64
-//
-// Sharing one cache lets a raw result be reused as if it were a boxed
-// pointer, which is exactly the failure mode seen in recursive fib.
-static mut FORCE_CACHE_BOXED: [(usize, usize, i64); FORCE_CACHE_SIZE] =
-    [(0, 0, 0); FORCE_CACHE_SIZE];
-static mut FORCE_CACHE_RAW: [(usize, usize, i64); FORCE_CACHE_SIZE] = [(0, 0, 0); FORCE_CACHE_SIZE];
+// RPython/PyPy's call_assembler path does not memoize recursive helper
+// results in a side cache. Keep the plumbing sites in place, but make the
+// cache a no-op so boxed results do not escape the GC's root graph through
+// ad-hoc global storage.
+const FORCE_CACHE_SIZE: usize = 1;
 
 thread_local! {
     static RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, FinishProtocol, Option<u64>, bool)>> =
@@ -198,13 +183,14 @@ pub fn maybe_handle_inline_concrete_call(
 
     let raw_arg = unsafe { w_int_get_value(arg0) };
     let code_ptr = unsafe { w_func_get_code_ptr(callable) };
-    let green_key = code_ptr as u64;
+    let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     // Inline concrete execution sometimes falls back to a helper-boundary
     // recursive call instead of a real frame switch. That helper must run as
     // plain concrete execution: if it reuses the outer inline override or the
     // outer trace's merge-point path, it will keep tracing against the wrong
     // symbolic frame and corrupt concrete stack reads.
     let _suspend_inline_override = pyre_interp::call::suspend_inline_call_override();
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let _jit_depth = crate::eval::jit_call_depth_bump();
     let forced = if code_ptr == frame.code as *const () {
         jit_force_self_recursive_call_raw_1(frame as *const PyFrame as i64, raw_arg)
@@ -270,42 +256,22 @@ fn self_recursive_dispatch(green_key: u64) -> (FinishProtocol, Option<u64>) {
 
 #[inline]
 fn force_cache_lookup(
-    protocol: FinishProtocol,
-    hash_idx: usize,
-    code_key: usize,
-    arg_key: usize,
+    _protocol: FinishProtocol,
+    _hash_idx: usize,
+    _code_key: usize,
+    _arg_key: usize,
 ) -> Option<i64> {
-    unsafe {
-        let entry = match protocol {
-            FinishProtocol::RawInt => &FORCE_CACHE_RAW[hash_idx],
-            FinishProtocol::Boxed => &FORCE_CACHE_BOXED[hash_idx],
-        };
-        if entry.0 == code_key && entry.1 == arg_key {
-            Some(entry.2)
-        } else {
-            None
-        }
-    }
+    None
 }
 
 #[inline]
 fn force_cache_store(
-    protocol: FinishProtocol,
-    hash_idx: usize,
-    code_key: usize,
-    arg_key: usize,
-    value: i64,
+    _protocol: FinishProtocol,
+    _hash_idx: usize,
+    _code_key: usize,
+    _arg_key: usize,
+    _value: i64,
 ) {
-    unsafe {
-        match protocol {
-            FinishProtocol::RawInt => {
-                FORCE_CACHE_RAW[hash_idx] = (code_key, arg_key, value);
-            }
-            FinishProtocol::Boxed => {
-                FORCE_CACHE_BOXED[hash_idx] = (code_key, arg_key, value);
-            }
-        }
-    }
 }
 
 #[inline]
@@ -413,10 +379,11 @@ extern "C" fn jit_call_user_function_from_frame(
 }
 
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
-    let green_key = frame.code as u64;
+    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
     let arg_key = if frame.locals_cells_stack_w.len() > 0 {
         force_cache_arg_key(frame.locals_cells_stack_w[0])
@@ -475,10 +442,11 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 }
 
 fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
-    let green_key = frame.code as u64;
+    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
     let arg_key = if frame.locals_cells_stack_w.len() > 0 {
         force_cache_arg_key(frame.locals_cells_stack_w[0])
@@ -536,10 +504,11 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
 /// Interpreter-only force: used by execute_call_assembler_direct
 /// to handle guard failures without recursive compiled dispatch.
 extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
-    let green_key = frame.code as u64;
+    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
     let arg_key = if frame.locals_cells_stack_w.len() > 0 {
         force_cache_arg_key(frame.locals_cells_stack_w[0])
@@ -573,8 +542,9 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
 /// Used by the fused raw-int recursive helper, which already maintains
 /// its own outer force cache keyed by (callee code, raw arg).
 extern "C" fn jit_force_callee_frame_interp_nocache(frame_ptr: i64) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let green_key = frame.code as u64;
+    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
 
     match pyre_interp::eval::eval_loop_for_force(frame) {
@@ -595,26 +565,9 @@ pub extern "C" fn jit_force_recursive_call_1(
     callable: i64,
     boxed_arg: i64,
 ) -> i64 {
-    let callable_ref = callable as PyObjectRef;
-    let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
-    let code_key = code_ptr as usize;
-    let arg_key = force_cache_arg_key(boxed_arg as PyObjectRef);
-
-    let hash_idx = force_cache_index(code_key, arg_key);
-    unsafe {
-        let entry = &FORCE_CACHE_BOXED[hash_idx];
-        if entry.0 == code_key && entry.1 == arg_key {
-            return entry.2;
-        }
-    }
-
     let frame_ptr = create_callee_frame_impl(caller_frame, callable, &[boxed_arg as PyObjectRef]);
     let result = jit_force_callee_frame(frame_ptr);
     jit_drop_callee_frame(frame_ptr);
-
-    unsafe {
-        FORCE_CACHE_BOXED[hash_idx] = (code_key, arg_key, result);
-    }
     result
 }
 
@@ -630,9 +583,10 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     callable: i64,
     raw_int_arg: i64,
 ) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
     let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
-    let green_key = code_ptr as u64;
+    let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     let code_key = code_ptr as usize;
     let (protocol, token_num, memo_safe) = recursive_dispatch(callable_ref, green_key);
     let arg_key = ((raw_int_arg as usize) << 1) | 1;
@@ -739,11 +693,12 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// path re-enters the same frame shape instead of dispatching through an
 /// additional callable metadata layer.
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let code_ptr = caller.code;
-    let green_key = code_ptr as u64;
+    let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     let code_key = code_ptr as usize;
-    let (protocol, _token_num) = self_recursive_dispatch(green_key);
+    let (protocol, token_num) = self_recursive_dispatch(green_key);
     let arg_key = ((raw_int_arg as usize) << 1) | 1;
 
     let hash_idx = force_cache_index(code_key, arg_key);
@@ -755,19 +710,57 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        // RPython assembler_call_helper: try compiled code first, fall
-        // back to interpreter. eval_with_jit matches this — it calls
-        // try_function_entry_jit (compiled dispatch) then eval_loop_jit.
-        let _recursive_entry = crate::eval::recursive_force_entry_bump();
-        match crate::eval::eval_with_jit(frame) {
-            Ok(result) => match protocol {
-                FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-                    w_int_get_value(result)
+        if let Some(token_num) = token_num {
+            let direct = if frame.next_instr == 0 && frame.valuestackdepth == 1 && frame.nlocals() == 1
+            {
+                let inputs = [frame_ptr, 0, 1, boxed as i64];
+                majit_codegen_cranelift::execute_call_assembler_direct(
+                    token_num,
+                    &inputs,
+                    jit_force_callee_frame_interp_nocache,
+                )
+            } else {
+                let nlocals = unsafe { (&*frame.code).varnames.len() };
+                let mut inputs = vec![frame_ptr, frame.next_instr as i64, frame.valuestackdepth as i64];
+                for i in 0..nlocals {
+                    inputs.push(frame.locals_cells_stack_w[i] as i64);
+                }
+                majit_codegen_cranelift::execute_call_assembler_direct(
+                    token_num,
+                    &inputs,
+                    jit_force_callee_frame_interp_nocache,
+                )
+            };
+            if let Some(raw) = direct {
+                match protocol {
+                    FinishProtocol::RawInt => raw,
+                    FinishProtocol::Boxed => w_int_new(raw) as i64,
+                }
+            } else {
+                let _recursive_entry = crate::eval::recursive_force_entry_bump();
+                match crate::eval::eval_with_jit(frame) {
+                    Ok(result) => match protocol {
+                        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
+                            w_int_get_value(result)
+                        },
+                        FinishProtocol::RawInt => result as i64,
+                        FinishProtocol::Boxed => result as i64,
+                    },
+                    Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
+                }
+            }
+        } else {
+            let _recursive_entry = crate::eval::recursive_force_entry_bump();
+            match crate::eval::eval_with_jit(frame) {
+                Ok(result) => match protocol {
+                    FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
+                        w_int_get_value(result)
+                    },
+                    FinishProtocol::RawInt => result as i64,
+                    FinishProtocol::Boxed => result as i64,
                 },
-                FinishProtocol::RawInt => result as i64,
-                FinishProtocol::Boxed => result as i64,
-            },
-            Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
+                Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
+            }
         }
     };
     jit_drop_callee_frame(frame_ptr);
@@ -790,6 +783,7 @@ extern "C" fn jit_bridge_compile_callee(
     trace_id: u64,
     green_key: u64,
 ) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
     use std::collections::HashMap;
 
