@@ -25,7 +25,7 @@ pub mod virtualstate;
 pub mod vstring;
 pub mod walkvirtual;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::intutils::IntBound;
 use info::PtrInfo;
@@ -67,6 +67,13 @@ pub struct ImportedShortPureOp {
 pub struct ImportedShortAlias {
     pub result: OpRef,
     pub same_as_source: OpRef,
+    pub same_as_opcode: OpCode,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportedShortSource {
+    pub result: OpRef,
+    pub source: OpRef,
 }
 
 /// Context provided to optimization passes.
@@ -117,9 +124,19 @@ pub struct OptContext {
     /// short boxes. Phase 2 can later re-materialize these aliases when
     /// building the short preamble for bridges.
     pub imported_short_aliases: Vec<ImportedShortAlias>,
+    /// Original preamble result box for each imported short-box result.
+    /// This preserves RPython PreambleOp.op identity so phase 2 assembly
+    /// can remap any surviving synthetic imported boxes back to the
+    /// corresponding preamble value.
+    pub imported_short_sources: Vec<ImportedShortSource>,
     /// RPython shortpreamble.py / rewrite.py: imported CALL_LOOPINVARIANT
     /// results keyed by constant function pointer.
     pub imported_loop_invariant_results: HashMap<i64, OpRef>,
+    /// RPython shortpreamble.py: active phase-2 short preamble builder.
+    /// Tracks which imported short facts are actually consumed by the body.
+    pub imported_short_preamble_builder: Option<crate::shortpreamble::ShortPreambleBuilder>,
+    /// Dedup imported short fact uses so the builder stays in first-use order.
+    imported_short_preamble_used: HashSet<OpRef>,
     /// RPython unroll.py: virtual structures at JUMP for preamble peeling.
     pub exported_jump_virtuals: Vec<crate::optimizer::ExportedJumpVirtual>,
     /// RPython shortpreamble.py: pass-collected preamble producers aligned to
@@ -131,6 +148,10 @@ pub struct OptContext {
     /// RPython optimizer.py: `patchguardop` — the last GUARD_FUTURE_CONDITION op.
     /// Used by unroll to attach resume data to extra guards from short preamble.
     pub patchguardop: Option<Op>,
+    /// RPython unroll.py:454-457: virtual state captured BEFORE force at JUMP.
+    /// Used by export_state to produce a VirtualState that includes virtuals
+    /// (which are forced by the time exported_loop_state is computed).
+    pub pre_force_virtual_state: Option<crate::virtualstate::VirtualState>,
 }
 
 impl OptContext {
@@ -149,11 +170,15 @@ impl OptContext {
             imported_short_arrayitems: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
+            imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
+            imported_short_preamble_builder: None,
+            imported_short_preamble_used: HashSet::new(),
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             patchguardop: None,
+            pre_force_virtual_state: None,
         }
     }
 
@@ -172,11 +197,15 @@ impl OptContext {
             imported_short_arrayitems: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
+            imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
+            imported_short_preamble_builder: None,
+            imported_short_preamble_used: HashSet::new(),
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             patchguardop: None,
+            pre_force_virtual_state: None,
         }
     }
 
@@ -231,6 +260,65 @@ impl OptContext {
         let pos_ref = op.pos;
         self.extra_operations.push_back(op);
         pos_ref
+    }
+
+    pub fn initialize_imported_short_preamble_builder(
+        &mut self,
+        label_args: &[OpRef],
+        exported_short_boxes: &[crate::shortpreamble::PreambleOp],
+    ) {
+        let produced: Vec<(OpRef, crate::shortpreamble::ProducedShortOp)> = exported_short_boxes
+            .iter()
+            .map(|entry| {
+                (
+                    entry.op.pos,
+                    crate::shortpreamble::ProducedShortOp {
+                        kind: entry.kind.clone(),
+                        preamble_op: entry.op.clone(),
+                        invented_name: entry.invented_name,
+                        same_as_source: entry.same_as_source,
+                    },
+                )
+            })
+            .collect();
+        self.imported_short_preamble_builder = Some(crate::shortpreamble::ShortPreambleBuilder::new(
+            label_args,
+            &produced,
+            label_args,
+        ));
+        self.imported_short_preamble_used.clear();
+    }
+
+    pub fn note_imported_short_use(&mut self, result: OpRef) {
+        if !self.imported_short_preamble_used.insert(result) {
+            return;
+        }
+        if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+            let _ = builder.use_box(result);
+        }
+    }
+
+    pub fn build_imported_short_preamble(&self) -> Option<crate::shortpreamble::ShortPreamble> {
+        self.imported_short_preamble_builder
+            .as_ref()
+            .map(|builder| builder.build_short_preamble_struct())
+    }
+
+    pub fn used_imported_short_aliases(&self) -> Vec<ImportedShortAlias> {
+        self.imported_short_preamble_builder
+            .as_ref()
+            .map(|builder| {
+                builder
+                    .extra_same_as()
+                    .iter()
+                    .map(|op| ImportedShortAlias {
+                        result: op.pos,
+                        same_as_source: op.arg(0),
+                        same_as_opcode: op.opcode,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn pop_extra_operation(&mut self) -> Option<Op> {

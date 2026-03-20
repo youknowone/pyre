@@ -1843,6 +1843,20 @@ impl Optimization for OptVirtualize {
                         self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                     }
                 }
+                // RPython unroll.py:454-457: capture virtual state BEFORE force.
+                // This is what export_state sees — virtuals are still alive here.
+                let pre_force_args: Vec<OpRef> = jump_op
+                    .args
+                    .iter()
+                    .map(|a| ctx.get_replacement(*a))
+                    .collect();
+                let pre_force_vs = crate::virtualstate::export_state(
+                    &pre_force_args,
+                    ctx,
+                    &ctx.ptr_info,
+                );
+                ctx.pre_force_virtual_state = Some(pre_force_vs);
+
                 self.optimize_escaping_op(&jump_op, ctx)
             }
 
