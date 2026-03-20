@@ -211,42 +211,74 @@ impl UnrollOptimizer {
             return (p1_ops, p1_ni);
         }
 
-        // ── export_state (unroll.py:452-477) ──
-        let p1_jump = match p1_ops.iter().rfind(|op| op.opcode == OpCode::Jump) {
-            Some(j) => j.clone(),
-            None => { *constants = consts_p1; return (p1_ops, p1_ni); }
+        // ── Phase 2 input trace: reconstruct virtuals for the peeled body ──
+        //
+        // RPython import_state/_generate_virtual keeps the loop header in the
+        // non-virtual box namespace and recreates virtual structure for the
+        // peeled iteration. The closest representation we have today is a body
+        // trace with explicit New+SetfieldGc reconstruction ops at entry.
+        let Some((body_trace, body_num_inputs)) =
+            build_body_trace_with_virtual_import(ops, &jump_virtuals, num_inputs)
+        else {
+            *constants = consts_p1;
+            let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
+            if !sp.is_empty() {
+                self.short_preamble = Some(sp);
+            }
+            return (p1_ops, p1_ni);
         };
-        let label_args = export_flatten_jump_args(&p1_ops, &p1_jump, &jump_virtuals);
-        let body_num_inputs = label_args.len();
+        let mut consts_p2 = consts_p1.clone();
 
         if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!("[jit] preamble peeling: {} virtual(s), label_args={}", jump_virtuals.len(), body_num_inputs);
+            eprintln!(
+                "[jit] preamble peeling: {} virtual(s), body_num_inputs={}",
+                jump_virtuals.len(),
+                body_num_inputs
+            );
         }
-
-        // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
-        let imported = build_imported_virtuals(&jump_virtuals);
-        let (remapped_ops, mut consts_p2) =
-            remap_trace_for_body(ops, &consts_p1, num_inputs, body_num_inputs);
 
         let mut opt_p2 = match vable_config.as_ref() {
             Some(c) => crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone()),
             None => crate::optimizer::Optimizer::default_pipeline(),
         };
-        opt_p2.imported_virtuals = imported;
         opt_p2.set_flatten_virtuals_at_jump(true);
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            let gc_before = body_trace.iter().filter(|o| o.opcode.is_guard()).count();
+            eprintln!(
+                "[jit] phase 2 input: {} ops, {} guards, body_num_inputs={}",
+                body_trace.len(),
+                gc_before,
+                body_num_inputs
+            );
+            for (&k, &v) in &consts_p2 {
+                if (k as usize) < body_num_inputs + 10 {
+                    eprintln!("[jit] phase 2 const: v{} = {}", k, v);
+                }
+            }
+        }
         let p2_ops = opt_p2.optimize_with_constants_and_inputs(
-            &remapped_ops, &mut consts_p2, body_num_inputs,
+            &body_trace, &mut consts_p2, body_num_inputs,
         );
         let p2_ni = opt_p2.final_num_inputs();
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let nc = p2_ops.iter()
                 .filter(|o| o.opcode == OpCode::New || o.opcode == OpCode::NewWithVtable).count();
-            eprintln!("[jit] phase 2: {} ops, {} New remaining", p2_ops.len(), nc);
+            let gc = p2_ops.iter()
+                .filter(|o| o.opcode.is_guard()).count();
+            eprintln!("[jit] phase 2: {} ops, {} New, {} guards", p2_ops.len(), nc, gc);
+            // Log constants that overlap with field inputargs
+            let field_start = num_inputs;
+            let field_end = body_num_inputs;
+            for i in field_start..field_end {
+                if let Some(&v) = consts_p2.get(&(i as u32)) {
+                    eprintln!("[jit] phase 2: CONST at field inputarg {} = {}", i, v);
+                }
+            }
         }
 
         // ── Assembly (compile.py:310-338) ──
-        let combined = assemble_peeled_trace(&p1_ops, &p2_ops, &label_args, p2_ni);
+        let combined = combine_preamble_and_body(&p1_ops, &p2_ops, p1_ni, p2_ni, &jump_virtuals);
         *constants = consts_p2;
         let sp = crate::shortpreamble::extract_short_preamble(&combined);
         if !sp.is_empty() { self.short_preamble = Some(sp); }
