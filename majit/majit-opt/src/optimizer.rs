@@ -260,12 +260,33 @@ impl Optimizer {
     }
 
     fn install_imported_virtuals(&self, ctx: &mut OptContext) {
+        // Track label arg positions for non-constant virtual fields.
+        // The flatten skips constants, so non-constant fields map to
+        // consecutive label positions starting after the virtual's position.
+        let mut label_slot = 0usize;
+        for iv in &self.imported_virtuals {
+            // Count non-virtual inputargs before this virtual
+            label_slot = iv.inputarg_index;
+        }
         for iv in &self.imported_virtuals {
             let virtual_head = ctx.get_replacement(OpRef(iv.inputarg_index as u32));
             let mut fields = Vec::new();
             let mut field_descrs = Vec::new();
             for (descr, field_info) in &iv.fields {
-                let field_ref = Self::import_virtual_state_value(field_info, ctx);
+                use crate::virtualstate::VirtualStateInfo;
+                let field_ref = match field_info {
+                    VirtualStateInfo::Constant(_) => {
+                        // Constant fields don't occupy a label arg slot
+                        Self::import_virtual_state_value(field_info, ctx)
+                    }
+                    _ => {
+                        // Non-constant fields use the next label arg slot
+                        let slot_ref = OpRef(label_slot as u32);
+                        label_slot += 1;
+                        Self::apply_imported_virtual_state(field_info, slot_ref, ctx);
+                        slot_ref
+                    }
+                };
                 fields.push((descr.index(), field_ref));
                 field_descrs.push((descr.index(), descr.clone()));
             }
