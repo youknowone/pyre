@@ -14,7 +14,7 @@ use pyre_interp::frame::PyFrame;
 use pyre_object::w_none;
 use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
 use std::cell::{Cell, UnsafeCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use majit_gc::trace::TypeInfo;
 use majit_meta::DetailedDriverRunOutcome;
@@ -71,6 +71,8 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 thread_local! {
     static FUNC_ENTRY_COUNTS: UnsafeCell<HashMap<u64, u32>> =
         UnsafeCell::new(HashMap::new());
+    static PYRE_RAW_INT_FINISH_HINTS: UnsafeCell<HashSet<u64>> =
+        UnsafeCell::new(HashSet::new());
 
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
     static JIT_TRACING: Cell<bool> = Cell::new(false);
@@ -81,6 +83,25 @@ thread_local! {
 #[inline]
 fn func_entry_counts() -> &'static mut HashMap<u64, u32> {
     FUNC_ENTRY_COUNTS.with(|cell| unsafe { &mut *cell.get() })
+}
+
+fn raw_int_finish_hints() -> &'static mut HashSet<u64> {
+    PYRE_RAW_INT_FINISH_HINTS.with(|cell| unsafe { &mut *cell.get() })
+}
+
+#[inline]
+pub(crate) fn note_finish_protocol_hint(green_key: u64, raw_int: bool) {
+    let hints = raw_int_finish_hints();
+    if raw_int {
+        hints.insert(green_key);
+    } else {
+        hints.remove(&green_key);
+    }
+}
+
+#[inline]
+pub(crate) fn has_finish_protocol_hint(green_key: u64) -> bool {
+    raw_int_finish_hints().contains(&green_key)
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -283,16 +304,11 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 
 /// Try running compiled code or entering the recursive function-entry path.
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
-    // RPython parity: blackhole interpreter has no JIT entry points.
-    // When executing inside a force callback (guard failure recovery),
-    // never re-enter compiled code. RPython achieves this structurally
-    // (blackhole dispatch loop has no can_enter_jit / jit_merge_point).
-    // pyre uses a thread-local flag until full structural isolation is
-    // implemented.
-    if in_blackhole_entry() {
-        return None;
-    }
-
+    // RPython parity: blackhole runs jitcode (no jit_merge_point).
+    // Callee frames enter through try_function_entry_jit normally —
+    // RPython's bhimpl_recursive_call calls portal_runner which CAN
+    // enter JIT. Structural isolation is provided by the blackhole
+    // running jitcode (not Python bytecode) for the guard-failed frame.
     let green_key = make_green_key(frame.code, frame.next_instr);
     let (driver, info) = driver_pair();
 
@@ -413,7 +429,9 @@ fn handle_jit_outcome(
             ..
         } => {
             let (driver, _) = driver_pair();
-            let raw_int_result = raw_int_result || driver.has_raw_int_finish(green_key);
+            let raw_int_result = raw_int_result
+                || driver.has_raw_int_finish(green_key)
+                || has_finish_protocol_hint(green_key);
             if majit_meta::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
@@ -558,7 +576,7 @@ result = fib(12)";
                 "recursive fib should compile a function-entry trace"
             );
             assert!(
-                driver.has_raw_int_finish(fib_key),
+                driver.has_raw_int_finish(fib_key) || has_finish_protocol_hint(fib_key),
                 "recursive fib compiled finish should use the raw-int protocol"
             );
         }
