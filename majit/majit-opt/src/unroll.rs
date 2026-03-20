@@ -243,7 +243,9 @@ impl UnrollOptimizer {
                 );
                 self.target_tokens.push(tt);
             }
-            if !sp.is_empty() { self.short_preamble = Some(sp); }
+            if !sp.is_empty() {
+                self.short_preamble = Some(sp);
+            }
             return (p1_ops, p1_ni);
         }
 
@@ -268,7 +270,8 @@ impl UnrollOptimizer {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[jit] preamble peeling: {} virtual(s), exported label_args={}",
-                jump_virtuals.len(), exported_state.end_args.len(),
+                jump_virtuals.len(),
+                exported_state.end_args.len(),
             );
         }
 
@@ -287,17 +290,26 @@ impl UnrollOptimizer {
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
-            eprintln!("[jit] phase 2 input: {} ops, {} guards, body_ni={}", remapped_ops.len(), gc_before, body_num_inputs);
+            eprintln!(
+                "[jit] phase 2 input: {} ops, {} guards, body_ni={}",
+                remapped_ops.len(),
+                gc_before,
+                body_num_inputs
+            );
         }
 
         let p2_ops = opt_p2.optimize_with_constants_and_inputs(
-            &remapped_ops, &mut consts_p2, body_num_inputs,
+            &remapped_ops,
+            &mut consts_p2,
+            body_num_inputs,
         );
         let p2_ni = opt_p2.final_num_inputs();
 
         if std::env::var_os("MAJIT_LOG").is_some() {
-            let nc = p2_ops.iter()
-                .filter(|o| o.opcode == OpCode::New || o.opcode == OpCode::NewWithVtable).count();
+            let nc = p2_ops
+                .iter()
+                .filter(|o| o.opcode == OpCode::New || o.opcode == OpCode::NewWithVtable)
+                .count();
             let gc = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
             eprintln!(
                 "[jit] phase 2: {} ops, {} New, {} guards, p2_ni={}",
@@ -365,15 +377,12 @@ impl UnrollOptimizer {
         }
 
         // finalize_short_preamble: create TargetToken for this loop version
-        let initial_sp = opt_p2
-            .imported_short_preamble
-            .clone()
-            .unwrap_or_else(|| {
-                crate::shortpreamble::build_short_preamble_from_exported_boxes(
-                    &exported_state.end_args,
-                    &exported_state.exported_short_boxes,
-                )
-            });
+        let initial_sp = opt_p2.imported_short_preamble.clone().unwrap_or_else(|| {
+            crate::shortpreamble::build_short_preamble_from_exported_boxes(
+                &exported_state.end_args,
+                &exported_state.exported_short_boxes,
+            )
+        });
         let opt_unroll = OptUnroll::new();
         let target_token = opt_unroll.finalize_short_preamble(
             self.target_tokens.len() as u64,
@@ -403,7 +412,12 @@ impl UnrollOptimizer {
             let opt_unroll = OptUnroll::new();
             let mut jump_ctx = crate::OptContext::with_num_inputs(32, body_num_inputs);
             opt_unroll
-                .jump_to_existing_trace(&body_jump_args, &mut self.target_tokens, &mut jump_ctx)
+                .jump_to_existing_trace(
+                    &body_jump_args,
+                    &mut self.target_tokens,
+                    &mut opt_p2,
+                    &mut jump_ctx,
+                )
                 .is_none() // None = jumped successfully
         };
 
@@ -474,7 +488,6 @@ impl UnrollOptimizer {
     pub fn check_no_forwarding(ctx: &crate::OptContext, oprefs: &[OpRef]) -> bool {
         oprefs.iter().all(|&r| ctx.get_replacement(r) == r)
     }
-
 
     /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
     /// If the trace has too many guards, disable retracing for this location.
@@ -846,6 +859,7 @@ impl OptUnroll {
         &self,
         jump_args: &[OpRef],
         target_tokens: &mut [TargetToken],
+        optimizer: &mut crate::optimizer::Optimizer,
         ctx: &mut OptContext,
     ) -> Option<crate::virtualstate::VirtualState> {
         let virtual_state = crate::virtualstate::export_state(jump_args, ctx, &ctx.ptr_info);
@@ -864,13 +878,12 @@ impl OptUnroll {
             let extra_guards = target_vs.generate_guards(&virtual_state);
             for guard_req in &extra_guards {
                 if let Some(guard_op) = guard_req.to_op(&args) {
-                    ctx.emit(guard_op);
+                    optimizer.send_extra_operation(&guard_op, ctx);
                 }
             }
 
             // unroll.py:346-347: make_inputargs_and_virtuals
-            let (target_args, virtuals) =
-                target_vs.make_inputargs_and_virtuals(&args, ctx);
+            let (target_args, virtuals) = target_vs.make_inputargs_and_virtuals(&args, ctx);
             let mut short_jump_args = target_args.clone();
             short_jump_args.extend(virtuals);
 
@@ -886,6 +899,7 @@ impl OptUnroll {
                         &target_args,
                         &sp,
                         Some(builder),
+                        optimizer,
                         ctx,
                     );
                     target_token.short_preamble = Some(builder.build_short_preamble_struct());
@@ -895,6 +909,7 @@ impl OptUnroll {
                         &target_args,
                         &sp,
                         None,
+                        optimizer,
                         ctx,
                     );
                 }
@@ -904,7 +919,7 @@ impl OptUnroll {
             let mut jump_args = target_args;
             jump_args.extend(extra);
             let jump = Op::new(OpCode::Jump, &jump_args);
-            ctx.emit(jump);
+            optimizer.send_extra_operation(&jump, ctx);
             return None; // successfully jumped
         }
 
@@ -918,9 +933,12 @@ impl OptUnroll {
     /// each short preamble op with remapped arguments.
     pub fn inline_short_preamble(
         jump_args: &[OpRef],
-        _args_no_virtuals: &[OpRef],
+        args_no_virtuals: &[OpRef],
         short_preamble: &crate::shortpreamble::ShortPreamble,
-        mut short_preamble_producer: Option<&mut crate::shortpreamble::ExtendedShortPreambleBuilder>,
+        mut short_preamble_producer: Option<
+            &mut crate::shortpreamble::ExtendedShortPreambleBuilder,
+        >,
+        optimizer: &mut crate::optimizer::Optimizer,
         ctx: &mut OptContext,
     ) -> Vec<OpRef> {
         let mut mapping: HashMap<OpRef, OpRef> = HashMap::new();
@@ -962,7 +980,9 @@ impl OptUnroll {
                         }
                     }
                 }
-                let new_ref = ctx.emit(new_op.clone());
+                let new_ref = ctx.alloc_op_position();
+                new_op.pos = new_ref;
+                optimizer.send_extra_operation(&new_op, ctx);
                 mapping.insert(sp_op.op.pos, new_ref);
                 replay_index += 1;
             }
@@ -972,6 +992,14 @@ impl OptUnroll {
             };
             let old_len = active_short.ops.len();
             let old_jump_args = active_short.used_boxes.len();
+            let mapped_jump_args: Vec<OpRef> = active_short
+                .used_boxes
+                .iter()
+                .map(|used_box| *mapping.get(used_box).unwrap_or(used_box))
+                .collect();
+            for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
+                let _ = optimizer.force_box(arg, ctx);
+            }
             let current_used_boxes = active_short.used_boxes.clone();
             for used_box in current_used_boxes {
                 let _ = builder.use_box(used_box);
@@ -1038,39 +1066,38 @@ impl OptUnroll {
     ) -> ExportedValueInfo {
         let resolved = ctx.get_replacement(opref);
         let constant = ctx.get_constant(resolved).cloned();
-        let (ptr_kind, ptr_descr, known_class, array_lenbound, nonnull) = match ctx
-            .get_ptr_info(resolved)
-        {
-            Some(crate::info::PtrInfo::Instance(info)) => (
-                ExportedPtrKind::Instance,
-                info.descr.clone(),
-                info.known_class,
-                None,
-                true,
-            ),
-            Some(crate::info::PtrInfo::Struct(info)) => (
-                ExportedPtrKind::Struct,
-                Some(info.descr.clone()),
-                None,
-                None,
-                true,
-            ),
-            Some(crate::info::PtrInfo::Array(info)) => (
-                ExportedPtrKind::Array,
-                Some(info.descr.clone()),
-                None,
-                Some(info.lenbound.clone()),
-                true,
-            ),
-            Some(ptr) => (
-                ExportedPtrKind::None,
-                None,
-                ptr.get_known_class().copied(),
-                None,
-                ptr.is_nonnull(),
-            ),
-            None => (ExportedPtrKind::None, None, None, None, false),
-        };
+        let (ptr_kind, ptr_descr, known_class, array_lenbound, nonnull) =
+            match ctx.get_ptr_info(resolved) {
+                Some(crate::info::PtrInfo::Instance(info)) => (
+                    ExportedPtrKind::Instance,
+                    info.descr.clone(),
+                    info.known_class,
+                    None,
+                    true,
+                ),
+                Some(crate::info::PtrInfo::Struct(info)) => (
+                    ExportedPtrKind::Struct,
+                    Some(info.descr.clone()),
+                    None,
+                    None,
+                    true,
+                ),
+                Some(crate::info::PtrInfo::Array(info)) => (
+                    ExportedPtrKind::Array,
+                    Some(info.descr.clone()),
+                    None,
+                    Some(info.lenbound.clone()),
+                    true,
+                ),
+                Some(ptr) => (
+                    ExportedPtrKind::None,
+                    None,
+                    ptr.get_known_class().copied(),
+                    None,
+                    ptr.is_nonnull(),
+                ),
+                None => (ExportedPtrKind::None, None, None, None, false),
+            };
         let int_bound = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned());
         let int_lower_bound = int_bound
             .as_ref()
@@ -1295,8 +1322,17 @@ impl OptUnroll {
                     }
                 }
             }
-            PtrInfo::KnownClass { class_ptr, is_nonnull } => {
-                ctx.set_ptr_info(opref, PtrInfo::KnownClass { class_ptr, is_nonnull });
+            PtrInfo::KnownClass {
+                class_ptr,
+                is_nonnull,
+            } => {
+                ctx.set_ptr_info(
+                    opref,
+                    PtrInfo::KnownClass {
+                        class_ptr,
+                        is_nonnull,
+                    },
+                );
             }
             PtrInfo::Constant(ptr) => {
                 ctx.set_ptr_info(opref, PtrInfo::Constant(ptr));
@@ -1343,13 +1379,15 @@ impl OptUnroll {
                                         .copied()
                                         .map(ExportedShortArg::Produced)
                                 })
-                                .or_else(|| ctx.get_constant(arg).cloned().map(ExportedShortArg::Const))
+                                .or_else(|| {
+                                    ctx.get_constant(arg).cloned().map(ExportedShortArg::Const)
+                                })
                         })
                         .collect::<Option<Vec<_>>>();
                     let Some(args) = args else {
                         continue;
                     };
-                let opcode = if entry.op.opcode.is_call() {
+                    let opcode = if entry.op.opcode.is_call() {
                         OpCode::call_pure_for_type(entry.op.result_type())
                     } else {
                         entry.op.opcode
@@ -1464,12 +1502,10 @@ impl OptUnroll {
                     let args = args
                         .iter()
                         .map(|arg| match arg {
-                            ExportedShortArg::Slot(slot) => {
-                                short_args
-                                    .get(*slot)
-                                    .copied()
-                                    .map(crate::ImportedShortPureArg::OpRef)
-                            }
+                            ExportedShortArg::Slot(slot) => short_args
+                                .get(*slot)
+                                .copied()
+                                .map(crate::ImportedShortPureArg::OpRef),
                             ExportedShortArg::Const(value) => {
                                 Some(crate::ImportedShortPureArg::Const(*value))
                             }
@@ -1482,12 +1518,13 @@ impl OptUnroll {
                     let Some(args) = args else {
                         continue;
                     };
-                    ctx.imported_short_pure_ops.push(crate::ImportedShortPureOp {
-                        opcode,
-                        descr_idx,
-                        args,
-                        result: result_opref,
-                    });
+                    ctx.imported_short_pure_ops
+                        .push(crate::ImportedShortPureOp {
+                            opcode,
+                            descr_idx,
+                            args,
+                            result: result_opref,
+                        });
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: result_opref,
                         source: same_as_source.unwrap_or(source),
@@ -1611,7 +1648,12 @@ pub(crate) fn export_state(
     ctx: &OptContext,
     exported_int_bounds: Option<&HashMap<OpRef, crate::intutils::IntBound>>,
 ) -> ExportedState {
-    OptUnroll::new().export_state_with_bounds(jump_args, renamed_inputargs, ctx, exported_int_bounds)
+    OptUnroll::new().export_state_with_bounds(
+        jump_args,
+        renamed_inputargs,
+        ctx,
+        exported_int_bounds,
+    )
 }
 
 /// unroll.py: import_state — module-level entry point.
@@ -1659,9 +1701,8 @@ fn assemble_peeled_trace(
     imported_short_aliases: &[crate::ImportedShortAlias],
     imported_short_sources: &[crate::ImportedShortSource],
 ) -> Vec<Op> {
-    let mut result = Vec::with_capacity(
-        p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len(),
-    );
+    let mut result =
+        Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
     let imported_short_sources: HashMap<OpRef, OpRef> = imported_short_sources
         .iter()
         .map(|entry| (entry.result, entry.source))
@@ -1669,7 +1710,9 @@ fn assemble_peeled_trace(
 
     // Preamble: everything except Jump
     for op in p1_ops {
-        if op.opcode == OpCode::Jump { break; }
+        if op.opcode == OpCode::Jump {
+            break;
+        }
         result.push(op.clone());
     }
 
@@ -1724,13 +1767,17 @@ fn assemble_peeled_trace(
     // a Label arg, map it to that Label arg's position in the preamble.
     // This handles the case where Phase 2's forwarding chain resolves to
     // a position that exists only in the preamble output.
-    let label_set: HashMap<OpRef, OpRef> = label_args.iter().copied()
+    let label_set: HashMap<OpRef, OpRef> = label_args
+        .iter()
+        .copied()
         .enumerate()
         .map(|(_, la)| (la, la))
         .collect();
     // Also map Phase 1 preamble positions that Phase 2 might reference
     for p1_op in p1_ops {
-        if p1_op.opcode == OpCode::Jump { break; }
+        if p1_op.opcode == OpCode::Jump {
+            break;
+        }
         if !p1_op.pos.is_none() && !remap.contains_key(&p1_op.pos) {
             // If this Phase 1 op produced a Label arg, use its preamble pos
             remap.insert(p1_op.pos, p1_op.pos);
@@ -1787,7 +1834,6 @@ fn assemble_peeled_trace(
 
     result
 }
-
 
 pub fn pick_virtual_state(
     my_vs: &crate::virtualstate::VirtualState,
@@ -2590,21 +2636,58 @@ mod tests {
 
         let opt = OptUnroll::new();
         let exported = opt.export_state(
-            &[OpRef(10), OpRef(11), OpRef(12), OpRef(13), OpRef(14), OpRef(15)],
+            &[
+                OpRef(10),
+                OpRef(11),
+                OpRef(12),
+                OpRef(13),
+                OpRef(14),
+                OpRef(15),
+            ],
             &[],
             &ctx,
         );
 
         assert!(exported.exported_infos.len() >= 6);
-        assert_eq!(exported.exported_infos[&OpRef(10)].constant, Some(Value::Int(42)));
-        assert_eq!(exported.exported_infos[&OpRef(11)].known_class, Some(GcRef(0x1234)));
+        assert_eq!(
+            exported.exported_infos[&OpRef(10)].constant,
+            Some(Value::Int(42))
+        );
+        assert_eq!(
+            exported.exported_infos[&OpRef(11)].known_class,
+            Some(GcRef(0x1234))
+        );
         assert_eq!(exported.exported_infos[&OpRef(12)].int_lower_bound, Some(7));
-        assert_eq!(exported.exported_infos[&OpRef(13)].constant, Some(Value::Ref(GcRef(0x5678))));
-        assert_eq!(exported.exported_infos[&OpRef(14)].ptr_kind, ExportedPtrKind::Instance);
-        assert_eq!(exported.exported_infos[&OpRef(14)].ptr_descr.as_ref().map(|d| d.index()), Some(91));
-        assert_eq!(exported.exported_infos[&OpRef(14)].known_class, Some(GcRef(0x7777)));
-        assert_eq!(exported.exported_infos[&OpRef(15)].ptr_kind, ExportedPtrKind::Array);
-        assert_eq!(exported.exported_infos[&OpRef(15)].ptr_descr.as_ref().map(|d| d.index()), Some(92));
+        assert_eq!(
+            exported.exported_infos[&OpRef(13)].constant,
+            Some(Value::Ref(GcRef(0x5678)))
+        );
+        assert_eq!(
+            exported.exported_infos[&OpRef(14)].ptr_kind,
+            ExportedPtrKind::Instance
+        );
+        assert_eq!(
+            exported.exported_infos[&OpRef(14)]
+                .ptr_descr
+                .as_ref()
+                .map(|d| d.index()),
+            Some(91)
+        );
+        assert_eq!(
+            exported.exported_infos[&OpRef(14)].known_class,
+            Some(GcRef(0x7777))
+        );
+        assert_eq!(
+            exported.exported_infos[&OpRef(15)].ptr_kind,
+            ExportedPtrKind::Array
+        );
+        assert_eq!(
+            exported.exported_infos[&OpRef(15)]
+                .ptr_descr
+                .as_ref()
+                .map(|d| d.index()),
+            Some(92)
+        );
         assert_eq!(
             exported.exported_infos[&OpRef(15)]
                 .array_lenbound
@@ -2622,15 +2705,15 @@ mod tests {
 
         // import_state forwards source → target (RPython set_forwarded)
         // so make_inputargs returns the forwarded (original) OpRefs
-        assert_eq!(
-            label_args,
-            vec![OpRef(11), OpRef(12), OpRef(14), OpRef(15)]
-        );
+        assert_eq!(label_args, vec![OpRef(11), OpRef(12), OpRef(14), OpRef(15)]);
         // setinfo_from_preamble first resolves source -> target, so facts land
         // on the forwarded target boxes.
         assert_eq!(ctx2.get_constant_int(OpRef(10)), Some(42));
         match ctx2.get_ptr_info(OpRef(11)) {
-            Some(PtrInfo::KnownClass { class_ptr, is_nonnull }) => {
+            Some(PtrInfo::KnownClass {
+                class_ptr,
+                is_nonnull,
+            }) => {
                 assert_eq!(class_ptr.as_usize(), 0x1234);
                 assert!(*is_nonnull);
             }
@@ -2665,12 +2748,7 @@ mod tests {
         let mut exported_bounds = std::collections::HashMap::new();
         exported_bounds.insert(OpRef(21), IntBound::bounded(10, 20));
 
-        let exported = export_state(
-            &[OpRef(21)],
-            &[],
-            &ctx,
-            Some(&exported_bounds),
-        );
+        let exported = export_state(&[OpRef(21)], &[], &ctx, Some(&exported_bounds));
 
         assert_eq!(
             exported.exported_infos[&OpRef(21)]
@@ -2695,17 +2773,18 @@ mod tests {
     #[test]
     fn test_exported_state_reimports_short_heap_field_facts() {
         let mut ctx = crate::OptContext::with_num_inputs(4, 0);
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::GetfieldGcI, &[OpRef(10)]);
-                op.pos = OpRef(11);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::Heap { descr_idx: 55 },
-            label_arg_idx: Some(1),
-            invented_name: false,
-            same_as_source: None,
-        });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::GetfieldGcI, &[OpRef(10)]);
+                    op.pos = OpRef(11);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Heap { descr_idx: 55 },
+                label_arg_idx: Some(1),
+                invented_name: false,
+                same_as_source: None,
+            });
 
         let exported = export_state(&[OpRef(10), OpRef(11)], &[], &ctx, None);
         assert_eq!(
@@ -2734,17 +2813,18 @@ mod tests {
     fn test_exported_state_reimports_loopinvariant_short_fact() {
         let mut ctx = crate::OptContext::with_num_inputs(4, 0);
         ctx.make_constant(OpRef(10), Value::Int(0x1234));
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::CallI, &[OpRef(10), OpRef(12)]);
-                op.pos = OpRef(11);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::LoopInvariant,
-            label_arg_idx: Some(1),
-            invented_name: false,
-            same_as_source: None,
-        });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::CallI, &[OpRef(10), OpRef(12)]);
+                    op.pos = OpRef(11);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::LoopInvariant,
+                label_arg_idx: Some(1),
+                invented_name: false,
+                same_as_source: None,
+            });
 
         let exported = export_state(&[OpRef(10), OpRef(11)], &[], &ctx, None);
         // label_args may exclude constants, so result_slot depends on
@@ -2772,17 +2852,18 @@ mod tests {
     fn test_exported_state_reimports_short_pure_fact() {
         let mut ctx = crate::OptContext::with_num_inputs(6, 0);
         ctx.make_constant(OpRef(10), Value::Int(7));
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
-                op.pos = OpRef(11);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::Pure,
-            label_arg_idx: Some(1),
-            invented_name: false,
-            same_as_source: None,
-        });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
+                    op.pos = OpRef(11);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: Some(1),
+                invented_name: false,
+                same_as_source: None,
+            });
 
         let exported = export_state(&[OpRef(12), OpRef(11)], &[], &ctx, None);
         assert_eq!(
@@ -2791,7 +2872,10 @@ mod tests {
                 source: OpRef(11),
                 opcode: OpCode::IntAdd,
                 descr_idx: None,
-                args: vec![ExportedShortArg::Slot(0), ExportedShortArg::Const(Value::Int(7))],
+                args: vec![
+                    ExportedShortArg::Slot(0),
+                    ExportedShortArg::Const(Value::Int(7))
+                ],
                 result: ExportedShortResult::Slot(1),
                 invented_name: false,
                 same_as_source: None,
@@ -2826,18 +2910,19 @@ mod tests {
             8,
             majit_ir::EffectInfo::elidable(),
         );
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::CallI, &[OpRef(10), OpRef(12)]);
-                op.pos = OpRef(11);
-                op.descr = Some(call_descr);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::Pure,
-            label_arg_idx: Some(1),
-            invented_name: false,
-            same_as_source: None,
-        });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::CallI, &[OpRef(10), OpRef(12)]);
+                    op.pos = OpRef(11);
+                    op.descr = Some(call_descr);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: Some(1),
+                invented_name: false,
+                same_as_source: None,
+            });
 
         let exported = export_state(&[OpRef(12), OpRef(11)], &[], &ctx, None);
         assert_eq!(
@@ -2877,28 +2962,30 @@ mod tests {
     fn test_exported_state_reimports_short_pure_dependency_chain() {
         let mut ctx = crate::OptContext::with_num_inputs(10, 0);
         ctx.make_constant(OpRef(10), Value::Int(7));
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
-                op.pos = OpRef(11);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::Pure,
-            label_arg_idx: None,
-            invented_name: false,
-            same_as_source: None,
-        });
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::IntMul, &[OpRef(11), OpRef(13)]);
-                op.pos = OpRef(14);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::Pure,
-            label_arg_idx: Some(2),
-            invented_name: false,
-            same_as_source: None,
-        });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
+                    op.pos = OpRef(11);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntMul, &[OpRef(11), OpRef(13)]);
+                    op.pos = OpRef(14);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: Some(2),
+                invented_name: false,
+                same_as_source: None,
+            });
 
         let exported = export_state(&[OpRef(12), OpRef(13), OpRef(14)], &[], &ctx, None);
         assert_eq!(
@@ -2920,10 +3007,7 @@ mod tests {
                     source: OpRef(14),
                     opcode: OpCode::IntMul,
                     descr_idx: None,
-                    args: vec![
-                        ExportedShortArg::Produced(0),
-                        ExportedShortArg::Slot(1),
-                    ],
+                    args: vec![ExportedShortArg::Produced(0), ExportedShortArg::Slot(1),],
                     result: ExportedShortResult::Slot(2),
                     invented_name: false,
                     same_as_source: None,
@@ -2968,28 +3052,30 @@ mod tests {
     fn test_imported_short_builder_tracks_used_dependency_chain() {
         let mut ctx = crate::OptContext::with_num_inputs(10, 0);
         ctx.make_constant(OpRef(10), Value::Int(7));
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
-                op.pos = OpRef(11);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::Pure,
-            label_arg_idx: None,
-            invented_name: false,
-            same_as_source: None,
-        });
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::IntMul, &[OpRef(11), OpRef(13)]);
-                op.pos = OpRef(14);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::Pure,
-            label_arg_idx: Some(2),
-            invented_name: false,
-            same_as_source: None,
-        });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
+                    op.pos = OpRef(11);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntMul, &[OpRef(11), OpRef(13)]);
+                    op.pos = OpRef(14);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: Some(2),
+                invented_name: false,
+                same_as_source: None,
+            });
 
         let exported = export_state(&[OpRef(12), OpRef(13), OpRef(14)], &[], &ctx, None);
         let mut ctx2 = crate::OptContext::with_num_inputs(10, 3);
@@ -3005,17 +3091,18 @@ mod tests {
     #[test]
     fn test_exported_state_reimports_invented_short_alias_metadata() {
         let mut ctx = crate::OptContext::with_num_inputs(6, 0);
-        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
-            op: {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(13)]);
-                op.pos = OpRef(30);
-                op
-            },
-            kind: crate::shortpreamble::PreambleOpKind::Pure,
-            label_arg_idx: None,
-            invented_name: true,
-            same_as_source: Some(OpRef(14)),
-        });
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(13)]);
+                    op.pos = OpRef(30);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: true,
+                same_as_source: Some(OpRef(14)),
+            });
 
         let exported = export_state(&[OpRef(12), OpRef(13), OpRef(14)], &[], &ctx, None);
         assert_eq!(
@@ -3104,17 +3191,22 @@ mod tests {
         };
 
         let mut ctx = crate::OptContext::with_num_inputs(8, 2);
+        let mut optimizer = crate::optimizer::Optimizer::new();
         let extra = OptUnroll::inline_short_preamble(
             &[OpRef(10), OpRef(11)],
             &[OpRef(10), OpRef(11)],
             &sp,
             None,
+            &mut optimizer,
             &mut ctx,
         );
 
         assert_eq!(ctx.new_operations.len(), 1);
         assert_eq!(ctx.new_operations[0].opcode, OpCode::IntAdd);
-        assert_eq!(ctx.new_operations[0].args.as_slice(), &[OpRef(10), OpRef(11)]);
+        assert_eq!(
+            ctx.new_operations[0].args.as_slice(),
+            &[OpRef(10), OpRef(11)]
+        );
         assert_eq!(extra, vec![ctx.new_operations[0].pos]);
     }
 
@@ -3161,8 +3253,8 @@ mod tests {
     #[test]
     fn test_import_state_rebuilds_nested_virtual_graph_from_exported_infos() {
         use crate::info::{PtrInfo, VirtualStructInfo};
-        use majit_ir::{Type, Value};
         use majit_ir::descr::{make_field_descr_full, make_size_descr_full};
+        use majit_ir::{Type, Value};
 
         let value_descr = make_field_descr_full(101, 0, 8, Type::Int, false);
         let next_descr = make_field_descr_full(102, 8, 8, Type::Ref, false);
@@ -3176,7 +3268,10 @@ mod tests {
             OpRef(11),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: node_descr.clone(),
-                fields: vec![(value_descr.index(), OpRef(12)), (next_descr.index(), OpRef(15))],
+                fields: vec![
+                    (value_descr.index(), OpRef(12)),
+                    (next_descr.index(), OpRef(15)),
+                ],
                 field_descrs: vec![
                     (value_descr.index(), value_descr.clone()),
                     (next_descr.index(), next_descr.clone()),
@@ -3187,7 +3282,10 @@ mod tests {
             OpRef(10),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: node_descr.clone(),
-                fields: vec![(value_descr.index(), OpRef(13)), (next_descr.index(), OpRef(11))],
+                fields: vec![
+                    (value_descr.index(), OpRef(13)),
+                    (next_descr.index(), OpRef(11)),
+                ],
                 field_descrs: vec![
                     (value_descr.index(), value_descr.clone()),
                     (next_descr.index(), next_descr.clone()),
@@ -3203,13 +3301,25 @@ mod tests {
 
         match ctx2.get_ptr_info(OpRef(10)) {
             Some(PtrInfo::VirtualStruct(info)) => {
-                assert_eq!(info.fields, vec![(value_descr.index(), OpRef(13)), (next_descr.index(), OpRef(11))]);
+                assert_eq!(
+                    info.fields,
+                    vec![
+                        (value_descr.index(), OpRef(13)),
+                        (next_descr.index(), OpRef(11))
+                    ]
+                );
             }
             other => panic!("expected virtual root, got {other:?}"),
         }
         match ctx2.get_ptr_info(OpRef(11)) {
             Some(PtrInfo::VirtualStruct(info)) => {
-                assert_eq!(info.fields, vec![(value_descr.index(), OpRef(12)), (next_descr.index(), OpRef(15))]);
+                assert_eq!(
+                    info.fields,
+                    vec![
+                        (value_descr.index(), OpRef(12)),
+                        (next_descr.index(), OpRef(15))
+                    ]
+                );
             }
             other => panic!("expected nested virtual, got {other:?}"),
         }

@@ -1455,6 +1455,7 @@ impl Optimization for OptRewrite {
                 if let Some(func_val) = ctx.get_constant_int(op.arg(0)) {
                     if let Some(&cached_result) = ctx.imported_loop_invariant_results.get(&func_val)
                     {
+                        ctx.note_imported_short_use(cached_result);
                         let cached_result = ctx.get_replacement(cached_result);
                         self.loop_invariant_results.insert(func_val, cached_result);
                     }
@@ -3536,8 +3537,7 @@ mod tests {
 
         let mut ctx = OptContext::with_num_inputs(4, 3);
         ctx.make_constant(OpRef(0), Value::Int(0x1234));
-        ctx.imported_loop_invariant_results
-            .insert(0x1234, OpRef(1));
+        ctx.imported_loop_invariant_results.insert(0x1234, OpRef(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&op, &mut ctx);

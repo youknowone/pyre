@@ -574,10 +574,8 @@ where
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[node, value], value_descr);
         // node.next = old_head
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[node, old_head], next_descr);
-        // stack.head = node (symbolic only — no heap writeback)
-        // RPython parity: head is carried as JUMP arg, not written to heap.
-        // Heap is only written on guard failure (via fail_args).
         sym.set_linked_list_head(selected, node);
+        sym.linked_list_writeback_head(ctx, selected, node);
 
         self.runtime_stack_mut(selected, runtime).push(concrete);
         Ok(())
@@ -600,8 +598,8 @@ where
         let value = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr);
         // next = head.next
         let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
-        // stack.head = next (symbolic only — no heap writeback)
         sym.set_linked_list_head(selected, next);
+        sym.linked_list_writeback_head(ctx, selected, next);
 
         let concrete = self
             .runtime_stack_mut(selected, runtime)
@@ -869,9 +867,9 @@ where
                     let Some(head) = sym.linked_list_head(selected) else {
                         return TraceAction::Abort;
                     };
-                    let next =
-                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
+                    let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
                     sym.set_linked_list_head(selected, next);
+                    sym.linked_list_writeback_head(ctx, selected, next);
                     if self.runtime_stack_mut(selected, runtime).pop().is_none() {
                         return TraceAction::Abort;
                     }
@@ -950,11 +948,25 @@ where
                     let value_descr = sym.node_value_descr().expect("node_value_descr");
                     let next_descr = sym.node_next_descr().expect("node_next_descr");
                     let head = sym.linked_list_head(selected).expect("head");
-                    let next_node = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr.clone());
-                    let val_top = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr.clone());
-                    let val_prev = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[next_node], value_descr.clone());
-                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[head, val_prev], value_descr.clone());
-                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[next_node, val_top], value_descr);
+                    let next_node =
+                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr.clone());
+                    let val_top =
+                        ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr.clone());
+                    let val_prev = ctx.record_op_with_descr(
+                        OpCode::GetfieldGcI,
+                        &[next_node],
+                        value_descr.clone(),
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[head, val_prev],
+                        value_descr.clone(),
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[next_node, val_top],
+                        value_descr,
+                    );
                     let runtime_stack = self.runtime_stack_mut(selected, runtime);
                     let len = runtime_stack.len();
                     runtime_stack.swap(len - 1, len - 2);

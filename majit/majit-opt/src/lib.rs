@@ -184,7 +184,9 @@ impl OptContext {
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             patchguardop: None,
-            pre_force_virtual_state: None, pre_force_jump_args: None, pre_force_field_refs: HashMap::new(),
+            pre_force_virtual_state: None,
+            pre_force_jump_args: None,
+            pre_force_field_refs: HashMap::new(),
         }
     }
 
@@ -211,7 +213,9 @@ impl OptContext {
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             patchguardop: None,
-            pre_force_virtual_state: None, pre_force_jump_args: None, pre_force_field_refs: HashMap::new(),
+            pre_force_virtual_state: None,
+            pre_force_jump_args: None,
+            pre_force_field_refs: HashMap::new(),
         }
     }
 
@@ -287,11 +291,9 @@ impl OptContext {
                 )
             })
             .collect();
-        self.imported_short_preamble_builder = Some(crate::shortpreamble::ShortPreambleBuilder::new(
-            label_args,
-            &produced,
-            label_args,
-        ));
+        self.imported_short_preamble_builder = Some(
+            crate::shortpreamble::ShortPreambleBuilder::new(label_args, &produced, label_args),
+        );
         self.imported_short_preamble_used.clear();
     }
 

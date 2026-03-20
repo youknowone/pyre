@@ -467,6 +467,7 @@ impl Optimization for OptPure {
                 }
 
                 if let Some(cached_ref) = self.lookup_imported_short_pure(&postponed, ctx) {
+                    ctx.note_imported_short_use(cached_ref);
                     let cached_ref = ctx.get_replacement(cached_ref);
                     ctx.replace_op(postponed.pos, cached_ref);
                     self.last_emitted_was_removed = true;
@@ -548,6 +549,7 @@ impl Optimization for OptPure {
             }
 
             if let Some(cached_ref) = self.lookup_imported_short_pure(op, ctx) {
+                ctx.note_imported_short_use(cached_ref);
                 let cached_ref = ctx.get_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
@@ -572,6 +574,7 @@ impl Optimization for OptPure {
         // CALL_PURE_* -> CSE or known_result lookup, then demote to CALL_*.
         if op.opcode.is_call_pure() {
             if let Some(cached_ref) = self.lookup_imported_short_pure(op, ctx) {
+                ctx.note_imported_short_use(cached_ref);
                 let cached_ref = ctx.get_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
@@ -685,14 +688,10 @@ impl Optimization for OptPure {
     /// Add pure operations and CALL_PURE results to the short preamble.
     fn produce_potential_short_preamble_ops(&self, sb: &mut crate::shortpreamble::ShortBoxes) {
         for op in &self.short_preamble_pure_ops {
-            if let Some(label_arg_idx) = sb.lookup_label_arg(op.pos) {
-                sb.add_pure_op(label_arg_idx, op.clone());
-            }
+            sb.add_pure_op(op.clone());
         }
         for op in &self.short_preamble_loopinvariant_ops {
-            if let Some(label_arg_idx) = sb.lookup_label_arg(op.pos) {
-                sb.add_loopinvariant_op(label_arg_idx, op.clone());
-            }
+            sb.add_loopinvariant_op(op.clone());
         }
     }
 }
@@ -1308,15 +1307,16 @@ mod tests {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
         ctx.make_constant(OpRef(10), majit_ir::Value::Int(7));
-        ctx.imported_short_pure_ops.push(crate::ImportedShortPureOp {
-            opcode: OpCode::IntAdd,
-            descr_idx: None,
-            args: vec![
-                crate::ImportedShortPureArg::OpRef(OpRef(0)),
-                crate::ImportedShortPureArg::Const(majit_ir::Value::Int(7)),
-            ],
-            result: OpRef(1),
-        });
+        ctx.imported_short_pure_ops
+            .push(crate::ImportedShortPureOp {
+                opcode: OpCode::IntAdd,
+                descr_idx: None,
+                args: vec![
+                    crate::ImportedShortPureArg::OpRef(OpRef(0)),
+                    crate::ImportedShortPureArg::Const(majit_ir::Value::Int(7)),
+                ],
+                result: OpRef(1),
+            });
 
         pass.setup();
 
@@ -1339,15 +1339,16 @@ mod tests {
             8,
             majit_ir::EffectInfo::elidable(),
         );
-        ctx.imported_short_pure_ops.push(crate::ImportedShortPureOp {
-            opcode: OpCode::CallPureI,
-            descr_idx: Some(77),
-            args: vec![
-                crate::ImportedShortPureArg::Const(majit_ir::Value::Int(0x1234)),
-                crate::ImportedShortPureArg::OpRef(OpRef(0)),
-            ],
-            result: OpRef(1),
-        });
+        ctx.imported_short_pure_ops
+            .push(crate::ImportedShortPureOp {
+                opcode: OpCode::CallPureI,
+                descr_idx: Some(77),
+                args: vec![
+                    crate::ImportedShortPureArg::Const(majit_ir::Value::Int(0x1234)),
+                    crate::ImportedShortPureArg::OpRef(OpRef(0)),
+                ],
+                result: OpRef(1),
+            });
 
         pass.setup();
 
@@ -1390,7 +1391,11 @@ mod tests {
         let mut op = Op::new(OpCode::CallPureI, &[OpRef(100), OpRef(0), OpRef(1)]);
         op.pos = OpRef(2);
         op.descr = Some(majit_ir::descr::make_call_descr(
-            vec![majit_ir::Type::Int, majit_ir::Type::Int, majit_ir::Type::Int],
+            vec![
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+            ],
             majit_ir::Type::Int,
             majit_ir::EffectInfo::elidable(),
         ));

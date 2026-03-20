@@ -548,13 +548,15 @@ impl ShortBoxes {
                 same_as
             }
         };
-        self.potential_ops.entry(arg).or_insert(PotentialShortOp::Preamble(PreambleOp {
-            op,
-            kind: PreambleOpKind::InputArg,
-            label_arg_idx,
-            invented_name: false,
-            same_as_source: None,
-        }));
+        self.potential_ops
+            .entry(arg)
+            .or_insert(PotentialShortOp::Preamble(PreambleOp {
+                op,
+                kind: PreambleOpKind::InputArg,
+                label_arg_idx,
+                invented_name: false,
+                same_as_source: None,
+            }));
         if !self.potential_order.contains(&arg) {
             self.potential_order.push(arg);
         }
@@ -837,7 +839,11 @@ impl CompoundOp {
     ///
     /// Recursively flatten a tree of CompoundOps into a list of
     /// ProducedShortOps in dependency order (children first).
-    pub fn flatten(&self, sb: &mut ShortBoxes, mut produced: Vec<ProducedShortOp>) -> Vec<ProducedShortOp> {
+    pub fn flatten(
+        &self,
+        sb: &mut ShortBoxes,
+        mut produced: Vec<ProducedShortOp>,
+    ) -> Vec<ProducedShortOp> {
         match self.one.as_ref() {
             PotentialShortOp::Compound(compound) => {
                 produced = compound.flatten(sb, produced);
@@ -943,10 +949,67 @@ impl AbstractShortPreambleBuilderState {
     }
 }
 
+fn build_short_preamble_struct_from_ops(
+    short_inputargs: &[OpRef],
+    ops: &[Op],
+    used_boxes: &[OpRef],
+) -> ShortPreamble {
+    let short_inputarg_positions: HashMap<OpRef, usize> = short_inputargs
+        .iter()
+        .enumerate()
+        .map(|(idx, &arg)| (arg, idx))
+        .collect();
+    let entries = ops
+        .iter()
+        .cloned()
+        .map(|op| {
+            let arg_mapping = op
+                .args
+                .iter()
+                .enumerate()
+                .filter_map(|(arg_pos, arg_ref)| {
+                    short_inputarg_positions
+                        .get(arg_ref)
+                        .copied()
+                        .map(|label_idx| (arg_pos, label_idx))
+                })
+                .collect();
+            let fail_arg_mapping = op
+                .fail_args
+                .as_ref()
+                .map(|fail_args| {
+                    fail_args
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(fail_arg_pos, fail_arg_ref)| {
+                            short_inputarg_positions
+                                .get(fail_arg_ref)
+                                .copied()
+                                .map(|label_idx| (fail_arg_pos, label_idx))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ShortPreambleOp {
+                op,
+                arg_mapping,
+                fail_arg_mapping,
+            }
+        })
+        .collect();
+    ShortPreamble {
+        ops: entries,
+        inputargs: short_inputargs.to_vec(),
+        used_boxes: used_boxes.to_vec(),
+        exported_state: None,
+    }
+}
+
 /// shortpreamble.py: ShortPreambleBuilder
 ///
 /// Builds the replayable short preamble from exported short boxes, while also
 /// collecting `used_boxes`, `short_preamble_jump`, and `extra_same_as`.
+#[derive(Clone, Debug)]
 pub struct ShortPreambleBuilder {
     state: AbstractShortPreambleBuilderState,
     produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
@@ -972,11 +1035,7 @@ impl ShortPreambleBuilder {
         }
     }
 
-    fn use_box_recursive(
-        &mut self,
-        result: OpRef,
-        visiting: &mut HashSet<OpRef>,
-    ) -> Option<Op> {
+    fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
         if self.state.used_boxes.contains(&result) {
             return Some(produced.preamble_op);
@@ -1020,59 +1079,11 @@ impl ShortPreambleBuilder {
     }
 
     pub fn build_short_preamble_struct(&self) -> ShortPreamble {
-        let short_inputarg_positions: HashMap<OpRef, usize> = self
-            .state
-            .short_inputargs
-            .iter()
-            .enumerate()
-            .map(|(idx, &arg)| (arg, idx))
-            .collect();
-        let entries = self
-            .state
-            .short
-            .iter()
-            .cloned()
-            .map(|op| {
-                let arg_mapping = op
-                    .args
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(arg_pos, arg_ref)| {
-                        short_inputarg_positions
-                            .get(arg_ref)
-                            .copied()
-                            .map(|label_idx| (arg_pos, label_idx))
-                    })
-                    .collect();
-                let fail_arg_mapping = op
-                    .fail_args
-                    .as_ref()
-                    .map(|fail_args| {
-                        fail_args
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(fail_arg_pos, fail_arg_ref)| {
-                                short_inputarg_positions
-                                    .get(fail_arg_ref)
-                                    .copied()
-                                    .map(|label_idx| (fail_arg_pos, label_idx))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                ShortPreambleOp {
-                    op,
-                    arg_mapping,
-                    fail_arg_mapping,
-                }
-            })
-            .collect();
-        ShortPreamble {
-            ops: entries,
-            inputargs: self.state.short_inputargs.clone(),
-            used_boxes: self.state.used_boxes.clone(),
-            exported_state: None,
-        }
+        build_short_preamble_struct_from_ops(
+            &self.state.short_inputargs,
+            &self.state.short,
+            &self.state.used_boxes,
+        )
     }
 
     pub fn used_boxes(&self) -> &[OpRef] {
@@ -1090,14 +1101,19 @@ impl ShortPreambleBuilder {
 
 /// shortpreamble.py: ExtendedShortPreambleBuilder
 ///
-/// Shares `extra_same_as` with the base builder while extending the short
-/// preamble during inline-short-preamble replay.
+/// Keeps the existing short preamble stable while allowing inline replay to
+/// discover additional required producers and append them to the loop label /
+/// jump contract.
+#[derive(Clone, Debug)]
 pub struct ExtendedShortPreambleBuilder {
     produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
-    short: Vec<Op>,
-    jump_args: Vec<Op>,
-    label_args: Option<Vec<OpRef>>,
-    extra_same_as: Vec<Op>,
+    short_inputargs: Vec<OpRef>,
+    base_short_ops: Vec<Op>,
+    base_results: HashSet<OpRef>,
+    base_extra_same_as: Vec<Op>,
+    extra_state: AbstractShortPreambleBuilderState,
+    label_args: Vec<OpRef>,
+    short_jump_args: Vec<OpRef>,
     pub target_token: u64,
 }
 
@@ -1105,68 +1121,87 @@ impl ExtendedShortPreambleBuilder {
     pub fn new(target_token: u64, sb: &ShortPreambleBuilder) -> Self {
         ExtendedShortPreambleBuilder {
             produced_short_boxes: sb.produced_short_boxes.clone(),
-            short: Vec::new(),
-            jump_args: Vec::new(),
-            label_args: None,
-            extra_same_as: sb.extra_same_as().to_vec(),
+            short_inputargs: sb.short_inputargs().to_vec(),
+            base_short_ops: Vec::new(),
+            base_results: HashSet::new(),
+            base_extra_same_as: sb.extra_same_as().to_vec(),
+            extra_state: AbstractShortPreambleBuilderState {
+                short_inputargs: sb.short_inputargs().to_vec(),
+                extra_same_as: sb.extra_same_as().to_vec(),
+                ..AbstractShortPreambleBuilderState::default()
+            },
+            label_args: Vec::new(),
+            short_jump_args: Vec::new(),
             target_token,
         }
     }
 
-    pub fn setup(&mut self, jump_args: Vec<Op>, short: Vec<Op>, label_args: Vec<OpRef>) {
-        self.jump_args = jump_args;
-        self.short = short;
-        self.label_args = Some(label_args);
+    pub fn setup(&mut self, short_preamble: &ShortPreamble, label_args: &[OpRef]) {
+        self.base_short_ops = short_preamble
+            .ops
+            .iter()
+            .map(|entry| entry.op.clone())
+            .collect();
+        self.base_results = self.base_short_ops.iter().map(|op| op.pos).collect();
+        self.extra_state.short.clear();
+        self.extra_state.used_boxes.clear();
+        self.extra_state.short_preamble_jump.clear();
+        self.extra_state.extra_same_as = self.base_extra_same_as.clone();
+        self.extra_state.short_inputargs = self.short_inputargs.clone();
+        self.label_args = label_args.to_vec();
+        self.short_jump_args = short_preamble.used_boxes.clone();
+    }
+
+    fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
+        let produced = self.produced_short_boxes.get(&result)?.clone();
+        if self.extra_state.used_boxes.contains(&result) {
+            return Some(produced.preamble_op);
+        }
+        if !visiting.insert(result) {
+            return None;
+        }
+        for &arg in &produced.preamble_op.args {
+            if self.produced_short_boxes.contains_key(&arg) {
+                let _ = self.use_box_recursive(arg, visiting);
+            }
+        }
+        visiting.remove(&result);
+        if self.base_results.contains(&result) {
+            return Some(produced.preamble_op);
+        }
+        if !self.label_args.contains(&result) {
+            self.label_args.push(result);
+        }
+        if !self.short_jump_args.contains(&result) {
+            self.short_jump_args.push(result);
+        }
+        Some(self.extra_state.use_box(result, &produced))
     }
 
     pub fn add_preamble_op(&mut self, result: OpRef) -> bool {
-        let Some(produced) = self.produced_short_boxes.get(&result).cloned() else {
-            return false;
-        };
-        if produced.invented_name {
-            let source = produced.same_as_source.unwrap_or(result);
-            let mut op = Op::new(
-                OpCode::same_as_for_type(produced.preamble_op.result_type()),
-                &[source],
-            );
-            op.pos = result;
-            self.extra_same_as.push(op);
-        }
-        let Some(label_args) = self.label_args.as_mut() else {
-            return false;
-        };
-        label_args.push(result);
-        self.jump_args.push(produced.preamble_op);
-        true
+        self.use_box(result).is_some()
     }
 
     pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
-        let jump = self.jump_args.pop()?;
-        let produced = self.produced_short_boxes.get(&result)?.clone();
-        let mut state = AbstractShortPreambleBuilderState {
-            short: std::mem::take(&mut self.short),
-            used_boxes: Vec::new(),
-            short_preamble_jump: Vec::new(),
-            extra_same_as: std::mem::take(&mut self.extra_same_as),
-            short_inputargs: Vec::new(),
-        };
-        let preamble_op = state.use_box(result, &produced);
-        self.short = state.short;
-        self.extra_same_as = state.extra_same_as;
-        self.jump_args.push(jump);
-        Some(preamble_op)
+        self.use_box_recursive(result, &mut HashSet::new())
+    }
+
+    pub fn build_short_preamble_struct(&self) -> ShortPreamble {
+        let mut ops = self.base_short_ops.clone();
+        ops.extend(self.extra_state.short.iter().cloned());
+        build_short_preamble_struct_from_ops(&self.short_inputargs, &ops, &self.short_jump_args)
     }
 
     pub fn extra_same_as(&self) -> &[Op] {
-        &self.extra_same_as
+        &self.extra_state.extra_same_as
     }
 
-    pub fn label_args(&self) -> Option<&[OpRef]> {
-        self.label_args.as_deref()
+    pub fn label_args(&self) -> &[OpRef] {
+        &self.label_args
     }
 
-    pub fn jump_args(&self) -> &[Op] {
-        &self.jump_args
+    pub fn jump_args(&self) -> &[OpRef] {
+        &self.short_jump_args
     }
 }
 
@@ -1253,12 +1288,12 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         }
     }
 
-        ShortPreamble {
-            ops: entries,
-            inputargs: Vec::new(),
-            used_boxes: Vec::new(),
-            exported_state: None,
-        }
+    ShortPreamble {
+        ops: entries,
+        inputargs: Vec::new(),
+        used_boxes: Vec::new(),
+        exported_state: None,
+    }
 }
 
 pub fn build_short_preamble_from_exported_boxes(
@@ -1668,7 +1703,8 @@ mod tests {
                 },
             ),
         ];
-        let mut builder = ShortPreambleBuilder::new(&[OpRef(0), OpRef(1)], &produced, &[OpRef(0), OpRef(1)]);
+        let mut builder =
+            ShortPreambleBuilder::new(&[OpRef(0), OpRef(1)], &produced, &[OpRef(0), OpRef(1)]);
 
         let used = builder.use_box(OpRef(8)).unwrap();
         assert_eq!(used.opcode, OpCode::IntMul);
@@ -1760,11 +1796,17 @@ mod tests {
         let produced = sb.produced_ops();
         assert_eq!(produced.len(), 2);
 
-        let chosen = produced.iter().find(|(result, _)| *result == OpRef(10)).unwrap();
+        let chosen = produced
+            .iter()
+            .find(|(result, _)| *result == OpRef(10))
+            .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
 
-        let alias = produced.iter().find(|(result, _)| *result != OpRef(10)).unwrap();
+        let alias = produced
+            .iter()
+            .find(|(result, _)| *result != OpRef(10))
+            .unwrap();
         assert_eq!(alias.1.kind, PreambleOpKind::Heap { descr_idx: 55 });
         assert!(alias.1.invented_name);
         assert_eq!(alias.1.same_as_source, Some(OpRef(10)));
@@ -1789,7 +1831,10 @@ mod tests {
         let produced = sb.produced_ops();
         assert_eq!(produced.len(), 3);
 
-        let chosen = produced.iter().find(|(result, _)| *result == OpRef(20)).unwrap();
+        let chosen = produced
+            .iter()
+            .find(|(result, _)| *result == OpRef(20))
+            .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
 
@@ -1799,9 +1844,11 @@ mod tests {
             .collect();
         assert_eq!(aliases.len(), 2);
         assert!(aliases.iter().all(|(_, produced)| produced.invented_name));
-        assert!(aliases
-            .iter()
-            .all(|(_, produced)| produced.same_as_source == Some(OpRef(20))));
+        assert!(
+            aliases
+                .iter()
+                .all(|(_, produced)| produced.same_as_source == Some(OpRef(20)))
+        );
     }
 
     #[test]
@@ -1876,10 +1923,18 @@ mod tests {
 
         let builder = ShortPreambleBuilder::new(&[OpRef(30)], &produced, &[OpRef(30)]);
         let mut ext = ExtendedShortPreambleBuilder::new(7, &builder);
-        ext.setup(vec![Op::new(OpCode::Jump, &[OpRef(30)])], vec![], vec![OpRef(30)]);
+        ext.setup(
+            &ShortPreamble {
+                ops: Vec::new(),
+                inputargs: vec![OpRef(30)],
+                used_boxes: vec![OpRef(30)],
+                exported_state: None,
+            },
+            &[OpRef(30)],
+        );
 
         assert!(ext.add_preamble_op(alias_result));
-        assert_eq!(ext.label_args().unwrap(), &[OpRef(30), alias_result]);
+        assert_eq!(ext.label_args(), &[OpRef(30), alias_result]);
         assert_eq!(ext.jump_args().len(), 2);
         assert_eq!(ext.extra_same_as().len(), 1);
         assert_eq!(ext.extra_same_as()[0].opcode, OpCode::SameAsI);

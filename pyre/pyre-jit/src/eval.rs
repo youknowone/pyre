@@ -7,20 +7,20 @@
 //! Equivalent to PyPy's `pypyjit/interp_jit.py` — the JIT is injected
 //! from outside the interpreter.
 
-use std::cell::{Cell, UnsafeCell};
-use std::collections::HashMap;
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
 use pyre_bytecode::bytecode::OpArgState;
 use pyre_interp::frame::PyFrame;
 use pyre_object::w_none;
 use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
+use std::cell::{Cell, UnsafeCell};
+use std::collections::HashMap;
 
 use majit_gc::trace::TypeInfo;
 use majit_meta::DetailedDriverRunOutcome;
 
-use crate::jit::frame_layout::build_pyframe_virtualizable_info;
 use crate::jit::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
+use crate::jit::frame_layout::build_pyframe_virtualizable_info;
 use majit_gc::collector::MiniMarkGC;
 use majit_meta::JitDriver;
 use pyre_object::floatobject::W_FloatObject;
@@ -226,8 +226,7 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // RPython green_key = (pycode, next_instr).
                 // Each (code, pc) pair has independent warmup counter
                 // and compiled loop, so inner/outer loops are separate.
-                let green_key =
-                    make_green_key(frame.code, frame.next_instr);
+                let green_key = make_green_key(frame.code, frame.next_instr);
                 if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
                     green_key,
                     frame.next_instr,
@@ -287,9 +286,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
                         "guard-restored"
                     }
-                    DetailedDriverRunOutcome::GuardFailure { restored: false, .. } => {
-                        "guard-unrestored"
-                    }
+                    DetailedDriverRunOutcome::GuardFailure {
+                        restored: false, ..
+                    } => "guard-unrestored",
                 };
                 eprintln!(
                     "[jit][func-entry] compiled outcome key={} arg0={:?} kind={}",
@@ -330,10 +329,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let self_recursive_candidate = crate::call_jit::self_recursive_function_entry_candidate(frame);
     let boosted = if driver.is_function_boosted(green_key) {
         true
-    } else if *count == 1
-        && recursive_entry
-        && self_recursive_candidate
-    {
+    } else if *count == 1 && recursive_entry && self_recursive_candidate {
         // PyPy converges recursive hot paths by boosting the callee toward a
         // separate function-entry trace once recursion becomes obvious.  We
         // only fast-track entries reached through our recursive force helper,

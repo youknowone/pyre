@@ -441,9 +441,9 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let _force_guard = crate::eval::blackhole_entry_bump();
     let result = resume_in_blackhole(frame);
     let value = match protocol {
-        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => {
-            unsafe { w_int_get_value(result) }
-        }
+        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
+            w_int_get_value(result)
+        },
         FinishProtocol::RawInt => result as i64,
         FinishProtocol::Boxed => result as i64,
     };
@@ -637,7 +637,9 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit][blackhole] setup pc={} nlocals={} regs_i_len={} local0={} frame_reg={}",
-            py_pc, nlocals, bh.registers_i.len(),
+            py_pc,
+            nlocals,
+            bh.registers_i.len(),
             bh.registers_i.get(0).copied().unwrap_or(-999),
             bh.registers_i.get(nlocals + 3).copied().unwrap_or(-999),
         );
@@ -707,8 +709,11 @@ pub extern "C" fn jit_force_recursive_call_1(
             None
         };
         let boxed = boxed_arg as PyObjectRef;
-        let callee_arg0 =
-            if !boxed.is_null() && unsafe { is_int(boxed) } { Some(unsafe { w_int_get_value(boxed) }) } else { None };
+        let callee_arg0 = if !boxed.is_null() && unsafe { is_int(boxed) } {
+            Some(unsafe { w_int_get_value(boxed) })
+        } else {
+            None
+        };
         eprintln!(
             "[jit][force-recursive-boxed] enter caller_arg0={:?} callee_arg0={:?}",
             caller_arg0, callee_arg0
@@ -848,9 +853,9 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
         // re-enter compiled code (no execute_call_assembler_direct).
         let bh_result = resume_in_blackhole(frame);
         match protocol {
-            FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => {
-                unsafe { w_int_get_value(bh_result) }
-            }
+            FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
+                w_int_get_value(bh_result)
+            },
             FinishProtocol::RawInt => bh_result as i64,
             FinishProtocol::Boxed => bh_result as i64,
         }

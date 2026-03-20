@@ -1796,18 +1796,31 @@ mod tests {
 
         assert!(
             driver
-                .jit_merge_point_keyed(key, 7, &mut state, &(), || {}, |_ctx, _sym| {
-                    TraceAction::Continue
-                })
+                .jit_merge_point_keyed(
+                    key,
+                    7,
+                    &mut state,
+                    &(),
+                    || {},
+                    |_ctx, _sym| { TraceAction::Continue }
+                )
                 .is_none()
         );
-        assert!(!driver.is_tracing(), "first merge_point call should only warm up");
+        assert!(
+            !driver.is_tracing(),
+            "first merge_point call should only warm up"
+        );
 
         assert!(
             driver
-                .jit_merge_point_keyed(key, 7, &mut state, &(), || {}, |_ctx, _sym| {
-                    TraceAction::Continue
-                })
+                .jit_merge_point_keyed(
+                    key,
+                    7,
+                    &mut state,
+                    &(),
+                    || {},
+                    |_ctx, _sym| { TraceAction::Continue }
+                )
                 .is_none()
         );
         assert!(
