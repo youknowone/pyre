@@ -1357,7 +1357,7 @@ where
                             return TraceAction::Abort;
                         };
                         (cond, runtime_cond)
-                    } else if sym.linked_list_head(selected).is_some() {
+                    } else if sym.ensure_linked_list_head(ctx, selected).is_some() {
                         let Ok((cond, runtime_cond)) =
                             self.linked_list_pop(ctx, sym, runtime, selected)
                         else {
@@ -2087,7 +2087,7 @@ where
     machine.run_to_end(ctx, sym, &runtime)
 }
 
-fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
+pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
     match opcode {
         OpCode::IntAdd => lhs.wrapping_add(rhs),
         OpCode::IntSub => lhs.wrapping_sub(rhs),
@@ -2122,7 +2122,7 @@ fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
 }
 
 /// Evaluate an overflow-checked binop. Returns `None` on overflow.
-fn eval_binop_ovf(opcode: OpCode, lhs: i64, rhs: i64) -> Option<i64> {
+pub(crate) fn eval_binop_ovf(opcode: OpCode, lhs: i64, rhs: i64) -> Option<i64> {
     match opcode {
         OpCode::IntAddOvf => lhs.checked_add(rhs),
         OpCode::IntSubOvf => lhs.checked_sub(rhs),
@@ -2131,7 +2131,7 @@ fn eval_binop_ovf(opcode: OpCode, lhs: i64, rhs: i64) -> Option<i64> {
     }
 }
 
-fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
+pub(crate) fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
     match opcode {
         OpCode::IntNeg => value.wrapping_neg(),
         other => panic!("unsupported jitcode integer unary op {other:?}"),
@@ -2139,7 +2139,7 @@ fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
 }
 
 /// Evaluate a float binary operation. Values are stored as i64 (bit-cast).
-fn eval_binop_f(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
+pub(crate) fn eval_binop_f(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
     let a = f64::from_bits(lhs as u64);
     let b = f64::from_bits(rhs as u64);
     let result = match opcode {
@@ -2155,7 +2155,7 @@ fn eval_binop_f(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
 }
 
 /// Evaluate a float unary operation.
-fn eval_unary_f(opcode: OpCode, value: i64) -> i64 {
+pub(crate) fn eval_unary_f(opcode: OpCode, value: i64) -> i64 {
     let a = f64::from_bits(value as u64);
     let result = match opcode {
         OpCode::FloatNeg => -a,
@@ -2165,7 +2165,7 @@ fn eval_unary_f(opcode: OpCode, value: i64) -> i64 {
     f64::to_bits(result) as i64
 }
 
-fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
+pub(crate) fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
     unsafe {
         match args {
             [] => {
