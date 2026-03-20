@@ -50,6 +50,9 @@ pub struct ShortPreambleOp {
     /// Which label arg indices this op's arguments map to.
     /// Maps from op arg position to label arg index.
     pub arg_mapping: Vec<(usize, usize)>,
+    /// Which label arg indices this op's fail args map to.
+    /// Maps from fail_arg position to label arg index.
+    pub fail_arg_mapping: Vec<(usize, usize)>,
 }
 
 /// The complete short preamble for a peeled loop.
@@ -62,6 +65,13 @@ pub struct ShortPreamble {
     /// Operations to prepend when entering the loop from a bridge.
     /// These are guards and setup ops with args referencing label arg indices.
     pub ops: Vec<ShortPreambleOp>,
+    /// Input args of the short preamble Label.
+    /// RPython stores the full short preamble as [Label(short_inputargs), ...].
+    pub inputargs: Vec<OpRef>,
+    /// Extra loop-header values carried by the short preamble Jump.
+    /// RPython appends `sb.used_boxes` to the loop label and jumps with
+    /// `args + extra`, where `extra` is the remapped version of these boxes.
+    pub used_boxes: Vec<OpRef>,
     /// The exported virtual state at the loop header (from the preamble's exit).
     /// Used to check bridge compatibility and generate additional guards.
     pub exported_state: Option<VirtualState>,
@@ -72,6 +82,8 @@ impl ShortPreamble {
     pub fn empty() -> Self {
         ShortPreamble {
             ops: Vec::new(),
+            inputargs: Vec::new(),
+            used_boxes: Vec::new(),
             exported_state: None,
         }
     }
@@ -106,18 +118,11 @@ impl ShortPreamble {
                 }
             }
 
-            // Also remap fail_args
             if let Some(ref mut fail_args) = op.fail_args {
-                for fa in fail_args.iter_mut() {
-                    // fail_args that reference label args get remapped
-                    for (_, label_idx) in &entry.arg_mapping {
-                        if let Some(bridge_ref) = bridge_args.get(*label_idx) {
-                            if fa.0 < bridge_args.len() as u32 {
-                                // Check if this fail_arg matches a label arg position
-                                if fa.0 == *label_idx as u32 {
-                                    *fa = *bridge_ref;
-                                }
-                            }
+                for (fail_arg_pos, label_idx) in &entry.fail_arg_mapping {
+                    if let Some(bridge_ref) = bridge_args.get(*label_idx) {
+                        if *fail_arg_pos < fail_args.len() {
+                            fail_args[*fail_arg_pos] = *bridge_ref;
                         }
                     }
                 }
@@ -154,12 +159,13 @@ impl ShortPreamble {
     }
 }
 
-/// Builder that collects short preamble operations during preamble optimization.
+/// Collector that extracts short preamble operations from an already-built
+/// preamble trace.
 ///
-/// Used by the optimizer when processing a peeled trace. As the optimizer
-/// processes the preamble section (before the Label), it records operations
-/// that establish facts the loop body depends on.
-pub struct ShortPreambleBuilder {
+/// This is intentionally separate from RPython's `ShortPreambleBuilder`.
+/// The RPython builder consumes exported short boxes while building phase 2;
+/// this collector just turns a preamble section into a `ShortPreamble`.
+pub struct CollectedShortPreambleBuilder {
     /// Raw ops collected during the preamble phase (before Label).
     raw_ops: Vec<Op>,
     /// Map from preamble OpRef to label arg index (set when Label is found).
@@ -168,9 +174,9 @@ pub struct ShortPreambleBuilder {
     active: bool,
 }
 
-impl ShortPreambleBuilder {
+impl CollectedShortPreambleBuilder {
     pub fn new() -> Self {
-        ShortPreambleBuilder {
+        CollectedShortPreambleBuilder {
             raw_ops: Vec::new(),
             preamble_to_label_arg: HashMap::new(),
             active: true,
@@ -231,18 +237,41 @@ impl ShortPreambleBuilder {
                         arg_mapping.push((arg_pos, label_idx));
                     }
                 }
-                ShortPreambleOp { op, arg_mapping }
+                let mut fail_arg_mapping = Vec::new();
+                if let Some(fail_args) = &op.fail_args {
+                    for (fail_arg_pos, fail_arg_ref) in fail_args.iter().enumerate() {
+                        if let Some(&label_idx) = self.preamble_to_label_arg.get(fail_arg_ref) {
+                            fail_arg_mapping.push((fail_arg_pos, label_idx));
+                        }
+                    }
+                }
+                ShortPreambleOp {
+                    op,
+                    arg_mapping,
+                    fail_arg_mapping,
+                }
             })
             .collect();
 
+        // Reconstruct label_args order from preamble_to_label_arg mapping
+        let mut inputargs_by_idx: Vec<(usize, OpRef)> = self
+            .preamble_to_label_arg
+            .iter()
+            .map(|(&opref, &idx)| (idx, opref))
+            .collect();
+        inputargs_by_idx.sort_by_key(|(idx, _)| *idx);
+        let inputargs: Vec<OpRef> = inputargs_by_idx.into_iter().map(|(_, r)| r).collect();
+
         ShortPreamble {
             ops: entries,
+            inputargs,
+            used_boxes: Vec::new(),
             exported_state,
         }
     }
 }
 
-impl Default for ShortPreambleBuilder {
+impl Default for CollectedShortPreambleBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -369,7 +398,7 @@ pub struct ShortBoxes {
     /// Mapping from exported label arg box to its position.
     pub label_arg_positions: HashMap<OpRef, usize>,
     /// shortpreamble.py: potential_ops
-    potential_ops: HashMap<OpRef, Vec<PreambleOp>>,
+    potential_ops: HashMap<OpRef, PotentialShortOp>,
     /// Ordered insertion list for potential ops, matching shortpreamble.py's
     /// OrderedDict iteration contract.
     potential_order: Vec<OpRef>,
@@ -387,6 +416,42 @@ pub struct ShortBoxes {
     next_synthetic_pos: u32,
     /// The number of label args.
     pub num_label_args: usize,
+}
+
+#[derive(Clone, Debug)]
+enum PotentialShortOp {
+    Preamble(PreambleOp),
+    Compound(CompoundOp),
+}
+
+impl PotentialShortOp {
+    fn add_op_to_short(&self, sb: &mut ShortBoxes) -> Option<ProducedShortOp> {
+        match self {
+            PotentialShortOp::Preamble(op) => op.add_op_to_short(sb),
+            PotentialShortOp::Compound(compound) => {
+                let mut produced = compound.flatten(sb, Vec::new());
+                if produced.is_empty() {
+                    None
+                } else {
+                    let index = ShortBoxes::pick_produced_op_index(&produced, true);
+                    let chosen = produced[index].clone();
+                    for (i, mut alt) in produced.into_iter().enumerate() {
+                        if i == index {
+                            continue;
+                        }
+                        let alias = OpRef(sb.next_synthetic_pos);
+                        sb.next_synthetic_pos += 1;
+                        alt.preamble_op.pos = alias;
+                        alt.invented_name = true;
+                        alt.same_as_source = Some(compound.res);
+                        sb.produced_short_boxes.insert(alias, alt.clone());
+                        sb.produced_order.push(alias);
+                    }
+                    Some(chosen)
+                }
+            }
+        }
+    }
 }
 
 impl ShortBoxes {
@@ -419,58 +484,58 @@ impl ShortBoxes {
         self.label_arg_positions.get(&opref).copied()
     }
 
-    fn add_op(&mut self, result: OpRef, pop: PreambleOp) {
+    fn add_op(&mut self, result: OpRef, pop: PotentialShortOp) {
         if !self.potential_ops.contains_key(&result) {
             self.potential_order.push(result);
         }
         self.next_synthetic_pos = self.next_synthetic_pos.max(result.0.saturating_add(1));
-        self.potential_ops.entry(result).or_default().push(pop);
+        self.potential_ops.insert(result, pop);
     }
 
-    /// Add a pure operation that produces a label arg value.
+    /// Add a pure operation as a short-box candidate.
     /// shortpreamble.py: sb.add_pure_op(op)
-    pub fn add_pure_op(&mut self, label_arg_idx: usize, op: Op) {
+    pub fn add_pure_op(&mut self, op: Op) {
         let result = op.pos;
         self.add_op(
             result,
-            PreambleOp {
+            PotentialShortOp::Preamble(PreambleOp {
                 op,
                 kind: PreambleOpKind::Pure,
-                label_arg_idx: Some(label_arg_idx),
+                label_arg_idx: self.lookup_label_arg(result),
                 invented_name: false,
                 same_as_source: None,
-            },
+            }),
         );
     }
 
-    /// Add a heap read that produces a label arg value.
+    /// Add a heap read as a short-box candidate.
     /// shortpreamble.py: sb.add_heap_op(op, descr)
-    pub fn add_heap_op(&mut self, label_arg_idx: usize, op: Op, descr_idx: u32) {
+    pub fn add_heap_op(&mut self, op: Op, descr_idx: u32) {
         let result = op.pos;
         self.add_op(
             result,
-            PreambleOp {
+            PotentialShortOp::Preamble(PreambleOp {
                 op,
                 kind: PreambleOpKind::Heap { descr_idx },
-                label_arg_idx: Some(label_arg_idx),
+                label_arg_idx: self.lookup_label_arg(result),
                 invented_name: false,
                 same_as_source: None,
-            },
+            }),
         );
     }
 
-    /// Add a loop-invariant call that produces a label arg value.
-    pub fn add_loopinvariant_op(&mut self, label_arg_idx: usize, op: Op) {
+    /// Add a loop-invariant call as a short-box candidate.
+    pub fn add_loopinvariant_op(&mut self, op: Op) {
         let result = op.pos;
         self.add_op(
             result,
-            PreambleOp {
+            PotentialShortOp::Preamble(PreambleOp {
                 op,
                 kind: PreambleOpKind::LoopInvariant,
-                label_arg_idx: Some(label_arg_idx),
+                label_arg_idx: self.lookup_label_arg(result),
                 invented_name: false,
                 same_as_source: None,
-            },
+            }),
         );
     }
 
@@ -483,13 +548,13 @@ impl ShortBoxes {
                 same_as
             }
         };
-        self.potential_ops.entry(arg).or_insert(vec![PreambleOp {
+        self.potential_ops.entry(arg).or_insert(PotentialShortOp::Preamble(PreambleOp {
             op,
             kind: PreambleOpKind::InputArg,
             label_arg_idx,
             invented_name: false,
             same_as_source: None,
-        }]);
+        }));
         if !self.potential_order.contains(&arg) {
             self.potential_order.push(arg);
         }
@@ -510,14 +575,14 @@ impl ShortBoxes {
         Some(opref)
     }
 
-    fn pick_producer_index(candidates: &[PreambleOp], pick_other: bool) -> usize {
+    fn pick_produced_op_index(candidates: &[ProducedShortOp], pick_other: bool) -> usize {
         let mut index: Option<usize> = None;
         for (i, item) in candidates.iter().enumerate() {
             let prefer = !matches!(item.kind, PreambleOpKind::Heap { .. })
                 && (pick_other || item.kind == PreambleOpKind::InputArg);
             if prefer {
                 if index.is_some() && pick_other {
-                    return Self::pick_producer_index(candidates, false);
+                    return Self::pick_produced_op_index(candidates, false);
                 }
                 index = Some(i);
             }
@@ -532,32 +597,9 @@ impl ShortBoxes {
         if self.boxes_in_production.contains(&result) {
             return None;
         }
-        let candidates = self.potential_ops.get(&result)?.clone();
+        let candidate = self.potential_ops.get(&result)?.clone();
         self.boxes_in_production.insert(result);
-        let produced = if candidates.len() == 1 {
-            candidates[0].add_op_to_short(self)
-        } else {
-            let index = Self::pick_producer_index(&candidates, true);
-            let chosen = candidates[index].add_op_to_short(self);
-            if chosen.is_some() {
-                for (i, candidate) in candidates.iter().enumerate() {
-                    if i == index {
-                        continue;
-                    }
-                    let Some(mut alt) = candidate.add_op_to_short(self) else {
-                        continue;
-                    };
-                    let alias = OpRef(self.next_synthetic_pos);
-                    self.next_synthetic_pos += 1;
-                    alt.preamble_op.pos = alias;
-                    alt.invented_name = true;
-                    alt.same_as_source = Some(result);
-                    self.produced_short_boxes.insert(alias, alt.clone());
-                    self.produced_order.push(alias);
-                }
-            }
-            chosen
-        }?;
+        let produced = candidate.add_op_to_short(self)?;
         self.produced_short_boxes.insert(result, produced.clone());
         self.produced_order.push(result);
         self.boxes_in_production.remove(&result);
@@ -597,16 +639,22 @@ impl ShortBoxes {
     /// Add a produced operation to the short boxes at the given position.
     pub fn add_potential_op(&mut self, label_arg_idx: usize, op: Op, kind: PreambleOpKind) {
         let result = op.pos;
-        self.add_op(
-            result,
-            PreambleOp {
-                op,
-                kind,
-                label_arg_idx: Some(label_arg_idx),
-                invented_name: false,
-                same_as_source: None,
-            },
-        );
+        let pop = PotentialShortOp::Preamble(PreambleOp {
+            op,
+            kind,
+            label_arg_idx: Some(label_arg_idx),
+            invented_name: false,
+            same_as_source: None,
+        });
+        let next = match self.potential_ops.remove(&result) {
+            Some(prev) => PotentialShortOp::Compound(CompoundOp {
+                res: result,
+                one: Box::new(pop),
+                two: Box::new(prev),
+            }),
+            None => pop,
+        };
+        self.add_op(result, next);
     }
 }
 
@@ -630,10 +678,13 @@ pub fn create_short_boxes(
         .collect()
 }
 
-/// shortpreamble.py: ExtendedShortPreambleBuilder — extended builder
-/// that classifies operations into Guard/Heap/Pure/LoopInvariant types
-/// for more precise short preamble generation.
-pub struct ExtendedShortPreambleBuilder {
+/// Collector-side extended builder for extracting categorized preamble ops from
+/// a peeled trace.
+///
+/// This is intentionally separate from RPython's active
+/// `ExtendedShortPreambleBuilder`, which operates while building the short
+/// preamble for phase 2 / bridge entry.
+pub struct CollectedExtendedShortPreambleBuilder {
     /// Guards from the preamble.
     guards: Vec<PreambleOp>,
     /// Heap reads from the preamble.
@@ -646,9 +697,9 @@ pub struct ExtendedShortPreambleBuilder {
     preamble_to_label_arg: HashMap<OpRef, usize>,
 }
 
-impl ExtendedShortPreambleBuilder {
+impl CollectedExtendedShortPreambleBuilder {
     pub fn new() -> Self {
-        ExtendedShortPreambleBuilder {
+        CollectedExtendedShortPreambleBuilder {
             guards: Vec::new(),
             heap_ops: Vec::new(),
             pure_ops: Vec::new(),
@@ -738,21 +789,32 @@ impl ExtendedShortPreambleBuilder {
                         arg_mapping.push((arg_pos, label_idx));
                     }
                 }
+                let mut fail_arg_mapping = Vec::new();
+                if let Some(fail_args) = &preamble_op.op.fail_args {
+                    for (fail_arg_pos, fail_arg_ref) in fail_args.iter().enumerate() {
+                        if let Some(&label_idx) = self.preamble_to_label_arg.get(fail_arg_ref) {
+                            fail_arg_mapping.push((fail_arg_pos, label_idx));
+                        }
+                    }
+                }
                 ShortPreambleOp {
                     op: preamble_op.op,
                     arg_mapping,
+                    fail_arg_mapping,
                 }
             })
             .collect();
 
         ShortPreamble {
             ops: entries,
+            inputargs: Vec::new(),
+            used_boxes: Vec::new(),
             exported_state,
         }
     }
 }
 
-impl Default for ExtendedShortPreambleBuilder {
+impl Default for CollectedExtendedShortPreambleBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -765,9 +827,9 @@ pub struct CompoundOp {
     /// The result OpRef of the compound operation.
     pub res: OpRef,
     /// First sub-operation.
-    pub one: Box<PreambleOp>,
+    one: Box<PotentialShortOp>,
     /// Second sub-operation (depends on the result of `one`).
-    pub two: Box<PreambleOp>,
+    two: Box<PotentialShortOp>,
 }
 
 impl CompoundOp {
@@ -775,25 +837,26 @@ impl CompoundOp {
     ///
     /// Recursively flatten a tree of CompoundOps into a list of
     /// ProducedShortOps in dependency order (children first).
-    pub fn flatten(&self) -> Vec<ProducedShortOp> {
-        let mut result = Vec::new();
-        // Emit first sub-op
-        result.push(ProducedShortOp {
-            kind: self.one.kind.clone(),
-            preamble_op: self.one.op.clone(),
-            invented_name: self.one.invented_name,
-            same_as_source: self.one.same_as_source,
-        });
-        // Emit second sub-op (may itself be compound — but in Rust
-        // we don't have the recursive PreambleOp tree structure,
-        // so we just emit `two` directly).
-        result.push(ProducedShortOp {
-            kind: self.two.kind.clone(),
-            preamble_op: self.two.op.clone(),
-            invented_name: self.two.invented_name,
-            same_as_source: self.two.same_as_source,
-        });
-        result
+    pub fn flatten(&self, sb: &mut ShortBoxes, mut produced: Vec<ProducedShortOp>) -> Vec<ProducedShortOp> {
+        match self.one.as_ref() {
+            PotentialShortOp::Compound(compound) => {
+                produced = compound.flatten(sb, produced);
+            }
+            PotentialShortOp::Preamble(op) => {
+                if let Some(pop) = op.add_op_to_short(sb) {
+                    produced.push(pop);
+                }
+            }
+        }
+        match self.two.as_ref() {
+            PotentialShortOp::Compound(compound) => compound.flatten(sb, produced),
+            PotentialShortOp::Preamble(op) => {
+                if let Some(pop) = op.add_op_to_short(sb) {
+                    produced.push(pop);
+                }
+                produced
+            }
+        }
     }
 }
 
@@ -845,6 +908,268 @@ pub struct ProducedShortOp {
     pub same_as_source: Option<OpRef>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct AbstractShortPreambleBuilderState {
+    short: Vec<Op>,
+    used_boxes: Vec<OpRef>,
+    short_preamble_jump: Vec<Op>,
+    extra_same_as: Vec<Op>,
+    short_inputargs: Vec<OpRef>,
+}
+
+impl AbstractShortPreambleBuilderState {
+    fn record_preamble_use(&mut self, result: OpRef, produced: &ProducedShortOp) {
+        if produced.invented_name {
+            let source = produced.same_as_source.unwrap_or(result);
+            let mut op = Op::new(
+                OpCode::same_as_for_type(produced.preamble_op.result_type()),
+                &[source],
+            );
+            op.pos = result;
+            self.extra_same_as.push(op);
+        }
+        self.used_boxes.push(result);
+        self.short_preamble_jump.push(produced.preamble_op.clone());
+    }
+
+    fn use_box(&mut self, result: OpRef, produced: &ProducedShortOp) -> Op {
+        let preamble_op = produced.preamble_op.clone();
+        self.short.push(preamble_op.clone());
+        if preamble_op.opcode.is_ovf() {
+            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+        }
+        self.record_preamble_use(result, produced);
+        preamble_op
+    }
+}
+
+/// shortpreamble.py: ShortPreambleBuilder
+///
+/// Builds the replayable short preamble from exported short boxes, while also
+/// collecting `used_boxes`, `short_preamble_jump`, and `extra_same_as`.
+pub struct ShortPreambleBuilder {
+    state: AbstractShortPreambleBuilderState,
+    produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
+}
+
+impl ShortPreambleBuilder {
+    pub fn new(
+        label_args: &[OpRef],
+        short_boxes: &[(OpRef, ProducedShortOp)],
+        short_inputargs: &[OpRef],
+    ) -> Self {
+        let produced_short_boxes = short_boxes.iter().cloned().collect();
+        ShortPreambleBuilder {
+            state: AbstractShortPreambleBuilderState {
+                short_inputargs: if short_inputargs.is_empty() {
+                    label_args.to_vec()
+                } else {
+                    short_inputargs.to_vec()
+                },
+                ..AbstractShortPreambleBuilderState::default()
+            },
+            produced_short_boxes,
+        }
+    }
+
+    fn use_box_recursive(
+        &mut self,
+        result: OpRef,
+        visiting: &mut HashSet<OpRef>,
+    ) -> Option<Op> {
+        let produced = self.produced_short_boxes.get(&result)?.clone();
+        if self.state.used_boxes.contains(&result) {
+            return Some(produced.preamble_op);
+        }
+        if !visiting.insert(result) {
+            return None;
+        }
+        for &arg in &produced.preamble_op.args {
+            if self.produced_short_boxes.contains_key(&arg) {
+                let _ = self.use_box_recursive(arg, visiting);
+            }
+        }
+        visiting.remove(&result);
+        Some(self.state.use_box(result, &produced))
+    }
+
+    pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
+        self.use_box_recursive(result, &mut HashSet::new())
+    }
+
+    pub fn add_preamble_op(&mut self, result: OpRef) -> bool {
+        let Some(produced) = self.produced_short_boxes.get(&result).cloned() else {
+            return false;
+        };
+        self.state.record_preamble_use(result, &produced);
+        true
+    }
+
+    pub fn build_short_preamble(&self) -> Vec<Op> {
+        let mut result = Vec::with_capacity(self.state.short.len() + 2);
+        result.push(Op::new(OpCode::Label, &self.state.short_inputargs));
+        result.extend(self.state.short.iter().cloned());
+        let jump_args: Vec<OpRef> = self
+            .state
+            .short_preamble_jump
+            .iter()
+            .map(|op| op.pos)
+            .collect();
+        result.push(Op::new(OpCode::Jump, &jump_args));
+        result
+    }
+
+    pub fn build_short_preamble_struct(&self) -> ShortPreamble {
+        let short_inputarg_positions: HashMap<OpRef, usize> = self
+            .state
+            .short_inputargs
+            .iter()
+            .enumerate()
+            .map(|(idx, &arg)| (arg, idx))
+            .collect();
+        let entries = self
+            .state
+            .short
+            .iter()
+            .cloned()
+            .map(|op| {
+                let arg_mapping = op
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(arg_pos, arg_ref)| {
+                        short_inputarg_positions
+                            .get(arg_ref)
+                            .copied()
+                            .map(|label_idx| (arg_pos, label_idx))
+                    })
+                    .collect();
+                let fail_arg_mapping = op
+                    .fail_args
+                    .as_ref()
+                    .map(|fail_args| {
+                        fail_args
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(fail_arg_pos, fail_arg_ref)| {
+                                short_inputarg_positions
+                                    .get(fail_arg_ref)
+                                    .copied()
+                                    .map(|label_idx| (fail_arg_pos, label_idx))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ShortPreambleOp {
+                    op,
+                    arg_mapping,
+                    fail_arg_mapping,
+                }
+            })
+            .collect();
+        ShortPreamble {
+            ops: entries,
+            inputargs: self.state.short_inputargs.clone(),
+            used_boxes: self.state.used_boxes.clone(),
+            exported_state: None,
+        }
+    }
+
+    pub fn used_boxes(&self) -> &[OpRef] {
+        &self.state.used_boxes
+    }
+
+    pub fn extra_same_as(&self) -> &[Op] {
+        &self.state.extra_same_as
+    }
+
+    pub fn short_inputargs(&self) -> &[OpRef] {
+        &self.state.short_inputargs
+    }
+}
+
+/// shortpreamble.py: ExtendedShortPreambleBuilder
+///
+/// Shares `extra_same_as` with the base builder while extending the short
+/// preamble during inline-short-preamble replay.
+pub struct ExtendedShortPreambleBuilder {
+    produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
+    short: Vec<Op>,
+    jump_args: Vec<Op>,
+    label_args: Option<Vec<OpRef>>,
+    extra_same_as: Vec<Op>,
+    pub target_token: u64,
+}
+
+impl ExtendedShortPreambleBuilder {
+    pub fn new(target_token: u64, sb: &ShortPreambleBuilder) -> Self {
+        ExtendedShortPreambleBuilder {
+            produced_short_boxes: sb.produced_short_boxes.clone(),
+            short: Vec::new(),
+            jump_args: Vec::new(),
+            label_args: None,
+            extra_same_as: sb.extra_same_as().to_vec(),
+            target_token,
+        }
+    }
+
+    pub fn setup(&mut self, jump_args: Vec<Op>, short: Vec<Op>, label_args: Vec<OpRef>) {
+        self.jump_args = jump_args;
+        self.short = short;
+        self.label_args = Some(label_args);
+    }
+
+    pub fn add_preamble_op(&mut self, result: OpRef) -> bool {
+        let Some(produced) = self.produced_short_boxes.get(&result).cloned() else {
+            return false;
+        };
+        if produced.invented_name {
+            let source = produced.same_as_source.unwrap_or(result);
+            let mut op = Op::new(
+                OpCode::same_as_for_type(produced.preamble_op.result_type()),
+                &[source],
+            );
+            op.pos = result;
+            self.extra_same_as.push(op);
+        }
+        let Some(label_args) = self.label_args.as_mut() else {
+            return false;
+        };
+        label_args.push(result);
+        self.jump_args.push(produced.preamble_op);
+        true
+    }
+
+    pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
+        let jump = self.jump_args.pop()?;
+        let produced = self.produced_short_boxes.get(&result)?.clone();
+        let mut state = AbstractShortPreambleBuilderState {
+            short: std::mem::take(&mut self.short),
+            used_boxes: Vec::new(),
+            short_preamble_jump: Vec::new(),
+            extra_same_as: std::mem::take(&mut self.extra_same_as),
+            short_inputargs: Vec::new(),
+        };
+        let preamble_op = state.use_box(result, &produced);
+        self.short = state.short;
+        self.extra_same_as = state.extra_same_as;
+        self.jump_args.push(jump);
+        Some(preamble_op)
+    }
+
+    pub fn extra_same_as(&self) -> &[Op] {
+        &self.extra_same_as
+    }
+
+    pub fn label_args(&self) -> Option<&[OpRef]> {
+        self.label_args.as_deref()
+    }
+
+    pub fn jump_args(&self) -> &[Op] {
+        &self.jump_args
+    }
+}
+
 /// shortpreamble.py: build short preamble from optimizer state.
 /// Called after preamble optimization is complete.
 /// Collects guards + pure ops from the optimized preamble and
@@ -854,7 +1179,7 @@ pub fn build_from_preamble_and_label(
     label_args: &[OpRef],
     exported_state: Option<VirtualState>,
 ) -> ShortPreamble {
-    let mut builder = ShortPreambleBuilder::new();
+    let mut builder = CollectedShortPreambleBuilder::new();
     // Record all preamble ops
     for op in preamble_ops {
         if op.opcode.is_guard() {
@@ -910,20 +1235,55 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             .enumerate()
             .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
             .collect();
+        let fail_arg_mapping: Vec<(usize, usize)> = op
+            .fail_args
+            .as_ref()
+            .into_iter()
+            .flat_map(|fail_args| fail_args.iter().enumerate())
+            .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
+            .collect();
 
         // Only include ops that reference label args
-        if !arg_mapping.is_empty() {
+        if !arg_mapping.is_empty() || !fail_arg_mapping.is_empty() {
             entries.push(ShortPreambleOp {
                 op: op.clone(),
                 arg_mapping,
+                fail_arg_mapping,
             });
         }
     }
 
-    ShortPreamble {
-        ops: entries,
-        exported_state: None,
+        ShortPreamble {
+            ops: entries,
+            inputargs: Vec::new(),
+            used_boxes: Vec::new(),
+            exported_state: None,
+        }
+}
+
+pub fn build_short_preamble_from_exported_boxes(
+    label_args: &[OpRef],
+    exported_short_boxes: &[PreambleOp],
+) -> ShortPreamble {
+    let produced: Vec<(OpRef, ProducedShortOp)> = exported_short_boxes
+        .iter()
+        .map(|entry| {
+            (
+                entry.op.pos,
+                ProducedShortOp {
+                    kind: entry.kind.clone(),
+                    preamble_op: entry.op.clone(),
+                    invented_name: entry.invented_name,
+                    same_as_source: entry.same_as_source,
+                },
+            )
+        })
+        .collect();
+    let mut builder = ShortPreambleBuilder::new(label_args, &produced, label_args);
+    for (result, _) in &produced {
+        let _ = builder.use_box(*result);
     }
+    builder.build_short_preamble_struct()
 }
 
 #[cfg(test)]
@@ -1015,7 +1375,10 @@ mod tests {
             ops: vec![ShortPreambleOp {
                 op: guard_op,
                 arg_mapping: vec![(0, 0)], // arg 0 maps to label arg 0
+                fail_arg_mapping: Vec::new(),
             }],
+            inputargs: vec![OpRef(100), OpRef(101)],
+            used_boxes: Vec::new(),
             exported_state: None,
         };
 
@@ -1037,7 +1400,10 @@ mod tests {
             ops: vec![ShortPreambleOp {
                 op: guard_op,
                 arg_mapping: vec![(0, 0), (1, 1)],
+                fail_arg_mapping: Vec::new(),
             }],
+            inputargs: vec![OpRef(100), OpRef(101)],
+            used_boxes: Vec::new(),
             exported_state: None,
         };
 
@@ -1050,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_builder_collects_guards() {
-        let mut builder = ShortPreambleBuilder::new();
+        let mut builder = CollectedShortPreambleBuilder::new();
 
         // Simulate preamble processing
         let guard1 = Op::new(OpCode::GuardTrue, &[OpRef(100)]);
@@ -1074,7 +1440,7 @@ mod tests {
 
     #[test]
     fn test_builder_maps_args_to_label_indices() {
-        let mut builder = ShortPreambleBuilder::new();
+        let mut builder = CollectedShortPreambleBuilder::new();
 
         // Preamble has guard on v100 and v101
         let guard = Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(200)]);
@@ -1091,7 +1457,7 @@ mod tests {
 
     #[test]
     fn test_builder_add_preamble_op_any_type() {
-        let mut builder = ShortPreambleBuilder::new();
+        let mut builder = CollectedShortPreambleBuilder::new();
 
         // add_preamble_op accepts any op type (not just guards)
         let pure_op = Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]);
@@ -1168,7 +1534,10 @@ mod tests {
             ops: vec![ShortPreambleOp {
                 op: Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
                 arg_mapping: vec![(0, 0)],
+                fail_arg_mapping: Vec::new(),
             }],
+            inputargs: vec![OpRef(0)],
+            used_boxes: Vec::new(),
             exported_state: None,
         };
 
@@ -1186,27 +1555,152 @@ mod tests {
     }
 
     #[test]
+    fn test_instantiate_remaps_fail_args_by_position() {
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
+        guard.fail_args = Some(vec![OpRef(10), OpRef(20)].into());
+        let sp = ShortPreamble {
+            ops: vec![ShortPreambleOp {
+                op: guard,
+                arg_mapping: vec![(0, 0)],
+                fail_arg_mapping: vec![(0, 0), (1, 1)],
+            }],
+            inputargs: vec![OpRef(10), OpRef(20)],
+            used_boxes: Vec::new(),
+            exported_state: None,
+        };
+
+        let instantiated = sp.instantiate(&[OpRef(100), OpRef(200)]);
+        assert_eq!(instantiated[0].args[0], OpRef(100));
+        let fail_args = instantiated[0].fail_args.as_ref().unwrap();
+        assert_eq!(fail_args.as_slice(), &[OpRef(100), OpRef(200)]);
+    }
+
+    #[test]
     fn test_num_guards_and_pure_ops() {
         let sp = ShortPreamble {
             ops: vec![
                 ShortPreambleOp {
                     op: Op::new(OpCode::GuardTrue, &[OpRef(0)]),
                     arg_mapping: vec![(0, 0)],
+                    fail_arg_mapping: Vec::new(),
                 },
                 ShortPreambleOp {
                     op: Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
                     arg_mapping: vec![(0, 0), (1, 1)],
+                    fail_arg_mapping: Vec::new(),
                 },
                 ShortPreambleOp {
                     op: Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
                     arg_mapping: vec![(0, 0)],
+                    fail_arg_mapping: Vec::new(),
                 },
             ],
+            inputargs: vec![OpRef(0), OpRef(1)],
+            used_boxes: Vec::new(),
             exported_state: None,
         };
 
         assert_eq!(sp.num_guards(), 2);
         assert_eq!(sp.num_pure_ops(), 1);
+    }
+
+    #[test]
+    fn test_build_short_preamble_from_exported_boxes_uses_exported_order() {
+        let exported = vec![
+            PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                    op.pos = OpRef(7);
+                    op
+                },
+                kind: PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            },
+            PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntSub, &[OpRef(7), OpRef(1)]);
+                    op.pos = OpRef(8);
+                    op
+                },
+                kind: PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            },
+        ];
+
+        let sp = build_short_preamble_from_exported_boxes(&[OpRef(0), OpRef(1)], &exported);
+        assert_eq!(sp.ops.len(), 2);
+        assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
+        assert_eq!(sp.ops[1].op.opcode, OpCode::IntSub);
+        assert_eq!(sp.ops[1].arg_mapping, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn test_rpython_short_preamble_builder_use_box_recurses_dependencies() {
+        let produced = vec![
+            (
+                OpRef(7),
+                ProducedShortOp {
+                    kind: PreambleOpKind::Pure,
+                    preamble_op: {
+                        let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                        op.pos = OpRef(7);
+                        op
+                    },
+                    invented_name: false,
+                    same_as_source: None,
+                },
+            ),
+            (
+                OpRef(8),
+                ProducedShortOp {
+                    kind: PreambleOpKind::Pure,
+                    preamble_op: {
+                        let mut op = Op::new(OpCode::IntMul, &[OpRef(7), OpRef(1)]);
+                        op.pos = OpRef(8);
+                        op
+                    },
+                    invented_name: false,
+                    same_as_source: None,
+                },
+            ),
+        ];
+        let mut builder = ShortPreambleBuilder::new(&[OpRef(0), OpRef(1)], &produced, &[OpRef(0), OpRef(1)]);
+
+        let used = builder.use_box(OpRef(8)).unwrap();
+        assert_eq!(used.opcode, OpCode::IntMul);
+        let short = builder.build_short_preamble();
+        assert_eq!(short[1].opcode, OpCode::IntAdd);
+        assert_eq!(short[2].opcode, OpCode::IntMul);
+        assert_eq!(builder.used_boxes(), &[OpRef(7), OpRef(8)]);
+    }
+
+    #[test]
+    fn test_build_short_preamble_struct_preserves_inputargs_and_used_boxes() {
+        let produced = vec![(
+            OpRef(7),
+            ProducedShortOp {
+                kind: PreambleOpKind::Pure,
+                preamble_op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                    op.pos = OpRef(7);
+                    op
+                },
+                invented_name: false,
+                same_as_source: None,
+            },
+        )];
+        let mut builder =
+            ShortPreambleBuilder::new(&[OpRef(0), OpRef(1)], &produced, &[OpRef(0), OpRef(1)]);
+
+        let _ = builder.use_box(OpRef(7));
+        let sp = builder.build_short_preamble_struct();
+
+        assert_eq!(sp.inputargs, vec![OpRef(0), OpRef(1)]);
+        assert_eq!(sp.used_boxes, vec![OpRef(7)]);
     }
 
     #[test]
@@ -1226,7 +1720,7 @@ mod tests {
 
     #[test]
     fn test_extended_builder() {
-        let mut builder = ExtendedShortPreambleBuilder::new();
+        let mut builder = CollectedExtendedShortPreambleBuilder::new();
         builder.set_label_args(&[OpRef(100), OpRef(101)]);
         builder.add_guard(Op::new(OpCode::GuardTrue, &[OpRef(100)]));
         builder.add_pure_op(Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]));
@@ -1243,11 +1737,152 @@ mod tests {
         sb.label_arg_positions.insert(OpRef(11), 1);
         let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         pure.pos = OpRef(10);
-        sb.add_pure_op(0, pure);
+        sb.add_pure_op(pure);
         let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
         heap.pos = OpRef(11);
-        sb.add_heap_op(1, heap, 5);
+        sb.add_heap_op(heap, 5);
         let produced = sb.produced_ops();
         assert_eq!(produced.len(), 2);
+    }
+
+    #[test]
+    fn test_short_boxes_compound_prefers_non_heap_and_emits_invented_alias() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(10)]);
+
+        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        heap.pos = OpRef(10);
+        sb.add_potential_op(0, heap, PreambleOpKind::Heap { descr_idx: 55 });
+
+        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        pure.pos = OpRef(10);
+        sb.add_potential_op(0, pure, PreambleOpKind::Pure);
+
+        let produced = sb.produced_ops();
+        assert_eq!(produced.len(), 2);
+
+        let chosen = produced.iter().find(|(result, _)| *result == OpRef(10)).unwrap();
+        assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
+        assert!(!chosen.1.invented_name);
+
+        let alias = produced.iter().find(|(result, _)| *result != OpRef(10)).unwrap();
+        assert_eq!(alias.1.kind, PreambleOpKind::Heap { descr_idx: 55 });
+        assert!(alias.1.invented_name);
+        assert_eq!(alias.1.same_as_source, Some(OpRef(10)));
+    }
+
+    #[test]
+    fn test_short_boxes_nested_compound_emits_multiple_invented_aliases() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(20)]);
+
+        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        heap.pos = OpRef(20);
+        sb.add_potential_op(0, heap, PreambleOpKind::Heap { descr_idx: 60 });
+
+        let mut loopinv = Op::new(OpCode::CallI, &[OpRef(0)]);
+        loopinv.pos = OpRef(20);
+        sb.add_potential_op(0, loopinv, PreambleOpKind::LoopInvariant);
+
+        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        pure.pos = OpRef(20);
+        sb.add_potential_op(0, pure, PreambleOpKind::Pure);
+
+        let produced = sb.produced_ops();
+        assert_eq!(produced.len(), 3);
+
+        let chosen = produced.iter().find(|(result, _)| *result == OpRef(20)).unwrap();
+        assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
+        assert!(!chosen.1.invented_name);
+
+        let aliases: Vec<_> = produced
+            .iter()
+            .filter(|(result, _)| *result != OpRef(20))
+            .collect();
+        assert_eq!(aliases.len(), 2);
+        assert!(aliases.iter().all(|(_, produced)| produced.invented_name));
+        assert!(aliases
+            .iter()
+            .all(|(_, produced)| produced.same_as_source == Some(OpRef(20))));
+    }
+
+    #[test]
+    fn test_rpython_short_preamble_builder_use_box_builds_label_short_and_jump() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(10)]);
+
+        let mut ovf = Op::new(OpCode::IntAddOvf, &[OpRef(0), OpRef(1)]);
+        ovf.pos = OpRef(10);
+        sb.add_potential_op(0, ovf, PreambleOpKind::Pure);
+
+        let produced = sb.produced_ops();
+        let mut builder = ShortPreambleBuilder::new(&[OpRef(10)], &produced, &[OpRef(10)]);
+        let used = builder.use_box(OpRef(10)).unwrap();
+        assert_eq!(used.opcode, OpCode::IntAddOvf);
+        assert_eq!(builder.used_boxes(), &[OpRef(10)]);
+
+        let short = builder.build_short_preamble();
+        assert_eq!(short.len(), 4);
+        assert_eq!(short[0].opcode, OpCode::Label);
+        assert_eq!(short[1].opcode, OpCode::IntAddOvf);
+        assert_eq!(short[2].opcode, OpCode::GuardNoOverflow);
+        assert_eq!(short[3].opcode, OpCode::Jump);
+        assert_eq!(short[3].args.as_slice(), &[OpRef(10)]);
+    }
+
+    #[test]
+    fn test_rpython_short_preamble_builder_tracks_extra_same_as() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(20)]);
+
+        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        heap.pos = OpRef(20);
+        sb.add_potential_op(0, heap, PreambleOpKind::Heap { descr_idx: 61 });
+
+        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        pure.pos = OpRef(20);
+        sb.add_potential_op(0, pure, PreambleOpKind::Pure);
+
+        let produced = sb.produced_ops();
+        let alias_result = produced
+            .iter()
+            .find(|(result, pop)| *result != OpRef(20) && pop.invented_name)
+            .map(|(result, _)| *result)
+            .unwrap();
+
+        let mut builder = ShortPreambleBuilder::new(&[OpRef(20)], &produced, &[OpRef(20)]);
+        assert!(builder.add_preamble_op(alias_result));
+        let extra = builder.extra_same_as();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].opcode, OpCode::SameAsI);
+        assert_eq!(extra[0].pos, alias_result);
+        assert_eq!(extra[0].args.as_slice(), &[OpRef(20)]);
+    }
+
+    #[test]
+    fn test_rpython_extended_builder_appends_label_and_jump_for_alias() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(30)]);
+
+        let mut heap = Op::new(OpCode::GetfieldGcI, &[OpRef(0)]);
+        heap.pos = OpRef(30);
+        sb.add_potential_op(0, heap, PreambleOpKind::Heap { descr_idx: 71 });
+
+        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        pure.pos = OpRef(30);
+        sb.add_potential_op(0, pure, PreambleOpKind::Pure);
+
+        let produced = sb.produced_ops();
+        let alias_result = produced
+            .iter()
+            .find(|(result, pop)| *result != OpRef(30) && pop.invented_name)
+            .map(|(result, _)| *result)
+            .unwrap();
+
+        let builder = ShortPreambleBuilder::new(&[OpRef(30)], &produced, &[OpRef(30)]);
+        let mut ext = ExtendedShortPreambleBuilder::new(7, &builder);
+        ext.setup(vec![Op::new(OpCode::Jump, &[OpRef(30)])], vec![], vec![OpRef(30)]);
+
+        assert!(ext.add_preamble_op(alias_result));
+        assert_eq!(ext.label_args().unwrap(), &[OpRef(30), alias_result]);
+        assert_eq!(ext.jump_args().len(), 2);
+        assert_eq!(ext.extra_same_as().len(), 1);
+        assert_eq!(ext.extra_same_as()[0].opcode, OpCode::SameAsI);
+        assert_eq!(ext.extra_same_as()[0].pos, alias_result);
     }
 }
