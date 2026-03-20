@@ -1178,13 +1178,14 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
-                    // [pool_ptr, selected, head_0, ..., head_N]
+                    // Linked-list mode carries pool/selected and the tracked head refs.
                     let mut values = vec![
                         (&self.#pool_field as *const _ as usize) as i64,
                         self.#sel_field as i64,
                     ];
                     for &(sidx, _) in &meta.storage_layout {
-                        values.push(self.#pool_field.get(sidx).head_ptr() as i64);
+                        let head = self.#pool_field.get(sidx).head_ptr();
+                        values.push(head as i64);
                     }
                     values
                 }
@@ -1193,7 +1194,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     // [pool_ptr=Int, selected=Int, head_0=Ref, ..., head_N=Ref]
                     let mut types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
                     for _ in &meta.storage_layout {
-                        types.push(majit_ir::Type::Ref);
+                        types.push(majit_ir::Type::Ref); // head
                     }
                     types
                 }
@@ -1201,7 +1202,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                     let mut heads = std::collections::HashMap::new();
                     for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
-                        // inputarg index = 2 + i (after pool, selected)
+                        // inputarg layout: [pool, selected, head_0, ..., head_N]
                         heads.insert(sidx, majit_ir::OpRef((2 + i) as u32));
                     }
                     __JitSym {
