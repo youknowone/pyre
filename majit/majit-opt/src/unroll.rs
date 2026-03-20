@@ -19,7 +19,7 @@
 /// don't collide with the original ops.
 use std::collections::HashMap;
 
-use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{GcRef, Op, OpCode, OpRef, Type, Value};
 
 use crate::{OptContext, Optimization, OptimizationResult};
 
@@ -133,6 +133,24 @@ impl UnrollOptimizer {
         self.short_preamble.as_ref()
     }
 
+    /// unroll.py:238-242: jump_to_preamble — redirect body JUMP to preamble.
+    ///
+    /// When jump_to_existing_trace fails (no compatible target_token),
+    /// the body JUMP goes back to the preamble for the next iteration.
+    /// This ensures the preamble guard provides loop exit.
+    ///
+    /// Returns modified body ops with JUMP targeting preamble inputargs.
+    pub fn jump_to_preamble(body_ops: &[Op], preamble_num_inputs: usize) -> Vec<Op> {
+        let mut result = body_ops.to_vec();
+        if let Some(jump) = result.iter_mut().rfind(|op| op.opcode == OpCode::Jump) {
+            // Truncate JUMP args to preamble's inputarg count.
+            // The preamble expects [pool, selected, ...] — fewer args than
+            // the body's flattened [pool, selected, field1, field2, ...].
+            jump.args.truncate(preamble_num_inputs);
+        }
+        result
+    }
+
     /// unroll.py: check_retrace_count(retrace_count, max_retrace_guards)
     /// Whether this bridge has too many guards for retrace to be worthwhile.
     pub fn too_many_guards_for_retrace(&self, retrace_count: u32, max_retrace_guards: u32) -> bool {
@@ -210,7 +228,16 @@ impl UnrollOptimizer {
 
         if jump_virtuals.is_empty() {
             *constants = consts_p1;
-            let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
+            let sp = opt_p1
+                .exported_loop_state
+                .as_ref()
+                .map(|state| {
+                    crate::shortpreamble::build_short_preamble_from_exported_boxes(
+                        &state.end_args,
+                        &state.exported_short_boxes,
+                    )
+                })
+                .unwrap_or_else(|| crate::shortpreamble::extract_short_preamble(&p1_ops));
             // Store TargetToken even for non-peeled loops (for bridge reuse)
             if let Some(ref es) = opt_p1.exported_loop_state {
                 let opt_unroll = OptUnroll::new();
@@ -246,8 +273,6 @@ impl UnrollOptimizer {
             );
         }
 
-        let imported = build_imported_virtuals(&jump_virtuals);
-
         let remapped_ops = ops.to_vec();
         let mut consts_p2 = consts_p1.clone();
 
@@ -256,7 +281,6 @@ impl UnrollOptimizer {
             None => crate::optimizer::Optimizer::default_pipeline(),
         };
         opt_p2.imported_loop_state = Some(exported_state.clone());
-        opt_p2.imported_virtuals = imported;
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
@@ -285,9 +309,63 @@ impl UnrollOptimizer {
         // Build the virtual state at end of Phase 2 body.
         let p2_exported = opt_p2.exported_loop_state.clone();
         let rewritten_jump_args = p2_exported.as_ref().map(|s| s.end_args.clone());
+        let imported_short_aliases = opt_p2.imported_short_aliases.clone();
+        let imported_short_sources = opt_p2.imported_short_sources.clone();
+
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            let imported_map: HashMap<OpRef, OpRef> = imported_short_sources
+                .iter()
+                .map(|entry| (entry.result, entry.source))
+                .collect();
+            let mut defined: std::collections::HashSet<OpRef> =
+                (0..body_num_inputs as u32).map(OpRef).collect();
+            for op in &p2_ops {
+                if !op.pos.is_none() {
+                    defined.insert(op.pos);
+                }
+            }
+            let mut unresolved = Vec::new();
+            for op in &p2_ops {
+                for &arg in &op.args {
+                    if arg.is_none() || defined.contains(&arg) {
+                        continue;
+                    }
+                    if unresolved.contains(&arg) {
+                        continue;
+                    }
+                    unresolved.push(arg);
+                }
+                if let Some(fail_args) = &op.fail_args {
+                    for &arg in fail_args {
+                        if arg.is_none() || defined.contains(&arg) {
+                            continue;
+                        }
+                        if unresolved.contains(&arg) {
+                            continue;
+                        }
+                        unresolved.push(arg);
+                    }
+                }
+            }
+            eprintln!(
+                "[jit] phase 2 imported_short_sources={}, unresolved_refs={:?}",
+                imported_short_sources.len(),
+                unresolved
+            );
+            for unresolved_ref in unresolved {
+                if let Some(source) = imported_map.get(&unresolved_ref) {
+                    eprintln!(
+                        "[jit] unresolved imported ref {unresolved_ref:?} -> preamble {source:?}"
+                    );
+                }
+            }
+        }
 
         // finalize_short_preamble: create TargetToken for this loop version
-        let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
+        let sp = crate::shortpreamble::build_short_preamble_from_exported_boxes(
+            &exported_state.end_args,
+            &exported_state.exported_short_boxes,
+        );
         let opt_unroll = OptUnroll::new();
         let target_token = opt_unroll.finalize_short_preamble(
             exported_state.virtual_state.clone(),
@@ -305,13 +383,42 @@ impl UnrollOptimizer {
             );
         }
 
+        // ── unroll.py:151-175: jump_to_existing_trace / jump_to_preamble ──
+        // Try to match the body's JUMP virtual state to an existing target.
+        // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
+        let mut body_ops = p2_ops;
+        let jump_to_self = {
+            let body_jump_args: Vec<OpRef> = body_ops
+                .iter()
+                .rfind(|o| o.opcode == OpCode::Jump)
+                .map(|j| j.args.to_vec())
+                .unwrap_or_default();
+            let opt_unroll = OptUnroll::new();
+            let mut jump_ctx = crate::OptContext::with_num_inputs(32, body_num_inputs);
+            opt_unroll
+                .jump_to_existing_trace(&body_jump_args, &self.target_tokens, &mut jump_ctx)
+                .is_none() // None = jumped successfully
+        };
+
+        if !jump_to_self {
+            // unroll.py:170-171: jump_to_preamble — body JUMP → preamble Label
+            body_ops = Self::jump_to_preamble(&body_ops, num_inputs);
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[jit] jump_to_preamble: body JUMP truncated to {} args", num_inputs);
+            }
+        } else if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[jit] jump_to_existing_trace: body JUMP → self-loop");
+        }
+
         // ── Assembly (compile.py:310-338) ──
         let combined = assemble_peeled_trace(
             &p1_ops,
-            &p2_ops,
+            &body_ops,
             &exported_label_args,
             rewritten_jump_args.as_deref(),
             p2_ni,
+            &imported_short_aliases,
+            &imported_short_sources,
         );
         *constants = consts_p2;
         (combined, p2_ni)
@@ -346,14 +453,6 @@ impl UnrollOptimizer {
         oprefs.iter().all(|&r| ctx.get_replacement(r) == r)
     }
 
-    /// unroll.py: jump_to_preamble(cell_token, jump_op)
-    /// Redirect a Jump to target the preamble instead of the loop body.
-    /// Used when the virtual state doesn't match any existing target token.
-    pub fn jump_to_preamble(jump_op: &Op) -> Op {
-        // In RPython this changes the jump's descr to the preamble's target token.
-        // Here we just return a copy of the jump op (the caller attaches the token).
-        jump_op.clone()
-    }
 
     /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
     /// If the trace has too many guards, disable retracing for this location.
@@ -400,6 +499,10 @@ pub struct ExportedState {
     /// Kept in a compact form that phase 2 can translate back into imported
     /// heap cache facts.
     pub exported_short_ops: Vec<ExportedShortOp>,
+    /// RPython shortpreamble.py: produced short boxes in preamble order.
+    /// This preserves the original preamble ops so the active path can build
+    /// short preambles without re-extracting them from the peeled trace.
+    pub exported_short_boxes: Vec<crate::shortpreamble::PreambleOp>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble.
@@ -412,6 +515,8 @@ pub struct ExportedState {
 pub struct ExportedValueInfo {
     /// A constant carried by this slot.
     pub constant: Option<Value>,
+    /// Full pointer info graph exported from the preamble.
+    pub ptr_info: Option<crate::info::PtrInfo>,
     /// Non-virtual pointer shape restored from the preamble.
     pub ptr_kind: ExportedPtrKind,
     /// Descriptor for non-virtual pointer shapes.
@@ -440,6 +545,7 @@ pub enum ExportedPtrKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExportedShortOp {
     Pure {
+        source: OpRef,
         opcode: OpCode,
         descr_idx: Option<u32>,
         args: Vec<ExportedShortArg>,
@@ -448,22 +554,28 @@ pub enum ExportedShortOp {
         same_as_source: Option<OpRef>,
     },
     HeapField {
+        source: OpRef,
         object_slot: usize,
         descr_idx: u32,
+        result_type: Type,
         result: ExportedShortResult,
         invented_name: bool,
         same_as_source: Option<OpRef>,
     },
     HeapArrayItem {
+        source: OpRef,
         object_slot: usize,
         descr_idx: u32,
         index: i64,
+        result_type: Type,
         result: ExportedShortResult,
         invented_name: bool,
         same_as_source: Option<OpRef>,
     },
     LoopInvariant {
+        source: OpRef,
         func_ptr: i64,
+        result_type: Type,
         result: ExportedShortResult,
         invented_name: bool,
         same_as_source: Option<OpRef>,
@@ -491,6 +603,7 @@ impl ExportedState {
         virtual_state: crate::virtualstate::VirtualState,
         exported_infos: HashMap<OpRef, ExportedValueInfo>,
         exported_short_ops: Vec<ExportedShortOp>,
+        exported_short_boxes: Vec<crate::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         short_inputargs: Vec<OpRef>,
     ) -> Self {
@@ -500,6 +613,7 @@ impl ExportedState {
             virtual_state,
             exported_infos,
             exported_short_ops,
+            exported_short_boxes,
             short_preamble: None,
             renamed_inputargs,
             short_inputargs,
@@ -550,7 +664,7 @@ pub struct UnrollInfo {
     /// The target token for this loop's entry point.
     pub target_token: u64,
     /// Extra same_as ops added during finalization.
-    pub extra_same_as: Vec<(OpRef, OpRef)>,
+    pub extra_same_as: Vec<Op>,
     /// Quasi-immutable dependencies discovered during optimization.
     pub quasi_immutable_deps: std::collections::HashSet<u64>,
     /// Extra ops to insert before the label (from bridge inlining).
@@ -609,6 +723,7 @@ impl OptUnroll {
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
         let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
+        let exported_short_boxes = ctx.exported_short_boxes.clone();
 
         ExportedState::new(
             label_args.clone(),
@@ -616,6 +731,7 @@ impl OptUnroll {
             virtual_state,
             infos,
             exported_short_ops,
+            exported_short_boxes,
             renamed_inputargs.to_vec(),
             short_args,
         )
@@ -792,7 +908,7 @@ impl OptUnroll {
             ctx.replace_op(source, *target);
             // unroll.py:487: info = exported_state.exported_infos.get(target, None)
             if let Some(info) = exported_state.exported_infos.get(target) {
-                self.apply_exported_info(source, info, ctx);
+                self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
             }
         }
 
@@ -855,6 +971,7 @@ impl OptUnroll {
             .or_else(|| ctx.int_lower_bounds.get(&resolved).copied());
         ExportedValueInfo {
             constant,
+            ptr_info: ctx.get_ptr_info(resolved).cloned(),
             ptr_kind,
             ptr_descr,
             known_class,
@@ -865,46 +982,71 @@ impl OptUnroll {
         }
     }
 
-    fn apply_exported_info(&self, opref: OpRef, info: &ExportedValueInfo, ctx: &mut OptContext) {
+    fn apply_exported_info(
+        &self,
+        opref: OpRef,
+        info: &ExportedValueInfo,
+        exported_infos: &HashMap<OpRef, ExportedValueInfo>,
+        ctx: &mut OptContext,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        self.apply_exported_info_recursive(opref, info, exported_infos, ctx, &mut seen);
+    }
+
+    fn apply_exported_info_recursive(
+        &self,
+        opref: OpRef,
+        info: &ExportedValueInfo,
+        exported_infos: &HashMap<OpRef, ExportedValueInfo>,
+        ctx: &mut OptContext,
+        seen: &mut std::collections::HashSet<OpRef>,
+    ) {
         let opref = ctx.get_replacement(opref);
+        if !seen.insert(opref) {
+            return;
+        }
         if let Some(value) = &info.constant {
             ctx.make_constant(opref, value.clone());
             if let Value::Ref(ptr) = value {
                 ctx.set_ptr_info(opref, crate::info::PtrInfo::Constant(*ptr));
             }
         }
-        match info.ptr_kind {
-            ExportedPtrKind::Instance => {
-                ctx.set_ptr_info(
-                    opref,
-                    crate::info::PtrInfo::instance(info.ptr_descr.clone(), info.known_class),
-                );
-            }
-            ExportedPtrKind::Struct => {
-                if let Some(descr) = info.ptr_descr.clone() {
-                    ctx.set_ptr_info(opref, crate::info::PtrInfo::struct_ptr(descr));
-                }
-            }
-            ExportedPtrKind::Array => {
-                if let Some(descr) = info.ptr_descr.clone() {
-                    let lenbound = info
-                        .array_lenbound
-                        .clone()
-                        .unwrap_or_else(crate::intutils::IntBound::nonnegative);
-                    ctx.set_ptr_info(opref, crate::info::PtrInfo::array(descr, lenbound));
-                }
-            }
-            ExportedPtrKind::None => {
-                if let Some(class_ptr) = info.known_class {
+        if let Some(ptr_info) = info.ptr_info.clone() {
+            self.apply_exported_ptr_info(opref, ptr_info, exported_infos, ctx, seen);
+        } else {
+            match info.ptr_kind {
+                ExportedPtrKind::Instance => {
                     ctx.set_ptr_info(
                         opref,
-                        crate::info::PtrInfo::KnownClass {
-                            class_ptr,
-                            is_nonnull: true,
-                        },
+                        crate::info::PtrInfo::instance(info.ptr_descr.clone(), info.known_class),
                     );
-                } else if info.nonnull {
-                    ctx.set_ptr_info(opref, crate::info::PtrInfo::NonNull);
+                }
+                ExportedPtrKind::Struct => {
+                    if let Some(descr) = info.ptr_descr.clone() {
+                        ctx.set_ptr_info(opref, crate::info::PtrInfo::struct_ptr(descr));
+                    }
+                }
+                ExportedPtrKind::Array => {
+                    if let Some(descr) = info.ptr_descr.clone() {
+                        let lenbound = info
+                            .array_lenbound
+                            .clone()
+                            .unwrap_or_else(crate::intutils::IntBound::nonnegative);
+                        ctx.set_ptr_info(opref, crate::info::PtrInfo::array(descr, lenbound));
+                    }
+                }
+                ExportedPtrKind::None => {
+                    if let Some(class_ptr) = info.known_class {
+                        ctx.set_ptr_info(
+                            opref,
+                            crate::info::PtrInfo::KnownClass {
+                                class_ptr,
+                                is_nonnull: true,
+                            },
+                        );
+                    } else if info.nonnull {
+                        ctx.set_ptr_info(opref, crate::info::PtrInfo::NonNull);
+                    }
                 }
             }
         }
@@ -917,6 +1059,146 @@ impl OptUnroll {
         }
         if let Some(lower) = info.int_lower_bound {
             ctx.int_lower_bounds.insert(opref, lower);
+        }
+    }
+
+    fn apply_exported_ptr_info(
+        &self,
+        opref: OpRef,
+        ptr_info: crate::info::PtrInfo,
+        exported_infos: &HashMap<OpRef, ExportedValueInfo>,
+        ctx: &mut OptContext,
+        seen: &mut std::collections::HashSet<OpRef>,
+    ) {
+        use crate::info::PtrInfo;
+
+        match ptr_info {
+            PtrInfo::Virtual(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::Virtual(info.clone()));
+                for &(_, field_ref) in &info.fields {
+                    if let Some(field_info) = exported_infos.get(&field_ref) {
+                        self.apply_exported_info_recursive(
+                            field_ref,
+                            field_info,
+                            exported_infos,
+                            ctx,
+                            seen,
+                        );
+                    }
+                }
+            }
+            PtrInfo::VirtualStruct(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::VirtualStruct(info.clone()));
+                for &(_, field_ref) in &info.fields {
+                    if let Some(field_info) = exported_infos.get(&field_ref) {
+                        self.apply_exported_info_recursive(
+                            field_ref,
+                            field_info,
+                            exported_infos,
+                            ctx,
+                            seen,
+                        );
+                    }
+                }
+            }
+            PtrInfo::VirtualArray(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::VirtualArray(info.clone()));
+                for &item_ref in &info.items {
+                    if let Some(item_info) = exported_infos.get(&item_ref) {
+                        self.apply_exported_info_recursive(
+                            item_ref,
+                            item_info,
+                            exported_infos,
+                            ctx,
+                            seen,
+                        );
+                    }
+                }
+            }
+            PtrInfo::VirtualArrayStruct(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::VirtualArrayStruct(info.clone()));
+                for fields in &info.element_fields {
+                    for &(_, field_ref) in fields {
+                        if let Some(field_info) = exported_infos.get(&field_ref) {
+                            self.apply_exported_info_recursive(
+                                field_ref,
+                                field_info,
+                                exported_infos,
+                                ctx,
+                                seen,
+                            );
+                        }
+                    }
+                }
+            }
+            PtrInfo::VirtualRawBuffer(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::VirtualRawBuffer(info.clone()));
+                for &(_, _, entry_ref) in &info.entries {
+                    if let Some(entry_info) = exported_infos.get(&entry_ref) {
+                        self.apply_exported_info_recursive(
+                            entry_ref,
+                            entry_info,
+                            exported_infos,
+                            ctx,
+                            seen,
+                        );
+                    }
+                }
+            }
+            PtrInfo::Instance(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::Instance(info.clone()));
+                for &(_, field_ref) in &info.fields {
+                    if let Some(field_info) = exported_infos.get(&field_ref) {
+                        self.apply_exported_info_recursive(
+                            field_ref,
+                            field_info,
+                            exported_infos,
+                            ctx,
+                            seen,
+                        );
+                    }
+                }
+            }
+            PtrInfo::Struct(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::Struct(info.clone()));
+                for &(_, field_ref) in &info.fields {
+                    if let Some(field_info) = exported_infos.get(&field_ref) {
+                        self.apply_exported_info_recursive(
+                            field_ref,
+                            field_info,
+                            exported_infos,
+                            ctx,
+                            seen,
+                        );
+                    }
+                }
+            }
+            PtrInfo::Array(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::Array(info.clone()));
+                for &item_ref in &info.items {
+                    if let Some(item_info) = exported_infos.get(&item_ref) {
+                        self.apply_exported_info_recursive(
+                            item_ref,
+                            item_info,
+                            exported_infos,
+                            ctx,
+                            seen,
+                        );
+                    }
+                }
+            }
+            PtrInfo::KnownClass { class_ptr, is_nonnull } => {
+                ctx.set_ptr_info(opref, PtrInfo::KnownClass { class_ptr, is_nonnull });
+            }
+            PtrInfo::Constant(ptr) => {
+                ctx.set_ptr_info(opref, PtrInfo::Constant(ptr));
+            }
+            PtrInfo::NonNull => {
+                ctx.set_ptr_info(opref, PtrInfo::NonNull);
+            }
+            PtrInfo::Virtualizable(info) => {
+                ctx.set_ptr_info(opref, PtrInfo::Virtualizable(info));
+            }
         }
     }
 
@@ -965,6 +1247,7 @@ impl OptUnroll {
                         entry.op.opcode
                     };
                     Some(ExportedShortOp::Pure {
+                        source: entry.op.pos,
                         opcode,
                         descr_idx: entry.op.descr.as_ref().map(|d| d.index()),
                         args,
@@ -980,8 +1263,10 @@ impl OptUnroll {
                     match entry.op.opcode {
                         OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
                             Some(ExportedShortOp::HeapField {
+                                source: entry.op.pos,
                                 object_slot,
                                 descr_idx,
+                                result_type: entry.op.result_type(),
                                 result,
                                 invented_name: entry.invented_name,
                                 same_as_source: entry.same_as_source,
@@ -992,9 +1277,11 @@ impl OptUnroll {
                         | OpCode::GetarrayitemGcF => {
                             let index = entry.op.arg(1).0 as i64;
                             Some(ExportedShortOp::HeapArrayItem {
+                                source: entry.op.pos,
                                 object_slot,
                                 descr_idx,
                                 index,
+                                result_type: entry.op.result_type(),
                                 result,
                                 invented_name: entry.invented_name,
                                 same_as_source: entry.same_as_source,
@@ -1008,7 +1295,9 @@ impl OptUnroll {
                         continue;
                     };
                     Some(ExportedShortOp::LoopInvariant {
+                        source: entry.op.pos,
                         func_ptr,
+                        result_type: entry.op.result_type(),
                         result,
                         invented_name: entry.invented_name,
                         same_as_source: entry.same_as_source,
@@ -1021,6 +1310,14 @@ impl OptUnroll {
                 exported.push(exported_op);
             }
         }
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[jit] collect_exported_short_ops: short_args={}, exported_short_boxes={}, exported_short_ops={}",
+                short_args.len(),
+                ctx.exported_short_boxes.len(),
+                exported.len()
+            );
+        }
         exported
     }
 
@@ -1030,6 +1327,13 @@ impl OptUnroll {
         exported_state: &ExportedState,
         ctx: &mut OptContext,
     ) {
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[jit] import_short_preamble_ops: short_args={}, exported_short_ops={}",
+                short_args.len(),
+                exported_state.exported_short_ops.len()
+            );
+        }
         let mut produced_results = Vec::with_capacity(exported_state.exported_short_ops.len());
         for entry in &exported_state.exported_short_ops {
             let mut resolve_result = |result: &ExportedShortResult| match result {
@@ -1038,6 +1342,7 @@ impl OptUnroll {
             };
             match *entry {
                 ExportedShortOp::Pure {
+                    source,
                     opcode,
                     descr_idx,
                     ref args,
@@ -1075,19 +1380,26 @@ impl OptUnroll {
                         args,
                         result: result_opref,
                     });
+                    ctx.imported_short_sources.push(crate::ImportedShortSource {
+                        result: result_opref,
+                        source: same_as_source.unwrap_or(source),
+                    });
                     if invented_name {
                         if let Some(source) = same_as_source {
                             ctx.imported_short_aliases.push(crate::ImportedShortAlias {
                                 result: result_opref,
                                 same_as_source: source,
+                                same_as_opcode: OpCode::same_as_for_type(opcode.result_type()),
                             });
                         }
                     }
                     produced_results.push(result_opref);
                 }
                 ExportedShortOp::HeapField {
+                    source,
                     object_slot,
                     descr_idx,
+                    result_type,
                     ref result,
                     invented_name,
                     same_as_source,
@@ -1099,20 +1411,32 @@ impl OptUnroll {
                         continue;
                     };
                     ctx.imported_short_fields.insert((obj, descr_idx), value);
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[jit] import_short_heap_field: obj={obj:?} descr_idx={descr_idx} value={value:?}"
+                        );
+                    }
+                    ctx.imported_short_sources.push(crate::ImportedShortSource {
+                        result: value,
+                        source: same_as_source.unwrap_or(source),
+                    });
                     if invented_name {
                         if let Some(source) = same_as_source {
                             ctx.imported_short_aliases.push(crate::ImportedShortAlias {
                                 result: value,
                                 same_as_source: source,
+                                same_as_opcode: OpCode::same_as_for_type(result_type),
                             });
                         }
                     }
                     produced_results.push(value);
                 }
                 ExportedShortOp::HeapArrayItem {
+                    source,
                     object_slot,
                     descr_idx,
                     index,
+                    result_type,
                     ref result,
                     invented_name,
                     same_as_source,
@@ -1125,18 +1449,25 @@ impl OptUnroll {
                     };
                     ctx.imported_short_arrayitems
                         .insert((obj, descr_idx, index), value);
+                    ctx.imported_short_sources.push(crate::ImportedShortSource {
+                        result: value,
+                        source: same_as_source.unwrap_or(source),
+                    });
                     if invented_name {
                         if let Some(source) = same_as_source {
                             ctx.imported_short_aliases.push(crate::ImportedShortAlias {
                                 result: value,
                                 same_as_source: source,
+                                same_as_opcode: OpCode::same_as_for_type(result_type),
                             });
                         }
                     }
                     produced_results.push(value);
                 }
                 ExportedShortOp::LoopInvariant {
+                    source,
                     func_ptr,
+                    result_type,
                     ref result,
                     invented_name,
                     same_as_source,
@@ -1145,11 +1476,16 @@ impl OptUnroll {
                         continue;
                     };
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
+                    ctx.imported_short_sources.push(crate::ImportedShortSource {
+                        result: value,
+                        source: same_as_source.unwrap_or(source),
+                    });
                     if invented_name {
                         if let Some(source) = same_as_source {
                             ctx.imported_short_aliases.push(crate::ImportedShortAlias {
                                 result: value,
                                 same_as_source: source,
+                                same_as_opcode: OpCode::same_as_for_type(result_type),
                             });
                         }
                     }
@@ -1211,8 +1547,16 @@ fn assemble_peeled_trace(
     label_args: &[OpRef],
     rewritten_jump_args: Option<&[OpRef]>,
     body_num_inputs: usize,
+    imported_short_aliases: &[crate::ImportedShortAlias],
+    imported_short_sources: &[crate::ImportedShortSource],
 ) -> Vec<Op> {
-    let mut result = Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1);
+    let mut result = Vec::with_capacity(
+        p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len(),
+    );
+    let imported_short_sources: HashMap<OpRef, OpRef> = imported_short_sources
+        .iter()
+        .map(|entry| (entry.result, entry.source))
+        .collect();
 
     // Preamble: everything except Jump
     for op in p1_ops {
@@ -1220,9 +1564,25 @@ fn assemble_peeled_trace(
         result.push(op.clone());
     }
 
+    // Extra SameAs aliases live at the end of the preamble, before the loop
+    // label, matching compile.py's `loop_info.extra_same_as + [label_op]`.
+    let mut max_pos = result
+        .iter()
+        .map(|op| op.pos.0)
+        .filter(|&p| p != u32::MAX)
+        .max()
+        .unwrap_or(0);
+    let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
+    for alias in imported_short_aliases {
+        let pos = OpRef((max_pos + 1).max(body_num_inputs as u32));
+        max_pos = pos.0;
+        let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
+        op.pos = pos;
+        remap.insert(alias.result, pos);
+        result.push(op);
+    }
+
     // Label position
-    let max_pos = result.iter()
-        .map(|op| op.pos.0).filter(|&p| p != u32::MAX).max().unwrap_or(0);
     let label_pos = (max_pos + 1).max(body_num_inputs as u32);
     let mut label_op = Op::new(OpCode::Label, label_args);
     label_op.pos = OpRef(label_pos);
@@ -1230,7 +1590,6 @@ fn assemble_peeled_trace(
 
     // Body: 2-pass remap (inputarg refs → label_args, op positions → after label)
     let body_base = label_pos + 1;
-    let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
 
     // Pass 1: collect all remappings
     for (i, &la) in label_args.iter().enumerate() {
@@ -1251,19 +1610,33 @@ fn assemble_peeled_trace(
             new_op.pos = OpRef(body_base + idx as u32);
         }
         for arg in &mut new_op.args {
-            if let Some(&m) = remap.get(arg) { *arg = m; }
+            if let Some(&m) = remap.get(arg) {
+                *arg = m;
+            } else if let Some(&source) = imported_short_sources.get(arg) {
+                *arg = source;
+            }
         }
         if new_op.opcode == OpCode::Jump {
             if let Some(forced_jump_args) = rewritten_jump_args {
                 new_op.args = forced_jump_args
                     .iter()
-                    .map(|arg| remap.get(arg).copied().unwrap_or(*arg))
+                    .map(|arg| {
+                        remap
+                            .get(arg)
+                            .copied()
+                            .or_else(|| imported_short_sources.get(arg).copied())
+                            .unwrap_or(*arg)
+                    })
                     .collect();
             }
         }
         if let Some(ref mut fa) = new_op.fail_args {
             for a in fa.iter_mut() {
-                if let Some(&m) = remap.get(a) { *a = m; }
+                if let Some(&m) = remap.get(a) {
+                    *a = m;
+                } else if let Some(&source) = imported_short_sources.get(a) {
+                    *a = source;
+                }
             }
         }
         result.push(new_op);
@@ -2160,8 +2533,10 @@ mod tests {
         assert_eq!(
             exported.exported_short_ops,
             vec![ExportedShortOp::HeapField {
+                source: OpRef(11),
                 object_slot: 0,
                 descr_idx: 55,
+                result_type: Type::Int,
                 result: ExportedShortResult::Slot(1),
                 invented_name: false,
                 same_as_source: None,
@@ -2235,6 +2610,7 @@ mod tests {
         assert_eq!(
             exported.exported_short_ops,
             vec![ExportedShortOp::Pure {
+                source: OpRef(11),
                 opcode: OpCode::IntAdd,
                 descr_idx: None,
                 args: vec![ExportedShortArg::Slot(0), ExportedShortArg::Const(Value::Int(7))],
@@ -2289,6 +2665,7 @@ mod tests {
         assert_eq!(
             exported.exported_short_ops,
             vec![ExportedShortOp::Pure {
+                source: OpRef(11),
                 opcode: OpCode::CallPureI,
                 descr_idx: Some(77),
                 args: vec![
@@ -2350,6 +2727,7 @@ mod tests {
             exported.exported_short_ops,
             vec![
                 ExportedShortOp::Pure {
+                    source: OpRef(11),
                     opcode: OpCode::IntAdd,
                     descr_idx: None,
                     args: vec![
@@ -2361,6 +2739,7 @@ mod tests {
                     same_as_source: None,
                 },
                 ExportedShortOp::Pure {
+                    source: OpRef(14),
                     opcode: OpCode::IntMul,
                     descr_idx: None,
                     args: vec![
@@ -2426,6 +2805,7 @@ mod tests {
         assert_eq!(
             exported.exported_short_ops,
             vec![ExportedShortOp::Pure {
+                source: OpRef(30),
                 opcode: OpCode::IntAdd,
                 descr_idx: None,
                 args: vec![ExportedShortArg::Slot(0), ExportedShortArg::Slot(1)],
@@ -2443,7 +2823,112 @@ mod tests {
             vec![crate::ImportedShortAlias {
                 result: ctx2.imported_short_pure_ops[0].result,
                 same_as_source: OpRef(14),
+                same_as_opcode: OpCode::SameAsI,
             }]
         );
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_emits_extra_same_as_before_label() {
+        let p1_ops = vec![{
+            let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+            op.pos = OpRef(3);
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntMul, &[OpRef(50), OpRef(0)]);
+                op.pos = OpRef(1);
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(50)]),
+        ];
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef(10)],
+            None,
+            1,
+            &[crate::ImportedShortAlias {
+                result: OpRef(50),
+                same_as_source: OpRef(10),
+                same_as_opcode: OpCode::SameAsI,
+            }],
+            &[crate::ImportedShortSource {
+                result: OpRef(50),
+                source: OpRef(10),
+            }],
+        );
+
+        assert_eq!(combined[0].opcode, OpCode::IntAdd);
+        assert_eq!(combined[1].opcode, OpCode::SameAsI);
+        assert_eq!(combined[1].args.as_slice(), &[OpRef(10)]);
+        assert_eq!(combined[2].opcode, OpCode::Label);
+        assert_eq!(combined[3].opcode, OpCode::IntMul);
+        assert_eq!(combined[3].args[0], combined[1].pos);
+        assert_eq!(combined[4].opcode, OpCode::Jump);
+        assert_eq!(combined[4].args[0], combined[1].pos);
+    }
+
+    #[test]
+    fn test_import_state_rebuilds_nested_virtual_graph_from_exported_infos() {
+        use crate::info::{PtrInfo, VirtualStructInfo};
+        use majit_ir::{Type, Value};
+        use majit_ir::descr::{make_field_descr_full, make_size_descr_full};
+
+        let value_descr = make_field_descr_full(101, 0, 8, Type::Int, false);
+        let next_descr = make_field_descr_full(102, 8, 8, Type::Ref, false);
+        let node_descr = make_size_descr_full(200, 16, 0);
+
+        let mut ctx = crate::OptContext::with_num_inputs(16, 0);
+        ctx.make_constant(OpRef(12), Value::Int(3));
+        ctx.make_constant(OpRef(13), Value::Int(2));
+        ctx.set_ptr_info(OpRef(15), PtrInfo::NonNull);
+        ctx.set_ptr_info(
+            OpRef(11),
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr: node_descr.clone(),
+                fields: vec![(value_descr.index(), OpRef(12)), (next_descr.index(), OpRef(15))],
+                field_descrs: vec![
+                    (value_descr.index(), value_descr.clone()),
+                    (next_descr.index(), next_descr.clone()),
+                ],
+            }),
+        );
+        ctx.set_ptr_info(
+            OpRef(10),
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr: node_descr.clone(),
+                fields: vec![(value_descr.index(), OpRef(13)), (next_descr.index(), OpRef(11))],
+                field_descrs: vec![
+                    (value_descr.index(), value_descr.clone()),
+                    (next_descr.index(), next_descr.clone()),
+                ],
+            }),
+        );
+
+        let exported = export_state(&[OpRef(10)], &[], &ctx, None);
+        let mut ctx2 = crate::OptContext::with_num_inputs(16, 1);
+        let label_args = import_state(&[OpRef(0)], &exported, &mut ctx2);
+
+        assert_eq!(label_args, vec![OpRef(15)]);
+
+        match ctx2.get_ptr_info(OpRef(10)) {
+            Some(PtrInfo::VirtualStruct(info)) => {
+                assert_eq!(info.fields, vec![(value_descr.index(), OpRef(13)), (next_descr.index(), OpRef(11))]);
+            }
+            other => panic!("expected virtual root, got {other:?}"),
+        }
+        match ctx2.get_ptr_info(OpRef(11)) {
+            Some(PtrInfo::VirtualStruct(info)) => {
+                assert_eq!(info.fields, vec![(value_descr.index(), OpRef(12)), (next_descr.index(), OpRef(15))]);
+            }
+            other => panic!("expected nested virtual, got {other:?}"),
+        }
+        match ctx2.get_ptr_info(OpRef(15)) {
+            Some(PtrInfo::NonNull) => {}
+            other => panic!("expected concrete tail info, got {other:?}"),
+        }
     }
 }
