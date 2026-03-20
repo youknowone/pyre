@@ -700,6 +700,13 @@ impl OptVirtualize {
         let field_idx = descr_index(&op.descr);
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
 
+        // RPython import_state parity: imported virtual heads already have
+        // their fields set from inputargs. The original trace's SetfieldGc
+        // carries preamble-time concrete values — skip them for imported virtuals.
+        if ctx.imported_virtual_heads.iter().any(|&(_, vh)| vh == struct_ref) {
+            return OptimizationResult::Remove;
+        }
+
         if is_raw_op && self.is_standard_virtualizable_ref(struct_ref, ctx) {
             return OptimizationResult::PassOn;
         }

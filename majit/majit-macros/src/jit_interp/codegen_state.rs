@@ -959,13 +959,15 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn node_value_descr(&self) -> Option<majit_ir::DescrRef> {
+                // RPython parity: Node.value is MUTABLE (no _immutable_fields_).
+                // is_immutable=false prevents constant folding across loop iterations.
                 Some(std::sync::Arc::new(
                     majit_ir::descr::SimpleFieldDescr::new(
                         0x8000_0001, // unique tag for value field
                         #value_offset,
                         8,
                         majit_ir::Type::Int,
-                        true,
+                        false, // RPython: Node.value is mutable
                     ),
                 ))
             }
