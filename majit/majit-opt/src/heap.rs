@@ -48,6 +48,10 @@ type ArrayItemKey = (OpRef, u32, i64);
 pub struct OptHeap {
     /// Cached field values: field_key -> value OpRef.
     cached_fields: HashMap<FieldKey, OpRef>,
+    /// Immutable (pure) field cache — separate from cached_fields to survive
+    /// all invalidation. RPython heap.py: is_always_pure() fields are never
+    /// invalidated (their values never change).
+    immutable_cached_fields: HashMap<FieldKey, OpRef>,
     /// Pending (lazy) setfields: field_key -> the SETFIELD_GC op.
     lazy_setfields: HashMap<FieldKey, Op>,
     /// Cached array items: array_item_key -> value OpRef.
@@ -108,6 +112,7 @@ impl OptHeap {
     pub fn new() -> Self {
         OptHeap {
             cached_fields: HashMap::new(),
+            immutable_cached_fields: HashMap::new(),
             lazy_setfields: HashMap::new(),
             cached_arrayitems: HashMap::new(),
             lazy_setarrayitems: HashMap::new(),
@@ -254,10 +259,6 @@ impl OptHeap {
     ///   been passed to a call or stored into the heap.
     fn invalidate_caches(&mut self) {
         let has_survivors = !self.immutable_field_descrs.is_empty() || !self.unescaped.is_empty();
-        if crate::majit_log_enabled() {
-            let before = self.cached_fields.len();
-            eprintln!("[heap] invalidate_caches: before={before} immutable_descrs={:?} unescaped={}", self.immutable_field_descrs.len(), self.unescaped.len());
-        }
 
         if has_survivors {
             self.cached_fields.retain(|&(obj, descr_idx), _| {
@@ -275,6 +276,7 @@ impl OptHeap {
                 .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
         } else {
             self.cached_fields.clear();
+        self.immutable_cached_fields.clear();
             self.cached_arrayitems.clear();
             self.cached_arrayitems_var.clear();
             self.array_min_lengths.clear();
@@ -537,6 +539,13 @@ impl OptHeap {
             return OptimizationResult::Remove;
         }
 
+        // Check immutable field cache first — these survive all invalidation.
+        if let Some(&cached) = self.immutable_cached_fields.get(&key) {
+            let cached = ctx.get_replacement(cached);
+            ctx.replace_op(op.pos, cached);
+            return OptimizationResult::Remove;
+        }
+
         // Check read cache.
         if let Some(&cached) = self.cached_fields.get(&key) {
             let cached = ctx.get_replacement(cached);
@@ -565,6 +574,11 @@ impl OptHeap {
         let struct_ref = ctx.get_replacement(op.arg(0));
         self.known_nonnull.insert(struct_ref);
         self.cached_fields.insert(key, op.pos);
+        // Save immutable fields in the permanent cache — they survive all
+        // invalidation because the value never changes.
+        if self.immutable_field_descrs.contains(&key.1) {
+            self.immutable_cached_fields.insert(key, op.pos);
+        }
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         // Record the field value in ptr_info so other passes can see it.
         if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
@@ -757,6 +771,11 @@ impl OptHeap {
             self.known_nonnull.insert(op.pos);
             return OptimizationResult::Emit(op.clone());
         }
+
+        // Note: postponed_op (from CallMayForce) must only be emitted at
+        // GuardNotForced, not at arbitrary guards. RPython's emit() callback
+        // calls emit_postponed_op() before every op, but the postpone→emit
+        // cycle is specifically CallMayForce→GuardNotForced. Don't emit here.
 
         // Guards: force lazy sets but keep caches (guards don't mutate the heap).
         // Track nullity implications from guards.
@@ -991,7 +1010,9 @@ impl Optimization for OptHeap {
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN => {
-                self.force_all_lazy(ctx);
+                // RPython emitting_operation: calls go through
+                // force_from_effectinfo (selective) or clean_caches,
+                // NOT force_all_lazy. force_all_lazy is only in flush().
                 self.mark_args_escaped(op);
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
                 self.postponed_op = Some(op.clone());
@@ -1007,12 +1028,31 @@ impl Optimization for OptHeap {
                 return OptimizationResult::Remove;
             }
 
-            // ── heap.py: GUARD_NOT_FORCED — emit postponed call ──
+            // heap.py: GUARD_NOT_FORCED — emit the postponed call_may_force,
+            // then handle as a guard. RPython uses force_lazy_sets_for_guard
+            // (not force_all_lazy) — immutable caches survive.
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
                 if let Some(postponed) = self.postponed_op.take() {
                     ctx.emit(postponed);
                 }
-                self.force_all_lazy(ctx);
+                // RPython emitting_operation for guards:
+                //   self.optimizer.pendingfields = self.force_lazy_sets_for_guard()
+                let pending_virtual = self.force_lazy_sets_for_guard(ctx);
+                for pending_op in pending_virtual {
+                    if pending_op.opcode == OpCode::SetarrayitemGc {
+                        let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
+                        if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
+                            self.lazy_setarrayitems
+                                .insert((pending_op.arg(0), descr_idx, index), pending_op);
+                        } else {
+                            ctx.emit(pending_op);
+                        }
+                    } else {
+                        let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
+                        self.lazy_setfields
+                            .insert((pending_op.arg(0), descr_idx), pending_op);
+                    }
+                }
                 return OptimizationResult::Emit(op.clone());
             }
 
@@ -1127,6 +1167,7 @@ impl Optimization for OptHeap {
 
     fn setup(&mut self) {
         self.cached_fields.clear();
+        self.immutable_cached_fields.clear();
         self.lazy_setfields.clear();
         self.cached_arrayitems.clear();
         self.lazy_setarrayitems.clear();
@@ -1152,6 +1193,7 @@ impl Optimization for OptHeap {
             "OptHeap: unflushed lazy sets at end of trace"
         );
         self.cached_fields.clear();
+        self.immutable_cached_fields.clear();
         self.lazy_setfields.clear();
         self.cached_arrayitems.clear();
         self.lazy_setarrayitems.clear();
