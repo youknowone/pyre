@@ -80,6 +80,12 @@ pub struct ImportedShortSource {
     pub source: OpRef,
 }
 
+#[derive(Clone, Debug)]
+pub struct TrackedPreambleUse {
+    pub result: OpRef,
+    pub produced: crate::shortpreamble::ProducedShortOp,
+}
+
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.
@@ -143,7 +149,7 @@ pub struct OptContext {
     imported_short_preamble_used: HashSet<OpRef>,
     /// RPython unroll.py: potential_extra_ops populated by force_op_from_preamble
     /// and later consumed by optimizer.force_box().
-    potential_extra_ops: HashSet<OpRef>,
+    potential_extra_ops: HashMap<OpRef, TrackedPreambleUse>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer: Option<crate::shortpreamble::ExtendedShortPreambleBuilder>,
@@ -164,6 +170,9 @@ pub struct OptContext {
     pub pre_force_virtual_state: Option<crate::virtualstate::VirtualState>,
     /// JUMP args captured BEFORE force (corresponding to pre_force_virtual_state).
     pub pre_force_jump_args: Option<Vec<OpRef>>,
+    /// RPython optimizer.py: end_args after force_box_for_end_of_preamble().
+    /// export_state() prefers this over a raw get_replacement() snapshot.
+    pub preamble_end_args: Option<Vec<OpRef>>,
     /// Field OpRefs of virtual args before force. Maps virtual OpRef →
     /// [(field_idx, field_value_ref)]. Used by make_inputargs to flatten
     /// virtuals into label args after force has destroyed PtrInfo.
@@ -190,7 +199,7 @@ impl OptContext {
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
             imported_short_preamble_used: HashSet::new(),
-            potential_extra_ops: HashSet::new(),
+            potential_extra_ops: HashMap::new(),
             active_short_preamble_producer: None,
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
@@ -198,6 +207,7 @@ impl OptContext {
             patchguardop: None,
             pre_force_virtual_state: None,
             pre_force_jump_args: None,
+            preamble_end_args: None,
             pre_force_field_refs: HashMap::new(),
         }
     }
@@ -221,7 +231,7 @@ impl OptContext {
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
             imported_short_preamble_used: HashSet::new(),
-            potential_extra_ops: HashSet::new(),
+            potential_extra_ops: HashMap::new(),
             active_short_preamble_producer: None,
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
@@ -229,6 +239,7 @@ impl OptContext {
             patchguardop: None,
             pre_force_virtual_state: None,
             pre_force_jump_args: None,
+            preamble_end_args: None,
             pre_force_field_refs: HashMap::new(),
         }
     }
@@ -289,6 +300,7 @@ impl OptContext {
     pub fn initialize_imported_short_preamble_builder(
         &mut self,
         label_args: &[OpRef],
+        short_inputargs: &[OpRef],
         exported_short_boxes: &[crate::shortpreamble::PreambleOp],
     ) {
         let produced: Vec<(OpRef, crate::shortpreamble::ProducedShortOp)> = exported_short_boxes
@@ -306,7 +318,7 @@ impl OptContext {
             })
             .collect();
         self.imported_short_preamble_builder = Some(
-            crate::shortpreamble::ShortPreambleBuilder::new(label_args, &produced, label_args),
+            crate::shortpreamble::ShortPreambleBuilder::new(label_args, &produced, short_inputargs),
         );
         self.imported_short_preamble_used.clear();
     }
@@ -317,19 +329,22 @@ impl OptContext {
 
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
         let result = self.get_replacement(result);
-        let mut tracked = false;
+        let is_constant = self.get_constant(result).is_some();
         if self.imported_short_preamble_used.insert(result) {
             if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                tracked = builder.use_box(result).is_some();
+                let tracked = builder.use_box(result).is_some();
+                if tracked && !is_constant {
+                    if let Some(produced) = builder.produced_short_op(result) {
+                        self.potential_extra_ops
+                            .insert(result, TrackedPreambleUse { result, produced });
+                    }
+                }
             }
-        }
-        if tracked && self.get_constant(result).is_none() {
-            self.potential_extra_ops.insert(result);
         }
         result
     }
 
-    pub fn take_potential_extra_op(&mut self, result: OpRef) -> bool {
+    pub fn take_potential_extra_op(&mut self, result: OpRef) -> Option<TrackedPreambleUse> {
         self.potential_extra_ops.remove(&result)
     }
 
@@ -561,12 +576,6 @@ pub trait Optimization {
 
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
-
-    /// RPython unroll.py: set Phase 2 flatten mode (only OptVirtualize uses this).
-    fn set_flatten_virtuals_at_jump(&mut self, _enabled: bool) {}
-
-    /// RPython: Phase 2 (flush=False) — don't force lazy sets on JUMP/FINISH.
-    fn set_skip_flush_on_final(&mut self, _enabled: bool) {}
 
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
     /// Contribute operations to the short preamble builder.
