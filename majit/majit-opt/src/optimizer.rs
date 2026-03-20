@@ -596,11 +596,10 @@ impl Optimizer {
             if !rec.insert(resolved) {
                 return resolved;
             }
-            // RPython info.py:148: force_box() → emit_extra(op) → emit New.
-            // Emit the New and SetfieldGc directly to new_operations since
-            // we're outside the pass chain (no drain will run).
+            // RPython info.py: _force_at_the_end_of_preamble() falls back to
+            // force_box() for top-level virtual ptrs. Outside the pass chain we
+            // materialize directly into new_operations via force_to_ops().
             let forced_ref = info.force_to_ops(resolved, ctx);
-            // Recursively force fields
             if let Some(new_info) = ctx.get_ptr_info(forced_ref).cloned() {
                 let mut updated = new_info;
                 updated.force_at_the_end_of_preamble(|child| {
@@ -844,18 +843,7 @@ impl Optimizer {
             self.install_imported_virtuals(&mut ctx);
         }
 
-        let stop_before_terminal = self.skip_flush && self.imported_loop_state.is_some();
-        let mut deferred_terminal_op: Option<Op> = None;
-
-        // RPython optimize_preamble()/optimize_peeled_loop():
-        // propagate_all_forward(..., flush=False) stops when it reaches the
-        // terminal JUMP/FINISH and leaves that op to the unroll/finalize
-        // logic instead of sending it through the optimization chain.
         for op in ops {
-            if stop_before_terminal && matches!(op.opcode, OpCode::Jump | OpCode::Finish) {
-                deferred_terminal_op = Some(op.clone());
-                break;
-            }
             self.propagate_one(op, &mut ctx);
         }
 
@@ -872,16 +860,11 @@ impl Optimizer {
         self.imported_short_preamble = ctx.build_imported_short_preamble();
         self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
         self.patchguardop = ctx.patchguardop.clone();
-        let jump = if stop_before_terminal {
-            deferred_terminal_op
-                .clone()
-                .filter(|op| op.opcode == OpCode::Jump)
-        } else {
-            ctx.new_operations
-                .iter()
-                .rfind(|op| op.opcode == OpCode::Jump)
-                .cloned()
-        };
+        let jump = ctx
+            .new_operations
+            .iter()
+            .rfind(|op| op.opcode == OpCode::Jump)
+            .cloned();
         self.exported_loop_state = jump.map(|jump| {
             let original_jump_args = ctx
                 .pre_force_jump_args
@@ -964,21 +947,6 @@ impl Optimizer {
             }
         }
 
-        // Remove ops with args pointing to undefined positions (intermediate
-        // forwarding positions from force_virtual that weren't drained).
-        // RPython doesn't need this due to in-place Box forwarding.
-        {
-            let defined: std::collections::HashSet<u32> = ctx.new_operations
-                .iter()
-                .filter(|o| !o.pos.is_none())
-                .map(|o| o.pos.0)
-                .chain((0..num_inputs as u32))
-                .chain(ctx.constants.iter().enumerate().filter_map(|(i, v)| v.as_ref().map(|_| i as u32)))
-                .collect();
-            ctx.new_operations.retain(|op| {
-                op.args.iter().all(|a| a.is_none() || a.0 < 10_000 && defined.contains(&a.0) || a.0 >= 10_000)
-            });
-        }
 
         // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
         // and all op positions are reassigned to start from final_num_inputs.
@@ -1527,43 +1495,6 @@ mod tests {
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
         // Jump should still be present.
         assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
-    }
-
-    #[test]
-    fn test_phase2_skip_flush_keeps_terminal_jump_out_of_pass_chain() {
-        let mut opt = Optimizer::default_pipeline();
-        opt.skip_flush = true;
-        opt.imported_loop_state = Some(crate::unroll::ExportedState::new(
-            vec![OpRef(0), OpRef(1)],
-            vec![OpRef(0), OpRef(1)],
-            crate::virtualstate::VirtualState::new(vec![
-                crate::virtualstate::VirtualStateInfo::Unknown,
-                crate::virtualstate::VirtualStateInfo::Unknown,
-            ]),
-            std::collections::HashMap::new(),
-            vec![],
-            vec![],
-            vec![OpRef(0), OpRef(1)],
-            vec![OpRef(0), OpRef(1)],
-        ));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
-        ];
-        for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef((i + 2) as u32);
-        }
-
-        let mut constants = std::collections::HashMap::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
-
-        assert!(result.iter().all(|op| op.opcode != OpCode::Jump));
-        let exported = opt
-            .exported_loop_state
-            .as_ref()
-            .expect("phase 2 should still export loop state from deferred jump");
-        assert_eq!(exported.end_args.as_slice(), &[OpRef(0), OpRef(1)]);
     }
 
     #[test]
