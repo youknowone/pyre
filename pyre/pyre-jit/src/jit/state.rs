@@ -2287,18 +2287,27 @@ impl TraceFrameState {
                     // callee are handled by force_fn → resume_in_blackhole.
                     // This is the fast path matching RPython's
                     // call_assembler / assembler_call_helper pattern.
-                    if let Some(token_number) = driver.get_loop_token_number(callee_key) {
-                        let callee_meta =
-                            driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
-                                panic!(
-                                    "compiled loop for self-recursive callee_key={callee_key} is missing compiled meta"
+                    // RPython warmstate.py:714 get_assembler_token: use
+                    // compiled token or pending token (compile_tmp_callback).
+                    if let Some(token_number) = driver
+                        .get_loop_token_number(callee_key)
+                        .or_else(|| driver.get_pending_token_number(callee_key))
+                    {
+                        // For pending token (not yet compiled), use current
+                        // trace's own metadata since it's self-recursive.
+                        let (callee_nlocals, callee_vsd, target_num_inputs) =
+                            if let Some(callee_meta) = driver.get_compiled_meta(callee_key) {
+                                (
+                                    callee_meta.num_locals,
+                                    callee_meta.valuestackdepth,
+                                    driver.get_compiled_num_inputs(callee_key).unwrap_or(1),
                                 )
-                            });
-                        let callee_nlocals = callee_meta.num_locals;
-                        let callee_vsd = callee_meta.valuestackdepth;
+                            } else {
+                                // Pending token: self-recursive, use caller's info
+                                let code = unsafe { &*(w_func_get_code_ptr(concrete_callable) as *const CodeObject) };
+                                (code.varnames.len(), code.varnames.len() + 1, 4)
+                            };
                         let callee_stack_only = callee_vsd.saturating_sub(callee_nlocals);
-                        let target_num_inputs =
-                            driver.get_compiled_num_inputs(callee_key).unwrap_or(1);
 
                         if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                             return self.with_ctx(|this, ctx| {
