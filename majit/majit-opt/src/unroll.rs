@@ -180,14 +180,12 @@ impl UnrollOptimizer {
     }
 
     /// compile.py:275-308: compile_loop — 2-phase preamble peeling.
+    /// compile.py:275-338: 2-phase preamble peeling (RPython parity).
     ///
-    /// RPython processes the SAME trace twice:
-    ///   Phase 1: optimize(trace) → preamble_ops + export_state(virtual_state)
-    ///   Phase 2: optimize(trace) + import_state → body_ops
-    ///   Result:  [preamble_ops] + Label(inputargs) + [body_ops] + Jump(...)
-    ///
-    /// Phase 1 discovers virtual structures at JUMP (New+SetfieldGc).
-    /// Phase 2 reconstructs them at body start so OptVirtualize eliminates them.
+    /// Phase 1 (optimize_preamble): full pipeline on trace → preamble_ops.
+    /// export_state: flatten virtual JUMP args → label_args.
+    /// Phase 2 (optimize_peeled_loop): import_state + full pipeline → body_ops.
+    /// Assembly: [preamble_no_jump] + Label(label_args) + [body_with_jump].
     pub fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
         ops: &[Op],
@@ -196,162 +194,63 @@ impl UnrollOptimizer {
         vable_config: Option<crate::virtualize::VirtualizableConfig>,
     ) -> (Vec<Op>, usize) {
         // ── Phase 1: PreambleCompileData.optimize() ──
-        // compile.py:275-276: optimize the trace → preamble ops
-        let mut constants_p1 = constants.clone();
-        let mut opt_preamble = if let Some(ref config) = vable_config {
-            crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config.clone())
-        } else {
-            crate::optimizer::Optimizer::default_pipeline()
+        // ── Phase 1: optimize_preamble (compile.py:275-276) ──
+        let mut consts_p1 = constants.clone();
+        let mut opt_p1 = match vable_config.as_ref() {
+            Some(c) => crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone()),
+            None => crate::optimizer::Optimizer::default_pipeline(),
         };
-        // NO OptUnroll — we handle peeling manually via 2-phase
-        let preamble_result = opt_preamble.optimize_with_constants_and_inputs(
-            ops,
-            &mut constants_p1,
-            num_inputs,
-        );
-        let preamble_num_inputs = opt_preamble.final_num_inputs();
-
-        // unroll.py:452-477: export_state — collect virtual structures at JUMP
-        let jump_virtuals = std::mem::take(&mut opt_preamble.exported_jump_virtuals);
+        let p1_ops = opt_p1.optimize_with_constants_and_inputs(ops, &mut consts_p1, num_inputs);
+        let p1_ni = opt_p1.final_num_inputs();
+        let jump_virtuals = std::mem::take(&mut opt_p1.exported_jump_virtuals);
 
         if jump_virtuals.is_empty() {
-            // No virtuals — single phase suffices
-            *constants = constants_p1;
-            let sp = crate::shortpreamble::extract_short_preamble(&preamble_result);
-            if !sp.is_empty() {
-                self.short_preamble = Some(sp);
-            }
-            return (preamble_result, preamble_num_inputs);
+            *constants = consts_p1;
+            let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
+            if !sp.is_empty() { self.short_preamble = Some(sp); }
+            return (p1_ops, p1_ni);
         }
 
-        // ── Phase 2: UnrolledLoopData.optimize() ──
-        // compile.py:291-292: optimize the SAME trace again, with imported state.
-        // unroll.py:make_inputargs_and_virtuals — flatten virtual fields.
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            for v in &jump_virtuals {
-                eprintln!(
-                    "[jit] phase 2: virtual at JUMP arg {} ({} fields, size={})",
-                    v.jump_arg_index,
-                    v.fields.len(),
-                    v.size_descr.index(),
-                );
-            }
-        }
-
-        // RPython unroll.py:479-504: import_state
-        // Phase 2 processes the SAME original trace as Phase 1.
-        // The optimizer is pre-populated with imported virtual state so
-        // OptVirtualize knows certain inputargs are virtual from the start.
-        //
-        // For each virtual JUMP arg, we add extra inputargs for the field values.
-        // The optimizer sees these extra inputargs as the virtual's fields.
-        // Field inputargs must not collide with original trace op positions.
-        // Place them right after the original num_inputs. The optimizer's
-        // effective_inputs = max(body_num_inputs, max_pos+1) ensures original
-        // trace ops get new positions beyond body_num_inputs.
-        // RPython make_inputargs_and_virtuals: the virtual pointer arg is
-        // replaced by its field values in the inputargs layout.
-        // E.g., [pool, selected, head] → [pool, selected, value, next]
-        // The virtual's fields start at the original virtual's position.
-        let mut imported = Vec::new();
-        let mut total_extra = 0; // fields added minus virtual removed
-        for virt in &jump_virtuals {
-            let base = virt.jump_arg_index + total_extra;
-            let fields: Vec<(majit_ir::DescrRef, usize)> = virt
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, (descr, _concrete))| (descr.clone(), base + i))
-                .collect();
-            imported.push(crate::optimizer::ImportedVirtual {
-                inputarg_index: base, // virtual was here, now fields start here
-                size_descr: virt.size_descr.clone(),
-                fields,
-            });
-            total_extra += virt.fields.len() - 1; // added N fields, removed 1 ptr
-        }
-        // New body inputargs count: original - 1(head) + N(fields) per virtual
-        let body_num_inputs = num_inputs + total_extra;
-
-        // Remap original trace ops so their positions don't collide with
-        // field inputargs (num_inputs..body_num_inputs).
-        let remap_base = body_num_inputs as u32;
-        let mut remapped_ops = ops.to_vec();
-        let mut pos_remap: HashMap<OpRef, OpRef> = HashMap::new();
-        for op in &mut remapped_ops {
-            if op.pos.0 != u32::MAX && op.pos.0 >= num_inputs as u32 && op.pos.0 < remap_base {
-                let new_pos = OpRef(op.pos.0 + total_extra as u32);
-                pos_remap.insert(op.pos, new_pos);
-                op.pos = new_pos;
-            }
-        }
-        // Remap references in args and fail_args
-        for op in &mut remapped_ops {
-            for arg in &mut op.args {
-                if let Some(&new_ref) = pos_remap.get(arg) {
-                    *arg = new_ref;
-                }
-            }
-            if let Some(ref mut fa) = op.fail_args {
-                for arg in fa.iter_mut() {
-                    if let Some(&new_ref) = pos_remap.get(arg) {
-                        *arg = new_ref;
-                    }
-                }
-            }
-        }
-
-        let mut constants_p2 = constants_p1.clone();
-        // Also remap constants keys
-        let mut remapped_constants = std::collections::HashMap::new();
-        for (&k, &v) in constants_p2.iter() {
-            let new_k = pos_remap.get(&OpRef(k)).map_or(k, |r| r.0);
-            remapped_constants.insert(new_k, v);
-        }
-        constants_p2 = remapped_constants;
-
-        let mut opt_body = if let Some(ref config) = vable_config {
-            crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config.clone())
-        } else {
-            crate::optimizer::Optimizer::default_pipeline()
+        // ── export_state (unroll.py:452-477) ──
+        let p1_jump = match p1_ops.iter().rfind(|op| op.opcode == OpCode::Jump) {
+            Some(j) => j.clone(),
+            None => { *constants = consts_p1; return (p1_ops, p1_ni); }
         };
-        opt_body.imported_virtuals = imported;
-        // No OptUnroll in Phase 2 — same trace (remapped), different initial state
-        let body_result = opt_body.optimize_with_constants_and_inputs(
-            &remapped_ops,
-            &mut constants_p2,
-            body_num_inputs,
-        );
-        let body_final = opt_body.final_num_inputs();
+        let label_args = export_flatten_jump_args(&p1_ops, &p1_jump, &jump_virtuals);
+        let body_num_inputs = label_args.len();
 
         if std::env::var_os("MAJIT_LOG").is_some() {
-            let new_count = body_result
-                .iter()
-                .filter(|op| op.opcode == OpCode::New || op.opcode == OpCode::NewWithVtable)
-                .count();
-            eprintln!(
-                "[jit] phase 2: {} ops, {} New remaining (0 = fully virtualized)",
-                body_result.len(),
-                new_count,
-            );
+            eprintln!("[jit] preamble peeling: {} virtual(s), label_args={}", jump_virtuals.len(), body_num_inputs);
         }
 
-        // compile.py:310-338: combine preamble + Label + body
-        let combined = combine_preamble_and_body(
-            &preamble_result,
-            &body_result,
-            preamble_num_inputs,
-            body_final,
-            &jump_virtuals,
+        // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
+        let imported = build_imported_virtuals(&jump_virtuals);
+        let (remapped_ops, mut consts_p2) =
+            remap_trace_for_body(ops, &consts_p1, num_inputs, body_num_inputs);
+
+        let mut opt_p2 = match vable_config.as_ref() {
+            Some(c) => crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone()),
+            None => crate::optimizer::Optimizer::default_pipeline(),
+        };
+        opt_p2.imported_virtuals = imported;
+        opt_p2.set_flatten_virtuals_at_jump(true);
+        let p2_ops = opt_p2.optimize_with_constants_and_inputs(
+            &remapped_ops, &mut consts_p2, body_num_inputs,
         );
+        let p2_ni = opt_p2.final_num_inputs();
 
-        *constants = constants_p2;
-        let sp = crate::shortpreamble::extract_short_preamble(&combined);
-        if !sp.is_empty() {
-            self.short_preamble = Some(sp);
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            let nc = p2_ops.iter()
+                .filter(|o| o.opcode == OpCode::New || o.opcode == OpCode::NewWithVtable).count();
+            eprintln!("[jit] phase 2: {} ops, {} New remaining", p2_ops.len(), nc);
         }
-        return (combined, body_final);
 
+        // ── Assembly (compile.py:310-338) ──
+        let combined = assemble_peeled_trace(&p1_ops, &p2_ops, &label_args, p2_ni);
+        *constants = consts_p2;
+        let sp = crate::shortpreamble::extract_short_preamble(&combined);
+        if !sp.is_empty() { self.short_preamble = Some(sp); }
+        (combined, p2_ni)
     }
 
     /// Count the guards in an optimized trace (for retrace_limit checks).
@@ -585,14 +484,182 @@ impl OptUnroll {
 /// or None if no match.
 /// RPython unroll.py: import_state + _generate_virtual.
 ///
+// ── RPython-parity helper functions for 2-phase preamble peeling ──
+
+/// unroll.py:452-477 export_state + make_inputargs_and_virtuals:
+/// Replace virtual ptr in Phase 1 JUMP args with field values from SetfieldGc.
+fn export_flatten_jump_args(
+    p1_ops: &[Op],
+    p1_jump: &Op,
+    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
+) -> Vec<OpRef> {
+    let mut args = p1_jump.args.clone();
+    for virt in jump_virtuals.iter().rev() {
+        if virt.jump_arg_index >= args.len() { continue; }
+        let vref = args[virt.jump_arg_index];
+        let mut fvals = Vec::new();
+        for (descr, _) in &virt.fields {
+            let fv = p1_ops.iter()
+                .find(|op| op.opcode == OpCode::SetfieldGc
+                    && op.args.first() == Some(&vref)
+                    && op.descr.as_ref().map_or(false, |d| d.index() == descr.index()))
+                .and_then(|op| op.args.get(1).copied())
+                .unwrap_or(OpRef::NONE);
+            fvals.push(fv);
+        }
+        args.remove(virt.jump_arg_index);
+        for (i, fv) in fvals.into_iter().enumerate() {
+            args.insert(virt.jump_arg_index + i, fv);
+        }
+    }
+    args.into_vec()
+}
+
+/// unroll.py:479-504 import_state: build ImportedVirtual for Phase 2.
+fn build_imported_virtuals(
+    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
+) -> Vec<crate::optimizer::ImportedVirtual> {
+    let mut imported = Vec::new();
+    let mut offset = 0;
+    for virt in jump_virtuals {
+        let base = virt.jump_arg_index + offset;
+        let fields: Vec<_> = virt.fields.iter().enumerate()
+            .map(|(i, (descr, _))| (descr.clone(), base + i))
+            .collect();
+        imported.push(crate::optimizer::ImportedVirtual {
+            inputarg_index: base,
+            size_descr: virt.size_descr.clone(),
+            fields,
+        });
+        offset += virt.fields.len() - 1;
+    }
+    imported
+}
+
+/// Remap original trace op positions that collide with body's extra inputargs.
+fn remap_trace_for_body(
+    ops: &[Op],
+    constants: &std::collections::HashMap<u32, i64>,
+    orig_num_inputs: usize,
+    body_num_inputs: usize,
+) -> (Vec<Op>, std::collections::HashMap<u32, i64>) {
+    let extra = body_num_inputs.saturating_sub(orig_num_inputs) as u32;
+    if extra == 0 {
+        return (ops.to_vec(), constants.clone());
+    }
+    let mut remapped = ops.to_vec();
+    let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
+    for op in &mut remapped {
+        if op.pos.0 != u32::MAX
+            && op.pos.0 >= orig_num_inputs as u32
+            && op.pos.0 < orig_num_inputs as u32 + extra
+        {
+            let new_pos = OpRef(op.pos.0 + extra);
+            remap.insert(op.pos, new_pos);
+            op.pos = new_pos;
+        }
+    }
+    for op in &mut remapped {
+        for arg in &mut op.args {
+            if let Some(&r) = remap.get(arg) { *arg = r; }
+        }
+        if let Some(ref mut fa) = op.fail_args {
+            for a in fa.iter_mut() {
+                if let Some(&r) = remap.get(a) { *a = r; }
+            }
+        }
+    }
+    let mut new_consts = std::collections::HashMap::new();
+    for (&k, &v) in constants {
+        let nk = remap.get(&OpRef(k)).map_or(k, |r| r.0);
+        new_consts.insert(nk, v);
+    }
+    (remapped, new_consts)
+}
+
+/// compile.py:310-338: [preamble_no_jump] + Label(label_args) + [body_with_jump]
+fn assemble_peeled_trace(
+    p1_ops: &[Op],
+    p2_ops: &[Op],
+    label_args: &[OpRef],
+    body_num_inputs: usize,
+) -> Vec<Op> {
+    let mut result = Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1);
+
+    // Preamble: everything except Jump
+    for op in p1_ops {
+        if op.opcode == OpCode::Jump { break; }
+        result.push(op.clone());
+    }
+
+    // Label position
+    let max_pos = result.iter()
+        .map(|op| op.pos.0).filter(|&p| p != u32::MAX).max().unwrap_or(0);
+    let label_pos = (max_pos + 1).max(body_num_inputs as u32);
+    let mut label_op = Op::new(OpCode::Label, label_args);
+    label_op.pos = OpRef(label_pos);
+    result.push(label_op);
+
+    // Body: 2-pass remap (inputarg refs → label_args, op positions → after label)
+    let body_base = label_pos + 1;
+    let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
+
+    // Pass 1: collect all remappings
+    for (i, &la) in label_args.iter().enumerate() {
+        if (i as u32) < body_num_inputs as u32 {
+            remap.insert(OpRef(i as u32), la);
+        }
+    }
+    for (idx, op) in p2_ops.iter().enumerate() {
+        if op.pos.0 != u32::MAX {
+            remap.insert(op.pos, OpRef(body_base + idx as u32));
+        }
+    }
+
+    // Pass 2: apply
+    for (idx, op) in p2_ops.iter().enumerate() {
+        let mut new_op = op.clone();
+        if new_op.pos.0 != u32::MAX {
+            new_op.pos = OpRef(body_base + idx as u32);
+        }
+        for arg in &mut new_op.args {
+            if let Some(&m) = remap.get(arg) { *arg = m; }
+        }
+        // Jump args: if a remapped arg doesn't point to a label_arg or
+        // a body-produced op, fall back to the corresponding label slot.
+        // This handles Phase 2 flattened field values that may reference
+        // stale pre-remap OpRefs.
+        if new_op.opcode == OpCode::Jump {
+            let body_positions: std::collections::HashSet<OpRef> = (0..p2_ops.len() as u32)
+                .map(|i| OpRef(body_base + i))
+                .collect();
+            let label_set: std::collections::HashSet<OpRef> = label_args.iter().copied().collect();
+            for (i, arg) in new_op.args.iter_mut().enumerate() {
+                if i < label_args.len()
+                    && !label_set.contains(arg)
+                    && !body_positions.contains(arg)
+                {
+                    *arg = label_args[i];
+                }
+            }
+        }
+        if let Some(ref mut fa) = new_op.fail_args {
+            for a in fa.iter_mut() {
+                if let Some(&m) = remap.get(a) { *a = m; }
+            }
+        }
+        result.push(new_op);
+    }
+
+    result
+}
+
+// ── Legacy helpers (kept for non-peeling paths) ──
+
 /// Build a modified trace for Phase 2 optimization by prepending
 /// New+SetfieldGc reconstruction ops that rebuild virtual objects
-/// from flattened field inputargs.
-///
-/// Input:  original trace [ops..., Jump(args)]
-///         + exported virtual structures from Phase 1
-/// Output: modified trace [New, SetfieldGc, ..., ops (with refs replaced), Jump(field_values)]
-///         with extra inputargs for the flattened fields
+/// from flattened field inputargs (unused — kept for reference).
+#[allow(dead_code)]
 fn build_body_trace_with_virtual_import(
     ops: &[Op],
     jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
@@ -725,6 +792,8 @@ fn combine_preamble_and_body(
     body_num_inputs: usize,
     jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
 ) -> Vec<Op> {
+    use std::collections::HashSet;
+
     let mut result = Vec::with_capacity(preamble.len() + body.len() + 1);
 
     // Preamble ops (Phase 1 result, up to but not including Jump)
@@ -790,12 +859,17 @@ fn combine_preamble_and_body(
 
     // Op position remap: avoid collisions with preamble
     let body_base = result.len() as u32 + body_num_inputs as u32 + 1;
+    let mut body_positions = HashSet::new();
     for (idx, op) in body.iter().enumerate() {
         if op.pos.0 != u32::MAX {
             let new_pos = OpRef(body_base + idx as u32);
             body_remap.insert(op.pos, new_pos);
+            if op.result_type() != majit_ir::Type::Void {
+                body_positions.insert(new_pos);
+            }
         }
     }
+    let label_args_set: HashSet<OpRef> = label_args.iter().copied().collect();
 
     // Pass 2: apply remap
     for (idx, op) in body.iter().enumerate() {
@@ -806,6 +880,20 @@ fn combine_preamble_and_body(
         for arg in &mut new_op.args {
             if let Some(&mapped) = body_remap.get(arg) {
                 *arg = mapped;
+            }
+        }
+        if new_op.opcode == OpCode::Jump {
+            for (i, arg) in new_op.args.iter_mut().enumerate() {
+                if i >= label_args.len() {
+                    break;
+                }
+                // RPython import_state closes the peeled body against the new
+                // label args. If a stale pre-phase-2 OpRef survives into the
+                // closing JUMP, fall back to the corresponding label slot so
+                // the loop back-edge stays in the label namespace.
+                if !label_args_set.contains(arg) && !body_positions.contains(arg) {
+                    *arg = label_args[i];
+                }
             }
         }
         if let Some(ref mut fa) = new_op.fail_args {
