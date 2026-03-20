@@ -74,6 +74,8 @@ pub struct Optimizer {
     /// RPython: propagate_all_forward(trace, flush=False) for Phase 2.
     /// When true, skip flush() at end of optimization.
     pub skip_flush: bool,
+    /// Preserved final context after optimization, for jump_to_existing_trace.
+    pub final_ctx: Option<OptContext>,
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.
@@ -355,6 +357,7 @@ impl Optimizer {
             imported_short_preamble_builder: None,
             patchguardop: None,
             skip_flush: false,
+            final_ctx: None,
         }
     }
 
@@ -547,11 +550,11 @@ impl Optimizer {
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // Follow forwarding chain first.
         let resolved = ctx.get_replacement(opref);
-        if ctx.take_potential_extra_op(resolved) {
+        if let Some(tracked) = ctx.take_potential_extra_op(resolved) {
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                let _ = builder.add_preamble_op(resolved);
+                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                let _ = builder.add_preamble_op(resolved);
+                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             }
         }
         // Check if any pass considers this a virtual.
@@ -1052,7 +1055,10 @@ impl Optimizer {
             }
         }
 
-        ctx.new_operations
+        // Preserve final context for jump_to_existing_trace.
+        let ops = std::mem::take(&mut ctx.new_operations);
+        self.final_ctx = Some(ctx);
+        ops
     }
 
     fn collect_exported_int_bounds(
