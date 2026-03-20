@@ -191,7 +191,21 @@ impl OptHeap {
             for arg in &mut op.args {
                 *arg = ctx.get_replacement(*arg);
             }
-            let value_ref = op.arg(1);
+            // Skip if value ref doesn't correspond to any defined op.
+            // This happens when a virtual was force-emitted but the lazy_set's
+            // value OpRef points to an intermediate forwarding position that
+            // was never assigned to an output op.
+            let value_ref = ctx.get_replacement(op.arg(1));
+            let num_inputs = ctx.num_inputs() as u32;
+            let value_is_undefined = !value_ref.is_none()
+                && value_ref.0 >= num_inputs
+                && !ctx
+                    .new_operations
+                    .iter()
+                    .any(|o| o.pos == value_ref);
+            if value_is_undefined {
+                continue;
+            }
             ctx.emit(op);
             self.cached_fields.insert(key, value_ref);
         }
