@@ -60,9 +60,13 @@ impl Optimization for OptSimplify {
                 OptimizationResult::Emit(new_op)
             }
 
-            // simplify.py: GUARD_FUTURE_CONDITION — removed, the guard was
-            // already handled by notice_guard_future_condition in the optimizer.
-            OpCode::GuardFutureCondition => OptimizationResult::Remove,
+            // simplify.py: GUARD_FUTURE_CONDITION — record in patchguardop,
+            // then remove. Unroll uses patchguardop to attach resume data to
+            // extra guards from short preamble.
+            OpCode::GuardFutureCondition => {
+                _ctx.patchguardop = Some(op.clone());
+                OptimizationResult::Remove
+            }
 
             // Hint operations that are simply removed
             OpCode::VirtualRefFinish
