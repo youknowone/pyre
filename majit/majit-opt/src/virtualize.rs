@@ -1810,23 +1810,26 @@ impl Optimization for OptVirtualize {
             // optimizer must not append its own synthetic inputs here.
             OpCode::Jump if self.vable_config.is_some() => {
                 let frame_ref = ctx.get_replacement(OpRef(0));
-                // Force virtualizable frame's arrays back to the heap
-                // BEFORE the jump. This ensures nursery-allocated boxed
-                // values are written to frame.locals_cells_stack_w so
-                // the next iteration reads correct (GC-updated) pointers.
+                // RPython carries virtualizable fields as JUMP args,
+                // avoiding per-iteration writeback. When JUMP args
+                // include locals (args.len() > 3), they are SSA values
+                // that flow to the next iteration. Writeback is only
+                // needed when locals are NOT in JUMP args (nlocals=0,
+                // e.g., module-level code using namespace instead of
+                // fast locals).
                 //
-                // RPython: _jump_to_existing_trace calls
-                // virtualizable.force_virtualizable_if_necessary()
-                // before emitting JUMP.
-                if let Some(PtrInfo::Virtualizable(vinfo)) =
-                    ctx.get_ptr_info(frame_ref).cloned()
-                {
-                    self.force_virtualizable(frame_ref, vinfo, ctx);
-                }
+                // For module-level loops, force_virtualizable writes
+                // New() results to the frame's namespace storage.
 
                 let mut jump_op = op.clone();
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
                     let resolved = ctx.get_replacement(*arg);
+                    if resolved == frame_ref {
+                        if matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_))) {
+                            *arg = resolved;
+                            continue;
+                        }
+                    }
                     if Self::is_virtual(resolved, ctx) {
                         self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                         let forced = self.force_virtual(resolved, ctx);
@@ -2085,7 +2088,9 @@ pub(crate) fn make_field_index_descr(idx: u32) -> DescrRef {
 }
 
 fn virtualizable_field_index(offset: usize) -> u32 {
-    0x1000_0000 | (((offset as u32) & 0x000f_ffff) << 4) | (0x7 << 1)
+    // Encode as: FIELD_DESCR_TAG | (offset << 4) | (size_bits << 1) | type_bits
+    // type_bits = 0 (Int), size_bits = 0 (8 & 0x7 = 0 for pointer-sized fields)
+    0x1000_0000 | (((offset as u32) & 0x000f_ffff) << 4)
 }
 
 /// Extract the byte offset from a field descriptor index.

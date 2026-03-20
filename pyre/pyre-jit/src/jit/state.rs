@@ -446,6 +446,9 @@ impl PyreSym {
             return;
         }
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
+        if majit_meta::majit_log_enabled() {
+            eprintln!("[jit][init-sym] concrete_frame={:#x} nlocals={} vable_base={:?}", concrete_frame, nlocals, self.vable_array_base);
+        }
         let valuestackdepth = concrete_stack_depth(concrete_frame).unwrap_or(nlocals);
         let stack_only_depth = valuestackdepth.saturating_sub(nlocals);
         self.nlocals = nlocals;
@@ -798,6 +801,26 @@ impl TraceFrameState {
 
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame(ctx);
+        // If nlocals was lost (e.g., inline tracing reset symbolic_initialized),
+        // re-derive from concrete frame. RPython keeps virtualizable_boxes in
+        // sync across all frames; pyre needs this fallback.
+        // If nlocals was lost (inline tracing reset), recover from
+        // the trace's num_inputs. RPython carries virtualizable_boxes
+        // across frames; pyre derives nlocals from inputarg count.
+        {
+            let num_inputs = ctx.num_inputs();
+            let s = self.sym_mut();
+            if s.nlocals == 0 && s.vable_array_base.is_some() {
+                let base = s.vable_array_base.unwrap() as usize;
+                let nlocals = num_inputs.saturating_sub(base);
+                if nlocals > 0 {
+                    s.nlocals = nlocals;
+                    s.symbolic_locals = (0..nlocals)
+                        .map(|i| OpRef(base as u32 + i as u32))
+                        .collect();
+                }
+            }
+        }
         let (frame, next_instr, stack_depth, nlocals, locals, stack) = {
             let s = self.sym();
             let stack_only = s.stack_only_depth();

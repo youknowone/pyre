@@ -242,6 +242,11 @@ impl TraceCtx {
         self.green_key
     }
 
+    /// Number of input arguments to the current trace.
+    pub fn num_inputs(&self) -> usize {
+        self.recorder.num_inputargs()
+    }
+
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()
