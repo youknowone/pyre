@@ -122,6 +122,9 @@ impl SharedOpcodeHandler for PyFrame {
         callable: Self::Value,
         args: &[Self::Value],
     ) -> Result<Self::Value, PyError> {
+        if let Some(result) = crate::call::replay_pending_inline_result(self) {
+            return Ok(result);
+        }
         call_callable(self, callable, args)
     }
 

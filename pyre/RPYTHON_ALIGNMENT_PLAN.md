@@ -19,6 +19,16 @@ Verified on the current tree:
   - `fib_recursive`: about `user 0.07s`
   - `inline_helper`: about `user 0.01s`
 
+Additional benchmark status from the current tree:
+
+- `./target/release/pyre pyre/bench/nbody_200.py`
+  does not finish within a 20s timeout.
+- `./target/release/pyre pyre/bench/fannkuch_8.py`
+  does not finish within a 20s timeout.
+- Local `pypy3` on the same machine is much faster on both:
+  - `nbody_200`: about `user 0.01s`
+  - `fannkuch_8`: about `user 0.02s`
+
 ## What The Updated Code Actually Looks Like
 
 ### 1. Recursive correctness is currently stable
@@ -73,15 +83,50 @@ inline result protocol is likely to produce another unstable half-state:
 That is not aligned with RPython. RPython gets the representation and frame
 ownership right first, then turns on deeper frame switching.
 
+### 5. `nbody` and `fannkuch` expose a more immediate RPython mismatch
+
+The current code already lowers homogeneous list accesses well enough to reach
+raw array operations:
+
+- `nbody` hot traces contain `GetarrayitemRawF` / `SetarrayitemRaw`
+- `fannkuch` dynamic int indexing now reaches `GetarrayitemRawI` /
+  `SetarrayitemRaw`
+
+However, the traces still end by rebuilding boxed `W_Float` / `W_Int` objects
+right before `Jump(...)`. This is the bigger remaining mismatch with
+`rpython/jit/metainterp/resume.py`, which carries live boxes as typed
+`INT / REF / FLOAT`, not uniformly boxed `Ref`.
+
+Today `pyre` still uses:
+
+- `[frame, next_instr, valuestackdepth, locals..., stack...]`
+- `locals/stack` all typed as `Ref`
+- restore paths that write them back as `PyObjectRef`
+
+Relevant code:
+
+- `pyre/pyre-jit/src/jit/state.rs::fail_arg_types_for_virtualizable_state`
+- `pyre/pyre-jit/src/jit/state.rs::close_loop_args`
+- `pyre/pyre-jit/src/jit/state.rs::extract_live`
+- `pyre/pyre-jit/src/jit/state.rs::live_value_types`
+- `pyre/pyre-jit/src/jit/state.rs::restore_virtualizable_i64`
+- `pyre/pyre-jit/src/jit/state.rs::restore_values`
+
+That representation mismatch is now the clearest next blocker for:
+
+- `nbody`: float-heavy loop-carried values
+- `fannkuch`: int-heavy loop-carried values
+
 ## Updated Priority Order
 
 The previous plan over-emphasized root self-recursive trace-through too early.
 The current code says the order should be:
 
-1. stop hot inline results from escaping as boxed objects
-2. make inline call/result ownership framestack-local
-3. then re-open deeper frame-switch tracing
-4. only after that, remove the remaining helper-boundary recursion
+1. make loop-carried live-state typed (`INT / REF / FLOAT`) instead of all `Ref`
+2. stop hot inline results from escaping as boxed objects
+3. make inline call/result ownership framestack-local
+4. then re-open deeper frame-switch tracing
+5. only after that, remove the remaining helper-boundary recursion
 
 ## Phase 0: Freeze The Current Baseline
 
@@ -99,9 +144,69 @@ Completion criteria:
 - recursive function-entry trace still compiles
 - both benches still return correct answers
 
-## Phase 1: Remove Escaping Boxed Int Results From Inline Hot Paths
+## Phase 1: Make Loop-Carried Live-State Typed
 
-This is the immediate highest-value step.
+This is now the highest-value RPython-aligned step for `nbody` and
+`fannkuch`.
+
+### RPython basis
+
+`rpython/jit/metainterp/resume.py` stores live values as typed boxes:
+
+- `INT`
+- `REF`
+- `FLOAT`
+
+It does not force arithmetic loop-carried values back into boxed heap objects
+before every `Jump(...)`.
+
+### Current pyre mismatch
+
+Today `pyre` still forces locals/stack live-state through boxed `PyObjectRef`
+slots:
+
+- `fail_arg_types_for_virtualizable_state(...)` types all locals/stack as `Ref`
+- `extract_live(...)` exports locals/stack as boxed pointers
+- `restore_virtualizable_i64(...)` writes boxed pointers back into frame slots
+
+This is why `nbody` traces still end with:
+
+- `New()`
+- `SetfieldGc(... floatval ...)`
+- `Jump(...)`
+
+even after most body arithmetic is already raw `Float*`.
+
+### Target
+
+Move loop-carried live-state toward typed `INT / REF / FLOAT`, matching
+`resume.py`, while keeping the concrete frame authoritative for interpreter
+execution.
+
+### Files
+
+- `pyre/pyre-jit/src/jit/state.rs`
+
+### Concrete work
+
+1. Split live-state typing by concrete value kind instead of using
+   `fail_arg_types_for_virtualizable_state(...)` for every slot.
+2. Teach loop-close export to carry raw int/float payloads where the concrete
+   local/stack value is a known `W_Int` / `W_Float`.
+3. Teach restore paths to rebuild boxed `PyObjectRef` only when resuming back
+   into interpreter state.
+4. Keep frame scalars (`frame`, `next_instr`, `valuestackdepth`) unchanged.
+
+### Completion criteria
+
+- `nbody` optimized traces show fewer `New + SetfieldGc` pairs before `Jump`
+- `fannkuch` optimized traces show fewer boxed int rebuilds before `Jump`
+- correctness remains intact
+
+## Phase 2: Remove Escaping Boxed Int Results From Inline Hot Paths
+
+This remains the next highest-value step for `inline_helper` after the typed
+live-state work above.
 
 ### Why this is first
 
@@ -149,7 +254,7 @@ Only materialize a boxed `W_Int` at a boundary that truly requires an object.
 - optimized `inline_helper` trace contains fewer boxed-int `New` nodes
 - `inline_helper` user time drops materially from the current `~0.04s`
 
-## Phase 2: Remove Portal Markers From Inline Hot Traces
+## Phase 3: Remove Portal Markers From Inline Hot Traces
 
 ### Why this is next
 
@@ -184,7 +289,7 @@ hot path unless it is semantically required.
 - optimized `inline_helper` trace no longer shows repeated inline-only
   `LeavePortalFrame()` markers
 
-## Phase 3: Replace The Single-Slot Inline Result Channel
+## Phase 4: Replace The Single-Slot Inline Result Channel
 
 ### Why this is now urgent
 
@@ -217,7 +322,7 @@ Inline concrete result flow must become framestack-owned, not TLS-slot-owned.
 - inline execution no longer depends on `set_inline_handled_result(...)`
   for nested call/return correctness
 
-## Phase 4: Make Residual Calls Fully Framestack-Owned
+## Phase 5: Make Residual Calls Fully Framestack-Owned
 
 ### Why this still matters
 
@@ -250,7 +355,7 @@ framestack state transitions, not sidecar interpreter calls with borrowed state.
 - nested inline residual calls no longer rely on interpreter-global state
 - result propagation is explicit and local to the framestack
 
-## Phase 5: Re-open Root Self-Recursive Trace-Through
+## Phase 6: Re-open Root Self-Recursive Trace-Through
 
 Only after phases 1-4 are stable.
 
@@ -287,7 +392,7 @@ Allow self-recursive root calls back into `trace_through_callee()` /
 - no `stack underflow`
 - hot recursive trace no longer depends on the self-recursive force helper
 
-## Phase 6: Remove Remaining Helper-Boundary Recursion
+## Phase 7: Remove Remaining Helper-Boundary Recursion
 
 After root self-recursive trace-through is stable:
 
@@ -304,21 +409,26 @@ Every phase should rerun at least:
 - `cargo test -p pyre-jit test_eval_recursive_fib_compiles_function_entry_trace -- --nocapture --test-threads=1`
 - `./target/release/pyre pyre/bench/fib_recursive.py`
 - `./target/release/pyre pyre/bench/inline_helper.py`
+- `timeout 20 ./target/release/pyre pyre/bench/nbody_200.py`
+- `timeout 20 ./target/release/pyre pyre/bench/fannkuch_8.py`
 - `MAJIT_LOG=1` trace capture for whichever hot path the phase targets
 
 For performance-focused phases, compare against the current baseline:
 
 - `fib_recursive`: ~`0.12 user`
 - `inline_helper`: ~`0.04 user`
+- `nbody_200`: currently does not finish within 20s
+- `fannkuch_8`: currently does not finish within 20s
 
 ## Immediate Next Task
 
 Start with Phase 1, not recursive frame switching:
 
-- audit and reduce `trace_box_int(...)` escape points in `state.rs`
-- make inline int results stay raw longer
-- confirm that `New + SetfieldGc` count drops in the optimized
-  `inline_helper` trace
+- change loop-carried/live-state handling to follow `resume.py`'s typed
+  `INT / REF / FLOAT` model
+- confirm that `nbody` and `fannkuch` traces lose boxed `New + SetfieldGc`
+  pairs right before `Jump(...)`
+- only after that, resume the inline-result and recursive framestack work
 
 That is the shortest path that is both:
 

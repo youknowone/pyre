@@ -4,7 +4,7 @@
 //! Each wraps a pyre-object or pyre-objspace operation with the
 //! correct calling convention and integer-based parameter passing.
 
-use majit_ir::{OpCode, OpRef};
+use majit_ir::{OpCode, OpRef, Type};
 use majit_meta::TraceCtx;
 
 use pyre_object::*;
@@ -41,8 +41,48 @@ pub fn emit_trace_call_int(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]
     ctx.call_int(helper, args)
 }
 
+pub fn emit_trace_call_int_typed(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+) -> OpRef {
+    ctx.call_int_typed(helper, args, arg_types)
+}
+
+pub fn emit_trace_call_ref(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) -> OpRef {
+    ctx.call_ref(helper, args)
+}
+
+pub fn emit_trace_call_ref_typed(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+) -> OpRef {
+    ctx.call_ref_typed(helper, args, arg_types)
+}
+
 pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) {
     ctx.call_void(helper, args);
+}
+
+pub fn emit_trace_call_void_typed(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+) {
+    ctx.call_void_typed(helper, args, arg_types);
+}
+
+pub fn emit_trace_call_may_force_ref_typed(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+) -> OpRef {
+    ctx.call_may_force_ref_typed(helper, args, arg_types)
 }
 
 pub fn emit_trace_build_flat(
@@ -64,7 +104,8 @@ pub fn emit_trace_build_flat(
             "{opname} build arity not supported by JIT"
         )));
     };
-    Ok(ctx.call_int(helper, items))
+    let arg_types = vec![Type::Ref; items.len()];
+    Ok(ctx.call_ref_typed(helper, items, &arg_types))
 }
 
 pub fn emit_trace_call_callable(
@@ -77,7 +118,9 @@ pub fn emit_trace_call_callable(
         .ok_or_else(|| PyError::type_error("call arity not supported by JIT"))?;
     let mut call_args = vec![frame, callable];
     call_args.extend_from_slice(args);
-    Ok(ctx.call_may_force_int(helper, &call_args))
+    let mut arg_types = vec![Type::Ref, Type::Ref];
+    arg_types.extend(std::iter::repeat_n(Type::Ref, args.len()));
+    Ok(ctx.call_may_force_ref_typed(helper, &call_args, &arg_types))
 }
 
 pub fn emit_trace_call_known_builtin(
@@ -89,7 +132,9 @@ pub fn emit_trace_call_known_builtin(
         .ok_or_else(|| PyError::type_error("builtin call arity not supported by JIT"))?;
     let mut call_args = vec![callable];
     call_args.extend_from_slice(args);
-    Ok(ctx.call_int(helper, &call_args))
+    let mut arg_types = vec![Type::Ref];
+    arg_types.extend(std::iter::repeat_n(Type::Ref, args.len()));
+    Ok(ctx.call_ref_typed(helper, &call_args, &arg_types))
 }
 
 pub fn emit_trace_call_known_function(
@@ -102,7 +147,9 @@ pub fn emit_trace_call_known_function(
         .ok_or_else(|| PyError::type_error("function call arity not supported by JIT"))?;
     let mut call_args = vec![frame, callable];
     call_args.extend_from_slice(args);
-    Ok(ctx.call_may_force_int(helper, &call_args))
+    let mut arg_types = vec![Type::Ref, Type::Ref];
+    arg_types.extend(std::iter::repeat_n(Type::Ref, args.len()));
+    Ok(ctx.call_may_force_ref_typed(helper, &call_args, &arg_types))
 }
 
 pub fn emit_trace_unpack_sequence(
@@ -113,10 +160,11 @@ pub fn emit_trace_unpack_sequence(
     let mut items = Vec::with_capacity(count);
     for idx in 0..count {
         let idx_const = ctx.const_int(idx as i64);
-        items.push(emit_trace_call_int(
+        items.push(emit_trace_call_ref_typed(
             ctx,
             jit_sequence_getitem as *const (),
             &[seq, idx_const],
+            &[Type::Ref, Type::Int],
         ));
     }
     Ok(items)
@@ -128,10 +176,11 @@ pub fn emit_trace_load_name_from_namespace(
     name: &str,
 ) -> OpRef {
     let [name_ptr, name_len] = trace_name_args(ctx, name);
-    emit_trace_call_int(
+    emit_trace_call_ref_typed(
         ctx,
         jit_load_name_from_namespace as *const (),
         &[namespace, name_ptr, name_len],
+        &[Type::Ref, Type::Int, Type::Int],
     )
 }
 
@@ -142,15 +191,16 @@ pub fn emit_trace_store_name_to_namespace(
     value: OpRef,
 ) {
     let [name_ptr, name_len] = trace_name_args(ctx, name);
-    emit_trace_call_void(
+    emit_trace_call_void_typed(
         ctx,
         jit_store_name_to_namespace as *const (),
         &[namespace, name_ptr, name_len, value],
+        &[Type::Ref, Type::Int, Type::Int, Type::Ref],
     );
 }
 
 pub fn emit_trace_truth_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    emit_trace_call_int(ctx, jit_truth_value as *const (), &[value])
+    emit_trace_call_int_typed(ctx, jit_truth_value as *const (), &[value], &[Type::Ref])
 }
 
 pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate: bool) -> OpRef {
@@ -160,7 +210,7 @@ pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate
     } else {
         truth
     };
-    emit_trace_call_int(ctx, jit_bool_value_from_truth as *const (), &[truth])
+    emit_trace_call_ref_typed(ctx, jit_bool_value_from_truth as *const (), &[truth], &[Type::Int])
 }
 
 pub fn emit_trace_binary_value(
@@ -175,10 +225,11 @@ pub fn emit_trace_binary_value(
         )));
     };
     let tag = ctx.const_int(tag);
-    Ok(emit_trace_call_int(
+    Ok(emit_trace_call_ref_typed(
         ctx,
         jit_binary_value_from_tag as *const (),
         &[a, b, tag],
+        &[Type::Ref, Type::Ref, Type::Int],
     ))
 }
 
@@ -189,11 +240,21 @@ pub fn emit_trace_compare_value(
     op: pyre_bytecode::bytecode::ComparisonOperator,
 ) -> OpRef {
     let tag = ctx.const_int(compare_op_tag(op));
-    emit_trace_call_int(ctx, jit_compare_value_from_tag as *const (), &[a, b, tag])
+    emit_trace_call_ref_typed(
+        ctx,
+        jit_compare_value_from_tag as *const (),
+        &[a, b, tag],
+        &[Type::Ref, Type::Ref, Type::Int],
+    )
 }
 
 pub fn emit_trace_range_iter_next_or_null(ctx: &mut TraceCtx, iter: OpRef) -> OpRef {
-    emit_trace_call_int(ctx, jit_range_iter_next_or_null as *const (), &[iter])
+    emit_trace_call_ref_typed(
+        ctx,
+        jit_range_iter_next_or_null as *const (),
+        &[iter],
+        &[Type::Ref],
+    )
 }
 
 pub fn emit_trace_int_constant(ctx: &mut TraceCtx, value: i64) -> OpRef {
@@ -205,11 +266,21 @@ pub fn emit_trace_float_constant(ctx: &mut TraceCtx, value: f64) -> OpRef {
 }
 
 pub fn emit_trace_unary_negative_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    emit_trace_call_int(ctx, jit_unary_negative_value as *const (), &[value])
+    emit_trace_call_ref_typed(
+        ctx,
+        jit_unary_negative_value as *const (),
+        &[value],
+        &[Type::Ref],
+    )
 }
 
 pub fn emit_trace_unary_invert_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    emit_trace_call_int(ctx, jit_unary_invert_value as *const (), &[value])
+    emit_trace_call_ref_typed(
+        ctx,
+        jit_unary_invert_value as *const (),
+        &[value],
+        &[Type::Ref],
+    )
 }
 
 pub trait TraceHelperAccess {
@@ -221,10 +292,11 @@ pub trait TraceHelperAccess {
     fn trace_make_function(&mut self, code_obj: OpRef) -> Result<OpRef, PyError> {
         let globals = self.trace_globals_ptr();
         self.with_trace_ctx(|ctx| {
-            Ok(emit_trace_call_int(
+            Ok(emit_trace_call_ref_typed(
                 ctx,
                 jit_make_function_from_globals as *const (),
                 &[globals, code_obj],
+                &[Type::Ref, Type::Ref],
             ))
         })
     }
@@ -251,7 +323,12 @@ pub trait TraceHelperAccess {
 
     fn trace_store_subscr(&mut self, obj: OpRef, key: OpRef, value: OpRef) -> Result<(), PyError> {
         self.with_trace_ctx(|ctx| {
-            let _ = emit_trace_call_int(ctx, jit_setitem as *const (), &[obj, key, value]);
+            let _ = emit_trace_call_int_typed(
+                ctx,
+                jit_setitem as *const (),
+                &[obj, key, value],
+                &[Type::Ref, Type::Ref, Type::Ref],
+            );
             Ok(())
         })
     }
@@ -259,10 +336,11 @@ pub trait TraceHelperAccess {
     fn trace_load_attr(&mut self, obj: OpRef, name: &str) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| {
             let [name_ptr, name_len] = trace_name_args(ctx, name);
-            Ok(emit_trace_call_int(
+            Ok(emit_trace_call_ref_typed(
                 ctx,
                 jit_getattr as *const (),
                 &[obj, name_ptr, name_len],
+                &[Type::Ref, Type::Int, Type::Int],
             ))
         })
     }
@@ -270,10 +348,11 @@ pub trait TraceHelperAccess {
     fn trace_store_attr(&mut self, obj: OpRef, name: &str, value: OpRef) -> Result<(), PyError> {
         self.with_trace_ctx(|ctx| {
             let [name_ptr, name_len] = trace_name_args(ctx, name);
-            let _ = emit_trace_call_int(
+            let _ = emit_trace_call_int_typed(
                 ctx,
                 jit_setattr as *const (),
                 &[obj, name_ptr, name_len, value],
+                &[Type::Ref, Type::Int, Type::Int, Type::Ref],
             );
             Ok(())
         })
@@ -281,7 +360,12 @@ pub trait TraceHelperAccess {
 
     fn trace_list_append(&mut self, list: OpRef, value: OpRef) -> Result<(), PyError> {
         self.with_trace_ctx(|ctx| {
-            emit_trace_call_void(ctx, jit_list_append as *const (), &[list, value]);
+            emit_trace_call_void_typed(
+                ctx,
+                jit_list_append as *const (),
+                &[list, value],
+                &[Type::Ref, Type::Ref],
+            );
             Ok(())
         })
     }

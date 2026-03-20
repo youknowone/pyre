@@ -90,24 +90,25 @@ impl CodeWriter {
     /// transforms. We go directly to assembly.
     pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> PyJitCode {
         let nlocals = code.varnames.len();
-        // Scratch registers after locals:
-        //   tmp0 = nlocals, tmp1 = nlocals+1, op_code_reg = nlocals+2,
-        //   frame_reg = nlocals+3
-        let tmp0 = nlocals as u16;
-        let tmp1 = (nlocals + 1) as u16;
-        let op_code_reg = (nlocals + 2) as u16;
-        let frame_reg = (nlocals + 3) as u16;
+        // RPython parity: Python bytecode locals / stack hold PyObject refs.
+        // Keep object values in ref registers, and reserve a separate int
+        // scratch bank for opcode immediates, truth flags, and the frame ptr.
+        let obj_tmp0 = nlocals as u16;
+        let obj_tmp1 = (nlocals + 1) as u16;
+        let arg_regs_start = (nlocals + 2) as u16; // up to CALL 4
+        let null_ref_reg = (nlocals + 6) as u16; // permanently zero / null
+
+        let int_tmp0 = 0u16;
+        let int_tmp1 = 1u16;
+        let op_code_reg = 2u16;
+        let frame_reg = 3u16;
 
         // RPython: self.assembler = Assembler()
         let mut assembler = JitCodeBuilder::default();
 
-        // RPython regalloc.py: ensure all scratch registers are allocated.
-        // JitCodeBuilder.touch_reg is private, so we emit dummy loads to
-        // register all scratch register indices in num_regs_i.
-        // These constants will be in the constant pool but the loads are
-        // overwritten immediately — they just ensure register allocation.
-        let arg_regs_end = (nlocals + 8) as u16; // support up to CALL 4
-        assembler.load_const_i_value(arg_regs_end, 0);
+        // RPython regalloc.py: keep kind-separated register files.
+        assembler.ensure_r_regs(null_ref_reg + 1);
+        assembler.ensure_i_regs(frame_reg + 1);
 
         // Register helper function pointers
         // RPython: CallControl manages fn addresses; assembler.finished()
@@ -158,30 +159,34 @@ impl CodeWriter {
                 // RPython flatten.py: input args → registers 0..n-1
                 Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
-                    assembler.push_i(reg);
+                    assembler.push_r(reg);
                 }
 
                 Instruction::StoreFast { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
-                    assembler.pop_i(reg);
+                    assembler.pop_r(reg);
                 }
 
                 Instruction::LoadSmallInt { i } => {
-                    // All stack values must be PyObjectRef pointers.
-                    // Box the raw integer via w_int_new.
+                    // RPython parity: Python stack carries boxed object refs.
+                    // Box the raw integer via w_int_new and keep the result in
+                    // the ref register file.
                     let val = i.get(op_arg) as u32 as i64;
-                    assembler.load_const_i_value(tmp0, val);
-                    assembler.call_int(box_int_fn_idx, &[tmp0], tmp0);
-                    assembler.push_i(tmp0);
+                    assembler.load_const_i_value(int_tmp0, val);
+                    assembler.call_ref_typed(
+                        box_int_fn_idx,
+                        &[majit_meta::jitcode::JitCallArg::int(int_tmp0)],
+                        obj_tmp0,
+                    );
+                    assembler.push_r(obj_tmp0);
                 }
 
                 Instruction::LoadConst { consti } => {
                     // RPython assembler.py: emit_const() deduplicates constants.
-                    // For now, push 0 placeholder; blackhole caller populates
-                    // from frame.
+                    // For now, push null placeholder; blackhole caller
+                    // materializes concrete consts from the frame.
                     let _idx = consti.get(op_arg);
-                    assembler.load_const_i_value(tmp0, 0);
-                    assembler.push_i(tmp0);
+                    assembler.push_r(null_ref_reg);
                 }
 
                 Instruction::PopTop => {
@@ -189,33 +194,45 @@ impl CodeWriter {
                 }
 
                 Instruction::PushNull => {
-                    assembler.load_const_i_value(tmp0, 0);
-                    assembler.push_i(tmp0);
+                    assembler.push_r(null_ref_reg);
                 }
 
                 // RPython jtransform.py: rewrite_op_int_add etc.
                 Instruction::BinaryOp { op } => {
                     let op_val = op.get(op_arg) as u32;
-                    assembler.pop_i(tmp1); // rhs
-                    assembler.pop_i(tmp0); // lhs
-                    // RPython: residual_call for generic binary dispatch
+                    assembler.pop_r(obj_tmp1); // rhs
+                    assembler.pop_r(obj_tmp0); // lhs
+                    // RPython: residual_call for generic binary dispatch,
+                    // returning a boxed PyObject ref.
                     assembler.load_const_i_value(op_code_reg, op_val as i64);
-                    assembler.call_may_force_int(
+                    assembler.call_may_force_ref_typed(
                         binary_op_fn_idx,
-                        &[tmp0, tmp1, op_code_reg],
-                        tmp0,
+                        &[
+                            majit_meta::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_meta::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_meta::jitcode::JitCallArg::int(op_code_reg),
+                        ],
+                        obj_tmp0,
                     );
-                    assembler.push_i(tmp0);
+                    assembler.push_r(obj_tmp0);
                 }
 
                 // RPython jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
                 Instruction::CompareOp { opname } => {
                     let op_val = opname.get(op_arg) as u32;
-                    assembler.pop_i(tmp1); // rhs
-                    assembler.pop_i(tmp0); // lhs
+                    assembler.pop_r(obj_tmp1); // rhs
+                    assembler.pop_r(obj_tmp0); // lhs
                     assembler.load_const_i_value(op_code_reg, op_val as i64);
-                    assembler.call_may_force_int(compare_fn_idx, &[tmp0, tmp1, op_code_reg], tmp0);
-                    assembler.push_i(tmp0);
+                    assembler.call_may_force_ref_typed(
+                        compare_fn_idx,
+                        &[
+                            majit_meta::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_meta::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_meta::jitcode::JitCallArg::int(op_code_reg),
+                        ],
+                        obj_tmp0,
+                    );
+                    assembler.push_r(obj_tmp0);
                 }
 
                 // RPython jtransform.py: optimize_goto_if_not → goto_if_not
@@ -224,11 +241,15 @@ impl CodeWriter {
                 Instruction::PopJumpIfFalse { delta } => {
                     let target_py_pc =
                         jump_target_forward(num_instrs, py_pc + 1, delta.get(op_arg).as_usize());
-                    assembler.pop_i(tmp0);
+                    assembler.pop_r(obj_tmp0);
                     // truth_fn: PyObjectRef → 0/1 (truthiness check)
-                    assembler.call_int(truth_fn_idx, &[tmp0], tmp0);
+                    assembler.call_int_typed(
+                        truth_fn_idx,
+                        &[majit_meta::jitcode::JitCallArg::reference(obj_tmp0)],
+                        int_tmp0,
+                    );
                     if target_py_pc < num_instrs {
-                        assembler.branch_reg_zero(tmp0, labels[target_py_pc]);
+                        assembler.branch_reg_zero(int_tmp0, labels[target_py_pc]);
                     }
                 }
 
@@ -238,11 +259,16 @@ impl CodeWriter {
                     // Invert: branch_reg_zero branches if zero, but we want
                     // branch if nonzero. Emit: tmp0 = (tmp0 == 0), then
                     // branch_reg_zero.
-                    assembler.pop_i(tmp0);
-                    assembler.load_const_i_value(tmp1, 0);
-                    assembler.record_binop_i(tmp0, OpCode::IntEq, tmp0, tmp1);
+                    assembler.pop_r(obj_tmp0);
+                    assembler.call_int_typed(
+                        truth_fn_idx,
+                        &[majit_meta::jitcode::JitCallArg::reference(obj_tmp0)],
+                        int_tmp0,
+                    );
+                    assembler.load_const_i_value(int_tmp1, 0);
+                    assembler.record_binop_i(int_tmp0, OpCode::IntEq, int_tmp0, int_tmp1);
                     if target_py_pc < num_instrs {
-                        assembler.branch_reg_zero(tmp0, labels[target_py_pc]);
+                        assembler.branch_reg_zero(int_tmp0, labels[target_py_pc]);
                     }
                 }
 
@@ -265,24 +291,30 @@ impl CodeWriter {
 
                 // RPython flatten.py: int_return / ref_return
                 Instruction::ReturnValue => {
-                    // Pop return value into register 0.
-                    // The blackhole caller reads registers_i[0] after run().
-                    assembler.pop_i(tmp0);
-                    assembler.move_i(0, tmp0);
+                    // Pop return value into ref register 0.
+                    // The blackhole caller reads registers_r[0] after run().
+                    assembler.pop_r(obj_tmp0);
+                    assembler.move_r(0, obj_tmp0);
                     assembler.abort();
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call (residual)
                 Instruction::LoadGlobal { namei } => {
                     let raw_namei = namei.get(op_arg) as usize as i64;
-                    assembler.load_const_i_value(tmp0, raw_namei);
-                    assembler.call_may_force_int(load_global_fn_idx, &[frame_reg, tmp0], tmp0);
+                    assembler.load_const_i_value(int_tmp0, raw_namei);
+                    assembler.call_may_force_ref_typed(
+                        load_global_fn_idx,
+                        &[
+                            majit_meta::jitcode::JitCallArg::int(frame_reg),
+                            majit_meta::jitcode::JitCallArg::int(int_tmp0),
+                        ],
+                        obj_tmp0,
+                    );
                     // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first
                     if raw_namei & 1 != 0 {
-                        assembler.load_const_i_value(tmp1, 0);
-                        assembler.push_i(tmp1);
+                        assembler.push_r(null_ref_reg);
                     }
-                    assembler.push_i(tmp0);
+                    assembler.push_r(obj_tmp0);
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call →
@@ -300,22 +332,23 @@ impl CodeWriter {
                     let nargs = argc.get(op_arg) as usize;
                     // Pop args in reverse into scratch registers
                     // For now, support up to 3 args (covers fib_recursive CALL 1)
-                    let arg_regs_start = (nlocals + 4) as u16;
                     for i in (0..nargs).rev() {
-                        assembler.pop_i(arg_regs_start + i as u16);
+                        assembler.pop_r(arg_regs_start + i as u16);
                     }
-                    assembler.pop_i(tmp1); // callable
+                    assembler.pop_r(obj_tmp1); // callable
                     assembler.pop_discard(); // NULL
 
                     // call_fn(callable, arg0, frame_ptr) → result
                     // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
-                    let mut call_args: Vec<u16> = vec![tmp1];
+                    let mut call_args = vec![majit_meta::jitcode::JitCallArg::reference(obj_tmp1)];
                     for i in 0..nargs {
-                        call_args.push(arg_regs_start + i as u16);
+                        call_args.push(majit_meta::jitcode::JitCallArg::reference(
+                            arg_regs_start + i as u16,
+                        ));
                     }
-                    call_args.push(frame_reg);
-                    assembler.call_may_force_int(call_fn_idx, &call_args, tmp0);
-                    assembler.push_i(tmp0);
+                    call_args.push(majit_meta::jitcode::JitCallArg::int(frame_reg));
+                    assembler.call_may_force_ref_typed(call_fn_idx, &call_args, obj_tmp0);
+                    assembler.push_r(obj_tmp0);
                 }
 
                 // Unsupported: abort to interpreter fallback

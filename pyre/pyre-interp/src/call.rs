@@ -13,15 +13,30 @@ use pyre_runtime::{
 };
 
 use crate::eval::eval_frame_plain;
-use crate::frame::PyFrame;
+use crate::frame::{PendingInlineResult, PyFrame};
 
 /// Store an inline-handled concrete result on the owning caller frame.
-pub fn set_pending_inline_result(frame: &mut PyFrame, result: PyObjectRef) {
+pub fn set_pending_inline_result(frame: &mut PyFrame, result: PendingInlineResult) {
     frame.pending_inline_result = Some(result);
 }
 
 fn take_pending_inline_result(frame: &mut PyFrame) -> Option<PyObjectRef> {
-    frame.pending_inline_result.take()
+    match frame.pending_inline_result.take()? {
+        PendingInlineResult::Ref(result) => Some(result),
+        PendingInlineResult::Int(value) => Some(pyre_object::w_int_new(value)),
+        PendingInlineResult::Float(value) => Some(pyre_object::floatobject::w_float_new(value)),
+    }
+}
+
+/// Replay the concrete result of a just-traced inline call.
+///
+/// PyPy's `finishframe()` feeds the result back to the parent frame's
+/// registers and resumes from there; it does not route the value through the
+/// generic call dispatcher.  Keep pyre's concrete replay explicit as well:
+/// the interpreter loop that replays the CALL bytecode consumes the pending
+/// result, pops callable/args, and pushes the materialized return value.
+pub fn replay_pending_inline_result(frame: &mut PyFrame) -> Option<PyObjectRef> {
+    take_pending_inline_result(frame)
 }
 
 // ── Eval function injection ──────────────────────────────────────
@@ -140,9 +155,6 @@ fn call_user_function_with_eval(
 }
 
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
-    if let Some(result) = take_pending_inline_result(frame) {
-        return Ok(result);
-    }
     dispatch_callable(
         callable,
         |callable| {
