@@ -185,6 +185,8 @@ impl UnrollOptimizer {
                 .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
                 .collect();
         }
+        // Export Phase 1's heap cache for Phase 2 import_state.
+        exported_state.preamble_heap_cache = opt_p1.export_all_cached_fields();
         self.ensure_preamble_target_token();
         // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
         // RPython import_state: phase 2 starts from the original trace input
@@ -448,6 +450,11 @@ pub struct ExportedState {
     /// Types of end_args as determined by Phase 1 optimization.
     /// Used by Phase 2 import_state to propagate unboxed types.
     pub end_arg_types: Vec<Type>,
+    /// Phase 1 heap cache: (obj, descr_idx, cached_value) entries
+    /// for ALL fields cached during preamble optimization.
+    /// Phase 2 import_state uses this to pre-populate its heap cache
+    /// for inputargs that the preamble already read fields from.
+    pub preamble_heap_cache: Vec<(OpRef, u32, OpRef)>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::virtualstate::VirtualState,
     /// unroll.py: exported_infos — optimizer knowledge from preamble.
@@ -569,6 +576,7 @@ impl ExportedState {
             end_args,
             next_iteration_args,
             end_arg_types: Vec::new(),
+            preamble_heap_cache: Vec::new(),
             virtual_state,
             exported_infos,
             exported_short_ops,
@@ -1045,14 +1053,24 @@ impl OptUnroll {
             if let Some(info) = exported_state.exported_infos.get(target) {
                 self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
             }
-            // When the preamble unboxed a Ref arg into Int/Float, the
-            // forwarded target is a raw value. Set int_lower_bounds to
-            // mark it as an int-typed loop-carried value for Phase 2's
-            // int bounds pass (nonneg optimization).
-            if let Some(&arg_type) = exported_state.end_arg_types.get(i) {
-                if arg_type == Type::Int {
-                    ctx.int_lower_bounds.entry(*target).or_insert(i64::MIN);
-                }
+        }
+
+        // Propagate Phase 1 heap cache to Phase 2.
+        // For each field cached in the preamble, if the object is a Phase 2
+        // inputarg (via forwarding), add it to imported_short_fields so the
+        // heap optimizer can skip redundant field reads.
+        // Use the FORWARDED object ref as key, since Phase 2's optimizer
+        // resolves forwarding before looking up the cache.
+        for &(obj, descr_idx, cached_val) in &exported_state.preamble_heap_cache {
+            if obj.is_none() || cached_val.is_none() {
+                continue;
+            }
+            // Check if this object is one of Phase 2's targetargs
+            if (obj.0 as usize) < targetargs.len() {
+                let forwarded_obj = ctx.get_replacement(obj);
+                let forwarded_val = ctx.get_replacement(cached_val);
+                ctx.imported_short_fields
+                    .insert((forwarded_obj, descr_idx), forwarded_val);
             }
         }
 

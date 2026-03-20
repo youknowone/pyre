@@ -543,6 +543,15 @@ impl Optimizer {
         }
     }
 
+    /// Collect all cached field entries from all passes.
+    pub fn export_all_cached_fields(&self) -> Vec<(OpRef, u32, OpRef)> {
+        let mut result = Vec::new();
+        for pass in &self.passes {
+            result.extend(pass.export_cached_fields());
+        }
+        result
+    }
+
     /// optimizer.py: flush()
     /// Flush all passes' postponed state.
     pub fn flush(&mut self, ctx: &mut OptContext) {

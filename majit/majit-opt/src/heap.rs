@@ -210,15 +210,7 @@ impl OptHeap {
             if info.is_virtual() {
                 // RPython info.py:148: force_box → emit New + SetfieldGc
                 let forced = info.force_to_ops(orig_val, ctx);
-                // RPython heap.py routes emit_extra() from OptHeap to
-                // optimizer.send_extra_operation(op, self.next_optimization).
-                // OptHeap is the last pass in majit's default pipelines, so
-                // the forced materialization must become concrete output
-                // immediately before we emit the heap writeback itself.
-                ctx.flush_extra_operations_raw();
-                // Update the op's arg to the forced concrete ref
                 op.args[1] = forced;
-                // Resolve remaining args
                 for arg in op.args.iter_mut() {
                     *arg = ctx.get_replacement(*arg);
                 }
@@ -261,9 +253,6 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        if crate::majit_log_enabled() && !pending.is_empty() {
-            eprintln!("[heap] force_all_lazy: {} pending lazy_setfields", pending.len());
-        }
         // 2-pass: first force all virtual values (emit New + SetfieldGc),
         // then emit all pool writebacks. This ensures SSA ordering:
         // v16 = New() must appear BEFORE SetfieldGc(pool, v16).
@@ -272,9 +261,6 @@ impl OptHeap {
             let orig_val = op.arg(1);
             if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
                 if info.is_virtual() {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[heap] force_to_ops: orig_val={orig_val:?}");
-                    }
                     info.force_to_ops(orig_val, ctx);
                 }
             }
@@ -1384,6 +1370,20 @@ impl Optimization for OptHeap {
 
     fn name(&self) -> &'static str {
         "heap"
+    }
+
+    fn export_cached_fields(&self) -> Vec<(OpRef, u32, OpRef)> {
+        self.cached_fields
+            .iter()
+            .filter(|&(_, &v)| !v.is_none())
+            .map(|(&(obj, descr_idx), &val)| (obj, descr_idx, val))
+            .chain(
+                self.immutable_cached_fields
+                    .iter()
+                    .filter(|&(_, &v)| !v.is_none())
+                    .map(|(&(obj, descr_idx), &val)| (obj, descr_idx, val)),
+            )
+            .collect()
     }
 
 }
