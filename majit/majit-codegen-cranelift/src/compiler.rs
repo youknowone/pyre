@@ -2070,13 +2070,17 @@ extern "C" fn call_assembler_shim(
     0
 }
 
+/// RPython parity: alloc shims do NOT register/unregister roots.
+/// Roots are persistently registered by run_compiled_code (matching
+/// RPython's _call_header_shadowstack, assembler.py:1122-1128).
+/// The GC finds roots via the persistent registration, not per-alloc.
 extern "C" fn gc_alloc_nursery_shim(
     runtime_id: u64,
-    roots_ptr: u64,
-    num_roots: u64,
+    _roots_ptr: u64,
+    _num_roots: u64,
     size: u64,
 ) -> u64 {
-    with_registered_gc_roots(runtime_id, roots_ptr, num_roots, |gc| {
+    with_gc_runtime(runtime_id, |gc| {
         let obj = gc.alloc_nursery(size as usize);
         obj.0 as u64
     })
@@ -2084,12 +2088,12 @@ extern "C" fn gc_alloc_nursery_shim(
 
 extern "C" fn gc_alloc_typed_nursery_shim(
     runtime_id: u64,
-    roots_ptr: u64,
-    num_roots: u64,
+    _roots_ptr: u64,
+    _num_roots: u64,
     type_id: u64,
     size: u64,
 ) -> u64 {
-    with_registered_gc_roots(runtime_id, roots_ptr, num_roots, |gc| {
+    with_gc_runtime(runtime_id, |gc| {
         let obj = gc.alloc_nursery_typed(type_id as u32, size as usize);
         obj.0 as u64
     })
@@ -2097,13 +2101,13 @@ extern "C" fn gc_alloc_typed_nursery_shim(
 
 extern "C" fn gc_alloc_varsize_shim(
     runtime_id: u64,
-    roots_ptr: u64,
-    num_roots: u64,
+    _roots_ptr: u64,
+    _num_roots: u64,
     base_size: u64,
     item_size: u64,
     length: u64,
 ) -> u64 {
-    with_registered_gc_roots(runtime_id, roots_ptr, num_roots, |gc| {
+    with_gc_runtime(runtime_id, |gc| {
         let obj = gc.alloc_varsize(base_size as usize, item_size as usize, length as usize);
         obj.0 as u64
     })
@@ -3003,32 +3007,13 @@ fn emit_indirect_call_from_parts(
         );
     }
 
-    // RPython parity: roots are registered/unregistered per-call for
-    // calls that might trigger GC (allocating calls). For non-allocating
-    // calls (most CallI/CallR), we skip registration entirely.
-    //
-    // TODO: Once gcmap bitmap is implemented, replace per-call
-    // registration with a single MOV per call site (RPython's approach).
+    // RPython parity: roots are persistently registered by
+    // run_compiled_code (_call_header_shadowstack, assembler.py:1122).
+    // Per-call, only spill/reload to keep roots array up-to-date.
+    // RPython's push_gcmap (callbuilder.py:39) is 1 MOV instruction;
+    // pop_gcmap (callbuilder.py:42) is 1 MOV. No function calls.
     spill_ref_roots(builder, roots_ptr, ref_root_slots, defined_ref_vars);
-    emit_gc_root_registration(
-        builder,
-        ptr_type,
-        call_conv,
-        gc_runtime_id,
-        roots_ptr,
-        ref_root_slots,
-        true,
-    );
     let call = builder.ins().call_indirect(sig_ref, func_ptr, &args);
-    emit_gc_root_registration(
-        builder,
-        ptr_type,
-        call_conv,
-        gc_runtime_id,
-        roots_ptr,
-        ref_root_slots,
-        false,
-    );
     reload_ref_roots(builder, roots_ptr, ref_root_slots, defined_ref_vars);
 
     if result_type != Type::Void {
@@ -3201,6 +3186,15 @@ fn run_compiled_code(
         (0, None)
     };
 
+    // RPython parity: _call_header_shadowstack (assembler.py:1122-1128)
+    // pushes jitframe onto shadowstack at entry. pyre equivalent:
+    // register all root slots with the GC allocator once.
+    if let Some(rid) = gc_runtime_id {
+        if num_ref_roots > 0 {
+            register_gc_roots(rid, &mut roots);
+        }
+    }
+
     let fail_index = with_active_force_frame(handle, || unsafe {
         func(
             inputs.as_ptr(),
@@ -3208,6 +3202,15 @@ fn run_compiled_code(
             roots.as_mut_ptr() as *mut i64,
         )
     }) as u32;
+
+    // RPython parity: _call_footer_shadowstack (assembler.py:1130-1136)
+    // pops jitframe from shadowstack at exit.
+    if let Some(rid) = gc_runtime_id {
+        if num_ref_roots > 0 {
+            unregister_gc_roots(rid, &mut roots);
+        }
+    }
+
     drop(_jitted_guard);
     (fail_index, outputs, handle, force_frame)
 }
@@ -3738,20 +3741,17 @@ impl CraneliftBackend {
         // No per-call registration/unregistration inside the compiled code.
         // Per-call spill/reload keeps the roots array up-to-date.
 
-        // Find LABEL — when present, ops before it form the preamble
-        // (executed once in the entry block), and the Label's args define
-        // the loop header's block parameters.
-        let label_idx = ops.iter().position(|op| op.opcode == OpCode::Label);
+        // RPython compile.py sends loops to the backend as:
+        // [start_label] + preamble_ops + [loop_label] + body_ops
+        // and JUMPs target LABEL descrs. Model that directly by creating
+        // a Cranelift block per LABEL descr.
+        let label_indices: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| (op.opcode == OpCode::Label).then_some(idx))
+            .collect();
 
-        // Determine loop block parameter count.
-        //
-        // RPython-style traces carry the canonical loop header arity in LABEL.
-        // Legacy no-LABEL traces must still agree with the terminal JUMP. Some
-        // optimizer paths may conservatively grow num_inputs for hidden virtual
-        // state while the actual no-LABEL loop body still jumps with a smaller
-        // visible arity. In that case the loop contract is the JUMP arity, not
-        // the raw num_inputs count.
-        let loop_param_count = if let Some(li) = label_idx {
+        let loop_param_count = if let Some(&li) = label_indices.last() {
             ops[li].args.len()
         } else {
             ops.iter()
@@ -3761,10 +3761,8 @@ impl CraneliftBackend {
                 .unwrap_or(num_inputs)
         };
 
-        // Declare extra variables for Label args beyond num_inputs.
-        // This handles depth growth in virtualizable storage loops where
-        // Jump args > InputArgs (RPython parity: preamble peeling bridges the gap).
-        if loop_param_count > num_inputs {
+        // Legacy no-LABEL traces can still need synthetic loop params.
+        if label_indices.is_empty() && loop_param_count > num_inputs {
             for i in num_inputs..loop_param_count {
                 if !declared_vars.contains(&(i as u32)) {
                     builder.declare_var(var(i as u32), cl_types::I64);
@@ -3773,20 +3771,48 @@ impl CraneliftBackend {
             }
         }
 
-        // Loop header block
-        let loop_block = builder.create_block();
-        for _ in 0..loop_param_count {
-            builder.append_block_param(loop_block, cl_types::I64);
+        let mut label_blocks = Vec::with_capacity(label_indices.len());
+        let mut label_blocks_by_descr = HashMap::new();
+        for &label_idx in &label_indices {
+            let block = builder.create_block();
+            for _ in 0..ops[label_idx].args.len() {
+                builder.append_block_param(block, cl_types::I64);
+            }
+            if let Some(descr_index) = ops[label_idx].descr.as_ref().map(|descr| descr.index()) {
+                label_blocks_by_descr.insert(descr_index, block);
+            }
+            label_blocks.push((label_idx, block));
         }
 
-        // Preamble ops (0..label_idx) execute in the entry block.
-        // After them we jump to loop_block and emit the body.
-        let body_start = label_idx.map_or(0, |i| i + 1);
+        let loop_block = label_blocks
+            .last()
+            .map(|(_, block)| *block)
+            .unwrap_or_else(|| {
+                let block = builder.create_block();
+                for _ in 0..loop_param_count {
+                    builder.append_block_param(block, cl_types::I64);
+                }
+                block
+            });
+
         let mut guard_idx: usize = 0;
         let mut last_ovf_flag: Option<CValue> = None;
 
-        // If no Label, jump entry -> loop immediately (old behavior)
-        if label_idx.is_none() {
+        if let Some(&(entry_label_idx, entry_label_block)) = label_blocks.first() {
+            let vals: Vec<CValue> = ops[entry_label_idx]
+                .args
+                .iter()
+                .map(|&r| resolve_opref(&mut builder, &constants, r))
+                .collect();
+            builder.ins().jump(entry_label_block, &vals);
+            builder.switch_to_block(entry_label_block);
+            for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
+                let param = builder.block_params(entry_label_block)[i];
+                if !arg_ref.is_none() && !constants.contains_key(&arg_ref.0) {
+                    builder.def_var(var(arg_ref.0), param);
+                }
+            }
+        } else {
             let zero = builder.ins().iconst(cl_types::I64, 0);
             let vals: Vec<CValue> = (0..loop_param_count)
                 .map(|i| {
@@ -3808,33 +3834,28 @@ impl CraneliftBackend {
         }
 
         for op_idx in 0..ops.len() {
-            // Skip ops before body_start when there's no Label
-            // (they don't exist in the no-label case since body_start=0)
-            if label_idx.is_none() && op_idx < body_start {
-                continue;
-            }
-
-            // When we reach the Label op, perform the entry->loop transition
-            if let Some(li) = label_idx {
-                if op_idx == li {
-                    // Jump entry -> loop with Label's arg values
-                    let vals: Vec<CValue> = ops[li]
+            if let Some((_, label_block)) = label_blocks
+                .iter()
+                .find(|(label_idx, _)| *label_idx == op_idx)
+            {
+                // The first LABEL is already the current block. Later LABELs
+                // are explicit jump targets inside the same compiled loop.
+                if Some(op_idx) != label_blocks.first().map(|(label_idx, _)| *label_idx) {
+                    let vals: Vec<CValue> = ops[op_idx]
                         .args
                         .iter()
                         .map(|&r| resolve_opref(&mut builder, &constants, r))
                         .collect();
-                    builder.ins().jump(loop_block, &vals);
-
-                    // Switch to loop block and bind block params
-                    builder.switch_to_block(loop_block);
-                    for (i, &arg_ref) in ops[li].args.iter().enumerate() {
-                        let param = builder.block_params(loop_block)[i];
+                    builder.ins().jump(*label_block, &vals);
+                    builder.switch_to_block(*label_block);
+                    for (i, &arg_ref) in ops[op_idx].args.iter().enumerate() {
+                        let param = builder.block_params(*label_block)[i];
                         if !arg_ref.is_none() && !constants.contains_key(&arg_ref.0) {
                             builder.def_var(var(arg_ref.0), param);
                         }
                     }
-                    continue; // skip emitting the Label op itself
                 }
+                continue;
             }
             let op = &ops[op_idx];
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
@@ -4879,15 +4900,6 @@ impl CraneliftBackend {
                     }
 
                     spill_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
-                    emit_gc_root_registration(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        gc_runtime_id,
-                        roots_ptr,
-                        &ref_root_slots,
-                        true,
-                    );
                     let result = emit_host_call(
                         &mut builder,
                         ptr_type,
@@ -4900,15 +4912,6 @@ impl CraneliftBackend {
                             expected_result_kind,
                         ],
                         Some(cl_types::I64),
-                    );
-                    emit_gc_root_registration(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        gc_runtime_id,
-                        roots_ptr,
-                        &ref_root_slots,
-                        false,
                     );
                     reload_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
 
@@ -5053,15 +5056,6 @@ impl CraneliftBackend {
 
                     // Spill GC roots before the call
                     spill_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
-                    emit_gc_root_registration(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        gc_runtime_id,
-                        roots_ptr,
-                        &ref_root_slots,
-                        true,
-                    );
 
                     // Release GIL (call the pre-hook)
                     let _ = emit_host_call(
@@ -5120,16 +5114,7 @@ impl CraneliftBackend {
                         None,
                     );
 
-                    // Unregister roots and reload
-                    emit_gc_root_registration(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        gc_runtime_id,
-                        roots_ptr,
-                        &ref_root_slots,
-                        false,
-                    );
+                    // Reload roots (may have been updated by GC during call)
                     reload_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
 
                     if let Some(result) = result {
@@ -6069,7 +6054,12 @@ impl CraneliftBackend {
                         .iter()
                         .map(|&r| resolve_opref(&mut builder, &constants, r))
                         .collect();
-                    builder.ins().jump(loop_block, &vals);
+                    let target_block = op
+                        .descr
+                        .as_ref()
+                        .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied())
+                        .unwrap_or(loop_block);
+                    builder.ins().jump(target_block, &vals);
                 }
 
                 OpCode::Finish => {
@@ -6934,7 +6924,12 @@ impl CraneliftBackend {
             }
         }
 
-        builder.seal_block(loop_block);
+        for (_, block) in &label_blocks {
+            builder.seal_block(*block);
+        }
+        if label_blocks.is_empty() {
+            builder.seal_block(loop_block);
+        }
         builder.finalize();
 
         // Compile

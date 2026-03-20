@@ -76,6 +76,9 @@ pub struct PyreMeta {
     /// When true, guard fail_args follow the layout:
     ///   [frame, next_instr, valuestackdepth, l0..lN, s0..sM]
     pub has_virtualizable: bool,
+    /// RPython resume.py parity: typed live boxes for locals + stack.
+    /// Order is locals first, then stack-only slots.
+    pub slot_types: Vec<Type>,
 }
 
 /// Symbolic state during tracing.
@@ -91,6 +94,8 @@ pub struct PyreSym {
     // These fields survive across per-instruction TraceFrameState lifetimes.
     pub(crate) symbolic_locals: Vec<OpRef>,
     pub(crate) symbolic_stack: Vec<OpRef>,
+    pub(crate) symbolic_local_types: Vec<Type>,
+    pub(crate) symbolic_stack_types: Vec<Type>,
     pub(crate) pending_next_instr: Option<usize>,
     pub(crate) locals_cells_stack_array_ref: OpRef,
     /// Absolute index into the unified array (starts at nlocals).
@@ -110,6 +115,7 @@ pub struct PyreSym {
     /// consumes this to emit GUARD_TRUE/GUARD_FALSE directly,
     /// bypassing bool object creation.
     pub(crate) last_comparison_truth: Option<OpRef>,
+    pub(crate) transient_value_types: std::collections::HashMap<OpRef, Type>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -373,22 +379,73 @@ pub(crate) fn record_current_state_guard(
     let mut fail_args = vec![frame, next_instr, stack_depth];
     fail_args.extend_from_slice(locals);
     fail_args.extend_from_slice(stack);
-    let fail_arg_types = fail_arg_types_for_virtualizable_state(fail_args.len());
+    let slot_types = std::iter::repeat_n(Type::Ref, fail_args.len().saturating_sub(3));
+    let fail_arg_types = virtualizable_fail_arg_types(slot_types);
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
 
-fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
-    let mut types = Vec::with_capacity(len);
-    for idx in 0..len {
-        if idx == 0 {
-            types.push(Type::Ref); // frame pointer
-        } else if idx < 3 {
-            types.push(Type::Int); // next_instr, valuestackdepth
+fn virtualizable_fail_arg_types(slot_types: impl IntoIterator<Item = Type>) -> Vec<Type> {
+    let mut types = vec![Type::Ref, Type::Int, Type::Int];
+    types.extend(slot_types);
+    types
+}
+
+fn concrete_value_type(value: PyObjectRef) -> Type {
+    if value.is_null() {
+        return Type::Ref;
+    }
+    unsafe {
+        if is_int(value) {
+            Type::Int
+        } else if is_float(value) {
+            Type::Float
         } else {
-            types.push(Type::Ref); // locals/stack: boxed PyObjectRef
+            Type::Ref
         }
     }
+}
+
+fn concrete_slot_types(
+    frame: usize,
+    num_locals: usize,
+    valuestackdepth: usize,
+) -> Vec<Type> {
+    let stack_only = valuestackdepth.saturating_sub(num_locals);
+    let mut types = Vec::with_capacity(num_locals + stack_only);
+    for idx in 0..num_locals {
+        types.push(
+            concrete_stack_value(frame, idx)
+                .map(concrete_value_type)
+                .unwrap_or(Type::Ref),
+        );
+    }
+    for stack_idx in 0..stack_only {
+        types.push(
+            concrete_stack_value(frame, num_locals + stack_idx)
+                .map(concrete_value_type)
+                .unwrap_or(Type::Ref),
+        );
+    }
     types
+}
+
+fn boxed_slot_i64_for_type(slot_type: Type, raw: i64) -> PyObjectRef {
+    match slot_type {
+        Type::Int => w_int_new(raw),
+        Type::Float => pyre_object::floatobject::w_float_new(f64::from_bits(raw as u64)),
+        Type::Ref | Type::Void => raw as PyObjectRef,
+    }
+}
+
+fn boxed_slot_value_for_type(slot_type: Type, value: &Value) -> PyObjectRef {
+    match (slot_type, value) {
+        (Type::Int, Value::Int(v)) => w_int_new(*v),
+        (Type::Float, Value::Float(v)) => pyre_object::floatobject::w_float_new(*v),
+        (_, Value::Ref(r)) => r.as_usize() as PyObjectRef,
+        (_, Value::Int(v)) => *v as PyObjectRef,
+        (_, Value::Float(v)) => v.to_bits() as PyObjectRef,
+        (_, Value::Void) => PY_NULL,
+    }
 }
 
 fn frame_callable_arg_types(nargs: usize) -> Vec<Type> {
@@ -397,6 +454,20 @@ fn frame_callable_arg_types(nargs: usize) -> Vec<Type> {
     types.push(Type::Ref);
     for _ in 0..nargs {
         types.push(Type::Ref);
+    }
+    types
+}
+
+fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
+    let mut types = Vec::with_capacity(len);
+    for idx in 0..len {
+        if idx == 0 {
+            types.push(Type::Ref);
+        } else if idx < 3 {
+            types.push(Type::Int);
+        } else {
+            types.push(Type::Ref);
+        }
     }
     types
 }
@@ -435,6 +506,8 @@ impl PyreSym {
             frame,
             symbolic_locals: Vec::new(),
             symbolic_stack: Vec::new(),
+            symbolic_local_types: Vec::new(),
+            symbolic_stack_types: Vec::new(),
             pending_next_instr: None,
             locals_cells_stack_array_ref: OpRef::NONE,
             valuestackdepth: 0,
@@ -445,6 +518,7 @@ impl PyreSym {
             symbolic_namespace_slots: std::collections::HashMap::new(),
             vable_array_base: None,
             last_comparison_truth: None,
+            transient_value_types: std::collections::HashMap::new(),
         }
     }
 
@@ -470,6 +544,9 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; nlocals]
         };
+        if self.symbolic_local_types.len() != nlocals {
+            self.symbolic_local_types = concrete_slot_types(concrete_frame, nlocals, nlocals);
+        }
         self.symbolic_stack = if let Some(base) = self.vable_array_base {
             let stack_base = base + nlocals as u32;
             (0..stack_only_depth)
@@ -478,6 +555,12 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; stack_only_depth]
         };
+        if self.symbolic_stack_types.len() != stack_only_depth {
+            self.symbolic_stack_types = concrete_slot_types(concrete_frame, nlocals, valuestackdepth)
+                .into_iter()
+                .skip(nlocals)
+                .collect();
+        }
         self.pending_next_instr = None;
         self.valuestackdepth = valuestackdepth;
         self.symbolic_initialized = true;
@@ -556,17 +639,63 @@ impl TraceFrameState {
     fn build_single_frame_fail_arg_types(&self) -> Vec<Type> {
         let s = self.sym();
         let stack_only = s.stack_only_depth();
-        fail_arg_types_for_virtualizable_state(3 + s.symbolic_locals.len() + stack_only)
+        let slot_types = s
+            .symbolic_local_types
+            .iter()
+            .copied()
+            .chain(
+                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
+                    .iter()
+                    .copied(),
+            );
+        virtualizable_fail_arg_types(slot_types)
     }
 
-    pub(crate) fn push_value(&mut self, _ctx: &mut TraceCtx, value: OpRef) {
+    fn remember_value_type(&mut self, value: OpRef, value_type: Type) {
+        if value.is_none() {
+            return;
+        }
+        self.sym_mut().transient_value_types.insert(value, value_type);
+    }
+
+    fn value_type(&self, value: OpRef) -> Type {
+        if value.is_none() {
+            return Type::Ref;
+        }
+        let s = self.sym();
+        if let Some(value_type) = s.transient_value_types.get(&value).copied() {
+            return value_type;
+        }
+        if let Some(idx) = s.symbolic_locals.iter().position(|&slot| slot == value) {
+            return s.symbolic_local_types.get(idx).copied().unwrap_or(Type::Ref);
+        }
+        let stack_only = s.stack_only_depth().min(s.symbolic_stack.len());
+        if let Some(idx) = s.symbolic_stack[..stack_only]
+            .iter()
+            .position(|&slot| slot == value)
+        {
+            return s.symbolic_stack_types.get(idx).copied().unwrap_or(Type::Ref);
+        }
+        Type::Ref
+    }
+
+    fn push_typed_value(&mut self, _ctx: &mut TraceCtx, value: OpRef, value_type: Type) {
         let s = self.sym_mut();
         let stack_idx = s.stack_only_depth();
         if stack_idx >= s.symbolic_stack.len() {
             s.symbolic_stack.resize(stack_idx + 1, OpRef::NONE);
         }
+        if stack_idx >= s.symbolic_stack_types.len() {
+            s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
+        }
         s.symbolic_stack[stack_idx] = value;
+        s.symbolic_stack_types[stack_idx] = value_type;
         s.valuestackdepth += 1;
+    }
+
+    pub(crate) fn push_value(&mut self, _ctx: &mut TraceCtx, value: OpRef) {
+        let value_type = self.value_type(value);
+        self.push_typed_value(_ctx, value, value_type);
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
@@ -583,7 +712,13 @@ impl TraceFrameState {
                 trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
         let value = s.symbolic_stack[stack_idx];
+        let value_type = s
+            .symbolic_stack_types
+            .get(stack_idx)
+            .copied()
+            .unwrap_or(Type::Ref);
         s.valuestackdepth -= 1;
+        s.transient_value_types.insert(value, value_type);
         Ok(value)
     }
 
@@ -604,7 +739,14 @@ impl TraceFrameState {
             s.symbolic_stack[stack_idx] =
                 trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
-        Ok(s.symbolic_stack[stack_idx])
+        let value = s.symbolic_stack[stack_idx];
+        let value_type = s
+            .symbolic_stack_types
+            .get(stack_idx)
+            .copied()
+            .unwrap_or(Type::Ref);
+        s.transient_value_types.insert(value, value_type);
+        Ok(value)
     }
 
     fn push_call_replay_stack(
@@ -657,6 +799,9 @@ impl TraceFrameState {
                 trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
         s.symbolic_stack.swap(top_idx, other_idx);
+        if top_idx < s.symbolic_stack_types.len() && other_idx < s.symbolic_stack_types.len() {
+            s.symbolic_stack_types.swap(top_idx, other_idx);
+        }
         Ok(())
     }
 
@@ -680,7 +825,10 @@ impl TraceFrameState {
                     trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
             }
         }
-        Ok(s.symbolic_locals[idx])
+        let value = s.symbolic_locals[idx];
+        let value_type = s.symbolic_local_types.get(idx).copied().unwrap_or(Type::Ref);
+        s.transient_value_types.insert(value, value_type);
+        Ok(value)
     }
 
     pub(crate) fn store_local_value(
@@ -689,11 +837,16 @@ impl TraceFrameState {
         idx: usize,
         value: OpRef,
     ) -> Result<(), PyError> {
+        let vtype = self.value_type(value);
         let s = self.sym_mut();
         if idx >= s.symbolic_locals.len() {
             return Err(PyError::type_error("local index out of range in trace"));
         }
         s.symbolic_locals[idx] = value;
+        if idx >= s.symbolic_local_types.len() {
+            s.symbolic_local_types.resize(idx + 1, Type::Ref);
+        }
+        s.symbolic_local_types[idx] = vtype;
         Ok(())
     }
 
@@ -825,6 +978,9 @@ impl TraceFrameState {
                     s.symbolic_locals = (0..nlocals)
                         .map(|i| OpRef(base as u32 + i as u32))
                         .collect();
+                    if s.symbolic_local_types.len() != nlocals {
+                        s.symbolic_local_types.resize(nlocals, Type::Ref);
+                    }
                 }
             }
         }
@@ -886,7 +1042,16 @@ impl TraceFrameState {
         let mut fail_args = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
         fail_args.extend_from_slice(&s.symbolic_locals);
         fail_args.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
-        let fail_arg_types = fail_arg_types_for_virtualizable_state(fail_args.len());
+        let fail_arg_types = virtualizable_fail_arg_types(
+            s.symbolic_local_types
+                .iter()
+                .copied()
+                .chain(
+                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
+                        .iter()
+                        .copied(),
+                ),
+        );
         ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
     }
 
@@ -1161,7 +1326,8 @@ impl TraceFrameState {
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_ptr_descr());
         let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
-        box_traced_raw_int(ctx, raw)
+        self.remember_value_type(raw, Type::Int);
+        raw
     }
 
     fn trace_direct_negative_int_list_getitem(
@@ -1183,7 +1349,8 @@ impl TraceFrameState {
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_int_items_ptr_descr());
         let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
-        box_traced_raw_int(ctx, raw)
+        self.remember_value_type(raw, Type::Int);
+        raw
     }
 
     fn trace_direct_float_list_getitem(
@@ -1204,7 +1371,8 @@ impl TraceFrameState {
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_ptr_descr());
         let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
-        box_traced_raw_float(ctx, raw)
+        self.remember_value_type(raw, Type::Float);
+        raw
     }
 
     fn trace_direct_negative_float_list_getitem(
@@ -1226,7 +1394,8 @@ impl TraceFrameState {
         let items_ptr =
             ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_float_items_ptr_descr());
         let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
-        box_traced_raw_float(ctx, raw)
+        self.remember_value_type(raw, Type::Float);
+        raw
     }
 
     fn trace_unpack_known_sequence(
@@ -1466,31 +1635,35 @@ impl TraceFrameState {
         self.with_ctx(|this, ctx| {
             let fail_args = this.current_fail_args(ctx);
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let result = if has_overflow {
-                crate::jit::generated::trace_int_binop_ovf(
-                    ctx,
-                    a,
-                    b,
-                    op_code,
-                    int_type_addr,
-                    crate::jit::descr::ob_type_descr(),
-                    crate::jit::descr::int_intval_descr(),
-                    crate::jit::descr::w_int_size_descr(),
-                    &fail_args,
-                )
+            let lhs_raw = if this.value_type(a) == Type::Int {
+                a
             } else {
-                crate::jit::generated::trace_int_binop(
+                crate::jit::generated::trace_unbox_int(
                     ctx,
                     a,
-                    b,
-                    op_code,
                     int_type_addr,
                     crate::jit::descr::ob_type_descr(),
                     crate::jit::descr::int_intval_descr(),
-                    crate::jit::descr::w_int_size_descr(),
                     &fail_args,
                 )
             };
+            let rhs_raw = if this.value_type(b) == Type::Int {
+                b
+            } else {
+                crate::jit::generated::trace_unbox_int(
+                    ctx,
+                    b,
+                    int_type_addr,
+                    crate::jit::descr::ob_type_descr(),
+                    crate::jit::descr::int_intval_descr(),
+                    &fail_args,
+                )
+            };
+            let result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+            if has_overflow {
+                this.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
+            }
+            this.remember_value_type(result, Type::Int);
             Ok(result)
         })
     }
@@ -1516,17 +1689,32 @@ impl TraceFrameState {
         self.with_ctx(|this, ctx| {
             let fail_args = this.current_fail_args(ctx);
             let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-            let result = crate::jit::generated::trace_float_binop(
-                ctx,
-                a,
-                b,
-                op_code,
-                float_type_addr,
-                crate::jit::descr::ob_type_descr(),
-                crate::jit::descr::float_floatval_descr(),
-                crate::jit::descr::w_float_size_descr(),
-                &fail_args,
-            );
+            let lhs_raw = if this.value_type(a) == Type::Float {
+                a
+            } else {
+                crate::jit::generated::trace_unbox_float(
+                    ctx,
+                    a,
+                    float_type_addr,
+                    crate::jit::descr::ob_type_descr(),
+                    crate::jit::descr::float_floatval_descr(),
+                    &fail_args,
+                )
+            };
+            let rhs_raw = if this.value_type(b) == Type::Float {
+                b
+            } else {
+                crate::jit::generated::trace_unbox_float(
+                    ctx,
+                    b,
+                    float_type_addr,
+                    crate::jit::descr::ob_type_descr(),
+                    crate::jit::descr::float_floatval_descr(),
+                    &fail_args,
+                )
+            };
+            let result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+            this.remember_value_type(result, Type::Float);
             Ok(result)
         })
     }
@@ -1554,16 +1742,31 @@ impl TraceFrameState {
                 return self.with_ctx(|this, ctx| {
                     let fail_args = this.current_fail_args(ctx);
                     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                    let truth = crate::jit::generated::trace_int_compare(
-                        ctx,
-                        a,
-                        b,
-                        cmp,
-                        int_type_addr,
-                        ob_type_descr(),
-                        int_intval_descr(),
-                        &fail_args,
-                    );
+                    let lhs_raw = if this.value_type(a) == Type::Int {
+                        a
+                    } else {
+                        crate::jit::generated::trace_unbox_int(
+                            ctx,
+                            a,
+                            int_type_addr,
+                            ob_type_descr(),
+                            int_intval_descr(),
+                            &fail_args,
+                        )
+                    };
+                    let rhs_raw = if this.value_type(b) == Type::Int {
+                        b
+                    } else {
+                        crate::jit::generated::trace_unbox_int(
+                            ctx,
+                            b,
+                            int_type_addr,
+                            ob_type_descr(),
+                            int_intval_descr(),
+                            &fail_args,
+                        )
+                    };
+                    let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
                     // RPython goto_if_not fusion: cache truth for
                     // the next POP_JUMP_IF to consume directly.
                     this.sym_mut().last_comparison_truth = Some(truth);
@@ -1582,16 +1785,31 @@ impl TraceFrameState {
                 return self.with_ctx(|this, ctx| {
                     let fail_args = this.current_fail_args(ctx);
                     let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                    let truth = crate::jit::generated::trace_float_compare(
-                        ctx,
-                        a,
-                        b,
-                        cmp,
-                        float_type_addr,
-                        ob_type_descr(),
-                        float_floatval_descr(),
-                        &fail_args,
-                    );
+                    let lhs_raw = if this.value_type(a) == Type::Float {
+                        a
+                    } else {
+                        crate::jit::generated::trace_unbox_float(
+                            ctx,
+                            a,
+                            float_type_addr,
+                            ob_type_descr(),
+                            float_floatval_descr(),
+                            &fail_args,
+                        )
+                    };
+                    let rhs_raw = if this.value_type(b) == Type::Float {
+                        b
+                    } else {
+                        crate::jit::generated::trace_unbox_float(
+                            ctx,
+                            b,
+                            float_type_addr,
+                            ob_type_descr(),
+                            float_floatval_descr(),
+                            &fail_args,
+                        )
+                    };
+                    let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
                     this.sym_mut().last_comparison_truth = Some(truth);
                     Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
                 });
@@ -1723,14 +1941,18 @@ impl TraceFrameState {
                                 list_int_items_ptr_descr(),
                             );
                             let fail_args = this.current_fail_args(ctx);
-                            let raw = crate::jit::generated::trace_unbox_int(
-                                ctx,
-                                value,
-                                &INT_TYPE as *const _ as i64,
-                                ob_type_descr(),
-                                int_intval_descr(),
-                                &fail_args,
-                            );
+                            let raw = if this.value_type(value) == Type::Int {
+                                value
+                            } else {
+                                crate::jit::generated::trace_unbox_int(
+                                    ctx,
+                                    value,
+                                    &INT_TYPE as *const _ as i64,
+                                    ob_type_descr(),
+                                    int_intval_descr(),
+                                    &fail_args,
+                                )
+                            };
                             trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
                         });
@@ -1766,14 +1988,18 @@ impl TraceFrameState {
                                 list_int_items_ptr_descr(),
                             );
                             let fail_args = this.current_fail_args(ctx);
-                            let raw = crate::jit::generated::trace_unbox_int(
-                                ctx,
-                                value,
-                                &INT_TYPE as *const _ as i64,
-                                ob_type_descr(),
-                                int_intval_descr(),
-                                &fail_args,
-                            );
+                            let raw = if this.value_type(value) == Type::Int {
+                                value
+                            } else {
+                                crate::jit::generated::trace_unbox_int(
+                                    ctx,
+                                    value,
+                                    &INT_TYPE as *const _ as i64,
+                                    ob_type_descr(),
+                                    int_intval_descr(),
+                                    &fail_args,
+                                )
+                            };
                             trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
                         });
@@ -1815,14 +2041,18 @@ impl TraceFrameState {
                                 list_float_items_ptr_descr(),
                             );
                             let fail_args = this.current_fail_args(ctx);
-                            let raw = crate::jit::generated::trace_unbox_float(
-                                ctx,
-                                value,
-                                &FLOAT_TYPE as *const _ as i64,
-                                ob_type_descr(),
-                                float_floatval_descr(),
-                                &fail_args,
-                            );
+                            let raw = if this.value_type(value) == Type::Float {
+                                value
+                            } else {
+                                crate::jit::generated::trace_unbox_float(
+                                    ctx,
+                                    value,
+                                    &FLOAT_TYPE as *const _ as i64,
+                                    ob_type_descr(),
+                                    float_floatval_descr(),
+                                    &fail_args,
+                                )
+                            };
                             trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
                         });
@@ -1858,14 +2088,18 @@ impl TraceFrameState {
                                 list_float_items_ptr_descr(),
                             );
                             let fail_args = this.current_fail_args(ctx);
-                            let raw = crate::jit::generated::trace_unbox_float(
-                                ctx,
-                                value,
-                                &FLOAT_TYPE as *const _ as i64,
-                                ob_type_descr(),
-                                float_floatval_descr(),
-                                &fail_args,
-                            );
+                            let raw = if this.value_type(value) == Type::Float {
+                                value
+                            } else {
+                                crate::jit::generated::trace_unbox_float(
+                                    ctx,
+                                    value,
+                                    &FLOAT_TYPE as *const _ as i64,
+                                    ob_type_descr(),
+                                    float_floatval_descr(),
+                                    &fail_args,
+                                )
+                            };
                             trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
                         });
@@ -2702,7 +2936,9 @@ impl TraceFrameState {
             sym.nlocals = callee_nlocals;
             sym.valuestackdepth = callee_nlocals;
             sym.symbolic_locals = args.to_vec();
+            sym.symbolic_local_types = args.iter().map(|&arg| self.value_type(arg)).collect();
             sym.symbolic_stack = Vec::new();
+            sym.symbolic_stack_types = Vec::new();
             sym.symbolic_initialized = true;
             let (vable_next_instr, vable_valuestackdepth) =
                 self.with_ctx(|_, ctx| (ctx.const_int(0), ctx.const_int(callee_nlocals as i64)));
@@ -2733,14 +2969,18 @@ impl TraceFrameState {
             sym.nlocals = callee_nlocals;
             sym.valuestackdepth = sym.nlocals;
             sym.symbolic_locals = Vec::with_capacity(sym.nlocals);
+            sym.symbolic_local_types = Vec::with_capacity(sym.nlocals);
             for i in 0..sym.nlocals {
                 if i < args.len() {
                     sym.symbolic_locals.push(args[i]);
+                    sym.symbolic_local_types.push(self.value_type(args[i]));
                 } else {
                     sym.symbolic_locals.push(OpRef::NONE);
+                    sym.symbolic_local_types.push(Type::Ref);
                 }
             }
             sym.symbolic_stack = Vec::new();
+            sym.symbolic_stack_types = Vec::new();
             sym.symbolic_initialized = true;
             (sym, Some(callee_frame_opref))
         };
@@ -3045,6 +3285,20 @@ impl TraceFrameState {
             return Ok(truth);
         }
 
+        if self.value_type(value) == Type::Int {
+            return self.with_ctx(|_, ctx| {
+                let zero = ctx.const_int(0);
+                Ok(ctx.record_op(OpCode::IntNe, &[value, zero]))
+            });
+        }
+        if self.value_type(value) == Type::Float {
+            return self.with_ctx(|_, ctx| {
+                let zero = ctx.const_int(0);
+                let zero_float = ctx.record_op(OpCode::CastIntToFloat, &[zero]);
+                Ok(ctx.record_op(OpCode::FloatNe, &[value, zero_float]))
+            });
+        }
+
         let Some(concrete_value) = self.concrete_popped_value() else {
             return self.trace_truth_value(value);
         };
@@ -3166,30 +3420,28 @@ impl TraceFrameState {
         }
 
         self.with_ctx(|this, ctx| {
-            let fail_args = this.current_fail_args(ctx);
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let payload = crate::jit::generated::trace_unbox_int(
-                ctx,
-                value,
-                int_type_addr,
-                ob_type_descr(),
-                int_intval_descr(),
-                &fail_args,
-            );
+            let payload = if this.value_type(value) == Type::Int {
+                value
+            } else {
+                let fail_args = this.current_fail_args(ctx);
+                let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+                crate::jit::generated::trace_unbox_int(
+                    ctx,
+                    value,
+                    int_type_addr,
+                    ob_type_descr(),
+                    int_intval_descr(),
+                    &fail_args,
+                )
+            };
             if matches!(opcode, OpCode::IntNeg) {
                 let min_val = ctx.const_int(i64::MIN);
                 let is_min = ctx.record_op(OpCode::IntEq, &[payload, min_val]);
                 this.record_guard(ctx, OpCode::GuardFalse, &[is_min]);
             }
             let result = ctx.record_op(opcode, &[payload]);
-            Ok(crate::jit::generated::trace_box_int(
-                ctx,
-                result,
-                w_int_size_descr(),
-                ob_type_descr(),
-                int_intval_descr(),
-                int_type_addr,
-            ))
+            this.remember_value_type(result, Type::Int);
+            Ok(result)
         })
     }
 
@@ -3693,13 +3945,19 @@ impl PyreJitState {
             let mut idx = 1;
             for local_idx in 0..nlocals {
                 if idx < values.len() {
-                    let _ = self.set_local_at(local_idx, values[idx] as pyre_object::PyObjectRef);
+                    let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
+                    let _ = self.set_local_at(local_idx, boxed_slot_i64_for_type(slot_type, values[idx]));
                 }
                 idx += 1;
             }
             for i in 0..stack_only {
                 if idx < values.len() {
-                    let _ = self.set_stack_at(i, values[idx] as pyre_object::PyObjectRef);
+                    let slot_type = meta
+                        .slot_types
+                        .get(nlocals + i)
+                        .copied()
+                        .unwrap_or(Type::Ref);
+                    let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
                 }
                 idx += 1;
             }
@@ -3795,10 +4053,10 @@ impl PyreJitState {
         let nlocals = self.local_count();
 
         // Locals follow directly (indices 0..nlocals in unified array)
-        // Locals: boxed ptrs (Ref type) — store directly to frame.
         for i in 0..nlocals {
             if idx < values.len() {
-                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
+                let slot_type = concrete_value_type(self.local_at(i).unwrap_or(PY_NULL));
+                let _ = self.set_local_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
                 idx += 1;
             }
         }
@@ -3807,7 +4065,8 @@ impl PyreJitState {
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
         for i in 0..stack_only {
             if idx < values.len() {
-                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
+                let slot_type = concrete_value_type(self.stack_at(i).unwrap_or(PY_NULL));
+                let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
                 idx += 1;
             }
         }
@@ -3894,36 +4153,65 @@ impl JitState for PyreJitState {
     type Env = PyreEnv;
 
     fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {
+        let num_locals = self.local_count();
+        let slot_types = concrete_slot_types(self.frame, num_locals, self.valuestackdepth);
         PyreMeta {
             merge_pc: self.next_instr,
-            num_locals: self.local_count(),
+            num_locals,
             ns_keys: self.namespace_keys(),
             valuestackdepth: self.valuestackdepth,
             has_virtualizable: self.has_virtualizable_info(),
+            slot_types,
         }
     }
 
     fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
-        let nlocals = self.local_count();
-        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        self.extract_live_values(_meta)
+            .into_iter()
+            .map(|value| match value {
+                Value::Int(v) => v,
+                Value::Float(v) => v.to_bits() as i64,
+                Value::Ref(r) => r.as_usize() as i64,
+                Value::Void => 0,
+            })
+            .collect()
+    }
+
+    fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
+        let nlocals = meta.num_locals;
+        let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
         let mut vals = vec![
-            self.frame as i64,
-            self.next_instr as i64,
-            self.valuestackdepth as i64,
+            Value::Ref(majit_ir::GcRef(self.frame)),
+            Value::Int(self.next_instr as i64),
+            Value::Int(self.valuestackdepth as i64),
         ];
-        // RPython: virtualizable_boxes = boxed object ptrs (Ref type).
         for i in 0..nlocals {
-            vals.push(self.local_at(i).unwrap_or(0 as PyObjectRef) as i64);
+            let value = self.local_at(i).unwrap_or(PY_NULL);
+            let slot_type = meta.slot_types.get(i).copied().unwrap_or(Type::Ref);
+            vals.push(match slot_type {
+                Type::Int => Value::Int(unsafe { w_int_get_value(value) }),
+                Type::Float => Value::Float(unsafe { pyre_object::floatobject::w_float_get_value(value) }),
+                Type::Ref | Type::Void => Value::Ref(majit_ir::GcRef(value as usize)),
+            });
         }
         for i in 0..stack_only {
-            vals.push(self.stack_at(i).unwrap_or(0 as PyObjectRef) as i64);
+            let value = self.stack_at(i).unwrap_or(PY_NULL);
+            let slot_type = meta
+                .slot_types
+                .get(nlocals + i)
+                .copied()
+                .unwrap_or(Type::Ref);
+            vals.push(match slot_type {
+                Type::Int => Value::Int(unsafe { w_int_get_value(value) }),
+                Type::Float => Value::Float(unsafe { pyre_object::floatobject::w_float_get_value(value) }),
+                Type::Ref | Type::Void => Value::Ref(majit_ir::GcRef(value as usize)),
+            });
         }
         vals
     }
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        let stack_only = meta.valuestackdepth.saturating_sub(meta.num_locals);
-        fail_arg_types_for_virtualizable_state(3 + meta.num_locals + stack_only)
+        virtualizable_fail_arg_types(meta.slot_types.iter().copied())
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
@@ -3932,6 +4220,11 @@ impl JitState for PyreJitState {
         sym.vable_valuestackdepth = OpRef(2);
         // Unified array: locals at base+0..base+nlocals, stack at base+nlocals..
         sym.vable_array_base = Some(3); // starts after frame(0), ni(1), vsd(2)
+        sym.nlocals = _meta.num_locals;
+        sym.symbolic_local_types = _meta.slot_types[.._meta.num_locals.min(_meta.slot_types.len())]
+            .to_vec();
+        sym.symbolic_stack_types = _meta.slot_types[_meta.num_locals.min(_meta.slot_types.len())..]
+            .to_vec();
         sym
     }
 
@@ -3944,6 +4237,7 @@ impl JitState for PyreJitState {
             && self.local_count() == meta.num_locals
             && self.namespace_len() == meta.ns_keys.len()
             && self.valuestackdepth == meta.valuestackdepth
+            && concrete_slot_types(self.frame, meta.num_locals, self.valuestackdepth) == meta.slot_types
     }
 
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
@@ -3995,31 +4289,51 @@ impl JitState for PyreJitState {
         if meta.has_virtualizable {
             // Virtualizable exits carry the current frame state, not the
             // merge-point state from `meta`.
-            //
-            // In particular, GuardNotForced from function-entry traces resumes
-            // the CALL bytecode with a deeper operand stack than
-            // `meta.valuestackdepth`.  Using the merge-point depth here drops
-            // callable/arg slots and resumes the interpreter with a corrupt
-            // stack.  RPython restores from the payload itself.
-            let ints: Vec<i64> = values
-                .iter()
-                .map(|v| match v {
-                    Value::Int(i) => *i,
-                    Value::Ref(r) => r.as_usize() as i64,
-                    _ => 0,
-                })
-                .collect();
-            self.restore_virtualizable_i64(&ints);
+            self.next_instr = values
+                .get(1)
+                .map(value_to_usize)
+                .unwrap_or(self.next_instr);
+            self.valuestackdepth = values
+                .get(2)
+                .map(value_to_usize)
+                .unwrap_or(self.valuestackdepth);
+            let nlocals = self.local_count();
+            let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+            let mut idx = 3;
+            for local_idx in 0..nlocals {
+                if let Some(value) = values.get(idx) {
+                    let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
+                    let _ = self.set_local_at(local_idx, boxed_slot_value_for_type(slot_type, value));
+                }
+                idx += 1;
+            }
+            for i in 0..stack_only {
+                if let Some(value) = values.get(idx) {
+                    let slot_type = meta
+                        .slot_types
+                        .get(nlocals + i)
+                        .copied()
+                        .unwrap_or(Type::Ref);
+                    let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, value));
+                }
+                idx += 1;
+            }
         } else {
             let nlocals = self.local_count();
             let stack_only_depth = meta.valuestackdepth.saturating_sub(nlocals);
             let mut idx = 1;
             for local_idx in 0..nlocals {
-                let _ = self.set_local_at(local_idx, value_to_ptr(&values[idx]));
+                let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
+                let _ = self.set_local_at(local_idx, boxed_slot_value_for_type(slot_type, &values[idx]));
                 idx += 1;
             }
             for i in 0..stack_only_depth {
-                let _ = self.set_stack_at(i, value_to_ptr(&values[idx]));
+                let slot_type = meta
+                    .slot_types
+                    .get(nlocals + i)
+                    .copied()
+                    .unwrap_or(Type::Ref);
+                let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, &values[idx]));
                 idx += 1;
             }
             self.valuestackdepth = meta.valuestackdepth;
