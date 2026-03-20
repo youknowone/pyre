@@ -397,6 +397,25 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         return cached;
     }
 
+    if majit_meta::majit_log_enabled() {
+        let arg0 = if frame.locals_cells_stack_w.len() > 0
+            && !frame.locals_cells_stack_w[0].is_null()
+            && unsafe { is_int(frame.locals_cells_stack_w[0]) }
+        {
+            Some(unsafe { w_int_get_value(frame.locals_cells_stack_w[0]) })
+        } else {
+            None
+        };
+        eprintln!(
+            "[jit][force-boxed] enter key={} ni={} vsd={} arg0={:?} raw_finish={}",
+            green_key,
+            frame.next_instr,
+            frame.valuestackdepth,
+            arg0,
+            matches!(protocol, FinishProtocol::RawInt)
+        );
+    }
+
     // PyPy assembler_call_helper (warmspot.py:1021): try compiled code
     // dispatch first, fall back to interpreter.
     let (driver, _) = crate::eval::driver_pair();
@@ -416,6 +435,12 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
             &inputs,
             jit_force_callee_frame_interp,
         ) {
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][force-boxed] direct finish key={} token={} raw={} protocol={:?} nlocals={} input_count={}",
+                    green_key, token_num, raw, protocol, nlocals, inputs.len()
+                );
+            }
             let result = match protocol {
                 FinishProtocol::RawInt => w_int_new(raw) as i64,
                 FinishProtocol::Boxed => raw,
@@ -423,16 +448,22 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
             force_cache_store(FinishProtocol::Boxed, hash_idx, code_key, arg_key, result);
             return result;
         }
+        if majit_meta::majit_log_enabled() {
+            eprintln!(
+                "[jit][force-boxed] direct miss key={} token={} -> eval_with_jit fallback",
+                green_key, token_num
+            );
+        }
+    } else if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][force-boxed] no token for key={} -> eval_with_jit fallback",
+            green_key
+        );
     }
 
     // Fallback: full eval_with_jit (interpreter + JIT)
     match crate::eval::eval_with_jit(frame) {
         Ok(result) => {
-            // Return boxed result — re-box raw ints from compiled traces.
-            // The trace's unbox_call_assembler_results pass will strip
-            // GetfieldRawI reads on CallMayForceI results, but if the
-            // result is used directly as an argument (not read via
-            // GetfieldRawI), it must remain a valid boxed pointer.
             let boxed = result as i64;
             force_cache_store(FinishProtocol::Boxed, hash_idx, code_key, arg_key, boxed);
             boxed
@@ -565,9 +596,42 @@ pub extern "C" fn jit_force_recursive_call_1(
     callable: i64,
     boxed_arg: i64,
 ) -> i64 {
+    if majit_meta::majit_log_enabled() {
+        let caller = unsafe { &*(caller_frame as *const PyFrame) };
+        let caller_arg0 = if caller.locals_cells_stack_w.len() > 0
+            && !caller.locals_cells_stack_w[0].is_null()
+            && unsafe { is_int(caller.locals_cells_stack_w[0]) }
+        {
+            Some(unsafe { w_int_get_value(caller.locals_cells_stack_w[0]) })
+        } else {
+            None
+        };
+        let boxed = boxed_arg as PyObjectRef;
+        let callee_arg0 =
+            if !boxed.is_null() && unsafe { is_int(boxed) } { Some(unsafe { w_int_get_value(boxed) }) } else { None };
+        eprintln!(
+            "[jit][force-recursive-boxed] enter caller_arg0={:?} callee_arg0={:?}",
+            caller_arg0, callee_arg0
+        );
+    }
     let frame_ptr = create_callee_frame_impl(caller_frame, callable, &[boxed_arg as PyObjectRef]);
     let result = jit_force_callee_frame(frame_ptr);
     jit_drop_callee_frame(frame_ptr);
+    if majit_meta::majit_log_enabled() {
+        let caller = unsafe { &*(caller_frame as *const PyFrame) };
+        let caller_arg0 = if caller.locals_cells_stack_w.len() > 0
+            && !caller.locals_cells_stack_w[0].is_null()
+            && unsafe { is_int(caller.locals_cells_stack_w[0]) }
+        {
+            Some(unsafe { w_int_get_value(caller.locals_cells_stack_w[0]) })
+        } else {
+            None
+        };
+        eprintln!(
+            "[jit][force-recursive-boxed] exit caller_arg0={:?}",
+            caller_arg0
+        );
+    }
     result
 }
 
