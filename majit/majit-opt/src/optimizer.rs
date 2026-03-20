@@ -53,6 +53,12 @@ pub struct Optimizer {
     /// Maps inputarg index → (size_descr, [(field_descr, field_inputarg_index)]).
     /// OptVirtualize reads this during setup to mark inputargs as virtual.
     pub imported_virtuals: Vec<ImportedVirtual>,
+    /// RPython unroll.py: export_state — exported optimizer facts at the end
+    /// of the preamble, adapted to majit's slot-based inputarg model.
+    pub exported_loop_state: Option<crate::unroll::ExportedState>,
+    /// RPython unroll.py: import_state — exported facts to re-apply onto the
+    /// next optimizer instance before phase 2 body optimization starts.
+    pub imported_loop_state: Option<crate::unroll::ExportedState>,
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.
@@ -98,6 +104,8 @@ impl Optimizer {
             resumedata_memo_consts: std::collections::HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             imported_virtuals: Vec::new(),
+            exported_loop_state: None,
+            imported_loop_state: None,
         }
     }
 
@@ -548,6 +556,13 @@ impl Optimizer {
             }
         }
 
+        if let Some(exported_state) = self.imported_loop_state.as_ref() {
+            let targetargs: Vec<OpRef> = (0..exported_state.next_iteration_args.len())
+                .map(|i| OpRef(i as u32))
+                .collect();
+            crate::unroll::import_state(&targetargs, exported_state, &mut ctx);
+        }
+
         // Process each operation through the pass chain
         for op in ops {
             self.propagate_one(op, &mut ctx);
@@ -559,7 +574,28 @@ impl Optimizer {
         }
 
         // Transfer exported virtual state from context to optimizer
-        self.exported_jump_virtuals = std::mem::take(&mut ctx.exported_jump_virtuals);
+        let exported_jump_virtuals = std::mem::take(&mut ctx.exported_jump_virtuals);
+        self.exported_loop_state = ctx
+            .new_operations
+            .iter()
+            .rfind(|op| op.opcode == OpCode::Jump)
+            .map(|jump| {
+                let flattened_args = crate::unroll::export_flatten_jump_args(
+                    &ctx.new_operations,
+                    jump,
+                    &exported_jump_virtuals,
+                );
+                let exported_int_bounds = self.collect_exported_int_bounds(&flattened_args, &ctx);
+                let renamed_inputargs: Vec<OpRef> =
+                    (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+                crate::unroll::export_state(
+                    &flattened_args,
+                    &renamed_inputargs,
+                    &ctx,
+                    Some(&exported_int_bounds),
+                )
+            });
+        self.exported_jump_virtuals = exported_jump_virtuals;
 
         // final_num_inputs = original inputs + virtual inputs added by passes.
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
@@ -652,6 +688,20 @@ impl Optimizer {
         }
 
         ctx.new_operations
+    }
+
+    fn collect_exported_int_bounds(
+        &self,
+        args: &[OpRef],
+        ctx: &OptContext,
+    ) -> std::collections::HashMap<OpRef, crate::intutils::IntBound> {
+        let mut exported = std::collections::HashMap::new();
+        for pass in &self.passes {
+            for (opref, bound) in pass.export_arg_int_bounds(args, ctx) {
+                exported.insert(opref, bound);
+            }
+        }
+        exported
     }
 
     /// Send one operation through the pass chain.
