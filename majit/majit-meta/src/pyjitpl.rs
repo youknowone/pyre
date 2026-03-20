@@ -12,6 +12,10 @@ use majit_trace::warmstate::{HotResult, WarmEnterState};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state};
 use crate::compile;
+pub use crate::compile::{
+    CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout, CompileResult,
+    DeadFrameArtifacts, RawCompileResult,
+};
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
 use crate::resume::{
@@ -34,94 +38,6 @@ pub enum BackEdgeAction {
     RunCompiled,
 }
 
-/// Detailed result from running compiled code, including guard failure info.
-///
-/// Mirrors RPython's handle_guard_failure in pyjitpl.py.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledExitLayout {
-    /// Compiled trace identifier for this exit (root loop or bridge).
-    pub trace_id: u64,
-    /// Backend fail-index for this exit.
-    pub fail_index: u32,
-    /// Trace op index that produced this exit, when known by the backend.
-    pub source_op_index: Option<usize>,
-    /// Typed layout of the raw exit slots produced by the backend.
-    pub exit_types: Vec<Type>,
-    /// Whether this exit is a FINISH rather than a guard failure.
-    pub is_finish: bool,
-    /// Exit slot indices that hold rooted GC references.
-    pub gc_ref_slots: Vec<usize>,
-    /// Exit slot indices that carry opaque FORCE_TOKEN handles.
-    pub force_token_slots: Vec<usize>,
-    /// Raw backend-origin recovery layout for this exit, when available.
-    pub recovery_layout: Option<ExitRecoveryLayout>,
-    /// Compact resume/jitframe layout attached to this exit, when available.
-    pub resume_layout: Option<ResumeLayoutSummary>,
-}
-
-pub struct CompileResult<'a, M> {
-    /// The live values at the point of guard failure (or loop finish).
-    pub values: Vec<i64>,
-    /// Typed exit values decoded from the backend deadframe.
-    pub typed_values: Vec<Value>,
-    /// The interpreter-specific metadata for this loop.
-    pub meta: &'a M,
-    /// Backend fail-index for this exit.
-    pub fail_index: u32,
-    /// Compiled trace identifier for this exit (root loop or bridge).
-    pub trace_id: u64,
-    /// Whether this exit is a FINISH rather than a guard failure.
-    pub is_finish: bool,
-    /// Static layout metadata for this compiled exit.
-    pub exit_layout: CompiledExitLayout,
-    /// Optional saved-data GC ref captured from the backend exit.
-    pub savedata: Option<GcRef>,
-    /// Pending exception state captured from the backend deadframe.
-    pub exception: ExceptionState,
-}
-
-pub struct RawCompileResult<'a, M> {
-    /// The live values at the point of guard failure (or loop finish).
-    pub values: Vec<i64>,
-    /// Typed exit values decoded from the backend exit.
-    pub typed_values: Vec<Value>,
-    /// The interpreter-specific metadata for this loop.
-    pub meta: &'a M,
-    /// Backend fail-index for this exit.
-    pub fail_index: u32,
-    /// Compiled trace identifier for this exit (root loop or bridge).
-    pub trace_id: u64,
-    /// Whether this exit is a FINISH rather than a guard failure.
-    pub is_finish: bool,
-    /// Static layout metadata for this compiled exit.
-    pub exit_layout: CompiledExitLayout,
-    /// Optional saved-data GC ref captured from the backend exit.
-    pub savedata: Option<GcRef>,
-    /// Pending exception state captured from the backend exit.
-    pub exception: ExceptionState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledTerminalExitLayout {
-    pub op_index: usize,
-    pub exit_layout: CompiledExitLayout,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledTraceLayout {
-    pub trace_id: u64,
-    pub exit_layouts: Vec<CompiledExitLayout>,
-    pub terminal_exit_layouts: Vec<CompiledTerminalExitLayout>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DeadFrameArtifacts {
-    pub values: Vec<i64>,
-    pub typed_values: Vec<Value>,
-    pub exit_layout: CompiledExitLayout,
-    pub savedata: Option<GcRef>,
-    pub exception: ExceptionState,
-}
 
 /// Per-guard failure tracking for bridge compilation decisions.
 pub(crate) struct GuardFailureInfo {

@@ -151,8 +151,10 @@ impl BaseJitCell {
     }
 }
 
-/// The current JIT state for a particular green key.
-pub enum JitState {
+/// Per-green-key JIT cell state with associated data.
+///
+/// Richer variant of BaseJitCellState that carries trace/token payloads.
+pub enum CellJitState {
     /// Normal interpretation; no tracing is active.
     Interpreting,
     /// Actively recording a trace.
