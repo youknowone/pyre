@@ -21,7 +21,7 @@ mod constant_pool;
 mod fail_descr;
 pub mod io_buffer;
 mod jit_state;
-mod jitcode;
+pub mod jitcode;
 mod jitdriver;
 pub mod parity;
 mod pyjitpl;
@@ -39,7 +39,9 @@ pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,
     io_buffer_write_fmt, jit_write_number_i64, jit_write_utf8_codepoint,
 };
-pub use jit_state::{DeoptMaterializationCache, JitState, PendingFieldWriteLayout};
+pub use jit_state::{
+    DeoptMaterializationCache, JitState, PendingFieldWriteLayout, ResidualVirtualizableSync,
+};
 pub use jitcode::{
     ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
     JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack, trace_jitcode,

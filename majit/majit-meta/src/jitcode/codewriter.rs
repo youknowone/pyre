@@ -47,6 +47,11 @@ impl JitCodeBuilder {
         Self::default()
     }
 
+    /// Current bytecode emission position.
+    pub fn current_pos(&self) -> usize {
+        self.code.len()
+    }
+
     pub fn add_const_i(&mut self, value: i64) -> u16 {
         if let Some(index) = self
             .constants_i
