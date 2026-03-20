@@ -249,29 +249,29 @@ impl UnrollOptimizer {
         // Place them right after the original num_inputs. The optimizer's
         // effective_inputs = max(body_num_inputs, max_pos+1) ensures original
         // trace ops get new positions beyond body_num_inputs.
-        let field_base = num_inputs;
-
+        // RPython make_inputargs_and_virtuals: the virtual pointer arg is
+        // replaced by its field values in the inputargs layout.
+        // E.g., [pool, selected, head] → [pool, selected, value, next]
+        // The virtual's fields start at the original virtual's position.
         let mut imported = Vec::new();
-        let mut extra_field_count = 0;
+        let mut total_extra = 0; // fields added minus virtual removed
         for virt in &jump_virtuals {
+            let base = virt.jump_arg_index + total_extra;
             let fields: Vec<(majit_ir::DescrRef, usize)> = virt
                 .fields
                 .iter()
-                .map(|(descr, _concrete)| {
-                    let field_inputarg = field_base + extra_field_count;
-                    extra_field_count += 1;
-                    (descr.clone(), field_inputarg)
-                })
+                .enumerate()
+                .map(|(i, (descr, _concrete))| (descr.clone(), base + i))
                 .collect();
             imported.push(crate::optimizer::ImportedVirtual {
-                inputarg_index: virt.jump_arg_index,
+                inputarg_index: base, // virtual was here, now fields start here
                 size_descr: virt.size_descr.clone(),
                 fields,
             });
+            total_extra += virt.fields.len() - 1; // added N fields, removed 1 ptr
         }
-        // Field inputargs are at positions num_inputs..num_inputs+extra_field_count.
-        // The optimizer must treat them as inputargs (not colliding with trace ops).
-        let body_num_inputs = num_inputs + extra_field_count;
+        // New body inputargs count: original - 1(head) + N(fields) per virtual
+        let body_num_inputs = num_inputs + total_extra;
 
         // Remap original trace ops so their positions don't collide with
         // field inputargs (num_inputs..body_num_inputs).
@@ -280,7 +280,7 @@ impl UnrollOptimizer {
         let mut pos_remap: HashMap<OpRef, OpRef> = HashMap::new();
         for op in &mut remapped_ops {
             if op.pos.0 != u32::MAX && op.pos.0 >= num_inputs as u32 && op.pos.0 < remap_base {
-                let new_pos = OpRef(op.pos.0 + extra_field_count as u32);
+                let new_pos = OpRef(op.pos.0 + total_extra as u32);
                 pos_remap.insert(op.pos, new_pos);
                 op.pos = new_pos;
             }
@@ -316,7 +316,6 @@ impl UnrollOptimizer {
             crate::optimizer::Optimizer::default_pipeline()
         };
         opt_body.imported_virtuals = imported;
-        opt_body.set_flatten_virtuals_at_jump(true);
         // No OptUnroll in Phase 2 — same trace (remapped), different initial state
         let body_result = opt_body.optimize_with_constants_and_inputs(
             &remapped_ops,
@@ -343,6 +342,7 @@ impl UnrollOptimizer {
             &body_result,
             preamble_num_inputs,
             body_final,
+            &jump_virtuals,
         );
 
         *constants = constants_p2;
@@ -715,13 +715,15 @@ fn build_body_trace_with_virtual_import(
 /// compile.py:310-338: combine preamble + Label + body into final trace.
 /// compile.py:310-338: combine preamble + Label + body.
 ///
-/// Remap body ops so their inputarg references (0..body_num_inputs)
-/// point to the Label args (which are preamble JUMP args).
+/// RPython parity: the preamble JUMP is extended with virtual field values
+/// so its args match the body's expected inputargs (including flattened fields).
+/// Body ops are remapped so inputarg refs point to the Label args.
 fn combine_preamble_and_body(
     preamble: &[Op],
     body: &[Op],
     _preamble_num_inputs: usize,
     body_num_inputs: usize,
+    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
 ) -> Vec<Op> {
     let mut result = Vec::with_capacity(preamble.len() + body.len() + 1);
 
@@ -735,18 +737,42 @@ fn combine_preamble_and_body(
 
     let preamble_jump = preamble.iter().rfind(|op| op.opcode == OpCode::Jump);
     let Some(jump) = preamble_jump else {
-        // No Jump in preamble — can't combine
         result.extend_from_slice(body);
         return result;
     };
 
-    // Label args = preamble JUMP args
-    // These are the values flowing from preamble into the loop body.
-    let label_args = &jump.args;
+    // RPython make_inputargs_and_virtuals: replace virtual JUMP arg with
+    // its field values. The virtual pointer is removed from the args and
+    // the fields are inserted in its place, matching the body's layout.
+    let mut label_args = jump.args.clone();
+    for virt in jump_virtuals.iter().rev() {
+        if virt.jump_arg_index >= label_args.len() {
+            continue;
+        }
+        let virtual_ref = label_args[virt.jump_arg_index];
+        let mut field_vals = Vec::new();
+        for (descr, _concrete) in &virt.fields {
+            let field_val = preamble
+                .iter()
+                .find(|op| {
+                    op.opcode == OpCode::SetfieldGc
+                        && op.args.first() == Some(&virtual_ref)
+                        && op.descr.as_ref().map_or(false, |d| d.index() == descr.index())
+                })
+                .and_then(|op| op.args.get(1).copied())
+                .unwrap_or(OpRef::NONE);
+            field_vals.push(field_val);
+        }
+        // Replace: remove virtual pointer, insert field values
+        label_args.remove(virt.jump_arg_index);
+        for (i, fv) in field_vals.into_iter().enumerate() {
+            label_args.insert(virt.jump_arg_index + i, fv);
+        }
+    }
 
     // Emit Label
     let label_pos = OpRef(result.len() as u32 + body_num_inputs as u32);
-    let mut label = Op::new(OpCode::Label, label_args);
+    let mut label = Op::new(OpCode::Label, &label_args);
     label.pos = label_pos;
     result.push(label);
 
