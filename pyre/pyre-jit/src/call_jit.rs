@@ -725,6 +725,38 @@ pub extern "C" fn jit_force_recursive_call_1(
     result
 }
 
+/// Self-recursive single-arg boxed helper.
+///
+/// Keeps the boxed helper path off the generic callable redispatch and
+/// blackhole fallback route. This mirrors the specialized raw helper:
+/// the callee frame is created directly from the caller's code/globals.
+pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: i64) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let boxed_arg_ref = boxed_arg as PyObjectRef;
+    let caller = unsafe { &*(caller_frame as *const PyFrame) };
+    let green_key = crate::eval::make_green_key(caller.code, 0);
+    if matches!(finish_protocol(green_key), FinishProtocol::RawInt)
+        && !boxed_arg_ref.is_null()
+        && unsafe { is_int(boxed_arg_ref) }
+    {
+        let raw_arg = unsafe { w_int_get_value(boxed_arg_ref) };
+        let forced = jit_force_self_recursive_call_raw_1(caller_frame, raw_arg);
+        return w_int_new(forced) as i64;
+    }
+
+    let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
+    let result = {
+        let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+        let _recursive_entry = crate::eval::recursive_force_entry_bump();
+        match crate::eval::eval_with_jit(frame) {
+            Ok(result) => result as i64,
+            Err(err) => panic!("jit force self-recursive call boxed failed: {err}"),
+        }
+    };
+    jit_drop_callee_frame(frame_ptr);
+    result
+}
+
 /// Fully fused recursive call with RAW INT arg — no boxing in trace at all.
 ///
 /// Eliminates ALL per-recursive-call overhead from trace:
@@ -738,6 +770,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     raw_int_arg: i64,
 ) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _force_guard = crate::eval::recursive_force_entry_bump();
     let callable_ref = callable as PyObjectRef;
     let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
@@ -756,47 +789,15 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        if let Some(token_num) = token_num {
-            let nlocals = unsafe { (&*frame.code).varnames.len() };
-            let mut inputs = vec![
-                frame_ptr,
-                frame.next_instr as i64,
-                frame.valuestackdepth as i64,
-            ];
-            for i in 0..nlocals {
-                inputs.push(frame.locals_cells_stack_w[i] as i64);
+        // RPython parity: force callbacks always use blackhole, never
+        // re-enter compiled code (no execute_call_assembler_direct).
+        let bh_result = resume_in_blackhole(frame);
+        match protocol {
+            FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => {
+                unsafe { w_int_get_value(bh_result) }
             }
-            if let Some(raw) = majit_codegen_cranelift::execute_call_assembler_direct(
-                token_num,
-                &inputs,
-                jit_force_callee_frame_interp_nocache,
-            ) {
-                normalize_direct_finish_result(protocol, raw)
-            } else {
-                // RPython parity fallback: guard failure recovery resumes in
-                // the blackhole interpreter.
-                let bh_result = resume_in_blackhole(frame);
-                match protocol {
-                    FinishProtocol::RawInt
-                        if !bh_result.is_null() && unsafe { is_int(bh_result) } =>
-                    {
-                        unsafe { w_int_get_value(bh_result) }
-                    }
-                    FinishProtocol::RawInt => bh_result as i64,
-                    FinishProtocol::Boxed => bh_result as i64,
-                }
-            }
-        } else {
-            // RPython parity: force callbacks without compiled callee code
-            // resume in the blackhole interpreter.
-            let bh_result = resume_in_blackhole(frame);
-            match protocol {
-                FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => {
-                    unsafe { w_int_get_value(bh_result) }
-                }
-                FinishProtocol::RawInt => bh_result as i64,
-                FinishProtocol::Boxed => bh_result as i64,
-            }
+            FinishProtocol::RawInt => bh_result as i64,
+            FinishProtocol::Boxed => bh_result as i64,
         }
     };
     jit_drop_callee_frame(frame_ptr);

@@ -259,6 +259,25 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             &env,
             || {},
         ) {
+            if majit_meta::majit_log_enabled() {
+                let kind = match &outcome {
+                    DetailedDriverRunOutcome::Finished { .. } => "finished",
+                    DetailedDriverRunOutcome::Jump { .. } => "jump",
+                    DetailedDriverRunOutcome::Abort { .. } => "abort",
+                    DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
+                        "guard-restored"
+                    }
+                    DetailedDriverRunOutcome::GuardFailure { restored: false, .. } => {
+                        "guard-unrestored"
+                    }
+                };
+                eprintln!(
+                    "[jit][func-entry] compiled outcome key={} arg0={:?} kind={}",
+                    green_key,
+                    debug_first_arg_int(frame),
+                    kind
+                );
+            }
             if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
                 if majit_meta::majit_log_enabled() {
                     let rendered = result.as_ref().ok().and_then(|value| {
@@ -360,16 +379,20 @@ fn handle_jit_outcome(
             };
             Some(Ok(value))
         }
-        DetailedDriverRunOutcome::Jump { .. } => {
+        DetailedDriverRunOutcome::Jump { .. }
+        | DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
+            // RPython parity: guard failure (including Jump=loop close
+            // with guard) → resume_in_blackhole(). The remaining
+            // execution runs in the blackhole with NO JIT re-entry.
             sync_jit_state_to_frame(jit_state, frame, info);
-            None
-        }
-        DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            // RPython parity: guard failure → resume_in_blackhole() runs
-            // the remaining execution with NO JIT re-entry. RPython's
-            // handle_fail() calls blackhole.resume_in_blackhole() which
-            // handles the rest of the frame entirely in the blackhole.
-            sync_jit_state_to_frame(jit_state, frame, info);
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][func-entry] guard-fail→blackhole arg0={:?} ni={} vsd={}",
+                    debug_first_arg_int(frame),
+                    frame.next_instr,
+                    frame.valuestackdepth
+                );
+            }
             let result = crate::call_jit::resume_in_blackhole_pub(frame);
             Some(Ok(result))
         }

@@ -1662,13 +1662,29 @@ impl BlackholeInterpreter {
     ///
     /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks.
     pub fn run(&mut self) {
+        let trace = crate::majit_log_enabled();
         loop {
             if self.finished() {
+                if trace {
+                    eprintln!("[bh-trace] finished at pos={} reg0={}", self.position, self.registers_i.get(0).copied().unwrap_or(-1));
+                }
                 return;
             }
+            let pos_before = self.position;
             let opcode = self.next_u8();
+            if trace {
+                let stack_len = self.runtime_stack_len(0);
+                eprintln!("[bh-trace] pos={} op={} reg0={} reg1={} stack_len={}",
+                    pos_before, opcode,
+                    self.registers_i.get(0).copied().unwrap_or(-1),
+                    self.registers_i.get(1).copied().unwrap_or(-1),
+                    stack_len);
+            }
             if self.dispatch_one(opcode).is_err() {
-                return; // LeaveFrame: return/abort hit
+                if trace {
+                    eprintln!("[bh-trace] abort/return at pos={} reg0={}", pos_before, self.registers_i.get(0).copied().unwrap_or(-1));
+                }
+                return;
             }
         }
     }
@@ -1863,6 +1879,10 @@ impl BlackholeInterpreter {
                 let cond_idx = self.next_u16() as usize;
                 let target = self.next_u16() as usize;
                 let cond = self.registers_i[cond_idx];
+                if crate::majit_log_enabled() {
+                    eprintln!("[bh-trace] BRANCH_REG_ZERO cond_idx={} cond={} target={} taken={}",
+                        cond_idx, cond, target, cond == 0);
+                }
                 if cond == 0 {
                     self.position = target;
                 }
