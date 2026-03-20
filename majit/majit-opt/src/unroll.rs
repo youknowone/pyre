@@ -287,6 +287,11 @@ impl UnrollOptimizer {
         // and sets up VirtualStruct PtrInfo for the imported head.
         let imported = build_imported_virtuals(&jump_virtuals);
         opt_p2.imported_virtuals = imported;
+        // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
+        // Don't flush lazy sets — virtuals remain virtual until JUMP handling.
+        opt_p2.skip_flush = true;
+        // Phase 2: JUMP flattens virtual fields instead of forcing them.
+        opt_p2.set_flatten_virtuals_at_jump(true);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();

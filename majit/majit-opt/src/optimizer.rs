@@ -71,6 +71,9 @@ pub struct Optimizer {
     pub imported_short_preamble_builder: Option<crate::shortpreamble::ShortPreambleBuilder>,
     /// simplify.py: patchguardop recorded from GUARD_FUTURE_CONDITION.
     pub patchguardop: Option<Op>,
+    /// RPython: propagate_all_forward(trace, flush=False) for Phase 2.
+    /// When true, skip flush() at end of optimization.
+    pub skip_flush: bool,
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.
@@ -351,6 +354,7 @@ impl Optimizer {
             imported_short_preamble: None,
             imported_short_preamble_builder: None,
             patchguardop: None,
+            skip_flush: false,
         }
     }
 
@@ -542,6 +546,13 @@ impl Optimizer {
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // Follow forwarding chain first.
         let resolved = ctx.get_replacement(opref);
+        if ctx.take_potential_extra_op(resolved) {
+            if let Some(builder) = ctx.active_short_preamble_producer_mut() {
+                let _ = builder.add_preamble_op(resolved);
+            } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
+                let _ = builder.add_preamble_op(resolved);
+            }
+        }
         // Check if any pass considers this a virtual.
         let is_virt = self.passes.iter().any(|p| p.is_virtual(resolved));
         if is_virt {
@@ -785,9 +796,12 @@ impl Optimizer {
             self.propagate_one(op, &mut ctx);
         }
 
-        // Flush all passes
-        for pass in &mut self.passes {
-            pass.flush();
+        // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
+        // Phase 2 leaves lazy sets pending so virtuals aren't forced.
+        if !self.skip_flush {
+            for pass in &mut self.passes {
+                pass.flush();
+            }
         }
 
         // Transfer exported virtual state from context to optimizer
