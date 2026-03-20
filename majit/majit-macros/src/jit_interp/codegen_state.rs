@@ -1178,33 +1178,44 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
-                    // Linked-list mode carries pool/selected and the tracked head refs.
+                    // RPython make_inputargs_and_virtuals: virtual head pointer
+                    // replaced by field values [value, next] per tracked storage.
+                    // Layout: [pool, selected, value_0, next_0, value_1, next_1, ...]
                     let mut values = vec![
                         (&self.#pool_field as *const _ as usize) as i64,
                         self.#sel_field as i64,
                     ];
                     for &(sidx, _) in &meta.storage_layout {
                         let head = self.#pool_field.get(sidx).head_ptr();
-                        values.push(head as i64);
+                        if head != 0 {
+                            let node = head as *const aheui_runtime::storage::StackNode;
+                            unsafe {
+                                values.push(aheui_runtime::value::val_to_i64(&(*node).value));
+                                values.push((*node).next as usize as i64);
+                            }
+                        } else {
+                            values.push(0);
+                            values.push(0);
+                        }
                     }
                     values
                 }
 
                 fn live_value_types(&self, meta: &__JitMeta) -> Vec<majit_ir::Type> {
-                    // [pool_ptr=Int, selected=Int, head_0=Ref, ..., head_N=Ref]
+                    // [pool=Int, selected=Int, value_0=Int, next_0=Ref, ...]
                     let mut types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
                     for _ in &meta.storage_layout {
-                        types.push(majit_ir::Type::Ref); // head
+                        types.push(majit_ir::Type::Int); // value field
+                        types.push(majit_ir::Type::Ref); // next field
                     }
                     types
                 }
 
                 fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
-                    let mut heads = std::collections::HashMap::new();
-                    for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
-                        // inputarg layout: [pool, selected, head_0, ..., head_N]
-                        heads.insert(sidx, majit_ir::OpRef((2 + i) as u32));
-                    }
+                    // Heads are lazily loaded via ensure_linked_list_head (Phase 1)
+                    // or injected as VirtualStruct via imported_virtuals (Phase 2).
+                    // Don't pre-populate from inputargs — they contain field values now.
+                    let heads = std::collections::HashMap::new();
                     __JitSym {
                         pool_ref: majit_ir::OpRef(0),
                         current_selected: meta.initial_selected,
