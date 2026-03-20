@@ -511,11 +511,13 @@ impl Optimizer {
             }
         }
 
-        // RPython unroll.py:479-504: import_state — inject virtual info from Phase 1.
-        // Tells OptVirtualize that certain inputargs are virtual objects.
+        // RPython unroll.py:479-504: import_state — reconstruct virtuals.
+        // For each imported virtual, allocate a FRESH OpRef as the virtual head.
+        // Set VirtualStruct on it with fields pointing to the field inputargs.
+        // Store the fresh OpRef in ctx.imported_virtual_heads so the JitCodeSym's
+        // ensure_linked_list_head can return it instead of loading from pool.
         if !self.imported_virtuals.is_empty() {
             for iv in &self.imported_virtuals {
-                let opref = OpRef(iv.inputarg_index as u32);
                 let mut fields = Vec::new();
                 let mut field_descrs = Vec::new();
                 for (descr, field_inputarg_idx) in &iv.fields {
@@ -523,14 +525,20 @@ impl Optimizer {
                     fields.push((descr.index(), field_ref));
                     field_descrs.push((descr.index(), descr.clone()));
                 }
+                // Allocate fresh OpRef for the virtual head node
+                let virtual_head = ctx.alloc_op_position();
                 ctx.set_ptr_info(
-                    opref,
+                    virtual_head,
                     crate::info::PtrInfo::VirtualStruct(crate::info::VirtualStructInfo {
                         descr: iv.size_descr.clone(),
                         fields,
                         field_descrs,
                     }),
                 );
+                // Map original inputarg position → virtual head
+                // (the original head inputarg is now replaced by field inputargs,
+                //  but ops still reference the original position via remap)
+                ctx.imported_virtual_heads.push((iv.inputarg_index, virtual_head));
             }
         }
 
