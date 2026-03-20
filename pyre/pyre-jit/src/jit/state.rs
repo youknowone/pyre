@@ -376,11 +376,11 @@ fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
     let mut types = Vec::with_capacity(len);
     for idx in 0..len {
         if idx == 0 {
-            types.push(Type::Ref);
+            types.push(Type::Ref); // frame pointer
         } else if idx < 3 {
-            types.push(Type::Int);
+            types.push(Type::Int); // next_instr, valuestackdepth
         } else {
-            types.push(Type::Ref);
+            types.push(Type::Ref); // locals/stack: boxed PyObjectRef
         }
     }
     types
@@ -786,26 +786,17 @@ impl TraceFrameState {
         unsafe { info.tracing_after_residual_call(obj_ptr) }
     }
 
+    /// RPython parity: virtualizable_boxes carry boxed ptrs through JUMP.
+    /// The symbolic value (OpRef) is passed directly — no re-boxing needed.
+    /// RPython's close_loop_args simply passes virtualizable_boxes[i] as-is.
     fn materialize_loop_carried_value(
         &mut self,
-        ctx: &mut TraceCtx,
+        _ctx: &mut TraceCtx,
         value: OpRef,
-        concrete_value: Option<PyObjectRef>,
+        _concrete_value: Option<PyObjectRef>,
     ) -> OpRef {
-        let Some(concrete_value) = concrete_value else {
-            return value;
-        };
-        if is_boxed_int_value(concrete_value) {
-            let raw_value = self.trace_guarded_int_payload(ctx, value);
-            return crate::jit::helpers::emit_box_int_inline(
-                ctx,
-                raw_value,
-                w_int_size_descr(),
-                ob_type_descr(),
-                int_intval_descr(),
-                &INT_TYPE as *const _ as i64,
-            );
-        }
+        // RPython: JUMP args = virtualizable_boxes, already boxed ptrs.
+        // No New + SetfieldGc — just pass the symbolic value through.
         value
     }
 
@@ -3756,6 +3747,7 @@ impl PyreJitState {
         let nlocals = self.local_count();
 
         // Locals follow directly (indices 0..nlocals in unified array)
+        // Locals: boxed ptrs (Ref type) — store directly to frame.
         for i in 0..nlocals {
             if idx < values.len() {
                 let _ = self.set_local_at(i, values[idx] as PyObjectRef);
@@ -3871,6 +3863,7 @@ impl JitState for PyreJitState {
             self.next_instr as i64,
             self.valuestackdepth as i64,
         ];
+        // RPython: virtualizable_boxes = boxed object ptrs (Ref type).
         for i in 0..nlocals {
             vals.push(self.local_at(i).unwrap_or(0 as PyObjectRef) as i64);
         }
