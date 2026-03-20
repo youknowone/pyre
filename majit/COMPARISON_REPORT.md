@@ -12,7 +12,7 @@
 | **optimizer.rs** | 90% | ~~call_pure_results, speculative_operation~~ 추가됨. 남은: resumedata_memo, guard sharing |
 | **simplify.rs** | 95% | ~~GUARD_FUTURE_CONDITION~~ notice_guard_future_condition 호출 추가됨 |
 | **descr.rs** | 85% | bitstring optimization, CallInfoCollection |
-| **intbounds.rs** | 85% | ~~backward propagation~~ 추가됨. 남은: STRGETITEM/GETFIELD bounds |
+| **intbounds.rs** | 95% | ~~backward propagation, STRGETITEM/GETFIELD bounds, UNICODEGETITEM, GETARRAYITEM_GC_I~~ 추가됨 |
 | **quasi_immut.rs** | 80% | CPU 통합, 디버그/통계 |
 | **virtualstate.rs** | 80% | ~~lenbound, make_inputargs~~ 추가됨. 남은: GenerateGuardState |
 | **shortpreamble.rs** | 75% | ~~ExtendedShortPreambleBuilder~~ 추가됨. 남은: CompoundOp, ShortInputArg |
