@@ -585,8 +585,45 @@ impl Optimizer {
     /// The exported loop state should record the boxes that survive the end of
     /// the preamble after virtuals have been forced into a loop-carried shape.
     pub fn force_box_for_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        self.force_box(ctx.get_replacement(opref), ctx)
+        let mut rec = std::collections::HashSet::new();
+        self.force_box_for_end_of_preamble_rec(opref, ctx, &mut rec)
     }
+
+    fn force_box_for_end_of_preamble_rec(
+        &mut self,
+        opref: OpRef,
+        ctx: &mut OptContext,
+        rec: &mut std::collections::HashSet<OpRef>,
+    ) -> OpRef {
+        let resolved = ctx.get_replacement(opref);
+        let Some(mut info) = ctx.get_ptr_info(resolved).cloned() else {
+            return resolved;
+        };
+
+        if matches!(
+            info,
+            crate::info::PtrInfo::Virtual(_)
+                | crate::info::PtrInfo::VirtualStruct(_)
+                | crate::info::PtrInfo::VirtualArray(_)
+                | crate::info::PtrInfo::VirtualArrayStruct(_)
+        ) {
+            if !rec.insert(resolved) {
+                return resolved;
+            }
+            info.force_at_the_end_of_preamble(|child| {
+                self.force_box_for_end_of_preamble_rec(child, ctx, rec)
+            });
+            ctx.set_ptr_info(resolved, info);
+            return resolved;
+        }
+
+        if info.is_virtual() {
+            return self.force_box(resolved, ctx);
+        }
+
+        resolved
+    }
+
 
     /// optimizer.py: protect_speculative_operation(op, ctx)
     /// When constant-folding a pure operation, verify that the folded
@@ -1851,5 +1888,40 @@ mod tests {
         assert!(!opt.can_replace_guards);
         opt.enable_guard_replacement();
         assert!(opt.can_replace_guards);
+    }
+    #[test]
+    fn test_force_box_for_end_of_preamble_recurses_virtual_fields() {
+        use crate::info::{PtrInfo, VirtualStructInfo};
+
+        let descr = make_size_descr(16);
+        let mut ctx = OptContext::new(32);
+        ctx.set_ptr_info(
+            OpRef(10),
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr: descr.clone(),
+                fields: vec![(1, OpRef(11))],
+                field_descrs: Vec::new(),
+            }),
+        );
+        ctx.replace_op(OpRef(11), OpRef(20));
+        ctx.set_ptr_info(
+            OpRef(20),
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr,
+                fields: Vec::new(),
+                field_descrs: Vec::new(),
+            }),
+        );
+
+        let mut opt = Optimizer::new();
+        let result = opt.force_box_for_end_of_preamble(OpRef(10), &mut ctx);
+
+        assert_eq!(result, OpRef(10));
+        match ctx.get_ptr_info(OpRef(10)) {
+            Some(PtrInfo::VirtualStruct(info)) => {
+                assert_eq!(info.fields, vec![(1, OpRef(20))]);
+            }
+            other => panic!("expected virtual struct, got {other:?}"),
+        }
     }
 }
