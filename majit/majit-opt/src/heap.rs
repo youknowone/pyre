@@ -106,9 +106,6 @@ pub struct OptHeap {
     /// When GETARRAYITEM_GC with constant index N is seen, the array
     /// must have length >= N+1. Tracked per array OpRef.
     array_min_lengths: HashMap<OpRef, i64>,
-    /// RPython: Phase 2 (flush=False) — don't force lazy sets on JUMP.
-    /// In RPython OptUnroll intercepts JUMP before OptHeap sees it.
-    skip_flush_on_final: bool,
 }
 
 impl OptHeap {
@@ -119,7 +116,6 @@ impl OptHeap {
             lazy_setfields: HashMap::new(),
             cached_arrayitems: HashMap::new(),
             lazy_setarrayitems: HashMap::new(),
-            skip_flush_on_final: false,
             seen_guard_not_invalidated: false,
             postponed_op: None,
             immutable_field_descrs: HashSet::new(),
@@ -862,12 +858,8 @@ impl OptHeap {
         }
 
         // Final operations (Jump, Finish): force everything.
-        // RPython Phase 2 (flush=False): OptUnroll intercepts JUMP before OptHeap.
-        // Skip lazy set flush to keep virtuals alive.
         if opcode.is_final() {
-            if !self.skip_flush_on_final {
-                self.force_all_lazy(ctx);
-            }
+            self.force_all_lazy(ctx);
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -1273,9 +1265,6 @@ impl Optimization for OptHeap {
         "heap"
     }
 
-    fn set_skip_flush_on_final(&mut self, enabled: bool) {
-        self.skip_flush_on_final = enabled;
-    }
 }
 
 #[cfg(test)]
