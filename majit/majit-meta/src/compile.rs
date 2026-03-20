@@ -11,10 +11,80 @@ use majit_codegen::{
 };
 use majit_ir::{GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
-use crate::pyjitpl::{CompiledExitLayout, CompiledTrace, StoredExitLayout, StoredResumeData};
+use crate::blackhole::ExceptionState;
+use crate::pyjitpl::{CompiledTrace, StoredExitLayout, StoredResumeData};
 use crate::resume::{
     ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary, ResumeLayoutSummary,
 };
+
+// ── Compilation result types (compile.py) ───────────────────────────────
+
+/// Static exit metadata for a compiled guard or finish point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledExitLayout {
+    pub trace_id: u64,
+    pub fail_index: u32,
+    pub source_op_index: Option<usize>,
+    pub exit_types: Vec<Type>,
+    pub is_finish: bool,
+    pub gc_ref_slots: Vec<usize>,
+    pub force_token_slots: Vec<usize>,
+    pub recovery_layout: Option<ExitRecoveryLayout>,
+    pub resume_layout: Option<ResumeLayoutSummary>,
+}
+
+/// Typed result from running compiled code.
+pub struct CompileResult<'a, M> {
+    pub values: Vec<i64>,
+    pub typed_values: Vec<Value>,
+    pub meta: &'a M,
+    pub fail_index: u32,
+    pub trace_id: u64,
+    pub is_finish: bool,
+    pub exit_layout: CompiledExitLayout,
+    pub savedata: Option<GcRef>,
+    pub exception: ExceptionState,
+}
+
+/// Raw (lightweight) result from running compiled code.
+pub struct RawCompileResult<'a, M> {
+    pub values: Vec<i64>,
+    pub typed_values: Vec<Value>,
+    pub meta: &'a M,
+    pub fail_index: u32,
+    pub trace_id: u64,
+    pub is_finish: bool,
+    pub exit_layout: CompiledExitLayout,
+    pub savedata: Option<GcRef>,
+    pub exception: ExceptionState,
+}
+
+/// Terminal exit layout for a FINISH or JUMP op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledTerminalExitLayout {
+    pub op_index: usize,
+    pub exit_layout: CompiledExitLayout,
+}
+
+/// Full trace compilation layout with all exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledTraceLayout {
+    pub trace_id: u64,
+    pub exit_layouts: Vec<CompiledExitLayout>,
+    pub terminal_exit_layouts: Vec<CompiledTerminalExitLayout>,
+}
+
+/// Artifacts extracted from a backend DeadFrame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeadFrameArtifacts {
+    pub values: Vec<i64>,
+    pub typed_values: Vec<Value>,
+    pub exit_layout: CompiledExitLayout,
+    pub savedata: Option<GcRef>,
+    pub exception: ExceptionState,
+}
+
+// ── Compilation helper functions ────────────────────────────────────────
 
 /// Build guard metadata for a compiled trace.
 ///
