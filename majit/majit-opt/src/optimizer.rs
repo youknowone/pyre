@@ -889,6 +889,32 @@ impl Optimizer {
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
         self.final_num_inputs = num_inputs + num_virtual_inputs;
 
+        // Resolve forwarding BEFORE remap so that all refs point to concrete
+        // positions that remap can then reassign.
+        {
+            let fwd = ctx.forwarding.clone();
+            let resolve = |opref: OpRef| -> OpRef {
+                let mut cur = opref;
+                loop {
+                    let idx = cur.0 as usize;
+                    if idx >= fwd.len() { return cur; }
+                    let next = fwd[idx];
+                    if next.is_none() || next == cur { return cur; }
+                    cur = next;
+                }
+            };
+            for op in &mut ctx.new_operations {
+                for arg in &mut op.args {
+                    *arg = resolve(*arg);
+                }
+                if let Some(ref mut fa) = op.fail_args {
+                    for arg in fa.iter_mut() {
+                        *arg = resolve(*arg);
+                    }
+                }
+            }
+        }
+
         // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
         // and all op positions are reassigned to start from final_num_inputs.
         // This ensures no position collisions between input block params and ops.
@@ -906,10 +932,6 @@ impl Optimizer {
             }
 
             // Op positions: reassign ALL ops to start from final_num_inputs.
-            // Partial remapping is incorrect once virtual inputs are added:
-            // original trace positions can already overlap the new
-            // final_num_inputs.. range, which causes SSA collisions in the
-            // optimized trace.
             for (new_idx, op) in ctx.new_operations.iter_mut().enumerate() {
                 let new_pos = fni + new_idx as u32;
                 if !op.pos.is_none() {
@@ -982,36 +1004,6 @@ impl Optimizer {
         for (idx, val) in ctx.constants.iter().enumerate() {
             if let Some(Value::Int(v)) = val {
                 constants.entry(idx as u32).or_insert(*v);
-            }
-        }
-
-        // Resolve any remaining forwarding in emitted ops.
-        // RPython uses in-place Box forwarding so this isn't needed there.
-        // In majit, ops emitted early may reference OpRefs that were later
-        // forwarded (e.g., a virtual ref that was force-materialized).
-        let fwd = ctx.forwarding.clone();
-        let resolve = |opref: OpRef| -> OpRef {
-            let mut cur = opref;
-            loop {
-                let idx = cur.0 as usize;
-                if idx >= fwd.len() {
-                    return cur;
-                }
-                let next = fwd[idx];
-                if next.is_none() || next == cur {
-                    return cur;
-                }
-                cur = next;
-            }
-        };
-        for op in &mut ctx.new_operations {
-            for arg in &mut op.args {
-                *arg = resolve(*arg);
-            }
-            if let Some(ref mut fa) = op.fail_args {
-                for arg in fa.iter_mut() {
-                    *arg = resolve(*arg);
-                }
             }
         }
 
