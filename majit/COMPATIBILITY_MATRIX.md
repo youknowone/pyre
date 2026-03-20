@@ -245,3 +245,17 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 - compile.py의 ResumeGuardDescr 계층 (trait 기반으로 대체)
 - blackhole.py의 바이트코드 디스패치 (직접 VM으로 대체)
 - resume.py의 class 계층 (enum 기반으로 대체)
+
+## Known Bugs
+
+**Compiled loop infinite loop on nested-loop functions (nbody advance)**
+- Symptom: func-entry JIT compiles advance() with nested while loops, compiled code runs forever
+- Trace has `OpRef(u32::MAX)` (NONE) in guard fail_args → suspect unresolved forwarding
+- Raw pointer constants in Jump args → GC stale risk
+- Status: Compilation succeeds, compiled code execution hangs (infinite loop, not crash)
+- Repro: `while k<8: advance(bodies, 0.01)` with 5-body nbody
+
+**Compiled loop segfault on 5-body nbody with float ops**
+- Symptom: compiled loop runs once then segfaults on second iteration
+- Suspect: GC nursery pointer invalidation across loop back-edge
+- Status: Under investigation
