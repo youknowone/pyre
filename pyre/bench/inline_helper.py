@@ -10,9 +10,12 @@ def square(x):
 def compute(x):
     return add(square(x), x)
 
-s = 0
-i = 0
-while i < 1000000:
-    s = add(s, compute(i))
-    i = add(i, 1)
-print(s)
+def main():
+    s = 0
+    i = 0
+    while i < 1000000:
+        s = add(s, compute(i))
+        i = add(i, 1)
+    print(s)
+
+main()
