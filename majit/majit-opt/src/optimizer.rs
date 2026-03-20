@@ -750,9 +750,12 @@ impl Optimizer {
         self.exported_loop_state = jump.map(|jump| {
             let preview_virtual_state =
                 crate::virtualstate::export_state(&jump.args, &ctx, &ctx.ptr_info);
-            let preview_label_args = preview_virtual_state.make_inputargs(&jump.args, &ctx);
+            let (preview_label_args, preview_virtuals) = preview_virtual_state
+                .make_inputargs_and_virtuals(&jump.args, &ctx);
+            let mut preview_short_args = preview_label_args.clone();
+            preview_short_args.extend(preview_virtuals);
             let mut short_boxes =
-                crate::shortpreamble::ShortBoxes::with_label_args(&preview_label_args);
+                crate::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
             self.produce_potential_short_preamble_ops(&mut short_boxes);
             let produced = short_boxes.produced_ops();
             ctx.exported_short_boxes = produced
@@ -761,6 +764,8 @@ impl Optimizer {
                     op: produced.preamble_op,
                     kind: produced.kind,
                     label_arg_idx: short_boxes.lookup_label_arg(result),
+                    invented_name: produced.invented_name,
+                    same_as_source: produced.same_as_source,
                 })
                 .collect();
             let exported_int_bounds =

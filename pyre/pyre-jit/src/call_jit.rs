@@ -438,7 +438,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     //
     // Bump recursive_force_entry to prevent JIT re-entry from any
     // interpreter code called during blackhole execution.
-    let _force_guard = crate::eval::recursive_force_entry_bump();
+    let _force_guard = crate::eval::blackhole_entry_bump();
     let result = resume_in_blackhole(frame);
     let value = match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => {
@@ -518,7 +518,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
 /// to handle guard failures without recursive compiled dispatch.
 extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
-    let _force_guard = crate::eval::recursive_force_entry_bump();
+    let _force_guard = crate::eval::blackhole_entry_bump();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
@@ -566,7 +566,7 @@ pub fn resume_in_blackhole_pub(frame: &mut PyFrame) -> pyre_object::PyObjectRef 
 fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     // Ensure JIT re-entry is blocked for all code called during
     // blackhole execution, including nested calls through bh_call_fn.
-    let _force_guard = crate::eval::recursive_force_entry_bump();
+    let _force_guard = crate::eval::blackhole_entry_bump();
     let code = unsafe { &*frame.code };
 
     // RPython: blackhole_from_resumedata() → setposition + consume_one_section
@@ -725,6 +725,30 @@ pub extern "C" fn jit_force_recursive_call_1(
     result
 }
 
+/// Fused recursive call with RAW INT arg, boxed result.
+///
+/// This keeps the trace-side argument in raw-int form even before the callee
+/// has stabilized on a raw-int finish protocol. It is a closer match to
+/// RPython's recursive portal argument flow than boxing the argument in the
+/// trace before every helper-boundary call.
+pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
+    caller_frame: i64,
+    callable: i64,
+    raw_int_arg: i64,
+) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let callable_ref = callable as PyObjectRef;
+    let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
+    let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
+    if matches!(finish_protocol(green_key), FinishProtocol::RawInt) {
+        let forced = jit_force_recursive_call_raw_1(caller_frame, callable, raw_int_arg);
+        return w_int_new(forced) as i64;
+    }
+
+    let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
+    jit_force_recursive_call_1(caller_frame, callable, boxed as i64)
+}
+
 /// Self-recursive single-arg boxed helper.
 ///
 /// Keeps the boxed helper path off the generic callable redispatch and
@@ -755,6 +779,27 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     };
     jit_drop_callee_frame(frame_ptr);
     result
+}
+
+/// Self-recursive single-arg helper with raw-int arg and boxed result.
+///
+/// Mirrors `jit_force_self_recursive_call_1`, but keeps the trace-side
+/// argument unboxed so recursive helper-boundary calls do not allocate a
+/// temporary `W_Int` in the trace.
+pub extern "C" fn jit_force_self_recursive_call_argraw_boxed_1(
+    caller_frame: i64,
+    raw_int_arg: i64,
+) -> i64 {
+    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let caller = unsafe { &*(caller_frame as *const PyFrame) };
+    let green_key = crate::eval::make_green_key(caller.code, 0);
+    if matches!(finish_protocol(green_key), FinishProtocol::RawInt) {
+        let forced = jit_force_self_recursive_call_raw_1(caller_frame, raw_int_arg);
+        return w_int_new(forced) as i64;
+    }
+
+    let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
+    jit_force_self_recursive_call_1(caller_frame, boxed as i64)
 }
 
 /// Fully fused recursive call with RAW INT arg — no boxing in trace at all.

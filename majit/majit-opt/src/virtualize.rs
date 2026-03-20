@@ -290,6 +290,52 @@ impl OptVirtualize {
     /// RPython unroll.py: force_box_for_end_of_preamble — record virtual
     /// structure before forcing, for preamble peeling phase 2.
     fn imported_head_load_descr_index(&self, opref: OpRef, ctx: &OptContext) -> Option<u32> {
+        fn find_pool_head_descr(
+            opref: OpRef,
+            ctx: &OptContext,
+            visited: &mut std::collections::HashSet<OpRef>,
+        ) -> Option<u32> {
+            let resolved = ctx.get_replacement(opref);
+            if !visited.insert(resolved) {
+                return None;
+            }
+
+            if let Some(op) = ctx
+                .new_operations
+                .iter()
+                .find(|op| op.pos == resolved)
+                .filter(|op| matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR))
+            {
+                let pool_ref = ctx.get_replacement(OpRef(0));
+                if op.arg(0) == pool_ref {
+                    return op.descr.as_ref().map(|d| d.index());
+                }
+                if let Some(descr_idx) = find_pool_head_descr(op.arg(0), ctx, visited) {
+                    return Some(descr_idx);
+                }
+            }
+
+            let child_refs: Vec<OpRef> = match ctx.get_ptr_info(resolved) {
+                Some(PtrInfo::Virtual(vinfo)) => vinfo.fields.iter().map(|(_, r)| *r).collect(),
+                Some(PtrInfo::VirtualStruct(vinfo)) => {
+                    vinfo.fields.iter().map(|(_, r)| *r).collect()
+                }
+                Some(PtrInfo::VirtualArray(vinfo)) => vinfo.items.clone(),
+                _ => Vec::new(),
+            };
+
+            let mut matches = child_refs
+                .into_iter()
+                .filter_map(|child| find_pool_head_descr(child, ctx, visited))
+                .collect::<Vec<_>>();
+            matches.dedup();
+            if matches.len() == 1 {
+                Some(matches[0])
+            } else {
+                None
+            }
+        }
+
         // Phase 2: the virtual's OpRef matches a GetfieldGcR that was emitted
         // (imported virtual head forwarded from the pool load).
         if let Some(idx) = ctx.new_operations
@@ -302,20 +348,12 @@ impl OptVirtualize {
         {
             return Some(idx);
         }
-        // Phase 1 fallback: the virtual was created by New(), not loaded from
-        // pool. Search new_operations for GetfieldGcR from the pool inputarg
-        // (OpRef(0)) — these are the head loads emitted earlier in the trace.
-        // RPython unroll.py: force_box_for_end_of_preamble records the virtual
-        // state; Phase 2 import_state intercepts the matching pool load.
-        ctx.new_operations
-            .iter()
-            .find(|op| {
-                (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR)
-                    && !op.args.is_empty()
-                    && op.arg(0) == OpRef(0)
-            })
-            .and_then(|op| op.descr.as_ref())
-            .map(|d| d.index())
+        // Phase 1 fallback: the virtual was created by New(), not loaded
+        // directly from the pool. Recover the originating GetfieldGcR(pool)
+        // by walking the virtual's field graph until we find the unique
+        // non-virtual tail that came from the pool.
+        let mut visited = std::collections::HashSet::new();
+        find_pool_head_descr(opref, ctx, &mut visited)
     }
 
     fn export_virtual_for_preamble(

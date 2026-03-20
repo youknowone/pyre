@@ -600,14 +600,15 @@ impl OptUnroll {
         for &arg in &end_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
-        // unroll.py:462-463
-        let label_args = virtual_state.make_inputargs(&end_args, ctx);
+        // unroll.py:462-469
+        let (label_args, virtuals) = virtual_state.make_inputargs_and_virtuals(&end_args, ctx);
         // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
         for &arg in &label_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
-
-        let exported_short_ops = self.collect_exported_short_ops(&label_args, ctx);
+        let mut short_args = label_args.clone();
+        short_args.extend(virtuals);
+        let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
 
         ExportedState::new(
             label_args.clone(),
@@ -616,7 +617,7 @@ impl OptUnroll {
             infos,
             exported_short_ops,
             renamed_inputargs.to_vec(),
-            label_args,
+            short_args,
         )
     }
 
@@ -796,8 +797,12 @@ impl OptUnroll {
         }
 
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
-        let label_args = exported_state.virtual_state.make_inputargs(targetargs, ctx);
-        self.import_short_preamble_ops(&label_args, exported_state, ctx);
+        let (label_args, virtuals) = exported_state
+            .virtual_state
+            .make_inputargs_and_virtuals(targetargs, ctx);
+        let mut short_args = label_args.clone();
+        short_args.extend(virtuals);
+        self.import_short_preamble_ops(&short_args, exported_state, ctx);
         label_args
     }
 
@@ -915,8 +920,12 @@ impl OptUnroll {
         }
     }
 
-    fn collect_exported_short_ops(&self, label_args: &[OpRef], ctx: &OptContext) -> Vec<ExportedShortOp> {
-        let short_boxes = crate::shortpreamble::ShortBoxes::with_label_args(label_args);
+    fn collect_exported_short_ops(
+        &self,
+        short_args: &[OpRef],
+        ctx: &OptContext,
+    ) -> Vec<ExportedShortOp> {
+        let short_boxes = crate::shortpreamble::ShortBoxes::with_label_args(short_args);
         let mut produced_indices: HashMap<OpRef, usize> = HashMap::new();
         let mut next_temp = 0usize;
         let mut exported = Vec::new();
@@ -1017,14 +1026,14 @@ impl OptUnroll {
 
     fn import_short_preamble_ops(
         &self,
-        label_args: &[OpRef],
+        short_args: &[OpRef],
         exported_state: &ExportedState,
         ctx: &mut OptContext,
     ) {
         let mut produced_results = Vec::with_capacity(exported_state.exported_short_ops.len());
         for entry in &exported_state.exported_short_ops {
             let mut resolve_result = |result: &ExportedShortResult| match result {
-                ExportedShortResult::Slot(slot) => label_args.get(*slot).copied(),
+                ExportedShortResult::Slot(slot) => short_args.get(*slot).copied(),
                 ExportedShortResult::Temporary(_) => Some(ctx.alloc_op_position()),
             };
             match *entry {
@@ -1043,7 +1052,10 @@ impl OptUnroll {
                         .iter()
                         .map(|arg| match arg {
                             ExportedShortArg::Slot(slot) => {
-                                label_args.get(*slot).copied().map(crate::ImportedShortPureArg::OpRef)
+                                short_args
+                                    .get(*slot)
+                                    .copied()
+                                    .map(crate::ImportedShortPureArg::OpRef)
                             }
                             ExportedShortArg::Const(value) => {
                                 Some(crate::ImportedShortPureArg::Const(*value))
@@ -1080,7 +1092,7 @@ impl OptUnroll {
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(&obj) = label_args.get(object_slot) else {
+                    let Some(&obj) = short_args.get(object_slot) else {
                         continue;
                     };
                     let Some(value) = resolve_result(result) else {
@@ -1105,7 +1117,7 @@ impl OptUnroll {
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(&obj) = label_args.get(object_slot) else {
+                    let Some(&obj) = short_args.get(object_slot) else {
                         continue;
                     };
                     let Some(value) = resolve_result(result) else {
