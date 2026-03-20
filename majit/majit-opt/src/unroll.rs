@@ -183,7 +183,7 @@ impl UnrollOptimizer {
     /// compile.py:275-338: 2-phase preamble peeling (RPython parity).
     ///
     /// Phase 1 (optimize_preamble): full pipeline on trace → preamble_ops.
-    /// export_state: flatten virtual JUMP args → label_args.
+    /// export_state: capture the preamble's exported optimizer state.
     /// Phase 2 (optimize_peeled_loop): import_state + full pipeline → body_ops.
     /// Assembly: [preamble_no_jump] + Label(label_args) + [body_with_jump].
     pub fn optimize_trace_with_constants_and_inputs_vable(
@@ -211,42 +211,39 @@ impl UnrollOptimizer {
             return (p1_ops, p1_ni);
         }
 
-        // ── export_state (unroll.py:452-477) ──
-        let p1_jump = match p1_ops.iter().rfind(|op| op.opcode == OpCode::Jump) {
-            Some(j) => j.clone(),
-            None => { *constants = consts_p1; return (p1_ops, p1_ni); }
+        let exported_state = match opt_p1.exported_loop_state.clone() {
+            Some(state) => state,
+            None => {
+                *constants = consts_p1;
+                return (p1_ops, p1_ni);
+            }
         };
+        let exported_label_args = exported_state.end_args.clone();
 
         // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
-        // RPython import_state: same trace, optimizer pre-populated with
-        // imported_virtual_heads. GetfieldGcR(pool) → virtual head forwarding
-        // in OptVirtualize eliminates the head load and enables virtualization.
-        // NO trace modification (no build_body_trace). Original trace as-is.
-        let label_args = export_flatten_jump_args(&p1_ops, &p1_jump, &jump_virtuals);
-        // Body needs extra inputargs for flattened virtual fields.
-        // label_args.len() > num_inputs when virtuals are flattened.
-        let body_num_inputs = label_args.len();
+        // RPython import_state: phase 2 starts from the original trace input
+        // contract. The optimizer state is imported from ExportedState; the
+        // trace itself is not rewritten to add synthetic field inputargs.
+        let body_num_inputs = num_inputs;
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[jit] preamble peeling: {} virtual(s), label_args={}",
-                jump_virtuals.len(), label_args.len(),
+                "[jit] preamble peeling: {} virtual(s), exported label_args={}",
+                jump_virtuals.len(), exported_state.end_args.len(),
             );
         }
 
         let imported = build_imported_virtuals(&jump_virtuals);
 
-        // Remap original trace ops to avoid collisions with field inputargs
-        let (remapped_ops, mut consts_p2) =
-            remap_trace_for_body(ops, &consts_p1, num_inputs, body_num_inputs);
+        let remapped_ops = ops.to_vec();
+        let mut consts_p2 = consts_p1.clone();
 
         let mut opt_p2 = match vable_config.as_ref() {
             Some(c) => crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone()),
             None => crate::optimizer::Optimizer::default_pipeline(),
         };
-        opt_p2.imported_loop_state = opt_p1.exported_loop_state.clone();
+        opt_p2.imported_loop_state = Some(exported_state.clone());
         opt_p2.imported_virtuals = imported;
-        opt_p2.set_flatten_virtuals_at_jump(true);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
@@ -283,7 +280,7 @@ impl UnrollOptimizer {
             let cond = o.arg(0);
             // A guard provides a loop exit only if its condition is NOT
             // a constant from the label_args (i.e., it can change at runtime).
-            let is_label_const = label_args.iter().enumerate().any(|(i, &la)| {
+            let is_label_const = exported_label_args.iter().enumerate().any(|(i, &la)| {
                 OpRef(i as u32) == cond && consts_p2.contains_key(&la.0)
             });
             !is_label_const && !consts_p2.contains_key(&cond.0)
@@ -302,6 +299,11 @@ impl UnrollOptimizer {
         }
 
         // ── Assembly (compile.py:310-338) ──
+        let label_args = opt_p2
+            .exported_loop_state
+            .as_ref()
+            .map(|state| state.end_args.clone())
+            .unwrap_or(exported_label_args);
         let combined = assemble_peeled_trace(&p1_ops, &p2_ops, &label_args, p2_ni);
         *constants = consts_p2;
         let sp = crate::shortpreamble::extract_short_preamble(&combined);
@@ -385,9 +387,13 @@ pub struct ExportedState {
     pub next_iteration_args: Vec<OpRef>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::virtualstate::VirtualState,
-    /// unroll.py: exported_infos — per-slot optimizer knowledge from preamble.
-    /// Aligned with next_iteration_args positions.
-    pub exported_infos: Vec<ExportedValueInfo>,
+    /// unroll.py: exported_infos — optimizer knowledge from preamble.
+    /// Maps OpRef → info for all args including virtual field contents.
+    pub exported_infos: HashMap<OpRef, ExportedValueInfo>,
+    /// RPython unroll.py: short_boxes exported from the preamble.
+    /// Kept in a compact form that phase 2 can translate back into imported
+    /// heap cache facts.
+    pub exported_short_ops: Vec<ExportedShortOp>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble.
@@ -425,13 +431,33 @@ pub enum ExportedPtrKind {
     Array,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportedShortOp {
+    HeapField {
+        object_slot: usize,
+        descr_idx: u32,
+        result_slot: usize,
+    },
+    HeapArrayItem {
+        object_slot: usize,
+        descr_idx: u32,
+        index: i64,
+        result_slot: usize,
+    },
+    LoopInvariant {
+        func_ptr: i64,
+        result_slot: usize,
+    },
+}
+
 impl ExportedState {
     /// unroll.py: ExportedState.__init__
     pub fn new(
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<OpRef>,
         virtual_state: crate::virtualstate::VirtualState,
-        exported_infos: Vec<ExportedValueInfo>,
+        exported_infos: HashMap<OpRef, ExportedValueInfo>,
+        exported_short_ops: Vec<ExportedShortOp>,
         renamed_inputargs: Vec<OpRef>,
         short_inputargs: Vec<OpRef>,
     ) -> Self {
@@ -440,6 +466,7 @@ impl ExportedState {
             next_iteration_args,
             virtual_state,
             exported_infos,
+            exported_short_ops,
             short_preamble: None,
             renamed_inputargs,
             short_inputargs,
@@ -491,6 +518,7 @@ impl OptUnroll {
         self.export_state_with_bounds(original_label_args, renamed_inputargs, ctx, None)
     }
 
+    /// unroll.py:452-477: export_state implementation.
     fn export_state_with_bounds(
         &self,
         original_label_args: &[OpRef],
@@ -498,27 +526,80 @@ impl OptUnroll {
         ctx: &OptContext,
         exported_int_bounds: Option<&HashMap<OpRef, crate::intutils::IntBound>>,
     ) -> ExportedState {
+        // unroll.py:454: end_args = [force_box_for_end_of_preamble(a) ...]
         let end_args: Vec<OpRef> = original_label_args
             .iter()
             .map(|&a| ctx.get_replacement(a))
             .collect();
-
+        // unroll.py:457
         let virtual_state = crate::virtualstate::export_state(&end_args, ctx, &ctx.ptr_info);
-        let exported_infos = end_args
-            .iter()
-            .map(|&arg| self.collect_exported_info(arg, ctx, exported_int_bounds))
-            .collect();
-
+        // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
+        let mut infos: HashMap<OpRef, ExportedValueInfo> = HashMap::new();
+        for &arg in &end_args {
+            self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
+        }
+        // unroll.py:462-463
         let label_args = virtual_state.make_inputargs(&end_args, ctx);
+        // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
+        for &arg in &label_args {
+            self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
+        }
+
+        let exported_short_ops = self.collect_exported_short_ops(&label_args, ctx);
 
         ExportedState::new(
             label_args.clone(),
             end_args,
             virtual_state,
-            exported_infos,
+            infos,
+            exported_short_ops,
             renamed_inputargs.to_vec(),
             label_args,
         )
+    }
+
+    /// unroll.py:432-443: _expand_info
+    fn expand_info(
+        &self,
+        arg: OpRef,
+        ctx: &OptContext,
+        exported_int_bounds: Option<&HashMap<OpRef, crate::intutils::IntBound>>,
+        infos: &mut HashMap<OpRef, ExportedValueInfo>,
+    ) {
+        let resolved = ctx.get_replacement(arg);
+        if infos.contains_key(&resolved) {
+            return;
+        }
+        let info = self.collect_exported_info(resolved, ctx, exported_int_bounds);
+        let is_virtual = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual());
+        infos.insert(resolved, info);
+        if is_virtual {
+            self.expand_infos_from_virtual(resolved, ctx, exported_int_bounds, infos);
+        }
+    }
+
+    /// unroll.py:445-450: _expand_infos_from_virtual
+    fn expand_infos_from_virtual(
+        &self,
+        opref: OpRef,
+        ctx: &OptContext,
+        exported_int_bounds: Option<&HashMap<OpRef, crate::intutils::IntBound>>,
+        infos: &mut HashMap<OpRef, ExportedValueInfo>,
+    ) {
+        let fields: Vec<OpRef> = match ctx.get_ptr_info(opref) {
+            Some(crate::info::PtrInfo::Virtual(v)) => v.fields.iter().map(|(_, r)| *r).collect(),
+            Some(crate::info::PtrInfo::VirtualStruct(v)) => {
+                v.fields.iter().map(|(_, r)| *r).collect()
+            }
+            Some(crate::info::PtrInfo::VirtualArray(v)) => v.items.clone(),
+            _ => return,
+        };
+        for field in fields {
+            if field.is_none() {
+                continue;
+            }
+            self.expand_info(field, ctx, exported_int_bounds, infos);
+        }
     }
 
     /// unroll.py: inline_short_preamble — replay short preamble ops
@@ -575,6 +656,7 @@ impl OptUnroll {
     ///
     /// Maps target args (from the new label) to the exported state's
     /// next_iteration_args, carrying forward type info and virtuals.
+    /// unroll.py:479-504: import_state
     pub fn import_state(
         &self,
         targetargs: &[OpRef],
@@ -582,17 +664,24 @@ impl OptUnroll {
         ctx: &mut OptContext,
     ) -> Vec<OpRef> {
         assert_eq!(
-            exported_state.exported_infos.len(),
+            exported_state.next_iteration_args.len(),
             targetargs.len(),
-            "import_state: arg count mismatch"
+            "import_state: next_iteration_args mismatch"
         );
 
-        for (source, info) in targetargs.iter().zip(exported_state.exported_infos.iter()) {
-            self.apply_exported_info(*source, info, ctx);
+        // unroll.py:483-490: forward args, apply exported info
+        for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
+            let source = targetargs[i];
+            // unroll.py:487: info = exported_state.exported_infos.get(target, None)
+            if let Some(info) = exported_state.exported_infos.get(target) {
+                self.apply_exported_info(source, info, ctx);
+            }
         }
 
-        // Create label args from virtual state
-        exported_state.virtual_state.make_inputargs(targetargs, ctx)
+        // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
+        let label_args = exported_state.virtual_state.make_inputargs(targetargs, ctx);
+        self.import_short_preamble_heap_ops(&label_args, exported_state, ctx);
+        label_args
     }
 
     fn collect_exported_info(
@@ -707,6 +796,98 @@ impl OptUnroll {
             ctx.int_lower_bounds.insert(opref, lower);
         }
     }
+
+    fn collect_exported_short_ops(&self, label_args: &[OpRef], ctx: &OptContext) -> Vec<ExportedShortOp> {
+        let short_boxes = crate::shortpreamble::ShortBoxes::with_label_args(label_args);
+        ctx.exported_short_boxes
+            .iter()
+            .filter_map(|entry| match entry.kind {
+                crate::shortpreamble::PreambleOpKind::Heap { descr_idx } => {
+                    let object_slot = short_boxes.lookup_label_arg(entry.op.arg(0))?;
+                    let result_slot = short_boxes.lookup_label_arg(entry.op.pos)?;
+                    match entry.op.opcode {
+                        OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
+                            Some(ExportedShortOp::HeapField {
+                                object_slot,
+                                descr_idx,
+                                result_slot,
+                            })
+                        }
+                        OpCode::GetarrayitemGcI
+                        | OpCode::GetarrayitemGcR
+                        | OpCode::GetarrayitemGcF => {
+                            let index = entry.op.arg(1).0 as i64;
+                            Some(ExportedShortOp::HeapArrayItem {
+                                object_slot,
+                                descr_idx,
+                                index,
+                                result_slot,
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+                crate::shortpreamble::PreambleOpKind::LoopInvariant => {
+                    let func_ptr = ctx.get_constant_int(entry.op.arg(0))?;
+                    let result_slot = short_boxes.lookup_label_arg(entry.op.pos)?;
+                    Some(ExportedShortOp::LoopInvariant {
+                        func_ptr,
+                        result_slot,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn import_short_preamble_heap_ops(
+        &self,
+        label_args: &[OpRef],
+        exported_state: &ExportedState,
+        ctx: &mut OptContext,
+    ) {
+        for entry in &exported_state.exported_short_ops {
+            match *entry {
+                ExportedShortOp::HeapField {
+                    object_slot,
+                    descr_idx,
+                    result_slot,
+                } => {
+                    let Some(&obj) = label_args.get(object_slot) else {
+                        continue;
+                    };
+                    let Some(&value) = label_args.get(result_slot) else {
+                        continue;
+                    };
+                    ctx.imported_short_fields.insert((obj, descr_idx), value);
+                }
+                ExportedShortOp::HeapArrayItem {
+                    object_slot,
+                    descr_idx,
+                    index,
+                    result_slot,
+                } => {
+                    let Some(&obj) = label_args.get(object_slot) else {
+                        continue;
+                    };
+                    let Some(&value) = label_args.get(result_slot) else {
+                        continue;
+                    };
+                    ctx.imported_short_arrayitems
+                        .insert((obj, descr_idx, index), value);
+                }
+                ExportedShortOp::LoopInvariant {
+                    func_ptr,
+                    result_slot,
+                } => {
+                    let Some(&value) = label_args.get(result_slot) else {
+                        continue;
+                    };
+                    ctx.imported_loop_invariant_results.insert(func_ptr, value);
+                }
+            }
+        }
+    }
 }
 
 /// unroll.py: export_state — module-level entry point.
@@ -737,95 +918,20 @@ pub(crate) fn import_state(
 ///
 // ── RPython-parity helper functions for 2-phase preamble peeling ──
 
-/// unroll.py:452-477 export_state + make_inputargs_and_virtuals:
-/// Replace virtual ptr in Phase 1 JUMP args with field values from SetfieldGc.
-pub(crate) fn export_flatten_jump_args(
-    p1_ops: &[Op],
-    p1_jump: &Op,
-    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
-) -> Vec<OpRef> {
-    let mut args = p1_jump.args.clone();
-    for virt in jump_virtuals.iter().rev() {
-        if virt.jump_arg_index >= args.len() { continue; }
-        let vref = args[virt.jump_arg_index];
-        let mut fvals = Vec::new();
-        for (descr, _) in &virt.fields {
-            let fv = p1_ops.iter()
-                .find(|op| op.opcode == OpCode::SetfieldGc
-                    && op.args.first() == Some(&vref)
-                    && op.descr.as_ref().map_or(false, |d| d.index() == descr.index()))
-                .and_then(|op| op.args.get(1).copied())
-                .unwrap_or(OpRef::NONE);
-            fvals.push(fv);
-        }
-        args.remove(virt.jump_arg_index);
-        for (i, fv) in fvals.into_iter().enumerate() {
-            args.insert(virt.jump_arg_index + i, fv);
-        }
-    }
-    args.into_vec()
-}
-
 /// unroll.py:479-504 import_state: build ImportedVirtual for Phase 2.
 fn build_imported_virtuals(
     jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
 ) -> Vec<crate::optimizer::ImportedVirtual> {
-    let mut imported = Vec::new();
-    let mut offset = 0;
-    for virt in jump_virtuals {
-        let base = virt.jump_arg_index + offset;
-        let fields: Vec<_> = virt.fields.iter().enumerate()
-            .map(|(i, (descr, _))| (descr.clone(), base + i))
-            .collect();
-        imported.push(crate::optimizer::ImportedVirtual {
-            inputarg_index: base,
+    jump_virtuals
+        .iter()
+        .map(|virt| crate::optimizer::ImportedVirtual {
+            inputarg_index: virt.jump_arg_index,
             size_descr: virt.size_descr.clone(),
-            fields,
+            kind: virt.kind.clone(),
+            fields: virt.fields.clone(),
             head_load_descr_index: virt.head_load_descr_index,
-        });
-        offset += virt.fields.len() - 1;
-    }
-    imported
-}
-
-/// Remap original trace op positions that collide with body's extra inputargs.
-fn remap_trace_for_body(
-    ops: &[Op],
-    constants: &std::collections::HashMap<u32, i64>,
-    orig_num_inputs: usize,
-    body_num_inputs: usize,
-) -> (Vec<Op>, std::collections::HashMap<u32, i64>) {
-    let extra = body_num_inputs.saturating_sub(orig_num_inputs) as u32;
-    if extra == 0 {
-        return (ops.to_vec(), constants.clone());
-    }
-    let mut remapped = ops.to_vec();
-    let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
-    // Shift ALL ops at pos >= orig_num_inputs by `extra` to make room
-    // for the flattened virtual field inputargs at [orig_num_inputs, body_num_inputs).
-    for op in &mut remapped {
-        if op.pos.0 != u32::MAX && op.pos.0 >= orig_num_inputs as u32 {
-            let new_pos = OpRef(op.pos.0 + extra);
-            remap.insert(op.pos, new_pos);
-            op.pos = new_pos;
-        }
-    }
-    for op in &mut remapped {
-        for arg in &mut op.args {
-            if let Some(&r) = remap.get(arg) { *arg = r; }
-        }
-        if let Some(ref mut fa) = op.fail_args {
-            for a in fa.iter_mut() {
-                if let Some(&r) = remap.get(a) { *a = r; }
-            }
-        }
-    }
-    let mut new_consts = std::collections::HashMap::new();
-    for (&k, &v) in constants {
-        let nk = remap.get(&OpRef(k)).map_or(k, |r| r.0);
-        new_consts.insert(nk, v);
-    }
-    (remapped, new_consts)
+        })
+        .collect()
 }
 
 /// compile.py:310-338: [preamble_no_jump] + Label(label_args) + [body_with_jump]
@@ -1675,18 +1781,18 @@ mod tests {
             &ctx,
         );
 
-        assert_eq!(exported.exported_infos.len(), 6);
-        assert_eq!(exported.exported_infos[0].constant, Some(Value::Int(42)));
-        assert_eq!(exported.exported_infos[1].known_class, Some(GcRef(0x1234)));
-        assert_eq!(exported.exported_infos[2].int_lower_bound, Some(7));
-        assert_eq!(exported.exported_infos[3].constant, Some(Value::Ref(GcRef(0x5678))));
-        assert_eq!(exported.exported_infos[4].ptr_kind, ExportedPtrKind::Instance);
-        assert_eq!(exported.exported_infos[4].ptr_descr.as_ref().map(|d| d.index()), Some(91));
-        assert_eq!(exported.exported_infos[4].known_class, Some(GcRef(0x7777)));
-        assert_eq!(exported.exported_infos[5].ptr_kind, ExportedPtrKind::Array);
-        assert_eq!(exported.exported_infos[5].ptr_descr.as_ref().map(|d| d.index()), Some(92));
+        assert!(exported.exported_infos.len() >= 6);
+        assert_eq!(exported.exported_infos[&OpRef(10)].constant, Some(Value::Int(42)));
+        assert_eq!(exported.exported_infos[&OpRef(11)].known_class, Some(GcRef(0x1234)));
+        assert_eq!(exported.exported_infos[&OpRef(12)].int_lower_bound, Some(7));
+        assert_eq!(exported.exported_infos[&OpRef(13)].constant, Some(Value::Ref(GcRef(0x5678))));
+        assert_eq!(exported.exported_infos[&OpRef(14)].ptr_kind, ExportedPtrKind::Instance);
+        assert_eq!(exported.exported_infos[&OpRef(14)].ptr_descr.as_ref().map(|d| d.index()), Some(91));
+        assert_eq!(exported.exported_infos[&OpRef(14)].known_class, Some(GcRef(0x7777)));
+        assert_eq!(exported.exported_infos[&OpRef(15)].ptr_kind, ExportedPtrKind::Array);
+        assert_eq!(exported.exported_infos[&OpRef(15)].ptr_descr.as_ref().map(|d| d.index()), Some(92));
         assert_eq!(
-            exported.exported_infos[5]
+            exported.exported_infos[&OpRef(15)]
                 .array_lenbound
                 .as_ref()
                 .map(|b| (b.lower, b.upper)),
@@ -1749,7 +1855,7 @@ mod tests {
         );
 
         assert_eq!(
-            exported.exported_infos[0]
+            exported.exported_infos[&OpRef(21)]
                 .int_bound
                 .as_ref()
                 .map(|b| (b.lower, b.upper)),
@@ -1766,5 +1872,69 @@ mod tests {
             Some((10, 20))
         );
         assert_eq!(ctx2.int_lower_bounds.get(&OpRef(0)).copied(), Some(10));
+    }
+
+    #[test]
+    fn test_exported_state_reimports_short_heap_field_facts() {
+        let mut ctx = crate::OptContext::with_num_inputs(4, 0);
+        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::GetfieldGcI, &[OpRef(10)]);
+                op.pos = OpRef(11);
+                op
+            },
+            kind: crate::shortpreamble::PreambleOpKind::Heap { descr_idx: 55 },
+            label_arg_idx: Some(1),
+        });
+
+        let exported = export_state(&[OpRef(10), OpRef(11)], &[], &ctx, None);
+        assert_eq!(
+            exported.exported_short_ops,
+            vec![ExportedShortOp::HeapField {
+                object_slot: 0,
+                descr_idx: 55,
+                result_slot: 1,
+            }]
+        );
+
+        let mut ctx2 = crate::OptContext::with_num_inputs(4, 2);
+        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
+        assert_eq!(label_args, vec![OpRef(0), OpRef(1)]);
+        assert_eq!(
+            ctx2.imported_short_fields.get(&(OpRef(0), 55)).copied(),
+            Some(OpRef(1))
+        );
+    }
+
+    #[test]
+    fn test_exported_state_reimports_loopinvariant_short_fact() {
+        let mut ctx = crate::OptContext::with_num_inputs(4, 0);
+        ctx.make_constant(OpRef(10), Value::Int(0x1234));
+        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::CallLoopinvariantI, &[OpRef(10), OpRef(12)]);
+                op.pos = OpRef(11);
+                op
+            },
+            kind: crate::shortpreamble::PreambleOpKind::LoopInvariant,
+            label_arg_idx: Some(1),
+        });
+
+        let exported = export_state(&[OpRef(10), OpRef(11)], &[], &ctx, None);
+        assert_eq!(
+            exported.exported_short_ops,
+            vec![ExportedShortOp::LoopInvariant {
+                func_ptr: 0x1234,
+                result_slot: 1,
+            }]
+        );
+
+        let mut ctx2 = crate::OptContext::with_num_inputs(4, 2);
+        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
+        assert_eq!(label_args, vec![OpRef(0), OpRef(1)]);
+        assert_eq!(
+            ctx2.imported_loop_invariant_results.get(&0x1234).copied(),
+            Some(OpRef(1))
+        );
     }
 }
