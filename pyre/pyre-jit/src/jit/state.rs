@@ -153,6 +153,13 @@ fn code_has_backward_jump(code: &CodeObject) -> bool {
     false
 }
 
+fn instruction_consumes_comparison_truth(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::PopJumpIfFalse { .. } | Instruction::PopJumpIfTrue { .. }
+    )
+}
+
 /// Environment context — currently unused.
 pub struct PyreEnv;
 
@@ -722,6 +729,23 @@ impl PyreSym {
 }
 
 impl TraceFrameState {
+    fn next_instruction_consumes_comparison_truth(&self) -> bool {
+        let frame = unsafe { &*(self.concrete_frame as *const pyre_interp::frame::PyFrame) };
+        let code = unsafe { &*frame.code };
+        // Skip Cache instructions (CPython 3.12+ inline caching no-ops)
+        // to find the actual next instruction.
+        let mut pc = self.fallthrough_pc;
+        loop {
+            match decode_instruction_at(code, pc) {
+                Some((Instruction::Cache, _)) => pc += 1,
+                Some((instruction, _)) => {
+                    return instruction_consumes_comparison_truth(instruction);
+                }
+                None => return false,
+            }
+        }
+    }
+
     pub(crate) fn from_sym(
         ctx: &mut TraceCtx,
         sym: &mut PyreSym,
@@ -1913,7 +1937,11 @@ impl TraceFrameState {
                     // RPython goto_if_not fusion: cache truth for
                     // the next POP_JUMP_IF to consume directly.
                     this.sym_mut().last_comparison_truth = Some(truth);
-                    Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
+                    if this.next_instruction_consumes_comparison_truth() {
+                        Ok(truth)
+                    } else {
+                        Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
+                    }
                 });
             }
             if is_float(lhs_obj) && is_float(rhs_obj) {
@@ -1954,7 +1982,11 @@ impl TraceFrameState {
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
                     this.sym_mut().last_comparison_truth = Some(truth);
-                    Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
+                    if this.next_instruction_consumes_comparison_truth() {
+                        Ok(truth)
+                    } else {
+                        Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
+                    }
                 });
             }
         }
@@ -4946,6 +4978,144 @@ mod tests {
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
         ));
         assert_ne!(call.args.last().copied(), Some(arg));
+    }
+
+    #[test]
+    fn test_compare_value_direct_keeps_raw_truth_for_immediate_branch_consumer() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("if 1 < 2:\n    x = 3\n").expect("test code should compile");
+        let compare_pc = (0..code.instructions.len())
+            .find(|&pc| {
+                matches!(
+                    decode_instruction_at(&code, pc),
+                    Some((Instruction::CompareOp { .. }, _))
+                )
+            })
+            .expect("test bytecode should contain COMPARE_OP");
+        let branch_pc = ((compare_pc + 1)..code.instructions.len())
+            .find(|&pc| {
+                decode_instruction_at(&code, pc)
+                    .map(|(instruction, _)| instruction_consumes_comparison_truth(instruction))
+                    .unwrap_or(false)
+            })
+            .expect("test bytecode should contain POP_JUMP_IF after COMPARE_OP");
+
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        frame.push(w_int_new(1));
+        frame.push(w_int_new(2));
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(2);
+        let lhs = OpRef(0);
+        let rhs = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_initialized = true;
+        sym.valuestackdepth = 0;
+        sym.transient_value_types.insert(lhs, Type::Int);
+        sym.transient_value_types.insert(rhs, Type::Int);
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: branch_pc,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let result = state
+            .compare_value_direct(lhs, rhs, ComparisonOperator::Less)
+            .expect("int comparison should trace");
+        let truth = state
+            .truth_value_direct(result)
+            .expect("immediate POP_JUMP consumer should reuse raw truth");
+
+        assert_eq!(result, truth);
+
+        let recorder = ctx.into_recorder();
+        let mut saw_cmp = false;
+        let mut saw_bool_call = false;
+        let mut saw_bool_unbox = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if op.opcode == OpCode::IntLt {
+                saw_cmp = true;
+            }
+            if op.opcode == OpCode::CallR {
+                saw_bool_call = true;
+            }
+            if op.opcode == OpCode::GetfieldGcI {
+                saw_bool_unbox = true;
+            }
+        }
+        assert!(saw_cmp, "branch compare should still emit raw int comparison");
+        assert!(
+            !saw_bool_call,
+            "immediate branch consumer should not allocate a bool object"
+        );
+        assert!(
+            !saw_bool_unbox,
+            "immediate branch consumer should not unbox a transient bool object"
+        );
+    }
+
+    #[test]
+    fn test_compare_value_direct_boxes_bool_when_not_immediately_consumed_by_branch() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        frame.push(w_int_new(1));
+        frame.push(w_int_new(2));
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(2);
+        let lhs = OpRef(0);
+        let rhs = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_initialized = true;
+        sym.valuestackdepth = 0;
+        sym.transient_value_types.insert(lhs, Type::Int);
+        sym.transient_value_types.insert(rhs, Type::Int);
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let _ = state
+            .compare_value_direct(lhs, rhs, ComparisonOperator::Less)
+            .expect("non-branch compare should trace");
+
+        let recorder = ctx.into_recorder();
+        let mut saw_bool_call = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if op.opcode == OpCode::CallR {
+                saw_bool_call = true;
+            }
+        }
+        assert!(
+            saw_bool_call,
+            "non-branch compare should continue to materialize a Python bool result"
+        );
     }
 
     #[test]
