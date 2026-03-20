@@ -261,7 +261,28 @@ impl UnrollOptimizer {
             let nc = p2_ops.iter()
                 .filter(|o| o.opcode == OpCode::New || o.opcode == OpCode::NewWithVtable).count();
             let gc = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
-            eprintln!("[jit] phase 2: {} ops, {} New, {} guards", p2_ops.len(), nc, gc);
+            eprintln!(
+                "[jit] phase 2: {} ops, {} New, {} guards, p2_ni={}",
+                p2_ops.len(),
+                nc,
+                gc,
+                p2_ni
+            );
+        }
+
+        // Safety: if Phase 2 eliminated ALL guards, fall back to Phase 1.
+        // A guardless loop body would run forever. This can happen when the
+        // trace's only guard depends on a constant from the preamble iteration.
+        // RPython handles this via bridge compilation, which we don't have yet.
+        let p2_guard_count = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
+        if p2_guard_count == 0 {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[jit] phase 2: 0 guards, falling back to phase 1");
+            }
+            *constants = consts_p1;
+            let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
+            if !sp.is_empty() { self.short_preamble = Some(sp); }
+            return (p1_ops, p1_ni);
         }
 
         // ── Assembly (compile.py:310-338) ──
@@ -826,7 +847,13 @@ fn combine_preamble_and_body(
         }
     }
 
-    let label_pos = OpRef(result.len() as u32 + body_num_inputs as u32);
+    let max_pos = result
+        .iter()
+        .map(|op| op.pos.0)
+        .filter(|&p| p != u32::MAX)
+        .max()
+        .unwrap_or(body_num_inputs as u32);
+    let label_pos = OpRef((max_pos + 1).max(body_num_inputs as u32));
     let mut label = Op::new(OpCode::Label, &label_args);
     label.pos = label_pos;
     result.push(label);
@@ -839,7 +866,7 @@ fn combine_preamble_and_body(
     }
 
     let body_ops: Vec<&Op> = body.iter().filter(|op| op.opcode != OpCode::Label).collect();
-    let body_base = result.len() as u32 + body_num_inputs as u32 + 1;
+    let body_base = label_pos.0 + 1;
     for (idx, op) in body_ops.iter().enumerate() {
         if op.pos.0 != u32::MAX {
             let new_pos = OpRef(body_base + idx as u32);
