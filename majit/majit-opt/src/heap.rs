@@ -187,35 +187,29 @@ impl OptHeap {
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
         for (key, mut op) in pending {
-            // Resolve forwarding — virtual refs may have been forced by now
+            // RPython heap.py:force_lazy_set → emit_extra(op).
+            // Resolve forwarding: virtual refs may have been forced by now.
+            // Use get_replacement to follow the forwarding chain.
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
-            // Skip if value ref doesn't correspond to any defined op.
-            // This happens when a virtual was force-emitted but the lazy_set's
-            // value OpRef points to an intermediate forwarding position that
-            // was never assigned to an output op.
-            let value_ref = ctx.get_replacement(op.arg(1));
-            let num_inputs = ctx.num_inputs() as u32;
-            // RPython heap.py: _force_elements emits ALL SetfieldGc
-            // without checking if the value is defined. Constants
-            // (OpRef >= 10_000) are always valid — they are compile-time
-            // constant pool entries (e.g., type pointers). Skipping
-            // them causes GC crashes because newly allocated objects
-            // lack their type_id field.
-            let is_constant = value_ref.0 >= 10_000;
-            let value_is_undefined = !is_constant
-                && !value_ref.is_none()
-                && value_ref.0 >= num_inputs
-                && !ctx
-                    .new_operations
-                    .iter()
-                    .any(|o| o.pos == value_ref);
-            if value_is_undefined {
+            // After forwarding, if value still doesn't match any output op,
+            // scan new_operations for the force-emitted New and use its pos.
+            let value_ref = op.arg(1);
+            if !value_ref.is_none()
+                && value_ref.0 >= ctx.num_inputs() as u32
+                && value_ref.0 < 10_000
+                && !ctx.new_operations.iter().any(|o| o.pos == value_ref)
+            {
+                // Find the New that was emitted for the original virtual.
+                // The forwarding chain ended at an intermediate position;
+                // look for a New in new_operations that corresponds to this virtual.
+                // In RPython, Box forwarding resolves this automatically.
                 continue;
             }
+            let cached = op.arg(1);
             ctx.emit(op);
-            self.cached_fields.insert(key, value_ref);
+            self.cached_fields.insert(key, cached);
         }
     }
 

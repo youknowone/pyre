@@ -325,18 +325,20 @@ impl UnrollOptimizer {
             }
         }
 
-        // RPython does NOT fall back for 0-guard body (relies on periodic
-        // interrupt checks). majit lacks interrupts, so guardless body loops
-        // would run forever. Fall back to Phase 1 until interrupt support.
-        let p2_guard_count = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
-        if p2_guard_count == 0 {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[jit] phase 2: 0 guards, falling back to phase 1 (no interrupt support)");
+        // Guard count safety: RPython does NOT fall back for 0-guard body
+        // (relies on periodic interrupts). majit lacks interrupts, so guardless
+        // loops would run forever. Fall back to Phase 1 until interrupt support.
+        {
+            let guard_count = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
+            if guard_count == 0 {
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!("[jit] phase 2: 0 guards, falling back to phase 1");
+                }
+                *constants = consts_p1;
+                let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
+                if !sp.is_empty() { self.short_preamble = Some(sp); }
+                return (p1_ops, p1_ni);
             }
-            *constants = consts_p1;
-            let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
-            if !sp.is_empty() { self.short_preamble = Some(sp); }
-            return (p1_ops, p1_ni);
         }
 
         // finalize_short_preamble: create TargetToken for this loop version
@@ -438,8 +440,9 @@ impl UnrollOptimizer {
             &p1_ops,
             &body_ops,
             &exported_label_args,
+            &exported_state.renamed_inputargs,
             &sp.used_boxes,
-            if redirected_tail_ops.is_empty() {
+            if jump_to_self && redirected_tail_ops.is_empty() {
                 rewritten_jump_args.as_deref()
             } else {
                 None
@@ -447,6 +450,9 @@ impl UnrollOptimizer {
             p2_ni,
             &imported_short_aliases,
             &imported_short_sources,
+            self.target_tokens
+                .first()
+                .map(|target| target.as_jump_target_descr()),
             self.target_tokens
                 .last()
                 .map(|target| target.as_jump_target_descr()),
@@ -1111,13 +1117,13 @@ impl OptUnroll {
         let (label_args, virtuals) = exported_state
             .virtual_state
             .make_inputargs_and_virtuals(targetargs, ctx);
-        let mut short_args = label_args.clone();
-        short_args.extend(virtuals);
         ctx.initialize_imported_short_preamble_builder(
-            &short_args,
+            &label_args,
             &exported_state.short_inputargs,
             &exported_state.exported_short_boxes,
         );
+        let mut short_args = label_args.clone();
+        short_args.extend(virtuals);
         self.import_short_preamble_ops(&short_args, exported_state, ctx);
         label_args
     }
@@ -1759,12 +1765,14 @@ fn assemble_peeled_trace(
     p1_ops: &[Op],
     p2_ops: &[Op],
     label_args: &[OpRef],
+    start_label_args: &[OpRef],
     extra_label_args: &[OpRef],
     rewritten_jump_args: Option<&[OpRef]>,
     body_num_inputs: usize,
     imported_short_aliases: &[crate::ImportedShortAlias],
     imported_short_sources: &[crate::ImportedShortSource],
-    label_descr: Option<DescrRef>,
+    start_label_descr: Option<DescrRef>,
+    loop_label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
@@ -1772,6 +1780,13 @@ fn assemble_peeled_trace(
         .iter()
         .map(|entry| (entry.result, entry.source))
         .collect();
+
+    if let Some(start_label_descr) = start_label_descr {
+        let mut start_label = Op::new(OpCode::Label, start_label_args);
+        start_label.pos = OpRef::NONE;
+        start_label.descr = Some(start_label_descr);
+        result.push(start_label);
+    }
 
     // Preamble: everything except Jump
     for op in p1_ops {
@@ -1811,7 +1826,7 @@ fn assemble_peeled_trace(
     }));
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
     label_op.pos = OpRef(label_pos);
-    label_op.descr = label_descr;
+    label_op.descr = loop_label_descr;
     result.push(label_op);
 
     // Body: 2-pass remap (inputarg refs → label_args, op positions → after label)
@@ -3279,6 +3294,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
+            &[OpRef(0)],
             &[],
             None,
             1,
@@ -3291,6 +3307,7 @@ mod tests {
                 result: OpRef(50),
                 source: OpRef(10),
             }],
+            None,
             None,
         );
 
@@ -3358,6 +3375,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
+            &[OpRef(0)],
             &[OpRef(50)],
             None,
             1,
@@ -3370,6 +3388,7 @@ mod tests {
                 result: OpRef(50),
                 source: OpRef(10),
             }],
+            None,
             None,
         );
 
