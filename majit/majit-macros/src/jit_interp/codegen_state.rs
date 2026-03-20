@@ -948,43 +948,44 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     }
 
     // Generate linked list JitCodeSym methods if node layout is provided
-    let linked_list_descr_methods = if let (Some(node_size), Some(value_offset), Some(next_offset)) = (
-        &storage.linked_list_node_size,
-        &storage.linked_list_value_offset,
-        &storage.linked_list_next_offset,
-    ) {
-        quote! {
-            fn node_size_descr(&self) -> Option<majit_ir::DescrRef> {
-                Some(majit_ir::descr::make_size_descr(#node_size))
-            }
+    let linked_list_descr_methods =
+        if let (Some(node_size), Some(value_offset), Some(next_offset)) = (
+            &storage.linked_list_node_size,
+            &storage.linked_list_value_offset,
+            &storage.linked_list_next_offset,
+        ) {
+            quote! {
+                fn node_size_descr(&self) -> Option<majit_ir::DescrRef> {
+                    Some(majit_ir::descr::make_size_descr(#node_size))
+                }
 
-            fn node_value_descr(&self) -> Option<majit_ir::DescrRef> {
-                Some(std::sync::Arc::new(
-                    majit_ir::descr::SimpleFieldDescr::new(
-                        0x8000_0001, // unique tag for value field
-                        #value_offset,
-                        8,
-                        majit_ir::Type::Int,
-                        true, // immutable: once set in New, value doesn't change
-                    ),
-                ))
-            }
+                fn node_value_descr(&self) -> Option<majit_ir::DescrRef> {
+                    Some(std::sync::Arc::new(
+                        majit_ir::descr::SimpleFieldDescr::new(
+                            0x8000_0001, // unique tag for value field
+                            #value_offset,
+                            8,
+                            majit_ir::Type::Int,
+                            true, // immutable: once set in New, value doesn't change
+                        ),
+                    ))
+                }
 
-            fn node_next_descr(&self) -> Option<majit_ir::DescrRef> {
-                Some(std::sync::Arc::new(
-                    majit_ir::descr::SimpleFieldDescr::new(
-                        0x8000_0002, // unique tag for next field
-                        #next_offset,
-                        8,
-                        majit_ir::Type::Ref,
-                        false,
-                    ),
-                ))
+                fn node_next_descr(&self) -> Option<majit_ir::DescrRef> {
+                    Some(std::sync::Arc::new(
+                        majit_ir::descr::SimpleFieldDescr::new(
+                            0x8000_0002, // unique tag for next field
+                            #next_offset,
+                            8,
+                            majit_ir::Type::Ref,
+                            false,
+                        ),
+                    ))
+                }
             }
-        }
-    } else {
-        quote! {}
-    };
+        } else {
+            quote! {}
+        };
 
     // ── Linked list mode ──
     // RPython parity: inputargs = [pool_ptr, selected], heads loaded lazily.
@@ -1148,7 +1149,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         ),
                     );
                     ctx.record_op_with_descr(
-                        majit_ir::OpCode::SetfieldRaw,
+                        majit_ir::OpCode::SetfieldGc,
                         &[self.pool_ref, new_head],
                         head_descr,
                     );

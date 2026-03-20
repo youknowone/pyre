@@ -298,9 +298,8 @@ impl MiniMarkGC {
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
         *hdr = GcHeader::with_flags(type_id, flags::TRACK_YOUNG_PTRS);
-        self.bytes_made_old_since_cycle = self
-            .bytes_made_old_since_cycle
-            .saturating_add(total_size);
+        self.bytes_made_old_since_cycle =
+            self.bytes_made_old_since_cycle.saturating_add(total_size);
         GcRef((ptr as usize) + GcHeader::SIZE)
     }
 
@@ -434,9 +433,8 @@ impl MiniMarkGC {
                 .alloc_and_copy(header_ptr as *const u8, total_size)
         };
         let new_obj_addr = new_header_ptr as usize + GcHeader::SIZE;
-        self.bytes_made_old_since_cycle = self
-            .bytes_made_old_since_cycle
-            .saturating_add(total_size);
+        self.bytes_made_old_since_cycle =
+            self.bytes_made_old_since_cycle.saturating_add(total_size);
 
         // Set TRACK_YOUNG_PTRS on the new old-gen object.
         let new_hdr = unsafe { &mut *(new_header_ptr as *mut GcHeader) };

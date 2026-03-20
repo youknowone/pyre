@@ -489,7 +489,8 @@ impl VirtualState {
                         // Fallback: use pre_force_field_refs if virtual was forced.
                         // Try both resolved and original opref (force may forward).
                         .or_else(|| {
-                            ctx.pre_force_field_refs.get(&resolved)
+                            ctx.pre_force_field_refs
+                                .get(&resolved)
                                 .or_else(|| ctx.pre_force_field_refs.get(&opref))
                                 .and_then(|flds| {
                                     flds.iter()
@@ -498,7 +499,13 @@ impl VirtualState {
                                 })
                         })
                         .unwrap_or(OpRef::NONE);
-                    Self::enum_forced_boxes_for_entry(field_state, field_ref, ctx, boxes, next_slot);
+                    Self::enum_forced_boxes_for_entry(
+                        field_state,
+                        field_ref,
+                        ctx,
+                        boxes,
+                        next_slot,
+                    );
                 }
             }
             VirtualStateInfo::VirtualArray { items, .. } => {

@@ -338,10 +338,12 @@ impl OptVirtualize {
 
         // Phase 2: the virtual's OpRef matches a GetfieldGcR that was emitted
         // (imported virtual head forwarded from the pool load).
-        if let Some(idx) = ctx.new_operations
+        if let Some(idx) = ctx
+            .new_operations
             .iter()
             .find(|op| {
-                op.pos == opref && (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR)
+                op.pos == opref
+                    && (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR)
             })
             .and_then(|op| op.descr.as_ref())
             .map(|d| d.index())
@@ -369,21 +371,26 @@ impl OptVirtualize {
         };
         match info {
             PtrInfo::VirtualStruct(ref vinfo) => {
-                let Some(head_load_descr_index) = self.imported_head_load_descr_index(resolved, ctx)
+                let Some(head_load_descr_index) =
+                    self.imported_head_load_descr_index(resolved, ctx)
                 else {
                     return;
                 };
-                let fields: Vec<(majit_ir::DescrRef, crate::virtualstate::VirtualStateInfo)> = vinfo
-                    .fields
-                    .iter()
-                    .map(|(field_idx, value_ref)| {
-                        let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
-                            .unwrap_or_else(|| make_field_index_descr(*field_idx));
-                        let val =
-                            crate::virtualstate::export_value_state(*value_ref, ctx, &ctx.ptr_info);
-                        (descr, val)
-                    })
-                    .collect();
+                let fields: Vec<(majit_ir::DescrRef, crate::virtualstate::VirtualStateInfo)> =
+                    vinfo
+                        .fields
+                        .iter()
+                        .map(|(field_idx, value_ref)| {
+                            let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
+                                .unwrap_or_else(|| make_field_index_descr(*field_idx));
+                            let val = crate::virtualstate::export_value_state(
+                                *value_ref,
+                                ctx,
+                                &ctx.ptr_info,
+                            );
+                            (descr, val)
+                        })
+                        .collect();
                 ctx.exported_jump_virtuals
                     .push(crate::optimizer::ExportedJumpVirtual {
                         jump_arg_index,
@@ -394,21 +401,26 @@ impl OptVirtualize {
                     });
             }
             PtrInfo::Virtual(ref vinfo) => {
-                let Some(head_load_descr_index) = self.imported_head_load_descr_index(resolved, ctx)
+                let Some(head_load_descr_index) =
+                    self.imported_head_load_descr_index(resolved, ctx)
                 else {
                     return;
                 };
-                let fields: Vec<(majit_ir::DescrRef, crate::virtualstate::VirtualStateInfo)> = vinfo
-                    .fields
-                    .iter()
-                    .map(|(field_idx, value_ref)| {
-                        let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
-                            .unwrap_or_else(|| make_field_index_descr(*field_idx));
-                        let val =
-                            crate::virtualstate::export_value_state(*value_ref, ctx, &ctx.ptr_info);
-                        (descr, val)
-                    })
-                    .collect();
+                let fields: Vec<(majit_ir::DescrRef, crate::virtualstate::VirtualStateInfo)> =
+                    vinfo
+                        .fields
+                        .iter()
+                        .map(|(field_idx, value_ref)| {
+                            let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
+                                .unwrap_or_else(|| make_field_index_descr(*field_idx));
+                            let val = crate::virtualstate::export_value_state(
+                                *value_ref,
+                                ctx,
+                                &ctx.ptr_info,
+                            );
+                            (descr, val)
+                        })
+                        .collect();
                 ctx.exported_jump_virtuals
                     .push(crate::optimizer::ExportedJumpVirtual {
                         jump_arg_index,
@@ -436,9 +448,7 @@ impl OptVirtualize {
             PtrInfo::VirtualStruct(vinfo) => {
                 vinfo.fields.iter().map(|(_, val_ref)| *val_ref).collect()
             }
-            PtrInfo::Virtual(vinfo) => {
-                vinfo.fields.iter().map(|(_, val_ref)| *val_ref).collect()
-            }
+            PtrInfo::Virtual(vinfo) => vinfo.fields.iter().map(|(_, val_ref)| *val_ref).collect(),
             _ => Vec::new(),
         }
     }
@@ -751,7 +761,11 @@ impl OptVirtualize {
         // RPython import_state parity: imported virtual heads already have
         // their fields set from inputargs. The original trace's SetfieldGc
         // carries preamble-time concrete values — skip them for imported virtuals.
-        if ctx.imported_virtual_heads.iter().any(|&(_, vh)| vh == struct_ref) {
+        if ctx
+            .imported_virtual_heads
+            .iter()
+            .any(|&(_, vh)| vh == struct_ref)
+        {
             return OptimizationResult::Remove;
         }
 
@@ -1217,7 +1231,8 @@ impl OptVirtualize {
                 .iter()
                 .find_map(|(idx, descr)| {
                     (*idx == field_idx).then(|| {
-                        descr.as_field_descr()
+                        descr
+                            .as_field_descr()
                             .map(|fd| fd.field_type() == Type::Ref)
                             .unwrap_or(false)
                     })
@@ -1858,11 +1873,8 @@ impl Optimization for OptVirtualize {
                     .iter()
                     .map(|a| ctx.get_replacement(*a))
                     .collect();
-                let pre_force_vs = crate::virtualstate::export_state(
-                    &pre_force_args,
-                    ctx,
-                    &ctx.ptr_info,
-                );
+                let pre_force_vs =
+                    crate::virtualstate::export_state(&pre_force_args, ctx, &ctx.ptr_info);
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
                 ctx.pre_force_jump_args = Some(pre_force_args.clone());
 
@@ -3568,10 +3580,18 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(2), OpRef(100)], value_fd.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(2), OpRef(100)],
+                value_fd.clone(),
+            ),
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(2), OpRef(0)], next_fd.clone()),
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(5), OpRef(101)], value_fd.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(5), OpRef(101)],
+                value_fd.clone(),
+            ),
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(5), OpRef(2)], next_fd.clone()),
             Op::new(OpCode::Finish, &[OpRef(5), OpRef(2), OpRef(1), OpRef(0)]),
         ];
@@ -3590,7 +3610,11 @@ mod tests {
             .filter(|op| op.opcode == OpCode::New)
             .map(|op| op.pos)
             .collect();
-        assert_eq!(new_positions.len(), 2, "expected two forced allocations; got {result:?}");
+        assert_eq!(
+            new_positions.len(),
+            2,
+            "expected two forced allocations; got {result:?}"
+        );
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
             assert!(
@@ -3896,7 +3920,11 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewArray, &[OpRef(10)], ad.clone()),
-            Op::with_descr(OpCode::SetarrayitemGc, &[OpRef(0), OpRef(11), OpRef(12)], ad),
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(0), OpRef(11), OpRef(12)],
+                ad,
+            ),
             guard,
         ];
         assign_positions(&mut ops);

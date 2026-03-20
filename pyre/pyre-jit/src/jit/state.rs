@@ -19,8 +19,7 @@ use pyre_object::strobject::is_str;
 use pyre_object::{
     PY_NULL, w_bool_from, w_int_get_value, w_int_new, w_list_can_append_without_realloc,
     w_list_is_inline_storage, w_list_len, w_list_new, w_list_uses_float_storage,
-    w_list_uses_int_storage, w_list_uses_object_storage,
-    w_str_get_value, w_tuple_len,
+    w_list_uses_int_storage, w_list_uses_object_storage, w_str_get_value, w_tuple_len,
 };
 use pyre_objspace::truth_value as objspace_truth_value;
 use pyre_runtime::{
@@ -248,7 +247,11 @@ pub(crate) fn trace_raw_float_array_getitem_value(
     array: OpRef,
     index: OpRef,
 ) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetarrayitemRawF, &[array, index], float_array_descr())
+    ctx.record_op_with_descr(
+        OpCode::GetarrayitemRawF,
+        &[array, index],
+        float_array_descr(),
+    )
 }
 
 /// Write to frame's locals_cells_stack_w array.
@@ -447,7 +450,10 @@ impl PyreSym {
         }
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
         if majit_meta::majit_log_enabled() {
-            eprintln!("[jit][init-sym] concrete_frame={:#x} nlocals={} vable_base={:?}", concrete_frame, nlocals, self.vable_array_base);
+            eprintln!(
+                "[jit][init-sym] concrete_frame={:#x} nlocals={} vable_base={:?}",
+                concrete_frame, nlocals, self.vable_array_base
+            );
         }
         let valuestackdepth = concrete_stack_depth(concrete_frame).unwrap_or(nlocals);
         let stack_only_depth = valuestackdepth.saturating_sub(nlocals);
@@ -611,7 +617,11 @@ impl TraceFrameState {
         self.sym_mut().pending_next_instr = Some(call_pc);
     }
 
-    fn pop_call_replay_stack(&mut self, ctx: &mut TraceCtx, args_len: usize) -> Result<(), PyError> {
+    fn pop_call_replay_stack(
+        &mut self,
+        ctx: &mut TraceCtx,
+        args_len: usize,
+    ) -> Result<(), PyError> {
         for _ in 0..(2 + args_len) {
             let _ = self.pop_value(ctx)?;
         }
@@ -1008,7 +1018,8 @@ impl TraceFrameState {
     }
 
     fn guard_list_strategy(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected: i64) {
-        let strategy = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_strategy_descr());
+        let strategy =
+            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_strategy_descr());
         self.guard_value(ctx, strategy, expected);
     }
 
@@ -1073,7 +1084,8 @@ impl TraceFrameState {
         self.guard_int_object_value(ctx, key, concrete_index as i64);
         let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_len_descr());
         self.guard_len_gt_index(ctx, len, concrete_index);
-        let items_ptr = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_ptr_descr());
+        let items_ptr =
+            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_ptr_descr());
         let index = ctx.const_int(concrete_index as i64);
         trace_raw_array_getitem_value(ctx, items_ptr, index)
     }
@@ -1095,7 +1107,8 @@ impl TraceFrameState {
         self.guard_int_object_value(ctx, key, concrete_key);
         let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_len_descr());
         self.guard_len_eq(ctx, len, concrete_len);
-        let items_ptr = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_ptr_descr());
+        let items_ptr =
+            ctx.record_op_with_descr(OpCode::GetfieldRawI, &[obj], list_items_ptr_descr());
         let index = ctx.const_int(normalized as i64);
         trace_raw_array_getitem_value(ctx, items_ptr, index)
     }
@@ -2327,7 +2340,9 @@ impl TraceFrameState {
                                 )
                             } else {
                                 // Pending token: self-recursive, use caller's info
-                                let code = unsafe { &*(w_func_get_code_ptr(concrete_callable) as *const CodeObject) };
+                                let code = unsafe {
+                                    &*(w_func_get_code_ptr(concrete_callable) as *const CodeObject)
+                                };
                                 (code.varnames.len(), code.varnames.len() + 1, 4)
                             };
                         let callee_stack_only = callee_vsd.saturating_sub(callee_nlocals);
@@ -2346,7 +2361,11 @@ impl TraceFrameState {
                                     let mut helper_args = vec![this.frame(), callable];
                                     helper_args.extend_from_slice(args);
                                     let helper_arg_types = frame_callable_arg_types(args.len());
-                                    ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types)
+                                    ctx.call_ref_typed(
+                                        frame_helper,
+                                        &helper_args,
+                                        &helper_arg_types,
+                                    )
                                 };
 
                                 let ca_args = if target_num_inputs <= 1 {
@@ -2525,8 +2544,11 @@ impl TraceFrameState {
                                 let mut helper_args = vec![this.frame(), callable];
                                 helper_args.extend_from_slice(args);
                                 let helper_arg_types = frame_callable_arg_types(args.len());
-                                let callee_frame =
-                                    ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
+                                let callee_frame = ctx.call_ref_typed(
+                                    frame_helper,
+                                    &helper_args,
+                                    &helper_arg_types,
+                                );
 
                                 let ca_args = if target_num_inputs <= 1 {
                                     vec![callee_frame]
@@ -2797,8 +2819,7 @@ impl TraceFrameState {
                     let is_self_recursive = callee_key
                         == unsafe {
                             crate::eval::make_green_key(
-                                (*(this.concrete_frame as *const pyre_interp::frame::PyFrame))
-                                    .code,
+                                (*(this.concrete_frame as *const pyre_interp::frame::PyFrame)).code,
                                 0,
                             )
                         };
@@ -2922,8 +2943,7 @@ impl TraceFrameState {
                     ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
                 let force_fn = crate::call_jit::jit_force_callee_frame as *const ();
                 this.sync_standard_virtualizable_before_residual_call(ctx);
-                let result =
-                    ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
+                let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
                 if !this.sync_standard_virtualizable_after_residual_call() {
                     // GuardNotForced fail → interpreter must re-execute CALL.
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
@@ -3923,11 +3943,7 @@ impl JitState for PyreJitState {
             });
             eprintln!(
                 "[jit][restore_values] before arg0={:?} meta.pc={} meta.vsd={} has_vable={} values={:?}",
-                arg0,
-                meta.merge_pc,
-                meta.valuestackdepth,
-                meta.has_virtualizable,
-                values
+                arg0, meta.merge_pc, meta.valuestackdepth, meta.has_virtualizable, values
             );
         }
         if values.len() == 1 {
@@ -3977,9 +3993,7 @@ impl JitState for PyreJitState {
             });
             eprintln!(
                 "[jit][restore_values] after arg0={:?} ni={} vsd={}",
-                arg0,
-                self.next_instr,
-                self.valuestackdepth
+                arg0, self.next_instr, self.valuestackdepth
             );
         }
     }
@@ -4222,11 +4236,8 @@ impl PyreJitState {
                     return None;
                 }
                 unsafe {
-                    std::slice::from_raw_parts(
-                        list_items_ptr as *const PyObjectRef,
-                        list_items_len,
-                    )
-                    .to_vec()
+                    std::slice::from_raw_parts(list_items_ptr as *const PyObjectRef, list_items_len)
+                        .to_vec()
                 }
             };
             let ptr = w_list_new(items);
@@ -4418,8 +4429,14 @@ mod tests {
 
         unsafe {
             assert!(is_list(list_ptr.0 as PyObjectRef));
-            assert_eq!(w_int_get_value(w_list_getitem(list_ptr.0 as PyObjectRef, 0).unwrap()), 2);
-            assert_eq!(w_int_get_value(w_list_getitem(list_ptr.0 as PyObjectRef, 1).unwrap()), 4);
+            assert_eq!(
+                w_int_get_value(w_list_getitem(list_ptr.0 as PyObjectRef, 0).unwrap()),
+                2
+            );
+            assert_eq!(
+                w_int_get_value(w_list_getitem(list_ptr.0 as PyObjectRef, 1).unwrap()),
+                4
+            );
         }
     }
 

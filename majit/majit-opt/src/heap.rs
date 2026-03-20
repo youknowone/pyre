@@ -286,7 +286,7 @@ impl OptHeap {
                 .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
         } else {
             self.cached_fields.clear();
-        self.immutable_cached_fields.clear();
+            self.immutable_cached_fields.clear();
             self.cached_arrayitems.clear();
             self.cached_arrayitems_var.clear();
             self.array_min_lengths.clear();
@@ -1336,7 +1336,8 @@ mod tests {
         let d = descr(55);
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 2);
-        ctx.imported_short_fields.insert((OpRef(0), d.index()), OpRef(1));
+        ctx.imported_short_fields
+            .insert((OpRef(0), d.index()), OpRef(1));
 
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d);
         op.pos = OpRef(2);

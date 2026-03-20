@@ -7,11 +7,11 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::pyobject::*;
 use crate::{
     FloatArray, IntArray, PyObjectArray, floatobject::w_float_get_value, floatobject::w_float_new,
     intobject::w_int_get_value, intobject::w_int_new,
 };
-use crate::pyobject::*;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,11 +35,15 @@ pub struct W_ListObject {
 }
 
 fn all_ints(items: &[PyObjectRef]) -> bool {
-    items.iter().all(|&item| !item.is_null() && unsafe { is_int(item) })
+    items
+        .iter()
+        .all(|&item| !item.is_null() && unsafe { is_int(item) })
 }
 
 fn all_floats(items: &[PyObjectRef]) -> bool {
-    items.iter().all(|&item| !item.is_null() && unsafe { is_float(item) })
+    items
+        .iter()
+        .all(|&item| !item.is_null() && unsafe { is_float(item) })
 }
 
 fn object_array_from_ints(values: &[i64]) -> PyObjectArray {

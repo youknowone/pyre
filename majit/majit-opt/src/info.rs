@@ -211,7 +211,10 @@ impl PtrInfo {
             PtrInfo::NonNull => true,
             PtrInfo::Constant(gcref) => !gcref.is_null(),
             PtrInfo::KnownClass { is_nonnull, .. } => *is_nonnull,
-            PtrInfo::Instance(_) | PtrInfo::Struct(_) | PtrInfo::Array(_) | PtrInfo::Virtual(_)
+            PtrInfo::Instance(_)
+            | PtrInfo::Struct(_)
+            | PtrInfo::Array(_)
+            | PtrInfo::Virtual(_)
             | PtrInfo::VirtualArray(_)
             | PtrInfo::VirtualStruct(_)
             | PtrInfo::VirtualArrayStruct(_)
@@ -344,7 +347,10 @@ impl PtrInfo {
                 majit_ir::OpCode::GuardSubclass,
             ],
             PtrInfo::Struct(_) | PtrInfo::Array(_) => {
-                vec![majit_ir::OpCode::GuardNonnull, majit_ir::OpCode::GuardGcType]
+                vec![
+                    majit_ir::OpCode::GuardNonnull,
+                    majit_ir::OpCode::GuardGcType,
+                ]
             }
             PtrInfo::Constant(_) => vec![majit_ir::OpCode::GuardValue],
             _ => Vec::new(),
@@ -392,10 +398,7 @@ impl PtrInfo {
         match (self, other) {
             (PtrInfo::Constant(a), PtrInfo::Constant(b)) => a == b,
             (PtrInfo::NonNull, PtrInfo::NonNull) => true,
-            (
-                PtrInfo::Instance(a),
-                PtrInfo::Instance(b),
-            ) => {
+            (PtrInfo::Instance(a), PtrInfo::Instance(b)) => {
                 a.descr.as_ref().map(|d| d.index()) == b.descr.as_ref().map(|d| d.index())
                     && a.known_class == b.known_class
             }

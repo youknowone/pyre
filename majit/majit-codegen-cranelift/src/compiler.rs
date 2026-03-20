@@ -6720,19 +6720,18 @@ impl CraneliftBackend {
                     let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let length =
                         resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
-                    let (base_size, item_size) = if let Some(ad) =
-                        op.descr.as_ref().and_then(|d| d.as_array_descr())
-                    {
-                        (
-                            builder.ins().iconst(cl_types::I64, ad.base_size() as i64),
-                            builder.ins().iconst(cl_types::I64, ad.item_size() as i64),
-                        )
-                    } else {
-                        (
-                            builder.ins().iconst(cl_types::I64, 16),
-                            builder.ins().iconst(cl_types::I64, 8),
-                        )
-                    };
+                    let (base_size, item_size) =
+                        if let Some(ad) = op.descr.as_ref().and_then(|d| d.as_array_descr()) {
+                            (
+                                builder.ins().iconst(cl_types::I64, ad.base_size() as i64),
+                                builder.ins().iconst(cl_types::I64, ad.item_size() as i64),
+                            )
+                        } else {
+                            (
+                                builder.ins().iconst(cl_types::I64, 16),
+                                builder.ins().iconst(cl_types::I64, 8),
+                            )
+                        };
                     let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,

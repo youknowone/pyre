@@ -477,7 +477,8 @@ impl<M: Clone> MetaInterp<M> {
                         op_index,
                         exit_layout: layout.public(
                             resolved_trace_id,
-                            compile::find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
+                            compile::find_fail_index_for_exit_op(&trace.ops, op_index)
+                                .unwrap_or(u32::MAX),
                         ),
                     })
                     .collect();
@@ -529,7 +530,6 @@ impl<M: Clone> MetaInterp<M> {
             })
         }
     }
-
 
     /// Create a new MetaInterp with the given compilation threshold.
     pub fn new(threshold: u32) -> Self {
@@ -1323,10 +1323,8 @@ impl<M: Clone> MetaInterp<M> {
         if label_arg_count == 0 && jump_arg_count > 0 {
             // No Label — insert one at the beginning with Jump-matching args
             let label_args: Vec<OpRef> = (0..jump_arg_count as u32).map(OpRef).collect();
-            let mut label_op = majit_ir::resoperation::Op::new(
-                majit_ir::OpCode::Label,
-                &label_args,
-            );
+            let mut label_op =
+                majit_ir::resoperation::Op::new(majit_ir::OpCode::Label, &label_args);
             label_op.pos = OpRef::NONE;
             optimized_ops.insert(0, label_op);
             // Extend inputargs to match
@@ -1340,8 +1338,7 @@ impl<M: Clone> MetaInterp<M> {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] abort compile: optimized label/jump arity mismatch label={} jump={}",
-                    label_arg_count,
-                    jump_arg_count,
+                    label_arg_count, jump_arg_count,
                 );
             }
             return;
@@ -1356,7 +1353,8 @@ impl<M: Clone> MetaInterp<M> {
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
         let (inputargs, optimized_ops) = (inputargs, optimized_ops);
         let optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
-        let optimized_ops = compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
+        let optimized_ops =
+            compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
@@ -2669,7 +2667,11 @@ impl<M: Clone> MetaInterp<M> {
                 Some(t) => t,
                 None => return false,
             };
-            trace_data.inputargs.iter().map(|arg| arg.tp).collect::<Vec<_>>()
+            trace_data
+                .inputargs
+                .iter()
+                .map(|arg| arg.tp)
+                .collect::<Vec<_>>()
         };
         if finish_arg_types.len() != finish_args.len() {
             return false;
@@ -3666,7 +3668,8 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns `true` if retracing was started, `false` if not possible.
     pub fn start_retrace(&mut self, green_key: u64, _fail_index: u32, live_values: &[i64]) -> bool {
-        let Some(root_trace_id) = self.compiled_loops.get(&green_key).map(|c| c.root_trace_id) else {
+        let Some(root_trace_id) = self.compiled_loops.get(&green_key).map(|c| c.root_trace_id)
+        else {
             return false;
         };
         self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values)
@@ -3994,7 +3997,6 @@ pub enum DetailedDriverRunOutcome {
     },
 }
 
-
 /// Decision about how to handle a function call during tracing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineDecision {
@@ -4128,7 +4130,10 @@ mod tests {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
         }
         if let Some(backend_layouts) = meta.backend.compiled_terminal_exit_layouts(&token) {
-            compile::merge_backend_terminal_exit_layouts(&mut terminal_exit_layouts, &backend_layouts);
+            compile::merge_backend_terminal_exit_layouts(
+                &mut terminal_exit_layouts,
+                &backend_layouts,
+            );
         }
         let trace_info = meta.backend.compiled_trace_info(&token, trace_id);
         MetaInterp::<()>::enrich_guard_resume_layouts_for_trace(
@@ -5624,7 +5629,10 @@ mod tests {
             .expect("bridge should run and exit");
         assert_eq!(bridge_exit.trace_id, bridge_trace_id);
         assert_eq!(bridge_exit.values, vec![0x1234, 1]);
-        assert_eq!(bridge_exit.exit_layout.exit_types, vec![Type::Ref, Type::Int]);
+        assert_eq!(
+            bridge_exit.exit_layout.exit_types,
+            vec![Type::Ref, Type::Int]
+        );
     }
 
     #[test]
@@ -5693,7 +5701,10 @@ mod tests {
             .run_compiled_detailed(green_key, &[0x1234, 1])
             .expect("bridge should run and exit");
         assert_eq!(bridge_exit.trace_id, bridge_trace_id);
-        assert_eq!(bridge_exit.exit_layout.exit_types, vec![Type::Ref, Type::Int]);
+        assert_eq!(
+            bridge_exit.exit_layout.exit_types,
+            vec![Type::Ref, Type::Int]
+        );
         assert_eq!(bridge_exit.values[1], 1);
         assert_ne!(bridge_exit.values[0], 0);
     }
@@ -5751,8 +5762,18 @@ mod tests {
         let bridge_ops = vec![
             mk_op(OpCode::Label, &label_args, OpRef::NONE.0),
             mk_op_with_descr(OpCode::New, &[], 28, node_size.clone()),
-            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(28), OpRef(0)], 29, value_field.clone()),
-            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(28), OpRef(6)], 30, next_field.clone()),
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(28), OpRef(0)],
+                29,
+                value_field.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(28), OpRef(6)],
+                30,
+                next_field.clone(),
+            ),
             mk_op_with_descr(OpCode::New, &[], 31, node_size),
             mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(31), OpRef(1)], 32, value_field),
             mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(31), OpRef(3)], 33, next_field),
@@ -7455,7 +7476,9 @@ mod tests {
 
 #[cfg(test)]
 mod raw_int_postprocess_tests {
-    use crate::compile::{unbox_call_assembler_results, unbox_finish_result, unbox_raw_force_results};
+    use crate::compile::{
+        unbox_call_assembler_results, unbox_finish_result, unbox_raw_force_results,
+    };
     use std::collections::{HashMap, HashSet};
 
     use majit_ir::{Op, OpCode, OpRef, Type, make_field_descr};

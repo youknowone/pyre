@@ -6,13 +6,15 @@
 use std::collections::{HashMap, HashSet};
 
 use majit_codegen::{
-    Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout,
-    JitCellToken, TerminalExitLayout,
+    Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
+    TerminalExitLayout,
 };
 use majit_ir::{GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::pyjitpl::{CompiledExitLayout, CompiledTrace, StoredExitLayout, StoredResumeData};
-use crate::resume::{ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary, ResumeLayoutSummary};
+use crate::resume::{
+    ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary, ResumeLayoutSummary,
+};
 
 /// Build guard metadata for a compiled trace.
 ///
@@ -510,7 +512,10 @@ pub(crate) fn terminal_exit_layout_for_trace(
     infer_terminal_exit_layout(&trace.inputargs, &trace.ops, trace_id, op_index)
 }
 
-pub(crate) fn decode_values_with_layout(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
+pub(crate) fn decode_values_with_layout(
+    raw_values: &[i64],
+    layout: &CompiledExitLayout,
+) -> Vec<Value> {
     layout
         .exit_types
         .iter()

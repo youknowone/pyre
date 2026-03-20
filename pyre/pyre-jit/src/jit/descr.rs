@@ -256,7 +256,12 @@ pub fn list_items_ptr_descr() -> DescrRef {
 }
 
 pub fn list_strategy_descr() -> DescrRef {
-    make_field_descr(std::mem::offset_of!(W_ListObject, strategy), 1, Type::Int, false)
+    make_field_descr(
+        std::mem::offset_of!(W_ListObject, strategy),
+        1,
+        Type::Int,
+        false,
+    )
 }
 
 pub fn list_items_len_descr() -> DescrRef {

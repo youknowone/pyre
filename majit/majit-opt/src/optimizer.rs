@@ -69,6 +69,8 @@ pub struct Optimizer {
     /// Preserved so finalize_short_preamble can create the live extended
     /// producer for the target token currently being compiled.
     pub imported_short_preamble_builder: Option<crate::shortpreamble::ShortPreambleBuilder>,
+    /// simplify.py: patchguardop recorded from GUARD_FUTURE_CONDITION.
+    pub patchguardop: Option<Op>,
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.
@@ -90,7 +92,9 @@ pub struct ImportedVirtual {
 
 #[derive(Clone, Debug)]
 pub enum ImportedVirtualKind {
-    Instance { known_class: Option<majit_ir::GcRef> },
+    Instance {
+        known_class: Option<majit_ir::GcRef>,
+    },
     Struct,
 }
 
@@ -202,19 +206,20 @@ impl Optimizer {
                         fields
                             .iter()
                             .map(|(field_idx, field_info)| {
-                                (*field_idx, Self::import_virtual_state_value(field_info, ctx))
+                                (
+                                    *field_idx,
+                                    Self::import_virtual_state_value(field_info, ctx),
+                                )
                             })
                             .collect()
                     })
                     .collect();
                 ctx.set_ptr_info(
                     opref,
-                    crate::info::PtrInfo::VirtualArrayStruct(
-                        crate::info::VirtualArrayStructInfo {
-                            descr: descr.clone(),
-                            element_fields: imported_elements,
-                        },
-                    ),
+                    crate::info::PtrInfo::VirtualArrayStruct(crate::info::VirtualArrayStructInfo {
+                        descr: descr.clone(),
+                        element_fields: imported_elements,
+                    }),
                 );
             }
             VirtualStateInfo::VirtualRawBuffer { size, entries } => {
@@ -345,6 +350,7 @@ impl Optimizer {
             imported_short_aliases: Vec::new(),
             imported_short_preamble: None,
             imported_short_preamble_builder: None,
+            patchguardop: None,
         }
     }
 
@@ -790,6 +796,7 @@ impl Optimizer {
         self.imported_short_aliases = ctx.used_imported_short_aliases();
         self.imported_short_preamble = ctx.build_imported_short_preamble();
         self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
+        self.patchguardop = ctx.patchguardop.clone();
         let jump = ctx
             .new_operations
             .iter()
@@ -798,20 +805,14 @@ impl Optimizer {
         self.exported_loop_state = jump.map(|jump| {
             // RPython unroll.py:454-457: use virtual state from BEFORE force.
             // OptVirtualize captures this in the JUMP handler.
-            let preview_virtual_state = ctx
-                .pre_force_virtual_state
-                .clone()
-                .unwrap_or_else(|| {
-                    crate::virtualstate::export_state(&jump.args, &ctx, &ctx.ptr_info)
-                });
+            let preview_virtual_state = ctx.pre_force_virtual_state.clone().unwrap_or_else(|| {
+                crate::virtualstate::export_state(&jump.args, &ctx, &ctx.ptr_info)
+            });
             // Use pre-force args for make_inputargs so virtual entries can
             // look up their field values from the still-virtual PtrInfo.
-            let vs_args = ctx
-                .pre_force_jump_args
-                .as_deref()
-                .unwrap_or(&jump.args);
-            let (preview_label_args, preview_virtuals) = preview_virtual_state
-                .make_inputargs_and_virtuals(vs_args, &ctx);
+            let vs_args = ctx.pre_force_jump_args.as_deref().unwrap_or(&jump.args);
+            let (preview_label_args, preview_virtuals) =
+                preview_virtual_state.make_inputargs_and_virtuals(vs_args, &ctx);
             let mut preview_short_args = preview_label_args.clone();
             preview_short_args.extend(preview_virtuals);
             let mut short_boxes =
@@ -828,10 +829,8 @@ impl Optimizer {
                     same_as_source: produced.same_as_source,
                 })
                 .collect();
-            let exported_int_bounds =
-                self.collect_exported_int_bounds(&jump.args, &ctx);
-            let renamed_inputargs: Vec<OpRef> =
-                (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &ctx);
+            let renamed_inputargs: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
             crate::unroll::export_state(
                 &jump.args,
                 &renamed_inputargs,
@@ -940,9 +939,13 @@ impl Optimizer {
             let mut cur = opref;
             loop {
                 let idx = cur.0 as usize;
-                if idx >= fwd.len() { return cur; }
+                if idx >= fwd.len() {
+                    return cur;
+                }
                 let next = fwd[idx];
-                if next.is_none() || next == cur { return cur; }
+                if next.is_none() || next == cur {
+                    return cur;
+                }
                 cur = next;
             }
         };
@@ -1190,11 +1193,8 @@ impl Optimizer {
                     for _ in 0..extra_fail_args.len() {
                         types.push(majit_ir::Type::Int);
                     }
-                    let new_descr = majit_ir::SimpleFailDescr::new(
-                        descr.index(),
-                        fd.fail_index(),
-                        types,
-                    );
+                    let new_descr =
+                        majit_ir::SimpleFailDescr::new(descr.index(), fd.fail_index(), types);
                     op.descr = Some(std::sync::Arc::new(new_descr));
                 }
             }
@@ -1698,11 +1698,21 @@ mod tests {
             .rd_virtuals
             .as_ref()
             .expect("direct virtual fail arg should be encoded as rd_virtuals");
-        let fail_args = guard.fail_args.as_ref().expect("guard should keep fail args");
+        let fail_args = guard
+            .fail_args
+            .as_ref()
+            .expect("guard should keep fail args");
 
         assert_eq!(rd_virtuals.len(), 1);
-        assert!(fail_args[0].is_none(), "virtual fail arg slot should be replaced");
-        assert_eq!(fail_args.len(), 2, "field value should be appended as extra fail arg");
+        assert!(
+            fail_args[0].is_none(),
+            "virtual fail arg slot should be replaced"
+        );
+        assert_eq!(
+            fail_args.len(),
+            2,
+            "field value should be appended as extra fail arg"
+        );
     }
 
     #[test]

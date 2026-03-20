@@ -1404,9 +1404,11 @@ fn blackhole_with_recovery_layout(
 // (unlike trace IR which only has the traced path).
 // ============================================================================
 
+use crate::jitcode::machine::{
+    call_int_function, eval_binop_f, eval_binop_i, eval_binop_ovf, eval_unary_f, eval_unary_i,
+};
 use crate::jitcode::{
-    self, JitArgKind, JitCode, MIFrame, MIFrameStack,
-    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_BRANCH_ZERO,
+    self, BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_BRANCH_ZERO,
     BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID,
     BC_CALL_FLOAT, BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT,
     BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT,
@@ -1423,10 +1425,7 @@ use crate::jitcode::{
     BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
     BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
     BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
-    BC_SWAP_STACK,
-};
-use crate::jitcode::machine::{
-    call_int_function, eval_binop_f, eval_binop_i, eval_binop_ovf, eval_unary_f, eval_unary_i,
+    BC_SWAP_STACK, JitArgKind, JitCode, MIFrame, MIFrameStack,
 };
 
 /// Return type of a blackhole frame.
@@ -1643,9 +1642,7 @@ impl BlackholeInterpreter {
     }
 
     fn runtime_stack_len(&self, selected: usize) -> usize {
-        self.runtime_stacks
-            .get(&selected)
-            .map_or(0, |s| s.len())
+        self.runtime_stacks.get(&selected).map_or(0, |s| s.len())
     }
 
     // -- Call argument reading --
@@ -1666,7 +1663,11 @@ impl BlackholeInterpreter {
         loop {
             if self.finished() {
                 if trace {
-                    eprintln!("[bh-trace] finished at pos={} reg0={}", self.position, self.registers_i.get(0).copied().unwrap_or(-1));
+                    eprintln!(
+                        "[bh-trace] finished at pos={} reg0={}",
+                        self.position,
+                        self.registers_i.get(0).copied().unwrap_or(-1)
+                    );
                 }
                 return;
             }
@@ -1674,15 +1675,22 @@ impl BlackholeInterpreter {
             let opcode = self.next_u8();
             if trace {
                 let stack_len = self.runtime_stack_len(0);
-                eprintln!("[bh-trace] pos={} op={} reg0={} reg1={} stack_len={}",
-                    pos_before, opcode,
+                eprintln!(
+                    "[bh-trace] pos={} op={} reg0={} reg1={} stack_len={}",
+                    pos_before,
+                    opcode,
                     self.registers_i.get(0).copied().unwrap_or(-1),
                     self.registers_i.get(1).copied().unwrap_or(-1),
-                    stack_len);
+                    stack_len
+                );
             }
             if self.dispatch_one(opcode).is_err() {
                 if trace {
-                    eprintln!("[bh-trace] abort/return at pos={} reg0={}", pos_before, self.registers_i.get(0).copied().unwrap_or(-1));
+                    eprintln!(
+                        "[bh-trace] abort/return at pos={} reg0={}",
+                        pos_before,
+                        self.registers_i.get(0).copied().unwrap_or(-1)
+                    );
                 }
                 return;
             }
@@ -1880,8 +1888,13 @@ impl BlackholeInterpreter {
                 let target = self.next_u16() as usize;
                 let cond = self.registers_i[cond_idx];
                 if crate::majit_log_enabled() {
-                    eprintln!("[bh-trace] BRANCH_REG_ZERO cond_idx={} cond={} target={} taken={}",
-                        cond_idx, cond, target, cond == 0);
+                    eprintln!(
+                        "[bh-trace] BRANCH_REG_ZERO cond_idx={} cond={} target={} taken={}",
+                        cond_idx,
+                        cond,
+                        target,
+                        cond == 0
+                    );
                 }
                 if cond == 0 {
                     self.position = target;
@@ -2156,10 +2169,7 @@ impl BlackholeInterpBuilder {
 /// and passes the return value. Continues until the bottom frame completes.
 ///
 /// RPython: `_run_forever()` in blackhole.py
-pub fn run_forever(
-    builder: &mut BlackholeInterpBuilder,
-    mut bh: BlackholeInterpreter,
-) {
+pub fn run_forever(builder: &mut BlackholeInterpBuilder, mut bh: BlackholeInterpreter) {
     loop {
         let ret_type = bh.resume_mainloop();
 
@@ -3465,7 +3475,7 @@ mod tests {
             bh.setposition(jitcode, 0);
             let _ = bh.run();
 
-            assert_eq!(bh.registers_i[0], 0);  // skipped
+            assert_eq!(bh.registers_i[0], 0); // skipped
             assert_eq!(bh.registers_i[1], 99);
         }
 

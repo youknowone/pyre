@@ -156,8 +156,7 @@ impl CodeWriter {
                 }
 
                 // RPython flatten.py: input args → registers 0..n-1
-                Instruction::LoadFast { var_num }
-                | Instruction::LoadFastBorrow { var_num } => {
+                Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     assembler.push_i(reg);
                 }
@@ -215,11 +214,7 @@ impl CodeWriter {
                     assembler.pop_i(tmp1); // rhs
                     assembler.pop_i(tmp0); // lhs
                     assembler.load_const_i_value(op_code_reg, op_val as i64);
-                    assembler.call_may_force_int(
-                        compare_fn_idx,
-                        &[tmp0, tmp1, op_code_reg],
-                        tmp0,
-                    );
+                    assembler.call_may_force_int(compare_fn_idx, &[tmp0, tmp1, op_code_reg], tmp0);
                     assembler.push_i(tmp0);
                 }
 
@@ -227,11 +222,8 @@ impl CodeWriter {
                 // Stack top is a Python object (True/False). We need to
                 // convert to raw 0/1 for branch_reg_zero.
                 Instruction::PopJumpIfFalse { delta } => {
-                    let target_py_pc = jump_target_forward(
-                        num_instrs,
-                        py_pc + 1,
-                        delta.get(op_arg).as_usize(),
-                    );
+                    let target_py_pc =
+                        jump_target_forward(num_instrs, py_pc + 1, delta.get(op_arg).as_usize());
                     assembler.pop_i(tmp0);
                     // truth_fn: PyObjectRef → 0/1 (truthiness check)
                     assembler.call_int(truth_fn_idx, &[tmp0], tmp0);
@@ -241,11 +233,8 @@ impl CodeWriter {
                 }
 
                 Instruction::PopJumpIfTrue { delta } => {
-                    let target_py_pc = jump_target_forward(
-                        num_instrs,
-                        py_pc + 1,
-                        delta.get(op_arg).as_usize(),
-                    );
+                    let target_py_pc =
+                        jump_target_forward(num_instrs, py_pc + 1, delta.get(op_arg).as_usize());
                     // Invert: branch_reg_zero branches if zero, but we want
                     // branch if nonzero. Emit: tmp0 = (tmp0 == 0), then
                     // branch_reg_zero.
@@ -259,21 +248,16 @@ impl CodeWriter {
 
                 // RPython flatten.py: goto Label
                 Instruction::JumpForward { delta } => {
-                    let target_py_pc = jump_target_forward(
-                        num_instrs,
-                        py_pc + 1,
-                        delta.get(op_arg).as_usize(),
-                    );
+                    let target_py_pc =
+                        jump_target_forward(num_instrs, py_pc + 1, delta.get(op_arg).as_usize());
                     if target_py_pc < num_instrs {
                         assembler.jump(labels[target_py_pc]);
                     }
                 }
 
                 Instruction::JumpBackward { delta } => {
-                    let target_py_pc = jump_target_backward(
-                        py_pc + 1,
-                        delta.get(op_arg).as_usize(),
-                    );
+                    let target_py_pc =
+                        jump_target_backward(py_pc + 1, delta.get(op_arg).as_usize());
                     if target_py_pc < num_instrs {
                         assembler.jump(labels[target_py_pc]);
                     }
@@ -292,11 +276,7 @@ impl CodeWriter {
                 Instruction::LoadGlobal { namei } => {
                     let raw_namei = namei.get(op_arg) as usize as i64;
                     assembler.load_const_i_value(tmp0, raw_namei);
-                    assembler.call_may_force_int(
-                        load_global_fn_idx,
-                        &[frame_reg, tmp0],
-                        tmp0,
-                    );
+                    assembler.call_may_force_int(load_global_fn_idx, &[frame_reg, tmp0], tmp0);
                     // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first
                     if raw_namei & 1 != 0 {
                         assembler.load_const_i_value(tmp1, 0);
@@ -334,11 +314,7 @@ impl CodeWriter {
                         call_args.push(arg_regs_start + i as u16);
                     }
                     call_args.push(frame_reg);
-                    assembler.call_may_force_int(
-                        call_fn_idx,
-                        &call_args,
-                        tmp0,
-                    );
+                    assembler.call_may_force_int(call_fn_idx, &call_args, tmp0);
                     assembler.push_i(tmp0);
                 }
 
@@ -397,10 +373,7 @@ thread_local! {
 ///
 /// RPython: CallControl.get_jitcode() deduplicates per graph.
 /// pyre: deduplicate per CodeObject pointer (thread-local cache).
-pub fn get_or_compile_jitcode(
-    code: &CodeObject,
-    writer: &CodeWriter,
-) -> &'static PyJitCode {
+pub fn get_or_compile_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode {
     let key = code as *const CodeObject as usize;
     JITCODE_CACHE.with(|cell| {
         let cache = unsafe { &mut *cell.get() };
