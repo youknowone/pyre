@@ -471,6 +471,13 @@ impl OptContext {
         })
     }
 
+    /// Create a new constant int OpRef.
+    pub fn make_constant_int(&mut self, value: i64) -> OpRef {
+        let pos = self.alloc_op_position();
+        self.make_constant(pos, Value::Int(value));
+        pos
+    }
+
     /// Record a constant-folded value and return its OpRef.
     ///
     /// If `opref` is not already a known constant, records the value.

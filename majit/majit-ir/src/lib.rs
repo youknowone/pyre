@@ -6,7 +6,7 @@ pub mod value;
 pub use descr::{
     ArrayDescr, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr, DescrRef, EffectInfo,
     ExtraEffect, FailDescr, FieldDescr, InteriorFieldDescr, OopSpecIndex, SimpleFailDescr,
-    SizeDescr, make_array_descr, make_field_descr,
+    SizeDescr, make_array_descr, make_field_descr, unpack_fielddescr,
 };
 pub use resoperation::{GuardVirtualEntry, OPCODE_COUNT, Op, OpCode, OpRef, format_trace};
 pub use value::{

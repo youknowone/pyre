@@ -253,24 +253,8 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        // 2-pass: first force all virtual values (emit New + SetfieldGc),
-        // then emit all pool writebacks. This ensures SSA ordering:
-        // v16 = New() must appear BEFORE SetfieldGc(pool, v16).
-        // Pass 1: force virtuals
-        for (_key, op) in &pending {
-            let orig_val = op.arg(1);
-            if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
-                if info.is_virtual() {
-                    info.force_to_ops(orig_val, ctx);
-                }
-            }
-        }
-        // RPython heap.py: force_lazy_set() replays forced ops via emit_extra()
-        // and those ops are processed immediately by downstream passes.
-        // OptHeap is last in majit's default pipelines, so flush the queued
-        // materialization ops before we test/emit the final writebacks.
-        ctx.flush_extra_operations_raw();
-        // Pass 2: emit pool writebacks (with resolved forwarding)
+        // Emit pool writebacks using emit_lazy_setfield which handles
+        // virtual values (force_to_ops) and undefined ref skip.
         for (key, mut op) in pending {
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
@@ -639,9 +623,34 @@ impl OptHeap {
             }
         }
 
-        // RPython heap.py optimize_GETFIELD_GC_* only constant-folds through
-        // optimizer.constant_fold() on a real constant box. Do not peek into
-        // host memory from an arbitrary integer constant here.
+        // RPython optimizer.py:783: constant_fold — read immutable field
+        // from a constant object at optimization time.
+        if let Some(descr) = &op.descr {
+            if descr.is_always_pure() {
+                let obj_ref = op.arg(0);
+                if let Some(ptr_val) = ctx.get_constant_int(obj_ref) {
+                    if ptr_val != 0 {
+                        if let Some((offset, field_size, _field_type)) =
+                            majit_ir::unpack_fielddescr(descr)
+                        {
+                            let addr = ptr_val as usize + offset;
+                            let folded = match field_size {
+                                8 => Some(unsafe { *(addr as *const i64) }),
+                                4 => Some(unsafe { *(addr as *const i32) as i64 }),
+                                2 => Some(unsafe { *(addr as *const i16) as i64 }),
+                                1 => Some(unsafe { *(addr as *const u8) as i64 }),
+                                _ => None,
+                            };
+                            if let Some(value) = folded {
+                                let const_ref = ctx.make_constant_int(value);
+                                ctx.replace_op(op.pos, const_ref);
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Check lazy set first: if there is a pending SETFIELD for this key,
         // the value is the second arg of that pending op.
