@@ -833,9 +833,7 @@ impl Optimizer {
         }
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
-            let targetargs: Vec<OpRef> = (0..exported_state.next_iteration_args.len())
-                .map(|i| OpRef(i as u32))
-                .collect();
+            let targetargs: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
             crate::unroll::import_state(&targetargs, exported_state, &mut ctx);
         }
 
