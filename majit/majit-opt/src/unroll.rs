@@ -280,6 +280,10 @@ impl UnrollOptimizer {
             None => crate::optimizer::Optimizer::default_pipeline(),
         };
         opt_p2.imported_loop_state = Some(exported_state.clone());
+        // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
+        // and sets up VirtualStruct PtrInfo for the imported head.
+        let imported = build_imported_virtuals(&jump_virtuals);
+        opt_p2.imported_virtuals = imported;
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
