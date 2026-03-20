@@ -458,6 +458,27 @@ fn frame_callable_arg_types(nargs: usize) -> Vec<Type> {
     types
 }
 
+fn one_arg_callee_frame_helper(arg_type: Type, is_self_recursive: bool) -> (*const (), Vec<Type>) {
+    match (is_self_recursive, arg_type) {
+        (true, Type::Int) => (
+            crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
+            vec![Type::Ref, Type::Int],
+        ),
+        (true, _) => (
+            crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
+            vec![Type::Ref, Type::Ref],
+        ),
+        (false, Type::Int) => (
+            crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),
+            vec![Type::Ref, Type::Ref, Type::Int],
+        ),
+        (false, _) => (
+            crate::call_jit::jit_create_callee_frame_1 as *const (),
+            vec![Type::Ref, Type::Ref, Type::Ref],
+        ),
+    }
+}
+
 fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
     let mut types = Vec::with_capacity(len);
     for idx in 0..len {
@@ -472,12 +493,33 @@ fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
     types
 }
 
-fn frame_entry_arg_types(len: usize) -> Vec<Type> {
-    if len <= 1 {
+fn frame_entry_arg_types_from_slot_types(slot_types: &[Type]) -> Vec<Type> {
+    if slot_types.is_empty() {
         vec![Type::Ref]
     } else {
-        fail_arg_types_for_virtualizable_state(len)
+        let mut types = Vec::with_capacity(3 + slot_types.len());
+        types.push(Type::Ref);
+        types.push(Type::Int);
+        types.push(Type::Int);
+        types.extend(slot_types.iter().copied());
+        types
     }
+}
+
+fn pending_entry_slot_types_from_args(
+    arg_types: &[Type],
+    callee_nlocals: usize,
+    callee_stack_only: usize,
+) -> Vec<Type> {
+    let mut slot_types = Vec::with_capacity(callee_nlocals + callee_stack_only);
+    slot_types.extend(arg_types.iter().copied().take(callee_nlocals));
+    while slot_types.len() < callee_nlocals {
+        slot_types.push(Type::Ref);
+    }
+    while slot_types.len() < callee_nlocals + callee_stack_only {
+        slot_types.push(Type::Ref);
+    }
+    slot_types
 }
 
 fn synthesize_fresh_callee_entry_args(
@@ -2574,19 +2616,33 @@ impl TraceFrameState {
                     {
                         // For pending token (not yet compiled), use current
                         // trace's own metadata since it's self-recursive.
-                        let (callee_nlocals, callee_vsd, target_num_inputs) =
+                        let (callee_nlocals, callee_vsd, target_num_inputs, callee_slot_types) =
                             if let Some(callee_meta) = driver.get_compiled_meta(callee_key) {
                                 (
                                     callee_meta.num_locals,
                                     callee_meta.valuestackdepth,
                                     driver.get_compiled_num_inputs(callee_key).unwrap_or(1),
+                                    callee_meta.slot_types.clone(),
                                 )
                             } else {
                                 // Pending token: self-recursive, use caller's info
                                 let code = unsafe {
                                     &*(w_func_get_code_ptr(concrete_callable) as *const CodeObject)
                                 };
-                                (code.varnames.len(), code.varnames.len() + 1, 4)
+                                let arg_slot_types: Vec<Type> =
+                                    args.iter().map(|&arg| self.value_type(arg)).collect();
+                                let callee_nlocals = code.varnames.len();
+                                let callee_stack_only = 0;
+                                (
+                                    callee_nlocals,
+                                    callee_nlocals + callee_stack_only,
+                                    4,
+                                    pending_entry_slot_types_from_args(
+                                        &arg_slot_types,
+                                        callee_nlocals,
+                                        callee_stack_only,
+                                    ),
+                                )
                             };
                         let callee_stack_only = callee_vsd.saturating_sub(callee_nlocals);
 
@@ -2594,12 +2650,9 @@ impl TraceFrameState {
                             return self.with_ctx(|this, ctx| {
                                 this.guard_value(ctx, callable, concrete_callable as i64);
                                 let callee_frame = if nargs == 1 {
-                                    ctx.call_ref_typed(
-                                        crate::call_jit::jit_create_self_recursive_callee_frame_1
-                                            as *const (),
-                                        &[this.frame(), args[0]],
-                                        &[Type::Ref, Type::Ref],
-                                    )
+                                    let (helper, helper_arg_types) =
+                                        one_arg_callee_frame_helper(this.value_type(args[0]), true);
+                                    ctx.call_ref_typed(helper, &[this.frame(), args[0]], &helper_arg_types)
                                 } else {
                                     let mut helper_args = vec![this.frame(), callable];
                                     helper_args.extend_from_slice(args);
@@ -2646,7 +2699,8 @@ impl TraceFrameState {
                                     }
                                     a
                                 };
-                                let ca_arg_types = frame_entry_arg_types(ca_args.len());
+                                let ca_arg_types =
+                                    frame_entry_arg_types_from_slot_types(&callee_slot_types);
                                 let result = ctx.call_assembler_int_by_number_typed(
                                     token_number,
                                     &ca_args,
@@ -2698,12 +2752,15 @@ impl TraceFrameState {
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                         return self.with_ctx(|this, ctx| {
                             this.guard_value(ctx, callable, concrete_callable as i64);
-                            let callee_frame = if is_self_recursive && nargs == 1 {
+                            let callee_frame = if nargs == 1 {
+                                let (helper, helper_arg_types) = one_arg_callee_frame_helper(
+                                    this.value_type(args[0]),
+                                    false,
+                                );
                                 ctx.call_ref_typed(
-                                    crate::call_jit::jit_create_self_recursive_callee_frame_1
-                                        as *const (),
-                                    &[this.frame(), args[0]],
-                                    &[Type::Ref, Type::Ref],
+                                    helper,
+                                    &[this.frame(), callable, args[0]],
+                                    &helper_arg_types,
                                 )
                             } else {
                                 let mut helper_args = vec![this.frame(), callable];
@@ -2717,7 +2774,12 @@ impl TraceFrameState {
                                 args,
                                 callee_nlocals,
                             );
-                            let ca_arg_types = frame_entry_arg_types(ca_args.len());
+                            let arg_slot_types: Vec<Type> =
+                                args.iter().map(|&arg| this.value_type(arg)).collect();
+                            let callee_slot_types =
+                                pending_entry_slot_types_from_args(&arg_slot_types, callee_nlocals, 0);
+                            let ca_arg_types =
+                                frame_entry_arg_types_from_slot_types(&callee_slot_types);
                             let result = ctx.call_assembler_int_by_number_typed(
                                 token_number,
                                 &ca_args,
@@ -2784,14 +2846,26 @@ impl TraceFrameState {
 
                             return self.with_ctx(|this, ctx| {
                                 this.guard_value(ctx, callable, concrete_callable as i64);
-                                let mut helper_args = vec![this.frame(), callable];
-                                helper_args.extend_from_slice(args);
-                                let helper_arg_types = frame_callable_arg_types(args.len());
-                                let callee_frame = ctx.call_ref_typed(
-                                    frame_helper,
-                                    &helper_args,
-                                    &helper_arg_types,
-                                );
+                                let callee_frame = if args.len() == 1 {
+                                    let (helper, helper_arg_types) = one_arg_callee_frame_helper(
+                                        this.value_type(args[0]),
+                                        false,
+                                    );
+                                    ctx.call_ref_typed(
+                                        helper,
+                                        &[this.frame(), callable, args[0]],
+                                        &helper_arg_types,
+                                    )
+                                } else {
+                                    let mut helper_args = vec![this.frame(), callable];
+                                    helper_args.extend_from_slice(args);
+                                    let helper_arg_types = frame_callable_arg_types(args.len());
+                                    ctx.call_ref_typed(
+                                        frame_helper,
+                                        &helper_args,
+                                        &helper_arg_types,
+                                    )
+                                };
 
                                 let ca_args = if target_num_inputs <= 1 {
                                     vec![callee_frame]
@@ -2828,7 +2902,8 @@ impl TraceFrameState {
                                     }
                                     a
                                 };
-                                let ca_arg_types = frame_entry_arg_types(ca_args.len());
+                                let ca_arg_types =
+                                    frame_entry_arg_types_from_slot_types(&callee_meta.slot_types);
                                 let result = ctx.call_assembler_int_by_number_typed(
                                     token_number,
                                     &ca_args,
@@ -2948,12 +3023,18 @@ impl TraceFrameState {
         } else {
             // Create symbolic OpRef for callee frame in trace
             let callee_frame_opref = self.with_ctx(|this, ctx| {
-                if is_self_recursive && args.len() == 1 {
-                    ctx.call_ref_typed(
-                        crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
-                        &[this.frame(), args[0]],
-                        &[Type::Ref, Type::Ref],
-                    )
+                if args.len() == 1 {
+                    let (helper, helper_arg_types) =
+                        one_arg_callee_frame_helper(this.value_type(args[0]), is_self_recursive);
+                    if is_self_recursive {
+                        ctx.call_ref_typed(helper, &[this.frame(), args[0]], &helper_arg_types)
+                    } else {
+                        ctx.call_ref_typed(
+                            helper,
+                            &[this.frame(), callable, args[0]],
+                            &helper_arg_types,
+                        )
+                    }
                 } else if let Some(frame_helper) = crate::call_jit::callee_frame_helper(args.len())
                 {
                     let mut helper_args = vec![this.frame(), callable];
@@ -3541,11 +3622,12 @@ pub(crate) fn trace_step_result_to_action(
         }
         Ok(pyre_runtime::StepResult::Return(value)) => TraceAction::Finish {
             finish_args: vec![value],
-            finish_arg_types: vec![Type::Int],
+            // Python function returns are always boxed PyObjectRef (GC reference).
+            finish_arg_types: vec![Type::Ref],
         },
         Ok(pyre_runtime::StepResult::Yield(value)) => TraceAction::Finish {
             finish_args: vec![value],
-            finish_arg_types: vec![Type::Int],
+            finish_arg_types: vec![Type::Ref],
         },
         Err(_) => TraceAction::Abort,
     }
@@ -4673,6 +4755,7 @@ mod tests {
             num_locals: 0,
             ns_keys: Vec::new(),
             valuestackdepth: 0,
+            slot_types: Vec::new(),
             has_virtualizable: false,
         }
     }

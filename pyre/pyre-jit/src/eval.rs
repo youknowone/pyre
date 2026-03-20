@@ -117,10 +117,16 @@ impl Drop for BlackholeEntryGuard {
 
 /// Bump the JIT call depth. Returns a guard that restores the
 /// depth when dropped.
+///
+/// PyPy interp_jit.py parity: only bump depth when actively tracing.
+/// When NOT tracing, inner function calls run eval_loop_jit with
+/// depth==0, allowing their own loops to independently warm up and
+/// compile with separate green keys — matching PyPy's is_recursive
+/// JitDriver behavior where each (pycode, next_instr) gets its own
+/// compiled loop.
 #[inline]
 pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
-    let depth = JIT_CALL_DEPTH.with(|d| d.get());
-    if depth > 0 || JIT_TRACING.with(|t| t.get()) {
+    if JIT_TRACING.with(|t| t.get()) {
         JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
         Some(JitCallDepthGuard)
     } else {
@@ -228,6 +234,11 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
         // pypyjitdriver.jit_merge_point(ec=ec, frame=self, next_instr=next_instr,
         //     pycode=pycode, is_being_profiled=is_being_profiled)
+        //
+        // Tracing merge_point is depth-gated: only the outermost portal
+        // (depth==0) records ops.  Inner calls are traced as residual CALLs,
+        // not as nested merge_points — matching RPython's CALL_MAY_FORCE /
+        // CALL_ASSEMBLER pattern for recursive JitDrivers.
         if JIT_CALL_DEPTH.with(|d| d.get()) == 0 && driver.is_tracing() {
             JIT_TRACING.with(|t| t.set(true));
             let pc = frame.next_instr;
@@ -257,7 +268,9 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     &env,
                     || {},
                 ) {
-                    if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
+                    if let Some(result) =
+                        handle_jit_outcome(outcome, &jit_state, frame, info, green_key)
+                    {
                         return result;
                     }
                 }
@@ -286,10 +299,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if driver.has_compiled_loop(green_key) {
         if majit_meta::majit_log_enabled() {
             eprintln!(
-                "[jit][func-entry] run compiled key={} arg0={:?} depth={}",
+                "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
                 green_key,
                 debug_first_arg_int(frame),
-                JIT_CALL_DEPTH.with(|d| d.get())
+                JIT_CALL_DEPTH.with(|d| d.get()),
+                driver.has_raw_int_finish(green_key)
             );
         }
         let env = PyreEnv;
@@ -320,7 +334,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     kind
                 );
             }
-            if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
+            if let Some(result) =
+                handle_jit_outcome(outcome, &jit_state, frame, info, green_key)
+            {
                 if majit_meta::majit_log_enabled() {
                     let rendered = result.as_ref().ok().and_then(|value| {
                         if value.is_null() || !unsafe { pyre_object::pyobject::is_int(*value) } {
@@ -388,6 +404,7 @@ fn handle_jit_outcome(
     jit_state: &PyreJitState,
     frame: &mut PyFrame,
     info: &majit_meta::virtualizable::VirtualizableInfo,
+    green_key: u64,
 ) -> Option<PyResult> {
     match outcome {
         DetailedDriverRunOutcome::Finished {
@@ -395,6 +412,14 @@ fn handle_jit_outcome(
             raw_int_result,
             ..
         } => {
+            let (driver, _) = driver_pair();
+            let raw_int_result = raw_int_result || driver.has_raw_int_finish(green_key);
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
+                    green_key, raw_int_result, typed_values
+                );
+            }
             let [value] = typed_values.as_slice() else {
                 return Some(Err(pyre_runtime::PyError::type_error(
                     "compiled finish did not produce a single object return value",
@@ -402,18 +427,23 @@ fn handle_jit_outcome(
             };
             let value = match value {
                 majit_ir::Value::Int(raw) => {
-                    if raw_int_result {
-                        // Re-box: the Finish was unboxed for the raw-int
-                        // CallAssembler protocol. Top-level exit must re-box.
-                        pyre_object::intobject::w_int_new(*raw)
-                    } else {
-                        *raw as pyre_object::PyObjectRef
-                    }
+                    // RPython parity: top-level finish values are already typed
+                    // (MIFrame.make_result_of_lastop / finishframe).  An INT
+                    // result register represents a Python int payload, not an
+                    // object pointer.  Re-box at the interpreter boundary
+                    // regardless of whether majit marked the trace as a
+                    // raw-int-finish optimization.
+                    let _ = raw_int_result;
+                    pyre_object::intobject::w_int_new(*raw)
                 }
                 majit_ir::Value::Ref(value) => value.as_usize() as pyre_object::PyObjectRef,
-                _ => {
+                majit_ir::Value::Float(f) => {
+                    // Re-box the raw float into a W_FloatObject.
+                    pyre_object::floatobject::w_float_new(*f)
+                }
+                majit_ir::Value::Void => {
                     return Some(Err(pyre_runtime::PyError::type_error(
-                        "compiled finish produced a non-object return value",
+                        "compiled finish produced a void return value",
                     )));
                 }
             };
