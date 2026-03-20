@@ -65,6 +65,9 @@ pub struct ImportedVirtual {
     pub size_descr: majit_ir::DescrRef,
     /// Fields: (field_descr, inputarg_index_of_field_value).
     pub fields: Vec<(majit_ir::DescrRef, usize)>,
+    /// Descr index of the GetfieldGcR(pool) that loads this head.
+    /// OptVirtualize forwards this load result to the virtual head.
+    pub head_load_descr_index: Option<u32>,
 }
 
 /// RPython unroll.py: ExportedState virtual field info.
@@ -75,6 +78,8 @@ pub struct ExportedJumpVirtual {
     pub jump_arg_index: usize,
     /// Size descriptor for New().
     pub size_descr: majit_ir::DescrRef,
+    /// Descr index of the pool GetfieldGcR that loaded this head.
+    pub head_load_descr_index: Option<u32>,
     /// Fields: (field_descr, concrete_i64_value).
     pub fields: Vec<(majit_ir::DescrRef, i64)>,
 }
@@ -535,10 +540,11 @@ impl Optimizer {
                         field_descrs,
                     }),
                 );
-                // Map original inputarg position → virtual head
-                // (the original head inputarg is now replaced by field inputargs,
-                //  but ops still reference the original position via remap)
-                ctx.imported_virtual_heads.push((iv.inputarg_index, virtual_head));
+                // Store: (head_load_descr_index, virtual_head_opref)
+                // OptVirtualize uses this to forward GetfieldGcR(pool) → virtual head.
+                if let Some(descr_idx) = iv.head_load_descr_index {
+                    ctx.imported_virtual_heads.push((descr_idx as usize, virtual_head));
+                }
             }
         }
 
