@@ -115,6 +115,10 @@ pub extern "C" fn jit_truth_value(value: i64) -> i64 {
     truth_value(value as PyObjectRef) as i64
 }
 
+pub extern "C" fn jit_bool_value_from_truth(value: i64) -> i64 {
+    bool_value_from_truth(value != 0) as i64
+}
+
 pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match binary_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,

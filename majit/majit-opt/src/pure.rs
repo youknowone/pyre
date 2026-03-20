@@ -142,6 +142,13 @@ pub struct OptPure {
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
     call_pure_positions: Vec<usize>,
+    /// RPython pure.py / shortpreamble.py: pure ops that phase 2 should be
+    /// able to reproduce from the preamble via optimizer state, not by
+    /// textual body replay.
+    short_preamble_pure_ops: Vec<Op>,
+    /// RPython shortpreamble.py: CALL_LOOPINVARIANT ops tracked separately
+    /// from regular pure ops and re-imported into rewrite state.
+    short_preamble_loopinvariant_ops: Vec<Op>,
     /// Whether the last emitted operation was removed (for GUARD_NO_EXCEPTION elimination).
     /// pure.py: last_emitted_operation is REMOVED check.
     last_emitted_was_removed: bool,
@@ -161,6 +168,8 @@ impl OptPure {
             loopinvariant_cache: HashMap::new(),
             postponed_op: None,
             call_pure_positions: Vec::new(),
+            short_preamble_pure_ops: Vec::new(),
+            short_preamble_loopinvariant_ops: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
@@ -211,16 +220,7 @@ impl OptPure {
 
     /// Handle CALL_PURE: demote to plain CALL since we can't constant-fold.
     fn handle_call_pure(&self, op: &Op) -> OptimizationResult {
-        let call_opcode = match op.opcode {
-            OpCode::CallPureI => OpCode::CallI,
-            OpCode::CallPureR => OpCode::CallR,
-            OpCode::CallPureF => OpCode::CallF,
-            OpCode::CallPureN => OpCode::CallN,
-            _ => unreachable!(),
-        };
-        let mut new_op = op.clone();
-        new_op.opcode = call_opcode;
-        OptimizationResult::Emit(new_op)
+        OptimizationResult::Emit(self.demote_call_pure(op))
     }
 
     /// Record a pure operation in the CSE cache.
@@ -325,10 +325,58 @@ impl OptPure {
         // Cache the result and demote to plain CALL_*.
         self.loopinvariant_cache.insert(key, op.pos);
 
-        let call_opcode = OpCode::call_for_type(op.result_type());
-        let mut new_op = op.clone();
-        new_op.opcode = call_opcode;
+        let new_op = self.demote_call_loopinvariant(op);
+        self.short_preamble_loopinvariant_ops.push(new_op.clone());
         OptimizationResult::Emit(new_op)
+    }
+
+    fn demote_call_pure(&self, op: &Op) -> Op {
+        let mut new_op = op.clone();
+        new_op.opcode = OpCode::call_for_type(op.result_type());
+        new_op
+    }
+
+    fn demote_call_loopinvariant(&self, op: &Op) -> Op {
+        let mut new_op = op.clone();
+        new_op.opcode = OpCode::call_for_type(op.result_type());
+        new_op
+    }
+
+    fn call_pure_can_raise(op: &Op) -> bool {
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .map(|cd| cd.effect_info().check_can_raise(true))
+            .unwrap_or(true)
+    }
+
+    fn lookup_imported_short_pure(&self, op: &Op, ctx: &OptContext) -> Option<OpRef> {
+        ctx.imported_short_pure_ops.iter().find_map(|entry| {
+            if entry.opcode != op.opcode {
+                return None;
+            }
+            if entry.descr_idx != op.descr.as_ref().map(|d| d.index()) {
+                return None;
+            }
+            if entry.args.len() != op.args.len() {
+                return None;
+            }
+            for (expected, &arg) in entry.args.iter().zip(op.args.iter()) {
+                match expected {
+                    crate::ImportedShortPureArg::OpRef(expected_ref) => {
+                        if ctx.get_replacement(arg) != *expected_ref {
+                            return None;
+                        }
+                    }
+                    crate::ImportedShortPureArg::Const(expected_value) => {
+                        if ctx.get_constant(arg) != Some(expected_value) {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Some(entry.result)
+        })
     }
 }
 
@@ -418,6 +466,13 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove; // guard also removed
                 }
 
+                if let Some(cached_ref) = self.lookup_imported_short_pure(&postponed, ctx) {
+                    let cached_ref = ctx.get_replacement(cached_ref);
+                    ctx.replace_op(postponed.pos, cached_ref);
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove; // guard also removed
+                }
+
                 // pure.py: CSE on the OVF op.
                 // _can_reuse_oldop: OVF ops can only reuse results from
                 // other OVF ops (not regular INT_ADD etc.), because the
@@ -492,6 +547,13 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
+            if let Some(cached_ref) = self.lookup_imported_short_pure(op, ctx) {
+                let cached_ref = ctx.get_replacement(cached_ref);
+                ctx.replace_op(op.pos, cached_ref);
+                self.last_emitted_was_removed = true;
+                return OptimizationResult::Remove;
+            }
+
             let key = PureOpKey::from_op(op);
 
             // CSE: exact same operation already computed?
@@ -503,11 +565,19 @@ impl Optimization for OptPure {
             }
 
             self.cache.insert(key, op.pos);
+            self.short_preamble_pure_ops.push(op.clone());
             return OptimizationResult::PassOn;
         }
 
         // CALL_PURE_* -> CSE or known_result lookup, then demote to CALL_*.
         if op.opcode.is_call_pure() {
+            if let Some(cached_ref) = self.lookup_imported_short_pure(op, ctx) {
+                let cached_ref = ctx.get_replacement(cached_ref);
+                ctx.replace_op(op.pos, cached_ref);
+                self.last_emitted_was_removed = true;
+                return OptimizationResult::Remove;
+            }
+
             let key = PureOpKey::from_op(op);
 
             // CSE: same call_pure with same args → reuse result.
@@ -529,7 +599,11 @@ impl Optimization for OptPure {
             self.cache.insert(key, op.pos);
             // Track position for short preamble generation.
             self.call_pure_positions.push(ctx.new_operations.len());
-            return self.handle_call_pure(op);
+            let new_op = self.demote_call_pure(op);
+            if !Self::call_pure_can_raise(op) {
+                self.short_preamble_pure_ops.push(new_op.clone());
+            }
+            return OptimizationResult::Emit(new_op);
         }
 
         // COND_CALL_VALUE_I/R → CSE like CALL_PURE, but skip arg[0]
@@ -595,6 +669,8 @@ impl Optimization for OptPure {
         self.loopinvariant_cache.clear();
         self.postponed_op = None;
         self.call_pure_positions.clear();
+        self.short_preamble_pure_ops.clear();
+        self.short_preamble_loopinvariant_ops.clear();
         self.last_emitted_was_removed = false;
         self.known_result_call_pure.clear();
         // Note: extra_call_pure is NOT cleared on setup — it persists
@@ -607,14 +683,17 @@ impl Optimization for OptPure {
 
     /// pure.py: produce_potential_short_preamble_ops(sb)
     /// Add pure operations and CALL_PURE results to the short preamble.
-    fn produce_potential_short_preamble_ops(&self, _sb: &mut crate::shortpreamble::ShortBoxes) {
-        // In RPython, this iterates new_operations and adds:
-        // 1. Always-pure ops (is_always_pure) → sb.add_pure_op
-        // 2. OVF + GUARD_NO_OVERFLOW pairs → sb.add_pure_op
-        // 3. CALL_PURE that can't raise → sb.add_pure_op
-        // The actual loop over new_operations requires access to ctx,
-        // which isn't available here. This is done at the Optimizer level
-        // via produce_potential_short_preamble_ops orchestration.
+    fn produce_potential_short_preamble_ops(&self, sb: &mut crate::shortpreamble::ShortBoxes) {
+        for op in &self.short_preamble_pure_ops {
+            if let Some(label_arg_idx) = sb.lookup_label_arg(op.pos) {
+                sb.add_pure_op(label_arg_idx, op.clone());
+            }
+        }
+        for op in &self.short_preamble_loopinvariant_ops {
+            if let Some(label_arg_idx) = sb.lookup_label_arg(op.pos) {
+                sb.add_loopinvariant_op(label_arg_idx, op.clone());
+            }
+        }
     }
 }
 
@@ -830,6 +909,8 @@ mod tests {
             loopinvariant_cache: HashMap::new(),
             postponed_op: None,
             call_pure_positions: Vec::new(),
+            short_preamble_pure_ops: Vec::new(),
+            short_preamble_loopinvariant_ops: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
@@ -1220,6 +1301,147 @@ mod tests {
             args,
         };
         assert_eq!(pass.lookup_known_result(&key), Some(OpRef(50)));
+    }
+
+    #[test]
+    fn test_imported_short_pure_result_replays_into_pure_cache() {
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(6, 0);
+        ctx.make_constant(OpRef(10), majit_ir::Value::Int(7));
+        ctx.imported_short_pure_ops.push(crate::ImportedShortPureOp {
+            opcode: OpCode::IntAdd,
+            descr_idx: None,
+            args: vec![
+                crate::ImportedShortPureArg::OpRef(OpRef(0)),
+                crate::ImportedShortPureArg::Const(majit_ir::Value::Int(7)),
+            ],
+            result: OpRef(1),
+        });
+
+        pass.setup();
+
+        let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10)]);
+        op.pos = OpRef(2);
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+    }
+
+    #[test]
+    fn test_imported_short_call_pure_result_replays_into_pure_cache() {
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(8, 0);
+        ctx.make_constant(OpRef(10), majit_ir::Value::Int(0x1234));
+        let call_descr = majit_ir::descr::make_call_descr_full(
+            77,
+            vec![majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            8,
+            majit_ir::EffectInfo::elidable(),
+        );
+        ctx.imported_short_pure_ops.push(crate::ImportedShortPureOp {
+            opcode: OpCode::CallPureI,
+            descr_idx: Some(77),
+            args: vec![
+                crate::ImportedShortPureArg::Const(majit_ir::Value::Int(0x1234)),
+                crate::ImportedShortPureArg::OpRef(OpRef(0)),
+            ],
+            result: OpRef(1),
+        });
+
+        pass.setup();
+
+        let mut op = Op::new(OpCode::CallPureI, &[OpRef(10), OpRef(0)]);
+        op.pos = OpRef(2);
+        op.descr = Some(call_descr);
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+    }
+
+    #[test]
+    fn test_short_preamble_collects_pure_op_candidate() {
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(4, 0);
+        pass.setup();
+
+        let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        op.pos = OpRef(2);
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::PassOn));
+
+        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(2)]);
+        pass.produce_potential_short_preamble_ops(&mut sb);
+        let collected = sb.produced_ops();
+        assert_eq!(collected.len(), 1);
+        assert!(matches!(
+            collected[0].1.kind,
+            crate::shortpreamble::PreambleOpKind::Pure
+        ));
+        assert_eq!(collected[0].1.preamble_op.opcode, OpCode::IntAdd);
+    }
+
+    #[test]
+    fn test_short_preamble_collects_non_raising_call_pure_candidate() {
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(6, 0);
+        pass.setup();
+
+        let mut op = Op::new(OpCode::CallPureI, &[OpRef(100), OpRef(0), OpRef(1)]);
+        op.pos = OpRef(2);
+        op.descr = Some(majit_ir::descr::make_call_descr(
+            vec![majit_ir::Type::Int, majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            majit_ir::EffectInfo::elidable(),
+        ));
+        let result = pass.propagate_forward(&op, &mut ctx);
+        match result {
+            OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
+            other => panic!("expected emitted demoted call, got {other:?}"),
+        }
+
+        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(2)]);
+        pass.produce_potential_short_preamble_ops(&mut sb);
+        let collected = sb.produced_ops();
+        assert_eq!(collected.len(), 1);
+        assert!(matches!(
+            collected[0].1.kind,
+            crate::shortpreamble::PreambleOpKind::Pure
+        ));
+        assert_eq!(collected[0].1.preamble_op.opcode, OpCode::CallPureI);
+    }
+
+    #[test]
+    fn test_short_preamble_collects_loopinvariant_candidate() {
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(6, 0);
+        pass.setup();
+
+        let mut op = Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(0)]);
+        op.pos = OpRef(2);
+        op.descr = Some(majit_ir::descr::make_call_descr(
+            vec![majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            majit_ir::EffectInfo::elidable(),
+        ));
+        let result = pass.propagate_forward(&op, &mut ctx);
+        match result {
+            OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
+            other => panic!("expected emitted demoted call, got {other:?}"),
+        }
+
+        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(2)]);
+        pass.produce_potential_short_preamble_ops(&mut sb);
+        let collected = sb.produced_ops();
+        assert_eq!(collected.len(), 1);
+        assert!(matches!(
+            collected[0].1.kind,
+            crate::shortpreamble::PreambleOpKind::LoopInvariant
+        ));
+        assert_eq!(
+            collected[0].1.preamble_op.opcode,
+            OpCode::CallLoopinvariantI
+        );
     }
 
     #[test]

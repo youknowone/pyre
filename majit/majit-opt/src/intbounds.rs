@@ -58,17 +58,29 @@ impl OptIntBounds {
         if let Some(val) = ctx.get_constant_int(opref) {
             return IntBound::from_constant(val);
         }
+        let imported = ctx.imported_int_bounds.get(&opref).cloned();
         let idx = opref.0 as usize;
         if idx < self.bounds.len() {
             if let Some(ref b) = self.bounds[idx] {
+                let mut merged = if let Some(imported) = imported {
+                    let mut merged = b.clone();
+                    let _ = merged.intersect(&imported);
+                    merged
+                } else {
+                    b.clone()
+                };
                 // heap.py: merge with cross-pass lower bounds (array lengths)
                 if let Some(&lower) = ctx.int_lower_bounds.get(&opref) {
-                    let mut merged = b.clone();
-                    merged.intersect(&IntBound::bounded(lower, i64::MAX));
-                    return merged;
+                    let _ = merged.intersect(&IntBound::bounded(lower, i64::MAX));
                 }
-                return b.clone();
+                return merged;
             }
+        }
+        if let Some(mut imported) = imported {
+            if let Some(&lower) = ctx.int_lower_bounds.get(&opref) {
+                let _ = imported.intersect(&IntBound::bounded(lower, i64::MAX));
+            }
+            return imported;
         }
         // heap.py: check cross-pass lower bounds even without local bound
         if let Some(&lower) = ctx.int_lower_bounds.get(&opref) {
@@ -1390,6 +1402,22 @@ impl Optimization for OptIntBounds {
         // preamble optimization and must be re-checked on bridge entry.
         // The actual bounds are in self.bounds — a real implementation
         // would iterate non-trivial bounds and generate guard ops.
+    }
+
+    fn export_arg_int_bounds(
+        &self,
+        args: &[OpRef],
+        ctx: &OptContext,
+    ) -> std::collections::HashMap<OpRef, IntBound> {
+        let mut exported = std::collections::HashMap::new();
+        for &arg in args {
+            let resolved = ctx.get_replacement(arg);
+            let bound = self.getintbound(resolved, ctx);
+            if !bound.is_unbounded() {
+                exported.insert(resolved, bound);
+            }
+        }
+        exported
     }
 }
 

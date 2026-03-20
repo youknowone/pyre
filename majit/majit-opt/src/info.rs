@@ -98,6 +98,15 @@ pub enum PtrInfo {
     /// Known class (type) of the object.
     /// info.py: NonNullPtrInfo with _known_class set
     KnownClass { class_ptr: GcRef, is_nonnull: bool },
+    /// Non-virtual GC object with cached field info.
+    /// info.py: InstancePtrInfo (is_virtual = False)
+    Instance(InstancePtrInfo),
+    /// Non-virtual GC struct with cached field info.
+    /// info.py: StructPtrInfo (is_virtual = False)
+    Struct(StructPtrInfo),
+    /// Non-virtual GC array with cached item info and lenbound.
+    /// info.py: ArrayPtrInfo (is_virtual = False)
+    Array(ArrayPtrInfo),
     /// Virtual object (allocation removed by the optimizer).
     /// info.py: InstancePtrInfo
     Virtual(VirtualInfo),
@@ -138,6 +147,34 @@ impl PtrInfo {
         }
     }
 
+    /// Create a non-virtual InstancePtrInfo.
+    pub fn instance(descr: Option<DescrRef>, known_class: Option<GcRef>) -> Self {
+        PtrInfo::Instance(InstancePtrInfo {
+            descr,
+            known_class,
+            fields: Vec::new(),
+            field_descrs: Vec::new(),
+        })
+    }
+
+    /// Create a non-virtual StructPtrInfo.
+    pub fn struct_ptr(descr: DescrRef) -> Self {
+        PtrInfo::Struct(StructPtrInfo {
+            descr,
+            fields: Vec::new(),
+            field_descrs: Vec::new(),
+        })
+    }
+
+    /// Create a non-virtual ArrayPtrInfo.
+    pub fn array(descr: DescrRef, lenbound: IntBound) -> Self {
+        PtrInfo::Array(ArrayPtrInfo {
+            descr,
+            lenbound,
+            items: Vec::new(),
+        })
+    }
+
     /// Create a Virtual PtrInfo (allocation removed).
     pub fn virtual_obj(descr: DescrRef, known_class: Option<GcRef>) -> Self {
         PtrInfo::Virtual(VirtualInfo {
@@ -174,7 +211,7 @@ impl PtrInfo {
             PtrInfo::NonNull => true,
             PtrInfo::Constant(gcref) => !gcref.is_null(),
             PtrInfo::KnownClass { is_nonnull, .. } => *is_nonnull,
-            PtrInfo::Virtual(_)
+            PtrInfo::Instance(_) | PtrInfo::Struct(_) | PtrInfo::Array(_) | PtrInfo::Virtual(_)
             | PtrInfo::VirtualArray(_)
             | PtrInfo::VirtualStruct(_)
             | PtrInfo::VirtualArrayStruct(_)
@@ -208,6 +245,7 @@ impl PtrInfo {
     pub fn get_known_class(&self) -> Option<&GcRef> {
         match self {
             PtrInfo::KnownClass { class_ptr, .. } => Some(class_ptr),
+            PtrInfo::Instance(v) => v.known_class.as_ref(),
             PtrInfo::Virtual(v) => v.known_class.as_ref(),
             _ => None,
         }
@@ -241,6 +279,9 @@ impl PtrInfo {
     /// info.py: _get_num_items() / num_fields
     pub fn num_fields(&self) -> usize {
         match self {
+            PtrInfo::Instance(v) => v.fields.len(),
+            PtrInfo::Struct(v) => v.fields.len(),
+            PtrInfo::Array(v) => v.items.len(),
             PtrInfo::Virtual(v) => v.fields.len(),
             PtrInfo::VirtualArray(v) => v.items.len(),
             PtrInfo::VirtualStruct(v) => v.fields.len(),
@@ -254,6 +295,9 @@ impl PtrInfo {
     /// info.py: visitor_walk_recursive — walks all fields of a virtual.
     pub fn visitor_walk_recursive(&self) -> Vec<OpRef> {
         match self {
+            PtrInfo::Instance(v) => v.fields.iter().map(|(_, r)| *r).collect(),
+            PtrInfo::Struct(v) => v.fields.iter().map(|(_, r)| *r).collect(),
+            PtrInfo::Array(v) => v.items.clone(),
             PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
             PtrInfo::VirtualArray(v) => v.items.clone(),
             PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| *r).collect(),
@@ -291,6 +335,17 @@ impl PtrInfo {
         match self {
             PtrInfo::NonNull => vec![majit_ir::OpCode::GuardNonnull],
             PtrInfo::KnownClass { .. } => vec![majit_ir::OpCode::GuardNonnullClass],
+            PtrInfo::Instance(info) if info.known_class.is_some() => {
+                vec![majit_ir::OpCode::GuardNonnullClass]
+            }
+            PtrInfo::Instance(info) if info.descr.is_some() => vec![
+                majit_ir::OpCode::GuardNonnull,
+                majit_ir::OpCode::GuardIsObject,
+                majit_ir::OpCode::GuardSubclass,
+            ],
+            PtrInfo::Struct(_) | PtrInfo::Array(_) => {
+                vec![majit_ir::OpCode::GuardNonnull, majit_ir::OpCode::GuardGcType]
+            }
             PtrInfo::Constant(_) => vec![majit_ir::OpCode::GuardValue],
             _ => Vec::new(),
         }
@@ -307,7 +362,13 @@ impl PtrInfo {
     /// info.py: is_about_object() — whether this info describes an object
     /// (has fields/vtable, as opposed to an array or raw buffer).
     pub fn is_about_object(&self) -> bool {
-        matches!(self, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_))
+        matches!(
+            self,
+            PtrInfo::Instance(_)
+                | PtrInfo::Struct(_)
+                | PtrInfo::Virtual(_)
+                | PtrInfo::VirtualStruct(_)
+        )
     }
 
     /// info.py: is_precise() — whether the type info is exact (not just a bound).
@@ -315,6 +376,9 @@ impl PtrInfo {
         matches!(
             self,
             PtrInfo::Constant(_)
+                | PtrInfo::Instance(_)
+                | PtrInfo::Struct(_)
+                | PtrInfo::Array(_)
                 | PtrInfo::Virtual(_)
                 | PtrInfo::VirtualArray(_)
                 | PtrInfo::VirtualStruct(_)
@@ -328,6 +392,17 @@ impl PtrInfo {
         match (self, other) {
             (PtrInfo::Constant(a), PtrInfo::Constant(b)) => a == b,
             (PtrInfo::NonNull, PtrInfo::NonNull) => true,
+            (
+                PtrInfo::Instance(a),
+                PtrInfo::Instance(b),
+            ) => {
+                a.descr.as_ref().map(|d| d.index()) == b.descr.as_ref().map(|d| d.index())
+                    && a.known_class == b.known_class
+            }
+            (PtrInfo::Struct(a), PtrInfo::Struct(b)) => a.descr.index() == b.descr.index(),
+            (PtrInfo::Array(a), PtrInfo::Array(b)) => {
+                a.descr.index() == b.descr.index() && a.lenbound == b.lenbound
+            }
             _ => std::ptr::eq(self, other),
         }
     }
@@ -335,6 +410,9 @@ impl PtrInfo {
     /// info.py: get_descr() — get the size/type descriptor for virtual objects.
     pub fn get_descr(&self) -> Option<&DescrRef> {
         match self {
+            PtrInfo::Instance(v) => v.descr.as_ref(),
+            PtrInfo::Struct(v) => Some(&v.descr),
+            PtrInfo::Array(v) => Some(&v.descr),
             PtrInfo::Virtual(v) => Some(&v.descr),
             PtrInfo::VirtualArray(v) => Some(&v.descr),
             PtrInfo::VirtualStruct(v) => Some(&v.descr),
@@ -343,9 +421,35 @@ impl PtrInfo {
         }
     }
 
+    /// info.py: getlenbound() on ArrayPtrInfo.
+    pub fn get_lenbound(&self) -> Option<&IntBound> {
+        match self {
+            PtrInfo::Array(v) => Some(&v.lenbound),
+            _ => None,
+        }
+    }
+
     /// info.py: setfield(field_descr, value) — set a field on a virtual object.
     pub fn set_field(&mut self, field_idx: u32, value: OpRef) {
         match self {
+            PtrInfo::Instance(v) => {
+                for entry in &mut v.fields {
+                    if entry.0 == field_idx {
+                        entry.1 = value;
+                        return;
+                    }
+                }
+                v.fields.push((field_idx, value));
+            }
+            PtrInfo::Struct(v) => {
+                for entry in &mut v.fields {
+                    if entry.0 == field_idx {
+                        entry.1 = value;
+                        return;
+                    }
+                }
+                v.fields.push((field_idx, value));
+            }
             PtrInfo::Virtual(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
@@ -371,6 +475,16 @@ impl PtrInfo {
     /// info.py: getfield(field_descr) — get a field from a virtual object.
     pub fn get_field(&self, field_idx: u32) -> Option<OpRef> {
         match self {
+            PtrInfo::Instance(v) => v
+                .fields
+                .iter()
+                .find(|(k, _)| *k == field_idx)
+                .map(|(_, v)| *v),
+            PtrInfo::Struct(v) => v
+                .fields
+                .iter()
+                .find(|(k, _)| *k == field_idx)
+                .map(|(_, v)| *v),
             PtrInfo::Virtual(v) => v
                 .fields
                 .iter()
@@ -387,19 +501,28 @@ impl PtrInfo {
 
     /// info.py: setitem(index, value) — set an item in a virtual array.
     pub fn set_item(&mut self, index: usize, value: OpRef) {
-        if let PtrInfo::VirtualArray(v) = self {
-            if index < v.items.len() {
+        match self {
+            PtrInfo::Array(v) => {
+                if index >= v.items.len() {
+                    v.items.resize(index + 1, OpRef::NONE);
+                }
                 v.items[index] = value;
             }
+            PtrInfo::VirtualArray(v) => {
+                if index < v.items.len() {
+                    v.items[index] = value;
+                }
+            }
+            _ => {}
         }
     }
 
     /// info.py: getitem(index) — get an item from a virtual array.
     pub fn get_item(&self, index: usize) -> Option<OpRef> {
-        if let PtrInfo::VirtualArray(v) = self {
-            v.items.get(index).copied()
-        } else {
-            None
+        match self {
+            PtrInfo::Array(v) => v.items.get(index).copied(),
+            PtrInfo::VirtualArray(v) => v.items.get(index).copied(),
+            _ => None,
         }
     }
 
@@ -560,6 +683,18 @@ impl PtrInfo {
     /// info.py: copy_fields_to_const()
     pub fn copy_fields_to(&self, other: &mut PtrInfo) {
         match (self, other) {
+            (PtrInfo::Instance(src), PtrInfo::Instance(dst)) => {
+                dst.fields = src.fields.clone();
+                dst.field_descrs = src.field_descrs.clone();
+            }
+            (PtrInfo::Struct(src), PtrInfo::Struct(dst)) => {
+                dst.fields = src.fields.clone();
+                dst.field_descrs = src.field_descrs.clone();
+            }
+            (PtrInfo::Array(src), PtrInfo::Array(dst)) => {
+                dst.items = src.items.clone();
+                dst.lenbound = src.lenbound.clone();
+            }
             (PtrInfo::Virtual(src), PtrInfo::Virtual(dst)) => {
                 dst.fields = src.fields.clone();
                 dst.field_descrs = src.field_descrs.clone();
@@ -597,6 +732,47 @@ pub struct VirtualArrayInfo {
     /// The array descriptor.
     pub descr: DescrRef,
     /// Element values.
+    pub items: Vec<OpRef>,
+}
+
+/// A non-virtual object with cached field info.
+///
+/// Mirrors RPython's InstancePtrInfo in the non-virtual case.
+#[derive(Clone, Debug)]
+pub struct InstancePtrInfo {
+    /// Best-known instance descriptor, if any.
+    pub descr: Option<DescrRef>,
+    /// Known class pointer, if guarded exactly.
+    pub known_class: Option<GcRef>,
+    /// Cached field values.
+    pub fields: Vec<(u32, OpRef)>,
+    /// Original field descriptors keyed by field index.
+    pub field_descrs: Vec<(u32, DescrRef)>,
+}
+
+/// A non-virtual GC struct with cached field info.
+///
+/// Mirrors RPython's StructPtrInfo in the non-virtual case.
+#[derive(Clone, Debug)]
+pub struct StructPtrInfo {
+    /// Exact struct descriptor.
+    pub descr: DescrRef,
+    /// Cached field values.
+    pub fields: Vec<(u32, OpRef)>,
+    /// Original field descriptors keyed by field index.
+    pub field_descrs: Vec<(u32, DescrRef)>,
+}
+
+/// A non-virtual GC array with cached item info and lenbound.
+///
+/// Mirrors RPython's ArrayPtrInfo in the non-virtual case.
+#[derive(Clone, Debug)]
+pub struct ArrayPtrInfo {
+    /// Exact array descriptor.
+    pub descr: DescrRef,
+    /// Known bounds on the array length.
+    pub lenbound: IntBound,
+    /// Cached item values for constant indices.
     pub items: Vec<OpRef>,
 }
 

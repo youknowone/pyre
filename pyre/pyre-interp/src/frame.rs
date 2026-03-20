@@ -59,6 +59,12 @@ pub struct PyFrame {
     /// Exception handler block stack (PyPy: lastblock linked list).
     /// NOT repr(C)-visible to JIT — stored after vable_token.
     pub block_stack: Vec<Block>,
+    /// Concrete inline-trace replay result owned by this frame.
+    ///
+    /// PyPy's frame switching keeps concrete call results scoped to the
+    /// active frame transition. We keep the pending replay result on the
+    /// concrete caller frame instead of a thread-global side channel.
+    pub pending_inline_result: Option<PyObjectRef>,
 }
 
 /// Exception handler block — pushed by SETUP_FINALLY/SETUP_EXCEPT, popped by POP_BLOCK.
@@ -140,6 +146,7 @@ impl PyFrame {
             namespace,
             vable_token: 0,
             block_stack: Vec::new(),
+            pending_inline_result: None,
         }
     }
 
@@ -243,6 +250,7 @@ impl PyFrame {
             namespace: globals,
             vable_token: 0,
             block_stack: Vec::new(),
+            pending_inline_result: None,
         }
     }
 

@@ -27,8 +27,9 @@ pub mod walkvirtual;
 
 use std::collections::HashMap;
 
+use crate::intutils::IntBound;
 use info::PtrInfo;
-use majit_ir::{Op, OpRef, Value};
+use majit_ir::{Op, OpCode, OpRef, Value};
 use std::collections::VecDeque;
 
 pub(crate) fn majit_log_enabled() -> bool {
@@ -46,6 +47,20 @@ pub enum OptimizationResult {
     Remove,
     /// Pass the operation to the next pass unchanged.
     PassOn,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImportedShortPureArg {
+    OpRef(OpRef),
+    Const(Value),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportedShortPureOp {
+    pub opcode: OpCode,
+    pub descr_idx: Option<u32>,
+    pub args: Vec<ImportedShortPureArg>,
+    pub result: OpRef,
 }
 
 /// Context provided to optimization passes.
@@ -79,8 +94,27 @@ pub struct OptContext {
     /// an ARRAYLEN_GC result >= index+1. intbounds.py uses this to
     /// eliminate redundant length guards.
     pub int_lower_bounds: HashMap<OpRef, i64>,
+    /// RPython unroll.py: widened integer knowledge imported from the preamble.
+    /// OptIntBounds intersects these with freshly discovered facts in phase 2.
+    pub imported_int_bounds: HashMap<OpRef, IntBound>,
+    /// RPython shortpreamble.py / heap.py: imported cached field reads from the
+    /// preamble. Phase 2 uses these to seed Heap's read cache without
+    /// re-emitting preamble heap reads.
+    pub imported_short_fields: HashMap<(OpRef, u32), OpRef>,
+    /// RPython shortpreamble.py / heap.py: imported cached constant-index array
+    /// reads from the preamble.
+    pub imported_short_arrayitems: HashMap<(OpRef, u32, i64), OpRef>,
+    /// RPython shortpreamble.py / pure.py: imported pure-operation results from
+    /// the preamble. Phase 2 uses these as cross-iteration CSE facts.
+    pub imported_short_pure_ops: Vec<ImportedShortPureOp>,
+    /// RPython shortpreamble.py / rewrite.py: imported CALL_LOOPINVARIANT
+    /// results keyed by constant function pointer.
+    pub imported_loop_invariant_results: HashMap<i64, OpRef>,
     /// RPython unroll.py: virtual structures at JUMP for preamble peeling.
     pub exported_jump_virtuals: Vec<crate::optimizer::ExportedJumpVirtual>,
+    /// RPython shortpreamble.py: pass-collected preamble producers aligned to
+    /// the exported loop-header inputargs.
+    pub exported_short_boxes: Vec<crate::shortpreamble::PreambleOp>,
     /// RPython import_state: maps original inputarg index → fresh virtual head OpRef.
     /// Used by ensure_linked_list_head to return the imported virtual.
     pub imported_virtual_heads: Vec<(usize, OpRef)>,
@@ -100,7 +134,13 @@ impl OptContext {
             extra_operations: VecDeque::new(),
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
+            imported_int_bounds: HashMap::new(),
+            imported_short_fields: HashMap::new(),
+            imported_short_arrayitems: HashMap::new(),
+            imported_short_pure_ops: Vec::new(),
+            imported_loop_invariant_results: HashMap::new(),
             exported_jump_virtuals: Vec::new(),
+            exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             patchguardop: None,
         }
@@ -116,7 +156,13 @@ impl OptContext {
             extra_operations: VecDeque::new(),
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
+            imported_int_bounds: HashMap::new(),
+            imported_short_fields: HashMap::new(),
+            imported_short_arrayitems: HashMap::new(),
+            imported_short_pure_ops: Vec::new(),
+            imported_loop_invariant_results: HashMap::new(),
             exported_jump_virtuals: Vec::new(),
+            exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             patchguardop: None,
         }
@@ -288,6 +334,7 @@ impl OptContext {
         self.new_operations.clear();
         self.extra_operations.clear();
         self.next_pos = self.num_inputs;
+        self.imported_int_bounds.clear();
     }
 
     /// Get a mutable reference to the last emitted operation.
@@ -363,6 +410,15 @@ pub trait Optimization {
     /// Called after preamble optimization to collect ops that bridges need to replay.
     fn produce_potential_short_preamble_ops(&self, _sb: &mut crate::shortpreamble::ShortBoxes) {
         // Default: no contribution
+    }
+
+    /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
+    fn export_arg_int_bounds(
+        &self,
+        _args: &[OpRef],
+        _ctx: &OptContext,
+    ) -> HashMap<OpRef, IntBound> {
+        HashMap::new()
     }
 
     /// optimizer.py: is_virtual(opref)

@@ -1,138 +1,326 @@
 # Pyre RPython Alignment Plan
 
-This document captures the pyre-only work needed to move recursive tracing
-from helper-boundary recursion toward PyPy/RPython-style frame-switch tracing.
+This plan is updated from the current tree as of 2026-03-20.
+It is intentionally `pyre`-only. If a later step requires `majit`
+changes again, stop there and escalate instead of half-wiring the path.
 
-## Current Stable Baseline
+## Current Baseline
+
+Verified on the current tree:
 
 - `cargo test -p pyre-jit test_eval_recursive_fib_compiles_function_entry_trace -- --nocapture --test-threads=1`
   passes.
-- `cargo build -p pyre-main --release` passes.
-- `./target/release/pyre-main pyre/bench/fib_recursive.py`
-  returns `9227465`, with roughly `user 0.24s` on the current machine.
-- `./target/release/pyre-main pyre/bench/inline_helper.py`
-  returns the correct result, with roughly `user 0.02s`.
+- `cargo build -p pyrex --release` passes.
+- `./target/release/pyre pyre/bench/fib_recursive.py`
+  returns `9227465`, roughly `user 0.12s`.
+- `./target/release/pyre pyre/bench/inline_helper.py`
+  returns the correct result, roughly `user 0.04s`.
+- Local `pypy3` on the same machine is still faster:
+  - `fib_recursive`: about `user 0.07s`
+  - `inline_helper`: about `user 0.01s`
 
-## Current Hard Blocker
+## What The Updated Code Actually Looks Like
 
-Root self-recursive trace-through is still disabled on purpose.
+### 1. Recursive correctness is currently stable
 
-When root self-recursive `can_trace_through` is re-enabled, concrete execution
-eventually falls through a residual/known-function call path that is still
-owned by the generic interpreter call protocol instead of the inline
-framestack. The concrete state then diverges from the inline framestack state,
-and the system fails with:
+- self-recursive raw helper currently executes the callee frame through the
+  pure interpreter force loop, not through direct compiled self-recursive
+  re-entry:
+  - `pyre/pyre-jit/src/call_jit.rs`
+- function-entry tracing and raw-int finish are still active:
+  - `pyre/pyre-jit/src/eval.rs`
 
-- `TypeError: stack underflow during interpreter opcode`
-- or `SIGSEGV`
+This means the current recursive path is slower than the ideal RPython path,
+but it is stable again.
 
-The failing boundary consistently shows up through:
+### 2. Inline concrete execution still uses an ad-hoc result channel
 
-- `pyre-jit/src/jit/state.rs`: self-recursive inline path
-- `pyre-runtime/src/runtime_ops.rs`: `jit_call_known_function_*`
-- `pyre-jit/src/call_jit.rs`: `jit_call_user_function_from_frame`
+- `pyre-interp/src/call.rs` uses `INLINE_HANDLED_RESULT: Cell<Option<PyObjectRef>>`
+- `pyre-jit/src/jit/state.rs` still writes concrete inline results back through
+  `set_inline_handled_result(...)`
 
-In short: tracing can switch frames, but concrete residual execution still
-cannot.
+This is not the final RPython-style design. It is an escape hatch that still
+works, but it means inline result flow is not fully framestack-owned.
 
-## Design Target
+### 3. The biggest current performance gap is not recursive helper dispatch
 
-Match PyPy/RPython more closely:
+The largest visible performance regression is currently `inline_helper`, not
+`fib_recursive`.
 
-- tracing and concrete execution both use a frame stack
-- call/return/residual-call transitions are owned by that framestack
-- self-recursive hot paths do not escape back to helper-boundary recursion
-  once tracing has entered inline execution
+From the optimized `inline_helper` trace:
 
-The target seam is `MIFrame` / `inline_trace_and_execute` in
-`pyre-jit/src/jit/state.rs`.
+- `New + SetfieldGc` boxed `W_Int` objects still survive in the final trace
+- `LeavePortalFrame()` markers still survive in the final trace
+- direct builtin/inline fast paths still return boxed objects through
+  `trace_box_int(...)`
 
-## Ordered Work Plan
+So the current hot inline path is still making object results escape instead of
+staying as raw values long enough for the optimizer to remove the boxes.
 
-### Phase 1. Make Concrete Residual Calls Framestack-Owned
+### 4. Root self-recursive trace-through is still not the immediate next step
 
-Goal:
-- residual calls reached during inline concrete execution must no longer route
-  back through generic `call_user_function()` behavior
+`MIFrame` / `inline_trace_and_execute` still exist in
+`pyre-jit/src/jit/state.rs`, but the current code does not yet have a fully
+framestack-owned concrete result and residual-call protocol.
 
-Required work:
-- introduce an explicit "inline framestack residual call" protocol in
-  `pyre-interp/src/call.rs`
-- keep it separate from:
-  - normal interpreter calls
-  - generic JIT helper-boundary calls
-- route only framestack-owned residual calls through it
+Trying to force root self-recursive trace-through before fixing the escaping
+inline result protocol is likely to produce another unstable half-state:
 
-Success criteria:
-- nested inline execution can perform a residual user-function call without
-  touching the outer interpreter stack protocol
+- helper-boundary recursion partially disabled
+- framestack still incomplete
+- concrete stack/result state diverging again
 
-### Phase 2. Extend MIFrame to Own Concrete Call/Return State
+That is not aligned with RPython. RPython gets the representation and frame
+ownership right first, then turns on deeper frame switching.
 
-Goal:
-- `MIFrame` must own enough concrete state to enter, resume, and return across
-  nested calls without falling back to TLS/result-slot tricks
+## Updated Priority Order
 
-Required work:
-- make the framestack carry explicit resume/result state
-- stop relying on implicit concrete-result handoff for nested residual paths
-- make parent resume deterministic and local to the framestack
+The previous plan over-emphasized root self-recursive trace-through too early.
+The current code says the order should be:
 
-Success criteria:
-- inline concrete execution no longer depends on generic interpreter call
-  re-entry to move results between parent and child frames
+1. stop hot inline results from escaping as boxed objects
+2. make inline call/result ownership framestack-local
+3. then re-open deeper frame-switch tracing
+4. only after that, remove the remaining helper-boundary recursion
 
-### Phase 3. Re-enable Root Self-Recursive Trace-Through
+## Phase 0: Freeze The Current Baseline
 
-Goal:
-- allow self-recursive root calls back into `trace_through_callee()`
+Purpose:
+- avoid mixing correctness regressions with performance work
 
-Required work:
-- change the self-recursive `can_trace_through` gate in
-  `pyre-jit/src/jit/state.rs`
-- keep the fallback policy the same once recursion exceeds inline limits:
-  residual/compiled boundary only after the framestack can own it safely
+Tasks:
+- keep the current recursive test green
+- keep both benchmark scripts runnable from `./target/release/pyre`
+- save one representative `MAJIT_LOG=1` trace for:
+  - `fib_recursive`
+  - `inline_helper`
 
-Success criteria:
-- `fib_recursive` passes with root self-recursive trace-through enabled
-- no `stack underflow`, no `SIGSEGV`
+Completion criteria:
+- recursive function-entry trace still compiles
+- both benches still return correct answers
 
-### Phase 4. Remove Helper-Boundary Recursion from the Hot Recursive Path
+## Phase 1: Remove Escaping Boxed Int Results From Inline Hot Paths
 
-Goal:
-- the hot recursive `fib` trace should stop going through
-  `CallMayForceI(jit_force_self_recursive_call_raw_1, ...)`
+This is the immediate highest-value step.
 
-Required work:
-- verify that recursive hot traces stay in frame-switch tracing
-- only leave through explicit residual/compiled boundaries after inline limits
+### Why this is first
 
-Success criteria:
-- the optimized trace no longer shows helper-boundary recursion for the hot
-  recursive path
+Current optimized `inline_helper` trace still contains:
 
-### Phase 5. Resume Performance Work
+- `New()`
+- `SetfieldGc(... ob_type ...)`
+- `SetfieldGc(... intval ...)`
+- later `GetfieldGcI(...)`
 
-Only after phases 1-4 are stable:
+That means the `W_Int` result is escaping instead of being virtualized away.
+This is the clearest current source of wasted work.
 
-- push virtual `W_Int` further so inline returns do not escape as boxed ints
-- reduce callee frame materialization that still survives outside the
-  frame-switch path
-- trim remaining call/namespace bookkeeping on the recursive hot path
+### Target
 
-## Guardrails
+For pure int inline paths, keep values raw for as long as possible.
+Only materialize a boxed `W_Int` at a boundary that truly requires an object.
 
-- Do not change `majit/*` as part of this plan.
-- Keep `fib_recursive` correctness green at every step.
-- Do not leave half-enabled root self-recursive trace-through in the tree.
-- If a change requires helper-boundary recursion to stay active, keep the
-  existing self-recursive root gate disabled.
+### Files
+
+- `pyre/pyre-jit/src/jit/state.rs`
+- `pyre/pyre-jit/src/jit/helpers.rs`
+- generated uses of `crate::jit::generated::trace_box_int(...)`
+
+### Concrete work
+
+1. Audit every `trace_box_int(...)` call site in `state.rs`
+   - classify each call site as:
+     - `must_box_now`
+     - `can_stay_raw_in_inline_path`
+2. Introduce an explicit raw-int inline result path for the direct helpers:
+   - `direct_abs_value`
+   - `direct_len_value` where the consumer can stay raw
+   - `direct_minmax_value`
+   - unary/binary/compare int fast paths
+3. Delay boxing until one of these true boundaries:
+   - store into a real object container that requires a `PyObjectRef`
+   - residual helper call that still expects boxed objects
+   - top-level return boundary
+4. Re-measure the optimized `inline_helper` trace
+   - `New + SetfieldGc` count must drop materially
+
+### Completion criteria
+
+- optimized `inline_helper` trace contains fewer boxed-int `New` nodes
+- `inline_helper` user time drops materially from the current `~0.04s`
+
+## Phase 2: Remove Portal Markers From Inline Hot Traces
+
+### Why this is next
+
+The optimized `inline_helper` trace still carries multiple
+`LeavePortalFrame()` markers. Even if backend cost is low, they:
+
+- increase trace size
+- increase optimization work
+- signal that inline bookkeeping is still too visible
+
+### Target
+
+Inline execution should not leave trace-level portal bookkeeping on the final
+hot path unless it is semantically required.
+
+### Files
+
+- `pyre/pyre-jit/src/jit/state.rs`
+- any inline call/return helper in `pyre-jit/src/call_jit.rs`
+
+### Concrete work
+
+1. identify where inline entry/leave markers are emitted today
+2. distinguish:
+   - real cross-portal transitions
+   - inline-only bookkeeping markers
+3. remove or suppress the inline-only markers
+4. verify trace shape again
+
+### Completion criteria
+
+- optimized `inline_helper` trace no longer shows repeated inline-only
+  `LeavePortalFrame()` markers
+
+## Phase 3: Replace The Single-Slot Inline Result Channel
+
+### Why this is now urgent
+
+The current code reverted to:
+
+- `INLINE_HANDLED_RESULT: Cell<Option<PyObjectRef>>`
+
+That is simpler, but it is not RPython-like. It is also fragile for nested
+inline/residual transitions.
+
+### Target
+
+Inline concrete result flow must become framestack-owned, not TLS-slot-owned.
+
+### Files
+
+- `pyre/pyre-interp/src/call.rs`
+- `pyre/pyre-jit/src/jit/state.rs`
+
+### Concrete work
+
+1. remove dependence on the global single result slot for nested inline calls
+2. move result ownership into `MIFrame`
+3. make parent resume/result propagation explicit in the framestack
+4. keep `call_callable_inline_residual(...)` but stop using TLS result passing
+   for nested inline return values
+
+### Completion criteria
+
+- inline execution no longer depends on `set_inline_handled_result(...)`
+  for nested call/return correctness
+
+## Phase 4: Make Residual Calls Fully Framestack-Owned
+
+### Why this still matters
+
+There is already an explicit inline residual-call protocol:
+
+- `pyre-interp/src/call.rs::call_callable_inline_residual`
+- `pyre-jit/src/jit/state.rs::execute_inline_residual_call`
+
+That was necessary, but it is still not the full ownership model.
+
+### Target
+
+Residual calls reached from inline execution should behave like explicit
+framestack state transitions, not sidecar interpreter calls with borrowed state.
+
+### Files
+
+- `pyre/pyre-jit/src/jit/state.rs`
+- `pyre/pyre-interp/src/call.rs`
+
+### Concrete work
+
+1. remove remaining hidden coupling between inline residual calls and outer
+   interpreter call/result channels
+2. keep concrete stack discipline local to the active `MIFrame`
+3. audit nested residual call return handling
+
+### Completion criteria
+
+- nested inline residual calls no longer rely on interpreter-global state
+- result propagation is explicit and local to the framestack
+
+## Phase 5: Re-open Root Self-Recursive Trace-Through
+
+Only after phases 1-4 are stable.
+
+### Why later
+
+At that point:
+
+- inline results no longer escape as aggressively
+- inline result ownership is framestack-local
+- residual paths are no longer piggybacking on interpreter-global result state
+
+Then root self-recursive frame-switch tracing becomes a structural extension,
+not another half-wired bypass.
+
+### Target
+
+Allow self-recursive root calls back into `trace_through_callee()` /
+`inline_trace_and_execute()` without helper-boundary recursion on the hot path.
+
+### Files
+
+- `pyre/pyre-jit/src/jit/state.rs`
+- `pyre/pyre-jit/src/call_jit.rs`
+
+### Concrete work
+
+1. change the self-recursive `can_trace_through` gate
+2. keep compiled/residual fallback only after inline limits
+3. verify no stack divergence and no helper fallback on the hot recursive path
+
+### Completion criteria
+
+- `fib_recursive` still correct
+- no `stack underflow`
+- hot recursive trace no longer depends on the self-recursive force helper
+
+## Phase 6: Remove Remaining Helper-Boundary Recursion
+
+After root self-recursive trace-through is stable:
+
+- remove `CallMayForceI(self_recursive_helper, ...)` from the hot recursive path
+- reduce surviving callee frame materialization outside true residual boundaries
+
+This is the point where the recursive path should start to look materially more
+like PyPy's frame-switch behavior.
+
+## Validation Matrix
+
+Every phase should rerun at least:
+
+- `cargo test -p pyre-jit test_eval_recursive_fib_compiles_function_entry_trace -- --nocapture --test-threads=1`
+- `./target/release/pyre pyre/bench/fib_recursive.py`
+- `./target/release/pyre pyre/bench/inline_helper.py`
+- `MAJIT_LOG=1` trace capture for whichever hot path the phase targets
+
+For performance-focused phases, compare against the current baseline:
+
+- `fib_recursive`: ~`0.12 user`
+- `inline_helper`: ~`0.04 user`
 
 ## Immediate Next Task
 
-Implement Phase 1:
+Start with Phase 1, not recursive frame switching:
 
-- define an explicit framestack residual-call protocol in `pyre-interp`
-- wire `inline_trace_and_execute` to use it for concrete nested residual calls
-- keep root self-recursive trace-through disabled until that path is proven
-  correct
+- audit and reduce `trace_box_int(...)` escape points in `state.rs`
+- make inline int results stay raw longer
+- confirm that `New + SetfieldGc` count drops in the optimized
+  `inline_helper` trace
+
+That is the shortest path that is both:
+
+- aligned with RPython/PyPy
+- supported by the updated code we actually have today
