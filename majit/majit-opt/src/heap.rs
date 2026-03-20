@@ -254,6 +254,10 @@ impl OptHeap {
     ///   been passed to a call or stored into the heap.
     fn invalidate_caches(&mut self) {
         let has_survivors = !self.immutable_field_descrs.is_empty() || !self.unescaped.is_empty();
+        if crate::majit_log_enabled() {
+            let before = self.cached_fields.len();
+            eprintln!("[heap] invalidate_caches: before={before} immutable_descrs={:?} unescaped={}", self.immutable_field_descrs.len(), self.unescaped.len());
+        }
 
         if has_survivors {
             self.cached_fields.retain(|&(obj, descr_idx), _| {
