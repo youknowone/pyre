@@ -180,7 +180,11 @@ impl UnrollOptimizer {
     }
 
     /// compile.py: compile_loop with optional virtualizable config.
-    /// When vable_config is Some, OptVirtualize tracks frame field accesses.
+    ///
+    /// RPython parity: 2-pass preamble peeling.
+    /// Pass 1: optimize with OptUnroll → discover virtual structures at JUMP
+    /// Pass 2: if virtuals found → re-optimize with virtual reconstruction
+    ///         at loop body start, enabling OptVirtualize to eliminate allocations
     pub fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
         ops: &[Op],
@@ -188,14 +192,56 @@ impl UnrollOptimizer {
         num_inputs: usize,
         vable_config: Option<crate::virtualize::VirtualizableConfig>,
     ) -> (Vec<Op>, usize) {
-        let mut optimizer = if let Some(config) = vable_config {
-            crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config)
+        // Pass 1: standard optimization with peeling
+        let mut constants_pass1 = constants.clone();
+        let mut optimizer = if let Some(ref config) = vable_config {
+            crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config.clone())
         } else {
             crate::optimizer::Optimizer::default_pipeline()
         };
         optimizer.add_pass(Box::new(OptUnroll::new()));
-        let result = optimizer.optimize_with_constants_and_inputs(ops, constants, num_inputs);
+        let result =
+            optimizer.optimize_with_constants_and_inputs(ops, &mut constants_pass1, num_inputs);
         let final_num_inputs = optimizer.final_num_inputs();
+
+        // Check if any JUMP args were virtual (exported by OptVirtualize)
+        let jump_virtuals = std::mem::take(&mut optimizer.exported_jump_virtuals);
+
+        if jump_virtuals.is_empty() {
+            // No virtuals at JUMP — single pass suffices
+            *constants = constants_pass1;
+            let sp = crate::shortpreamble::extract_short_preamble(&result);
+            if !sp.is_empty() {
+                self.short_preamble = Some(sp);
+            }
+            return (result, final_num_inputs);
+        }
+
+        // Pass 2: RPython parity — re-optimize with virtual awareness
+        // The peeled trace has New+SetfieldGc in the body that OptVirtualize
+        // can now identify and virtualize, since the preamble established
+        // the virtual structure. This eliminates per-iteration allocation.
+        //
+        // TODO: implement full export_state/import_state for Pass 2.
+        // For now, Pass 1 result is used (with materialized virtuals).
+        // This is functionally correct but doesn't eliminate allocations.
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[jit] preamble peeling: found {} virtual(s) at JUMP, pass 2 needed",
+                jump_virtuals.len(),
+            );
+        }
+
+        // Store jump virtuals info for future use
+        self.exported_state = Some(crate::virtualstate::VirtualState::new(
+            jump_virtuals
+                .iter()
+                .map(|_| crate::virtualstate::VirtualStateInfo::Unknown)
+                .collect(),
+        ));
+
+        // For now, return Pass 1 result. Full 2-pass will be implemented next.
+        *constants = constants_pass1;
         let sp = crate::shortpreamble::extract_short_preamble(&result);
         if !sp.is_empty() {
             self.short_preamble = Some(sp);

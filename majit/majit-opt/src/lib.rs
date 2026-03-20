@@ -31,6 +31,10 @@ use info::PtrInfo;
 use majit_ir::{Op, OpRef, Value};
 use std::collections::VecDeque;
 
+pub(crate) fn majit_log_enabled() -> bool {
+    std::env::var_os("MAJIT_LOG").is_some()
+}
+
 /// Result of an optimization pass processing an operation.
 #[derive(Debug)]
 pub enum OptimizationResult {
@@ -75,6 +79,9 @@ pub struct OptContext {
     /// an ARRAYLEN_GC result >= index+1. intbounds.py uses this to
     /// eliminate redundant length guards.
     pub int_lower_bounds: HashMap<OpRef, i64>,
+    /// RPython parity: virtual structures found in JUMP args during preamble.
+    /// Collected by OptVirtualize, read by the unroll optimizer for 2-pass peeling.
+    pub exported_jump_virtuals: Vec<crate::optimizer::ExportedJumpVirtual>,
 }
 
 impl OptContext {
@@ -88,6 +95,7 @@ impl OptContext {
             extra_operations: VecDeque::new(),
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
+            exported_jump_virtuals: Vec::new(),
         }
     }
 
@@ -101,6 +109,7 @@ impl OptContext {
             extra_operations: VecDeque::new(),
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
+            exported_jump_virtuals: Vec::new(),
         }
     }
 
@@ -112,6 +121,13 @@ impl OptContext {
         self.next_pos = self
             .next_pos
             .max(self.num_inputs + self.new_operations.len() as u32);
+        while self
+            .constants
+            .get(self.next_pos as usize)
+            .is_some_and(|value| value.is_some())
+        {
+            self.next_pos += 1;
+        }
         let pos_ref = OpRef(self.next_pos);
         self.next_pos += 1;
         pos_ref
