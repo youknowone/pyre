@@ -619,7 +619,7 @@ impl<M: Clone> MetaInterp<M> {
             raw_int_box_helpers: HashSet::new(),
             raw_int_force_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
-            max_unroll_recursion: 3, // CallMayForce + direct dispatch
+            max_unroll_recursion: 7, // RPython default from rlib/jit.py
         }
     }
 
@@ -634,15 +634,20 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn trace_entry_vable_lengths(&self, info: &VirtualizableInfo) -> Vec<usize> {
+        // RPython initialize_virtualizable() seeds virtualizable_boxes from the
+        // current trace entry boxes, not by re-reading a potentially larger
+        // heap layout.  When the interpreter provides explicit trace-entry
+        // lengths, prefer them because they describe the live input box prefix
+        // that was actually recorded for this trace.
+        if !self.vable_array_lengths.is_empty() {
+            return self.vable_array_lengths.clone();
+        }
         if !self.vable_ptr.is_null() && info.can_read_all_array_lengths_from_heap() {
             // Safety: vable_ptr is cached from JitState::virtualizable_heap_ptr()
             // for the currently active interpreter state.
-            let heap_lengths = unsafe { info.read_array_lengths_from_heap(self.vable_ptr) };
-            if heap_lengths.iter().any(|&len| len > 0) || self.vable_array_lengths.is_empty() {
-                return heap_lengths;
-            }
+            return unsafe { info.read_array_lengths_from_heap(self.vable_ptr) };
         }
-        self.vable_array_lengths.clone()
+        Vec::new()
     }
 
     /// Set the trace eagerness (guard failure threshold for bridge tracing).
@@ -1363,37 +1368,33 @@ impl<M: Clone> MetaInterp<M> {
             );
         let num_ops_after = optimized_ops.len();
 
-        // Extend inputargs if the optimizer added virtual inputs (virtualizable)
-        // or if the trace's Jump has more args than InputArgs (depth growth).
-        let mut inputargs = trace.inputargs.clone();
+        // RPython compile.py compiles the root loop with the original trace
+        // inputargs. Extra boxes introduced by peeling live at the loop
+        // LABEL/JUMP boundary, not at the external entry point.
+        let inputargs = trace.inputargs.clone();
         let jump_arg_count = optimized_ops
             .iter()
             .rev()
             .find(|op| op.opcode == majit_ir::OpCode::Jump)
             .map(|op| op.args.len())
             .unwrap_or(0);
-        let required = final_num_inputs.max(jump_arg_count);
-        while inputargs.len() < required {
-            inputargs.push(majit_ir::InputArg {
-                tp: majit_ir::Type::Int,
-                index: inputargs.len() as u32,
-            });
-        }
 
-        // If Jump has more args than the Label (depth growth), extend the Label.
-        // RPython: the optimizer's preamble peeling creates a Label with extended args.
-        // Here we do it post-hoc since the trace was recorded with smaller InputArgs.
-        let mut optimized_ops = optimized_ops;
-        if jump_arg_count > 0 {
-            for op in &mut optimized_ops {
-                if op.opcode == majit_ir::OpCode::Label && op.args.len() < jump_arg_count {
-                    // Extend Label args with dummy OpRefs for the extra positions.
-                    while op.args.len() < jump_arg_count {
-                        op.args.push(majit_ir::OpRef::NONE);
-                    }
-                }
+        let label_arg_count = optimized_ops
+            .iter()
+            .find(|op| op.opcode == majit_ir::OpCode::Label)
+            .map(|op| op.args.len())
+            .unwrap_or(0);
+        if jump_arg_count != label_arg_count {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] abort compile: optimized label/jump arity mismatch label={} jump={}",
+                    label_arg_count,
+                    jump_arg_count,
+                );
             }
+            return;
         }
+        let optimized_ops = optimized_ops;
 
         // RPython virtualizable parity: standard virtualizable fields and
         // arrays stay in the trace as first-class virtualizable boxes.
@@ -1403,6 +1404,7 @@ impl<M: Clone> MetaInterp<M> {
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
         let (inputargs, optimized_ops) = (inputargs, optimized_ops);
         let optimized_ops = unbox_call_assembler_results(optimized_ops);
+        let optimized_ops = normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
@@ -2859,6 +2861,21 @@ impl<M: Clone> MetaInterp<M> {
             &mut constants,
             bridge_inputargs.len(),
         );
+
+        // RPython parity: unbox the Finish result in bridges too.
+        // Without this, bridges return boxed pointers while the caller
+        // (call_assembler_fast_path) expects raw ints for [Type::Int] Finish.
+        let (optimized_ops, bridge_finish_unboxed) =
+            unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers);
+        if bridge_finish_unboxed {
+            self.raw_int_finish_keys.insert(green_key);
+        }
+        let optimized_ops = if bridge_finish_unboxed {
+            unbox_raw_force_results(optimized_ops, &constants, &self.raw_int_force_helpers)
+        } else {
+            optimized_ops
+        };
+
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
         let bridge_trace_id = self.alloc_trace_id();
@@ -4799,6 +4816,17 @@ mod tests {
         info
     }
 
+    #[repr(C)]
+    struct TraceEntryArray {
+        len: usize,
+        items: [i64; 4],
+    }
+
+    #[repr(C)]
+    struct TraceEntryObj {
+        arr: *const TraceEntryArray,
+    }
+
     fn start_tracing_with_virtualizable(
         meta: &mut MetaInterp<()>,
         info: VirtualizableInfo,
@@ -4822,6 +4850,31 @@ mod tests {
             .into_iter()
             .filter(|op| op.opcode != OpCode::Jump)
             .collect()
+    }
+
+    #[test]
+    fn trace_entry_vable_lengths_prefers_cached_fallback_over_heap_lengths() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_array_field_with_layout(
+            "arr",
+            Type::Int,
+            std::mem::offset_of!(TraceEntryObj, arr),
+            0,
+            std::mem::size_of::<usize>(),
+        );
+
+        let array = TraceEntryArray {
+            len: 4,
+            items: [10, 20, 30, 40],
+        };
+        let obj = TraceEntryObj { arr: &array };
+
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.set_virtualizable_info(info.clone());
+        meta.set_vable_ptr((&obj as *const TraceEntryObj).cast());
+        meta.set_vable_array_lengths(vec![1]);
+
+        assert_eq!(meta.trace_entry_vable_lengths(&info), vec![1]);
     }
 
     #[test]
@@ -8146,6 +8199,51 @@ fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
                 ops.remove(idx);
             }
         }
+    }
+
+    ops
+}
+
+fn normalize_closing_jump_args(
+    mut ops: Vec<Op>,
+    constants: &std::collections::HashMap<u32, i64>,
+    num_inputs: usize,
+) -> Vec<Op> {
+    let Some(label_args) = ops
+        .iter()
+        .find(|op| op.opcode == OpCode::Label)
+        .map(|op| op.args.clone())
+    else {
+        return ops;
+    };
+
+    let defined: std::collections::HashSet<OpRef> = ops
+        .iter()
+        .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos.is_none())
+        .map(|op| op.pos)
+        .collect();
+
+    let Some(jump) = ops.iter_mut().rfind(|op| op.opcode == OpCode::Jump) else {
+        return ops;
+    };
+
+    for (idx, arg) in jump.args.iter_mut().enumerate() {
+        if idx >= label_args.len() {
+            break;
+        }
+        if constants.contains_key(&arg.0) {
+            continue;
+        }
+        if (arg.0 as usize) < num_inputs {
+            continue;
+        }
+        if defined.contains(arg) {
+            continue;
+        }
+        // compile.py closes the loop against the label namespace. If a stale
+        // pre-normalization box leaks into the final Jump, replace it with the
+        // corresponding label slot before handing the trace to the backend.
+        *arg = label_args[idx];
     }
 
     ops
