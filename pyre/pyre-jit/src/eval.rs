@@ -192,9 +192,20 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 /// Calls merge_point on EVERY iteration (PyPy line 85-87), not just
 /// when tracing. This matches PyPy's jit_merge_point placement.
 pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
+    let code = unsafe { &*frame.code };
+
+    // RPython parity: JIT only runs inside functions (nlocals > 0).
+    // Module-level code (nlocals=0) uses STORE_NAME/LOAD_NAME to
+    // access variables via the namespace dict, not fast locals.
+    // Without fast locals, variables cannot be carried as JUMP args,
+    // causing GC stale pointer issues when nursery objects are
+    // allocated in compiled loops.
+    if code.varnames.is_empty() {
+        return pyre_interp::eval::eval_frame_plain(frame);
+    }
+
     let env = PyreEnv;
     let mut arg_state = OpArgState::default();
-    let code = unsafe { &*frame.code };
     let (driver, info) = driver_pair();
 
     loop {
