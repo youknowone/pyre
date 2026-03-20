@@ -65,6 +65,10 @@ pub struct Optimizer {
     pub imported_short_aliases: Vec<crate::ImportedShortAlias>,
     /// Builder-derived short preamble actually used by phase 2.
     pub imported_short_preamble: Option<crate::shortpreamble::ShortPreamble>,
+    /// RPython unroll.py: short_preamble_producer after import_state.
+    /// Preserved so finalize_short_preamble can create the live extended
+    /// producer for the target token currently being compiled.
+    pub imported_short_preamble_builder: Option<crate::shortpreamble::ShortPreambleBuilder>,
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.
@@ -319,6 +323,7 @@ impl Optimizer {
             imported_short_sources: Vec::new(),
             imported_short_aliases: Vec::new(),
             imported_short_preamble: None,
+            imported_short_preamble_builder: None,
         }
     }
 
@@ -763,14 +768,21 @@ impl Optimizer {
         self.imported_short_sources = std::mem::take(&mut ctx.imported_short_sources);
         self.imported_short_aliases = ctx.used_imported_short_aliases();
         self.imported_short_preamble = ctx.build_imported_short_preamble();
+        self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
         let jump = ctx
             .new_operations
             .iter()
             .rfind(|op| op.opcode == OpCode::Jump)
             .cloned();
         self.exported_loop_state = jump.map(|jump| {
-            let preview_virtual_state =
-                crate::virtualstate::export_state(&jump.args, &ctx, &ctx.ptr_info);
+            // RPython unroll.py:454-457: use virtual state from BEFORE force.
+            // OptVirtualize captures this in the JUMP handler.
+            let preview_virtual_state = ctx
+                .pre_force_virtual_state
+                .clone()
+                .unwrap_or_else(|| {
+                    crate::virtualstate::export_state(&jump.args, &ctx, &ctx.ptr_info)
+                });
             let (preview_label_args, preview_virtuals) = preview_virtual_state
                 .make_inputargs_and_virtuals(&jump.args, &ctx);
             let mut preview_short_args = preview_label_args.clone();
