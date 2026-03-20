@@ -327,6 +327,21 @@ impl UnrollOptimizer {
             );
         }
 
+        // Safety: if Phase 2 body has 0 guards, fall back to Phase 1.
+        // A guardless body loop would run forever without bridge compilation.
+        let p2_guard_count = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
+        if p2_guard_count == 0 {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[jit] phase 2: 0 guards, falling back to phase 1");
+            }
+            *constants = consts_p1;
+            let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
+            if !sp.is_empty() {
+                self.short_preamble = Some(sp);
+            }
+            return (p1_ops, p1_ni);
+        }
+
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
         // Build the virtual state at end of Phase 2 body.
         let p2_exported = opt_p2.exported_loop_state.clone();
@@ -1039,10 +1054,12 @@ impl OptUnroll {
             "import_state: next_iteration_args mismatch"
         );
 
-        // unroll.py:483-490: forward args, apply exported info
+        // unroll.py:483-490: apply exported info to targetargs.
+        // RPython uses source.set_forwarded(target), but majit's transitive
+        // get_replacement chains cause conflicts with imported virtual fields.
+        // Only apply info (constants, types, bounds) without forwarding.
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
-            ctx.replace_op(source, *target);
             // unroll.py:487: info = exported_state.exported_infos.get(target, None)
             if let Some(info) = exported_state.exported_infos.get(target) {
                 self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
