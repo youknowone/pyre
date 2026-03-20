@@ -23,5 +23,22 @@ pub fn trace_bytecode(
     // stack offset calculations.
     frame_state.promote_valuestackdepth(concrete_frame);
 
-    frame_state.trace_code_step(code, pc)
+    let action = frame_state.trace_code_step(code, pc);
+
+    // RPython pyjitpl.py reached_loop_header(): when a back-edge closes
+    // the loop, the compiled trace must be registered under the back-edge's
+    // green key, not the function-entry key.  Without this, func-entry
+    // tracing stores the loop under PC=0, causing infinite re-entry.
+    if matches!(
+        action,
+        TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. }
+    ) {
+        let back_edge_key = crate::eval::make_green_key(
+            code as *const CodeObject,
+            pc,
+        );
+        ctx.set_green_key(back_edge_key);
+    }
+
+    action
 }
