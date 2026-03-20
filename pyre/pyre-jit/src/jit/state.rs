@@ -2273,18 +2273,12 @@ impl TraceFrameState {
                 if is_self_recursive
                     && crate::call_jit::recursive_force_cache_safe(concrete_callable)
                     && !inline_framestack_active
-                    // Direct self-recursive CallAssembler assumes the callee
-                    // reaches a final Finish result. Our current function-entry
-                    // traces for fib still produce Jump exits for base cases,
-                    // so taking the raw CallAssembler fast path here feeds a
-                    // non-final outcome back as if it were a finished int.
-                    //
-                    // Until root recursive trace-through / ChangeFrame is
-                    // complete, keep self-recursive calls on the existing
-                    // helper-boundary path, which can run the callee through
-                    // eval_with_jit() until a real return value is produced.
-                    && false
                 {
+                    // RPython parity: compiled code calls compiled code
+                    // directly via CALL_ASSEMBLER. Guard failures in the
+                    // callee are handled by force_fn → resume_in_blackhole.
+                    // This is the fast path matching RPython's
+                    // call_assembler / assembler_call_helper pattern.
                     if let Some(token_number) = driver.get_loop_token_number(callee_key) {
                         let callee_meta =
                             driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
@@ -2383,8 +2377,7 @@ impl TraceFrameState {
                     }
                 }
 
-                if !is_self_recursive
-                    && let Some(token_number) = driver.get_pending_token_number(callee_key)
+                if let Some(token_number) = driver.get_pending_token_number(callee_key)
                 {
                     let callee_nlocals = {
                         let code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
@@ -2463,8 +2456,7 @@ impl TraceFrameState {
                             });
                         };
 
-                        if !is_self_recursive
-                            && let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs)
+                        if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs)
                         {
                             let callee_meta = driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
                                 panic!(
@@ -2823,14 +2815,6 @@ impl TraceFrameState {
                         // lifetime of this trace. Before the callee has a raw
                         // int finish, use the boxed helper with a Ref result,
                         // matching RPython's call_assembler result kind.
-                        if majit_meta::majit_log_enabled() && is_self_recursive {
-                            eprintln!(
-                                "[jit][self-call-lower] raw_finish_ready={} cache_safe={} concrete_arg_is_int={}",
-                                raw_finish_ready,
-                                crate::call_jit::recursive_force_cache_safe(concrete_callable),
-                                matches!(concrete_arg0, Some(arg) if unsafe { pyre_object::pyobject::is_int(arg) }),
-                            );
-                        }
                         let force_fn = if is_self_recursive
                             && crate::call_jit::recursive_force_cache_safe(concrete_callable)
                         {
@@ -2844,18 +2828,12 @@ impl TraceFrameState {
                             == crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1
                                 as *const ()
                         {
-                            if majit_meta::majit_log_enabled() && is_self_recursive {
-                                eprintln!("[jit][self-call-lower] using self argraw boxed helper");
-                            }
                             ctx.call_may_force_ref_typed(
                                 force_fn,
                                 &[this.frame(), raw_arg],
                                 &[Type::Ref, Type::Int],
                             )
                         } else {
-                            if majit_meta::majit_log_enabled() && is_self_recursive {
-                                eprintln!("[jit][self-call-lower] using generic argraw boxed helper");
-                            }
                             ctx.call_may_force_ref_typed(
                                 force_fn,
                                 &[this.frame(), callable, raw_arg],
