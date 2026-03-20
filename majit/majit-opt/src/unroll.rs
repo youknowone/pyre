@@ -245,6 +245,12 @@ impl UnrollOptimizer {
         //
         // For each virtual JUMP arg, we add extra inputargs for the field values.
         // The optimizer sees these extra inputargs as the virtual's fields.
+        // Field inputargs must not collide with original trace op positions.
+        // Place them right after the original num_inputs. The optimizer's
+        // effective_inputs = max(body_num_inputs, max_pos+1) ensures original
+        // trace ops get new positions beyond body_num_inputs.
+        let field_base = num_inputs;
+
         let mut imported = Vec::new();
         let mut extra_field_count = 0;
         for virt in &jump_virtuals {
@@ -252,7 +258,7 @@ impl UnrollOptimizer {
                 .fields
                 .iter()
                 .map(|(descr, _concrete)| {
-                    let field_inputarg = num_inputs + extra_field_count;
+                    let field_inputarg = field_base + extra_field_count;
                     extra_field_count += 1;
                     (descr.clone(), field_inputarg)
                 })
@@ -263,18 +269,57 @@ impl UnrollOptimizer {
                 fields,
             });
         }
+        // Field inputargs are at positions num_inputs..num_inputs+extra_field_count.
+        // The optimizer must treat them as inputargs (not colliding with trace ops).
         let body_num_inputs = num_inputs + extra_field_count;
 
+        // Remap original trace ops so their positions don't collide with
+        // field inputargs (num_inputs..body_num_inputs).
+        let remap_base = body_num_inputs as u32;
+        let mut remapped_ops = ops.to_vec();
+        let mut pos_remap: HashMap<OpRef, OpRef> = HashMap::new();
+        for op in &mut remapped_ops {
+            if op.pos.0 != u32::MAX && op.pos.0 >= num_inputs as u32 && op.pos.0 < remap_base {
+                let new_pos = OpRef(op.pos.0 + extra_field_count as u32);
+                pos_remap.insert(op.pos, new_pos);
+                op.pos = new_pos;
+            }
+        }
+        // Remap references in args and fail_args
+        for op in &mut remapped_ops {
+            for arg in &mut op.args {
+                if let Some(&new_ref) = pos_remap.get(arg) {
+                    *arg = new_ref;
+                }
+            }
+            if let Some(ref mut fa) = op.fail_args {
+                for arg in fa.iter_mut() {
+                    if let Some(&new_ref) = pos_remap.get(arg) {
+                        *arg = new_ref;
+                    }
+                }
+            }
+        }
+
         let mut constants_p2 = constants_p1.clone();
+        // Also remap constants keys
+        let mut remapped_constants = std::collections::HashMap::new();
+        for (&k, &v) in constants_p2.iter() {
+            let new_k = pos_remap.get(&OpRef(k)).map_or(k, |r| r.0);
+            remapped_constants.insert(new_k, v);
+        }
+        constants_p2 = remapped_constants;
+
         let mut opt_body = if let Some(ref config) = vable_config {
             crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config.clone())
         } else {
             crate::optimizer::Optimizer::default_pipeline()
         };
         opt_body.imported_virtuals = imported;
-        // No OptUnroll in Phase 2 — same trace, different initial state
+        opt_body.set_flatten_virtuals_at_jump(true);
+        // No OptUnroll in Phase 2 — same trace (remapped), different initial state
         let body_result = opt_body.optimize_with_constants_and_inputs(
-            ops,
+            &remapped_ops,
             &mut constants_p2,
             body_num_inputs,
         );

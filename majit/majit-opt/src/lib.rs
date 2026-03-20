@@ -340,6 +340,9 @@ pub trait Optimization {
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
 
+    /// RPython unroll.py: set Phase 2 flatten mode (only OptVirtualize uses this).
+    fn set_flatten_virtuals_at_jump(&mut self, _enabled: bool) {}
+
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
     /// Contribute operations to the short preamble builder.
     /// Called after preamble optimization to collect ops that bridges need to replay.
