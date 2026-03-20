@@ -164,13 +164,27 @@ impl UnrollOptimizer {
         let p1_ni = opt_p1.final_num_inputs();
         let jump_virtuals = std::mem::take(&mut opt_p1.exported_jump_virtuals);
 
-        let exported_state = match opt_p1.exported_loop_state.clone() {
+        let mut exported_state = match opt_p1.exported_loop_state.clone() {
             Some(state) => state,
             None => {
                 *constants = consts_p1;
                 return (p1_ops, p1_ni);
             }
         };
+        // Determine types of end_args from Phase 1's output ops.
+        // This enables Phase 2 to skip unboxing for Int/Float-typed args.
+        {
+            let op_types: HashMap<OpRef, Type> = p1_ops
+                .iter()
+                .filter(|op| !op.pos.is_none())
+                .map(|op| (op.pos, op.opcode.result_type()))
+                .collect();
+            exported_state.end_arg_types = exported_state
+                .end_args
+                .iter()
+                .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
+                .collect();
+        }
         self.ensure_preamble_target_token();
         // RPython import_state/export_state preserve the original loop-header
         // contract. Virtual structure is restored through VirtualState, not by
@@ -489,6 +503,9 @@ pub struct ExportedState {
     pub end_args: Vec<OpRef>,
     /// Args for the next iteration (before forcing).
     pub next_iteration_args: Vec<OpRef>,
+    /// Types of end_args as determined by Phase 1 optimization.
+    /// Used by Phase 2 import_state to propagate unboxed types.
+    pub end_arg_types: Vec<Type>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::virtualstate::VirtualState,
     /// unroll.py: exported_infos — optimizer knowledge from preamble.
@@ -609,6 +626,7 @@ impl ExportedState {
         ExportedState {
             end_args,
             next_iteration_args,
+            end_arg_types: Vec::new(),
             virtual_state,
             exported_infos,
             exported_short_ops,
@@ -1032,7 +1050,7 @@ impl OptUnroll {
             for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
                 let _ = optimizer.force_box(arg, ctx);
             }
-            optimizer.flush();
+            optimizer.flush(ctx);
             let Some(builder) = ctx.active_short_preamble_producer_mut() else {
                 break;
             };
@@ -1073,6 +1091,15 @@ impl OptUnroll {
             // unroll.py:487: info = exported_state.exported_infos.get(target, None)
             if let Some(info) = exported_state.exported_infos.get(target) {
                 self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
+            }
+            // When the preamble unboxed a Ref arg into Int/Float, the
+            // forwarded target is a raw value. Set int_lower_bounds to
+            // mark it as an int-typed loop-carried value for Phase 2's
+            // int bounds pass (nonneg optimization).
+            if let Some(&arg_type) = exported_state.end_arg_types.get(i) {
+                if arg_type == Type::Int {
+                    ctx.int_lower_bounds.entry(*target).or_insert(i64::MIN);
+                }
             }
         }
 
@@ -1435,8 +1462,11 @@ impl OptUnroll {
                         same_as_source: entry.same_as_source,
                     })
                 }
-                crate::shortpreamble::PreambleOpKind::Heap { descr_idx } => {
+                crate::shortpreamble::PreambleOpKind::Heap => {
                     let Some(object_slot) = short_boxes.lookup_label_arg(entry.op.arg(0)) else {
+                        continue;
+                    };
+                    let Some(descr_idx) = entry.op.descr.as_ref().map(|d| d.index()) else {
                         continue;
                     };
                     match entry.op.opcode {
@@ -2882,11 +2912,15 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(OpCode::GetfieldGcI, &[OpRef(10)]);
+                    let mut op = Op::with_descr(
+                        OpCode::GetfieldGcI,
+                        &[OpRef(10)],
+                        majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+                    );
                     op.pos = OpRef(11);
                     op
                 },
-                kind: crate::shortpreamble::PreambleOpKind::Heap { descr_idx: 55 },
+                kind: crate::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
                 invented_name: false,
                 same_as_source: None,
