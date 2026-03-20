@@ -2270,9 +2270,17 @@ impl TraceFrameState {
                 // self-recursive "Inline" path is still helper-boundary,
                 // so prefer direct CallAssembler as soon as a compiled token
                 // exists instead of paying that extra helper layer.
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][call-check] is_self={} cache_safe={} inline_active={} callee_key={}",
+                        is_self_recursive,
+                        crate::call_jit::recursive_force_cache_safe(concrete_callable),
+                        inline_framestack_active,
+                        callee_key
+                    );
+                }
                 if is_self_recursive
                     && crate::call_jit::recursive_force_cache_safe(concrete_callable)
-                    && !inline_framestack_active
                 {
                     // RPython parity: compiled code calls compiled code
                     // directly via CALL_ASSEMBLER. Guard failures in the
@@ -2377,6 +2385,15 @@ impl TraceFrameState {
                     }
                 }
 
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][call-dispatch] callee_key={} pending_token={:?} loop_token={:?} is_self={}",
+                        callee_key,
+                        driver.get_pending_token_number(callee_key),
+                        driver.get_loop_token_number(callee_key),
+                        is_self_recursive
+                    );
+                }
                 if let Some(token_number) = driver.get_pending_token_number(callee_key)
                 {
                     let callee_nlocals = {

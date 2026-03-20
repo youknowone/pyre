@@ -3845,11 +3845,15 @@ impl<M: Clone> MetaInterp<M> {
             }
 
             // Self-recursion: PyPy max_unroll_recursion strategy.
+            // RPython warmstate.py:714 get_assembler_token: when the
+            // callee is not yet compiled, compile_tmp_callback creates
+            // a temporary token so CALL_ASSEMBLER can still be emitted.
+            // In pyre, pending_token serves the same role.
             if is_self_recursive {
                 if recursive_depth < self.max_unroll_recursion {
                     return InlineDecision::Inline;
                 }
-                if callee_compiled {
+                if callee_compiled || self.pending_token.map_or(false, |(k, _)| k == callee_key) {
                     return InlineDecision::CallAssembler;
                 }
                 self.warm_state.boost_function_entry(callee_key);
