@@ -237,10 +237,35 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        for (key, mut op) in pending {
-            if Self::emit_lazy_setfield(&mut op, ctx) {
-                self.cached_fields.insert(key, op.arg(1));
+        // 2-pass: first force all virtual values (emit New + SetfieldGc),
+        // then emit all pool writebacks. This ensures SSA ordering:
+        // v16 = New() must appear BEFORE SetfieldGc(pool, v16).
+        // Pass 1: force virtuals
+        for (_key, op) in &pending {
+            let orig_val = op.arg(1);
+            if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
+                if info.is_virtual() {
+                    info.force_to_ops(orig_val, ctx);
+                }
             }
+        }
+        // Pass 2: emit pool writebacks (with resolved forwarding)
+        for (key, mut op) in pending {
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+            let val = op.arg(1);
+            // Skip if value still undefined after force
+            if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000 {
+                let defined = ctx.new_operations.iter().any(|o| {
+                    o.pos == val && o.opcode.result_type() != Type::Void
+                });
+                if !defined {
+                    continue;
+                }
+            }
+            ctx.emit(op.clone());
+            self.cached_fields.insert(key, op.arg(1));
         }
     }
 
