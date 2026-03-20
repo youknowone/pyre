@@ -228,65 +228,85 @@ impl UnrollOptimizer {
         // compile.py:291-292: optimize the SAME trace again, with imported state.
         // unroll.py:make_inputargs_and_virtuals — flatten virtual fields.
         if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[jit] preamble peeling phase 2: {} virtual(s) at JUMP",
-                jump_virtuals.len(),
-            );
-        }
-
-        // Build body trace: prepend New+SetfieldGc reconstruction, then original ops
-        let body_trace =
-            build_body_trace_with_virtual_import(ops, &jump_virtuals, num_inputs);
-
-        if let Some((body_ops, body_num_inputs)) = body_trace {
-            let mut constants_p2 = constants_p1.clone();
-            let mut opt_body = if let Some(ref config) = vable_config {
-                crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config.clone())
-            } else {
-                crate::optimizer::Optimizer::default_pipeline()
-            };
-            let body_result = opt_body.optimize_with_constants_and_inputs(
-                &body_ops,
-                &mut constants_p2,
-                body_num_inputs,
-            );
-            let body_final = opt_body.final_num_inputs();
-
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                let new_count = body_result
-                    .iter()
-                    .filter(|op| op.opcode == OpCode::New || op.opcode == OpCode::NewWithVtable)
-                    .count();
+            for v in &jump_virtuals {
                 eprintln!(
-                    "[jit] phase 2: {} ops, {} New remaining (0 = fully virtualized)",
-                    body_result.len(),
-                    new_count,
+                    "[jit] phase 2: virtual at JUMP arg {} ({} fields, size={})",
+                    v.jump_arg_index,
+                    v.fields.len(),
+                    v.size_descr.index(),
                 );
             }
-
-            // compile.py:310-338: combine preamble + Label + body
-            let combined = combine_preamble_and_body(
-                &preamble_result,
-                &body_result,
-                preamble_num_inputs,
-                body_final,
-            );
-
-            *constants = constants_p2;
-            let sp = crate::shortpreamble::extract_short_preamble(&combined);
-            if !sp.is_empty() {
-                self.short_preamble = Some(sp);
-            }
-            return (combined, body_final);
         }
 
-        // Import failed — fall back to Phase 1
-        *constants = constants_p1;
-        let sp = crate::shortpreamble::extract_short_preamble(&preamble_result);
+        // RPython unroll.py:479-504: import_state
+        // Phase 2 processes the SAME original trace as Phase 1.
+        // The optimizer is pre-populated with imported virtual state so
+        // OptVirtualize knows certain inputargs are virtual from the start.
+        //
+        // For each virtual JUMP arg, we add extra inputargs for the field values.
+        // The optimizer sees these extra inputargs as the virtual's fields.
+        let mut imported = Vec::new();
+        let mut extra_field_count = 0;
+        for virt in &jump_virtuals {
+            let fields: Vec<(majit_ir::DescrRef, usize)> = virt
+                .fields
+                .iter()
+                .map(|(descr, _concrete)| {
+                    let field_inputarg = num_inputs + extra_field_count;
+                    extra_field_count += 1;
+                    (descr.clone(), field_inputarg)
+                })
+                .collect();
+            imported.push(crate::optimizer::ImportedVirtual {
+                inputarg_index: virt.jump_arg_index,
+                size_descr: virt.size_descr.clone(),
+                fields,
+            });
+        }
+        let body_num_inputs = num_inputs + extra_field_count;
+
+        let mut constants_p2 = constants_p1.clone();
+        let mut opt_body = if let Some(ref config) = vable_config {
+            crate::optimizer::Optimizer::default_pipeline_with_virtualizable(config.clone())
+        } else {
+            crate::optimizer::Optimizer::default_pipeline()
+        };
+        opt_body.imported_virtuals = imported;
+        // No OptUnroll in Phase 2 — same trace, different initial state
+        let body_result = opt_body.optimize_with_constants_and_inputs(
+            ops,
+            &mut constants_p2,
+            body_num_inputs,
+        );
+        let body_final = opt_body.final_num_inputs();
+
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            let new_count = body_result
+                .iter()
+                .filter(|op| op.opcode == OpCode::New || op.opcode == OpCode::NewWithVtable)
+                .count();
+            eprintln!(
+                "[jit] phase 2: {} ops, {} New remaining (0 = fully virtualized)",
+                body_result.len(),
+                new_count,
+            );
+        }
+
+        // compile.py:310-338: combine preamble + Label + body
+        let combined = combine_preamble_and_body(
+            &preamble_result,
+            &body_result,
+            preamble_num_inputs,
+            body_final,
+        );
+
+        *constants = constants_p2;
+        let sp = crate::shortpreamble::extract_short_preamble(&combined);
         if !sp.is_empty() {
             self.short_preamble = Some(sp);
         }
-        (preamble_result, preamble_num_inputs)
+        return (combined, body_final);
+
     }
 
     /// Count the guards in an optimized trace (for retrace_limit checks).

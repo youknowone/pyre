@@ -49,6 +49,22 @@ pub struct Optimizer {
     /// RPython unroll.py: virtual structures found in JUMP args during preamble.
     /// Populated by OptVirtualize.export_virtual_for_preamble().
     pub exported_jump_virtuals: Vec<ExportedJumpVirtual>,
+    /// RPython unroll.py: import_state — virtual structures to inject at Phase 2 start.
+    /// Maps inputarg index → (size_descr, [(field_descr, field_inputarg_index)]).
+    /// OptVirtualize reads this during setup to mark inputargs as virtual.
+    pub imported_virtuals: Vec<ImportedVirtual>,
+}
+
+/// RPython unroll.py: import_state virtual info for Phase 2.
+/// Tells OptVirtualize that an inputarg is a virtual object.
+#[derive(Clone, Debug)]
+pub struct ImportedVirtual {
+    /// Inputarg index that holds this virtual.
+    pub inputarg_index: usize,
+    /// Size descriptor for the virtual's New().
+    pub size_descr: majit_ir::DescrRef,
+    /// Fields: (field_descr, inputarg_index_of_field_value).
+    pub fields: Vec<(majit_ir::DescrRef, usize)>,
 }
 
 /// RPython unroll.py: ExportedState virtual field info.
@@ -76,6 +92,7 @@ impl Optimizer {
             quasi_immutable_deps: std::collections::HashSet::new(),
             resumedata_memo_consts: std::collections::HashMap::new(),
             exported_jump_virtuals: Vec::new(),
+            imported_virtuals: Vec::new(),
         }
     }
 
@@ -484,6 +501,36 @@ impl Optimizer {
                     }
                     break;
                 }
+            }
+        }
+
+        // RPython unroll.py:479-504: import_state — inject virtual info from Phase 1.
+        // Tells OptVirtualize that certain inputargs are virtual objects.
+        if !self.imported_virtuals.is_empty() {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[jit] import_state: {} imported virtuals", self.imported_virtuals.len());
+            }
+            for iv in &self.imported_virtuals {
+                let opref = OpRef(iv.inputarg_index as u32);
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    let field_info: Vec<_> = iv.fields.iter().map(|(d, idx)| format!("descr={} -> inputarg {}", d.index(), idx)).collect();
+                    eprintln!("[jit]   v{} = VirtualStruct(size={}, fields=[{}])", iv.inputarg_index, iv.size_descr.index(), field_info.join(", "));
+                }
+                let mut fields = Vec::new();
+                let mut field_descrs = Vec::new();
+                for (descr, field_inputarg_idx) in &iv.fields {
+                    let field_ref = OpRef(*field_inputarg_idx as u32);
+                    fields.push((descr.index(), field_ref));
+                    field_descrs.push((descr.index(), descr.clone()));
+                }
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualStruct(crate::info::VirtualStructInfo {
+                        descr: iv.size_descr.clone(),
+                        fields,
+                        field_descrs,
+                    }),
+                );
             }
         }
 
