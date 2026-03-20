@@ -1631,7 +1631,7 @@ impl BlackholeInterpreter {
             .unwrap_or(0)
     }
 
-    fn runtime_stack_push(&mut self, selected: usize, value: i64) {
+    pub fn runtime_stack_push(&mut self, selected: usize, value: i64) {
         self.runtime_stacks.entry(selected).or_default().push(value);
     }
 
@@ -1660,14 +1660,16 @@ impl BlackholeInterpreter {
 
     /// Execute the dispatch loop on the current jitcode.
     ///
-    /// RPython: `BlackholeInterpreter.run()` → `dispatch_loop()`
-    pub fn run(&mut self) -> Result<(), LeaveFrame> {
+    /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks.
+    pub fn run(&mut self) {
         loop {
             if self.finished() {
-                return Err(LeaveFrame);
+                return;
             }
             let opcode = self.next_u8();
-            self.dispatch_one(opcode)?;
+            if self.dispatch_one(opcode).is_err() {
+                return; // LeaveFrame: return/abort hit
+            }
         }
     }
 
@@ -2085,7 +2087,7 @@ impl BlackholeInterpreter {
     ///
     /// RPython: `BlackholeInterpreter._resume_mainloop(current_exc)`
     pub fn resume_mainloop(&mut self) -> BhReturnType {
-        let _ = self.run();
+        self.run();
         self.return_type
     }
 }

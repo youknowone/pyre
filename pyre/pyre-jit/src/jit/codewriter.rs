@@ -56,6 +56,10 @@ pub struct CodeWriter {
     pub load_global_fn: extern "C" fn(i64, i64) -> i64,
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     pub binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// Box a raw integer into a PyObject (w_int_new).
+    pub box_int_fn: extern "C" fn(i64) -> i64,
+    /// Truthiness check: PyObjectRef → raw 0 or 1.
+    pub truth_fn: extern "C" fn(i64) -> i64,
 }
 
 impl CodeWriter {
@@ -64,12 +68,16 @@ impl CodeWriter {
         load_global_fn: extern "C" fn(i64, i64) -> i64,
         compare_fn: extern "C" fn(i64, i64, i64) -> i64,
         binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
+        box_int_fn: extern "C" fn(i64) -> i64,
+        truth_fn: extern "C" fn(i64) -> i64,
     ) -> Self {
         Self {
             call_fn,
             load_global_fn,
             compare_fn,
             binary_op_fn,
+            box_int_fn,
+            truth_fn,
         }
     }
 
@@ -100,6 +108,8 @@ impl CodeWriter {
         let load_global_fn_idx = assembler.add_fn_ptr(self.load_global_fn as *const ());
         let compare_fn_idx = assembler.add_fn_ptr(self.compare_fn as *const ());
         let binary_op_fn_idx = assembler.add_fn_ptr(self.binary_op_fn as *const ());
+        let box_int_fn_idx = assembler.add_fn_ptr(self.box_int_fn as *const ());
+        let truth_fn_idx = assembler.add_fn_ptr(self.truth_fn as *const ());
 
         // RPython flatten.py: pre-create labels for each block.
         // Python bytecodes are linear, so each instruction index gets a label.
@@ -150,8 +160,11 @@ impl CodeWriter {
                 }
 
                 Instruction::LoadSmallInt { i } => {
+                    // All stack values must be PyObjectRef pointers.
+                    // Box the raw integer via w_int_new.
                     let val = i.get(op_arg) as u32 as i64;
                     assembler.load_const_i_value(tmp0, val);
+                    assembler.call_int(box_int_fn_idx, &[tmp0], tmp0);
                     assembler.push_i(tmp0);
                 }
 
@@ -203,6 +216,8 @@ impl CodeWriter {
                 }
 
                 // RPython jtransform.py: optimize_goto_if_not → goto_if_not
+                // Stack top is a Python object (True/False). We need to
+                // convert to raw 0/1 for branch_reg_zero.
                 Instruction::PopJumpIfFalse { delta } => {
                     let target_py_pc = jump_target_forward(
                         num_instrs,
@@ -210,6 +225,8 @@ impl CodeWriter {
                         delta.get(op_arg).as_usize(),
                     );
                     assembler.pop_i(tmp0);
+                    // truth_fn: PyObjectRef → 0/1 (truthiness check)
+                    assembler.call_int(truth_fn_idx, &[tmp0], tmp0);
                     if target_py_pc < num_instrs {
                         assembler.branch_reg_zero(tmp0, labels[target_py_pc]);
                     }

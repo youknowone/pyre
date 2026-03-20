@@ -417,7 +417,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     }
 
     // PyPy assembler_call_helper (warmspot.py:1021): try compiled code
-    // dispatch first, fall back to interpreter.
+    // dispatch first, fall back to blackhole interpreter.
     let (driver, _) = crate::eval::driver_pair();
     if let Some(token) = driver.get_loop_token(green_key) {
         let token_num = token.number;
@@ -462,27 +462,20 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     }
 
     // RPython parity: assembler_call_helper falls back to blackhole
-    // interpreter, NOT the full tracing interpreter. Using eval_with_jit
-    // here causes re-entry into compiled code → same guard failure →
-    // sync_jit_state_to_frame with wrong state → wrong results.
-    // Use eval_frame_plain (pure interpreter, no JIT re-entry).
-    match pyre_interp::eval::eval_frame_plain(frame) {
-        Ok(result) => {
-            let value = match protocol {
-                FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => {
-                    unsafe { w_int_get_value(result) }
-                }
-                FinishProtocol::RawInt => result as i64,
-                FinishProtocol::Boxed => result as i64,
-            };
-            force_cache_store(protocol, hash_idx, code_key, arg_key, value);
-            // Return boxed for the caller's trace (CallMayForceR expects pointer)
-            match protocol {
-                FinishProtocol::RawInt => w_int_new(value) as i64,
-                FinishProtocol::Boxed => value,
-            }
+    // interpreter. resume_in_blackhole runs jitcode with no JIT hooks,
+    // matching RPython's ResumeGuardForcedDescr.handle_fail() path.
+    let result = resume_in_blackhole(frame);
+    let value = match protocol {
+        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => {
+            unsafe { w_int_get_value(result) }
         }
-        Err(err) => panic!("jit force callee frame failed: {err}"),
+        FinishProtocol::RawInt => result as i64,
+        FinishProtocol::Boxed => result as i64,
+    };
+    force_cache_store(protocol, hash_idx, code_key, arg_key, value);
+    match protocol {
+        FinishProtocol::RawInt => w_int_new(value) as i64,
+        FinishProtocol::Boxed => value,
     }
 }
 
@@ -566,20 +559,95 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
         return cached;
     }
 
-    match pyre_interp::eval::eval_loop_for_force(frame) {
-        Ok(result) => {
-            let value = match protocol {
-                FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-                    w_int_get_value(result)
-                },
-                FinishProtocol::RawInt => result as i64,
-                FinishProtocol::Boxed => result as i64,
-            };
-            force_cache_store(protocol, hash_idx, code_key, arg_key, value);
-            value
+    // RPython: ResumeGuardForcedDescr.handle_fail() calls
+    // resume_in_blackhole() which runs the blackhole interpreter
+    // on jitcode bytecodes. This ensures no JIT re-entry.
+    let result = resume_in_blackhole(frame);
+
+    let value = match protocol {
+        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
+            w_int_get_value(result)
+        },
+        FinishProtocol::RawInt => result as i64,
+        FinishProtocol::Boxed => result as i64,
+    };
+    force_cache_store(protocol, hash_idx, code_key, arg_key, value);
+    value
+}
+
+/// RPython: blackhole.py resume_in_blackhole()
+///
+/// Compiles the frame's CodeObject to JitCode (via CodeWriter), creates
+/// a BlackholeInterpreter, loads frame state, and runs it.
+/// The blackhole has NO JIT entry points — structural isolation.
+fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
+    let code = unsafe { &*frame.code };
+
+    // RPython: blackhole_from_resumedata() → setposition + consume_one_section
+    // For pyre, we compile Python bytecodes to JitCode and load frame state.
+    let writer = crate::jit::codewriter::CodeWriter::new(
+        bh_call_fn,
+        bh_load_global_fn,
+        bh_compare_fn,
+        bh_binary_op_fn,
+        bh_box_int_fn,
+        bh_truth_fn,
+    );
+    let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+
+    // Map Python PC → JitCode PC
+    let py_pc = frame.next_instr;
+    let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
+        pyjitcode.pc_map[py_pc]
+    } else {
+        0
+    };
+
+    // RPython: blackholeinterp = builder.acquire_interp()
+    let mut bh = majit_meta::blackhole::BlackholeInterpreter::new();
+    // RPython: blackholeinterp.setposition(jitcode, pc)
+    bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
+
+    // RPython: resumereader.consume_one_section(curbh) — load register values
+    // For pyre: fast locals → int registers, value stack → runtime stack
+    let nlocals = code.varnames.len();
+    for i in 0..nlocals {
+        if i < frame.locals_cells_stack_w.len() {
+            bh.setarg_i(i, frame.locals_cells_stack_w[i] as i64);
         }
-        Err(err) => panic!("jit force callee frame (interp) failed: {err}"),
     }
+
+    // Load value stack into blackhole runtime stack
+    let stack_base = nlocals;
+    let vsd = frame.valuestackdepth;
+    for i in stack_base..vsd {
+        if i < frame.locals_cells_stack_w.len() {
+            bh.runtime_stack_push(0, frame.locals_cells_stack_w[i] as i64);
+        }
+    }
+
+    // Set frame pointer in frame_reg (nlocals+3) for LOAD_GLOBAL and CALL
+    if nlocals + 3 < bh.registers_i.len() {
+        bh.setarg_i(nlocals + 3, frame as *mut PyFrame as i64);
+    }
+
+    // RPython: _run_forever(blackholeinterp, current_exc)
+    bh.run();
+
+    // Return value is in registers_i[0] (set by RETURN_VALUE → move_i(0, tmp0))
+    let result = bh.registers_i[0] as PyObjectRef;
+    if majit_meta::majit_log_enabled() {
+        let int_val = if !result.is_null() && unsafe { is_int(result) } {
+            Some(unsafe { w_int_get_value(result) })
+        } else {
+            None
+        };
+        eprintln!(
+            "[jit][blackhole] resume result raw={} int_val={:?} pc={}",
+            bh.registers_i[0], int_val, py_pc
+        );
+    }
+    result
 }
 
 /// Interpreter-only force without memoization.
@@ -1250,7 +1318,7 @@ pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
     // when combined with the IN_BLACKHOLE guard in try_function_entry_jit.
     let parent_frame = unsafe { &*(frame_ptr as *const PyFrame) };
 
-    if !is_func(callable) {
+    if !unsafe { is_func(callable) } {
         // Builtin function: call directly
         let func = unsafe { pyre_runtime::w_builtin_func_get(callable) };
         let args = [arg0 as PyObjectRef];
@@ -1272,14 +1340,10 @@ pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
     );
     callee_frame.fix_array_ptrs();
 
-    // RPython: blackhole executes callee's jitcode recursively.
-    // For now, use eval_frame_plain (pure interpreter, no JIT re-entry).
-    // This is safe because bh_call_fn is only called from within the
-    // BlackholeInterpreter's dispatch loop, which has no JIT hooks.
-    match pyre_interp::eval::eval_frame_plain(&mut callee_frame) {
-        Ok(result) => result as i64,
-        Err(_) => 0,
-    }
+    // RPython: bhimpl_recursive_call_i calls portal_runner directly,
+    // which runs the blackhole interpreter recursively.
+    // We recursively call resume_in_blackhole on the callee frame.
+    resume_in_blackhole(&mut callee_frame) as i64
 }
 
 /// RPython: bhimpl_residual_call — LOAD_GLOBAL helper.
@@ -1307,6 +1371,20 @@ pub extern "C" fn bh_load_global_fn(frame_ptr: i64, namei: i64) -> i64 {
     }
 }
 
+/// Box a raw integer into a PyObject (w_int_new wrapper).
+pub extern "C" fn bh_box_int_fn(value: i64) -> i64 {
+    w_int_new(value) as i64
+}
+
+/// Truthiness check: PyObjectRef → raw 0 or 1.
+pub extern "C" fn bh_truth_fn(value: i64) -> i64 {
+    let obj = value as PyObjectRef;
+    if obj.is_null() {
+        return 0;
+    }
+    pyre_objspace::opcode_ops::truth_value(obj) as i64
+}
+
 /// RPython: bhimpl_int_lt, bhimpl_int_eq, etc. — comparison helper.
 ///
 /// Performs a Python-level comparison and returns a boolean PyObject.
@@ -1318,11 +1396,11 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return 0;
     }
 
-    // CPython 3.13: COMPARE_OP oparg encodes comparison in low bits.
-    // Bits 4+ are flags (e.g. bit 4 = "bool" conversion).
-    // Extract the comparison operator index (low 4 bits).
-    let cmp_tag = (op_code >> 4) as i64;
-    match pyre_objspace::opcode_ops::compare_value_from_tag(lhs, rhs, cmp_tag) {
+    // op_code is the raw CPython COMPARE_OP oparg (= ComparisonOperator discriminant).
+    // Transmute back and call compare_value.
+    use pyre_bytecode::bytecode::ComparisonOperator;
+    let op: ComparisonOperator = unsafe { std::mem::transmute(op_code as u8) };
+    match pyre_objspace::opcode_ops::compare_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(_) => 0,
     }
@@ -1339,7 +1417,11 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return 0;
     }
 
-    match pyre_objspace::opcode_ops::binary_value_from_tag(lhs, rhs, op_code) {
+    // op_code is the raw CPython BINARY_OP oparg (= BinaryOperator discriminant).
+    // Transmute back to BinaryOperator enum and call binary_value.
+    use pyre_bytecode::bytecode::BinaryOperator;
+    let op: BinaryOperator = unsafe { std::mem::transmute(op_code as u8) };
+    match pyre_objspace::opcode_ops::binary_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(_) => 0,
     }
