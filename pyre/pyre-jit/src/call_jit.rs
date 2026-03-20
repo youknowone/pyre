@@ -46,7 +46,7 @@ fn force_cache_index(code_key: usize, arg_key: usize) -> usize {
 #[inline]
 fn finish_protocol(green_key: u64) -> FinishProtocol {
     let (driver, _) = crate::eval::driver_pair();
-    if driver.has_raw_int_finish(green_key) {
+    if driver.has_raw_int_finish(green_key) || crate::eval::has_finish_protocol_hint(green_key) {
         FinishProtocol::RawInt
     } else {
         FinishProtocol::Boxed
@@ -233,11 +233,7 @@ fn recursive_dispatch(
         }
 
         let (driver, _) = crate::eval::driver_pair();
-        let protocol = if driver.has_raw_int_finish(green_key) {
-            FinishProtocol::RawInt
-        } else {
-            FinishProtocol::Boxed
-        };
+        let protocol = finish_protocol(green_key);
         let token_num = driver.get_loop_token(green_key).map(|token| token.number);
         let memo_safe = recursive_force_cache_safe(callable);
         if token_num.is_some() {
@@ -257,11 +253,7 @@ fn self_recursive_dispatch(green_key: u64) -> (FinishProtocol, Option<u64>) {
         }
 
         let (driver, _) = crate::eval::driver_pair();
-        let protocol = if driver.has_raw_int_finish(green_key) {
-            FinishProtocol::RawInt
-        } else {
-            FinishProtocol::Boxed
-        };
+        let protocol = finish_protocol(green_key);
         let token_num = driver.get_loop_token(green_key).map(|token| token.number);
         if token_num.is_some() {
             *slot = Some((green_key, protocol, token_num));
@@ -432,13 +424,11 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         );
     }
 
-    // RPython parity: assembler_call_helper (warmspot.py:1021) calls
-    // fail_descr.handle_fail() → resume_in_blackhole(). It does NOT
-    // try to re-execute compiled code. Always use the blackhole.
-    //
-    // Bump recursive_force_entry to prevent JIT re-entry from any
-    // interpreter code called during blackhole execution.
-    let _force_guard = crate::eval::blackhole_entry_bump();
+    // RPython: resume_in_blackhole for THIS frame.
+    // TODO: RPython allows nested bhimpl_recursive_call to use
+    // RPython: resume_in_blackhole runs jitcode (no jit_merge_point).
+    // bhimpl_recursive_call → portal_runner → JIT allowed for callees.
+    // No blackhole_entry_bump needed — structural isolation via jitcode.
     let result = resume_in_blackhole(frame);
     let value = match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
@@ -449,7 +439,10 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     };
     force_cache_store(protocol, hash_idx, code_key, arg_key, value);
     match protocol {
-        FinishProtocol::RawInt => w_int_new(value) as i64,
+        // RPython parity: CallAssemblerI keeps the callee's unboxed INT
+        // result all the way through the force path as well.  Re-boxing here
+        // corrupts callers that already treat the result as a raw int.
+        FinishProtocol::RawInt => value,
         FinishProtocol::Boxed => value,
     }
 }
@@ -518,7 +511,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
 /// to handle guard failures without recursive compiled dispatch.
 extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
-    let _force_guard = crate::eval::blackhole_entry_bump();
+    // RPython: blackhole interp — no blackhole_entry_bump needed.
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
@@ -564,22 +557,12 @@ pub fn resume_in_blackhole_pub(frame: &mut PyFrame) -> pyre_object::PyObjectRef 
 /// a BlackholeInterpreter, loads frame state, and runs it.
 /// The blackhole has NO JIT entry points — structural isolation.
 fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
-    // Ensure JIT re-entry is blocked for all code called during
-    // blackhole execution, including nested calls through bh_call_fn.
-    let _force_guard = crate::eval::blackhole_entry_bump();
+    // RPython parity: blackhole has no jit_merge_point, but
+    // bhimpl_recursive_call calls portal_runner which CAN enter JIT.
+    // eval_frame_plain handles THIS frame without JIT hooks;
+    // nested calls go through eval_with_jit normally.
     let code = unsafe { &*frame.code };
     let py_pc = frame.next_instr;
-
-    // RPython handles guard failure recovery via bridge compilation
-    // (compile.py:696-728). Until proper bridge tracing is implemented,
-    // use eval_frame_plain for force_fn calls. This is faster than the
-    // full blackhole path because it avoids JitCode compilation and
-    // BlackholeInterpreter setup. in_blackhole_entry() prevents JIT
-    // re-entry from nested calls.
-    match pyre_interp::eval::eval_frame_plain(frame) {
-        Ok(result) => return result,
-        Err(_) => return pyre_object::PY_NULL,
-    }
 
     // RPython: blackhole_from_resumedata() → setposition + consume_one_section
     // For pyre, we compile Python bytecodes to JitCode and load frame state.
@@ -1173,6 +1156,16 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1(caller_frame: i64, ar
     create_self_recursive_callee_frame_impl_1_boxed(caller_frame, arg0 as PyObjectRef)
 }
 
+/// Self-recursive raw-int variant: accepts a raw int and boxes it when
+/// materializing the interpreter frame local.
+pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
+    caller_frame: i64,
+    raw_int_arg: i64,
+) -> i64 {
+    let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
+    create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed)
+}
+
 /// Raw-int variant: accepts a raw int and boxes it internally.
 /// Eliminates trace_box_int CallI from the trace (boxing folded into frame creation).
 pub extern "C" fn jit_create_callee_frame_1_raw_int(
@@ -1250,8 +1243,14 @@ pub fn callee_frame_helper(nargs: usize) -> Option<*const ()> {
 /// Unlike jit_force_callee_frame which returns raw int for the CA protocol,
 /// this returns a boxed PyObjectRef for use in traces that expect boxed values.
 pub extern "C" fn jit_force_callee_frame_boxed(frame_ptr: i64) -> i64 {
-    // jit_force_callee_frame now returns boxed, so no re-boxing needed.
-    jit_force_callee_frame(frame_ptr)
+    let frame = unsafe { &*(frame_ptr as *const PyFrame) };
+    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
+    let protocol = finish_protocol(green_key);
+    let result = jit_force_callee_frame(frame_ptr);
+    match protocol {
+        FinishProtocol::RawInt => w_int_new(result) as i64,
+        FinishProtocol::Boxed => result,
+    }
 }
 
 pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
