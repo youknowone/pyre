@@ -917,6 +917,15 @@ impl Optimizer {
         });
         self.exported_jump_virtuals = exported_jump_virtuals;
 
+        // RPython: emit_extra routes ops through send_extra_operation which
+        // processes them immediately. In majit, force_virtual during
+        // exported_loop_state pushes to extra_operations which aren't drained
+        // outside the pass chain. Drain them now so forced New ops reach
+        // new_operations and lazy_set refs resolve correctly.
+        while let Some(op) = ctx.pop_extra_operation() {
+            ctx.emit(op);
+        }
+
         // final_num_inputs = original inputs + virtual inputs added by passes.
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
         self.final_num_inputs = num_inputs + num_virtual_inputs;

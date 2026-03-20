@@ -466,14 +466,34 @@ impl OptHeap {
         for (obj, descr_idx) in field_keys {
             if ei.check_readonly_descr_field(descr_idx) {
                 // Call reads this field → force lazy set (but keep cache)
-                if let Some(lazy_op) = self.lazy_setfields.remove(&(obj, descr_idx)) {
-                    ctx.emit(lazy_op);
+                if let Some(mut lazy_op) = self.lazy_setfields.remove(&(obj, descr_idx)) {
+                    for arg in lazy_op.args.iter_mut() {
+                        *arg = ctx.get_replacement(*arg);
+                    }
+                    let val = lazy_op.arg(1);
+                    if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000
+                        && !ctx.new_operations.iter().any(|o| o.pos == val)
+                    {
+                        // Value points to undrained force position — skip
+                    } else {
+                        ctx.emit(lazy_op);
+                    }
                 }
             }
             if ei.check_write_descr_field(descr_idx) {
                 // Call writes this field → force lazy set AND invalidate cache
-                if let Some(lazy_op) = self.lazy_setfields.remove(&(obj, descr_idx)) {
-                    ctx.emit(lazy_op);
+                if let Some(mut lazy_op) = self.lazy_setfields.remove(&(obj, descr_idx)) {
+                    for arg in lazy_op.args.iter_mut() {
+                        *arg = ctx.get_replacement(*arg);
+                    }
+                    let val = lazy_op.arg(1);
+                    if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000
+                        && !ctx.new_operations.iter().any(|o| o.pos == val)
+                    {
+                        // Value points to undrained force position — skip
+                    } else {
+                        ctx.emit(lazy_op);
+                    }
                 }
                 if !self.immutable_field_descrs.contains(&descr_idx) {
                     self.cached_fields.remove(&(obj, descr_idx));
@@ -525,37 +545,9 @@ impl OptHeap {
             }
         }
 
-        // Constant-fold: if the source is a compile-time constant address,
-        // read the field value directly from memory. This is safe for
-        // immutable fields (ob_type, etc.). PyPy heap.py does this for
-        // quasi-immutable fields guarded by GUARD_NOT_INVALIDATED.
-        // Constant-fold: source is a compile-time constant address.
-        // Read the field value directly from memory at optimization time.
-        // Safe for immutable fields (ob_type). PyPy heap.py handles this
-        // via quasi-immutable guarded by GUARD_NOT_INVALIDATED.
-        if op.num_args() >= 1 {
-            if let Some(addr) = ctx.get_constant_int(op.arg(0)) {
-                if addr != 0 {
-                    if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_field_descr()) {
-                        let offset = fd.offset();
-                        let field_size = fd.field_size();
-                        if field_size <= 8 {
-                            let ptr = (addr as usize + offset) as *const u8;
-                            let mut buf = [0u8; 8];
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), field_size);
-                            }
-                            let folded = i64::from_ne_bytes(buf);
-                            let const_ref = ctx.find_or_record_constant_int(op.pos, folded);
-                            if const_ref != op.pos {
-                                ctx.replace_op(op.pos, const_ref);
-                            }
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                }
-            }
-        }
+        // RPython heap.py optimize_GETFIELD_GC_* only constant-folds through
+        // optimizer.constant_fold() on a real constant box. Do not peek into
+        // host memory from an arbitrary integer constant here.
 
         // Check lazy set first: if there is a pending SETFIELD for this key,
         // the value is the second arg of that pending op.
@@ -1362,6 +1354,21 @@ mod tests {
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+    }
+
+    #[test]
+    fn test_getfield_does_not_deref_arbitrary_int_constant_base() {
+        let d = immutable_descr(77);
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        ctx.make_constant(OpRef(0), majit_ir::Value::Int(1));
+
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d);
+        op.pos = OpRef(1);
+
+        let result = heap.optimize_getfield(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Emit(_)));
+        assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(1));
     }
 
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──
