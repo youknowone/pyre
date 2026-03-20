@@ -317,7 +317,8 @@ impl MiniMarkGC {
         // copy_nursery_object mutates oldgen/nursery.
         // Pinned objects are left in place (not copied to old gen).
         let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
-        for root_ptr in roots {
+        for (root_idx, root_ptr) in roots.iter().enumerate() {
+            let root_ptr = *root_ptr;
             let gcref = unsafe { *root_ptr };
             if !gcref.is_null() && self.is_nursery_object_start(gcref.0) {
                 if self.pinned_objects.contains(&gcref.0) {
@@ -412,6 +413,17 @@ impl MiniMarkGC {
         }
 
         let type_id = hdr.type_id();
+        if type_id as usize >= self.types.len() {
+            panic!(
+                "GC BUG: invalid type_id={} at obj_addr={:#x} (header_addr={:#x}, nursery={:#x}..{:#x}, forwarded={})",
+                type_id,
+                obj_addr,
+                obj_addr - GcHeader::SIZE,
+                self.nursery.start(),
+                self.nursery.end(),
+                hdr.is_forwarded(),
+            );
+        }
         let type_info = self.types.get(type_id);
 
         // Compute the actual payload size (for varsize objects, read the length).
