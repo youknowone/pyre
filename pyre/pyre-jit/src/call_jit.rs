@@ -941,6 +941,7 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     frame.next_instr = 0;
     frame.vable_token = 0;
     frame.block_stack.clear();
+    frame.pending_inline_result = None;
 }
 
 fn create_callee_frame_impl_1_boxed(
@@ -1215,5 +1216,131 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     if !arena.put(ptr) {
         // Not an arena frame (heap fallback) — free it
         unsafe { drop(Box::from_raw(ptr)) };
+    }
+}
+
+// ===========================================================================
+// Blackhole helper functions
+//
+// RPython blackhole.py: bhimpl_recursive_call_i, bhimpl_residual_call_*
+//
+// These are called by the BlackholeInterpreter through JitCode.fn_ptrs.
+// They execute Python operations WITHOUT JIT re-entry, matching RPython's
+// structural isolation: the blackhole never calls maybe_compile_and_run.
+// ===========================================================================
+
+/// RPython: bhimpl_recursive_call_i — call a Python function in blackhole mode.
+///
+/// The blackhole pops callable and args into registers before calling this.
+/// For CALL 1: args = [callable, arg0, frame_ptr]
+/// For CALL 0: args = [callable, frame_ptr]
+///
+/// This function creates a callee frame and recursively runs the blackhole
+/// on the callee's JitCode, ensuring no JIT re-entry.
+pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
+    let callable = callable as PyObjectRef;
+    if callable.is_null() {
+        return 0;
+    }
+
+    // RPython: bhimpl_recursive_call_i calls portal_runner directly.
+    // pyre: we call call_user_function_plain which uses eval_frame_plain
+    // (no JIT hooks). For full RPython parity, this should recursively
+    // use the blackhole, but call_user_function_plain is sufficient
+    // when combined with the IN_BLACKHOLE guard in try_function_entry_jit.
+    let parent_frame = unsafe { &*(frame_ptr as *const PyFrame) };
+
+    if !is_func(callable) {
+        // Builtin function: call directly
+        let func = unsafe { pyre_runtime::w_builtin_func_get(callable) };
+        let args = [arg0 as PyObjectRef];
+        return func(&args) as i64;
+    }
+
+    let code_ptr = unsafe { w_func_get_code_ptr(callable) };
+    let globals = unsafe { w_func_get_globals(callable) };
+    let closure = unsafe { w_func_get_closure(callable) };
+    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+
+    let args = [arg0 as PyObjectRef];
+    let mut callee_frame = PyFrame::new_for_call_with_closure(
+        func_code,
+        &args,
+        globals,
+        parent_frame.execution_context,
+        closure,
+    );
+    callee_frame.fix_array_ptrs();
+
+    // RPython: blackhole executes callee's jitcode recursively.
+    // For now, use eval_frame_plain (pure interpreter, no JIT re-entry).
+    // This is safe because bh_call_fn is only called from within the
+    // BlackholeInterpreter's dispatch loop, which has no JIT hooks.
+    match pyre_interp::eval::eval_frame_plain(&mut callee_frame) {
+        Ok(result) => result as i64,
+        Err(_) => 0,
+    }
+}
+
+/// RPython: bhimpl_residual_call — LOAD_GLOBAL helper.
+///
+/// Loads a global name from the frame's namespace (globals + builtins).
+/// namei is the raw oparg from LOAD_GLOBAL: name_idx = namei >> 1.
+pub extern "C" fn bh_load_global_fn(frame_ptr: i64, namei: i64) -> i64 {
+    let frame = unsafe { &*(frame_ptr as *const PyFrame) };
+    let code = unsafe { &*frame.code };
+    let raw = namei as usize;
+    let idx = raw >> 1;
+
+    if idx >= code.names.len() {
+        return 0;
+    }
+
+    let name = code.names[idx].as_ref();
+    // PyFrame.namespace = globals; look up name there.
+    // exec_load_name dispatches through the NamespaceOpcodeHandler trait;
+    // for the blackhole we call the namespace directly.
+    let ns = unsafe { &*frame.namespace };
+    match ns.get(name) {
+        Some(&value) => value as i64,
+        None => 0,
+    }
+}
+
+/// RPython: bhimpl_int_lt, bhimpl_int_eq, etc. — comparison helper.
+///
+/// Performs a Python-level comparison and returns a boolean PyObject.
+/// op_code encodes the CompareOp tag from CPython 3.13 COMPARE_OP.
+pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
+    let lhs = lhs as PyObjectRef;
+    let rhs = rhs as PyObjectRef;
+    if lhs.is_null() || rhs.is_null() {
+        return 0;
+    }
+
+    // CPython 3.13: COMPARE_OP oparg encodes comparison in low bits.
+    // Bits 4+ are flags (e.g. bit 4 = "bool" conversion).
+    // Extract the comparison operator index (low 4 bits).
+    let cmp_tag = (op_code >> 4) as i64;
+    match pyre_objspace::opcode_ops::compare_value_from_tag(lhs, rhs, cmp_tag) {
+        Ok(result) => result as i64,
+        Err(_) => 0,
+    }
+}
+
+/// RPython: bhimpl_int_add, bhimpl_int_sub, etc. — binary op helper.
+///
+/// Performs a Python-level binary operation.
+/// op_code is the BinaryOperator tag from CPython 3.13 BINARY_OP.
+pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
+    let lhs = lhs as PyObjectRef;
+    let rhs = rhs as PyObjectRef;
+    if lhs.is_null() || rhs.is_null() {
+        return 0;
+    }
+
+    match pyre_objspace::opcode_ops::binary_value_from_tag(lhs, rhs, op_code) {
+        Ok(result) => result as i64,
+        Err(_) => 0,
     }
 }

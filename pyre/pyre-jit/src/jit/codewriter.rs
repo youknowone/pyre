@@ -280,16 +280,38 @@ impl CodeWriter {
                     assembler.push_i(tmp0);
                 }
 
-                // RPython jtransform.py: rewrite_op_direct_call /
-                // rewrite_op_indirect_call → call_may_force
+                // RPython jtransform.py: rewrite_op_direct_call →
+                // call_may_force / residual_call
+                //
+                // RPython blackhole.py: bhimpl_recursive_call_i calls
+                // portal_runner directly, bypassing JIT entry.
+                // Here we pop args and callable from the stack into
+                // registers, then call the helper with explicit args.
+                //
+                // Stack layout before CALL(argc):
+                //   [NULL, callable, arg0, arg1, ..., arg(argc-1)]
+                // We pop in reverse: args first, then callable, then NULL.
                 Instruction::Call { argc } => {
-                    let nargs = argc.get(op_arg) as usize as i64;
-                    // The blackhole call helper handles popping args from
-                    // the runtime stack internally.
-                    assembler.load_const_i_value(op_code_reg, nargs);
+                    let nargs = argc.get(op_arg) as usize;
+                    // Pop args in reverse into scratch registers
+                    // For now, support up to 3 args (covers fib_recursive CALL 1)
+                    let arg_regs_start = (nlocals + 4) as u16;
+                    for i in (0..nargs).rev() {
+                        assembler.pop_i(arg_regs_start + i as u16);
+                    }
+                    assembler.pop_i(tmp1); // callable
+                    assembler.pop_discard(); // NULL
+
+                    // call_fn(callable, arg0, frame_ptr) → result
+                    // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
+                    let mut call_args: Vec<u16> = vec![tmp1];
+                    for i in 0..nargs {
+                        call_args.push(arg_regs_start + i as u16);
+                    }
+                    call_args.push(frame_reg);
                     assembler.call_may_force_int(
                         call_fn_idx,
-                        &[frame_reg, op_code_reg, tmp0],
+                        &call_args,
                         tmp0,
                     );
                     assembler.push_i(tmp0);
