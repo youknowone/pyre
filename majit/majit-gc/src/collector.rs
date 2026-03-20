@@ -415,12 +415,11 @@ impl MiniMarkGC {
         let type_id = hdr.type_id();
         if type_id as usize >= self.types.len() {
             panic!(
-                "GC BUG: invalid type_id={} at obj_addr={:#x} (header_addr={:#x}, nursery={:#x}..{:#x}, forwarded={})",
+                "GC BUG: invalid type_id={} at obj_addr={:#x} (header_addr={:#x}, nursery_start={:#x}, forwarded={})",
                 type_id,
                 obj_addr,
                 obj_addr - GcHeader::SIZE,
-                self.nursery.start(),
-                self.nursery.end(),
+                self.nursery.start_ptr() as usize,
                 hdr.is_forwarded(),
             );
         }
