@@ -103,6 +103,15 @@ impl TraceCtx {
         self.inline_frames.len()
     }
 
+    /// Update the green key for this trace.
+    ///
+    /// RPython pyjitpl.py reached_loop_header(): when func-entry tracing
+    /// hits a back-edge, the loop must be registered under the back-edge's
+    /// green key, not the function-entry key.
+    pub fn set_green_key(&mut self, key: u64) {
+        self.green_key = key;
+    }
+
     /// Check if `key` matches the current trace's green_key or any
     /// inlined frame's key. Used for self-recursion detection.
     pub fn is_tracing_key(&self, key: u64) -> bool {
