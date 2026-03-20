@@ -1810,16 +1810,23 @@ impl Optimization for OptVirtualize {
             // optimizer must not append its own synthetic inputs here.
             OpCode::Jump if self.vable_config.is_some() => {
                 let frame_ref = ctx.get_replacement(OpRef(0));
-                // Force all virtual args EXCEPT the virtualizable frame
+                // Force virtualizable frame's arrays back to the heap
+                // BEFORE the jump. This ensures nursery-allocated boxed
+                // values are written to frame.locals_cells_stack_w so
+                // the next iteration reads correct (GC-updated) pointers.
+                //
+                // RPython: _jump_to_existing_trace calls
+                // virtualizable.force_virtualizable_if_necessary()
+                // before emitting JUMP.
+                if let Some(PtrInfo::Virtualizable(vinfo)) =
+                    ctx.get_ptr_info(frame_ref).cloned()
+                {
+                    self.force_virtualizable(frame_ref, vinfo, ctx);
+                }
+
                 let mut jump_op = op.clone();
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
                     let resolved = ctx.get_replacement(*arg);
-                    if resolved == frame_ref {
-                        if matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_))) {
-                            *arg = resolved;
-                            continue;
-                        }
-                    }
                     if Self::is_virtual(resolved, ctx) {
                         self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                         let forced = self.force_virtual(resolved, ctx);
@@ -1828,8 +1835,6 @@ impl Optimization for OptVirtualize {
                         *arg = resolved;
                     }
                 }
-                // TODO: RPython _jump_to_existing_trace emits compatibility guards
-                // here. Requires bridge compilation for proper fail_args.
                 OptimizationResult::Replace(jump_op)
             }
 
@@ -1855,7 +1860,42 @@ impl Optimization for OptVirtualize {
                     ctx,
                     &ctx.ptr_info,
                 );
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] pre_force_vs: args={:?} has_virtual={} fields={:?}",
+                        pre_force_args,
+                        pre_force_vs.has_virtuals(),
+                        ctx.pre_force_field_refs.keys().collect::<Vec<_>>()
+                    );
+                }
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
+                ctx.pre_force_jump_args = Some(pre_force_args.clone());
+
+                // Save virtual field OpRefs before force destroys them.
+                // make_inputargs needs this to flatten virtual into field values.
+                for &arg in &pre_force_args {
+                    if let Some(info) = ctx.get_ptr_info(arg).cloned() {
+                        match info {
+                            PtrInfo::VirtualStruct(ref vs) => {
+                                for &(field_idx, ref val) in &vs.fields {
+                                    ctx.pre_force_field_refs
+                                        .entry(arg)
+                                        .or_insert_with(Vec::new)
+                                        .push((field_idx, *val));
+                                }
+                            }
+                            PtrInfo::Virtual(ref v) => {
+                                for &(field_idx, ref val) in &v.fields {
+                                    ctx.pre_force_field_refs
+                                        .entry(arg)
+                                        .or_insert_with(Vec::new)
+                                        .push((field_idx, *val));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
 
                 self.optimize_escaping_op(&jump_op, ctx)
             }
