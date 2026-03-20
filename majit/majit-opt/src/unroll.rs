@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use majit_ir::{GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 use crate::{OptContext, Optimization, OptimizationResult};
 
@@ -325,18 +325,17 @@ impl UnrollOptimizer {
             }
         }
 
-        // Safety: if Phase 2 body has 0 guards, fall back to Phase 1.
-        // A guardless body loop would run forever without bridge compilation.
+        // RPython does NOT fall back for 0-guard body (relies on periodic
+        // interrupt checks). majit lacks interrupts, so guardless body loops
+        // would run forever. Fall back to Phase 1 until interrupt support.
         let p2_guard_count = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
         if p2_guard_count == 0 {
             if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[jit] phase 2: 0 guards, falling back to phase 1");
+                eprintln!("[jit] phase 2: 0 guards, falling back to phase 1 (no interrupt support)");
             }
             *constants = consts_p1;
             let sp = crate::shortpreamble::extract_short_preamble(&p1_ops);
-            if !sp.is_empty() {
-                self.short_preamble = Some(sp);
-            }
+            if !sp.is_empty() { self.short_preamble = Some(sp); }
             return (p1_ops, p1_ni);
         }
 
@@ -448,6 +447,9 @@ impl UnrollOptimizer {
             p2_ni,
             &imported_short_aliases,
             &imported_short_sources,
+            self.target_tokens
+                .last()
+                .map(|target| target.as_jump_target_descr()),
         );
         *constants = consts_p2;
         (combined, p2_ni)
@@ -981,7 +983,8 @@ impl OptUnroll {
             // unroll.py:357-359: emit JUMP to target
             let mut jump_args = target_args;
             jump_args.extend(extra);
-            let jump = Op::new(OpCode::Jump, &jump_args);
+            let mut jump = Op::new(OpCode::Jump, &jump_args);
+            jump.descr = Some(target_token.as_jump_target_descr());
             optimizer.send_extra_operation(&jump, ctx);
             return None; // successfully jumped
         }
@@ -1761,6 +1764,7 @@ fn assemble_peeled_trace(
     body_num_inputs: usize,
     imported_short_aliases: &[crate::ImportedShortAlias],
     imported_short_sources: &[crate::ImportedShortSource],
+    label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
@@ -1807,6 +1811,7 @@ fn assemble_peeled_trace(
     }));
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
     label_op.pos = OpRef(label_pos);
+    label_op.descr = label_descr;
     result.push(label_op);
 
     // Body: 2-pass remap (inputarg refs → label_args, op positions → after label)
@@ -3286,6 +3291,7 @@ mod tests {
                 result: OpRef(50),
                 source: OpRef(10),
             }],
+            None,
         );
 
         assert_eq!(combined[0].opcode, OpCode::IntAdd);
@@ -3364,6 +3370,7 @@ mod tests {
                 result: OpRef(50),
                 source: OpRef(10),
             }],
+            None,
         );
 
         assert_eq!(combined[2].opcode, OpCode::Label);
