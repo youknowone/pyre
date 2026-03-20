@@ -286,6 +286,11 @@ pub struct PreambleOp {
     pub kind: PreambleOpKind,
     /// Index of the argument in the label (None if not a label arg).
     pub label_arg_idx: Option<usize>,
+    /// RPython shortpreamble.py: whether this producer was assigned an
+    /// invented SameAs name because another producer won the original slot.
+    pub invented_name: bool,
+    /// Original result box this invented name aliases, if any.
+    pub same_as_source: Option<OpRef>,
 }
 
 impl PreambleOp {
@@ -350,6 +355,8 @@ impl PreambleOp {
         Some(ProducedShortOp {
             kind: self.kind.clone(),
             preamble_op,
+            invented_name: self.invented_name,
+            same_as_source: self.same_as_source,
         })
     }
 }
@@ -376,6 +383,8 @@ pub struct ShortBoxes {
     short_inputargs: Vec<OpRef>,
     /// shortpreamble.py: boxes_in_production
     boxes_in_production: HashSet<OpRef>,
+    /// Fresh synthetic names for invented short-box aliases.
+    next_synthetic_pos: u32,
     /// The number of label args.
     pub num_label_args: usize,
 }
@@ -391,6 +400,7 @@ impl ShortBoxes {
             const_short_boxes: Vec::new(),
             short_inputargs: Vec::new(),
             boxes_in_production: HashSet::new(),
+            next_synthetic_pos: 0,
             num_label_args,
         }
     }
@@ -400,6 +410,7 @@ impl ShortBoxes {
         for (idx, &arg) in label_args.iter().enumerate() {
             boxes.label_arg_positions.insert(arg, idx);
             boxes.short_inputargs.push(arg);
+            boxes.next_synthetic_pos = boxes.next_synthetic_pos.max(arg.0.saturating_add(1));
         }
         boxes
     }
@@ -412,6 +423,7 @@ impl ShortBoxes {
         if !self.potential_ops.contains_key(&result) {
             self.potential_order.push(result);
         }
+        self.next_synthetic_pos = self.next_synthetic_pos.max(result.0.saturating_add(1));
         self.potential_ops.entry(result).or_default().push(pop);
     }
 
@@ -425,6 +437,8 @@ impl ShortBoxes {
                 op,
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: Some(label_arg_idx),
+                invented_name: false,
+                same_as_source: None,
             },
         );
     }
@@ -439,6 +453,8 @@ impl ShortBoxes {
                 op,
                 kind: PreambleOpKind::Heap { descr_idx },
                 label_arg_idx: Some(label_arg_idx),
+                invented_name: false,
+                same_as_source: None,
             },
         );
     }
@@ -452,6 +468,8 @@ impl ShortBoxes {
                 op,
                 kind: PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(label_arg_idx),
+                invented_name: false,
+                same_as_source: None,
             },
         );
     }
@@ -469,6 +487,8 @@ impl ShortBoxes {
             op,
             kind: PreambleOpKind::InputArg,
             label_arg_idx,
+            invented_name: false,
+            same_as_source: None,
         }]);
         if !self.potential_order.contains(&arg) {
             self.potential_order.push(arg);
@@ -518,7 +538,25 @@ impl ShortBoxes {
             candidates[0].add_op_to_short(self)
         } else {
             let index = Self::pick_producer_index(&candidates, true);
-            candidates[index].add_op_to_short(self)
+            let chosen = candidates[index].add_op_to_short(self);
+            if chosen.is_some() {
+                for (i, candidate) in candidates.iter().enumerate() {
+                    if i == index {
+                        continue;
+                    }
+                    let Some(mut alt) = candidate.add_op_to_short(self) else {
+                        continue;
+                    };
+                    let alias = OpRef(self.next_synthetic_pos);
+                    self.next_synthetic_pos += 1;
+                    alt.preamble_op.pos = alias;
+                    alt.invented_name = true;
+                    alt.same_as_source = Some(result);
+                    self.produced_short_boxes.insert(alias, alt.clone());
+                    self.produced_order.push(alias);
+                }
+            }
+            chosen
         }?;
         self.produced_short_boxes.insert(result, produced.clone());
         self.produced_order.push(result);
@@ -565,6 +603,8 @@ impl ShortBoxes {
                 op,
                 kind,
                 label_arg_idx: Some(label_arg_idx),
+                invented_name: false,
+                same_as_source: None,
             },
         );
     }
@@ -632,6 +672,8 @@ impl ExtendedShortPreambleBuilder {
             op,
             kind: PreambleOpKind::Guard,
             label_arg_idx,
+            invented_name: false,
+            same_as_source: None,
         });
     }
 
@@ -642,6 +684,8 @@ impl ExtendedShortPreambleBuilder {
             op,
             kind: PreambleOpKind::Pure,
             label_arg_idx,
+            invented_name: false,
+            same_as_source: None,
         });
     }
 
@@ -652,6 +696,8 @@ impl ExtendedShortPreambleBuilder {
             op,
             kind: PreambleOpKind::Heap { descr_idx },
             label_arg_idx,
+            invented_name: false,
+            same_as_source: None,
         });
     }
 
@@ -662,6 +708,8 @@ impl ExtendedShortPreambleBuilder {
             op,
             kind: PreambleOpKind::LoopInvariant,
             label_arg_idx,
+            invented_name: false,
+            same_as_source: None,
         });
     }
 
@@ -733,6 +781,8 @@ impl CompoundOp {
         result.push(ProducedShortOp {
             kind: self.one.kind.clone(),
             preamble_op: self.one.op.clone(),
+            invented_name: self.one.invented_name,
+            same_as_source: self.one.same_as_source,
         });
         // Emit second sub-op (may itself be compound — but in Rust
         // we don't have the recursive PreambleOp tree structure,
@@ -740,6 +790,8 @@ impl CompoundOp {
         result.push(ProducedShortOp {
             kind: self.two.kind.clone(),
             preamble_op: self.two.op.clone(),
+            invented_name: self.two.invented_name,
+            same_as_source: self.two.same_as_source,
         });
         result
     }
@@ -765,6 +817,8 @@ impl ShortInputArg {
         ProducedShortOp {
             kind: PreambleOpKind::Pure,
             preamble_op: self.preamble_op.clone(),
+            invented_name: false,
+            same_as_source: None,
         }
     }
 
@@ -785,6 +839,10 @@ pub struct ProducedShortOp {
     pub kind: PreambleOpKind,
     /// The preamble operation to replay.
     pub preamble_op: Op,
+    /// Whether this short op uses an invented SameAs result.
+    pub invented_name: bool,
+    /// Original result this invented name aliases.
+    pub same_as_source: Option<OpRef>,
 }
 
 /// shortpreamble.py: build short preamble from optimizer state.
