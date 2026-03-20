@@ -385,10 +385,9 @@ pub struct ExportedState {
     pub next_iteration_args: Vec<OpRef>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::virtualstate::VirtualState,
-    /// RPython ExportedState.exported_infos adapted to SSA-slot indices.
-    /// OpRefs do not survive across optimizer instances, so majit stores the
-    /// exported facts aligned with next_iteration_args positions.
-    pub exported_arg_infos: Vec<ExportedValueInfo>,
+    /// unroll.py: exported_infos — per-slot optimizer knowledge from preamble.
+    /// Aligned with next_iteration_args positions.
+    pub exported_infos: Vec<ExportedValueInfo>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble.
@@ -432,7 +431,7 @@ impl ExportedState {
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<OpRef>,
         virtual_state: crate::virtualstate::VirtualState,
-        exported_arg_infos: Vec<ExportedValueInfo>,
+        exported_infos: Vec<ExportedValueInfo>,
         renamed_inputargs: Vec<OpRef>,
         short_inputargs: Vec<OpRef>,
     ) -> Self {
@@ -440,7 +439,7 @@ impl ExportedState {
             end_args,
             next_iteration_args,
             virtual_state,
-            exported_arg_infos,
+            exported_infos,
             short_preamble: None,
             renamed_inputargs,
             short_inputargs,
@@ -450,6 +449,29 @@ impl ExportedState {
     /// unroll.py: final() — ExportedState is never final (loop continues).
     pub fn is_final(&self) -> bool {
         false
+    }
+}
+
+/// unroll.py: UnrollInfo(BasicLoopInfo) — return type from optimize_peeled_loop.
+///
+/// Carries the target_token, label_op, and extra_same_as needed to
+/// finalize compilation after the peeled loop body is optimized.
+#[derive(Clone, Debug)]
+pub struct UnrollInfo {
+    /// The target token for this loop's entry point.
+    pub target_token: u64,
+    /// Extra same_as ops added during finalization.
+    pub extra_same_as: Vec<(OpRef, OpRef)>,
+    /// Quasi-immutable dependencies discovered during optimization.
+    pub quasi_immutable_deps: std::collections::HashSet<u64>,
+    /// Extra ops to insert before the label (from bridge inlining).
+    pub extra_before_label: Vec<Op>,
+}
+
+impl UnrollInfo {
+    /// unroll.py: final() — UnrollInfo is always final.
+    pub fn is_final(&self) -> bool {
+        true
     }
 }
 
@@ -482,7 +504,7 @@ impl OptUnroll {
             .collect();
 
         let virtual_state = crate::virtualstate::export_state(&end_args, ctx, &ctx.ptr_info);
-        let exported_arg_infos = end_args
+        let exported_infos = end_args
             .iter()
             .map(|&arg| self.collect_exported_info(arg, ctx, exported_int_bounds))
             .collect();
@@ -493,7 +515,7 @@ impl OptUnroll {
             label_args.clone(),
             end_args,
             virtual_state,
-            exported_arg_infos,
+            exported_infos,
             renamed_inputargs.to_vec(),
             label_args,
         )
@@ -560,12 +582,12 @@ impl OptUnroll {
         ctx: &mut OptContext,
     ) -> Vec<OpRef> {
         assert_eq!(
-            exported_state.exported_arg_infos.len(),
+            exported_state.exported_infos.len(),
             targetargs.len(),
             "import_state: arg count mismatch"
         );
 
-        for (source, info) in targetargs.iter().zip(exported_state.exported_arg_infos.iter()) {
+        for (source, info) in targetargs.iter().zip(exported_state.exported_infos.iter()) {
             self.apply_exported_info(*source, info, ctx);
         }
 
@@ -687,7 +709,8 @@ impl OptUnroll {
     }
 }
 
-pub(crate) fn build_exported_state_for_jump_args(
+/// unroll.py: export_state — module-level entry point.
+pub(crate) fn export_state(
     jump_args: &[OpRef],
     renamed_inputargs: &[OpRef],
     ctx: &OptContext,
@@ -696,7 +719,8 @@ pub(crate) fn build_exported_state_for_jump_args(
     OptUnroll::new().export_state_with_bounds(jump_args, renamed_inputargs, ctx, exported_int_bounds)
 }
 
-pub(crate) fn import_exported_state(
+/// unroll.py: import_state — module-level entry point.
+pub(crate) fn import_state(
     targetargs: &[OpRef],
     exported_state: &ExportedState,
     ctx: &mut OptContext,
@@ -881,387 +905,6 @@ fn assemble_peeled_trace(
     result
 }
 
-// ── Legacy helpers (kept for non-peeling paths) ──
-
-/// Build a modified trace for Phase 2 optimization by prepending
-/// New+SetfieldGc reconstruction ops that rebuild virtual objects
-/// from flattened field inputargs (unused — kept for reference).
-#[allow(dead_code)]
-fn build_body_trace_with_virtual_import(
-    ops: &[Op],
-    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
-    num_inputs: usize,
-) -> Option<(Vec<Op>, usize)> {
-    // Find the Jump op
-    let jump_idx = ops.iter().rposition(|op| op.opcode == OpCode::Jump)?;
-    let jump_op = &ops[jump_idx];
-
-    let mut next_pos = num_inputs as u32;
-    for op in ops {
-        if op.pos.0 != u32::MAX {
-            next_pos = next_pos.max(op.pos.0 + 1);
-        }
-    }
-
-    let mut expanded_input_index = 0usize;
-    let mut virtual_to_reconstructed: HashMap<usize, (OpRef, Vec<OpRef>)> = HashMap::new();
-    let mut inputarg_replacement: HashMap<OpRef, OpRef> = HashMap::new();
-
-    let mut jump_virtual_map = HashMap::new();
-    for virt in jump_virtuals {
-        jump_virtual_map.insert(virt.jump_arg_index, virt);
-    }
-
-    for arg_idx in 0..num_inputs {
-        if let Some(virt) = jump_virtual_map.get(&arg_idx) {
-            let mut field_inputargs = Vec::new();
-            for _ in &virt.fields {
-                let field_ref = OpRef(expanded_input_index as u32);
-                field_inputargs.push(field_ref);
-                expanded_input_index += 1;
-            }
-            virtual_to_reconstructed
-                .insert(arg_idx, (OpRef(next_pos), field_inputargs));
-            inputarg_replacement.insert(OpRef(arg_idx as u32), OpRef(next_pos));
-            next_pos += 1;
-        } else {
-            inputarg_replacement.insert(OpRef(arg_idx as u32), OpRef(expanded_input_index as u32));
-            expanded_input_index += 1;
-        }
-    }
-
-    if virtual_to_reconstructed.is_empty() {
-        return None;
-    }
-
-    let body_num_inputs = expanded_input_index;
-    let mut result =
-        Vec::with_capacity(ops.len() + jump_virtuals.len() * 4);
-
-    // Emit New+SetfieldGc reconstruction at trace start (before original ops)
-    for virt in jump_virtuals {
-        if let Some((new_ref, field_refs)) = virtual_to_reconstructed.get(&virt.jump_arg_index)
-        {
-            let mut new_op = Op::new(OpCode::New, &[]);
-            new_op.pos = *new_ref;
-            new_op.descr = Some(virt.size_descr.clone());
-            result.push(new_op);
-
-            for (i, (descr, _concrete)) in virt.fields.iter().enumerate() {
-                let mut set_op = Op::new(OpCode::SetfieldGc, &[*new_ref, field_refs[i]]);
-                set_op.pos = OpRef(next_pos);
-                next_pos += 1;
-                set_op.descr = Some(descr.clone());
-                result.push(set_op);
-            }
-        }
-    }
-
-    // Original ops with virtual refs replaced by reconstructed refs
-    for (idx, op) in ops.iter().enumerate() {
-        let mut new_op = op.clone();
-        for arg in &mut new_op.args {
-            if let Some(&repl) = inputarg_replacement.get(arg) {
-                *arg = repl;
-            }
-        }
-        if let Some(ref mut fa) = new_op.fail_args {
-            for arg in fa.iter_mut() {
-                if let Some(&repl) = inputarg_replacement.get(arg) {
-                    *arg = repl;
-                }
-            }
-        }
-        result.push(new_op);
-    }
-
-    Some((result, body_num_inputs))
-}
-
-/// compile.py:310-338: combine preamble + Label + body into final trace.
-/// compile.py:310-338: combine preamble + Label + body.
-///
-/// RPython parity: the preamble JUMP is extended with virtual field values
-/// so its args match the body's expected inputargs (including flattened fields).
-/// Body ops are remapped so inputarg refs point to the Label args.
-fn combine_preamble_and_body(
-    preamble: &[Op],
-    body: &[Op],
-    _preamble_num_inputs: usize,
-    body_num_inputs: usize,
-    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
-) -> Vec<Op> {
-    let mut result = Vec::with_capacity(preamble.len() + body.len() + 1);
-
-    // Preamble ops (Phase 1 result, up to but not including Jump)
-    for op in preamble {
-        if op.opcode == OpCode::Jump {
-            break;
-        }
-        result.push(op.clone());
-    }
-
-    let preamble_jump = preamble.iter().rfind(|op| op.opcode == OpCode::Jump);
-    let Some(jump) = preamble_jump else {
-        result.extend_from_slice(body);
-        return result;
-    };
-
-    let mut label_args = Vec::new();
-    let mut virt_by_arg = HashMap::new();
-    for virt in jump_virtuals {
-        virt_by_arg.insert(virt.jump_arg_index, virt);
-    }
-    for (arg_idx, &arg) in jump.args.iter().enumerate() {
-        if let Some(virt) = virt_by_arg.get(&arg_idx) {
-            let mut field_vals = Vec::new();
-            for (descr, _concrete) in &virt.fields {
-                let field_val = preamble
-                    .iter()
-                    .find(|op| {
-                        op.opcode == OpCode::SetfieldGc
-                            && op.args.first() == Some(&arg)
-                            && op.descr.as_ref().map_or(false, |d| d.index() == descr.index())
-                    })
-                    .and_then(|op| op.args.get(1).copied())
-                    .unwrap_or(OpRef::NONE);
-                label_args.push(field_val);
-                field_vals.push(field_val);
-            }
-        } else {
-            label_args.push(arg);
-        }
-    }
-
-    let max_pos = result
-        .iter()
-        .map(|op| op.pos.0)
-        .filter(|&p| p != u32::MAX)
-        .max()
-        .unwrap_or(body_num_inputs as u32);
-    let label_pos = OpRef((max_pos + 1).max(body_num_inputs as u32));
-    let mut label = Op::new(OpCode::Label, &label_args);
-    label.pos = label_pos;
-    result.push(label);
-
-    let mut body_remap: HashMap<OpRef, OpRef> = HashMap::new();
-    for (i, &label_arg) in label_args.iter().enumerate() {
-        if i < body_num_inputs {
-            body_remap.insert(OpRef(i as u32), label_arg);
-        }
-    }
-
-    let body_ops: Vec<&Op> = body.iter().filter(|op| op.opcode != OpCode::Label).collect();
-    let body_base = label_pos.0 + 1;
-    for (idx, op) in body_ops.iter().enumerate() {
-        if op.pos.0 != u32::MAX {
-            let new_pos = OpRef(body_base + idx as u32);
-            body_remap.insert(op.pos, new_pos);
-        }
-    }
-
-    for (idx, op) in body_ops.iter().enumerate() {
-        let mut new_op = (*op).clone();
-        if new_op.pos.0 != u32::MAX {
-            new_op.pos = OpRef(body_base + idx as u32);
-        }
-        for arg in &mut new_op.args {
-            if let Some(&mapped) = body_remap.get(arg) {
-                *arg = mapped;
-            }
-        }
-        if let Some(ref mut fa) = new_op.fail_args {
-            for arg in fa.iter_mut() {
-                if let Some(&mapped) = body_remap.get(arg) {
-                    *arg = mapped;
-                }
-            }
-        }
-        // Remap descr fail_arg_types if present (for guard descriptors)
-        result.push(new_op);
-    }
-
-    result
-}
-
-/// RPython unroll.py: make_inputargs_and_virtuals + _generate_virtual.
-///
-/// Transform the Phase 1 peeled trace to flatten virtual JUMP args into
-/// their constituent field values, and insert reconstruction ops at body start.
-///
-/// Input:  Phase 1 optimized peeled trace with materialized virtuals at JUMP
-/// Output: Modified trace where:
-///   - JUMP carries field VALUES instead of virtual pointer
-///   - LABEL has extra field-value inputargs
-///   - Body start has New+SetfieldGc that reconstruct the virtual
-///   - Body refs to old virtual replaced with reconstructed ref
-///
-/// Phase 2 optimizer will then virtualize the reconstruction ops.
-fn flatten_virtuals_in_peeled_trace(
-    ops: &[Op],
-    jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
-    num_inputs: usize,
-) -> Option<(Vec<Op>, usize)> {
-    let label_idx = ops.iter().position(|op| op.opcode == OpCode::Label)?;
-    let jump_idx = ops.iter().rposition(|op| op.opcode == OpCode::Jump)?;
-    if label_idx >= jump_idx {
-        return None;
-    }
-
-    let label_op = &ops[label_idx];
-    let jump_op = &ops[jump_idx];
-
-    // Map each virtual JUMP arg → (New position, [SetfieldGc field value OpRefs])
-    let mut virtual_info: HashMap<usize, (OpRef, Vec<(majit_ir::DescrRef, OpRef)>)> =
-        HashMap::new();
-    let mut new_positions: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
-
-    for virt in jump_virtuals {
-        if virt.jump_arg_index >= jump_op.args.len() {
-            continue;
-        }
-        let jump_arg = jump_op.args[virt.jump_arg_index];
-
-        // Find New op that produced this JUMP arg
-        let new_op = ops[label_idx + 1..jump_idx]
-            .iter()
-            .find(|op| op.pos == jump_arg && op.opcode == OpCode::New)?;
-        new_positions.insert(new_op.pos);
-
-        // Collect SetfieldGc field values for this New
-        let mut field_values = Vec::new();
-        for op in &ops[label_idx + 1..jump_idx] {
-            if op.opcode == OpCode::SetfieldGc
-                && op.args.first() == Some(&new_op.pos)
-                && op.args.len() >= 2
-            {
-                if let Some(descr) = &op.descr {
-                    field_values.push((descr.clone(), op.args[1]));
-                }
-            }
-        }
-        if field_values.is_empty() {
-            continue;
-        }
-        virtual_info.insert(virt.jump_arg_index, (new_op.pos, field_values));
-    }
-
-    if virtual_info.is_empty() {
-        return None;
-    }
-
-    // Compute next available OpRef position
-    let mut next_pos = num_inputs as u32;
-    for op in ops.iter() {
-        if op.pos.0 != u32::MAX {
-            next_pos = next_pos.max(op.pos.0 + 1);
-        }
-    }
-
-    let mut result = Vec::with_capacity(ops.len() + virtual_info.len() * 4);
-    let mut virtual_to_reconstructed: HashMap<OpRef, OpRef> = HashMap::new();
-    let label_orig_len = label_op.args.len();
-
-    // ── Preamble ops (before Label) — unchanged ──
-    for op in &ops[..label_idx] {
-        result.push(op.clone());
-    }
-
-    // ── Modified Label: add extra field-value inputargs ──
-    let mut new_label = label_op.clone();
-    let mut extra_field_count = 0;
-    // Track: for each virtual, which extra Label arg indices hold its fields
-    let mut virt_field_label_indices: HashMap<usize, Vec<usize>> = HashMap::new();
-
-    for (&virt_idx, (_new_pos, fields)) in &virtual_info {
-        let mut indices = Vec::new();
-        for _ in fields {
-            let idx = label_orig_len + extra_field_count;
-            new_label.args.push(OpRef(idx as u32));
-            indices.push(idx);
-            extra_field_count += 1;
-        }
-        virt_field_label_indices.insert(virt_idx, indices);
-    }
-    result.push(new_label);
-
-    // ── Reconstruction: New+SetfieldGc after Label ──
-    // RPython unroll.py: _generate_virtual — rebuild virtual from flattened fields
-    for (&virt_idx, (_new_pos, fields)) in &virtual_info {
-        let original_label_arg = label_op.args.get(virt_idx).copied()?;
-
-        // Find size_descr from the original New op
-        let orig_new = ops[label_idx + 1..jump_idx]
-            .iter()
-            .find(|op| op.pos == *_new_pos)?;
-        let size_descr = orig_new.descr.clone()?;
-
-        // Emit New
-        let reconstructed_ref = OpRef(next_pos);
-        next_pos += 1;
-        let mut new_op = Op::new(OpCode::New, &[]);
-        new_op.pos = reconstructed_ref;
-        new_op.descr = Some(size_descr);
-        result.push(new_op);
-
-        // Emit SetfieldGc for each field, using the extra Label args
-        let field_indices = virt_field_label_indices.get(&virt_idx)?;
-        for (i, (descr, _orig_value)) in fields.iter().enumerate() {
-            let field_input_ref = OpRef(field_indices[i] as u32);
-            let mut set_op = Op::new(OpCode::SetfieldGc, &[reconstructed_ref, field_input_ref]);
-            set_op.pos = OpRef(next_pos);
-            next_pos += 1;
-            set_op.descr = Some(descr.clone());
-            result.push(set_op);
-        }
-
-        virtual_to_reconstructed.insert(original_label_arg, reconstructed_ref);
-    }
-
-    // ── Body ops: replace refs to old virtual with reconstructed ──
-    for op in &ops[label_idx + 1..jump_idx] {
-        // Skip the original New+SetfieldGc for the virtual (now reconstructed above)
-        if new_positions.contains(&op.pos) {
-            continue;
-        }
-        if op.opcode == OpCode::SetfieldGc {
-            if let Some(&first) = op.args.first() {
-                if new_positions.contains(&first) {
-                    continue;
-                }
-            }
-        }
-
-        let mut new_op = op.clone();
-        for arg in &mut new_op.args {
-            if let Some(&r) = virtual_to_reconstructed.get(arg) {
-                *arg = r;
-            }
-        }
-        if let Some(ref mut fa) = new_op.fail_args {
-            for arg in fa.iter_mut() {
-                if let Some(&r) = virtual_to_reconstructed.get(arg) {
-                    *arg = r;
-                }
-            }
-        }
-        result.push(new_op);
-    }
-
-    // ── Modified Jump: replace virtual ref with field values ──
-    let mut new_jump = jump_op.clone();
-    // Replace virtual args with placeholder and add field values as extra args
-    for (&virt_idx, (_new_pos, fields)) in &virtual_info {
-        for (_descr, value_ref) in fields {
-            new_jump.args.push(*value_ref);
-        }
-    }
-    new_jump.pos = OpRef(next_pos);
-    result.push(new_jump);
-
-    let new_num_inputs = num_inputs + extra_field_count;
-    Some((result, new_num_inputs))
-}
 
 pub fn pick_virtual_state(
     my_vs: &crate::virtualstate::VirtualState,
@@ -1271,48 +914,6 @@ pub fn pick_virtual_state(
         if my_vs.is_compatible(target_vs) {
             return Some(i);
         }
-    }
-    None
-}
-
-/// unroll.py: _jump_to_existing_trace(jump_op, label_op, runtime_boxes)
-///
-/// Check if any existing compiled trace (target_token) has a compatible
-/// virtual state. If so, generate extra guards, inline the short preamble,
-/// and redirect the jump.
-///
-/// Returns Some(ops_to_emit) if a match was found, None otherwise.
-pub fn jump_to_existing_trace_full(
-    jump_args: &[OpRef],
-    target_states: &[crate::virtualstate::VirtualState],
-    target_short_preambles: &[Option<crate::shortpreamble::ShortPreamble>],
-    ctx: &mut OptContext,
-) -> Option<(usize, Vec<OpRef>)> {
-    let my_vs = crate::virtualstate::VirtualState::new(
-        jump_args
-            .iter()
-            .map(|_| crate::virtualstate::VirtualStateInfo::Unknown)
-            .collect(),
-    );
-
-    for (i, target_vs) in target_states.iter().enumerate() {
-        if !my_vs.is_compatible(target_vs) {
-            continue;
-        }
-        // Generate extra guards from virtual state mismatch
-        let _extra_guards = target_vs.generate_guards(&my_vs);
-
-        // Make input args matching the target's virtual state
-        let args = target_vs.make_inputargs(jump_args, ctx);
-
-        // Inline short preamble if available
-        let final_args = if let Some(Some(sp)) = target_short_preambles.get(i) {
-            OptUnroll::inline_short_preamble(&args, sp, ctx)
-        } else {
-            args.clone()
-        };
-
-        return Some((i, final_args));
     }
     None
 }
@@ -2074,18 +1675,18 @@ mod tests {
             &ctx,
         );
 
-        assert_eq!(exported.exported_arg_infos.len(), 6);
-        assert_eq!(exported.exported_arg_infos[0].constant, Some(Value::Int(42)));
-        assert_eq!(exported.exported_arg_infos[1].known_class, Some(GcRef(0x1234)));
-        assert_eq!(exported.exported_arg_infos[2].int_lower_bound, Some(7));
-        assert_eq!(exported.exported_arg_infos[3].constant, Some(Value::Ref(GcRef(0x5678))));
-        assert_eq!(exported.exported_arg_infos[4].ptr_kind, ExportedPtrKind::Instance);
-        assert_eq!(exported.exported_arg_infos[4].ptr_descr.as_ref().map(|d| d.index()), Some(91));
-        assert_eq!(exported.exported_arg_infos[4].known_class, Some(GcRef(0x7777)));
-        assert_eq!(exported.exported_arg_infos[5].ptr_kind, ExportedPtrKind::Array);
-        assert_eq!(exported.exported_arg_infos[5].ptr_descr.as_ref().map(|d| d.index()), Some(92));
+        assert_eq!(exported.exported_infos.len(), 6);
+        assert_eq!(exported.exported_infos[0].constant, Some(Value::Int(42)));
+        assert_eq!(exported.exported_infos[1].known_class, Some(GcRef(0x1234)));
+        assert_eq!(exported.exported_infos[2].int_lower_bound, Some(7));
+        assert_eq!(exported.exported_infos[3].constant, Some(Value::Ref(GcRef(0x5678))));
+        assert_eq!(exported.exported_infos[4].ptr_kind, ExportedPtrKind::Instance);
+        assert_eq!(exported.exported_infos[4].ptr_descr.as_ref().map(|d| d.index()), Some(91));
+        assert_eq!(exported.exported_infos[4].known_class, Some(GcRef(0x7777)));
+        assert_eq!(exported.exported_infos[5].ptr_kind, ExportedPtrKind::Array);
+        assert_eq!(exported.exported_infos[5].ptr_descr.as_ref().map(|d| d.index()), Some(92));
         assert_eq!(
-            exported.exported_arg_infos[5]
+            exported.exported_infos[5]
                 .array_lenbound
                 .as_ref()
                 .map(|b| (b.lower, b.upper)),
@@ -2140,7 +1741,7 @@ mod tests {
         let mut exported_bounds = std::collections::HashMap::new();
         exported_bounds.insert(OpRef(21), IntBound::bounded(10, 20));
 
-        let exported = build_exported_state_for_jump_args(
+        let exported = export_state(
             &[OpRef(21)],
             &[],
             &ctx,
@@ -2148,7 +1749,7 @@ mod tests {
         );
 
         assert_eq!(
-            exported.exported_arg_infos[0]
+            exported.exported_infos[0]
                 .int_bound
                 .as_ref()
                 .map(|b| (b.lower, b.upper)),
@@ -2156,7 +1757,7 @@ mod tests {
         );
 
         let mut ctx2 = crate::OptContext::with_num_inputs(4, 1);
-        let label_args = import_exported_state(&[OpRef(0)], &exported, &mut ctx2);
+        let label_args = import_state(&[OpRef(0)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(0)]);
         assert_eq!(
             ctx2.imported_int_bounds
