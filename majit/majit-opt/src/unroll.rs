@@ -733,15 +733,19 @@ impl OptUnroll {
             .iter()
             .map(|&a| ctx.get_replacement(a))
             .collect();
-        // unroll.py:457
-        let virtual_state = crate::virtualstate::export_state(&end_args, ctx, &ctx.ptr_info);
+        // unroll.py:457: use pre-force virtual state if available
+        let virtual_state = ctx
+            .pre_force_virtual_state
+            .clone()
+            .unwrap_or_else(|| crate::virtualstate::export_state(&end_args, ctx, &ctx.ptr_info));
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
         let mut infos: HashMap<OpRef, ExportedValueInfo> = HashMap::new();
         for &arg in &end_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
-        // unroll.py:462-469
-        let (label_args, virtuals) = virtual_state.make_inputargs_and_virtuals(&end_args, ctx);
+        // unroll.py:462-469: use pre-force args for make_inputargs
+        let vs_args = ctx.pre_force_jump_args.as_deref().unwrap_or(&end_args);
+        let (label_args, virtuals) = virtual_state.make_inputargs_and_virtuals(vs_args, ctx);
         // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
         for &arg in &label_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
