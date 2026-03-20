@@ -3003,6 +3003,12 @@ fn emit_indirect_call_from_parts(
         );
     }
 
+    // RPython parity: roots are registered/unregistered per-call for
+    // calls that might trigger GC (allocating calls). For non-allocating
+    // calls (most CallI/CallR), we skip registration entirely.
+    //
+    // TODO: Once gcmap bitmap is implemented, replace per-call
+    // registration with a single MOV per call site (RPython's approach).
     spill_ref_roots(builder, roots_ptr, ref_root_slots, defined_ref_vars);
     emit_gc_root_registration(
         builder,
@@ -3726,6 +3732,11 @@ impl CraneliftBackend {
                 .load(cl_types::I64, MemFlags::trusted(), addr, 0);
             builder.def_var(var(i as u32), val);
         }
+
+        // RPython parity: GC roots are registered by run_compiled_code()
+        // before calling into compiled code, and unregistered after return.
+        // No per-call registration/unregistration inside the compiled code.
+        // Per-call spill/reload keeps the roots array up-to-date.
 
         // Find LABEL — when present, ops before it form the preamble
         // (executed once in the entry block), and the Label's args define
