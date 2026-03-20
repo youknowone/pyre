@@ -362,10 +362,15 @@ impl UnrollOptimizer {
         }
 
         // finalize_short_preamble: create TargetToken for this loop version
-        let sp = crate::shortpreamble::build_short_preamble_from_exported_boxes(
-            &exported_state.end_args,
-            &exported_state.exported_short_boxes,
-        );
+        let sp = opt_p2
+            .imported_short_preamble
+            .clone()
+            .unwrap_or_else(|| {
+                crate::shortpreamble::build_short_preamble_from_exported_boxes(
+                    &exported_state.end_args,
+                    &exported_state.exported_short_boxes,
+                )
+            });
         let opt_unroll = OptUnroll::new();
         let target_token = opt_unroll.finalize_short_preamble(
             exported_state.virtual_state.clone(),
@@ -916,6 +921,10 @@ impl OptUnroll {
         let (label_args, virtuals) = exported_state
             .virtual_state
             .make_inputargs_and_virtuals(targetargs, ctx);
+        ctx.initialize_imported_short_preamble_builder(
+            &label_args,
+            &exported_state.exported_short_boxes,
+        );
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
         self.import_short_preamble_ops(&short_args, exported_state, ctx);
@@ -1600,6 +1609,32 @@ fn assemble_peeled_trace(
     for (idx, op) in p2_ops.iter().enumerate() {
         if op.pos.0 != u32::MAX {
             remap.insert(op.pos, OpRef(body_base + idx as u32));
+        }
+    }
+    // Phase 2 ops may reference OpRefs not in the body (e.g., a forced
+    // virtual's New at an intermediate position). If such a ref matches
+    // a Label arg, map it to that Label arg's position in the preamble.
+    // This handles the case where Phase 2's forwarding chain resolves to
+    // a position that exists only in the preamble output.
+    let label_set: HashMap<OpRef, OpRef> = label_args.iter().copied()
+        .enumerate()
+        .map(|(_, la)| (la, la))
+        .collect();
+    // Also map Phase 1 preamble positions that Phase 2 might reference
+    for p1_op in p1_ops {
+        if p1_op.opcode == OpCode::Jump { break; }
+        if !p1_op.pos.is_none() && !remap.contains_key(&p1_op.pos) {
+            // If this Phase 1 op produced a Label arg, use its preamble pos
+            remap.insert(p1_op.pos, p1_op.pos);
+        }
+    }
+    // imported_short_sources: Phase 2 result OpRef → Phase 1 source OpRef.
+    // After forwarding resolution, body args may reference the SOURCE
+    // (Phase 1 position) instead of the result. Map those to preamble.
+    for (source_ref, _) in &imported_short_sources {
+        if !remap.contains_key(source_ref) {
+            // This source is a preamble op position; body can reference it
+            remap.insert(*source_ref, *source_ref);
         }
     }
 
@@ -2784,6 +2819,44 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_imported_short_builder_tracks_used_dependency_chain() {
+        let mut ctx = crate::OptContext::with_num_inputs(10, 0);
+        ctx.make_constant(OpRef(10), Value::Int(7));
+        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
+                op.pos = OpRef(11);
+                op
+            },
+            kind: crate::shortpreamble::PreambleOpKind::Pure,
+            label_arg_idx: None,
+            invented_name: false,
+            same_as_source: None,
+        });
+        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::IntMul, &[OpRef(11), OpRef(13)]);
+                op.pos = OpRef(14);
+                op
+            },
+            kind: crate::shortpreamble::PreambleOpKind::Pure,
+            label_arg_idx: Some(2),
+            invented_name: false,
+            same_as_source: None,
+        });
+
+        let exported = export_state(&[OpRef(12), OpRef(13), OpRef(14)], &[], &ctx, None);
+        let mut ctx2 = crate::OptContext::with_num_inputs(10, 3);
+        import_state(&[OpRef(0), OpRef(1), OpRef(2)], &exported, &mut ctx2);
+        ctx2.note_imported_short_use(OpRef(14));
+        let sp = ctx2.build_imported_short_preamble().unwrap();
+
+        assert_eq!(sp.ops.len(), 2);
+        assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
+        assert_eq!(sp.ops[1].op.opcode, OpCode::IntMul);
     }
 
     #[test]
