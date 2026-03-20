@@ -8,9 +8,9 @@
 | **intutils.rs** | 95% | make_guards, getnullness |
 | **trace.rs** | 95% | 완료 |
 | **heapcache.py 기능 (heap.rs에 통합)** | 95% | 별도 Rust 파일 없음. `heap.rs`에 array/quasi-immut/arraylen/loopinvariant cache 통합, 남은: explicit version system |
-| **pure.rs** | 90% | ~~postponed_op, constant_fold, ovf, GUARD_NO_EXCEPTION, short_preamble~~ 모두 추가됨. 남은: COND_CALL_VALUE |
+| **pure.rs** | 95% | ~~postponed_op, constant_fold, ovf, GUARD_NO_EXCEPTION, short_preamble, COND_CALL_VALUE~~ 모두 추가됨 |
 | **optimizer.rs** | 90% | ~~call_pure_results, speculative_operation~~ 추가됨. 남은: resumedata_memo, guard sharing |
-| **simplify.rs** | 90% | ~~GUARD_FUTURE_CONDITION~~ 스텁 추가됨 |
+| **simplify.rs** | 95% | ~~GUARD_FUTURE_CONDITION~~ notice_guard_future_condition 호출 추가됨 |
 | **descr.rs** | 85% | bitstring optimization, CallInfoCollection |
 | **intbounds.rs** | 85% | ~~backward propagation~~ 추가됨. 남은: STRGETITEM/GETFIELD bounds |
 | **quasi_immut.rs** | 80% | CPU 통합, 디버그/통계 |
@@ -24,7 +24,7 @@
 | **virtualize.rs** | 65% | 남은: COND_CALL, JIT_FORCE_VIRTUAL, GETARRAYITEM_RAW |
 | **opencoder.rs** | 65% | 남은: constant pooling 최적화 |
 | **vstring.rs** | 60% | ~~_int_add/_int_sub, postprocess_strlen~~ 추가됨. 남은: copy_str_content, initialize_forced_string |
-| **blackhole.rs** | 60% | goto_if_not, raise/reraise, 문자열 ops |
+| **blackhole.rs** | 80% | ~~BlackholeInterpreter, Builder, dispatch, frame chain, resume~~ 추가됨. 남은: goto_if_not, raise/reraise, 문자열 ops |
 | **virtual_ref.rs** | 60% | ~~continue_tracing~~ 추가됨. 남은: graph transformation, is_virtual_ref |
 | **flatten.rs / pipeline.rs** | 60% | 남은: liveness, regalloc |
 | **majit-analyze lib.rs** | 82% | canonical pipeline API 정착. 남은: descriptor/effectinfo object parity, graph-native helper assembly |

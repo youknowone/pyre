@@ -84,6 +84,9 @@ pub struct OptContext {
     /// RPython import_state: maps original inputarg index → fresh virtual head OpRef.
     /// Used by ensure_linked_list_head to return the imported virtual.
     pub imported_virtual_heads: Vec<(usize, OpRef)>,
+    /// RPython optimizer.py: `patchguardop` — the last GUARD_FUTURE_CONDITION op.
+    /// Used by unroll to attach resume data to extra guards from short preamble.
+    pub patchguardop: Option<Op>,
 }
 
 impl OptContext {
@@ -99,6 +102,7 @@ impl OptContext {
             int_lower_bounds: HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             imported_virtual_heads: Vec::new(),
+            patchguardop: None,
         }
     }
 
@@ -114,6 +118,7 @@ impl OptContext {
             int_lower_bounds: HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             imported_virtual_heads: Vec::new(),
+            patchguardop: None,
         }
     }
 
