@@ -292,6 +292,8 @@ impl UnrollOptimizer {
         opt_p2.skip_flush = true;
         // Phase 2: JUMP flattens virtual fields instead of forcing them.
         opt_p2.set_flatten_virtuals_at_jump(true);
+        // Phase 2: don't force lazy sets on JUMP (RPython flush=False).
+        opt_p2.set_skip_flush_on_final(true);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
@@ -895,25 +897,27 @@ impl OptUnroll {
             // unroll.py:353-356: inline short preamble
             let mut extra = Vec::new();
             if let Some(sp) = target_token.short_preamble.clone() {
-                if let Some(builder) = target_token.short_preamble_producer.as_mut() {
+                if let Some(mut builder) = target_token.short_preamble_producer.take() {
                     let mut label_args = sp.inputargs.clone();
                     label_args.extend(sp.used_boxes.iter().copied());
                     builder.setup(&sp, &label_args);
+                    ctx.activate_short_preamble_producer(builder);
                     extra = Self::inline_short_preamble(
                         &short_jump_args,
                         &target_args,
                         &sp,
-                        Some(builder),
                         optimizer,
                         ctx,
                     );
-                    target_token.short_preamble = Some(builder.build_short_preamble_struct());
+                    if let Some(builder) = ctx.take_active_short_preamble_producer() {
+                        target_token.short_preamble = Some(builder.build_short_preamble_struct());
+                        target_token.short_preamble_producer = Some(builder);
+                    }
                 } else {
                     extra = Self::inline_short_preamble(
                         &short_jump_args,
                         &target_args,
                         &sp,
-                        None,
                         optimizer,
                         ctx,
                     );
@@ -940,9 +944,6 @@ impl OptUnroll {
         jump_args: &[OpRef],
         args_no_virtuals: &[OpRef],
         short_preamble: &crate::shortpreamble::ShortPreamble,
-        mut short_preamble_producer: Option<
-            &mut crate::shortpreamble::ExtendedShortPreambleBuilder,
-        >,
         optimizer: &mut crate::optimizer::Optimizer,
         ctx: &mut OptContext,
     ) -> Vec<OpRef> {
@@ -992,11 +993,11 @@ impl OptUnroll {
                 replay_index += 1;
             }
 
-            let Some(builder) = short_preamble_producer.as_deref_mut() else {
+            let Some(current_short) = ctx.build_active_short_preamble() else {
                 break;
             };
-            let old_len = active_short.ops.len();
-            let old_jump_args = active_short.used_boxes.len();
+            let old_len = current_short.ops.len();
+            let old_jump_args = current_short.used_boxes.len();
             let mapped_jump_args: Vec<OpRef> = active_short
                 .used_boxes
                 .iter()
@@ -1005,10 +1006,9 @@ impl OptUnroll {
             for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
                 let _ = optimizer.force_box(arg, ctx);
             }
-            let current_used_boxes = active_short.used_boxes.clone();
-            for used_box in current_used_boxes {
-                let _ = builder.use_box(used_box);
-            }
+            let Some(builder) = ctx.active_short_preamble_producer_mut() else {
+                break;
+            };
             active_short = builder.build_short_preamble_struct();
             if active_short.ops.len() == old_len && active_short.used_boxes.len() == old_jump_args {
                 break;
@@ -3094,6 +3094,38 @@ mod tests {
     }
 
     #[test]
+    fn test_force_op_from_preamble_only_adds_jump_box_after_force_box() {
+        let mut ctx = crate::OptContext::with_num_inputs(10, 3);
+        ctx.initialize_imported_short_preamble_builder(
+            &[OpRef(0), OpRef(1), OpRef(2)],
+            &[crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                    op.pos = OpRef(20);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            }],
+        );
+
+        let forced = ctx.force_op_from_preamble(OpRef(20));
+        assert_eq!(forced, OpRef(20));
+
+        let sp = ctx.build_imported_short_preamble().unwrap();
+        assert_eq!(sp.ops.len(), 1);
+        assert!(sp.used_boxes.is_empty());
+
+        let mut optimizer = crate::optimizer::Optimizer::new();
+        let _ = optimizer.force_box(OpRef(20), &mut ctx);
+
+        let sp = ctx.build_imported_short_preamble().unwrap();
+        assert_eq!(sp.used_boxes, vec![OpRef(20)]);
+    }
+
+    #[test]
     fn test_exported_state_reimports_invented_short_alias_metadata() {
         let mut ctx = crate::OptContext::with_num_inputs(6, 0);
         ctx.exported_short_boxes
@@ -3201,7 +3233,6 @@ mod tests {
             &[OpRef(10), OpRef(11)],
             &[OpRef(10), OpRef(11)],
             &sp,
-            None,
             &mut optimizer,
             &mut ctx,
         );
