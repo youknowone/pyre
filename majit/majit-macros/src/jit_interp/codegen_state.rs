@@ -1110,6 +1110,15 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     if let Some(&head) = self.linked_list_heads.get(&selected) {
                         return Some(head);
                     }
+                    // RPython import_state: check if this storage has an imported virtual head
+                    for &(orig_idx, virtual_head) in &ctx.imported_virtual_heads {
+                        if orig_idx == selected || orig_idx == 2 + self.storage_layout
+                            .iter().position(|&(s, _)| s == selected).unwrap_or(usize::MAX)
+                        {
+                            self.linked_list_heads.insert(selected, virtual_head);
+                            return Some(virtual_head);
+                        }
+                    }
                     // Lazy load: read head pointer from pool.jit_data_ptrs[selected]
                     let head_offset = ((#ptrs_offset) as usize) + selected * 8;
                     let head_descr: majit_ir::DescrRef = std::sync::Arc::new(
@@ -1178,37 +1187,19 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
-                    // RPython make_inputargs_and_virtuals: virtual head pointer
-                    // replaced by field values [value, next] per tracked storage.
-                    // Layout: [pool, selected, value_0, next_0, value_1, next_1, ...]
-                    let mut values = vec![
+                    // RPython compile.py: root loop inputargs stay at the
+                    // original red variables. Linked-list heads are loaded
+                    // lazily from the pool object at trace entry and only
+                    // become explicit boxes at the inner LABEL/JUMP boundary.
+                    vec![
                         (&self.#pool_field as *const _ as usize) as i64,
                         self.#sel_field as i64,
-                    ];
-                    for &(sidx, _) in &meta.storage_layout {
-                        let head = self.#pool_field.get(sidx).head_ptr();
-                        if head != 0 {
-                            let node = head as *const aheui_runtime::storage::StackNode;
-                            unsafe {
-                                values.push(aheui_runtime::value::val_to_i64(&(*node).value));
-                                values.push((*node).next as usize as i64);
-                            }
-                        } else {
-                            values.push(0);
-                            values.push(0);
-                        }
-                    }
-                    values
+                    ]
                 }
 
                 fn live_value_types(&self, meta: &__JitMeta) -> Vec<majit_ir::Type> {
-                    // [pool=Int, selected=Int, value_0=Int, next_0=Ref, ...]
-                    let mut types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
-                    for _ in &meta.storage_layout {
-                        types.push(majit_ir::Type::Int); // value field
-                        types.push(majit_ir::Type::Ref); // next field
-                    }
-                    types
+                    let _ = meta;
+                    vec![majit_ir::Type::Int, majit_ir::Type::Int]
                 }
 
                 fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
@@ -1235,14 +1226,14 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                    // values = [pool_ptr, selected, per_storage_heads..., resume_pc]
-                    // OR [pool_ptr, selected] for JUMP args (loop finish)
+                    // Root loop live state is [pool_ptr, selected]. Guard
+                    // failures restore linked-list heads through the
+                    // interpreter-specific failure handler, not here.
                     self.#sel_field = values
                         .get(1)
                         .copied()
                         .and_then(|v| usize::try_from(v).ok())
                         .unwrap_or(meta.initial_selected);
-                    // Heads are restored via pool.sync_jit_cache by the interpreter
                 }
 
                 fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {

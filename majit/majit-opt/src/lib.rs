@@ -81,6 +81,9 @@ pub struct OptContext {
     pub int_lower_bounds: HashMap<OpRef, i64>,
     /// RPython unroll.py: virtual structures at JUMP for preamble peeling.
     pub exported_jump_virtuals: Vec<crate::optimizer::ExportedJumpVirtual>,
+    /// RPython import_state: maps original inputarg index → fresh virtual head OpRef.
+    /// Used by ensure_linked_list_head to return the imported virtual.
+    pub imported_virtual_heads: Vec<(usize, OpRef)>,
 }
 
 impl OptContext {
@@ -95,6 +98,7 @@ impl OptContext {
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
             exported_jump_virtuals: Vec::new(),
+            imported_virtual_heads: Vec::new(),
         }
     }
 
@@ -109,11 +113,17 @@ impl OptContext {
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
             exported_jump_virtuals: Vec::new(),
+            imported_virtual_heads: Vec::new(),
         }
     }
 
     pub fn num_inputs(&self) -> usize {
         self.num_inputs as usize
+    }
+
+    /// Allocate a fresh OpRef position (for imported virtual heads).
+    pub fn alloc_op_position(&mut self) -> OpRef {
+        self.reserve_pos()
     }
 
     pub(crate) fn reserve_pos(&mut self) -> OpRef {
