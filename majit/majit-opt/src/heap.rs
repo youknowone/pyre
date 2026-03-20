@@ -188,7 +188,7 @@ impl OptHeap {
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
         for (key, mut op) in pending {
             // Resolve forwarding — virtual refs may have been forced by now
-            for arg in &mut op.args {
+            for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
             // Skip if value ref doesn't correspond to any defined op.
@@ -197,7 +197,15 @@ impl OptHeap {
             // was never assigned to an output op.
             let value_ref = ctx.get_replacement(op.arg(1));
             let num_inputs = ctx.num_inputs() as u32;
-            let value_is_undefined = !value_ref.is_none()
+            // RPython heap.py: _force_elements emits ALL SetfieldGc
+            // without checking if the value is defined. Constants
+            // (OpRef >= 10_000) are always valid — they are compile-time
+            // constant pool entries (e.g., type pointers). Skipping
+            // them causes GC crashes because newly allocated objects
+            // lack their type_id field.
+            let is_constant = value_ref.0 >= 10_000;
+            let value_is_undefined = !is_constant
+                && !value_ref.is_none()
                 && value_ref.0 >= num_inputs
                 && !ctx
                     .new_operations
