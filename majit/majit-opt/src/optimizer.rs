@@ -533,6 +533,14 @@ impl Optimizer {
         }
     }
 
+    /// optimizer.py: flush()
+    /// Flush all passes' postponed state.
+    pub fn flush(&mut self) {
+        for pass in &mut self.passes {
+            pass.flush();
+        }
+    }
+
     /// Build a short preamble from an optimized trace's preamble section.
     /// Convenience method that combines extract + produce.
     pub fn build_short_preamble(optimized_ops: &[Op]) -> crate::shortpreamble::ShortPreamble {
@@ -570,6 +578,14 @@ impl Optimizer {
         } else {
             resolved
         }
+    }
+
+    /// optimizer.py: force_box_for_end_of_preamble(box)
+    ///
+    /// The exported loop state should record the boxes that survive the end of
+    /// the preamble after virtuals have been forced into a loop-carried shape.
+    pub fn force_box_for_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+        self.force_box(ctx.get_replacement(opref), ctx)
     }
 
     /// optimizer.py: protect_speculative_operation(op, ctx)
@@ -806,9 +822,7 @@ impl Optimizer {
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Phase 2 leaves lazy sets pending so virtuals aren't forced.
         if !self.skip_flush {
-            for pass in &mut self.passes {
-                pass.flush();
-            }
+            self.flush();
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -824,6 +838,16 @@ impl Optimizer {
             .rfind(|op| op.opcode == OpCode::Jump)
             .cloned();
         self.exported_loop_state = jump.map(|jump| {
+            let original_jump_args = ctx
+                .pre_force_jump_args
+                .clone()
+                .unwrap_or_else(|| jump.args.to_vec());
+            ctx.preamble_end_args = Some(
+                original_jump_args
+                    .iter()
+                    .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
+                    .collect(),
+            );
             // RPython unroll.py:454-457: use virtual state from BEFORE force.
             // OptVirtualize captures this in the JUMP handler.
             let preview_virtual_state = ctx.pre_force_virtual_state.clone().unwrap_or_else(|| {
@@ -853,7 +877,7 @@ impl Optimizer {
             let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &ctx);
             let renamed_inputargs: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
             crate::unroll::export_state(
-                &jump.args,
+                &original_jump_args,
                 &renamed_inputargs,
                 &ctx,
                 Some(&exported_int_bounds),
@@ -912,6 +936,16 @@ impl Optimizer {
                 }
                 remap.insert(old_idx, next_const_pos);
                 next_const_pos += 1;
+            }
+
+            // Apply remap to forwarding table too, so forwarding resolution
+            // after remap resolves to the correct remapped positions.
+            for entry in &mut ctx.forwarding {
+                if !entry.is_none() {
+                    if let Some(&new_pos) = remap.get(&entry.0) {
+                        *entry = OpRef(new_pos);
+                    }
+                }
             }
 
             // Apply remap to all args and fail_args
@@ -1279,6 +1313,8 @@ mod tests {
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::{OpCode, OpRef};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     /// A trivial pass that removes INT_ADD(x, 0) -> x
     struct AddZeroElimination;
@@ -1335,6 +1371,24 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "remove_as_constant"
+        }
+    }
+
+    struct FlushCounter {
+        hits: Rc<Cell<usize>>,
+    }
+
+    impl Optimization for FlushCounter {
+        fn propagate_forward(&mut self, _op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
+            OptimizationResult::PassOn
+        }
+
+        fn flush(&mut self) {
+            self.hits.set(self.hits.get() + 1);
+        }
+
+        fn name(&self) -> &'static str {
+            "flush_counter"
         }
     }
 
@@ -1480,6 +1534,18 @@ mod tests {
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
+    }
+
+    #[test]
+    fn test_flush_invokes_all_passes() {
+        let hits = Rc::new(Cell::new(0));
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(FlushCounter { hits: hits.clone() }));
+        opt.add_pass(Box::new(FlushCounter { hits: hits.clone() }));
+
+        opt.flush();
+
+        assert_eq!(hits.get(), 2);
     }
 
     #[test]
