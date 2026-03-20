@@ -597,6 +597,12 @@ pub trait Optimization {
         // Default: no contribution
     }
 
+    /// Export all cached field entries from this pass.
+    /// Used to propagate heap cache from Phase 1 to Phase 2 via ExportedState.
+    fn export_cached_fields(&self) -> Vec<(OpRef, u32, OpRef)> {
+        Vec::new()
+    }
+
     /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
     fn export_arg_int_bounds(
         &self,
