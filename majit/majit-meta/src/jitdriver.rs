@@ -8,6 +8,7 @@ use crate::pyjitpl::{
 use crate::resume::ResumeLayoutSummary;
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
+use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::{GreenKey, JitDriverVar, Type, Value, VarKind};
 
@@ -213,6 +214,11 @@ impl<S: JitState> JitDriver<S> {
     /// Register a create_frame_N → create_frame_N_raw_int mapping for box folding.
     pub fn register_create_frame_raw(&mut self, normal: *const (), raw_int: *const ()) {
         self.meta.register_create_frame_raw(normal, raw_int);
+    }
+
+    /// Attach a GC allocator to the active backend.
+    pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
+        self.meta.backend_mut().set_gc_allocator(gc);
     }
 
     /// PyPy JitDriver(is_recursive=True).

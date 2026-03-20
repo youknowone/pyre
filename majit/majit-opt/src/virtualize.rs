@@ -287,6 +287,8 @@ impl OptVirtualize {
 
     /// RPython unroll.py: force_box_for_end_of_preamble — record virtual structure
     /// before forcing, so the peeled loop body can reconstruct it.
+    /// RPython unroll.py: force_box_for_end_of_preamble — record virtual
+    /// structure before forcing, for preamble peeling phase 2.
     fn export_virtual_for_preamble(
         &self,
         opref: OpRef,
@@ -298,7 +300,6 @@ impl OptVirtualize {
             Some(info) if info.is_virtual() => info.clone(),
             _ => return,
         };
-
         match info {
             PtrInfo::VirtualStruct(ref vinfo) => {
                 let fields: Vec<(majit_ir::DescrRef, i64)> = vinfo
@@ -307,14 +308,14 @@ impl OptVirtualize {
                     .map(|(field_idx, value_ref)| {
                         let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                             .unwrap_or_else(|| make_field_index_descr(*field_idx));
-                        let concrete = ctx
+                        let val = ctx
                             .get_constant(*value_ref)
                             .map(|v| match v {
                                 majit_ir::Value::Int(i) => *i,
                                 _ => 0,
                             })
                             .unwrap_or(0);
-                        (descr, concrete)
+                        (descr, val)
                     })
                     .collect();
                 ctx.exported_jump_virtuals
@@ -324,7 +325,31 @@ impl OptVirtualize {
                         fields,
                     });
             }
-            _ => {} // Only VirtualStruct for now (StackNode)
+            PtrInfo::Virtual(ref vinfo) => {
+                let fields: Vec<(majit_ir::DescrRef, i64)> = vinfo
+                    .fields
+                    .iter()
+                    .map(|(field_idx, value_ref)| {
+                        let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
+                            .unwrap_or_else(|| make_field_index_descr(*field_idx));
+                        let val = ctx
+                            .get_constant(*value_ref)
+                            .map(|v| match v {
+                                majit_ir::Value::Int(i) => *i,
+                                _ => 0,
+                            })
+                            .unwrap_or(0);
+                        (descr, val)
+                    })
+                    .collect();
+                ctx.exported_jump_virtuals
+                    .push(crate::optimizer::ExportedJumpVirtual {
+                        jump_arg_index,
+                        size_descr: vinfo.descr.clone(),
+                        fields,
+                    });
+            }
+            _ => {}
         }
     }
 
@@ -1671,9 +1696,7 @@ impl Optimization for OptVirtualize {
                         }
                     }
                     if Self::is_virtual(resolved, ctx) {
-                        // RPython unroll.py: record virtual structure for preamble peeling.
-                        // force_box_for_end_of_preamble exports the virtual's fields
-                        // so the peeled loop body can reconstruct it.
+                        // RPython unroll.py: export virtual structure for preamble peeling
                         self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                         let forced = self.force_virtual(resolved, ctx);
                         *arg = ctx.get_replacement(forced);
@@ -1685,8 +1708,17 @@ impl Optimization for OptVirtualize {
             }
 
             // JUMP (no virtualizable) / FINISH — force all virtual args
-            // Note: Finish is handled above with CALL_MAY_FORCE.
-            OpCode::Jump => self.optimize_escaping_op(op, ctx),
+            // Also export virtual structure for preamble peeling (non-vable path).
+            OpCode::Jump => {
+                let mut jump_op = op.clone();
+                for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
+                    let resolved = ctx.get_replacement(*arg);
+                    if Self::is_virtual(resolved, ctx) {
+                        self.export_virtual_for_preamble(resolved, arg_idx, ctx);
+                    }
+                }
+                self.optimize_escaping_op(&jump_op, ctx)
+            }
 
             // Escape ops (testing)
             OpCode::EscapeI | OpCode::EscapeR | OpCode::EscapeF | OpCode::EscapeN => {

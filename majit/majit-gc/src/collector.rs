@@ -105,17 +105,20 @@ struct IncrementalMarkState {
     marking_in_progress: bool,
     /// Number of objects marked so far in this cycle.
     objects_marked: usize,
-    /// Target number of objects to mark per increment.
+    /// Target number of bytes to trace per increment.
+    ///
+    /// Mirrors incminimark's `gc_increment_step`, which defaults to
+    /// `nursery_size * 2`.
     mark_budget_per_step: usize,
 }
 
 impl IncrementalMarkState {
-    fn new() -> Self {
+    fn new(nursery_size: usize) -> Self {
         IncrementalMarkState {
             gray_stack: Vec::new(),
             marking_in_progress: false,
             objects_marked: 0,
-            mark_budget_per_step: 64,
+            mark_budget_per_step: (nursery_size.saturating_mul(2)).max(1),
         }
     }
 }
@@ -155,6 +158,15 @@ pub struct MiniMarkGC {
     /// Old-gen bytes at the end of the last completed major collection.
     /// Used to decide when to start the next incremental cycle.
     last_major_bytes: usize,
+    /// Bytes promoted to old gen since the current incremental cycle started.
+    ///
+    /// Mirrors incminimark's `size_objects_made_old`.
+    bytes_made_old_since_cycle: usize,
+    /// Promotion credit granted by completed major-GC steps within the current
+    /// incremental cycle.
+    ///
+    /// Mirrors incminimark's `threshold_objects_made_old`.
+    threshold_bytes_made_old: usize,
     /// Pinned nursery objects that must not be moved during minor collection.
     pinned_objects: HashSet<usize>,
     /// Registry of compiled code regions for GC root scanning.
@@ -169,6 +181,7 @@ impl MiniMarkGC {
 
     /// Create a new GC with custom configuration.
     pub fn with_config(config: GcConfig) -> Self {
+        let nursery_size = config.nursery_size;
         MiniMarkGC {
             nursery: Nursery::new(config.nursery_size),
             oldgen: OldGen::new(),
@@ -179,8 +192,10 @@ impl MiniMarkGC {
             config,
             minor_collections: 0,
             major_collections: 0,
-            incr_state: IncrementalMarkState::new(),
+            incr_state: IncrementalMarkState::new(nursery_size),
             last_major_bytes: 0,
+            bytes_made_old_since_cycle: 0,
+            threshold_bytes_made_old: 0,
             pinned_objects: HashSet::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
         }
@@ -259,6 +274,9 @@ impl MiniMarkGC {
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
         *hdr = GcHeader::with_flags(type_id, flags::TRACK_YOUNG_PTRS);
+        self.bytes_made_old_since_cycle = self
+            .bytes_made_old_since_cycle
+            .saturating_add(total_size);
         GcRef((ptr as usize) + GcHeader::SIZE)
     }
 
@@ -335,19 +353,10 @@ impl MiniMarkGC {
             self.reset_nursery_with_pinned();
         }
 
-        // Incremental marking piggyback: if an incremental cycle is in
-        // progress, perform one bounded marking step.
-        if self.incr_state.marking_in_progress {
-            let done = self.incremental_mark_step();
-            if done {
-                self.finish_incremental_cycle();
-            }
-        }
-
-        // Check if we should start a new incremental cycle.
-        if !self.incr_state.marking_in_progress && self.should_start_major_cycle() {
-            self.start_incremental_cycle();
-        }
+        // Minor collections must also drive incremental major-collection
+        // progress. Like incminimark, take one or more major steps until
+        // promoted bytes are back under the current step credit.
+        self.run_major_progress_after_minor();
     }
 
     /// Copy a single nursery object to old gen.
@@ -389,6 +398,9 @@ impl MiniMarkGC {
                 .alloc_and_copy(header_ptr as *const u8, total_size)
         };
         let new_obj_addr = new_header_ptr as usize + GcHeader::SIZE;
+        self.bytes_made_old_since_cycle = self
+            .bytes_made_old_since_cycle
+            .saturating_add(total_size);
 
         // Set TRACK_YOUNG_PTRS on the new old-gen object.
         let new_hdr = unsafe { &mut *(new_header_ptr as *mut GcHeader) };
@@ -487,22 +499,73 @@ impl MiniMarkGC {
         }
     }
 
+    /// Drive incremental major-collection progress after a minor collection.
+    ///
+    /// This follows incminimark's accounting rule: each major step grants
+    /// `nursery_size / 2` bytes of promotion credit, and allocation-heavy
+    /// minors may need multiple consecutive steps so old-gen growth does not
+    /// outrun marking.
+    fn run_major_progress_after_minor(&mut self) {
+        if !self.incr_state.marking_in_progress && !self.should_start_major_cycle() {
+            return;
+        }
+
+        loop {
+            self.threshold_bytes_made_old = self
+                .threshold_bytes_made_old
+                .saturating_add(self.config.nursery_size / 2);
+
+            if !self.incr_state.marking_in_progress {
+                self.bytes_made_old_since_cycle = 0;
+                self.threshold_bytes_made_old = self.config.nursery_size / 2;
+                self.start_incremental_cycle();
+            }
+
+            let done = self.incremental_mark_step();
+            if done {
+                self.finish_incremental_cycle();
+                break;
+            }
+
+            if self.bytes_made_old_since_cycle <= self.threshold_bytes_made_old {
+                break;
+            }
+        }
+    }
+
     /// Perform one incremental marking step.
     ///
-    /// Processes up to `mark_budget_per_step` objects from the gray stack.
+    /// Processes up to `mark_budget_per_step` bytes from the gray stack.
+    /// Like incminimark, this is a byte budget, but we always process at least
+    /// one object so very small budgets still make forward progress.
     /// Returns `true` if marking is complete (gray stack exhausted).
     pub fn incremental_mark_step(&mut self) -> bool {
         let mut budget = self.incr_state.mark_budget_per_step;
-        while budget > 0 {
+        let mut processed_any = false;
+        while budget > 0 || !processed_any {
             let Some(obj_addr) = self.incr_state.gray_stack.pop() else {
                 self.incr_state.marking_in_progress = false;
                 return true; // marking complete
             };
+            let obj_size = self.object_total_size(obj_addr);
             self.mark_object(obj_addr);
             self.incr_state.objects_marked += 1;
-            budget -= 1;
+            budget = budget.saturating_sub(obj_size.max(1));
+            processed_any = true;
         }
         false // more work to do
+    }
+
+    fn object_total_size(&self, obj_addr: usize) -> usize {
+        let type_id = unsafe { header_of(obj_addr).type_id() };
+        let type_info = self.types.get(type_id);
+        let payload_size = if type_info.item_size > 0 {
+            let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+            type_info.total_instance_size(length)
+        } else {
+            type_info.size
+        };
+        GcHeader::SIZE + payload_size
     }
 
     /// Mark a single object: trace its GC pointer fields and push
@@ -550,6 +613,8 @@ impl MiniMarkGC {
         self.major_collections += 1;
         self.oldgen.sweep();
         self.last_major_bytes = self.oldgen.total_bytes();
+        self.bytes_made_old_since_cycle = 0;
+        self.threshold_bytes_made_old = 0;
     }
 
     /// Whether an incremental marking cycle is currently in progress.
@@ -562,7 +627,7 @@ impl MiniMarkGC {
         self.incr_state.objects_marked
     }
 
-    /// Set the per-step marking budget (number of objects per step).
+    /// Set the per-step marking budget in bytes.
     pub fn set_mark_budget(&mut self, budget: usize) {
         self.incr_state.mark_budget_per_step = budget;
     }
@@ -2134,6 +2199,46 @@ mod tests {
     }
 
     #[test]
+    fn test_minor_collection_can_take_multiple_major_steps_when_promotions_outpace_credit() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        // Build an old-gen chain large enough that a single budget=1 marking
+        // step cannot finish it.
+        let mut prev = GcRef::NULL;
+        for _ in 0..6 {
+            let obj = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+            unsafe {
+                *(obj.0 as *mut GcRef) = prev;
+            }
+            prev = obj;
+        }
+        let mut root = prev;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        assert!(gc.incr_state.gray_stack.len() >= 1);
+
+        // Simulate a minor collection that promoted more than one step's worth
+        // of objects so incminimark-style accounting demands extra progress.
+        gc.bytes_made_old_since_cycle = gc.config.nursery_size;
+        gc.threshold_bytes_made_old = 0;
+        gc.run_major_progress_after_minor();
+
+        assert!(
+            gc.incremental_objects_marked() >= 2
+                || gc.threshold_bytes_made_old > gc.config.nursery_size / 2,
+            "major progress should take multiple steps when promoted bytes outpace credit"
+        );
+
+        gc.roots.clear();
+    }
+
+    #[test]
     fn test_incremental_marking_budget() {
         // Each step should process at most `mark_budget_per_step` objects.
         let ptr_size = std::mem::size_of::<GcRef>();
@@ -2162,20 +2267,21 @@ mod tests {
         gc.do_collect_nursery();
         assert!(!gc.is_in_nursery(head.0));
 
-        // Start incremental cycle with budget of 2.
+        // Start incremental cycle with a tiny byte budget so each step still
+        // processes exactly one object.
         gc.set_mark_budget(2);
         gc.start_incremental_cycle();
         assert!(gc.is_incremental_marking());
 
-        // First step: marks at most 2 objects.
+        // First step: marks at most 1 object.
         let done = gc.incremental_mark_step();
-        assert!(!done, "should not be done after marking only 2 out of 10");
-        assert_eq!(gc.incremental_objects_marked(), 2);
+        assert!(!done, "should not be done after marking only 1 out of 10");
+        assert_eq!(gc.incremental_objects_marked(), 1);
 
-        // Second step: marks 2 more.
+        // Second step: marks 1 more.
         let done = gc.incremental_mark_step();
-        assert!(!done, "should not be done after 4 total");
-        assert_eq!(gc.incremental_objects_marked(), 4);
+        assert!(!done, "should not be done after 2 total");
+        assert_eq!(gc.incremental_objects_marked(), 2);
 
         gc.roots.clear();
     }

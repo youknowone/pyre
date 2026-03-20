@@ -955,15 +955,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     ) {
         quote! {
             fn node_size_descr(&self) -> Option<majit_ir::DescrRef> {
-                Some(std::sync::Arc::new(
-                    majit_ir::descr::SimpleFieldDescr::new(
-                        0x8000_0000, // unique tag for node size
-                        0,
-                        #node_size,
-                        majit_ir::Type::Ref,
-                        false,
-                    ),
-                ))
+                Some(majit_ir::descr::make_size_descr(#node_size))
             }
 
             fn node_value_descr(&self) -> Option<majit_ir::DescrRef> {

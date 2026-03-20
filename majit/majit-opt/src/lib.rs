@@ -79,8 +79,7 @@ pub struct OptContext {
     /// an ARRAYLEN_GC result >= index+1. intbounds.py uses this to
     /// eliminate redundant length guards.
     pub int_lower_bounds: HashMap<OpRef, i64>,
-    /// RPython parity: virtual structures found in JUMP args during preamble.
-    /// Collected by OptVirtualize, read by the unroll optimizer for 2-pass peeling.
+    /// RPython unroll.py: virtual structures at JUMP for preamble peeling.
     pub exported_jump_virtuals: Vec<crate::optimizer::ExportedJumpVirtual>,
 }
 
