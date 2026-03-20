@@ -44,7 +44,7 @@ pub struct UnrollOptimizer {
 impl UnrollOptimizer {
     pub fn new() -> Self {
         UnrollOptimizer {
-            retrace_limit: 5,
+            retrace_limit: 0,
             bridge_guard_count: 0,
             short_preamble: None,
             exported_state: None,
@@ -530,6 +530,7 @@ fn build_imported_virtuals(
             inputarg_index: base,
             size_descr: virt.size_descr.clone(),
             fields,
+            head_load_descr_index: virt.head_load_descr_index,
         });
         offset += virt.fields.len() - 1;
     }

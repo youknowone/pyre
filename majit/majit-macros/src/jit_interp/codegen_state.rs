@@ -1110,16 +1110,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     if let Some(&head) = self.linked_list_heads.get(&selected) {
                         return Some(head);
                     }
-                    // RPython import_state: check if this storage has an imported virtual head
-                    for &(orig_idx, virtual_head) in &ctx.imported_virtual_heads {
-                        if orig_idx == selected || orig_idx == 2 + self.storage_layout
-                            .iter().position(|&(s, _)| s == selected).unwrap_or(usize::MAX)
-                        {
-                            self.linked_list_heads.insert(selected, virtual_head);
-                            return Some(virtual_head);
-                        }
-                    }
                     // Lazy load: read head pointer from pool.jit_data_ptrs[selected]
+                    // (Phase 2 import forwarding is handled by OptVirtualize)
                     let head_offset = ((#ptrs_offset) as usize) + selected * 8;
                     let head_descr: majit_ir::DescrRef = std::sync::Arc::new(
                         majit_ir::descr::SimpleFieldDescr::new(
