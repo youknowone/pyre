@@ -13,7 +13,7 @@ use crate::resume::{
 };
 use majit_ir::{Op, OpCode, OpRef};
 
-use crate::executor::{execute_one, OpResult, resolve};
+use crate::executor::{OpResult, execute_one, resolve};
 
 /// Trait for IR-based blackhole memory access.
 ///

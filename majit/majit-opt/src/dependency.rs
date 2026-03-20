@@ -6,8 +6,8 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use majit_ir::{Op, OpCode, OpRef};
 use crate::schedule::PackGroup;
+use majit_ir::{Op, OpCode, OpRef};
 
 /// A node in the dependency graph.
 #[derive(Clone, Debug)]

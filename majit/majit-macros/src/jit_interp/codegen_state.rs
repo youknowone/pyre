@@ -33,7 +33,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     let state_type = &config.state_type;
     let env_type = &config.env_type;
     let pool_field = extract_field_member(&storage.pool);
+    let pool_ref_field = storage.pool_ref.as_ref().map(extract_field_member);
     let sel_field = extract_field_member(&storage.selector);
+    let selected_ref_field = storage.selected_ref.as_ref().map(extract_field_member);
+    let stacksize_field = storage.stacksize.as_ref().map(extract_field_member);
     let untraceable = &storage.untraceable;
     let scan_fn = &storage.scan_fn;
     let can_trace_guard = &storage.can_trace_guard;
@@ -988,13 +991,26 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
         };
 
     // ── Linked list mode ──
-    // RPython parity: inputargs = [pool_ptr, selected], heads loaded lazily.
-    // No flattened stack elements, no depth constraint on validate_close.
+    // RPython parity: live state carries stacksize + storage ref + selected.
+    // Stack heads and sizes live on GC-managed shadow stack objects.
     if storage.linked_list_node_size.is_some() {
-        let ptrs_offset = &storage
-            .compact_ptrs_offset
-            .as_ref()
-            .expect("linked_list mode requires compact_ptrs_offset (head pointer cache offset)");
+        let pool_ref_field =
+            pool_ref_field.expect("linked_list mode requires storage.pool_ref as a GcRef field");
+        let selected_ref_field = selected_ref_field
+            .expect("linked_list mode requires storage.selected_ref as a GcRef field");
+        let stacksize_field =
+            stacksize_field.expect("linked_list mode requires storage.stacksize");
+        let storage_offset = storage.linked_list_storage_offset.as_ref().expect(
+            "linked_list mode requires linked_list_storage_offset (shadow storage pools offset)",
+        );
+        let stack_head_offset = storage.linked_list_stack_head_offset.as_ref().expect(
+            "linked_list mode requires linked_list_stack_head_offset",
+        );
+        let stack_size_offset = storage.linked_list_stack_size_offset.as_ref().expect(
+            "linked_list mode requires linked_list_stack_size_offset",
+        );
+        let pool_live_raw = quote! { self.#pool_ref_field.as_usize() as i64 };
+        let selected_ref_live_raw = quote! { self.#selected_ref_field.as_usize() as i64 };
 
         return quote! {
             #[derive(Clone)]
@@ -1007,13 +1023,16 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             #[allow(non_camel_case_types)]
             struct __JitSym {
                 pool_ref: majit_ir::OpRef,
+                current_stacksize_value: Option<majit_ir::OpRef>,
                 current_selected: usize,
                 current_selected_value: Option<majit_ir::OpRef>,
+                current_selected_ref: Option<majit_ir::OpRef>,
                 storage_layout: Vec<(usize, usize)>,
                 loop_header_pc: usize,
                 header_selected: usize,
                 trace_started: bool,
                 meta_storage_count: usize,
+                linked_list_stack_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
                 linked_list_heads: std::collections::HashMap<usize, majit_ir::OpRef>,
                 // Keep symbolic stacks for fallback (non-linked-list storages)
                 stacks: std::collections::HashMap<usize, majit_meta::SymbolicStack>,
@@ -1035,6 +1054,14 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     self.current_selected_value
                 }
 
+                fn current_selected_ref(&self) -> Option<majit_ir::OpRef> {
+                    self.current_selected_ref
+                }
+
+                fn current_stacksize_value(&self) -> Option<majit_ir::OpRef> {
+                    self.current_stacksize_value
+                }
+
                 fn set_current_selected(&mut self, selected: usize) {
                     self.current_selected = selected;
                 }
@@ -1042,6 +1069,16 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 fn set_current_selected_value(&mut self, selected: usize, value: majit_ir::OpRef) {
                     self.current_selected = selected;
                     self.current_selected_value = Some(value);
+                }
+
+                fn set_current_selected_ref(&mut self, selected: usize, value: majit_ir::OpRef) {
+                    self.current_selected = selected;
+                    self.current_selected_ref = Some(value);
+                    self.linked_list_stack_refs.insert(selected, value);
+                }
+
+                fn set_current_stacksize_value(&mut self, value: majit_ir::OpRef) {
+                    self.current_stacksize_value = Some(value);
                 }
 
                 fn stack(&self, selected: usize) -> Option<&majit_meta::SymbolicStack> {
@@ -1063,27 +1100,23 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
-                    // [pool_ref, selected_value, per_storage_head...]
+                    let stacksize = self.current_stacksize_value
+                        .unwrap_or(majit_ir::OpRef::NONE);
                     let selected = self.current_selected_value
                         .unwrap_or(majit_ir::OpRef::NONE);
-                    let mut args = vec![self.pool_ref, selected];
-                    for &(sidx, _) in self.storage_layout.iter().take(self.meta_storage_count) {
-                        if let Some(&head) = self.linked_list_heads.get(&sidx) {
-                            args.push(head);
-                        } else {
-                            args.push(majit_ir::OpRef::NONE);
-                        }
-                    }
-                    Some(args)
+                    let selected_ref = self.current_selected_ref
+                        .unwrap_or(majit_ir::OpRef::NONE);
+                    // RPython parity: guard fail state carries the red vars.
+                    Some(vec![stacksize, self.pool_ref, selected, selected_ref])
                 }
 
                 fn fail_args_types(&self) -> Option<Vec<majit_ir::Type>> {
-                    // [pool=Int, selected=Int, head_0=Ref, ..., head_N=Ref]
-                    let mut types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
-                    for _ in self.storage_layout.iter().take(self.meta_storage_count) {
-                        types.push(majit_ir::Type::Ref);
-                    }
-                    Some(types)
+                    Some(vec![
+                        majit_ir::Type::Int,
+                        majit_ir::Type::Ref,
+                        majit_ir::Type::Int,
+                        majit_ir::Type::Ref,
+                    ])
                 }
 
                 fn selected_in_fail_args_prefix(&self) -> bool {
@@ -1099,8 +1132,52 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     self.linked_list_heads.get(&selected).copied()
                 }
 
+                fn linked_list_stack_ref(&self, selected: usize) -> Option<majit_ir::OpRef> {
+                    if selected == self.current_selected {
+                        self.current_selected_ref
+                    } else {
+                        self.linked_list_stack_refs.get(&selected).copied()
+                    }
+                }
+
                 fn set_linked_list_head(&mut self, selected: usize, head: majit_ir::OpRef) {
                     self.linked_list_heads.insert(selected, head);
+                }
+
+                fn set_linked_list_stack_ref(&mut self, selected: usize, stack_ref: majit_ir::OpRef) {
+                    self.linked_list_stack_refs.insert(selected, stack_ref);
+                    if selected == self.current_selected {
+                        self.current_selected_ref = Some(stack_ref);
+                    }
+                }
+
+                fn ensure_linked_list_stack_ref(
+                    &mut self,
+                    ctx: &mut majit_meta::TraceCtx,
+                    selected: usize,
+                ) -> Option<majit_ir::OpRef> {
+                    if false #( || selected == #untraceable )* {
+                        return None;
+                    }
+                    if selected == self.current_selected {
+                        if let Some(stack_ref) = self.current_selected_ref {
+                            return Some(stack_ref);
+                        }
+                    }
+                    if let Some(&stack_ref) = self.linked_list_stack_refs.get(&selected) {
+                        return Some(stack_ref);
+                    }
+                    let stack_descr = self.linked_list_storage_item_descr(selected)?;
+                    let stack_ref = ctx.record_op_with_descr(
+                        majit_ir::OpCode::GetfieldGcR,
+                        &[self.pool_ref],
+                        stack_descr,
+                    );
+                    self.linked_list_stack_refs.insert(selected, stack_ref);
+                    if selected == self.current_selected {
+                        self.current_selected_ref = Some(stack_ref);
+                    }
+                    Some(stack_ref)
                 }
 
                 fn ensure_linked_list_head(
@@ -1111,21 +1188,11 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     if let Some(&head) = self.linked_list_heads.get(&selected) {
                         return Some(head);
                     }
-                    // Lazy load: read head pointer from pool.jit_data_ptrs[selected]
-                    // (Phase 2 import forwarding is handled by OptVirtualize)
-                    let head_offset = ((#ptrs_offset) as usize) + selected * 8;
-                    let head_descr: majit_ir::DescrRef = std::sync::Arc::new(
-                        majit_ir::descr::SimpleFieldDescr::new(
-                            ((head_offset as u32) << 2) | 0,
-                            head_offset,
-                            8,
-                            majit_ir::Type::Ref,
-                            false,
-                        ),
-                    );
+                    let stack_ref = self.ensure_linked_list_stack_ref(ctx, selected)?;
+                    let head_descr = self.linked_list_stack_head_descr()?;
                     let head = ctx.record_op_with_descr(
                         majit_ir::OpCode::GetfieldGcR,
-                        &[self.pool_ref],
+                        &[stack_ref],
                         head_descr,
                     );
                     self.linked_list_heads.insert(selected, head);
@@ -1138,20 +1205,72 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     selected: usize,
                     new_head: majit_ir::OpRef,
                 ) {
-                    let head_offset = ((#ptrs_offset) as usize) + selected * 8;
-                    let head_descr: majit_ir::DescrRef = std::sync::Arc::new(
+                    let Some(stack_ref) = self.ensure_linked_list_stack_ref(ctx, selected) else {
+                        return;
+                    };
+                    let Some(head_descr) = self.linked_list_stack_head_descr() else {
+                        return;
+                    };
+                    ctx.record_op_with_descr(
+                        majit_ir::OpCode::SetfieldGc,
+                        &[stack_ref, new_head],
+                        head_descr,
+                    );
+                }
+
+                fn linked_list_storage_item_descr(&self, selected: usize) -> Option<majit_ir::DescrRef> {
+                    let offset = ((#storage_offset) as usize) + selected * 8;
+                    Some(std::sync::Arc::new(
                         majit_ir::descr::SimpleFieldDescr::new(
-                            ((head_offset as u32) << 2) | 0,
-                            head_offset,
+                            ((offset as u32) << 2) | 0x1,
+                            offset,
                             8,
                             majit_ir::Type::Ref,
                             false,
                         ),
-                    );
+                    ))
+                }
+
+                fn linked_list_stack_head_descr(&self) -> Option<majit_ir::DescrRef> {
+                    Some(std::sync::Arc::new(
+                        majit_ir::descr::SimpleFieldDescr::new(
+                            0x8000_0003,
+                            #stack_head_offset,
+                            8,
+                            majit_ir::Type::Ref,
+                            false,
+                        ),
+                    ))
+                }
+
+                fn linked_list_stack_size_descr(&self) -> Option<majit_ir::DescrRef> {
+                    Some(std::sync::Arc::new(
+                        majit_ir::descr::SimpleFieldDescr::new(
+                            0x8000_0004,
+                            #stack_size_offset,
+                            8,
+                            majit_ir::Type::Int,
+                            false,
+                        ),
+                    ))
+                }
+
+                fn linked_list_writeback_size(
+                    &mut self,
+                    ctx: &mut majit_meta::TraceCtx,
+                    selected: usize,
+                    new_size: majit_ir::OpRef,
+                ) {
+                    let Some(stack_ref) = self.ensure_linked_list_stack_ref(ctx, selected) else {
+                        return;
+                    };
+                    let Some(size_descr) = self.linked_list_stack_size_descr() else {
+                        return;
+                    };
                     ctx.record_op_with_descr(
                         majit_ir::OpCode::SetfieldGc,
-                        &[self.pool_ref, new_head],
-                        head_descr,
+                        &[stack_ref, new_size],
+                        size_descr,
                     );
                 }
 
@@ -1180,36 +1299,41 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
-                    // RPython compile.py: root loop inputargs stay at the
-                    // original red variables. Linked-list heads are loaded
-                    // lazily from the pool object at trace entry and only
-                    // become explicit boxes at the inner LABEL/JUMP boundary.
+                    // RPython parity: root loop inputargs are the red vars.
+                    // Concrete stack contents stay on shadow stack objects.
+                    let _ = meta;
                     vec![
-                        (&self.#pool_field as *const _ as usize) as i64,
+                        self.#stacksize_field as i64,
+                        #pool_live_raw,
                         self.#sel_field as i64,
+                        #selected_ref_live_raw,
                     ]
                 }
 
                 fn live_value_types(&self, meta: &__JitMeta) -> Vec<majit_ir::Type> {
                     let _ = meta;
-                    vec![majit_ir::Type::Int, majit_ir::Type::Int]
+                    vec![
+                        majit_ir::Type::Int,
+                        majit_ir::Type::Ref,
+                        majit_ir::Type::Int,
+                        majit_ir::Type::Ref,
+                    ]
                 }
 
                 fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
-                    // Heads are lazily loaded via ensure_linked_list_head (Phase 1)
-                    // or injected as VirtualStruct via imported_virtuals (Phase 2).
-                    // Don't pre-populate from inputargs — they contain field values now.
-                    let heads = std::collections::HashMap::new();
                     __JitSym {
-                        pool_ref: majit_ir::OpRef(0),
+                        pool_ref: majit_ir::OpRef(1),
+                        current_stacksize_value: Some(majit_ir::OpRef(0)),
                         current_selected: meta.initial_selected,
-                        current_selected_value: Some(majit_ir::OpRef(1)),
+                        current_selected_value: Some(majit_ir::OpRef(2)),
+                        current_selected_ref: Some(majit_ir::OpRef(3)),
                         storage_layout: meta.storage_layout.clone(),
                         loop_header_pc: header_pc,
                         header_selected: meta.initial_selected,
                         trace_started: false,
                         meta_storage_count: meta.storage_layout.len(),
-                        linked_list_heads: heads,
+                        linked_list_stack_refs: std::collections::HashMap::new(),
+                        linked_list_heads: std::collections::HashMap::new(),
                         stacks: std::collections::HashMap::new(),
                     }
                 }
@@ -1219,30 +1343,37 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                    // Root loop live state is [pool_ptr, selected]. Guard
-                    // failures restore linked-list heads through the
-                    // interpreter-specific failure handler, not here.
+                    self.#stacksize_field = values
+                        .first()
+                        .copied()
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or_default();
+                    self.#pool_ref_field = majit_ir::GcRef(
+                        values
+                            .get(1)
+                            .copied()
+                            .and_then(|v| usize::try_from(v).ok())
+                            .unwrap_or(0),
+                    );
                     self.#sel_field = values
-                        .get(1)
+                        .get(2)
                         .copied()
                         .and_then(|v| usize::try_from(v).ok())
                         .unwrap_or(meta.initial_selected);
+                    self.#selected_ref_field = majit_ir::GcRef(
+                        values
+                            .get(3)
+                            .copied()
+                            .and_then(|v| usize::try_from(v).ok())
+                            .unwrap_or(0),
+                    );
                 }
 
                 fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
-                    // [pool_ref, selected, head_0, ..., head_N]
-                    // Heads carried as JUMP args so OptVirtualize can track them.
+                    let stacksize = sym.current_stacksize_value.unwrap_or(majit_ir::OpRef::NONE);
                     let selected = sym.current_selected_value.unwrap_or(majit_ir::OpRef::NONE);
-                    let mut args = vec![sym.pool_ref, selected];
-                    for &(sidx, _) in sym.storage_layout.iter().take(sym.meta_storage_count) {
-                        args.push(
-                            sym.linked_list_heads
-                                .get(&sidx)
-                                .copied()
-                                .unwrap_or(majit_ir::OpRef::NONE),
-                        );
-                    }
-                    args
+                    let selected_ref = sym.current_selected_ref.unwrap_or(majit_ir::OpRef::NONE);
+                    vec![stacksize, sym.pool_ref, selected, selected_ref]
                 }
 
                 #vable_info_fn

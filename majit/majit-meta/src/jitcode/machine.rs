@@ -33,8 +33,16 @@ use crate::{SymbolicStack, TraceAction, TraceCtx};
 pub trait JitCodeSym {
     fn current_selected(&self) -> usize;
     fn current_selected_value(&self) -> Option<OpRef>;
+    fn current_selected_ref(&self) -> Option<OpRef> {
+        None
+    }
+    fn current_stacksize_value(&self) -> Option<OpRef> {
+        None
+    }
     fn set_current_selected(&mut self, selected: usize);
     fn set_current_selected_value(&mut self, selected: usize, value: OpRef);
+    fn set_current_selected_ref(&mut self, _selected: usize, _value: OpRef) {}
+    fn set_current_stacksize_value(&mut self, _value: OpRef) {}
     fn guard_selected(&self) -> usize {
         self.current_selected()
     }
@@ -162,13 +170,34 @@ pub trait JitCodeSym {
         None
     }
 
+    /// Get the linked list stack object OpRef for a storage.
+    fn linked_list_stack_ref(&self, _selected: usize) -> Option<OpRef> {
+        None
+    }
+
     /// Update the linked list head OpRef for a storage.
     fn set_linked_list_head(&mut self, _selected: usize, _head: OpRef) {}
+
+    /// Update the linked list stack object OpRef for a storage.
+    fn set_linked_list_stack_ref(&mut self, _selected: usize, _stack_ref: OpRef) {}
 
     /// Ensure linked list head is loaded for a storage.
     /// Lazily loads from the pool object via GetfieldRawI on first access.
     fn ensure_linked_list_head(&mut self, _ctx: &mut TraceCtx, selected: usize) -> Option<OpRef> {
         self.linked_list_head(selected)
+    }
+
+    /// Ensure linked list stack object is loaded for a storage.
+    fn ensure_linked_list_stack_ref(
+        &mut self,
+        _ctx: &mut TraceCtx,
+        selected: usize,
+    ) -> Option<OpRef> {
+        if selected == self.current_selected() {
+            self.current_selected_ref()
+        } else {
+            self.linked_list_stack_ref(selected)
+        }
     }
 
     /// Write new linked list head back to the pool object's head cache.
@@ -193,6 +222,30 @@ pub trait JitCodeSym {
     /// Node.next field descriptor for SetfieldGc/GetfieldGcR.
     fn node_next_descr(&self) -> Option<majit_ir::DescrRef> {
         None
+    }
+
+    /// Descriptor for loading one storage ref from the shadow storage object.
+    fn linked_list_storage_item_descr(&self, _selected: usize) -> Option<majit_ir::DescrRef> {
+        None
+    }
+
+    /// Descriptor for the head field on the shadow stack object.
+    fn linked_list_stack_head_descr(&self) -> Option<majit_ir::DescrRef> {
+        None
+    }
+
+    /// Descriptor for the size field on the shadow stack object.
+    fn linked_list_stack_size_descr(&self) -> Option<majit_ir::DescrRef> {
+        None
+    }
+
+    /// Write the latest linked-list size back to the shadow stack object.
+    fn linked_list_writeback_size(
+        &mut self,
+        _ctx: &mut TraceCtx,
+        _selected: usize,
+        _new_size: OpRef,
+    ) {
     }
 
     // -- State field support (register/tape machines) -----
@@ -500,6 +553,66 @@ where
         Ok(())
     }
 
+    fn linked_list_stack_size(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        selected: usize,
+    ) -> Result<OpRef, TraceAction> {
+        if selected == sym.current_selected() {
+            sym.current_stacksize_value().ok_or(TraceAction::Abort)
+        } else {
+            let stack_ref = sym
+                .ensure_linked_list_stack_ref(ctx, selected)
+                .ok_or(TraceAction::Abort)?;
+            let size_descr = sym
+                .linked_list_stack_size_descr()
+                .ok_or(TraceAction::Abort)?;
+            Ok(ctx.record_op_with_descr(OpCode::GetfieldGcI, &[stack_ref], size_descr))
+        }
+    }
+
+    fn linked_list_adjust_size(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        selected: usize,
+        delta: i64,
+    ) -> Result<OpRef, TraceAction> {
+        let size = self.linked_list_stack_size(ctx, sym, selected)?;
+        let amount = ctx.const_int(delta.abs());
+        let new_size = if delta >= 0 {
+            ctx.record_op(OpCode::IntAdd, &[size, amount])
+        } else {
+            ctx.record_op(OpCode::IntSub, &[size, amount])
+        };
+        sym.linked_list_writeback_size(ctx, selected, new_size);
+        if selected == sym.current_selected() {
+            sym.set_current_stacksize_value(new_size);
+        }
+        Ok(new_size)
+    }
+
+    fn linked_list_select_storage(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        selected: usize,
+    ) -> Result<(), TraceAction> {
+        let stack_ref = sym
+            .ensure_linked_list_stack_ref(ctx, selected)
+            .ok_or(TraceAction::Abort)?;
+        let size_descr = sym
+            .linked_list_stack_size_descr()
+            .ok_or(TraceAction::Abort)?;
+        let stacksize = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[stack_ref], size_descr);
+        let selected_value = ctx.const_int(selected as i64);
+        sym.set_current_selected_value(selected, selected_value);
+        sym.set_current_selected_ref(selected, stack_ref);
+        sym.set_current_stacksize_value(stacksize);
+        Ok(())
+    }
+
     fn compact_pop_int(
         &mut self,
         ctx: &mut TraceCtx,
@@ -576,6 +689,7 @@ where
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[node, old_head], next_descr);
         sym.set_linked_list_head(selected, node);
         sym.linked_list_writeback_head(ctx, selected, node);
+        let _ = self.linked_list_adjust_size(ctx, sym, selected, 1)?;
 
         self.runtime_stack_mut(selected, runtime).push(concrete);
         Ok(())
@@ -600,6 +714,7 @@ where
         let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
         sym.set_linked_list_head(selected, next);
         sym.linked_list_writeback_head(ctx, selected, next);
+        let _ = self.linked_list_adjust_size(ctx, sym, selected, -1)?;
 
         let concrete = self
             .runtime_stack_mut(selected, runtime)
@@ -870,6 +985,12 @@ where
                     let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
                     sym.set_linked_list_head(selected, next);
                     sym.linked_list_writeback_head(ctx, selected, next);
+                    if self
+                        .linked_list_adjust_size(ctx, sym, selected, -1)
+                        .is_err()
+                    {
+                        return TraceAction::Abort;
+                    }
                     if self.runtime_stack_mut(selected, runtime).pop().is_none() {
                         return TraceAction::Abort;
                     }
@@ -1347,7 +1468,9 @@ where
                 let required = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 let concrete_len = self.runtime_stack_mut(selected, runtime).len();
-                if let Some((_, len, _)) = Self::compact_storage_refs(ctx, sym, selected) {
+                if let Some(len) = sym.current_stacksize_value() {
+                    self.compact_guard_required_stack(ctx, sym, len, required, concrete_len);
+                } else if let Some((_, len, _)) = Self::compact_storage_refs(ctx, sym, selected) {
                     // RPython parity: the BRPOP path is part of the traced path,
                     // so compact-storage mode must guard on the current stack
                     // depth before the interpreter decides whether to jump.
@@ -1584,7 +1707,13 @@ where
                         .get(const_idx)
                         .expect("jitcode const index out of bounds") as usize
                 };
-                if Self::compact_storage_refs(ctx, sym, new_selected).is_none()
+                if sym.ensure_linked_list_stack_ref(ctx, new_selected).is_some() {
+                    if self.linked_list_select_storage(ctx, sym, new_selected).is_err() {
+                        return TraceAction::Abort;
+                    }
+                } else if sym.current_selected_ref().is_some() {
+                    return TraceAction::Abort;
+                } else if Self::compact_storage_refs(ctx, sym, new_selected).is_none()
                     && sym.stack(new_selected).is_none()
                 {
                     if Self::compact_storage_refs(ctx, sym, sym.current_selected()).is_some() {
@@ -1594,9 +1723,12 @@ where
                     let offset = sym.total_slots();
                     sym.ensure_stack(new_selected, offset, len);
                     let _ = self.runtime_stack_mut(new_selected, runtime);
+                    let selected_value = ctx.const_int(new_selected as i64);
+                    sym.set_current_selected_value(new_selected, selected_value);
+                } else {
+                    let selected_value = ctx.const_int(new_selected as i64);
+                    sym.set_current_selected_value(new_selected, selected_value);
                 }
-                let selected_value = ctx.const_int(new_selected as i64);
-                sym.set_current_selected_value(new_selected, selected_value);
             }
             BC_PUSH_TO => {
                 let (src_idx, target) = {
@@ -1611,6 +1743,8 @@ where
                     {
                         return TraceAction::Abort;
                     }
+                } else if sym.current_selected_ref().is_some() {
+                    return TraceAction::Abort;
                 } else if Self::compact_storage_refs(ctx, sym, target).is_some() {
                     if self
                         .compact_push_int(ctx, sym, runtime, target, value, concrete)

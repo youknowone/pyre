@@ -467,8 +467,7 @@ impl Optimization for OptPure {
                 }
 
                 if let Some(cached_ref) = self.lookup_imported_short_pure(&postponed, ctx) {
-                    ctx.note_imported_short_use(cached_ref);
-                    let cached_ref = ctx.get_replacement(cached_ref);
+                    let cached_ref = ctx.force_op_from_preamble(cached_ref);
                     ctx.replace_op(postponed.pos, cached_ref);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -549,8 +548,7 @@ impl Optimization for OptPure {
             }
 
             if let Some(cached_ref) = self.lookup_imported_short_pure(op, ctx) {
-                ctx.note_imported_short_use(cached_ref);
-                let cached_ref = ctx.get_replacement(cached_ref);
+                let cached_ref = ctx.force_op_from_preamble(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -574,8 +572,7 @@ impl Optimization for OptPure {
         // CALL_PURE_* -> CSE or known_result lookup, then demote to CALL_*.
         if op.opcode.is_call_pure() {
             if let Some(cached_ref) = self.lookup_imported_short_pure(op, ctx) {
-                ctx.note_imported_short_use(cached_ref);
-                let cached_ref = ctx.get_replacement(cached_ref);
+                let cached_ref = ctx.force_op_from_preamble(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;

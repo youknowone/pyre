@@ -26,10 +26,12 @@ use majit_ir::{Op, OpCode, OpRef};
 
 use crate::{OptContext, Optimization, OptimizationResult};
 
-
-pub use crate::dependency::{DepNode, DependencyGraph};
 pub use crate::dependency::schedule_operations;
-pub use crate::schedule::{PackGroup, PackSet, AccumulationPack, GuardAnalysis, GenericCostModel, CostModel, are_adjacent_memory_refs};
+pub use crate::dependency::{DepNode, DependencyGraph};
+pub use crate::schedule::{
+    AccumulationPack, CostModel, GenericCostModel, GuardAnalysis, PackGroup, PackSet,
+    are_adjacent_memory_refs,
+};
 
 /// vector.py: VectorLoop — wraps a loop body for vectorization analysis.
 /// Provides the iteration over loop body ops and manages unrolling.

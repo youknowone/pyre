@@ -765,22 +765,28 @@ impl PtrInfo {
     /// info.py: produce_short_preamble_ops(structbox, descr, index, optimizer, shortboxes)
     ///
     /// Add cached field values to the short preamble builder.
-    /// For each non-null field in the virtual, register a GETFIELD read
-    /// so the bridge can re-populate the optimizer's field cache.
-    pub fn produce_short_preamble_ops(&self, structbox: OpRef) -> Vec<(OpCode, OpRef, u32)> {
+    /// For each non-null field in the virtual, register a descriptor-carrying
+    /// GETFIELD read so the bridge can re-populate the optimizer's field cache.
+    pub fn produce_short_preamble_ops(&self, structbox: OpRef) -> Vec<Op> {
         let mut result = Vec::new();
         // Fields are accessed per-variant below
         if let PtrInfo::Virtual(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    result.push((OpCode::GetfieldGcI, structbox, field_idx));
+                    if let Some((_, descr)) = v.field_descrs.iter().find(|(idx, _)| *idx == field_idx)
+                    {
+                        result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr.clone()));
+                    }
                 }
             }
         }
         if let PtrInfo::VirtualStruct(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    result.push((OpCode::GetfieldGcI, structbox, field_idx));
+                    if let Some((_, descr)) = v.field_descrs.iter().find(|(idx, _)| *idx == field_idx)
+                    {
+                        result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr.clone()));
+                    }
                 }
             }
         }

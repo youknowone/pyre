@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use majit_ir::{OopSpecIndex, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, Type};
 
 use crate::{OptContext, Optimization, OptimizationResult};
 
@@ -48,6 +48,8 @@ type ArrayItemKey = (OpRef, u32, i64);
 pub struct OptHeap {
     /// Cached field values: field_key -> value OpRef.
     cached_fields: HashMap<FieldKey, OpRef>,
+    /// Descriptors for cached field values.
+    cached_field_descrs: HashMap<FieldKey, DescrRef>,
     /// Immutable (pure) field cache — separate from cached_fields to survive
     /// all invalidation. RPython heap.py: is_always_pure() fields are never
     /// invalidated (their values never change).
@@ -56,6 +58,8 @@ pub struct OptHeap {
     lazy_setfields: HashMap<FieldKey, Op>,
     /// Cached array items: array_item_key -> value OpRef.
     cached_arrayitems: HashMap<ArrayItemKey, OpRef>,
+    /// Descriptors for cached array item values.
+    cached_arrayitem_descrs: HashMap<ArrayItemKey, DescrRef>,
     /// Pending (lazy) setarrayitems: array_item_key -> the SETARRAYITEM_GC op.
     lazy_setarrayitems: HashMap<ArrayItemKey, Op>,
     /// Whether we've already emitted a GUARD_NOT_INVALIDATED.
@@ -112,9 +116,11 @@ impl OptHeap {
     pub fn new() -> Self {
         OptHeap {
             cached_fields: HashMap::new(),
+            cached_field_descrs: HashMap::new(),
             immutable_cached_fields: HashMap::new(),
             lazy_setfields: HashMap::new(),
             cached_arrayitems: HashMap::new(),
+            cached_arrayitem_descrs: HashMap::new(),
             lazy_setarrayitems: HashMap::new(),
             seen_guard_not_invalidated: false,
             postponed_op: None,
@@ -164,6 +170,18 @@ impl OptHeap {
         Some((array, descr.index(), index_ref))
     }
 
+    fn remember_field_descr(&mut self, key: FieldKey, op: &Op) {
+        if let Some(descr) = &op.descr {
+            self.cached_field_descrs.insert(key, descr.clone());
+        }
+    }
+
+    fn remember_arrayitem_descr(&mut self, key: ArrayItemKey, op: &Op) {
+        if let Some(descr) = &op.descr {
+            self.cached_arrayitem_descrs.insert(key, descr.clone());
+        }
+    }
+
     /// heap.py: force_lazy_set — emit lazy setfields.
     /// If any lazy setfield argument references the postponed_op,
     /// emit the postponed_op first (RPython heap.py exact logic).
@@ -192,6 +210,12 @@ impl OptHeap {
             if info.is_virtual() {
                 // RPython info.py:148: force_box → emit New + SetfieldGc
                 let forced = info.force_to_ops(orig_val, ctx);
+                // RPython heap.py routes emit_extra() from OptHeap to
+                // optimizer.send_extra_operation(op, self.next_optimization).
+                // OptHeap is the last pass in majit's default pipelines, so
+                // the forced materialization must become concrete output
+                // immediately before we emit the heap writeback itself.
+                ctx.flush_extra_operations_raw();
                 // Update the op's arg to the forced concrete ref
                 op.args[1] = forced;
                 // Resolve remaining args
@@ -237,6 +261,9 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
+        if crate::majit_log_enabled() && !pending.is_empty() {
+            eprintln!("[heap] force_all_lazy: {} pending lazy_setfields", pending.len());
+        }
         // 2-pass: first force all virtual values (emit New + SetfieldGc),
         // then emit all pool writebacks. This ensures SSA ordering:
         // v16 = New() must appear BEFORE SetfieldGc(pool, v16).
@@ -245,10 +272,18 @@ impl OptHeap {
             let orig_val = op.arg(1);
             if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
                 if info.is_virtual() {
+                    if crate::majit_log_enabled() {
+                        eprintln!("[heap] force_to_ops: orig_val={orig_val:?}");
+                    }
                     info.force_to_ops(orig_val, ctx);
                 }
             }
         }
+        // RPython heap.py: force_lazy_set() replays forced ops via emit_extra()
+        // and those ops are processed immediately by downstream passes.
+        // OptHeap is last in majit's default pipelines, so flush the queued
+        // materialization ops before we test/emit the final writebacks.
+        ctx.flush_extra_operations_raw();
         // Pass 2: emit pool writebacks (with resolved forwarding)
         for (key, mut op) in pending {
             for arg in op.args.iter_mut() {
@@ -266,17 +301,28 @@ impl OptHeap {
             }
             ctx.emit(op.clone());
             self.cached_fields.insert(key, op.arg(1));
+            self.remember_field_descr(key, &op);
         }
     }
 
     /// Force all pending lazy setarrayitems: emit the stored ops and cache their values.
     fn force_all_lazy_setarrayitems(&mut self, ctx: &mut OptContext) {
         let pending: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
+        for (_key, op) in &pending {
+            let orig_val = op.arg(2);
+            if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
+                if info.is_virtual() {
+                    info.force_to_ops(orig_val, ctx);
+                }
+            }
+        }
+        ctx.flush_extra_operations_raw();
         for (key, mut op) in pending {
             for arg in &mut op.args {
                 *arg = ctx.get_replacement(*arg);
             }
             let value_ref = op.arg(2);
+            self.remember_arrayitem_descr(key, &op);
             ctx.emit(op);
             self.cached_arrayitems.insert(key, value_ref);
         }
@@ -311,6 +357,7 @@ impl OptHeap {
             if is_virtual || self.unescaped.contains(&value_ref) {
                 pendingfields.push(op);
             } else {
+                self.remember_field_descr(key, &op);
                 ctx.emit(op);
                 self.cached_fields.insert(key, value_ref);
             }
@@ -329,6 +376,7 @@ impl OptHeap {
             if is_virtual || self.unescaped.contains(&value_ref) {
                 pendingfields.push(op);
             } else {
+                self.remember_arrayitem_descr(key, &op);
                 ctx.emit(op);
                 self.cached_arrayitems.insert(key, value_ref);
             }
@@ -620,6 +668,7 @@ impl OptHeap {
         if let Some(&cached) = ctx.imported_short_fields.get(&key) {
             let cached = ctx.force_op_from_preamble(cached);
             self.cached_fields.entry(key).or_insert(cached);
+            self.remember_field_descr(key, op);
         }
 
         // Check immutable field cache first — these survive all invalidation.
@@ -649,6 +698,7 @@ impl OptHeap {
             // the result so it survives calls (unlike normal mutable fields).
             self.quasi_immut_cache.insert(key, op.pos);
             self.cached_fields.insert(key, op.pos);
+            self.remember_field_descr(key, op);
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -657,6 +707,7 @@ impl OptHeap {
         let struct_ref = ctx.get_replacement(op.arg(0));
         self.known_nonnull.insert(struct_ref);
         self.cached_fields.insert(key, op.pos);
+        self.remember_field_descr(key, op);
         // Save immutable fields in the permanent cache — they survive all
         // invalidation because the value never changes.
         if self.immutable_field_descrs.contains(&key.1) {
@@ -725,6 +776,7 @@ impl OptHeap {
             if let Some(&cached) = ctx.imported_short_arrayitems.get(&key) {
                 let cached = ctx.force_op_from_preamble(cached);
                 self.cached_arrayitems.entry(key).or_insert(cached);
+                self.remember_arrayitem_descr(key, op);
             }
             if let Some(&cached) = self.cached_arrayitems.get(&key) {
                 let cached = ctx.get_replacement(cached);
@@ -732,6 +784,7 @@ impl OptHeap {
                 return OptimizationResult::Remove;
             }
             self.cached_arrayitems.insert(key, op.pos);
+            self.remember_arrayitem_descr(key, op);
             // heap.py line 701: make_nonnull(op.getarg(0))
             let array_ref = ctx.get_replacement(op.arg(0));
             self.known_nonnull.insert(array_ref);
@@ -1214,6 +1267,7 @@ impl Optimization for OptHeap {
                         return OptimizationResult::Remove;
                     }
                     self.cached_fields.insert(key, op.pos);
+                    self.remember_field_descr(key, op);
                 }
                 OptimizationResult::Emit(op.clone())
             }
@@ -1222,6 +1276,7 @@ impl Optimization for OptHeap {
             OpCode::RawStore => {
                 if let Some(key) = Self::field_key(op) {
                     self.cached_fields.insert(key, op.arg(1));
+                    self.remember_field_descr(key, op);
                 }
                 OptimizationResult::Emit(op.clone())
             }
@@ -1254,9 +1309,11 @@ impl Optimization for OptHeap {
 
     fn setup(&mut self) {
         self.cached_fields.clear();
+        self.cached_field_descrs.clear();
         self.immutable_cached_fields.clear();
         self.lazy_setfields.clear();
         self.cached_arrayitems.clear();
+        self.cached_arrayitem_descrs.clear();
         self.lazy_setarrayitems.clear();
         self.seen_guard_not_invalidated = false;
         self.postponed_op = None;
@@ -1272,14 +1329,12 @@ impl Optimization for OptHeap {
         self.array_min_lengths.clear();
     }
 
-    fn flush(&mut self) {
-        // RPython parity: flush pending state without discarding the heap cache.
-        // export_state() runs after flush() and still expects cached field/array
-        // reads to be available for short preamble construction.
-        debug_assert!(
-            self.lazy_setfields.is_empty() && self.lazy_setarrayitems.is_empty(),
-            "OptHeap: unflushed lazy sets at end of trace"
-        );
+    fn flush(&mut self, ctx: &mut OptContext) {
+        // RPython heap.py: flush() = force_all_lazy_sets(); emit_postponed_op()
+        self.force_all_lazy(ctx);
+        if let Some(postponed) = self.postponed_op.take() {
+            ctx.emit(postponed);
+        }
     }
 
     /// heap.py: produce_potential_short_preamble_ops(sb)
@@ -1294,9 +1349,16 @@ impl Optimization for OptHeap {
             if sb.lookup_label_arg(obj).is_none() {
                 continue;
             }
-            let mut op = Op::new(OpCode::GetfieldGcI, &[obj]);
+            let Some(descr) = self.cached_field_descrs.get(&(obj, descr_idx)) else {
+                continue;
+            };
+            let opcode = descr
+                .as_field_descr()
+                .map(|field_descr| OpCode::getfield_for_type(field_descr.field_type()))
+                .unwrap_or(OpCode::GetfieldGcI);
+            let mut op = Op::with_descr(opcode, &[obj], descr.clone());
             op.pos = cached_val;
-            sb.add_heap_op(op, descr_idx);
+            sb.add_heap_op(op);
         }
 
         for (&(obj, descr_idx, index), &cached_val) in &self.cached_arrayitems {
@@ -1306,10 +1368,17 @@ impl Optimization for OptHeap {
             if sb.lookup_label_arg(obj).is_none() {
                 continue;
             }
+            let Some(descr) = self.cached_arrayitem_descrs.get(&(obj, descr_idx, index)) else {
+                continue;
+            };
             let idx_ref = OpRef(index as u32);
-            let mut op = Op::new(OpCode::GetarrayitemGcI, &[obj, idx_ref]);
+            let opcode = descr
+                .as_array_descr()
+                .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
+                .unwrap_or(OpCode::GetarrayitemGcI);
+            let mut op = Op::with_descr(opcode, &[obj, idx_ref], descr.clone());
             op.pos = cached_val;
-            sb.add_heap_op(op, descr_idx);
+            sb.add_heap_op(op);
         }
     }
 
@@ -2022,6 +2091,22 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::GetfieldGcF);
         assert_eq!(result[1].opcode, OpCode::CallN);
         assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_short_preamble_ref_field_preserves_getfield_opcode() {
+        let descr = majit_ir::make_field_descr(55, 8, majit_ir::Type::Ref, false);
+        let mut pass = OptHeap::new();
+        let key = (OpRef(100), descr.index());
+        pass.cached_fields.insert(key, OpRef(101));
+        pass.cached_field_descrs.insert(key, descr);
+
+        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(100), OpRef(101)]);
+        pass.produce_potential_short_preamble_ops(&mut sb);
+        let produced = sb.produced_ops();
+
+        assert_eq!(produced.len(), 1);
+        assert_eq!(produced[0].1.preamble_op.opcode, OpCode::GetfieldGcR);
     }
 
     // ── Test 22: Immutable field survives multiple calls ──

@@ -3725,6 +3725,23 @@ impl CraneliftBackend {
                 }
             }
         }
+        // RPython parity: LABEL args are independent box names bound by the
+        // incoming JUMP, not necessarily inputargs or local op results.
+        // The backend must declare them before the corresponding block param
+        // is assigned in the LABEL handling path.
+        for op in ops {
+            if op.opcode != OpCode::Label {
+                continue;
+            }
+            for &arg in &op.args {
+                if arg.is_none() || constants.contains_key(&arg.0) || declared_vars.contains(&arg.0)
+                {
+                    continue;
+                }
+                declared_vars.insert(arg.0);
+                builder.declare_var(var(arg.0), cl_types::I64);
+            }
+        }
 
         // Load inputs from input buffer
         for i in 0..num_inputs {
@@ -7831,6 +7848,17 @@ mod tests {
         effect_info: EffectInfo,
     }
 
+    #[derive(Debug)]
+    struct TestLabelDescr {
+        idx: u32,
+    }
+
+    impl Descr for TestLabelDescr {
+        fn index(&self) -> u32 {
+            self.idx
+        }
+    }
+
     impl Descr for TestCallDescr {
         fn as_call_descr(&self) -> Option<&dyn CallDescr> {
             Some(self)
@@ -7874,6 +7902,10 @@ mod tests {
             arg_types,
             result_type,
         ))
+    }
+
+    fn make_label_descr(idx: u32) -> majit_ir::DescrRef {
+        Arc::new(TestLabelDescr { idx })
     }
 
     extern "C" fn collect_nursery_via_runtime(runtime_id: i64) -> i64 {
@@ -10418,6 +10450,26 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(0x1000)), Value::Int(0x100)]);
         assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0x1100));
+    }
+
+    #[test]
+    fn test_jump_target_label_args_are_declared_even_without_local_producer() {
+        let mut backend = CraneliftBackend::new();
+        let loop_descr = make_label_descr(9001);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(OpCode::Jump, &[OpRef(0)], OpRef::NONE.0, loop_descr.clone()),
+            mk_op_with_descr(OpCode::Label, &[OpRef(50)], OpRef::NONE.0, loop_descr),
+            mk_op(OpCode::Finish, &[OpRef(50)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(76_001);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(42)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 42);
     }
 
     // ── Overflow detection tests ──
@@ -13167,6 +13219,96 @@ mod tests {
         assert_ne!(moved_root, root);
         assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0xD00DFEED);
         assert!(!new_obj.is_null());
+    }
+
+    #[test]
+    fn test_gc_collecting_alloc_preserves_live_ref_results() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 48,
+            large_object_threshold: 1024,
+        });
+        gc.register_type(TypeInfo::simple(16));
+
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+
+        let fd = make_field_descr(0, 8, Type::Int, true);
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(OpCode::Label, &[], OpRef::NONE.0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(16)], 0),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], OpRef::NONE.0, fd.clone()),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(32)], 1),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(101)], OpRef::NONE.0, fd),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(24)], 2),
+            mk_op(OpCode::Finish, &[OpRef(0), OpRef(1), OpRef(2)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(1505_1);
+        let mut constants = HashMap::new();
+        constants.insert(100, 111);
+        constants.insert(101, 222);
+        backend.set_constants(constants);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[]);
+        let obj0 = backend.get_ref_value(&frame, 0);
+        let obj1 = backend.get_ref_value(&frame, 1);
+        let obj2 = backend.get_ref_value(&frame, 2);
+
+        assert!(!obj0.is_null());
+        assert!(!obj1.is_null());
+        assert!(!obj2.is_null());
+        assert_eq!(unsafe { *(obj0.0 as *const i64) }, 111);
+        assert_eq!(unsafe { *(obj1.0 as *const i64) }, 222);
+    }
+
+    #[test]
+    fn test_setfield_gc_from_old_object_keeps_young_ref_alive_across_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 48,
+            large_object_threshold: 1024,
+        });
+        let old_root_tid = gc.register_type(TypeInfo::with_gc_ptrs(8, vec![0]));
+        let young_node_tid = gc.register_type(TypeInfo::simple(16));
+
+        let mut root = gc.alloc_with_type(old_root_tid, 8);
+        unsafe {
+            gc.add_root(&mut root as *mut GcRef);
+        }
+        gc.collect_nursery();
+        gc.remove_root(&mut root as *mut GcRef);
+        assert!(!gc.is_in_nursery(root.0), "root must be old before JIT runs");
+
+        let filler = gc.alloc_with_type(young_node_tid, 16);
+        assert!(gc.is_in_nursery(filler.0));
+
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let ref_fd = make_field_descr(0, 8, Type::Ref, false);
+        let int_fd = make_field_descr(0, 8, Type::Int, true);
+        let inputargs = vec![InputArg::new_ref(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(16)], 1),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(100)], OpRef::NONE.0, int_fd),
+            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], OpRef::NONE.0, ref_fd),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(24)], 2),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, 777);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1505_2);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
+        let moved_root = backend.get_ref_value(&frame, 0);
+        assert!(!moved_root.is_null());
+
+        let child = GcRef(unsafe { *(moved_root.0 as *const usize) });
+        assert!(!child.is_null(), "old root lost its young child across collection");
+        assert_eq!(unsafe { *(child.0 as *const i64) }, 777);
     }
 
     #[test]

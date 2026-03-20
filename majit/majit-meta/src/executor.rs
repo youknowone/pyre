@@ -22,7 +22,11 @@ pub(crate) enum OpResult {
     Unsupported(String),
 }
 
-pub(crate) fn execute_one(op: &Op, values: &HashMap<u32, i64>, exc: &mut ExceptionState) -> OpResult {
+pub(crate) fn execute_one(
+    op: &Op,
+    values: &HashMap<u32, i64>,
+    exc: &mut ExceptionState,
+) -> OpResult {
     match op.opcode {
         // ── Control flow ──
         OpCode::Label => OpResult::Void,
@@ -725,4 +729,3 @@ pub(crate) fn float_binop(values: &HashMap<u32, i64>, op: &Op) -> (f64, f64) {
 pub(crate) fn float_unop(values: &HashMap<u32, i64>, op: &Op) -> f64 {
     f64::from_bits(resolve(values, op.args[0]) as u64)
 }
-

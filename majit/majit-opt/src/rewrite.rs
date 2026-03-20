@@ -7,6 +7,12 @@ use majit_ir::{Op, OpCode, OpRef, Value};
 
 use crate::{OptContext, Optimization, OptimizationResult, intdiv};
 
+#[cold]
+#[inline(never)]
+fn raise_invalid_loop(msg: &'static str) -> ! {
+    std::panic::panic_any(crate::optimize::InvalidLoop(msg));
+}
+
 /// Check if a float is an exact power of 2 (±2^n).
 /// rewrite.py: uses frexp; mantissa==0.5 means exact power of 2.
 fn is_power_of_two_float(v: f64) -> bool {
@@ -702,33 +708,31 @@ impl OptRewrite {
 
     // ── Guards ──
 
-    /// Optimize GUARD_TRUE: if arg is known constant 1 -> remove,
-    /// if known constant 0 -> always fails (leave as-is for now, backend handles it).
+    /// Optimize GUARD_TRUE following RPython rewrite.py: optimize_guard(op, CONST_1).
+    /// If the condition is a known constant 0, the trace is impossible and must abort.
     fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(val) = ctx.get_constant_int(arg0) {
             if val != 0 {
-                // Guard always passes -> remove
                 return OptimizationResult::Remove;
             }
-            // val == 0: guard always fails. Keep it (the backend must handle it).
+            raise_invalid_loop("GUARD_TRUE proven to always fail");
         }
 
         OptimizationResult::PassOn
     }
 
-    /// Optimize GUARD_FALSE: if arg is known constant 0 -> remove,
-    /// if known constant nonzero -> always fails.
+    /// Optimize GUARD_FALSE following RPython rewrite.py: optimize_guard(op, CONST_0).
+    /// If the condition is a known constant nonzero, the trace is impossible and must abort.
     fn optimize_guard_false(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(val) = ctx.get_constant_int(arg0) {
             if val == 0 {
-                // Guard always passes -> remove
                 return OptimizationResult::Remove;
             }
-            // val != 0: guard always fails. Keep it.
+            raise_invalid_loop("GUARD_FALSE proven to always fail");
         }
 
         OptimizationResult::PassOn
@@ -1455,8 +1459,7 @@ impl Optimization for OptRewrite {
                 if let Some(func_val) = ctx.get_constant_int(op.arg(0)) {
                     if let Some(&cached_result) = ctx.imported_loop_invariant_results.get(&func_val)
                     {
-                        ctx.note_imported_short_use(cached_result);
-                        let cached_result = ctx.get_replacement(cached_result);
+                        let cached_result = ctx.force_op_from_preamble(cached_result);
                         self.loop_invariant_results.insert(func_val, cached_result);
                     }
                     if let Some(&cached_result) = self.loop_invariant_results.get(&func_val) {
@@ -2449,9 +2452,13 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
-        // Guard always fails, but we pass on (backend handles it)
-        assert!(matches!(result, OptimizationResult::PassOn));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pass.propagate_forward(&ops[1], &mut ctx)
+        }))
+        .expect_err("guard_true(0) should abort as InvalidLoop");
+        assert!(err
+            .downcast_ref::<crate::optimize::InvalidLoop>()
+            .is_some());
     }
 
     #[test]
@@ -2483,6 +2490,27 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
+    }
+
+    #[test]
+    fn test_guard_false_known_true() {
+        let mut ops = vec![
+            Op::new(OpCode::SameAsI, &[]),
+            Op::new(OpCode::GuardFalse, &[OpRef(0)]),
+        ];
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(2);
+        ctx.make_constant(OpRef(0), Value::Int(1));
+        ctx.emit(ops[0].clone());
+
+        let mut pass = OptRewrite::new();
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pass.propagate_forward(&ops[1], &mut ctx)
+        }))
+        .expect_err("guard_false(1) should abort as InvalidLoop");
+        assert!(err
+            .downcast_ref::<crate::optimize::InvalidLoop>()
+            .is_some());
     }
 
     #[test]
@@ -2576,8 +2604,7 @@ mod tests {
 
     #[test]
     fn test_optimizer_integration_chain() {
-        // Test chaining: x - x -> 0, then guard_true(0) should NOT be removed
-        // (it always fails)
+        // RPython parity: x - x -> 0, then guard_true(0) makes the trace impossible.
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),                  // op0: x
             Op::new(OpCode::IntSub, &[OpRef(0), OpRef(0)]), // op1: x - x -> 0
@@ -2588,35 +2615,30 @@ mod tests {
         let mut ctx = OptContext::new(3);
         let mut pass = OptRewrite::new();
 
-        for op in &ops {
-            let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for op in &ops {
+                let mut resolved = op.clone();
+                for arg in &mut resolved.args {
+                    *arg = ctx.get_replacement(*arg);
+                }
+                match pass.propagate_forward(&resolved, &mut ctx) {
+                    OptimizationResult::Emit(emitted) => {
+                        ctx.emit(emitted);
+                    }
+                    OptimizationResult::Replace(replacement) => {
+                        ctx.emit(replacement);
+                    }
+                    OptimizationResult::Remove => {}
+                    OptimizationResult::PassOn => {
+                        ctx.emit(resolved);
+                    }
+                }
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
-                OptimizationResult::Emit(emitted) => {
-                    ctx.emit(emitted);
-                }
-                OptimizationResult::Replace(replacement) => {
-                    ctx.emit(replacement);
-                }
-                OptimizationResult::Remove => {}
-                OptimizationResult::PassOn => {
-                    ctx.emit(resolved);
-                }
-            }
-        }
-
-        // op0 is emitted, op1 is removed (constant 0), op2 (guard_true(0))
-        // should be passed on since guard_true of known 0 always fails
-        // => we keep it for the backend.
-        // Let's check that guard_true(0) is in the output
-        let guards: Vec<_> = ctx
-            .new_operations
-            .iter()
-            .filter(|op| op.opcode == OpCode::GuardTrue)
-            .collect();
-        assert_eq!(guards.len(), 1, "guard_true(0) should remain in trace");
+        }))
+        .expect_err("guard_true(0) should abort the optimized trace");
+        assert!(err
+            .downcast_ref::<crate::optimize::InvalidLoop>()
+            .is_some());
     }
 
     // ── Wrapping arithmetic tests ──

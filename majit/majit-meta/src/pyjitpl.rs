@@ -1206,13 +1206,30 @@ impl<M: Clone> MetaInterp<M> {
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
         // array slots through the loop as virtual state instead of heap traffic.
-        let (optimized_ops, final_num_inputs) = unroll_opt
-            .optimize_trace_with_constants_and_inputs_vable(
+        let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unroll_opt.optimize_trace_with_constants_and_inputs_vable(
                 &trace_ops,
                 &mut constants,
                 trace.inputargs.len(),
                 vable_config,
-            );
+            )
+        }));
+        let (optimized_ops, final_num_inputs) = match optimize_result {
+            Ok(result) => result,
+            Err(payload) => {
+                if payload
+                    .downcast_ref::<majit_opt::optimize::InvalidLoop>()
+                    .is_some()
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!("[jit] abort trace at key={} (InvalidLoop during optimize)", green_key);
+                    }
+                    self.warm_state.abort_tracing(green_key, false);
+                    return;
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
         let num_ops_after = optimized_ops.len();
 
         // RPython compile.py compiles the root loop with the original trace

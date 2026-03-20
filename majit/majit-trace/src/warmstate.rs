@@ -74,9 +74,10 @@ pub struct BaseJitCell {
     pub tracing_generation: u64,
     /// Compiled loop token, if compilation has completed.
     pub loop_token: Option<JitCellToken>,
-    /// Number of times tracing was aborted (non-permanent) for this key.
-    /// After `retrace_limit` aborts, the cell becomes DONT_TRACE_HERE.
-    /// RPython equivalent: retrace_limit parameter.
+    /// Number of times tracing was aborted for this key.
+    ///
+    /// Kept for diagnostics only. In RPython, `retrace_limit` is handled by
+    /// optimizeopt/unroll during retracing, not by warmstate abort handling.
     pub abort_count: u32,
 }
 
@@ -474,27 +475,24 @@ impl WarmEnterState {
     }
 
     /// Mark that tracing was aborted for a green key.
-    /// Optionally sets DONT_TRACE_HERE to prevent retrying.
+    ///
+    /// RPython parity:
+    /// - non-permanent aborts clear TRACING and allow a future retry
+    /// - permanent aborts mark the location as DONT_TRACE_HERE
     pub fn abort_tracing(&mut self, green_key_hash: u64, disable_noninlinable_function: bool) {
-        let mut mark_dont_trace = disable_noninlinable_function;
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
             if disable_noninlinable_function {
                 cell.state = BaseJitCellState::NotHot;
             } else {
                 cell.abort_count += 1;
-                if cell.abort_count < self.retrace_limit {
-                    cell.state = BaseJitCellState::NotHot;
-                } else {
-                    mark_dont_trace = true;
-                }
+                cell.state = BaseJitCellState::NotHot;
             }
         }
 
-        if mark_dont_trace {
-            // Too many retries — or an explicit permanent abort — stop
-            // tracing this location entirely. RPython equivalent:
-            // retrace_limit exceeded / disable_noninlinable_function().
+        if disable_noninlinable_function {
+            // RPython only marks the location DONT_TRACE_HERE for explicit
+            // "disable_noninlinable_function" style aborts.
             self.disable_noninlinable_function(green_key_hash);
         }
         if let Some(log) = &mut self.jitlog {

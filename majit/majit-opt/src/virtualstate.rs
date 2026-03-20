@@ -470,6 +470,43 @@ impl VirtualState {
         (inputargs, virtuals)
     }
 
+    /// RPython: `VirtualState.make_inputargs(..., optimizer, force_boxes=...)`
+    ///
+    /// This is the active path used by unroll jump matching. When a non-virtual
+    /// slot receives a virtual box, `force_boxes=true` forces it through the
+    /// optimizer instead of immediately failing.
+    pub fn make_inputargs_and_virtuals_with_optimizer(
+        &self,
+        concrete_refs: &[OpRef],
+        optimizer: &mut crate::optimizer::Optimizer,
+        ctx: &mut OptContext,
+        force_boxes: bool,
+    ) -> Result<(Vec<OpRef>, Vec<OpRef>), ()> {
+        let mut args = vec![OpRef::NONE; self.num_boxes()];
+        let mut next_slot = 0usize;
+        for (idx, info) in self.state.iter().enumerate() {
+            let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
+            Self::enum_forced_boxes_for_entry_with_optimizer(
+                info,
+                opref,
+                optimizer,
+                ctx,
+                &mut args,
+                &mut next_slot,
+                force_boxes,
+            )?;
+        }
+        let inputargs: Vec<OpRef> = args.into_iter().filter(|opref| !opref.is_none()).collect();
+        let virtuals: Vec<OpRef> = self
+            .state
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| info.is_virtual())
+            .filter_map(|(i, _)| concrete_refs.get(i).copied())
+            .collect();
+        Ok((inputargs, virtuals))
+    }
+
     fn enum_forced_boxes_for_entry(
         info: &VirtualStateInfo,
         opref: OpRef,
@@ -567,6 +604,136 @@ impl VirtualState {
                     *slot = ctx.get_replacement(opref);
                 }
                 *next_slot += 1;
+            }
+        }
+    }
+
+    fn enum_forced_boxes_for_entry_with_optimizer(
+        info: &VirtualStateInfo,
+        opref: OpRef,
+        optimizer: &mut crate::optimizer::Optimizer,
+        ctx: &mut OptContext,
+        boxes: &mut [OpRef],
+        next_slot: &mut usize,
+        force_boxes: bool,
+    ) -> Result<(), ()> {
+        match info {
+            VirtualStateInfo::Constant(_) => Ok(()),
+            VirtualStateInfo::Virtual { fields, .. }
+            | VirtualStateInfo::VirtualStruct { fields, .. } => {
+                let resolved = ctx.get_replacement(opref);
+                for (field_idx, field_state) in fields {
+                    let field_ref = ctx
+                        .get_ptr_info(resolved)
+                        .and_then(|info| info.get_field(*field_idx))
+                        .or_else(|| {
+                            ctx.pre_force_field_refs
+                                .get(&resolved)
+                                .or_else(|| ctx.pre_force_field_refs.get(&opref))
+                                .and_then(|flds| {
+                                    flds.iter()
+                                        .find(|(idx, _)| *idx == *field_idx)
+                                        .map(|(_, r)| *r)
+                                })
+                        })
+                        .unwrap_or(OpRef::NONE);
+                    Self::enum_forced_boxes_for_entry_with_optimizer(
+                        field_state,
+                        field_ref,
+                        optimizer,
+                        ctx,
+                        boxes,
+                        next_slot,
+                        force_boxes,
+                    )?;
+                }
+                Ok(())
+            }
+            VirtualStateInfo::VirtualArray { items, .. } => {
+                let resolved = ctx.get_replacement(opref);
+                for (index, item_state) in items.iter().enumerate() {
+                    let item_ref = ctx
+                        .get_ptr_info(resolved)
+                        .and_then(|info| info.get_item(index))
+                        .unwrap_or(OpRef::NONE);
+                    Self::enum_forced_boxes_for_entry_with_optimizer(
+                        item_state,
+                        item_ref,
+                        optimizer,
+                        ctx,
+                        boxes,
+                        next_slot,
+                        force_boxes,
+                    )?;
+                }
+                Ok(())
+            }
+            VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => {
+                let resolved = ctx.get_replacement(opref);
+                let mut flat_index = 0usize;
+                for fields in element_fields {
+                    for (_, field_state) in fields {
+                        let item_ref = ctx
+                            .get_ptr_info(resolved)
+                            .and_then(|info| info.get_item(flat_index))
+                            .unwrap_or(OpRef::NONE);
+                        Self::enum_forced_boxes_for_entry_with_optimizer(
+                            field_state,
+                            item_ref,
+                            optimizer,
+                            ctx,
+                            boxes,
+                            next_slot,
+                            force_boxes,
+                        )?;
+                        flat_index += 1;
+                    }
+                }
+                Ok(())
+            }
+            VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
+                let resolved = ctx.get_replacement(opref);
+                for (index, (_, _, entry_state)) in entries.iter().enumerate() {
+                    let entry_ref = ctx
+                        .get_ptr_info(resolved)
+                        .and_then(|info| match info {
+                            PtrInfo::VirtualRawBuffer(vinfo) => {
+                                vinfo.entries.get(index).map(|(_, _, value)| *value)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(OpRef::NONE);
+                    Self::enum_forced_boxes_for_entry_with_optimizer(
+                        entry_state,
+                        entry_ref,
+                        optimizer,
+                        ctx,
+                        boxes,
+                        next_slot,
+                        force_boxes,
+                    )?;
+                }
+                Ok(())
+            }
+            VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull
+            | VirtualStateInfo::IntBounded(_)
+            | VirtualStateInfo::Unknown => {
+                let resolved = ctx.get_replacement(opref);
+                let forced = match ctx.get_ptr_info(resolved) {
+                    Some(ptr_info) if ptr_info.is_virtual() => {
+                        if !force_boxes {
+                            return Err(());
+                        }
+                        optimizer.force_box(resolved, ctx)
+                    }
+                    _ => resolved,
+                };
+                if let Some(slot) = boxes.get_mut(*next_slot) {
+                    *slot = ctx.get_replacement(forced);
+                }
+                *next_slot += 1;
+                Ok(())
             }
         }
     }
@@ -1622,6 +1789,43 @@ mod tests {
         ));
         // VirtualArray becomes NonNull
         assert!(matches!(&state.state[2], VirtualStateInfo::NonNull));
+    }
+
+    #[test]
+    fn test_make_inputargs_with_optimizer_retries_virtual_into_nonvirtual_slot() {
+        let descr = test_descr(12);
+        let virtual_ref = OpRef(20);
+        let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
+        let mut ctx = OptContext::new(32);
+        ctx.set_ptr_info(
+            virtual_ref,
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr,
+                fields: vec![],
+                field_descrs: Vec::new(),
+            }),
+        );
+        let mut optimizer = crate::optimizer::Optimizer::new();
+
+        assert!(state
+            .make_inputargs_and_virtuals_with_optimizer(
+                &[virtual_ref],
+                &mut optimizer,
+                &mut ctx,
+                false,
+            )
+            .is_err());
+
+        let (inputargs, virtuals) = state
+            .make_inputargs_and_virtuals_with_optimizer(
+                &[virtual_ref],
+                &mut optimizer,
+                &mut ctx,
+                true,
+            )
+            .expect("force_boxes=True should retry instead of failing");
+        assert_eq!(inputargs, vec![virtual_ref]);
+        assert!(virtuals.is_empty());
     }
 
     #[test]
