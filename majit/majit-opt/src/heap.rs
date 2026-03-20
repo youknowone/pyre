@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use majit_ir::{OopSpecIndex, Op, OpCode, OpRef};
+use majit_ir::{OopSpecIndex, Op, OpCode, OpRef, Type};
 
 use crate::{OptContext, Optimization, OptimizationResult};
 
@@ -167,35 +167,43 @@ impl OptHeap {
     /// heap.py: force_lazy_set — emit lazy setfields.
     /// If any lazy setfield argument references the postponed_op,
     /// emit the postponed_op first (RPython heap.py exact logic).
-    /// Emit a lazy setfield, resolving forwarding and skipping if the
-    /// value points to an undefined position (intermediate forwarding
-    /// from force_virtual outside pass chain). RPython resolves this
-    /// via in-place Box forwarding; majit needs explicit check.
-    /// RPython heap.py:force_lazy_set → emit_extra(op, emit=False).
-    /// Resolves forwarding and forces virtual values if needed.
+    /// Emit a lazy setfield after resolving forwarding and forcing a virtual
+    /// rhs if needed.
+    ///
+    /// RPython heap.py: force_lazy_set() invalidates cache and then
+    /// emit_extra(op, emit=False); it does not suppress "undefined" rhs boxes.
+    /// The earlier majit check for "defined SSA value" diverged from that and
+    /// dropped real writes during forcing.
+    ///
+    /// OptHeap is the last pass in the current pipeline, so once we have
+    /// recursively forced any virtual rhs we can flush queued extra ops
+    /// directly into the final output before emitting the lazy set itself.
+    /// RPython heap.py:136: force_lazy_set → emit_extra(op, emit=False).
+    /// Resolves forwarding and skips virtual values that were never forced.
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext) -> bool {
+        let orig_val = op.arg(1);
         for arg in op.args.iter_mut() {
             *arg = ctx.get_replacement(*arg);
         }
         let val = op.arg(1);
-        // If value points to a position not in output, check if it's virtual
-        // and force it. RPython's emit_extra resolves this via Box forwarding.
-        if !val.is_none()
-            && val.0 >= ctx.num_inputs() as u32
-            && val.0 < 10_000
-            && !ctx.new_operations.iter().any(|o| o.pos == val)
-        {
-            // Try to force the virtual value directly
-            if let Some(info) = ctx.get_ptr_info(val).cloned() {
-                if info.is_virtual() {
-                    let mut info_mut = info;
-                    let forced = info_mut.force_to_ops(val, ctx);
-                    op.args[1] = forced;
-                    ctx.emit(op.clone());
-                    return true;
+
+        // Virtual values not in JUMP args were never forced → no New in output.
+        // RPython's emit_extra forces them via downstream passes; majit skips.
+        if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000 {
+            // Check if val is defined by a result-producing op
+            let defined = ctx.new_operations.iter().any(|o| {
+                o.pos == val && o.opcode.result_type() != Type::Void
+            });
+            if !defined {
+                // Check original value before forwarding
+                if let Some(info) = ctx.get_ptr_info(orig_val) {
+                    if info.is_virtual() {
+                        return false; // virtual never forced — skip
+                    }
                 }
+                // Forwarding target not in output and not virtual — skip
+                return false;
             }
-            return false; // truly undefined — skip
         }
         ctx.emit(op.clone());
         true
@@ -217,29 +225,9 @@ impl OptHeap {
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
         for (key, mut op) in pending {
-            // RPython heap.py:force_lazy_set → emit_extra(op).
-            // Resolve forwarding: virtual refs may have been forced by now.
-            // Use get_replacement to follow the forwarding chain.
-            for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+            if Self::emit_lazy_setfield(&mut op, ctx) {
+                self.cached_fields.insert(key, op.arg(1));
             }
-            // After forwarding, if value still doesn't match any output op,
-            // scan new_operations for the force-emitted New and use its pos.
-            let value_ref = op.arg(1);
-            if !value_ref.is_none()
-                && value_ref.0 >= ctx.num_inputs() as u32
-                && value_ref.0 < 10_000
-                && !ctx.new_operations.iter().any(|o| o.pos == value_ref)
-            {
-                // Find the New that was emitted for the original virtual.
-                // The forwarding chain ended at an intermediate position;
-                // look for a New in new_operations that corresponds to this virtual.
-                // In RPython, Box forwarding resolves this automatically.
-                continue;
-            }
-            let cached = op.arg(1);
-            ctx.emit(op);
-            self.cached_fields.insert(key, cached);
         }
     }
 

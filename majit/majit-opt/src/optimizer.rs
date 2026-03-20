@@ -851,6 +851,7 @@ impl Optimizer {
         // Phase 2 leaves lazy sets pending so virtuals aren't forced.
         if !self.skip_flush {
             self.flush();
+            self.drain_extra_operations_from(0, &mut ctx);
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -917,14 +918,11 @@ impl Optimizer {
         });
         self.exported_jump_virtuals = exported_jump_virtuals;
 
-        // RPython: emit_extra routes ops through send_extra_operation which
-        // processes them immediately. In majit, force_virtual during
-        // exported_loop_state pushes to extra_operations which aren't drained
-        // outside the pass chain. Drain them now so forced New ops reach
-        // new_operations and lazy_set refs resolve correctly.
-        while let Some(op) = ctx.pop_extra_operation() {
-            ctx.emit(op);
-        }
+        // Discard extra_operations from force_box_for_end_of_preamble.
+        // These are force artifacts (New/SetfieldGc for exported state info)
+        // that should NOT appear in the trace output. RPython's emit_extra
+        // processes them but the results feed into exported_state, not the trace.
+        while ctx.pop_extra_operation().is_some() {}
 
         // final_num_inputs = original inputs + virtual inputs added by passes.
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
@@ -960,12 +958,7 @@ impl Optimizer {
         // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
         // and all op positions are reassigned to start from final_num_inputs.
         // This ensures no position collisions between input block params and ops.
-        // Drain extra_operations left by exported_loop_state computation.
-        // force_box_for_end_of_preamble → force_virtual → emit_through_passes
-        // pushes to extra_operations, but no pass-chain drain runs afterward.
-        while let Some(op) = ctx.pop_extra_operation() {
-            ctx.emit(op);
-        }
+        self.drain_extra_operations_from(0, &mut ctx);
         if num_virtual_inputs > 0 {
             let fni = self.final_num_inputs as u32;
             let mut remap = std::collections::HashMap::new();
