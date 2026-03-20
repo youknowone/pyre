@@ -200,18 +200,31 @@ impl OptHeap {
     /// emit_extra routes through all passes, which calls force_box on
     /// virtual args (optimizer.py:624). In majit, we force directly
     /// via force_to_ops before emitting.
-    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext) -> bool {
+    /// RPython heap.py:136: force_lazy_set → emit_extra(op, emit=False).
+    /// `allow_force`: true for call-triggered force (safe — guards follow),
+    /// false for JUMP/flush force (unsafe — may create guardless loops).
+    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, allow_force: bool) -> bool {
         let orig_val = op.arg(1);
 
-        // RPython: emit_extra → send_extra_operation → _emit_operation
-        // → force_box(arg) for each arg. If arg is virtual, force it.
-        // Check BEFORE forwarding resolution (orig_val has ptr_info).
-        // RPython: emit_extra → force_box forces virtual values.
-        // In majit, forcing here makes guardless loops infinite (no interrupt).
-        // Skip virtual values — compile fails, interpreter fallback handles it.
-        if let Some(info) = ctx.get_ptr_info(orig_val) {
+        // Check if value is virtual BEFORE forwarding resolution.
+        if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
             if info.is_virtual() {
-                return false;
+                if allow_force {
+                    // RPython info.py:148: force_box → emit New + SetfieldGc.
+                    // Safe here because this is call-triggered — the trace
+                    // continues after this with guards that provide loop exit.
+                    let forced = info.force_to_ops(orig_val, ctx);
+                    op.args[1] = forced;
+                    for arg in op.args.iter_mut() {
+                        *arg = ctx.get_replacement(*arg);
+                    }
+                    ctx.emit(op.clone());
+                    return true;
+                } else {
+                    // JUMP/flush path: skip to avoid guardless infinite loops.
+                    // majit lacks RPython's interrupt mechanism.
+                    return false;
+                }
             }
         }
 
@@ -249,25 +262,12 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        // Emit pool writebacks using emit_lazy_setfield which handles
-        // virtual values (force_to_ops) and undefined ref skip.
+        // JUMP/flush path: allow_force=false (no virtual force — avoids
+        // guardless infinite loops without interrupt mechanism).
         for (key, mut op) in pending {
-            for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+            if Self::emit_lazy_setfield(&mut op, ctx, false) {
+                self.cached_fields.insert(key, op.arg(1));
             }
-            let val = op.arg(1);
-            // Skip if value still undefined after force
-            if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000 {
-                let defined = ctx.new_operations.iter().any(|o| {
-                    o.pos == val && o.opcode.result_type() != Type::Void
-                });
-                if !defined {
-                    continue;
-                }
-            }
-            ctx.emit(op.clone());
-            self.cached_fields.insert(key, op.arg(1));
-            self.remember_field_descr(key, &op);
         }
     }
 
@@ -550,7 +550,7 @@ impl OptHeap {
                     {
                         // Value points to undrained force position — skip
                     } else {
-                        Self::emit_lazy_setfield(&mut lazy_op, ctx);
+                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                     }
                 }
             }
@@ -566,7 +566,7 @@ impl OptHeap {
                     {
                         // Value points to undrained force position — skip
                     } else {
-                        Self::emit_lazy_setfield(&mut lazy_op, ctx);
+                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                     }
                 }
                 if !self.immutable_field_descrs.contains(&descr_idx) {
@@ -580,12 +580,12 @@ impl OptHeap {
         for (obj, descr_idx, index) in array_keys {
             if ei.check_readonly_descr_array(descr_idx) {
                 if let Some(mut lazy_op) = self.lazy_setarrayitems.remove(&(obj, descr_idx, index)) {
-                    Self::emit_lazy_setfield(&mut lazy_op, ctx);
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                 }
             }
             if ei.check_write_descr_array(descr_idx) {
                 if let Some(mut lazy_op) = self.lazy_setarrayitems.remove(&(obj, descr_idx, index)) {
-                    Self::emit_lazy_setfield(&mut lazy_op, ctx);
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                 }
                 self.cached_arrayitems.remove(&(obj, descr_idx, index));
             }

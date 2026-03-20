@@ -1056,22 +1056,26 @@ impl OptUnroll {
         }
 
         // Propagate Phase 1 heap cache to Phase 2.
-        // For each field cached in the preamble, if the object is a Phase 2
-        // inputarg (via forwarding), add it to imported_short_fields so the
-        // heap optimizer can skip redundant field reads.
-        // Use the FORWARDED object ref as key, since Phase 2's optimizer
-        // resolves forwarding before looking up the cache.
+        // Only import entries whose cached value is an end_arg (label arg),
+        // since intermediate Phase 1 values (like v9=intval) are NOT carried
+        // to the body label and would be undefined references.
+        let end_arg_set: std::collections::HashSet<OpRef> =
+            exported_state.end_args.iter().copied().collect();
         for &(obj, descr_idx, cached_val) in &exported_state.preamble_heap_cache {
             if obj.is_none() || cached_val.is_none() {
                 continue;
             }
-            // Check if this object is one of Phase 2's targetargs
-            if (obj.0 as usize) < targetargs.len() {
-                let forwarded_obj = ctx.get_replacement(obj);
-                let forwarded_val = ctx.get_replacement(cached_val);
-                ctx.imported_short_fields
-                    .insert((forwarded_obj, descr_idx), forwarded_val);
+            if (obj.0 as usize) >= targetargs.len() {
+                continue;
             }
+            // Only import if the cached value is an end_arg (will be in the body label)
+            if !end_arg_set.contains(&cached_val) {
+                continue;
+            }
+            let forwarded_obj = ctx.get_replacement(obj);
+            let forwarded_val = ctx.get_replacement(cached_val);
+            ctx.imported_short_fields
+                .insert((forwarded_obj, descr_idx), forwarded_val);
         }
 
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
