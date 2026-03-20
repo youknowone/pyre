@@ -596,11 +596,19 @@ impl Optimizer {
             if !rec.insert(resolved) {
                 return resolved;
             }
-            info.force_at_the_end_of_preamble(|child| {
-                self.force_box_for_end_of_preamble_rec(child, ctx, rec)
-            });
-            ctx.set_ptr_info(resolved, info);
-            return resolved;
+            // RPython info.py:148: force_box() → emit_extra(op) → emit New.
+            // Emit the New and SetfieldGc directly to new_operations since
+            // we're outside the pass chain (no drain will run).
+            let forced_ref = info.force_to_ops(resolved, ctx);
+            // Recursively force fields
+            if let Some(new_info) = ctx.get_ptr_info(forced_ref).cloned() {
+                let mut updated = new_info;
+                updated.force_at_the_end_of_preamble(|child| {
+                    self.force_box_for_end_of_preamble_rec(child, ctx, rec)
+                });
+                ctx.set_ptr_info(forced_ref, updated);
+            }
+            return forced_ref;
         }
 
         if info.is_virtual() {
@@ -1519,6 +1527,43 @@ mod tests {
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
         // Jump should still be present.
         assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_phase2_skip_flush_keeps_terminal_jump_out_of_pass_chain() {
+        let mut opt = Optimizer::default_pipeline();
+        opt.skip_flush = true;
+        opt.imported_loop_state = Some(crate::unroll::ExportedState::new(
+            vec![OpRef(0), OpRef(1)],
+            vec![OpRef(0), OpRef(1)],
+            crate::virtualstate::VirtualState::new(vec![
+                crate::virtualstate::VirtualStateInfo::Unknown,
+                crate::virtualstate::VirtualStateInfo::Unknown,
+            ]),
+            std::collections::HashMap::new(),
+            vec![],
+            vec![],
+            vec![OpRef(0), OpRef(1)],
+            vec![OpRef(0), OpRef(1)],
+        ));
+
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
+        ];
+        for (i, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef((i + 2) as u32);
+        }
+
+        let mut constants = std::collections::HashMap::new();
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        assert!(result.iter().all(|op| op.opcode != OpCode::Jump));
+        let exported = opt
+            .exported_loop_state
+            .as_ref()
+            .expect("phase 2 should still export loop state from deferred jump");
+        assert_eq!(exported.end_args.as_slice(), &[OpRef(0), OpRef(1)]);
     }
 
     #[test]
