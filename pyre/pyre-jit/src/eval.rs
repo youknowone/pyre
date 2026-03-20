@@ -9,7 +9,6 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
-
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
 use pyre_bytecode::bytecode::OpArgState;
@@ -17,19 +16,22 @@ use pyre_interp::frame::PyFrame;
 use pyre_object::w_none;
 use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
 
+use majit_gc::trace::TypeInfo;
 use majit_meta::DetailedDriverRunOutcome;
 
-/// Function-entry tracing threshold.
+use crate::jit::frame_layout::build_pyframe_virtualizable_info;
+use crate::jit::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
+use majit_gc::collector::MiniMarkGC;
+use majit_meta::JitDriver;
+use pyre_object::floatobject::W_FloatObject;
+use pyre_object::intobject::W_IntObject;
+
+const JIT_THRESHOLD: u32 = 1039;
 /// Function-entry tracing threshold.
 /// PyPy uses WarmEnterState.function_threshold (default 1619).
 /// We use a lower value for faster JIT warmup in pyre's use case.
 /// TODO: read from driver.warm_state().function_threshold() instead.
 const FUNC_ENTRY_THRESHOLD: u32 = 7;
-
-use crate::jit::frame_layout::build_pyframe_virtualizable_info;
-use majit_meta::JitDriver;
-
-const JIT_THRESHOLD: u32 = 1039;
 
 type JitDriverPair = (
     JitDriver<PyreJitState>,
@@ -41,6 +43,13 @@ thread_local! {
         let info = build_pyframe_virtualizable_info();
         let mut d = JitDriver::new(JIT_THRESHOLD);
         d.set_virtualizable_info(info.clone());
+        let mut gc = MiniMarkGC::new();
+        let w_int_tid = gc.register_type(TypeInfo::simple(std::mem::size_of::<W_IntObject>()));
+        debug_assert_eq!(w_int_tid, W_INT_GC_TYPE_ID);
+        let w_float_tid =
+            gc.register_type(TypeInfo::simple(std::mem::size_of::<W_FloatObject>()));
+        debug_assert_eq!(w_float_tid, W_FLOAT_GC_TYPE_ID);
+        d.set_gc_allocator(Box::new(gc));
         d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
         d.register_raw_int_force_helper(crate::call_jit::jit_force_recursive_call_raw_1 as *const ());
         d.register_raw_int_force_helper(crate::call_jit::jit_force_self_recursive_call_raw_1 as *const ());
@@ -71,6 +80,13 @@ thread_local! {
 #[inline]
 fn func_entry_counts() -> &'static mut HashMap<u64, u32> {
     FUNC_ENTRY_COUNTS.with(|cell| unsafe { &mut *cell.get() })
+}
+
+/// RPython green_key = (pycode, next_instr).
+/// Each (code, pc) pair has independent warmup counter and compiled loop.
+#[inline]
+pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> u64 {
+    (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 
 /// RAII guard that decrements `JIT_CALL_DEPTH` on drop.
@@ -140,6 +156,17 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     eval_loop_jit(frame)
 }
 
+fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
+    if frame.locals_cells_stack_w.len() == 0 {
+        return None;
+    }
+    let value = frame.locals_cells_stack_w[0];
+    if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
+        return None;
+    }
+    Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
+}
+
 /// JIT-enabled evaluation loop (PyPy interp_jit.py dispatch()).
 ///
 /// Calls merge_point on EVERY iteration (PyPy line 85-87), not just
@@ -176,8 +203,13 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             StepResult::Continue => {}
             StepResult::CloseLoop(_) => {
                 let mut jit_state = build_jit_state(frame, info);
+                // RPython green_key = (pycode, next_instr).
+                // Each (code, pc) pair has independent warmup counter
+                // and compiled loop, so inner/outer loops are separate.
+                let green_key =
+                    make_green_key(frame.code, frame.next_instr);
                 if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
-                    frame.code as u64,
+                    green_key,
                     frame.next_instr,
                     &mut jit_state,
                     &env,
@@ -194,26 +226,54 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     }
 }
 
-/// Try running compiled code or count function entry.
+/// Try running compiled code or entering the recursive function-entry path.
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
-    let green_key = frame.code as u64;
+    // RPython parity: blackhole interpreter has no JIT entry points.
+    // When executing inside a force callback (guard failure recovery),
+    // never re-enter compiled code. RPython achieves this structurally
+    // (blackhole dispatch loop has no can_enter_jit / jit_merge_point).
+    // pyre uses a thread-local flag until full structural isolation is
+    // implemented.
+    if in_recursive_force_entry() {
+        return None;
+    }
+
+    let green_key = make_green_key(frame.code, frame.next_instr);
     let (driver, info) = driver_pair();
 
-    // If compiled code exists for this function, run it regardless of
-    // call depth. This matches PyPy's call_assembler: compiled code
-    // calls compiled code directly, not through the interpreter.
     if driver.has_compiled_loop(green_key) {
+        if majit_meta::majit_log_enabled() {
+            eprintln!(
+                "[jit][func-entry] run compiled key={} arg0={:?} depth={}",
+                green_key,
+                debug_first_arg_int(frame),
+                JIT_CALL_DEPTH.with(|d| d.get())
+            );
+        }
         let env = PyreEnv;
         let mut jit_state = build_jit_state(frame, info);
-        // sync_before auto-sets array lengths from JitState.
-                    if let Some(outcome) = driver.can_enter_jit_keyed(
-                        green_key,
-                        frame.next_instr,
-                        &mut jit_state,
-                        &env,
+        if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
+            green_key,
+            frame.next_instr,
+            &mut jit_state,
+            &env,
             || {},
         ) {
             if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info) {
+                if majit_meta::majit_log_enabled() {
+                    let rendered = result.as_ref().ok().and_then(|value| {
+                        if value.is_null() || !unsafe { pyre_object::pyobject::is_int(*value) } {
+                            return None;
+                        }
+                        Some(unsafe { pyre_object::intobject::w_int_get_value(*value) })
+                    });
+                    eprintln!(
+                        "[jit][func-entry] compiled return key={} arg0={:?} result={:?}",
+                        green_key,
+                        debug_first_arg_int(frame),
+                        rendered
+                    );
+                }
                 return Some(result);
             }
         }
@@ -228,8 +288,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let count = counts.entry(green_key).or_insert(0);
     *count += 1;
 
-    // Also check if the warm state boosted this function (e.g., from
-    // recursive inline depth limit). If so, fast-track to tracing.
     let boosted = if driver.is_function_boosted(green_key) {
         true
     } else if *count == 1
@@ -253,6 +311,15 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
 
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][func-entry] start tracing key={} arg0={:?} count={} boosted={}",
+            green_key,
+            debug_first_arg_int(frame),
+            *count,
+            boosted
+        );
+    }
     driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
     None
 }
@@ -293,10 +360,18 @@ fn handle_jit_outcome(
             };
             Some(Ok(value))
         }
-        DetailedDriverRunOutcome::Jump { .. }
-        | DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
+        DetailedDriverRunOutcome::Jump { .. } => {
             sync_jit_state_to_frame(jit_state, frame, info);
             None
+        }
+        DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
+            // RPython parity: guard failure → resume_in_blackhole() runs
+            // the remaining execution with NO JIT re-entry. RPython's
+            // handle_fail() calls blackhole.resume_in_blackhole() which
+            // handles the rest of the frame entirely in the blackhole.
+            sync_jit_state_to_frame(jit_state, frame, info);
+            let result = crate::call_jit::resume_in_blackhole_pub(frame);
+            Some(Ok(result))
         }
         DetailedDriverRunOutcome::GuardFailure {
             restored: false, ..
@@ -383,7 +458,7 @@ result = fib(12)";
         unsafe {
             let fib = *(*frame.namespace).get("fib").unwrap();
             assert!(is_func(fib));
-            let fib_key = w_func_get_code_ptr(fib) as u64;
+            let fib_key = make_green_key(w_func_get_code_ptr(fib) as *const _, 0);
             let result = *(*frame.namespace).get("result").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(result), 144);
             let (driver, _) = driver_pair();

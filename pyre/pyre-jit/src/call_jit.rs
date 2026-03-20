@@ -53,6 +53,22 @@ fn finish_protocol(green_key: u64) -> FinishProtocol {
     }
 }
 
+#[inline]
+fn normalize_direct_finish_result(protocol: FinishProtocol, raw: i64) -> i64 {
+    match protocol {
+        FinishProtocol::RawInt => {
+            let maybe_boxed = raw as PyObjectRef;
+            let looks_like_heap_ptr = raw > 4096 && (raw as usize & 0x7) == 0;
+            if looks_like_heap_ptr && !maybe_boxed.is_null() && unsafe { is_int(maybe_boxed) } {
+                unsafe { w_int_get_value(maybe_boxed) }
+            } else {
+                raw
+            }
+        }
+        FinishProtocol::Boxed => raw,
+    }
+}
+
 fn debug_instruction_window(frame: &PyFrame) -> String {
     let code = unsafe { &*frame.code };
     let mut out = String::new();
@@ -416,54 +432,13 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         );
     }
 
-    // PyPy assembler_call_helper (warmspot.py:1021): try compiled code
-    // dispatch first, fall back to blackhole interpreter.
-    let (driver, _) = crate::eval::driver_pair();
-    if let Some(token) = driver.get_loop_token(green_key) {
-        let token_num = token.number;
-        let nlocals = unsafe { (&*frame.code).varnames.len() };
-        let mut inputs = vec![
-            frame_ptr,
-            frame.next_instr as i64,
-            frame.valuestackdepth as i64,
-        ];
-        for i in 0..nlocals {
-            inputs.push(frame.locals_cells_stack_w[i] as i64);
-        }
-        if let Some(raw) = majit_codegen_cranelift::execute_call_assembler_direct(
-            token_num,
-            &inputs,
-            jit_force_callee_frame_interp,
-        ) {
-            if majit_meta::majit_log_enabled() {
-                eprintln!(
-                    "[jit][force-boxed] direct finish key={} token={} raw={} protocol={:?} nlocals={} input_count={}",
-                    green_key, token_num, raw, protocol, nlocals, inputs.len()
-                );
-            }
-            let result = match protocol {
-                FinishProtocol::RawInt => w_int_new(raw) as i64,
-                FinishProtocol::Boxed => raw,
-            };
-            force_cache_store(FinishProtocol::Boxed, hash_idx, code_key, arg_key, result);
-            return result;
-        }
-        if majit_meta::majit_log_enabled() {
-            eprintln!(
-                "[jit][force-boxed] direct miss key={} token={} -> eval_with_jit fallback",
-                green_key, token_num
-            );
-        }
-    } else if majit_meta::majit_log_enabled() {
-        eprintln!(
-            "[jit][force-boxed] no token for key={} -> eval_with_jit fallback",
-            green_key
-        );
-    }
-
-    // RPython parity: assembler_call_helper falls back to blackhole
-    // interpreter. resume_in_blackhole runs jitcode with no JIT hooks,
-    // matching RPython's ResumeGuardForcedDescr.handle_fail() path.
+    // RPython parity: assembler_call_helper (warmspot.py:1021) calls
+    // fail_descr.handle_fail() → resume_in_blackhole(). It does NOT
+    // try to re-execute compiled code. Always use the blackhole.
+    //
+    // Bump recursive_force_entry to prevent JIT re-entry from any
+    // interpreter code called during blackhole execution.
+    let _force_guard = crate::eval::recursive_force_entry_bump();
     let result = resume_in_blackhole(frame);
     let value = match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => {
@@ -515,7 +490,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
             jit_force_callee_frame_interp,
         ) {
             let value = match protocol {
-                FinishProtocol::RawInt => raw,
+                FinishProtocol::RawInt => normalize_direct_finish_result(protocol, raw),
                 FinishProtocol::Boxed => w_int_new(raw) as i64,
             };
             force_cache_store(protocol, hash_idx, code_key, arg_key, value);
@@ -543,6 +518,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
 /// to handle guard failures without recursive compiled dispatch.
 extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _force_guard = crate::eval::recursive_force_entry_bump();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let code_key = frame.code as usize;
@@ -577,10 +553,20 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
 
 /// RPython: blackhole.py resume_in_blackhole()
 ///
+/// Public wrapper for guard failure recovery.
+pub fn resume_in_blackhole_pub(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
+    resume_in_blackhole(frame)
+}
+
+/// RPython: blackhole.py resume_in_blackhole()
+///
 /// Compiles the frame's CodeObject to JitCode (via CodeWriter), creates
 /// a BlackholeInterpreter, loads frame state, and runs it.
 /// The blackhole has NO JIT entry points — structural isolation.
 fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
+    // Ensure JIT re-entry is blocked for all code called during
+    // blackhole execution, including nested calls through bh_call_fn.
+    let _force_guard = crate::eval::recursive_force_entry_bump();
     let code = unsafe { &*frame.code };
 
     // RPython: blackhole_from_resumedata() → setposition + consume_one_section
@@ -631,6 +617,15 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
         bh.setarg_i(nlocals + 3, frame as *mut PyFrame as i64);
     }
 
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][blackhole] setup pc={} nlocals={} regs_i_len={} local0={} frame_reg={}",
+            py_pc, nlocals, bh.registers_i.len(),
+            bh.registers_i.get(0).copied().unwrap_or(-999),
+            bh.registers_i.get(nlocals + 3).copied().unwrap_or(-999),
+        );
+    }
+
     // RPython: _run_forever(blackholeinterp, current_exc)
     bh.run();
 
@@ -678,6 +673,19 @@ pub extern "C" fn jit_force_recursive_call_1(
     callable: i64,
     boxed_arg: i64,
 ) -> i64 {
+    let callable_ref = callable as PyObjectRef;
+    let boxed_arg_ref = boxed_arg as PyObjectRef;
+    let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
+    let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
+    if matches!(finish_protocol(green_key), FinishProtocol::RawInt)
+        && !boxed_arg_ref.is_null()
+        && unsafe { is_int(boxed_arg_ref) }
+    {
+        let raw_arg = unsafe { w_int_get_value(boxed_arg_ref) };
+        let forced = jit_force_recursive_call_raw_1(caller_frame, callable, raw_arg);
+        return w_int_new(forced) as i64;
+    }
+
     if majit_meta::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
         let caller_arg0 = if caller.locals_cells_stack_w.len() > 0
@@ -696,7 +704,7 @@ pub extern "C" fn jit_force_recursive_call_1(
             caller_arg0, callee_arg0
         );
     }
-    let frame_ptr = create_callee_frame_impl(caller_frame, callable, &[boxed_arg as PyObjectRef]);
+    let frame_ptr = create_callee_frame_impl(caller_frame, callable, &[boxed_arg_ref]);
     let result = jit_force_callee_frame(frame_ptr);
     jit_drop_callee_frame(frame_ptr);
     if majit_meta::majit_log_enabled() {
@@ -748,73 +756,46 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        if memo_safe {
-            if let Some(token_num) = token_num {
-                let direct = if frame.next_instr == 0
-                    && frame.valuestackdepth == 1
-                    && frame.nlocals() == 1
-                {
-                    let inputs = [frame_ptr, 0, 1, boxed as i64];
-                    majit_codegen_cranelift::execute_call_assembler_direct(
-                        token_num,
-                        &inputs,
-                        jit_force_callee_frame_interp_nocache,
-                    )
-                } else {
-                    let nlocals = unsafe { (&*frame.code).varnames.len() };
-                    let mut inputs = vec![
-                        frame_ptr,
-                        frame.next_instr as i64,
-                        frame.valuestackdepth as i64,
-                    ];
-                    for i in 0..nlocals {
-                        inputs.push(frame.locals_cells_stack_w[i] as i64);
-                    }
-                    majit_codegen_cranelift::execute_call_assembler_direct(
-                        token_num,
-                        &inputs,
-                        jit_force_callee_frame_interp_nocache,
-                    )
-                };
-                if let Some(raw) = direct {
-                    match protocol {
-                        FinishProtocol::RawInt => raw,
-                        FinishProtocol::Boxed => w_int_new(raw) as i64,
-                    }
-                } else {
-                    match crate::eval::eval_with_jit(frame) {
-                        Ok(result) => match protocol {
-                            FinishProtocol::RawInt
-                                if !result.is_null() && unsafe { is_int(result) } =>
-                            unsafe { w_int_get_value(result) },
-                            FinishProtocol::RawInt => result as i64,
-                            FinishProtocol::Boxed => result as i64,
-                        },
-                        Err(err) => panic!("jit force recursive call raw failed: {err}"),
-                    }
-                }
+        if let Some(token_num) = token_num {
+            let nlocals = unsafe { (&*frame.code).varnames.len() };
+            let mut inputs = vec![
+                frame_ptr,
+                frame.next_instr as i64,
+                frame.valuestackdepth as i64,
+            ];
+            for i in 0..nlocals {
+                inputs.push(frame.locals_cells_stack_w[i] as i64);
+            }
+            if let Some(raw) = majit_codegen_cranelift::execute_call_assembler_direct(
+                token_num,
+                &inputs,
+                jit_force_callee_frame_interp_nocache,
+            ) {
+                normalize_direct_finish_result(protocol, raw)
             } else {
-                match crate::eval::eval_with_jit(frame) {
-                    Ok(result) => match protocol {
-                        FinishProtocol::RawInt
-                            if !result.is_null() && unsafe { is_int(result) } =>
-                        unsafe { w_int_get_value(result) },
-                        FinishProtocol::RawInt => result as i64,
-                        FinishProtocol::Boxed => result as i64,
-                    },
-                    Err(err) => panic!("jit force recursive call raw failed: {err}"),
+                // RPython parity fallback: guard failure recovery resumes in
+                // the blackhole interpreter.
+                let bh_result = resume_in_blackhole(frame);
+                match protocol {
+                    FinishProtocol::RawInt
+                        if !bh_result.is_null() && unsafe { is_int(bh_result) } =>
+                    {
+                        unsafe { w_int_get_value(bh_result) }
+                    }
+                    FinishProtocol::RawInt => bh_result as i64,
+                    FinishProtocol::Boxed => bh_result as i64,
                 }
             }
         } else {
-            match crate::eval::eval_with_jit(frame) {
-                Ok(result) => match protocol {
-                    FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-                        w_int_get_value(result)
-                    },
-                    FinishProtocol::RawInt => result as i64,
-                    FinishProtocol::Boxed => result as i64,
-                },
-                Err(err) => panic!("jit force recursive call raw failed: {err}"),
+            // RPython parity: force callbacks without compiled callee code
+            // resume in the blackhole interpreter.
+            let bh_result = resume_in_blackhole(frame);
+            match protocol {
+                FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => {
+                    unsafe { w_int_get_value(bh_result) }
+                }
+                FinishProtocol::RawInt => bh_result as i64,
+                FinishProtocol::Boxed => bh_result as i64,
             }
         }
     };
@@ -840,11 +821,14 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// additional callable metadata layer.
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    if majit_meta::majit_log_enabled() && raw_int_arg <= 4 {
+        eprintln!("[jit][force-self-recursive] enter arg={}", raw_int_arg);
+    }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let code_ptr = caller.code;
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     let code_key = code_ptr as usize;
-    let (protocol, token_num) = self_recursive_dispatch(green_key);
+    let (protocol, _token_num) = self_recursive_dispatch(green_key);
     let arg_key = ((raw_int_arg as usize) << 1) | 1;
 
     let hash_idx = force_cache_index(code_key, arg_key);
@@ -856,61 +840,26 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        if let Some(token_num) = token_num {
-            let direct = if frame.next_instr == 0 && frame.valuestackdepth == 1 && frame.nlocals() == 1
-            {
-                let inputs = [frame_ptr, 0, 1, boxed as i64];
-                majit_codegen_cranelift::execute_call_assembler_direct(
-                    token_num,
-                    &inputs,
-                    jit_force_callee_frame_interp_nocache,
-                )
-            } else {
-                let nlocals = unsafe { (&*frame.code).varnames.len() };
-                let mut inputs = vec![frame_ptr, frame.next_instr as i64, frame.valuestackdepth as i64];
-                for i in 0..nlocals {
-                    inputs.push(frame.locals_cells_stack_w[i] as i64);
-                }
-                majit_codegen_cranelift::execute_call_assembler_direct(
-                    token_num,
-                    &inputs,
-                    jit_force_callee_frame_interp_nocache,
-                )
-            };
-            if let Some(raw) = direct {
-                match protocol {
-                    FinishProtocol::RawInt => raw,
-                    FinishProtocol::Boxed => w_int_new(raw) as i64,
-                }
-            } else {
-                let _recursive_entry = crate::eval::recursive_force_entry_bump();
-                match crate::eval::eval_with_jit(frame) {
-                    Ok(result) => match protocol {
-                        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-                            w_int_get_value(result)
-                        },
-                        FinishProtocol::RawInt => result as i64,
-                        FinishProtocol::Boxed => result as i64,
-                    },
-                    Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
-                }
-            }
-        } else {
-            let _recursive_entry = crate::eval::recursive_force_entry_bump();
-            match crate::eval::eval_with_jit(frame) {
-                Ok(result) => match protocol {
-                    FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-                        w_int_get_value(result)
-                    },
-                    FinishProtocol::RawInt => result as i64,
-                    FinishProtocol::Boxed => result as i64,
+        let _recursive_entry = crate::eval::recursive_force_entry_bump();
+        match crate::eval::eval_with_jit(frame) {
+            Ok(result) => match protocol {
+                FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
+                    w_int_get_value(result)
                 },
-                Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
-            }
+                FinishProtocol::RawInt => result as i64,
+                FinishProtocol::Boxed => result as i64,
+            },
+            Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
         }
     };
     jit_drop_callee_frame(frame_ptr);
     force_cache_store(protocol, hash_idx, code_key, arg_key, result);
+    if majit_meta::majit_log_enabled() && raw_int_arg <= 4 {
+        eprintln!(
+            "[jit][force-self-recursive] exit arg={} result={} protocol={:?}",
+            raw_int_arg, result, protocol
+        );
+    }
     result
 }
 
@@ -1081,37 +1030,6 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let func_code = caller.code;
     let globals = caller.namespace;
     let execution_context = caller.execution_context;
-
-    let arena = arena_ref();
-    if let Some((ptr, was_init)) = arena.take() {
-        if was_init {
-            let f = unsafe { &mut *ptr };
-            if f.code == func_code
-                && f.namespace == globals
-                && f.execution_context == execution_context
-            {
-                reset_reused_call_frame(f, &[boxed_arg]);
-            } else {
-                unsafe {
-                    std::ptr::write(
-                        ptr,
-                        PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
-                    );
-                    (&mut *ptr).fix_array_ptrs();
-                }
-            }
-        } else {
-            unsafe {
-                std::ptr::write(
-                    ptr,
-                    PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
-                );
-                (&mut *ptr).fix_array_ptrs();
-            }
-            arena.mark_initialized();
-        }
-        return ptr as i64;
-    }
 
     let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
         func_code,

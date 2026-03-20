@@ -10,7 +10,7 @@ use majit_meta::TraceCtx;
 use pyre_object::*;
 use pyre_objspace::{
     jit_binary_value_from_tag, jit_compare_value_from_tag, jit_getattr, jit_setattr, jit_setitem,
-    jit_truth_value, jit_unary_invert_value, jit_unary_negative_value,
+    jit_bool_value_from_truth, jit_truth_value, jit_unary_invert_value, jit_unary_negative_value,
 };
 use pyre_runtime::{
     PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_range_iter_next_or_null,
@@ -160,11 +160,7 @@ pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate
     } else {
         truth
     };
-    let false_singleton = ctx.const_int(w_bool_from(false) as i64);
-    let bool_delta =
-        ctx.const_int((w_bool_from(true) as i64).wrapping_sub(w_bool_from(false) as i64));
-    let offset = ctx.record_op(OpCode::IntMul, &[truth, bool_delta]);
-    ctx.record_op(OpCode::IntAdd, &[false_singleton, offset])
+    emit_trace_call_int(ctx, jit_bool_value_from_truth as *const (), &[truth])
 }
 
 pub fn emit_trace_binary_value(
@@ -402,6 +398,21 @@ pub fn emit_box_int_inline(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
     // Emit: SetfieldGc(v, intval, raw_int)
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_int], intval_descr);
+    new_op
+}
+
+pub fn emit_box_float_inline(
+    ctx: &mut TraceCtx,
+    raw_float: OpRef,
+    size_descr: majit_ir::DescrRef,
+    ob_type_descr: majit_ir::DescrRef,
+    floatval_descr: majit_ir::DescrRef,
+    float_type_addr: i64,
+) -> OpRef {
+    let new_op = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    let type_const = ctx.const_int(float_type_addr);
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_float], floatval_descr);
     new_op
 }
 

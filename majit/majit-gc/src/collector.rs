@@ -167,6 +167,13 @@ pub struct MiniMarkGC {
     ///
     /// Mirrors incminimark's `threshold_objects_made_old`.
     threshold_bytes_made_old: usize,
+    /// Exact payload addresses of objects currently resident in the nursery.
+    ///
+    /// In RPython, roots are always exact GC object addresses. In this hybrid
+    /// runtime, root slots can transiently contain non-GC refs or interior raw
+    /// pointers, so the root-walker seam must distinguish exact nursery object
+    /// starts from arbitrary addresses within the nursery range.
+    nursery_object_starts: HashSet<usize>,
     /// Pinned nursery objects that must not be moved during minor collection.
     pinned_objects: HashSet<usize>,
     /// Registry of compiled code regions for GC root scanning.
@@ -196,6 +203,7 @@ impl MiniMarkGC {
             last_major_bytes: 0,
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
+            nursery_object_starts: HashSet::new(),
             pinned_objects: HashSet::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
         }
@@ -210,6 +218,16 @@ impl MiniMarkGC {
     #[inline]
     pub fn is_in_nursery(&self, addr: usize) -> bool {
         self.nursery.contains(addr)
+    }
+
+    #[inline]
+    fn is_managed_heap_object(&self, addr: usize) -> bool {
+        self.nursery_object_starts.contains(&addr) || self.oldgen.contains(addr)
+    }
+
+    #[inline]
+    fn is_nursery_object_start(&self, addr: usize) -> bool {
+        self.nursery_object_starts.contains(&addr)
     }
 
     /// Allocate a fixed-size object with the given type ID and size (excluding header).
@@ -232,11 +250,15 @@ impl MiniMarkGC {
                 return self.alloc_in_oldgen(type_id, total_size);
             }
             Self::init_nursery_object(ptr, type_id);
-            return GcRef((ptr as usize) + GcHeader::SIZE);
+            let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+            self.nursery_object_starts.insert(obj.0);
+            return obj;
         }
 
         Self::init_nursery_object(ptr, type_id);
-        GcRef((ptr as usize) + GcHeader::SIZE)
+        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+        self.nursery_object_starts.insert(obj.0);
+        obj
     }
 
     /// Allocate without triggering collection.
@@ -257,7 +279,9 @@ impl MiniMarkGC {
         }
 
         Self::init_nursery_object(ptr, type_id);
-        GcRef((ptr as usize) + GcHeader::SIZE)
+        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+        self.nursery_object_starts.insert(obj.0);
+        obj
     }
 
     /// Initialize a nursery object's header.
@@ -296,7 +320,7 @@ impl MiniMarkGC {
         let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
         for root_ptr in roots {
             let gcref = unsafe { *root_ptr };
-            if !gcref.is_null() && self.is_in_nursery(gcref.0) {
+            if !gcref.is_null() && self.is_nursery_object_start(gcref.0) {
                 if self.pinned_objects.contains(&gcref.0) {
                     continue;
                 }
@@ -311,7 +335,7 @@ impl MiniMarkGC {
         // RPython gc.py: GcRootMap_shadowstack — walk the thread-local
         // shadow stack to find GC refs pushed by compiled JIT code.
         crate::shadow_stack::walk_roots(|gcref| {
-            if self.is_in_nursery(gcref.0) {
+            if self.is_nursery_object_start(gcref.0) {
                 if !self.pinned_objects.contains(&gcref.0) {
                     *gcref = self.copy_nursery_object(gcref.0);
                 }
@@ -359,8 +383,10 @@ impl MiniMarkGC {
         // Reset nursery for new allocations, preserving pinned objects.
         if self.pinned_objects.is_empty() {
             self.nursery.reset();
+            self.nursery_object_starts.clear();
         } else {
             self.reset_nursery_with_pinned();
+            self.nursery_object_starts = self.pinned_objects.clone();
         }
 
         // Minor collections must also drive incremental major-collection
@@ -499,7 +525,7 @@ impl MiniMarkGC {
         let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
         for root_ptr in roots {
             let gcref = unsafe { *root_ptr };
-            if !gcref.is_null() {
+            if !gcref.is_null() && self.is_managed_heap_object(gcref.0) {
                 let hdr = unsafe { header_of(gcref.0) };
                 if !hdr.has_flag(flags::VISITED) {
                     hdr.set_flag(flags::VISITED);
@@ -672,7 +698,7 @@ impl MiniMarkGC {
             let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
             for root_ptr in roots {
                 let gcref = unsafe { *root_ptr };
-                if !gcref.is_null() {
+                if !gcref.is_null() && self.is_managed_heap_object(gcref.0) {
                     let hdr = unsafe { header_of(gcref.0) };
                     if !hdr.has_flag(flags::VISITED) {
                         hdr.set_flag(flags::VISITED);
@@ -940,7 +966,7 @@ impl MiniMarkGC {
     /// Returns true if pinning succeeded, false if the object is null or
     /// not in the nursery.
     pub fn pin(&mut self, obj: GcRef) -> bool {
-        if obj.is_null() || !self.is_in_nursery(obj.0) {
+        if obj.is_null() || !self.is_nursery_object_start(obj.0) {
             return false;
         }
         unsafe {
@@ -956,7 +982,7 @@ impl MiniMarkGC {
             return;
         }
         // Clear the header flag if the object is still in the nursery.
-        if self.is_in_nursery(obj.0) {
+        if self.is_nursery_object_start(obj.0) {
             unsafe {
                 header_of(obj.0).clear_flag(flags::PINNED);
             }
@@ -3260,5 +3286,78 @@ mod tests {
         // Free the second region.
         gc.jit_free(0x2000, 512);
         assert_eq!(gc.compiled_code_registry.len(), 0);
+    }
+
+    #[test]
+    fn test_incremental_cycle_root_walk_skips_non_gc_roots() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut rooted = obj;
+        let mut external = GcRef(Box::into_raw(Box::new(0xDEADBEEFu64)) as usize);
+        unsafe {
+            gc.roots.add(&mut rooted);
+            gc.roots.add(&mut external);
+        }
+
+        gc.do_collect_nursery();
+        gc.start_incremental_cycle();
+        while !gc.gc_step() {}
+
+        assert!(!rooted.is_null());
+        assert!(gc.oldgen.contains(rooted.0));
+
+        gc.roots.clear();
+        unsafe {
+            drop(Box::from_raw(external.0 as *mut u64));
+        }
+    }
+
+    #[test]
+    fn test_full_collection_root_walk_skips_non_gc_roots() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut rooted = obj;
+        let mut external = GcRef(Box::into_raw(Box::new(0xFEEDFACEu64)) as usize);
+        unsafe {
+            gc.roots.add(&mut rooted);
+            gc.roots.add(&mut external);
+        }
+
+        gc.do_collect_nursery();
+        gc.do_collect_full();
+
+        assert!(!rooted.is_null());
+        assert!(gc.oldgen.contains(rooted.0));
+
+        gc.roots.clear();
+        unsafe {
+            drop(Box::from_raw(external.0 as *mut u64));
+        }
+    }
+
+    #[test]
+    fn test_minor_root_walk_skips_interior_nursery_pointers() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut exact_root = obj;
+        let mut interior_root = GcRef(obj.0 + 8);
+        unsafe {
+            gc.roots.add(&mut exact_root);
+            gc.roots.add(&mut interior_root);
+        }
+
+        gc.do_collect_nursery();
+
+        assert!(!exact_root.is_null());
+        assert!(gc.oldgen.contains(exact_root.0));
+        assert_eq!(interior_root.0, obj.0 + 8);
+
+        gc.roots.clear();
     }
 }

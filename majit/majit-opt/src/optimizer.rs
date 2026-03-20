@@ -248,7 +248,7 @@ impl Optimizer {
 
     fn install_imported_virtuals(&self, ctx: &mut OptContext) {
         for iv in &self.imported_virtuals {
-            let virtual_head = OpRef(iv.inputarg_index as u32);
+            let virtual_head = ctx.get_replacement(OpRef(iv.inputarg_index as u32));
             let mut fields = Vec::new();
             let mut field_descrs = Vec::new();
             for (descr, field_info) in &iv.fields {
@@ -754,9 +754,14 @@ impl Optimizer {
             let mut short_boxes =
                 crate::shortpreamble::ShortBoxes::with_label_args(&preview_label_args);
             self.produce_potential_short_preamble_ops(&mut short_boxes);
-            ctx.exported_short_boxes = short_boxes
-                .non_empty_ops()
-                .map(|(_, op)| op.clone())
+            let produced = short_boxes.produced_ops();
+            ctx.exported_short_boxes = produced
+                .into_iter()
+                .map(|(result, produced)| crate::shortpreamble::PreambleOp {
+                    op: produced.preamble_op,
+                    kind: produced.kind,
+                    label_arg_idx: short_boxes.lookup_label_arg(result),
+                })
                 .collect();
             let exported_int_bounds =
                 self.collect_exported_int_bounds(&jump.args, &ctx);

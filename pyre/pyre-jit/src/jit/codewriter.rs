@@ -101,6 +101,14 @@ impl CodeWriter {
         // RPython: self.assembler = Assembler()
         let mut assembler = JitCodeBuilder::default();
 
+        // RPython regalloc.py: ensure all scratch registers are allocated.
+        // JitCodeBuilder.touch_reg is private, so we emit dummy loads to
+        // register all scratch register indices in num_regs_i.
+        // These constants will be in the constant pool but the loads are
+        // overwritten immediately — they just ensure register allocation.
+        let arg_regs_end = (nlocals + 8) as u16; // support up to CALL 4
+        assembler.load_const_i_value(arg_regs_end, 0);
+
         // Register helper function pointers
         // RPython: CallControl manages fn addresses; assembler.finished()
         // writes them into callinfocollection.

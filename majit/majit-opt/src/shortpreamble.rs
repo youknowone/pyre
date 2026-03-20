@@ -294,16 +294,29 @@ impl PreambleOp {
     /// For HeapOp: reconstruct the getfield/getarrayitem with remapped args.
     /// For PureOp: reconstruct the pure op (promoting to CALL_PURE if call).
     /// For LoopInvariantOp: reconstruct as CALL_LOOPINVARIANT.
-    pub fn add_op_to_short(&self) -> ProducedShortOp {
+    pub fn add_op_to_short(&self, sb: &mut ShortBoxes) -> Option<ProducedShortOp> {
         let preamble_op = match &self.kind {
-            PreambleOpKind::InputArg => self.op.clone(),
+            PreambleOpKind::InputArg | PreambleOpKind::Guard => self.op.clone(),
             PreambleOpKind::Heap { descr_idx: _ } => {
-                // HeapOp: the op is already a GETFIELD/GETARRAYITEM
-                self.op.clone()
+                let args = self
+                    .op
+                    .args
+                    .iter()
+                    .map(|&arg| sb.produce_arg(arg))
+                    .collect::<Option<Vec<_>>>()?;
+                let mut op = self.op.clone();
+                op.args = args.into_iter().collect();
+                op
             }
             PreambleOpKind::Pure => {
-                // PureOp: if it's a call, promote to CALL_PURE
+                let args = self
+                    .op
+                    .args
+                    .iter()
+                    .map(|&arg| sb.produce_arg(arg))
+                    .collect::<Option<Vec<_>>>()?;
                 let mut op = self.op.clone();
+                op.args = args.into_iter().collect();
                 if op.opcode.is_call() {
                     op.opcode = match op.opcode {
                         OpCode::CallI => OpCode::CallPureI,
@@ -316,8 +329,14 @@ impl PreambleOp {
                 op
             }
             PreambleOpKind::LoopInvariant => {
-                // LoopInvariantOp: promote to CALL_LOOPINVARIANT
+                let args = self
+                    .op
+                    .args
+                    .iter()
+                    .map(|&arg| sb.produce_arg(arg))
+                    .collect::<Option<Vec<_>>>()?;
                 let mut op = self.op.clone();
+                op.args = args.into_iter().collect();
                 op.opcode = match op.opcode {
                     OpCode::CallI => OpCode::CallLoopinvariantI,
                     OpCode::CallR => OpCode::CallLoopinvariantR,
@@ -327,12 +346,11 @@ impl PreambleOp {
                 };
                 op
             }
-            PreambleOpKind::Guard => self.op.clone(),
         };
-        ProducedShortOp {
+        Some(ProducedShortOp {
             kind: self.kind.clone(),
             preamble_op,
-        }
+        })
     }
 }
 
@@ -345,8 +363,13 @@ pub struct ShortBoxes {
     pub label_arg_positions: HashMap<OpRef, usize>,
     /// shortpreamble.py: potential_ops
     potential_ops: HashMap<OpRef, Vec<PreambleOp>>,
+    /// Ordered insertion list for potential ops, matching shortpreamble.py's
+    /// OrderedDict iteration contract.
+    potential_order: Vec<OpRef>,
     /// shortpreamble.py: produced_short_boxes
     produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
+    /// Production order for exported short ops.
+    produced_order: Vec<OpRef>,
     /// shortpreamble.py: const_short_boxes
     const_short_boxes: Vec<PreambleOp>,
     /// shortpreamble.py: short_inputargs
@@ -362,7 +385,9 @@ impl ShortBoxes {
         ShortBoxes {
             label_arg_positions: HashMap::new(),
             potential_ops: HashMap::new(),
+            potential_order: Vec::new(),
             produced_short_boxes: HashMap::new(),
+            produced_order: Vec::new(),
             const_short_boxes: Vec::new(),
             short_inputargs: Vec::new(),
             boxes_in_production: HashSet::new(),
@@ -384,6 +409,9 @@ impl ShortBoxes {
     }
 
     fn add_op(&mut self, result: OpRef, pop: PreambleOp) {
+        if !self.potential_ops.contains_key(&result) {
+            self.potential_order.push(result);
+        }
         self.potential_ops.entry(result).or_default().push(pop);
     }
 
@@ -442,6 +470,24 @@ impl ShortBoxes {
             kind: PreambleOpKind::InputArg,
             label_arg_idx,
         }]);
+        if !self.potential_order.contains(&arg) {
+            self.potential_order.push(arg);
+        }
+    }
+
+    fn produce_arg(&mut self, opref: OpRef) -> Option<OpRef> {
+        if let Some(existing) = self.produced_short_boxes.get(&opref) {
+            return Some(existing.preamble_op.pos);
+        }
+        if self.boxes_in_production.contains(&opref) {
+            return None;
+        }
+        if self.potential_ops.contains_key(&opref) {
+            return self
+                .materialize_one(opref)
+                .map(|produced| produced.preamble_op.pos);
+        }
+        Some(opref)
     }
 
     fn pick_producer_index(candidates: &[PreambleOp], pick_other: bool) -> usize {
@@ -469,29 +515,32 @@ impl ShortBoxes {
         let candidates = self.potential_ops.get(&result)?.clone();
         self.boxes_in_production.insert(result);
         let produced = if candidates.len() == 1 {
-            candidates[0].add_op_to_short()
+            candidates[0].add_op_to_short(self)
         } else {
             let index = Self::pick_producer_index(&candidates, true);
-            candidates[index].add_op_to_short()
-        };
+            candidates[index].add_op_to_short(self)
+        }?;
         self.produced_short_boxes.insert(result, produced.clone());
+        self.produced_order.push(result);
         self.boxes_in_production.remove(&result);
         Some(produced)
     }
 
     /// shortpreamble.py: produced_short_boxes after add_op_to_short().
     pub fn produced_ops(&mut self) -> Vec<(OpRef, ProducedShortOp)> {
-        let keys: Vec<OpRef> = self.potential_ops.keys().copied().collect();
+        let keys = self.potential_order.clone();
         for key in keys {
             let _ = self.materialize_one(key);
         }
-        let mut out: Vec<_> = self
-            .produced_short_boxes
+        self.produced_order
             .iter()
-            .map(|(&k, v)| (k, v.clone()))
-            .collect();
-        out.sort_by_key(|(k, _)| self.lookup_label_arg(*k).unwrap_or(usize::MAX));
-        out
+            .filter_map(|key| {
+                self.produced_short_boxes
+                    .get(key)
+                    .cloned()
+                    .map(|produced| (*key, produced))
+            })
+            .collect()
     }
 
     /// shortpreamble.py: create_short_inputargs(label_args)

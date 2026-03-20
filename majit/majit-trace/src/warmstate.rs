@@ -258,8 +258,8 @@ const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
 const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
 
 /// Maximum number of non-permanent trace aborts before giving up on a green key.
-/// RPython warmstate.py: retrace_limit (default 5).
-const DEFAULT_RETRACE_LIMIT: u32 = 5;
+/// RPython default from rlib/jit.py: retrace_limit = 0.
+const DEFAULT_RETRACE_LIMIT: u32 = 0;
 
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
 
@@ -379,10 +379,10 @@ impl WarmEnterState {
             jitlog: Logger::from_env(),
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
-            retrace_limit: 5,
+            retrace_limit: DEFAULT_RETRACE_LIMIT,
             max_retrace_guards: 15,
             max_unroll_loops: 0,
-            max_unroll_recursion: 3,
+            max_unroll_recursion: DEFAULT_MAX_INLINE_DEPTH,
             loop_longevity: 1000,
             vectorize: false,
             vec_cost: 0,
@@ -408,10 +408,10 @@ impl WarmEnterState {
             jitlog,
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
-            retrace_limit: 5,
+            retrace_limit: DEFAULT_RETRACE_LIMIT,
             max_retrace_guards: 15,
             max_unroll_loops: 0,
-            max_unroll_recursion: 3,
+            max_unroll_recursion: DEFAULT_MAX_INLINE_DEPTH,
             loop_longevity: 1000,
             vectorize: false,
             vec_cost: 0,
@@ -1011,7 +1011,9 @@ impl WarmEnterState {
             "retrace_limit" => self.retrace_limit = DEFAULT_RETRACE_LIMIT,
             "max_retrace_guards" => self.max_retrace_guards = 15,
             "max_unroll_loops" => self.max_unroll_loops = 0,
-            "max_unroll_recursion" => self.max_unroll_recursion = 3,
+            "max_unroll_recursion" => {
+                self.max_unroll_recursion = DEFAULT_MAX_INLINE_DEPTH;
+            }
             "loop_longevity" => self.loop_longevity = 1000,
             "vectorize" => self.vectorize = false,
             "vec_cost" => self.vec_cost = 0,

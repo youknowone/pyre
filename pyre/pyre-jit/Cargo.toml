@@ -16,6 +16,7 @@ majit-codegen = { path = "../../majit/majit-codegen" }
 majit-codegen-cranelift = { path = "../../majit/majit-codegen-cranelift" }
 majit-opt = { path = "../../majit/majit-opt" }
 majit-trace = { path = "../../majit/majit-trace" }
+majit-gc = { path = "../../majit/majit-gc" }
 
 [build-dependencies]
 majit-analyze = { path = "../../majit/majit-analyze" }

@@ -15,20 +15,13 @@ use pyre_runtime::{
 use crate::eval::eval_frame_plain;
 use crate::frame::PyFrame;
 
-thread_local! {
-    /// When trace inlining executes the callee synchronously inside the
-    /// trace handler, the concrete result is stored here so that the
-    /// concrete CALL_FUNCTION handler can pick it up without re-executing.
-    static INLINE_HANDLED_RESULT: Cell<Option<PyObjectRef>> = const { Cell::new(None) };
+/// Store an inline-handled concrete result on the owning caller frame.
+pub fn set_pending_inline_result(frame: &mut PyFrame, result: PyObjectRef) {
+    frame.pending_inline_result = Some(result);
 }
 
-/// Store an inline-handled result for the concrete handler to pick up.
-pub fn set_inline_handled_result(result: PyObjectRef) {
-    INLINE_HANDLED_RESULT.with(|c| c.set(Some(result)));
-}
-
-fn take_inline_handled_result() -> Option<PyObjectRef> {
-    INLINE_HANDLED_RESULT.with(|c| c.take())
+fn take_pending_inline_result(frame: &mut PyFrame) -> Option<PyObjectRef> {
+    frame.pending_inline_result.take()
 }
 
 // ── Eval function injection ──────────────────────────────────────
@@ -96,6 +89,21 @@ pub fn suspend_inline_call_override() -> SuspendInlineCallOverrideGuard {
     SuspendInlineCallOverrideGuard { previous_depth }
 }
 
+pub struct SuspendInlineHandledResultGuard;
+
+impl Drop for SuspendInlineHandledResultGuard {
+    fn drop(&mut self) {}
+}
+
+/// Temporarily isolate inline-result replay from helper-boundary execution.
+///
+/// Results are now owned by the concrete caller frame, so helper-boundary
+/// interpreters no longer share a thread-global result channel. The guard
+/// remains as an explicit protocol marker for residual-call slow paths.
+pub fn suspend_inline_handled_result() -> SuspendInlineHandledResultGuard {
+    SuspendInlineHandledResultGuard
+}
+
 fn try_inline_call_override(
     frame: &PyFrame,
     callable: PyObjectRef,
@@ -132,7 +140,7 @@ fn call_user_function_with_eval(
 }
 
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
-    if let Some(result) = take_inline_handled_result() {
+    if let Some(result) = take_pending_inline_result(frame) {
         return Ok(result);
     }
     dispatch_callable(
@@ -184,6 +192,7 @@ pub fn call_callable_inline_residual(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
+    let _suspend_inline_result = suspend_inline_handled_result();
     dispatch_callable(
         callable,
         |callable| {

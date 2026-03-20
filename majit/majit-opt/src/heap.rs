@@ -539,6 +539,10 @@ impl OptHeap {
             return OptimizationResult::Remove;
         }
 
+        if let Some(&cached) = ctx.imported_short_fields.get(&key) {
+            self.cached_fields.entry(key).or_insert(cached);
+        }
+
         // Check immutable field cache first — these survive all invalidation.
         if let Some(&cached) = self.immutable_cached_fields.get(&key) {
             let cached = ctx.get_replacement(cached);
@@ -638,6 +642,9 @@ impl OptHeap {
                 let cached = lazy_op.arg(2);
                 ctx.replace_op(op.pos, cached);
                 return OptimizationResult::Remove;
+            }
+            if let Some(&cached) = ctx.imported_short_arrayitems.get(&key) {
+                self.cached_arrayitems.entry(key).or_insert(cached);
             }
             if let Some(&cached) = self.cached_arrayitems.get(&key) {
                 let cached = ctx.get_replacement(cached);
@@ -1218,8 +1225,10 @@ impl Optimization for OptHeap {
             if cached_val.is_none() || obj.is_none() {
                 continue;
             }
-            let label_arg_idx = cached_val.0 as usize;
-            if label_arg_idx >= sb.num_label_args {
+            let Some(label_arg_idx) = sb.lookup_label_arg(cached_val) else {
+                continue;
+            };
+            if sb.lookup_label_arg(obj).is_none() {
                 continue;
             }
             let mut op = Op::new(OpCode::GetfieldGcI, &[obj]);
@@ -1231,8 +1240,10 @@ impl Optimization for OptHeap {
             if cached_val.is_none() || obj.is_none() {
                 continue;
             }
-            let label_arg_idx = cached_val.0 as usize;
-            if label_arg_idx >= sb.num_label_args {
+            let Some(label_arg_idx) = sb.lookup_label_arg(cached_val) else {
+                continue;
+            };
+            if sb.lookup_label_arg(obj).is_none() {
                 continue;
             }
             let idx_ref = OpRef(index as u32);
@@ -1326,6 +1337,21 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
         assert_eq!(result[1].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_imported_short_field_cache_replays_into_heap() {
+        let d = descr(55);
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::with_num_inputs(4, 2);
+        ctx.imported_short_fields.insert((OpRef(0), d.index()), OpRef(1));
+
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d);
+        op.pos = OpRef(2);
+
+        let result = heap.optimize_getfield(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
     }
 
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──

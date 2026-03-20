@@ -113,6 +113,13 @@ impl OldGen {
         }
     }
 
+    /// Check whether `obj_addr` is the payload address of a tracked old-gen object.
+    pub fn contains(&self, obj_addr: usize) -> bool {
+        self.objects
+            .iter()
+            .any(|obj_record| obj_record.header_addr + GcHeader::SIZE == obj_addr)
+    }
+
     /// Mark an old-gen object as visited (for major collection).
     pub fn mark_visited(obj_addr: usize) {
         unsafe {

@@ -522,17 +522,6 @@ pub fn set_gil_hooks(
     let _ = GIL_REACQUIRE_HOOK.set(Box::new(reacquire));
 }
 
-/// Allocation shim: allocate `size` bytes from the nursery (or fallback to malloc).
-///
-/// In a real GC integration this would use the bump-pointer allocator.
-/// The current implementation uses a simple heap allocation as a placeholder.
-extern "C" fn jit_malloc_nursery_shim(size: i64) -> i64 {
-    let layout = std::alloc::Layout::from_size_align(size.max(8) as usize, 8)
-        .unwrap_or(std::alloc::Layout::new::<u64>());
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    ptr as i64
-}
-
 extern "C" fn jit_release_gil_shim() {
     if let Some(hook) = GIL_RELEASE_HOOK.get() {
         hook();
@@ -1783,6 +1772,10 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
 /// Stack-allocated output buffer size for the fast path.
 /// Traces with more output slots fall back to the normal path.
 const FAST_PATH_MAX_OUTPUTS: usize = 16;
+/// Stack-allocated GC root buffer size for the fast path.
+/// Traces with more live ref roots must use the heap path to avoid
+/// overwriting the fixed stack scratch space.
+const FAST_PATH_MAX_ROOTS: usize = 8;
 
 /// Fast path for call_assembler when a force callback is available.
 /// Runs compiled code with stack-allocated buffers, avoiding all heap
@@ -1794,8 +1787,11 @@ fn call_assembler_fast_path(
     force_fn: extern "C" fn(i64) -> i64,
 ) -> u64 {
     let actual_outputs = target.max_output_slots.max(1);
-    if actual_outputs > FAST_PATH_MAX_OUTPUTS {
-        // Rare: too many outputs for stack buffer. Fall back to heap path.
+    let actual_roots = target.num_ref_roots.max(1);
+    if actual_outputs > FAST_PATH_MAX_OUTPUTS || actual_roots > FAST_PATH_MAX_ROOTS {
+        // Rare: too many outputs or GC roots for the fixed stack buffers.
+        // Fall back to the heap path, which sizes both buffers from the
+        // compiled target metadata.
         return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
     }
 
@@ -1810,7 +1806,7 @@ fn call_assembler_fast_path(
 
     // Stack-allocated buffers — no heap allocation per call
     let mut outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
-    let mut roots = [GcRef::NULL; 8];
+    let mut roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
 
     let fail_index = unsafe {
         func(
@@ -2082,9 +2078,19 @@ extern "C" fn gc_alloc_nursery_shim(
 ) -> u64 {
     with_registered_gc_roots(runtime_id, roots_ptr, num_roots, |gc| {
         let obj = gc.alloc_nursery(size as usize);
-        // Fresh old-gen allocations need to be remembered before the rewriter
-        // starts skipping write barriers on stores into the same object.
-        gc.write_barrier(obj);
+        obj.0 as u64
+    })
+}
+
+extern "C" fn gc_alloc_typed_nursery_shim(
+    runtime_id: u64,
+    roots_ptr: u64,
+    num_roots: u64,
+    type_id: u64,
+    size: u64,
+) -> u64 {
+    with_registered_gc_roots(runtime_id, roots_ptr, num_roots, |gc| {
+        let obj = gc.alloc_nursery_typed(type_id as u32, size as usize);
         obj.0 as u64
     })
 }
@@ -2099,7 +2105,6 @@ extern "C" fn gc_alloc_varsize_shim(
 ) -> u64 {
     with_registered_gc_roots(runtime_id, roots_ptr, num_roots, |gc| {
         let obj = gc.alloc_varsize(base_size as usize, item_size as usize, length as usize);
-        gc.write_barrier(obj);
         obj.0 as u64
     })
 }
@@ -2596,6 +2601,10 @@ fn resolve_constant_i64(
         ));
     }
     Ok(opref.0 as i64)
+}
+
+fn resolve_rewriter_immediate_i64(constants: &HashMap<u32, i64>, opref: OpRef) -> i64 {
+    constants.get(&opref.0).copied().unwrap_or(opref.0 as i64)
 }
 
 fn type_for_opref(
@@ -5216,8 +5225,10 @@ impl CraneliftBackend {
                 OpCode::CallMallocNursery => {
                     let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
-                    let size_total =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
+                    let size_total = builder.ins().iconst(
+                        cl_types::I64,
+                        resolve_rewriter_immediate_i64(&constants, op.arg(0)),
+                    );
                     let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
                     let result = emit_collecting_gc_call(
                         &mut builder,
@@ -5988,26 +5999,17 @@ impl CraneliftBackend {
                     let ad = descr
                         .as_array_descr()
                         .expect("zero_array descriptor must be an ArrayDescr");
-                    let scale_start = resolve_constant_i64(
-                        &constants,
-                        &known_values,
-                        op.opcode,
-                        op.arg(3),
-                        "ZERO_ARRAY start scale",
-                    )?;
-                    let scale_size = resolve_constant_i64(
-                        &constants,
-                        &known_values,
-                        op.opcode,
-                        op.arg(4),
-                        "ZERO_ARRAY size scale",
-                    )?;
-                    let base =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
-                    let start =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(1));
-                    let size =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(2));
+                    let scale_start = resolve_rewriter_immediate_i64(&constants, op.arg(3));
+                    let scale_size = resolve_rewriter_immediate_i64(&constants, op.arg(4));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let start = builder.ins().iconst(
+                        cl_types::I64,
+                        resolve_rewriter_immediate_i64(&constants, op.arg(1)),
+                    );
+                    let size = builder.ins().iconst(
+                        cl_types::I64,
+                        resolve_rewriter_immediate_i64(&constants, op.arg(2)),
+                    );
 
                     let start_bytes = match scale_start {
                         0 => builder.ins().iconst(cl_types::I64, 0),
@@ -6041,8 +6043,10 @@ impl CraneliftBackend {
                 // args[0] = base ptr, args[1] = byte offset
                 OpCode::NurseryPtrIncrement => {
                     let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let offset =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(1));
+                    let offset = builder.ins().iconst(
+                        cl_types::I64,
+                        resolve_rewriter_immediate_i64(&constants, op.arg(1)),
+                    );
                     let r = builder.ins().iadd(base, offset);
                     builder.def_var(var(vi), r);
                 }
@@ -6686,36 +6690,62 @@ impl CraneliftBackend {
                 // These are normally eliminated by the optimizer (virtualize pass)
                 // or rewritten by the GC rewriter. If they reach the backend,
                 // we call out to a runtime helper.
-                OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
-                    // Call jit_malloc_nursery(size) → returns ptr
-                    let size =
-                        if op.opcode == OpCode::NewArray || op.opcode == OpCode::NewArrayClear {
-                            // Array allocation: first arg is the length
-                            let len = resolve_opref(&mut builder, &constants, op.arg(0));
-                            // size = base_size + len * item_size
-                            // For simplicity, assume 8-byte items + 16-byte header
-                            let item_size = builder.ins().iconst(cl_types::I64, 8);
-                            let items_total = builder.ins().imul(len, item_size);
-                            builder.ins().iadd_imm(items_total, 16)
-                        } else {
-                            // Fixed-size object: use SizeDescr if available, else 16
-                            let alloc_size = op
-                                .descr
-                                .as_ref()
-                                .and_then(|d| d.as_size_descr())
-                                .map_or(16, |sd| sd.size() as i64);
-                            builder.ins().iconst(cl_types::I64, alloc_size)
-                        };
-
-                    let result = emit_host_call(
+                OpCode::New | OpCode::NewWithVtable => {
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    let (size, type_id) = op
+                        .descr
+                        .as_ref()
+                        .and_then(|d| d.as_size_descr())
+                        .map_or((16, 0), |sd| (sd.size() as i64, sd.type_id() as i64));
+                    let size = builder.ins().iconst(cl_types::I64, size);
+                    let type_id = builder.ins().iconst(cl_types::I64, type_id);
+                    let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        jit_malloc_nursery_shim as *const () as usize,
-                        &[size],
+                        roots_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        runtime_id,
+                        gc_alloc_typed_nursery_shim as *const () as usize,
+                        &[type_id, size],
                         Some(cl_types::I64),
                     )
-                    .expect("jit_malloc_nursery_shim must return a value");
+                    .expect("GC allocation helper must return a value");
+                    builder.def_var(var(vi), result);
+                }
+                OpCode::NewArray | OpCode::NewArrayClear => {
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    let length =
+                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
+                    let (base_size, item_size) = if let Some(ad) =
+                        op.descr.as_ref().and_then(|d| d.as_array_descr())
+                    {
+                        (
+                            builder.ins().iconst(cl_types::I64, ad.base_size() as i64),
+                            builder.ins().iconst(cl_types::I64, ad.item_size() as i64),
+                        )
+                    } else {
+                        (
+                            builder.ins().iconst(cl_types::I64, 16),
+                            builder.ins().iconst(cl_types::I64, 8),
+                        )
+                    };
+                    let result = emit_collecting_gc_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        roots_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        runtime_id,
+                        gc_alloc_varsize_shim as *const () as usize,
+                        &[base_size, item_size, length],
+                        Some(cl_types::I64),
+                    )
+                    .expect("GC varsize allocation helper must return a value");
                     builder.def_var(var(vi), result);
                 }
 
@@ -6836,35 +6866,45 @@ impl CraneliftBackend {
                 // Newunicode: allocate a unicode string of length args[0].
                 // Layout: 16-byte header + length * char_size bytes.
                 OpCode::Newstr => {
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let len = resolve_opref(&mut builder, &constants, op.arg(0));
-                    // Byte string: 1 byte per char + 16-byte header
-                    let size = builder.ins().iadd_imm(len, 16);
-                    let result = emit_host_call(
+                    let base_size = builder.ins().iconst(cl_types::I64, 16);
+                    let item_size = builder.ins().iconst(cl_types::I64, 1);
+                    let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        jit_malloc_nursery_shim as *const () as usize,
-                        &[size],
+                        roots_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        runtime_id,
+                        gc_alloc_varsize_shim as *const () as usize,
+                        &[base_size, item_size, len],
                         Some(cl_types::I64),
                     )
-                    .expect("jit_malloc_nursery_shim must return a value");
+                    .expect("GC varsize allocation helper must return a value");
                     builder.def_var(var(vi), result);
                 }
                 OpCode::Newunicode => {
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let len = resolve_opref(&mut builder, &constants, op.arg(0));
-                    // Unicode string: 4 bytes per char + 16-byte header
-                    let char_size = builder.ins().iconst(cl_types::I64, 4);
-                    let chars_total = builder.ins().imul(len, char_size);
-                    let size = builder.ins().iadd_imm(chars_total, 16);
-                    let result = emit_host_call(
+                    let base_size = builder.ins().iconst(cl_types::I64, 16);
+                    let item_size = builder.ins().iconst(cl_types::I64, 4);
+                    let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        jit_malloc_nursery_shim as *const () as usize,
-                        &[size],
+                        roots_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        runtime_id,
+                        gc_alloc_varsize_shim as *const () as usize,
+                        &[base_size, item_size, len],
                         Some(cl_types::I64),
                     )
-                    .expect("jit_malloc_nursery_shim must return a value");
+                    .expect("GC varsize allocation helper must return a value");
                     builder.def_var(var(vi), result);
                 }
                 // All OpCode variants are explicitly handled above.

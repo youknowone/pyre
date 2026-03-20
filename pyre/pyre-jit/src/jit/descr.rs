@@ -158,7 +158,11 @@ pub fn make_immutable_field_descr(
 #[derive(Debug)]
 pub struct PyreSizeDescr {
     obj_size: usize,
+    type_id: u32,
 }
+
+pub const W_INT_GC_TYPE_ID: u32 = 0;
+pub const W_FLOAT_GC_TYPE_ID: u32 = 1;
 
 impl Descr for PyreSizeDescr {
     fn index(&self) -> u32 {
@@ -176,7 +180,7 @@ impl SizeDescr for PyreSizeDescr {
     }
 
     fn type_id(&self) -> u32 {
-        0
+        self.type_id
     }
 
     fn is_immutable(&self) -> bool {
@@ -186,7 +190,14 @@ impl SizeDescr for PyreSizeDescr {
 
 /// Create a size descriptor for a fixed-size object.
 pub fn make_size_descr(obj_size: usize) -> DescrRef {
-    Arc::new(PyreSizeDescr { obj_size })
+    Arc::new(PyreSizeDescr {
+        obj_size,
+        type_id: 0,
+    })
+}
+
+pub fn make_size_descr_with_type(obj_size: usize, type_id: u32) -> DescrRef {
+    Arc::new(PyreSizeDescr { obj_size, type_id })
 }
 
 /// Create an array descriptor for a pointer-backed array field.
@@ -213,8 +224,10 @@ use pyre_object::rangeobject::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
 };
 use pyre_object::{
-    BOOL_BOOLVAL_OFFSET, DICT_LEN_OFFSET, INT_INTVAL_OFFSET, PYOBJECT_ARRAY_HEAP_CAP_OFFSET,
-    PYOBJECT_ARRAY_LEN_OFFSET, STR_LEN_OFFSET, W_ListObject, W_TupleObject,
+    BOOL_BOOLVAL_OFFSET, DICT_LEN_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET, FLOAT_ARRAY_LEN_OFFSET,
+    FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET,
+    INT_INTVAL_OFFSET, PYOBJECT_ARRAY_HEAP_CAP_OFFSET, PYOBJECT_ARRAY_LEN_OFFSET, STR_LEN_OFFSET,
+    W_ListObject, W_TupleObject,
 };
 use pyre_runtime::{PYNAMESPACE_VALUES_LEN_OFFSET, PYNAMESPACE_VALUES_OFFSET};
 
@@ -242,9 +255,67 @@ pub fn list_items_ptr_descr() -> DescrRef {
     )
 }
 
+pub fn list_strategy_descr() -> DescrRef {
+    make_field_descr(std::mem::offset_of!(W_ListObject, strategy), 1, Type::Int, false)
+}
+
 pub fn list_items_len_descr() -> DescrRef {
     make_field_descr(
         std::mem::offset_of!(W_ListObject, items) + PYOBJECT_ARRAY_LEN_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
+}
+
+pub fn list_int_items_ptr_descr() -> DescrRef {
+    make_field_descr(
+        std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_PTR_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
+}
+
+pub fn list_int_items_len_descr() -> DescrRef {
+    make_field_descr(
+        std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_LEN_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
+}
+
+pub fn list_int_items_heap_cap_descr() -> DescrRef {
+    make_field_descr(
+        std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_HEAP_CAP_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
+}
+
+pub fn list_float_items_ptr_descr() -> DescrRef {
+    make_field_descr(
+        std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_PTR_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
+}
+
+pub fn list_float_items_len_descr() -> DescrRef {
+    make_field_descr(
+        std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_LEN_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
+}
+
+pub fn list_float_items_heap_cap_descr() -> DescrRef {
+    make_field_descr(
+        std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_HEAP_CAP_OFFSET,
         8,
         Type::Int,
         false,
@@ -315,12 +386,12 @@ pub fn ob_type_descr() -> DescrRef {
 
 /// Size descriptor for W_IntObject allocation via `New`.
 pub fn w_int_size_descr() -> DescrRef {
-    make_size_descr(std::mem::size_of::<W_IntObject>())
+    make_size_descr_with_type(std::mem::size_of::<W_IntObject>(), W_INT_GC_TYPE_ID)
 }
 
 /// Size descriptor for W_FloatObject allocation via `New`.
 pub fn w_float_size_descr() -> DescrRef {
-    make_size_descr(std::mem::size_of::<W_FloatObject>())
+    make_size_descr_with_type(std::mem::size_of::<W_FloatObject>(), W_FLOAT_GC_TYPE_ID)
 }
 
 #[cfg(test)]

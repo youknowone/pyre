@@ -1453,6 +1453,11 @@ impl Optimization for OptRewrite {
             | OpCode::CallLoopinvariantN => {
                 // arg(0) is the function pointer — use as cache key
                 if let Some(func_val) = ctx.get_constant_int(op.arg(0)) {
+                    if let Some(&cached_result) = ctx.imported_loop_invariant_results.get(&func_val)
+                    {
+                        let cached_result = ctx.get_replacement(cached_result);
+                        self.loop_invariant_results.insert(func_val, cached_result);
+                    }
                     if let Some(&cached_result) = self.loop_invariant_results.get(&func_val) {
                         // Cache hit: reuse previous result
                         let cached_result = ctx.get_replacement(cached_result);
@@ -3522,5 +3527,21 @@ mod tests {
             result.iter().any(|o| o.opcode == OpCode::CallN),
             "COND_CALL_N(1, ...) should become CALL_N"
         );
+    }
+
+    #[test]
+    fn test_imported_loopinvariant_result_replays_into_rewrite() {
+        let mut op = Op::new(OpCode::CallLoopinvariantI, &[OpRef(0), OpRef(2)]);
+        op.pos = OpRef(3);
+
+        let mut ctx = OptContext::with_num_inputs(4, 3);
+        ctx.make_constant(OpRef(0), Value::Int(0x1234));
+        ctx.imported_loop_invariant_results
+            .insert(0x1234, OpRef(1));
+
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(3)), OpRef(1));
     }
 }

@@ -441,22 +441,22 @@ pub enum ExportedShortOp {
         opcode: OpCode,
         descr_idx: Option<u32>,
         args: Vec<ExportedShortArg>,
-        result_slot: usize,
+        result: ExportedShortResult,
     },
     HeapField {
         object_slot: usize,
         descr_idx: u32,
-        result_slot: usize,
+        result: ExportedShortResult,
     },
     HeapArrayItem {
         object_slot: usize,
         descr_idx: u32,
         index: i64,
-        result_slot: usize,
+        result: ExportedShortResult,
     },
     LoopInvariant {
         func_ptr: i64,
-        result_slot: usize,
+        result: ExportedShortResult,
     },
 }
 
@@ -464,6 +464,13 @@ pub enum ExportedShortOp {
 pub enum ExportedShortArg {
     Slot(usize),
     Const(Value),
+    Produced(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportedShortResult {
+    Slot(usize),
+    Temporary(usize),
 }
 
 impl ExportedState {
@@ -771,6 +778,7 @@ impl OptUnroll {
         // unroll.py:483-490: forward args, apply exported info
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
+            ctx.replace_op(*target, source);
             // unroll.py:487: info = exported_state.exported_infos.get(target, None)
             if let Some(info) = exported_state.exported_infos.get(target) {
                 self.apply_exported_info(source, info, ctx);
@@ -898,11 +906,19 @@ impl OptUnroll {
 
     fn collect_exported_short_ops(&self, label_args: &[OpRef], ctx: &OptContext) -> Vec<ExportedShortOp> {
         let short_boxes = crate::shortpreamble::ShortBoxes::with_label_args(label_args);
-        ctx.exported_short_boxes
-            .iter()
-            .filter_map(|entry| match entry.kind {
+        let mut produced_indices: HashMap<OpRef, usize> = HashMap::new();
+        let mut next_temp = 0usize;
+        let mut exported = Vec::new();
+        for entry in &ctx.exported_short_boxes {
+            let result = if let Some(slot) = short_boxes.lookup_label_arg(entry.op.pos) {
+                ExportedShortResult::Slot(slot)
+            } else {
+                let temp = next_temp;
+                next_temp += 1;
+                ExportedShortResult::Temporary(temp)
+            };
+            let exported_op = match entry.kind {
                 crate::shortpreamble::PreambleOpKind::Pure => {
-                    let result_slot = short_boxes.lookup_label_arg(entry.op.pos)?;
                     let args = entry
                         .op
                         .args
@@ -911,9 +927,18 @@ impl OptUnroll {
                             short_boxes
                                 .lookup_label_arg(arg)
                                 .map(ExportedShortArg::Slot)
+                                .or_else(|| {
+                                    produced_indices
+                                        .get(&arg)
+                                        .copied()
+                                        .map(ExportedShortArg::Produced)
+                                })
                                 .or_else(|| ctx.get_constant(arg).cloned().map(ExportedShortArg::Const))
                         })
-                        .collect::<Option<Vec<_>>>()?;
+                        .collect::<Option<Vec<_>>>();
+                    let Some(args) = args else {
+                        continue;
+                    };
                     let opcode = if entry.op.opcode.is_call() {
                         OpCode::call_pure_for_type(entry.op.result_type())
                     } else {
@@ -923,18 +948,19 @@ impl OptUnroll {
                         opcode,
                         descr_idx: entry.op.descr.as_ref().map(|d| d.index()),
                         args,
-                        result_slot,
+                        result,
                     })
                 }
                 crate::shortpreamble::PreambleOpKind::Heap { descr_idx } => {
-                    let object_slot = short_boxes.lookup_label_arg(entry.op.arg(0))?;
-                    let result_slot = short_boxes.lookup_label_arg(entry.op.pos)?;
+                    let Some(object_slot) = short_boxes.lookup_label_arg(entry.op.arg(0)) else {
+                        continue;
+                    };
                     match entry.op.opcode {
                         OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
                             Some(ExportedShortOp::HeapField {
                                 object_slot,
                                 descr_idx,
-                                result_slot,
+                                result,
                             })
                         }
                         OpCode::GetarrayitemGcI
@@ -945,23 +971,29 @@ impl OptUnroll {
                                 object_slot,
                                 descr_idx,
                                 index,
-                                result_slot,
+                                result,
                             })
                         }
                         _ => None,
                     }
                 }
                 crate::shortpreamble::PreambleOpKind::LoopInvariant => {
-                    let func_ptr = ctx.get_constant_int(entry.op.arg(0))?;
-                    let result_slot = short_boxes.lookup_label_arg(entry.op.pos)?;
+                    let Some(func_ptr) = ctx.get_constant_int(entry.op.arg(0)) else {
+                        continue;
+                    };
                     Some(ExportedShortOp::LoopInvariant {
                         func_ptr,
-                        result_slot,
+                        result,
                     })
                 }
                 _ => None,
-            })
-            .collect()
+            };
+            if let Some(exported_op) = exported_op {
+                produced_indices.insert(entry.op.pos, exported.len());
+                exported.push(exported_op);
+            }
+        }
+        exported
     }
 
     fn import_short_preamble_ops(
@@ -970,15 +1002,20 @@ impl OptUnroll {
         exported_state: &ExportedState,
         ctx: &mut OptContext,
     ) {
+        let mut produced_results = Vec::with_capacity(exported_state.exported_short_ops.len());
         for entry in &exported_state.exported_short_ops {
+            let mut resolve_result = |result: &ExportedShortResult| match result {
+                ExportedShortResult::Slot(slot) => label_args.get(*slot).copied(),
+                ExportedShortResult::Temporary(_) => Some(ctx.alloc_op_position()),
+            };
             match *entry {
                 ExportedShortOp::Pure {
                     opcode,
                     descr_idx,
                     ref args,
-                    result_slot,
+                    ref result,
                 } => {
-                    let Some(&result) = label_args.get(result_slot) else {
+                    let Some(result_opref) = resolve_result(result) else {
                         continue;
                     };
                     let args = args
@@ -990,6 +1027,10 @@ impl OptUnroll {
                             ExportedShortArg::Const(value) => {
                                 Some(crate::ImportedShortPureArg::Const(*value))
                             }
+                            ExportedShortArg::Produced(index) => produced_results
+                                .get(*index)
+                                .copied()
+                                .map(crate::ImportedShortPureArg::OpRef),
                         })
                         .collect::<Option<Vec<_>>>();
                     let Some(args) = args else {
@@ -999,45 +1040,49 @@ impl OptUnroll {
                         opcode,
                         descr_idx,
                         args,
-                        result,
+                        result: result_opref,
                     });
+                    produced_results.push(result_opref);
                 }
                 ExportedShortOp::HeapField {
                     object_slot,
                     descr_idx,
-                    result_slot,
+                    ref result,
                 } => {
                     let Some(&obj) = label_args.get(object_slot) else {
                         continue;
                     };
-                    let Some(&value) = label_args.get(result_slot) else {
+                    let Some(value) = resolve_result(result) else {
                         continue;
                     };
                     ctx.imported_short_fields.insert((obj, descr_idx), value);
+                    produced_results.push(value);
                 }
                 ExportedShortOp::HeapArrayItem {
                     object_slot,
                     descr_idx,
                     index,
-                    result_slot,
+                    ref result,
                 } => {
                     let Some(&obj) = label_args.get(object_slot) else {
                         continue;
                     };
-                    let Some(&value) = label_args.get(result_slot) else {
+                    let Some(value) = resolve_result(result) else {
                         continue;
                     };
                     ctx.imported_short_arrayitems
                         .insert((obj, descr_idx, index), value);
+                    produced_results.push(value);
                 }
                 ExportedShortOp::LoopInvariant {
                     func_ptr,
-                    result_slot,
+                    ref result,
                 } => {
-                    let Some(&value) = label_args.get(result_slot) else {
+                    let Some(value) = resolve_result(result) else {
                         continue;
                     };
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
+                    produced_results.push(value);
                 }
             }
         }
@@ -2049,7 +2094,7 @@ mod tests {
             vec![ExportedShortOp::HeapField {
                 object_slot: 0,
                 descr_idx: 55,
-                result_slot: 1,
+                result: ExportedShortResult::Slot(1),
             }]
         );
 
@@ -2119,7 +2164,7 @@ mod tests {
                 opcode: OpCode::IntAdd,
                 descr_idx: None,
                 args: vec![ExportedShortArg::Slot(0), ExportedShortArg::Const(Value::Int(7))],
-                result_slot: 1,
+                result: ExportedShortResult::Slot(1),
             }]
         );
 
@@ -2172,7 +2217,7 @@ mod tests {
                     ExportedShortArg::Const(Value::Int(0x1234)),
                     ExportedShortArg::Slot(0),
                 ],
-                result_slot: 1,
+                result: ExportedShortResult::Slot(1),
             }]
         );
 
@@ -2190,6 +2235,87 @@ mod tests {
                 ],
                 result: OpRef(1),
             }]
+        );
+    }
+
+    #[test]
+    fn test_exported_state_reimports_short_pure_dependency_chain() {
+        let mut ctx = crate::OptContext::with_num_inputs(10, 0);
+        ctx.make_constant(OpRef(10), Value::Int(7));
+        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
+                op.pos = OpRef(11);
+                op
+            },
+            kind: crate::shortpreamble::PreambleOpKind::Pure,
+            label_arg_idx: None,
+        });
+        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::IntMul, &[OpRef(11), OpRef(13)]);
+                op.pos = OpRef(14);
+                op
+            },
+            kind: crate::shortpreamble::PreambleOpKind::Pure,
+            label_arg_idx: Some(2),
+        });
+
+        let exported = export_state(&[OpRef(12), OpRef(13), OpRef(14)], &[], &ctx, None);
+        assert_eq!(
+            exported.exported_short_ops,
+            vec![
+                ExportedShortOp::Pure {
+                    opcode: OpCode::IntAdd,
+                    descr_idx: None,
+                    args: vec![
+                        ExportedShortArg::Slot(0),
+                        ExportedShortArg::Const(Value::Int(7)),
+                    ],
+                    result: ExportedShortResult::Temporary(0),
+                },
+                ExportedShortOp::Pure {
+                    opcode: OpCode::IntMul,
+                    descr_idx: None,
+                    args: vec![
+                        ExportedShortArg::Produced(0),
+                        ExportedShortArg::Slot(1),
+                    ],
+                    result: ExportedShortResult::Slot(2),
+                },
+            ]
+        );
+
+        let mut ctx2 = crate::OptContext::with_num_inputs(10, 3);
+        let label_args = import_state(&[OpRef(0), OpRef(1), OpRef(2)], &exported, &mut ctx2);
+        assert_eq!(label_args, vec![OpRef(0), OpRef(1), OpRef(2)]);
+        assert_eq!(ctx2.imported_short_pure_ops.len(), 2);
+        let temp_result = ctx2.imported_short_pure_ops[0].result;
+        assert_ne!(temp_result, OpRef(0));
+        assert_ne!(temp_result, OpRef(1));
+        assert_ne!(temp_result, OpRef(2));
+        assert_eq!(
+            ctx2.imported_short_pure_ops,
+            vec![
+                crate::ImportedShortPureOp {
+                    opcode: OpCode::IntAdd,
+                    descr_idx: None,
+                    args: vec![
+                        crate::ImportedShortPureArg::OpRef(OpRef(0)),
+                        crate::ImportedShortPureArg::Const(Value::Int(7)),
+                    ],
+                    result: temp_result,
+                },
+                crate::ImportedShortPureOp {
+                    opcode: OpCode::IntMul,
+                    descr_idx: None,
+                    args: vec![
+                        crate::ImportedShortPureArg::OpRef(temp_result),
+                        crate::ImportedShortPureArg::OpRef(OpRef(1)),
+                    ],
+                    result: OpRef(2),
+                },
+            ]
         );
     }
 }

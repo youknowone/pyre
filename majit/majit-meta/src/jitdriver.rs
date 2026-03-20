@@ -836,12 +836,10 @@ impl<S: JitState> JitDriver<S> {
             if let Some(ptr) = ptr {
                 self.meta.set_vable_ptr(ptr.cast_const());
             }
-            if !info.can_read_all_array_lengths_from_heap() {
-                let fallback_lengths = state
-                    .virtualizable_array_lengths(meta, &vable_name, info)
-                    .unwrap_or_default();
-                self.meta.set_vable_array_lengths(fallback_lengths);
-            }
+            let fallback_lengths = state
+                .virtualizable_array_lengths(meta, &vable_name, info)
+                .unwrap_or_default();
+            self.meta.set_vable_array_lengths(fallback_lengths);
         }
         true
     }
