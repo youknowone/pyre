@@ -431,8 +431,14 @@ pub enum ExportedPtrKind {
     Array,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ExportedShortOp {
+    Pure {
+        opcode: OpCode,
+        descr_idx: Option<u32>,
+        args: Vec<ExportedShortArg>,
+        result_slot: usize,
+    },
     HeapField {
         object_slot: usize,
         descr_idx: u32,
@@ -448,6 +454,12 @@ pub enum ExportedShortOp {
         func_ptr: i64,
         result_slot: usize,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportedShortArg {
+    Slot(usize),
+    Const(Value),
 }
 
 impl ExportedState {
@@ -680,7 +692,7 @@ impl OptUnroll {
 
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
         let label_args = exported_state.virtual_state.make_inputargs(targetargs, ctx);
-        self.import_short_preamble_heap_ops(&label_args, exported_state, ctx);
+        self.import_short_preamble_ops(&label_args, exported_state, ctx);
         label_args
     }
 
@@ -802,6 +814,31 @@ impl OptUnroll {
         ctx.exported_short_boxes
             .iter()
             .filter_map(|entry| match entry.kind {
+                crate::shortpreamble::PreambleOpKind::Pure => {
+                    let result_slot = short_boxes.lookup_label_arg(entry.op.pos)?;
+                    let args = entry
+                        .op
+                        .args
+                        .iter()
+                        .map(|&arg| {
+                            short_boxes
+                                .lookup_label_arg(arg)
+                                .map(ExportedShortArg::Slot)
+                                .or_else(|| ctx.get_constant(arg).cloned().map(ExportedShortArg::Const))
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    let opcode = if entry.op.opcode.is_call() {
+                        OpCode::call_pure_for_type(entry.op.result_type())
+                    } else {
+                        entry.op.opcode
+                    };
+                    Some(ExportedShortOp::Pure {
+                        opcode,
+                        descr_idx: entry.op.descr.as_ref().map(|d| d.index()),
+                        args,
+                        result_slot,
+                    })
+                }
                 crate::shortpreamble::PreambleOpKind::Heap { descr_idx } => {
                     let object_slot = short_boxes.lookup_label_arg(entry.op.arg(0))?;
                     let result_slot = short_boxes.lookup_label_arg(entry.op.pos)?;
@@ -840,7 +877,7 @@ impl OptUnroll {
             .collect()
     }
 
-    fn import_short_preamble_heap_ops(
+    fn import_short_preamble_ops(
         &self,
         label_args: &[OpRef],
         exported_state: &ExportedState,
@@ -848,6 +885,36 @@ impl OptUnroll {
     ) {
         for entry in &exported_state.exported_short_ops {
             match *entry {
+                ExportedShortOp::Pure {
+                    opcode,
+                    descr_idx,
+                    ref args,
+                    result_slot,
+                } => {
+                    let Some(&result) = label_args.get(result_slot) else {
+                        continue;
+                    };
+                    let args = args
+                        .iter()
+                        .map(|arg| match arg {
+                            ExportedShortArg::Slot(slot) => {
+                                label_args.get(*slot).copied().map(crate::ImportedShortPureArg::OpRef)
+                            }
+                            ExportedShortArg::Const(value) => {
+                                Some(crate::ImportedShortPureArg::Const(*value))
+                            }
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(args) = args else {
+                        continue;
+                    };
+                    ctx.imported_short_pure_ops.push(crate::ImportedShortPureOp {
+                        opcode,
+                        descr_idx,
+                        args,
+                        result,
+                    });
+                }
                 ExportedShortOp::HeapField {
                     object_slot,
                     descr_idx,
@@ -1912,7 +1979,7 @@ mod tests {
         ctx.make_constant(OpRef(10), Value::Int(0x1234));
         ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
             op: {
-                let mut op = Op::new(OpCode::CallLoopinvariantI, &[OpRef(10), OpRef(12)]);
+                let mut op = Op::new(OpCode::CallI, &[OpRef(10), OpRef(12)]);
                 op.pos = OpRef(11);
                 op
             },
@@ -1921,20 +1988,66 @@ mod tests {
         });
 
         let exported = export_state(&[OpRef(10), OpRef(11)], &[], &ctx, None);
+        // label_args may exclude constants, so result_slot depends on
+        // make_inputargs output — just check func_ptr is correct.
+        assert_eq!(exported.exported_short_ops.len(), 1);
+        match &exported.exported_short_ops[0] {
+            ExportedShortOp::LoopInvariant { func_ptr, .. } => {
+                assert_eq!(*func_ptr, 0x1234);
+            }
+            other => panic!("expected LoopInvariant, got {other:?}"),
+        }
+
+        let mut ctx2 = crate::OptContext::with_num_inputs(4, 2);
+        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
+        // OpRef(10) is constant → excluded from label_args by make_inputargs
+        assert_eq!(label_args, vec![OpRef(1)]);
+        // result_slot=0 in label_args=[OpRef(1)] → OpRef(1)
+        assert_eq!(
+            ctx2.imported_loop_invariant_results.get(&0x1234).copied(),
+            Some(OpRef(1))
+        );
+    }
+
+    #[test]
+    fn test_exported_state_reimports_short_pure_fact() {
+        let mut ctx = crate::OptContext::with_num_inputs(6, 0);
+        ctx.make_constant(OpRef(10), Value::Int(7));
+        ctx.exported_short_boxes.push(crate::shortpreamble::PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
+                op.pos = OpRef(11);
+                op
+            },
+            kind: crate::shortpreamble::PreambleOpKind::Pure,
+            label_arg_idx: Some(1),
+        });
+
+        let exported = export_state(&[OpRef(12), OpRef(11)], &[], &ctx, None);
         assert_eq!(
             exported.exported_short_ops,
-            vec![ExportedShortOp::LoopInvariant {
-                func_ptr: 0x1234,
+            vec![ExportedShortOp::Pure {
+                opcode: OpCode::IntAdd,
+                descr_idx: None,
+                args: vec![ExportedShortArg::Slot(0), ExportedShortArg::Const(Value::Int(7))],
                 result_slot: 1,
             }]
         );
 
-        let mut ctx2 = crate::OptContext::with_num_inputs(4, 2);
+        let mut ctx2 = crate::OptContext::with_num_inputs(6, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(0), OpRef(1)]);
         assert_eq!(
-            ctx2.imported_loop_invariant_results.get(&0x1234).copied(),
-            Some(OpRef(1))
+            ctx2.imported_short_pure_ops,
+            vec![crate::ImportedShortPureOp {
+                opcode: OpCode::IntAdd,
+                descr_idx: None,
+                args: vec![
+                    crate::ImportedShortPureArg::OpRef(OpRef(0)),
+                    crate::ImportedShortPureArg::Const(Value::Int(7)),
+                ],
+                result: OpRef(1),
+            }]
         );
     }
 }
