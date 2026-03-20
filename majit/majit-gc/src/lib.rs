@@ -14,6 +14,7 @@ pub mod header;
 pub mod nursery;
 pub mod oldgen;
 pub mod rewrite;
+pub mod shadow_stack;
 pub mod trace;
 
 /// GC flags stored in object headers.
@@ -62,6 +63,12 @@ pub trait GcAllocator: Send {
     /// Allocate a fixed-size object in the nursery.
     fn alloc_nursery(&mut self, size: usize) -> GcRef;
 
+    /// Allocate a fixed-size object with a known GC type id.
+    fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        let _ = type_id;
+        self.alloc_nursery(size)
+    }
+
     /// Allocate a fixed-size object without triggering collection.
     ///
     /// Implementations may fall back to old-gen allocation when the nursery
@@ -70,6 +77,18 @@ pub trait GcAllocator: Send {
 
     /// Allocate a variable-size object (array/string).
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef;
+
+    /// Allocate a variable-size object with a known GC type id.
+    fn alloc_varsize_typed(
+        &mut self,
+        type_id: u32,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> GcRef {
+        let _ = type_id;
+        self.alloc_varsize(base_size, item_size, length)
+    }
 
     /// Allocate a variable-size object without triggering collection.
     ///
