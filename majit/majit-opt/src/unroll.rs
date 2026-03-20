@@ -713,10 +713,14 @@ fn build_body_trace_with_virtual_import(
 }
 
 /// compile.py:310-338: combine preamble + Label + body into final trace.
+/// compile.py:310-338: combine preamble + Label + body.
+///
+/// Remap body ops so their inputarg references (0..body_num_inputs)
+/// point to the Label args (which are preamble JUMP args).
 fn combine_preamble_and_body(
     preamble: &[Op],
     body: &[Op],
-    preamble_num_inputs: usize,
+    _preamble_num_inputs: usize,
     body_num_inputs: usize,
 ) -> Vec<Op> {
     let mut result = Vec::with_capacity(preamble.len() + body.len() + 1);
@@ -729,16 +733,65 @@ fn combine_preamble_and_body(
         result.push(op.clone());
     }
 
-    // Label between preamble and body
-    // Label args = Jump args from preamble (the values entering the loop)
-    if let Some(jump) = preamble.iter().rfind(|op| op.opcode == OpCode::Jump) {
-        let mut label = Op::new(OpCode::Label, &jump.args);
-        label.pos = OpRef(result.len() as u32 + body_num_inputs as u32);
-        result.push(label);
+    let preamble_jump = preamble.iter().rfind(|op| op.opcode == OpCode::Jump);
+    let Some(jump) = preamble_jump else {
+        // No Jump in preamble — can't combine
+        result.extend_from_slice(body);
+        return result;
+    };
+
+    // Label args = preamble JUMP args
+    // These are the values flowing from preamble into the loop body.
+    let label_args = &jump.args;
+
+    // Emit Label
+    let label_pos = OpRef(result.len() as u32 + body_num_inputs as u32);
+    let mut label = Op::new(OpCode::Label, label_args);
+    label.pos = label_pos;
+    result.push(label);
+
+    // 2-pass remap of body ops:
+    // Pass 1: build complete remap table (inputargs + all op positions)
+    // Pass 2: apply remap to all args
+    let mut body_remap: HashMap<OpRef, OpRef> = HashMap::new();
+
+    // Inputarg remap: body OpRef(0..body_num_inputs) → label_args
+    for (i, &label_arg) in label_args.iter().enumerate() {
+        if i < body_num_inputs {
+            body_remap.insert(OpRef(i as u32), label_arg);
+        }
     }
 
-    // Body ops (Phase 2 result)
-    result.extend_from_slice(body);
+    // Op position remap: avoid collisions with preamble
+    let body_base = result.len() as u32 + body_num_inputs as u32 + 1;
+    for (idx, op) in body.iter().enumerate() {
+        if op.pos.0 != u32::MAX {
+            let new_pos = OpRef(body_base + idx as u32);
+            body_remap.insert(op.pos, new_pos);
+        }
+    }
+
+    // Pass 2: apply remap
+    for (idx, op) in body.iter().enumerate() {
+        let mut new_op = op.clone();
+        if new_op.pos.0 != u32::MAX {
+            new_op.pos = OpRef(body_base + idx as u32);
+        }
+        for arg in &mut new_op.args {
+            if let Some(&mapped) = body_remap.get(arg) {
+                *arg = mapped;
+            }
+        }
+        if let Some(ref mut fa) = new_op.fail_args {
+            for arg in fa.iter_mut() {
+                if let Some(&mapped) = body_remap.get(arg) {
+                    *arg = mapped;
+                }
+            }
+        }
+        // Remap descr fail_arg_types if present (for guard descriptors)
+        result.push(new_op);
+    }
 
     result
 }
