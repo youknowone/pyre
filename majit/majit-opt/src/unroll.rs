@@ -696,37 +696,40 @@ fn build_body_trace_with_virtual_import(
         }
     }
 
-    // For each virtual JUMP arg, add extra inputargs for field values
-    let mut extra_inputarg_count = 0;
+    let mut expanded_input_index = 0usize;
     let mut virtual_to_reconstructed: HashMap<usize, (OpRef, Vec<OpRef>)> = HashMap::new();
+    let mut inputarg_replacement: HashMap<OpRef, OpRef> = HashMap::new();
 
+    let mut jump_virtual_map = HashMap::new();
     for virt in jump_virtuals {
-        if virt.jump_arg_index >= jump_op.args.len() {
-            continue;
-        }
-        let mut field_inputargs = Vec::new();
-        for _ in &virt.fields {
-            let field_ref = OpRef((num_inputs + extra_inputarg_count) as u32);
-            field_inputargs.push(field_ref);
-            extra_inputarg_count += 1;
-        }
+        jump_virtual_map.insert(virt.jump_arg_index, virt);
+    }
 
-        // New op to reconstruct virtual
-        let new_ref = OpRef(next_pos);
-        next_pos += 1;
-
-        virtual_to_reconstructed.insert(
-            virt.jump_arg_index,
-            (new_ref, field_inputargs),
-        );
+    for arg_idx in 0..num_inputs {
+        if let Some(virt) = jump_virtual_map.get(&arg_idx) {
+            let mut field_inputargs = Vec::new();
+            for _ in &virt.fields {
+                let field_ref = OpRef(expanded_input_index as u32);
+                field_inputargs.push(field_ref);
+                expanded_input_index += 1;
+            }
+            virtual_to_reconstructed
+                .insert(arg_idx, (OpRef(next_pos), field_inputargs));
+            inputarg_replacement.insert(OpRef(arg_idx as u32), OpRef(next_pos));
+            next_pos += 1;
+        } else {
+            inputarg_replacement.insert(OpRef(arg_idx as u32), OpRef(expanded_input_index as u32));
+            expanded_input_index += 1;
+        }
     }
 
     if virtual_to_reconstructed.is_empty() {
         return None;
     }
 
+    let body_num_inputs = expanded_input_index;
     let mut result =
-        Vec::with_capacity(ops.len() + extra_inputarg_count * 2 + jump_virtuals.len());
+        Vec::with_capacity(ops.len() + jump_virtuals.len() * 4);
 
     // Emit New+SetfieldGc reconstruction at trace start (before original ops)
     for virt in jump_virtuals {
@@ -748,20 +751,6 @@ fn build_body_trace_with_virtual_import(
     }
 
     // Original ops with virtual refs replaced by reconstructed refs
-    // The original JUMP arg at virt.jump_arg_index is an inputarg (< num_inputs).
-    // In the body, any op that reads from this inputarg should read from
-    // the reconstructed virtual instead.
-    let mut inputarg_replacement: HashMap<OpRef, OpRef> = HashMap::new();
-    for virt in jump_virtuals {
-        if virt.jump_arg_index >= jump_op.args.len() {
-            continue;
-        }
-        let original_inputarg = OpRef(virt.jump_arg_index as u32);
-        if let Some((new_ref, _)) = virtual_to_reconstructed.get(&virt.jump_arg_index) {
-            inputarg_replacement.insert(original_inputarg, *new_ref);
-        }
-    }
-
     for (idx, op) in ops.iter().enumerate() {
         let mut new_op = op.clone();
         for arg in &mut new_op.args {
@@ -779,7 +768,7 @@ fn build_body_trace_with_virtual_import(
         result.push(new_op);
     }
 
-    Some((result, num_inputs + extra_inputarg_count))
+    Some((result, body_num_inputs))
 }
 
 /// compile.py:310-338: combine preamble + Label + body into final trace.
@@ -792,7 +781,7 @@ fn combine_preamble_and_body(
     preamble: &[Op],
     body: &[Op],
     _preamble_num_inputs: usize,
-    _body_num_inputs: usize,
+    body_num_inputs: usize,
     jump_virtuals: &[crate::optimizer::ExportedJumpVirtual],
 ) -> Vec<Op> {
     let mut result = Vec::with_capacity(preamble.len() + body.len() + 1);
@@ -811,23 +800,11 @@ fn combine_preamble_and_body(
         return result;
     };
 
+    let mut label_args = Vec::new();
     let mut virt_by_arg = HashMap::new();
     for virt in jump_virtuals {
         virt_by_arg.insert(virt.jump_arg_index, virt);
     }
-
-    let mut label_args = Vec::new();
-    let mut inputarg_map: HashMap<OpRef, OpRef> = HashMap::new();
-    let mut pending_reconstruction: Vec<(usize, &crate::optimizer::ExportedJumpVirtual, Vec<OpRef>)> =
-        Vec::new();
-
-    let mut next_pos = result
-        .iter()
-        .filter_map(|op| (op.pos.0 != u32::MAX).then_some(op.pos.0))
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-
     for (arg_idx, &arg) in jump.args.iter().enumerate() {
         if let Some(virt) = virt_by_arg.get(&arg_idx) {
             let mut field_vals = Vec::new();
@@ -844,45 +821,25 @@ fn combine_preamble_and_body(
                 label_args.push(field_val);
                 field_vals.push(field_val);
             }
-            pending_reconstruction.push((arg_idx, virt, field_vals));
         } else {
             label_args.push(arg);
-            inputarg_map.insert(OpRef(arg_idx as u32), arg);
         }
     }
 
-    let label_pos = OpRef(next_pos);
-    next_pos += 1;
+    let label_pos = OpRef(result.len() as u32 + body_num_inputs as u32);
     let mut label = Op::new(OpCode::Label, &label_args);
     label.pos = label_pos;
     result.push(label);
 
-    for (arg_idx, virt, field_vals) in pending_reconstruction {
-        let new_ref = OpRef(next_pos);
-        next_pos += 1;
-        inputarg_map.insert(OpRef(arg_idx as u32), new_ref);
-        let mut new_op = Op::new(OpCode::New, &[]);
-        new_op.pos = new_ref;
-        new_op.descr = Some(virt.size_descr.clone());
-        result.push(new_op);
-
-        for (i, (descr, _)) in virt.fields.iter().enumerate() {
-            let mut set_op = Op::new(OpCode::SetfieldGc, &[new_ref, field_vals[i]]);
-            set_op.pos = OpRef(next_pos);
-            next_pos += 1;
-            set_op.descr = Some(descr.clone());
-            result.push(set_op);
+    let mut body_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    for (i, &label_arg) in label_args.iter().enumerate() {
+        if i < body_num_inputs {
+            body_remap.insert(OpRef(i as u32), label_arg);
         }
     }
 
-    let mut body_remap: HashMap<OpRef, OpRef> = HashMap::new();
-
-    for (inputarg, mapped) in inputarg_map {
-        body_remap.insert(inputarg, mapped);
-    }
-
     let body_ops: Vec<&Op> = body.iter().filter(|op| op.opcode != OpCode::Label).collect();
-    let body_base = next_pos;
+    let body_base = result.len() as u32 + body_num_inputs as u32 + 1;
     for (idx, op) in body_ops.iter().enumerate() {
         if op.pos.0 != u32::MAX {
             let new_pos = OpRef(body_base + idx as u32);
