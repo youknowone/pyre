@@ -1371,7 +1371,7 @@ impl<M: Clone> MetaInterp<M> {
         // RPython compile.py compiles the root loop with the original trace
         // inputargs. Extra boxes introduced by peeling live at the loop
         // LABEL/JUMP boundary, not at the external entry point.
-        let inputargs = trace.inputargs.clone();
+        let mut inputargs = trace.inputargs.clone();
         let jump_arg_count = optimized_ops
             .iter()
             .rev()
@@ -1384,7 +1384,27 @@ impl<M: Clone> MetaInterp<M> {
             .find(|op| op.opcode == majit_ir::OpCode::Label)
             .map(|op| op.args.len())
             .unwrap_or(0);
-        if jump_arg_count != label_arg_count {
+        // When preamble peeling is not active, there's no Label op.
+        // In that case, inputargs serve as the loop entry contract.
+        // Extend Label or insert one to match Jump arity.
+        let mut optimized_ops = optimized_ops;
+        if label_arg_count == 0 && jump_arg_count > 0 {
+            // No Label — insert one at the beginning with Jump-matching args
+            let label_args: Vec<OpRef> = (0..jump_arg_count as u32).map(OpRef).collect();
+            let mut label_op = majit_ir::resoperation::Op::new(
+                majit_ir::OpCode::Label,
+                &label_args,
+            );
+            label_op.pos = OpRef::NONE;
+            optimized_ops.insert(0, label_op);
+            // Extend inputargs to match
+            while inputargs.len() < jump_arg_count {
+                inputargs.push(majit_ir::InputArg {
+                    tp: majit_ir::Type::Int,
+                    index: inputargs.len() as u32,
+                });
+            }
+        } else if label_arg_count != jump_arg_count {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] abort compile: optimized label/jump arity mismatch label={} jump={}",

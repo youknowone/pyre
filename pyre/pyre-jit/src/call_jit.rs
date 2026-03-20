@@ -461,12 +461,26 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         );
     }
 
-    // Fallback: full eval_with_jit (interpreter + JIT)
-    match crate::eval::eval_with_jit(frame) {
+    // RPython parity: assembler_call_helper falls back to blackhole
+    // interpreter, NOT the full tracing interpreter. Using eval_with_jit
+    // here causes re-entry into compiled code → same guard failure →
+    // sync_jit_state_to_frame with wrong state → wrong results.
+    // Use eval_frame_plain (pure interpreter, no JIT re-entry).
+    match pyre_interp::eval::eval_frame_plain(frame) {
         Ok(result) => {
-            let boxed = result as i64;
-            force_cache_store(FinishProtocol::Boxed, hash_idx, code_key, arg_key, boxed);
-            boxed
+            let value = match protocol {
+                FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => {
+                    unsafe { w_int_get_value(result) }
+                }
+                FinishProtocol::RawInt => result as i64,
+                FinishProtocol::Boxed => result as i64,
+            };
+            force_cache_store(protocol, hash_idx, code_key, arg_key, value);
+            // Return boxed for the caller's trace (CallMayForceR expects pointer)
+            match protocol {
+                FinishProtocol::RawInt => w_int_new(value) as i64,
+                FinishProtocol::Boxed => value,
+            }
         }
         Err(err) => panic!("jit force callee frame failed: {err}"),
     }
