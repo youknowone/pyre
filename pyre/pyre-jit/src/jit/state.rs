@@ -2403,7 +2403,8 @@ impl TraceFrameState {
                         is_self_recursive
                     );
                 }
-                if let Some(token_number) = driver.get_pending_token_number(callee_key)
+                if !is_self_recursive
+                    && let Some(token_number) = driver.get_pending_token_number(callee_key)
                 {
                     let callee_nlocals = {
                         let code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
@@ -2482,7 +2483,8 @@ impl TraceFrameState {
                             });
                         };
 
-                        if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs)
+                        if !is_self_recursive
+                            && let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs)
                         {
                             let callee_meta = driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
                                 panic!(
