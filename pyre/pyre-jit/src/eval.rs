@@ -75,6 +75,7 @@ thread_local! {
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
     static JIT_TRACING: Cell<bool> = Cell::new(false);
     static RECURSIVE_FORCE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
+    static BLACKHOLE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
 }
 
 #[inline]
@@ -106,6 +107,14 @@ impl Drop for RecursiveForceEntryGuard {
     }
 }
 
+pub(crate) struct BlackholeEntryGuard;
+
+impl Drop for BlackholeEntryGuard {
+    fn drop(&mut self) {
+        BLACKHOLE_ENTRY_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
 /// Bump the JIT call depth. Returns a guard that restores the
 /// depth when dropped.
 #[inline]
@@ -128,6 +137,17 @@ pub(crate) fn recursive_force_entry_bump() -> RecursiveForceEntryGuard {
 #[inline]
 pub(crate) fn in_recursive_force_entry() -> bool {
     RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.get() > 0)
+}
+
+#[inline]
+pub(crate) fn blackhole_entry_bump() -> BlackholeEntryGuard {
+    BLACKHOLE_ENTRY_DEPTH.with(|d| d.set(d.get() + 1));
+    BlackholeEntryGuard
+}
+
+#[inline]
+pub(crate) fn in_blackhole_entry() -> bool {
+    BLACKHOLE_ENTRY_DEPTH.with(|d| d.get() > 0)
 }
 
 /// Evaluate a Python frame with JIT compilation.
@@ -234,7 +254,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // (blackhole dispatch loop has no can_enter_jit / jit_merge_point).
     // pyre uses a thread-local flag until full structural isolation is
     // implemented.
-    if in_recursive_force_entry() {
+    if in_blackhole_entry() {
         return None;
     }
 
@@ -306,12 +326,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let counts = func_entry_counts();
     let count = counts.entry(green_key).or_insert(0);
     *count += 1;
-
+    let recursive_entry = in_recursive_force_entry();
+    let self_recursive_candidate = crate::call_jit::self_recursive_function_entry_candidate(frame);
     let boosted = if driver.is_function_boosted(green_key) {
         true
     } else if *count == 1
-        && in_recursive_force_entry()
-        && crate::call_jit::self_recursive_function_entry_candidate(frame)
+        && recursive_entry
+        && self_recursive_candidate
     {
         // PyPy converges recursive hot paths by boosting the callee toward a
         // separate function-entry trace once recursion becomes obvious.  We
@@ -379,20 +400,18 @@ fn handle_jit_outcome(
             };
             Some(Ok(value))
         }
-        DetailedDriverRunOutcome::Jump { .. }
-        | DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            // RPython parity: guard failure (including Jump=loop close
-            // with guard) → resume_in_blackhole(). The remaining
-            // execution runs in the blackhole with NO JIT re-entry.
+        DetailedDriverRunOutcome::Jump { .. } => {
+            // Jump = guard failure that restored frame state.
+            // Return None to let the caller's interpreter loop continue.
+            // in_blackhole_entry() prevents JIT re-entry from nested calls.
             sync_jit_state_to_frame(jit_state, frame, info);
-            if majit_meta::majit_log_enabled() {
-                eprintln!(
-                    "[jit][func-entry] guard-fail→blackhole arg0={:?} ni={} vsd={}",
-                    debug_first_arg_int(frame),
-                    frame.next_instr,
-                    frame.valuestackdepth
-                );
-            }
+            None
+        }
+        DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
+            // RPython parity: guard failure → resume_in_blackhole().
+            // The remaining execution runs in the blackhole with NO
+            // JIT re-entry.
+            sync_jit_state_to_frame(jit_state, frame, info);
             let result = crate::call_jit::resume_in_blackhole_pub(frame);
             Some(Ok(result))
         }

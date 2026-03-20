@@ -2273,6 +2273,17 @@ impl TraceFrameState {
                 if is_self_recursive
                     && crate::call_jit::recursive_force_cache_safe(concrete_callable)
                     && !inline_framestack_active
+                    // Direct self-recursive CallAssembler assumes the callee
+                    // reaches a final Finish result. Our current function-entry
+                    // traces for fib still produce Jump exits for base cases,
+                    // so taking the raw CallAssembler fast path here feeds a
+                    // non-final outcome back as if it were a finished int.
+                    //
+                    // Until root recursive trace-through / ChangeFrame is
+                    // complete, keep self-recursive calls on the existing
+                    // helper-boundary path, which can run the callee through
+                    // eval_with_jit() until a real return value is produced.
+                    && false
                 {
                     if let Some(token_number) = driver.get_loop_token_number(callee_key) {
                         let callee_meta =
@@ -2372,7 +2383,9 @@ impl TraceFrameState {
                     }
                 }
 
-                if let Some(token_number) = driver.get_pending_token_number(callee_key) {
+                if !is_self_recursive
+                    && let Some(token_number) = driver.get_pending_token_number(callee_key)
+                {
                     let callee_nlocals = {
                         let code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
                         (&*code_ptr).varnames.len()
@@ -2450,7 +2463,9 @@ impl TraceFrameState {
                             });
                         };
 
-                        if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
+                        if !is_self_recursive
+                            && let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs)
+                        {
                             let callee_meta = driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
                                 panic!(
                                     "compiled loop for callee_key={callee_key} is missing compiled meta"
@@ -2736,15 +2751,15 @@ impl TraceFrameState {
             if args.len() == 1 {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
                     let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
+                    let is_self_recursive = callee_key
+                        == unsafe {
+                            crate::eval::make_green_key(
+                                (*(this.concrete_frame as *const pyre_interp::frame::PyFrame))
+                                    .code,
+                                0,
+                            )
+                        };
                     if raw_finish_ready {
-                        let is_self_recursive = callee_key
-                            == unsafe {
-                                crate::eval::make_green_key(
-                                    (*(this.concrete_frame as *const pyre_interp::frame::PyFrame))
-                                        .code,
-                                    0,
-                                )
-                            };
                         let force_fn = if is_self_recursive
                             && crate::call_jit::recursive_force_cache_safe(concrete_callable)
                         {
@@ -2808,12 +2823,45 @@ impl TraceFrameState {
                         // lifetime of this trace. Before the callee has a raw
                         // int finish, use the boxed helper with a Ref result,
                         // matching RPython's call_assembler result kind.
+                        if majit_meta::majit_log_enabled() && is_self_recursive {
+                            eprintln!(
+                                "[jit][self-call-lower] raw_finish_ready={} cache_safe={} concrete_arg_is_int={}",
+                                raw_finish_ready,
+                                crate::call_jit::recursive_force_cache_safe(concrete_callable),
+                                matches!(concrete_arg0, Some(arg) if unsafe { pyre_object::pyobject::is_int(arg) }),
+                            );
+                        }
+                        let force_fn = if is_self_recursive
+                            && crate::call_jit::recursive_force_cache_safe(concrete_callable)
+                        {
+                            crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1
+                                as *const ()
+                        } else {
+                            crate::call_jit::jit_force_recursive_call_argraw_boxed_1 as *const ()
+                        };
                         this.sync_standard_virtualizable_before_residual_call(ctx);
-                        let result = ctx.call_may_force_ref_typed(
-                            crate::call_jit::jit_force_recursive_call_1 as *const (),
-                            &[this.frame(), callable, args[0]],
-                            &[Type::Ref, Type::Ref, Type::Ref],
-                        );
+                        let result = if force_fn
+                            == crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1
+                                as *const ()
+                        {
+                            if majit_meta::majit_log_enabled() && is_self_recursive {
+                                eprintln!("[jit][self-call-lower] using self argraw boxed helper");
+                            }
+                            ctx.call_may_force_ref_typed(
+                                force_fn,
+                                &[this.frame(), raw_arg],
+                                &[Type::Ref, Type::Int],
+                            )
+                        } else {
+                            if majit_meta::majit_log_enabled() && is_self_recursive {
+                                eprintln!("[jit][self-call-lower] using generic argraw boxed helper");
+                            }
+                            ctx.call_may_force_ref_typed(
+                                force_fn,
+                                &[this.frame(), callable, raw_arg],
+                                &[Type::Ref, Type::Ref, Type::Int],
+                            )
+                        };
                         if !this.sync_standard_virtualizable_after_residual_call() {
                             this.push_call_replay_stack(ctx, callable, args, call_pc);
                             this.record_guard(ctx, OpCode::GuardNotForced, &[]);
@@ -3837,6 +3885,22 @@ impl JitState for PyreJitState {
             return;
         };
         self.frame = value_to_usize(frame);
+        if majit_meta::majit_log_enabled() {
+            let arg0 = self.local_at(0).and_then(|value| {
+                if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
+                    return None;
+                }
+                Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
+            });
+            eprintln!(
+                "[jit][restore_values] before arg0={:?} meta.pc={} meta.vsd={} has_vable={} values={:?}",
+                arg0,
+                meta.merge_pc,
+                meta.valuestackdepth,
+                meta.has_virtualizable,
+                values
+            );
+        }
         if values.len() == 1 {
             let _ = self.refresh_from_frame();
             return;
@@ -3875,6 +3939,20 @@ impl JitState for PyreJitState {
             self.valuestackdepth = meta.valuestackdepth;
         }
         let _ = self.sync_scalar_fields_to_frame();
+        if majit_meta::majit_log_enabled() {
+            let arg0 = self.local_at(0).and_then(|value| {
+                if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
+                    return None;
+                }
+                Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
+            });
+            eprintln!(
+                "[jit][restore_values] after arg0={:?} ni={} vsd={}",
+                arg0,
+                self.next_instr,
+                self.valuestackdepth
+            );
+        }
     }
 
     fn reconstructed_frame_value_types(

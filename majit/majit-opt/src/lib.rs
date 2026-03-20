@@ -63,6 +63,12 @@ pub struct ImportedShortPureOp {
     pub result: OpRef,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportedShortAlias {
+    pub result: OpRef,
+    pub same_as_source: OpRef,
+}
+
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.
@@ -107,6 +113,10 @@ pub struct OptContext {
     /// RPython shortpreamble.py / pure.py: imported pure-operation results from
     /// the preamble. Phase 2 uses these as cross-iteration CSE facts.
     pub imported_short_pure_ops: Vec<ImportedShortPureOp>,
+    /// RPython shortpreamble.py: invented SameAs names preserved from exported
+    /// short boxes. Phase 2 can later re-materialize these aliases when
+    /// building the short preamble for bridges.
+    pub imported_short_aliases: Vec<ImportedShortAlias>,
     /// RPython shortpreamble.py / rewrite.py: imported CALL_LOOPINVARIANT
     /// results keyed by constant function pointer.
     pub imported_loop_invariant_results: HashMap<i64, OpRef>,
@@ -138,6 +148,7 @@ impl OptContext {
             imported_short_fields: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
+            imported_short_aliases: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
@@ -160,6 +171,7 @@ impl OptContext {
             imported_short_fields: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
+            imported_short_aliases: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
