@@ -139,16 +139,10 @@ impl UnrollOptimizer {
     /// the body JUMP goes back to the preamble for the next iteration.
     /// This ensures the preamble guard provides loop exit.
     ///
-    /// Returns modified body ops with JUMP targeting preamble inputargs.
-    pub fn jump_to_preamble(body_ops: &[Op], preamble_num_inputs: usize) -> Vec<Op> {
-        let mut result = body_ops.to_vec();
-        if let Some(jump) = result.iter_mut().rfind(|op| op.opcode == OpCode::Jump) {
-            // Truncate JUMP args to preamble's inputarg count.
-            // The preamble expects [pool, selected, ...] — fewer args than
-            // the body's flattened [pool, selected, field1, field2, ...].
-            jump.args.truncate(preamble_num_inputs);
-        }
-        result
+    /// Returns modified body ops with JUMP retargeted to the preamble.
+    /// RPython keeps the arglist intact and only changes the jump target.
+    pub fn jump_to_preamble(body_ops: &[Op], _preamble_num_inputs: usize) -> Vec<Op> {
+        body_ops.to_vec()
     }
 
     /// unroll.py: check_retrace_count(retrace_count, max_retrace_guards)
@@ -308,7 +302,6 @@ impl UnrollOptimizer {
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
         // Build the virtual state at end of Phase 2 body.
         let p2_exported = opt_p2.exported_loop_state.clone();
-        let rewritten_jump_args = p2_exported.as_ref().map(|s| s.end_args.clone());
         let imported_short_aliases = opt_p2.imported_short_aliases.clone();
         let imported_short_sources = opt_p2.imported_short_sources.clone();
 
@@ -371,6 +364,11 @@ impl UnrollOptimizer {
                     &exported_state.exported_short_boxes,
                 )
             });
+        let rewritten_jump_args = p2_exported.as_ref().map(|s| {
+            let mut args = s.end_args.clone();
+            args.extend(sp.used_boxes.iter().copied());
+            args
+        });
         let opt_unroll = OptUnroll::new();
         let target_token = opt_unroll.finalize_short_preamble(
             exported_state.virtual_state.clone(),
@@ -378,7 +376,7 @@ impl UnrollOptimizer {
         );
         self.target_tokens.push(target_token);
         if !sp.is_empty() {
-            self.short_preamble = Some(sp);
+            self.short_preamble = Some(sp.clone());
         }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -409,7 +407,7 @@ impl UnrollOptimizer {
             // unroll.py:170-171: jump_to_preamble — body JUMP → preamble Label
             body_ops = Self::jump_to_preamble(&body_ops, num_inputs);
             if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[jit] jump_to_preamble: body JUMP truncated to {} args", num_inputs);
+                eprintln!("[jit] jump_to_preamble: body JUMP preserved");
             }
         } else if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("[jit] jump_to_existing_trace: body JUMP → self-loop");
@@ -420,6 +418,7 @@ impl UnrollOptimizer {
             &p1_ops,
             &body_ops,
             &exported_label_args,
+            &sp.used_boxes,
             rewritten_jump_args.as_deref(),
             p2_ni,
             &imported_short_aliases,
@@ -834,16 +833,21 @@ impl OptUnroll {
             }
 
             // unroll.py:346-347: make_inputargs_and_virtuals
-            let (target_args, _virtuals) =
+            let (target_args, virtuals) =
                 target_vs.make_inputargs_and_virtuals(&args, ctx);
+            let mut short_jump_args = target_args.clone();
+            short_jump_args.extend(virtuals);
 
             // unroll.py:353-356: inline short preamble
+            let mut extra = Vec::new();
             if let Some(sp) = &target_token.short_preamble {
-                let _remapped = Self::inline_short_preamble(&target_args, sp, ctx);
+                extra = Self::inline_short_preamble(&short_jump_args, &target_args, sp, ctx);
             }
 
             // unroll.py:357-359: emit JUMP to target
-            let jump = Op::new(OpCode::Jump, &target_args);
+            let mut jump_args = target_args;
+            jump_args.extend(extra);
+            let jump = Op::new(OpCode::Jump, &jump_args);
             ctx.emit(jump);
             return None; // successfully jumped
         }
@@ -858,13 +862,18 @@ impl OptUnroll {
     /// each short preamble op with remapped arguments.
     pub fn inline_short_preamble(
         jump_args: &[OpRef],
+        _args_no_virtuals: &[OpRef],
         short_preamble: &crate::shortpreamble::ShortPreamble,
         ctx: &mut OptContext,
     ) -> Vec<OpRef> {
         let mut mapping: HashMap<OpRef, OpRef> = HashMap::new();
 
-        // Map short preamble input args to jump args
-        // (short_preamble.ops[i].arg_mapping tells us which args to remap)
+        for (i, &short_inputarg) in short_preamble.inputargs.iter().enumerate() {
+            if let Some(&jump_arg) = jump_args.get(i) {
+                mapping.insert(short_inputarg, jump_arg);
+            }
+        }
+
         for sp_op in &short_preamble.ops {
             let mut new_op = sp_op.op.clone();
             // Remap args from arg_mapping (label idx → jump arg)
@@ -883,10 +892,10 @@ impl OptUnroll {
             mapping.insert(sp_op.op.pos, new_ref);
         }
 
-        // Return remapped jump args
-        jump_args
+        short_preamble
+            .used_boxes
             .iter()
-            .map(|&a| *mapping.get(&a).unwrap_or(&a))
+            .map(|&used_box| *mapping.get(&used_box).unwrap_or(&used_box))
             .collect()
     }
 
@@ -921,12 +930,12 @@ impl OptUnroll {
         let (label_args, virtuals) = exported_state
             .virtual_state
             .make_inputargs_and_virtuals(targetargs, ctx);
-        ctx.initialize_imported_short_preamble_builder(
-            &label_args,
-            &exported_state.exported_short_boxes,
-        );
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
+        ctx.initialize_imported_short_preamble_builder(
+            &short_args,
+            &exported_state.exported_short_boxes,
+        );
         self.import_short_preamble_ops(&short_args, exported_state, ctx);
         label_args
     }
@@ -1554,6 +1563,7 @@ fn assemble_peeled_trace(
     p1_ops: &[Op],
     p2_ops: &[Op],
     label_args: &[OpRef],
+    extra_label_args: &[OpRef],
     rewritten_jump_args: Option<&[OpRef]>,
     body_num_inputs: usize,
     imported_short_aliases: &[crate::ImportedShortAlias],
@@ -1593,7 +1603,15 @@ fn assemble_peeled_trace(
 
     // Label position
     let label_pos = (max_pos + 1).max(body_num_inputs as u32);
-    let mut label_op = Op::new(OpCode::Label, label_args);
+    let mut full_label_args = label_args.to_vec();
+    full_label_args.extend(extra_label_args.iter().map(|arg| {
+        remap
+            .get(arg)
+            .copied()
+            .or_else(|| imported_short_sources.get(arg).copied())
+            .unwrap_or(*arg)
+    }));
+    let mut label_op = Op::new(OpCode::Label, &full_label_args);
     label_op.pos = OpRef(label_pos);
     result.push(label_op);
 
@@ -1911,6 +1929,22 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_jump_to_preamble_preserves_jump_args() {
+        let body_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                op.pos = OpRef(2);
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(2), OpRef(50)]),
+        ];
+
+        let result = UnrollOptimizer::jump_to_preamble(&body_ops, 1);
+        assert_eq!(result[1].opcode, OpCode::Jump);
+        assert_eq!(result[1].args.as_slice(), &[OpRef(0), OpRef(2), OpRef(50)]);
     }
 
     #[test]
@@ -2921,6 +2955,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
+            &[],
             None,
             1,
             &[crate::ImportedShortAlias {
@@ -2942,6 +2977,75 @@ mod tests {
         assert_eq!(combined[3].args[0], combined[1].pos);
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(combined[4].args[0], combined[1].pos);
+    }
+
+    #[test]
+    fn test_inline_short_preamble_returns_extra_used_boxes() {
+        let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        op.pos = OpRef(7);
+        let sp = crate::shortpreamble::ShortPreamble {
+            ops: vec![crate::shortpreamble::ShortPreambleOp {
+                op,
+                arg_mapping: vec![(0, 0), (1, 1)],
+                fail_arg_mapping: Vec::new(),
+            }],
+            inputargs: vec![OpRef(0), OpRef(1)],
+            used_boxes: vec![OpRef(7)],
+            exported_state: None,
+        };
+
+        let mut ctx = crate::OptContext::with_num_inputs(8, 2);
+        let extra = OptUnroll::inline_short_preamble(
+            &[OpRef(10), OpRef(11)],
+            &[OpRef(10), OpRef(11)],
+            &sp,
+            &mut ctx,
+        );
+
+        assert_eq!(ctx.new_operations.len(), 1);
+        assert_eq!(ctx.new_operations[0].opcode, OpCode::IntAdd);
+        assert_eq!(ctx.new_operations[0].args.as_slice(), &[OpRef(10), OpRef(11)]);
+        assert_eq!(extra, vec![ctx.new_operations[0].pos]);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_extends_label_with_used_boxes() {
+        let p1_ops = vec![{
+            let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+            op.pos = OpRef(3);
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntMul, &[OpRef(50), OpRef(0)]);
+                op.pos = OpRef(1);
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(50)]),
+        ];
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef(10)],
+            &[OpRef(50)],
+            None,
+            1,
+            &[crate::ImportedShortAlias {
+                result: OpRef(50),
+                same_as_source: OpRef(10),
+                same_as_opcode: OpCode::SameAsI,
+            }],
+            &[crate::ImportedShortSource {
+                result: OpRef(50),
+                source: OpRef(10),
+            }],
+        );
+
+        assert_eq!(combined[2].opcode, OpCode::Label);
+        assert_eq!(combined[2].args.as_slice(), &[OpRef(10), combined[1].pos]);
+        assert_eq!(combined[4].opcode, OpCode::Jump);
+        assert_eq!(combined[4].args.as_slice(), &[OpRef(10), combined[1].pos]);
     }
 
     #[test]

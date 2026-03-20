@@ -759,6 +759,17 @@ impl OptVirtualize {
             return OptimizationResult::PassOn;
         }
 
+        // If the value being stored is virtual and the struct is NOT virtual,
+        // force the value first. RPython handles this implicitly via Box
+        // forwarding; majit needs explicit force since OpRefs are copy-based.
+        if !Self::is_virtual(struct_ref, ctx) && Self::is_virtual(value_ref, ctx) {
+            let forced = self.force_virtual(value_ref, ctx);
+            let forced_ref = ctx.get_replacement(forced);
+            let mut new_op = op.clone();
+            new_op.args = vec![struct_ref, forced_ref].into();
+            return OptimizationResult::Replace(new_op);
+        }
+
         if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
             if info.is_virtual() {
                 match info {
