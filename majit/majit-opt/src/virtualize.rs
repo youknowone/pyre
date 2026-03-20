@@ -299,6 +299,35 @@ impl OptVirtualize {
     /// before forcing, so the peeled loop body can reconstruct it.
     /// RPython unroll.py: force_box_for_end_of_preamble — record virtual
     /// structure before forcing, for preamble peeling phase 2.
+    fn imported_head_load_descr_index(&self, opref: OpRef, ctx: &OptContext) -> Option<u32> {
+        // Phase 2: the virtual's OpRef matches a GetfieldGcR that was emitted
+        // (imported virtual head forwarded from the pool load).
+        if let Some(idx) = ctx.new_operations
+            .iter()
+            .find(|op| {
+                op.pos == opref && (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR)
+            })
+            .and_then(|op| op.descr.as_ref())
+            .map(|d| d.index())
+        {
+            return Some(idx);
+        }
+        // Phase 1 fallback: the virtual was created by New(), not loaded from
+        // pool. Search new_operations for GetfieldGcR from the pool inputarg
+        // (OpRef(0)) — these are the head loads emitted earlier in the trace.
+        // RPython unroll.py: force_box_for_end_of_preamble records the virtual
+        // state; Phase 2 import_state intercepts the matching pool load.
+        ctx.new_operations
+            .iter()
+            .find(|op| {
+                (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR)
+                    && !op.args.is_empty()
+                    && op.arg(0) == OpRef(0)
+            })
+            .and_then(|op| op.descr.as_ref())
+            .map(|d| d.index())
+    }
+
     fn export_virtual_for_preamble(
         &self,
         opref: OpRef,
@@ -312,6 +341,10 @@ impl OptVirtualize {
         };
         match info {
             PtrInfo::VirtualStruct(ref vinfo) => {
+                let Some(head_load_descr_index) = self.imported_head_load_descr_index(resolved, ctx)
+                else {
+                    return;
+                };
                 let fields: Vec<(majit_ir::DescrRef, i64)> = vinfo
                     .fields
                     .iter()
@@ -328,21 +361,19 @@ impl OptVirtualize {
                         (descr, val)
                     })
                     .collect();
-                // Find the GetfieldGcR descr that loaded this head from pool
-                let head_load_descr_index = ctx.new_operations.iter()
-                    .find(|op| op.pos == resolved
-                        && (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR))
-                    .and_then(|op| op.descr.as_ref())
-                    .map(|d| d.index());
                 ctx.exported_jump_virtuals
                     .push(crate::optimizer::ExportedJumpVirtual {
                         jump_arg_index,
                         size_descr: vinfo.descr.clone(),
-                        head_load_descr_index,
+                        head_load_descr_index: Some(head_load_descr_index),
                         fields,
                     });
             }
             PtrInfo::Virtual(ref vinfo) => {
+                let Some(head_load_descr_index) = self.imported_head_load_descr_index(resolved, ctx)
+                else {
+                    return;
+                };
                 let fields: Vec<(majit_ir::DescrRef, i64)> = vinfo
                     .fields
                     .iter()
@@ -359,16 +390,11 @@ impl OptVirtualize {
                         (descr, val)
                     })
                     .collect();
-                let head_load_descr_index = ctx.new_operations.iter()
-                    .find(|op| op.pos == resolved
-                        && (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR))
-                    .and_then(|op| op.descr.as_ref())
-                    .map(|d| d.index());
                 ctx.exported_jump_virtuals
                     .push(crate::optimizer::ExportedJumpVirtual {
                         jump_arg_index,
                         size_descr: vinfo.descr.clone(),
-                        head_load_descr_index,
+                        head_load_descr_index: Some(head_load_descr_index),
                         fields,
                     });
             }
@@ -1771,17 +1797,17 @@ impl Optimization for OptVirtualize {
                     }
                     if Self::is_virtual(resolved, ctx) {
                         if self.flatten_virtuals_at_jump {
-                            // Phase 2: flatten virtual fields into JUMP args
+                            // Phase 2: flatten virtual fields into JUMP args.
                             let flattened = self.flatten_virtual_fields(resolved, ctx);
                             if !flattened.is_empty() {
-                                *arg = resolved; // placeholder, will be replaced
+                                *arg = resolved;
                                 extra_flattened.push((arg_idx, flattened));
                             } else {
-                                self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                                 let forced = self.force_virtual(resolved, ctx);
                                 *arg = ctx.get_replacement(forced);
                             }
                         } else {
+                            // Phase 1: export then force.
                             self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                             let forced = self.force_virtual(resolved, ctx);
                             *arg = ctx.get_replacement(forced);
@@ -1790,13 +1816,14 @@ impl Optimization for OptVirtualize {
                         *arg = resolved;
                     }
                 }
+                // TODO: RPython _jump_to_existing_trace emits compatibility guards
+                // here. Requires bridge compilation for proper fail_args.
+
                 // Apply flattening: replace virtual arg with field values
                 for (idx, fields) in extra_flattened.into_iter().rev() {
-                    // Replace the virtual arg position with first field
                     if let Some(first) = fields.first() {
                         jump_op.args[idx] = *first;
                     }
-                    // Insert remaining fields after this position
                     for (i, &field) in fields.iter().skip(1).enumerate() {
                         jump_op.args.insert(idx + 1 + i, field);
                     }
@@ -1813,6 +1840,8 @@ impl Optimization for OptVirtualize {
                     let resolved = ctx.get_replacement(*arg);
                     if Self::is_virtual(resolved, ctx) {
                         if self.flatten_virtuals_at_jump {
+                            // Phase 2: unconditionally flatten virtual fields into JUMP args.
+                            // RPython _jump_to_existing_trace: virtual state must match.
                             let flattened = self.flatten_virtual_fields(resolved, ctx);
                             if !flattened.is_empty() {
                                 *arg = resolved;
@@ -1820,10 +1849,16 @@ impl Optimization for OptVirtualize {
                                 continue;
                             }
                         }
+                        // Phase 1: export virtual structure for preamble peeling.
                         self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                     }
                 }
                 if !extra_flattened.is_empty() {
+                    // TODO: RPython _jump_to_existing_trace emits compatibility
+                    // guards here, but they require bridge compilation for proper
+                    // fail_args (the virtual must be materialized on guard failure).
+                    // Without bridge compilation, the body's original guards
+                    // (e.g., GuardTrue for branch_zero) provide the loop exit.
                     for (idx, fields) in extra_flattened.into_iter().rev() {
                         if let Some(first) = fields.first() {
                             jump_op.args[idx] = *first;
