@@ -285,6 +285,49 @@ impl OptVirtualize {
         opref
     }
 
+    /// RPython unroll.py: force_box_for_end_of_preamble — record virtual structure
+    /// before forcing, so the peeled loop body can reconstruct it.
+    fn export_virtual_for_preamble(
+        &self,
+        opref: OpRef,
+        jump_arg_index: usize,
+        ctx: &mut OptContext,
+    ) {
+        let resolved = ctx.get_replacement(opref);
+        let info = match ctx.get_ptr_info(resolved) {
+            Some(info) if info.is_virtual() => info.clone(),
+            _ => return,
+        };
+
+        match info {
+            PtrInfo::VirtualStruct(ref vinfo) => {
+                let fields: Vec<(majit_ir::DescrRef, i64)> = vinfo
+                    .fields
+                    .iter()
+                    .map(|(field_idx, value_ref)| {
+                        let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
+                            .unwrap_or_else(|| make_field_index_descr(*field_idx));
+                        let concrete = ctx
+                            .get_constant(*value_ref)
+                            .map(|v| match v {
+                                majit_ir::Value::Int(i) => *i,
+                                _ => 0,
+                            })
+                            .unwrap_or(0);
+                        (descr, concrete)
+                    })
+                    .collect();
+                ctx.exported_jump_virtuals
+                    .push(crate::optimizer::ExportedJumpVirtual {
+                        jump_arg_index,
+                        size_descr: vinfo.descr.clone(),
+                        fields,
+                    });
+            }
+            _ => {} // Only VirtualStruct for now (StackNode)
+        }
+    }
+
     fn force_virtual_instance(
         &mut self,
         opref: OpRef,
@@ -1619,7 +1662,7 @@ impl Optimization for OptVirtualize {
                 let frame_ref = ctx.get_replacement(OpRef(0));
                 // Force all virtual args EXCEPT the virtualizable frame
                 let mut jump_op = op.clone();
-                for arg in &mut jump_op.args {
+                for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
                     let resolved = ctx.get_replacement(*arg);
                     if resolved == frame_ref {
                         if matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_))) {
@@ -1628,10 +1671,10 @@ impl Optimization for OptVirtualize {
                         }
                     }
                     if Self::is_virtual(resolved, ctx) {
-                        // TODO: extract_virtual_int_field works correctly but
-                        // causes SIGSEGV because JUMP carries raw Int while
-                        // Label expects boxed Ref. Enabling this requires
-                        // preamble/Label type coordination (peel loop).
+                        // RPython unroll.py: record virtual structure for preamble peeling.
+                        // force_box_for_end_of_preamble exports the virtual's fields
+                        // so the peeled loop body can reconstruct it.
+                        self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                         let forced = self.force_virtual(resolved, ctx);
                         *arg = ctx.get_replacement(forced);
                     } else {
@@ -3275,6 +3318,73 @@ mod tests {
             0,
             "GETFIELD after force should be forwarded via heap cache; got ops: {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_finish_forces_virtual_refs_to_emitted_allocations() {
+        let node_sd = size_descr(1);
+        let value_fd = field_descr(10);
+        let next_fd = ref_field_descr(11);
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], node_sd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(2), OpRef(100)], value_fd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(2), OpRef(0)], next_fd.clone()),
+            Op::with_descr(OpCode::New, &[], node_sd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(5), OpRef(101)], value_fd.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(5), OpRef(2)], next_fd.clone()),
+            Op::new(OpCode::Finish, &[OpRef(5), OpRef(2), OpRef(1), OpRef(0)]),
+        ];
+        for (idx, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef((idx + 2) as u32);
+        }
+
+        let mut opt = Optimizer::default_pipeline();
+        let mut constants = HashMap::new();
+        constants.insert(100, 7);
+        constants.insert(101, 11);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        let new_positions: std::collections::HashSet<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::New)
+            .map(|op| op.pos)
+            .collect();
+        assert_eq!(new_positions.len(), 2, "expected two forced allocations; got {result:?}");
+
+        for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
+            assert!(
+                new_positions.contains(&set_op.arg(0)),
+                "SetfieldGc target must be one of the emitted News; got {:?} in {:?}",
+                set_op.arg(0),
+                result
+            );
+        }
+
+        let finish = result
+            .iter()
+            .find(|op| op.opcode == OpCode::Finish)
+            .expect("optimized trace should keep Finish");
+        assert!(
+            new_positions.contains(&finish.arg(0)),
+            "first Finish ref should be a forced allocation; got {:?} in {:?}",
+            finish.arg(0),
+            result
+        );
+        assert!(
+            new_positions.contains(&finish.arg(1)),
+            "second Finish ref should be a forced allocation; got {:?} in {:?}",
+            finish.arg(1),
+            result
+        );
+        assert!(
+            !constants.contains_key(&finish.arg(0).0),
+            "forced allocation ref must not collide with an exported int constant"
+        );
+        assert!(
+            !constants.contains_key(&finish.arg(1).0),
+            "forced allocation ref must not collide with an exported int constant"
         );
     }
 

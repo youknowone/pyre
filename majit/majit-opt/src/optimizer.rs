@@ -46,11 +46,28 @@ pub struct Optimizer {
     /// In RPython this is `resume.ResumeDataLoopMemo`; here we use a simple
     /// HashMap since the full type lives in majit-meta (no circular dep).
     resumedata_memo_consts: std::collections::HashMap<i64, u32>,
+    /// RPython parity: virtual structures discovered at JUMP (end of preamble).
+    /// Each entry: (jump_arg_index, VirtualFieldInfo { descr, fields: [(field_descr, opref)] })
+    /// Used by the 2-pass preamble peeling to reconstruct virtuals in the body.
+    pub exported_jump_virtuals: Vec<ExportedJumpVirtual>,
+}
+
+/// A virtual object found in JUMP args during preamble optimization.
+/// RPython unroll.py: part of ExportedState.virtual_state.
+#[derive(Clone, Debug)]
+pub struct ExportedJumpVirtual {
+    /// Index in the JUMP args where this virtual was.
+    pub jump_arg_index: usize,
+    /// Size descriptor for New().
+    pub size_descr: majit_ir::DescrRef,
+    /// Fields: (field_descr, concrete_value_i64)
+    pub fields: Vec<(majit_ir::DescrRef, i64)>,
 }
 
 impl Optimizer {
     pub fn new() -> Self {
         Optimizer {
+            exported_jump_virtuals: Vec::new(),
             passes: Vec::new(),
             final_num_inputs: 0,
             call_pure_results: std::collections::HashMap::new(),
@@ -1169,6 +1186,105 @@ mod tests {
                 result
             );
         }
+    }
+
+    #[test]
+    fn test_remap_keeps_force_like_new_positions_out_of_constant_map() {
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
+        opt.add_pass(Box::new(QueueForceLikeExtraOps {
+            queued: false,
+            field_descr: std::sync::Arc::new(TestDescr(9)),
+        }));
+        opt.add_pass(Box::new(RemoveAsConstant {
+            target: OpRef(2),
+            value: 472,
+        }));
+        opt.add_pass(Box::new(OptHeap::new()));
+
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
+        ];
+        ops[0].pos = OpRef(2);
+        ops[1].pos = OpRef(3);
+
+        let mut constants = std::collections::HashMap::new();
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        let new_positions: std::collections::HashSet<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::New)
+            .map(|op| op.pos.0)
+            .collect();
+        assert!(
+            !new_positions.is_empty(),
+            "expected force-like New op in optimized trace; got {:?}",
+            result
+        );
+        for pos in &new_positions {
+            assert!(
+                !constants.contains_key(pos),
+                "live New position v{pos} must not collide with exported int constant map {:?}; trace {:?}",
+                constants,
+                result
+            );
+        }
+        assert!(
+            result
+                .iter()
+                .filter(|op| op.opcode == OpCode::SetfieldGc)
+                .all(|op| new_positions.contains(&op.arg(0).0)),
+            "SetfieldGc targets must remain emitted New refs; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_force_like_extra_ops_skip_preexisting_constant_slots_without_virtual_inputs() {
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(QueueForceLikeExtraOps {
+            queued: false,
+            field_descr: std::sync::Arc::new(TestDescr(11)),
+        }));
+        opt.add_pass(Box::new(OptHeap::new()));
+
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
+        ];
+        ops[0].pos = OpRef(10066);
+        ops[1].pos = OpRef(10067);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10068, 472);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        let new_positions: std::collections::HashSet<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::New)
+            .map(|op| op.pos.0)
+            .collect();
+        assert_eq!(
+            new_positions,
+            std::collections::HashSet::from([10069]),
+            "queued New should skip constant-only slot v10068; got {:?}",
+            result
+        );
+        assert!(
+            result
+                .iter()
+                .filter(|op| op.opcode == OpCode::SetfieldGc)
+                .all(|op| new_positions.contains(&op.arg(0).0)),
+            "SetfieldGc targets must remain emitted New refs; got {:?}",
+            result
+        );
+        assert_eq!(constants.get(&10068), Some(&472));
+        assert!(
+            !constants.contains_key(&10069),
+            "live New position must not collide with constant map {:?}",
+            constants
+        );
     }
 
     #[test]
