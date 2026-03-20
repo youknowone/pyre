@@ -96,6 +96,13 @@ impl Optimizer {
         }
     }
 
+    /// RPython unroll.py: set Phase 2 flatten mode on OptVirtualize.
+    pub fn set_flatten_virtuals_at_jump(&mut self, enabled: bool) {
+        for pass in &mut self.passes {
+            pass.set_flatten_virtuals_at_jump(enabled);
+        }
+    }
+
     /// Record a CALL_PURE result for cross-iteration constant folding.
     /// RPython optimizer.py: `call_pure_results[key] = value`
     pub fn record_call_pure_result(&mut self, args: Vec<majit_ir::OpRef>, value: majit_ir::Value) {

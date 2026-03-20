@@ -62,6 +62,9 @@ pub struct OptVirtualize {
     vable_array_ptrs: HashMap<OpRef, (usize, Option<DescrRef>)>,
     /// Whether virtualizable state has been initialized from existing trace inputs.
     vable_initialized: bool,
+    /// RPython unroll.py: Phase 2 mode. When true, JUMP flattens virtuals
+    /// into field values instead of materializing them.
+    flatten_virtuals_at_jump: bool,
     /// Whether setup needs to initialize virtualizable PtrInfo on ctx.
     /// Set in setup(), applied in first propagate_forward().
     needs_vable_setup: bool,
@@ -74,6 +77,7 @@ impl OptVirtualize {
             vable_array_ptrs: HashMap::new(),
             vable_initialized: false,
             needs_vable_setup: false,
+            flatten_virtuals_at_jump: false,
         }
     }
 
@@ -84,7 +88,13 @@ impl OptVirtualize {
             vable_array_ptrs: HashMap::new(),
             vable_initialized: false,
             needs_vable_setup: false,
+            flatten_virtuals_at_jump: false,
         }
+    }
+
+    /// RPython unroll.py: enable virtual flattening at JUMP for Phase 2.
+    pub fn set_flatten_virtuals_at_jump(&mut self, enabled: bool) {
+        self.flatten_virtuals_at_jump = enabled;
     }
 
     /// Seed virtualizable state from existing trace inputs.
@@ -350,6 +360,25 @@ impl OptVirtualize {
                     });
             }
             _ => {}
+        }
+    }
+
+    /// RPython unroll.py: make_inputargs_and_virtuals — extract field values
+    /// from a virtual without materializing it. Returns field OpRefs.
+    fn flatten_virtual_fields(&self, opref: OpRef, ctx: &OptContext) -> Vec<OpRef> {
+        let resolved = ctx.get_replacement(opref);
+        let info = match ctx.get_ptr_info(resolved) {
+            Some(info) if info.is_virtual() => info.clone(),
+            _ => return Vec::new(),
+        };
+        match info {
+            PtrInfo::VirtualStruct(vinfo) => {
+                vinfo.fields.iter().map(|(_, val_ref)| *val_ref).collect()
+            }
+            PtrInfo::Virtual(vinfo) => {
+                vinfo.fields.iter().map(|(_, val_ref)| *val_ref).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -1687,6 +1716,7 @@ impl Optimization for OptVirtualize {
                 let frame_ref = ctx.get_replacement(OpRef(0));
                 // Force all virtual args EXCEPT the virtualizable frame
                 let mut jump_op = op.clone();
+                let mut extra_flattened: Vec<(usize, Vec<OpRef>)> = Vec::new();
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
                     let resolved = ctx.get_replacement(*arg);
                     if resolved == frame_ref {
@@ -1696,26 +1726,69 @@ impl Optimization for OptVirtualize {
                         }
                     }
                     if Self::is_virtual(resolved, ctx) {
-                        // RPython unroll.py: export virtual structure for preamble peeling
-                        self.export_virtual_for_preamble(resolved, arg_idx, ctx);
-                        let forced = self.force_virtual(resolved, ctx);
-                        *arg = ctx.get_replacement(forced);
+                        if self.flatten_virtuals_at_jump {
+                            // Phase 2: flatten virtual fields into JUMP args
+                            let flattened = self.flatten_virtual_fields(resolved, ctx);
+                            if !flattened.is_empty() {
+                                *arg = resolved; // placeholder, will be replaced
+                                extra_flattened.push((arg_idx, flattened));
+                            } else {
+                                self.export_virtual_for_preamble(resolved, arg_idx, ctx);
+                                let forced = self.force_virtual(resolved, ctx);
+                                *arg = ctx.get_replacement(forced);
+                            }
+                        } else {
+                            self.export_virtual_for_preamble(resolved, arg_idx, ctx);
+                            let forced = self.force_virtual(resolved, ctx);
+                            *arg = ctx.get_replacement(forced);
+                        }
                     } else {
                         *arg = resolved;
+                    }
+                }
+                // Apply flattening: replace virtual arg with field values
+                for (idx, fields) in extra_flattened.into_iter().rev() {
+                    // Replace the virtual arg position with first field
+                    if let Some(first) = fields.first() {
+                        jump_op.args[idx] = *first;
+                    }
+                    // Insert remaining fields after this position
+                    for (i, &field) in fields.iter().skip(1).enumerate() {
+                        jump_op.args.insert(idx + 1 + i, field);
                     }
                 }
                 OptimizationResult::Replace(jump_op)
             }
 
             // JUMP (no virtualizable) / FINISH — force all virtual args
-            // Also export virtual structure for preamble peeling (non-vable path).
+            // Also flatten in Phase 2 or export for preamble peeling.
             OpCode::Jump => {
                 let mut jump_op = op.clone();
+                let mut extra_flattened: Vec<(usize, Vec<OpRef>)> = Vec::new();
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
                     let resolved = ctx.get_replacement(*arg);
                     if Self::is_virtual(resolved, ctx) {
+                        if self.flatten_virtuals_at_jump {
+                            let flattened = self.flatten_virtual_fields(resolved, ctx);
+                            if !flattened.is_empty() {
+                                *arg = resolved;
+                                extra_flattened.push((arg_idx, flattened));
+                                continue;
+                            }
+                        }
                         self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                     }
+                }
+                if !extra_flattened.is_empty() {
+                    for (idx, fields) in extra_flattened.into_iter().rev() {
+                        if let Some(first) = fields.first() {
+                            jump_op.args[idx] = *first;
+                        }
+                        for (i, &field) in fields.iter().skip(1).enumerate() {
+                            jump_op.args.insert(idx + 1 + i, field);
+                        }
+                    }
+                    return OptimizationResult::Replace(jump_op);
                 }
                 self.optimize_escaping_op(&jump_op, ctx)
             }
@@ -1820,6 +1893,10 @@ impl Optimization for OptVirtualize {
 
     fn name(&self) -> &'static str {
         "virtualize"
+    }
+
+    fn set_flatten_virtuals_at_jump(&mut self, enabled: bool) {
+        self.flatten_virtuals_at_jump = enabled;
     }
 }
 
