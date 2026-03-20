@@ -59,6 +59,12 @@ pub struct Optimizer {
     /// RPython unroll.py: import_state — exported facts to re-apply onto the
     /// next optimizer instance before phase 2 body optimization starts.
     pub imported_loop_state: Option<crate::unroll::ExportedState>,
+    /// Original preamble result boxes for imported short-box results.
+    pub imported_short_sources: Vec<crate::ImportedShortSource>,
+    /// Invented SameAs aliases imported from short-preamble export/import.
+    pub imported_short_aliases: Vec<crate::ImportedShortAlias>,
+    /// Builder-derived short preamble actually used by phase 2.
+    pub imported_short_preamble: Option<crate::shortpreamble::ShortPreamble>,
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.
@@ -106,6 +112,9 @@ impl Optimizer {
         ctx: &mut OptContext,
     ) -> OpRef {
         let opref = ctx.alloc_op_position();
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[jit] import_virtual_state_value {opref:?} <= {info:?}");
+        }
         Self::apply_imported_virtual_state(info, opref, ctx);
         opref
     }
@@ -256,6 +265,12 @@ impl Optimizer {
                 fields.push((descr.index(), field_ref));
                 field_descrs.push((descr.index(), descr.clone()));
             }
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[jit] install_imported_virtual head={virtual_head:?} fields={:?}",
+                    fields
+                );
+            }
             match &iv.kind {
                 ImportedVirtualKind::Instance { known_class } => {
                     ctx.set_ptr_info(
@@ -301,6 +316,9 @@ impl Optimizer {
             imported_virtuals: Vec::new(),
             exported_loop_state: None,
             imported_loop_state: None,
+            imported_short_sources: Vec::new(),
+            imported_short_aliases: Vec::new(),
+            imported_short_preamble: None,
         }
     }
 
@@ -742,6 +760,9 @@ impl Optimizer {
 
         // Transfer exported virtual state from context to optimizer
         let exported_jump_virtuals = std::mem::take(&mut ctx.exported_jump_virtuals);
+        self.imported_short_sources = std::mem::take(&mut ctx.imported_short_sources);
+        self.imported_short_aliases = ctx.used_imported_short_aliases();
+        self.imported_short_preamble = ctx.build_imported_short_preamble();
         let jump = ctx
             .new_operations
             .iter()
@@ -868,6 +889,32 @@ impl Optimizer {
         for (idx, val) in ctx.constants.iter().enumerate() {
             if let Some(Value::Int(v)) = val {
                 constants.entry(idx as u32).or_insert(*v);
+            }
+        }
+
+        // Resolve any remaining forwarding in emitted ops.
+        // RPython uses in-place Box forwarding so this isn't needed there.
+        // In majit, ops emitted early may reference OpRefs that were later
+        // forwarded (e.g., a virtual ref that was force-materialized).
+        let fwd = ctx.forwarding.clone();
+        let resolve = |opref: OpRef| -> OpRef {
+            let mut cur = opref;
+            loop {
+                let idx = cur.0 as usize;
+                if idx >= fwd.len() { return cur; }
+                let next = fwd[idx];
+                if next.is_none() || next == cur { return cur; }
+                cur = next;
+            }
+        };
+        for op in &mut ctx.new_operations {
+            for arg in &mut op.args {
+                *arg = resolve(*arg);
+            }
+            if let Some(ref mut fa) = op.fail_args {
+                for arg in fa.iter_mut() {
+                    *arg = resolve(*arg);
+                }
             }
         }
 
