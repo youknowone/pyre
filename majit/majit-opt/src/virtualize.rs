@@ -1860,14 +1860,6 @@ impl Optimization for OptVirtualize {
                     ctx,
                     &ctx.ptr_info,
                 );
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] pre_force_vs: args={:?} has_virtual={} fields={:?}",
-                        pre_force_args,
-                        pre_force_vs.has_virtuals(),
-                        ctx.pre_force_field_refs.keys().collect::<Vec<_>>()
-                    );
-                }
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
                 ctx.pre_force_jump_args = Some(pre_force_args.clone());
 

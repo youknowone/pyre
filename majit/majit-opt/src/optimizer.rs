@@ -783,8 +783,14 @@ impl Optimizer {
                 .unwrap_or_else(|| {
                     crate::virtualstate::export_state(&jump.args, &ctx, &ctx.ptr_info)
                 });
+            // Use pre-force args for make_inputargs so virtual entries can
+            // look up their field values from the still-virtual PtrInfo.
+            let vs_args = ctx
+                .pre_force_jump_args
+                .as_deref()
+                .unwrap_or(&jump.args);
             let (preview_label_args, preview_virtuals) = preview_virtual_state
-                .make_inputargs_and_virtuals(&jump.args, &ctx);
+                .make_inputargs_and_virtuals(vs_args, &ctx);
             let mut preview_short_args = preview_label_args.clone();
             preview_short_args.extend(preview_virtuals);
             let mut short_boxes =

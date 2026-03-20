@@ -486,6 +486,17 @@ impl VirtualState {
                 for (field_idx, field_state) in fields {
                     let field_ref = ptr_info
                         .and_then(|info| info.get_field(*field_idx))
+                        // Fallback: use pre_force_field_refs if virtual was forced.
+                        // Try both resolved and original opref (force may forward).
+                        .or_else(|| {
+                            ctx.pre_force_field_refs.get(&resolved)
+                                .or_else(|| ctx.pre_force_field_refs.get(&opref))
+                                .and_then(|flds| {
+                                    flds.iter()
+                                        .find(|(idx, _)| *idx == *field_idx)
+                                        .map(|(_, r)| *r)
+                                })
+                        })
                         .unwrap_or(OpRef::NONE);
                     Self::enum_forced_boxes_for_entry(field_state, field_ref, ctx, boxes, next_slot);
                 }
@@ -564,6 +575,14 @@ impl VirtualState {
             .iter()
             .zip(other.state.iter())
             .all(|(a, b)| a.is_compatible(b))
+    }
+
+    /// virtualstate.py: generalization_of(other, optimizer)
+    ///
+    /// `self` is the target loop state's requirement and `other` is the
+    /// incoming state. Returns true if `self` can safely accept `other`.
+    pub fn generalization_of(&self, other: &VirtualState) -> bool {
+        self.is_compatible(other)
     }
 
     /// Generate guards to bridge from `other` state to `self` state.
@@ -1351,6 +1370,15 @@ mod tests {
         ]);
 
         assert!(s1.is_compatible(&s2));
+    }
+
+    #[test]
+    fn test_virtual_state_generalization_direction_matches_rpython() {
+        let target = VirtualState::new(vec![VirtualStateInfo::Unknown]);
+        let incoming = VirtualState::new(vec![VirtualStateInfo::NonNull]);
+
+        assert!(target.generalization_of(&incoming));
+        assert!(!incoming.generalization_of(&target));
     }
 
     #[test]

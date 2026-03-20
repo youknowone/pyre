@@ -152,6 +152,12 @@ pub struct OptContext {
     /// Used by export_state to produce a VirtualState that includes virtuals
     /// (which are forced by the time exported_loop_state is computed).
     pub pre_force_virtual_state: Option<crate::virtualstate::VirtualState>,
+    /// JUMP args captured BEFORE force (corresponding to pre_force_virtual_state).
+    pub pre_force_jump_args: Option<Vec<OpRef>>,
+    /// Field OpRefs of virtual args before force. Maps virtual OpRef →
+    /// [(field_idx, field_value_ref)]. Used by make_inputargs to flatten
+    /// virtuals into label args after force has destroyed PtrInfo.
+    pub pre_force_field_refs: HashMap<OpRef, Vec<(u32, OpRef)>>,
 }
 
 impl OptContext {
@@ -178,7 +184,7 @@ impl OptContext {
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             patchguardop: None,
-            pre_force_virtual_state: None,
+            pre_force_virtual_state: None, pre_force_jump_args: None, pre_force_field_refs: HashMap::new(),
         }
     }
 
@@ -205,7 +211,7 @@ impl OptContext {
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             patchguardop: None,
-            pre_force_virtual_state: None,
+            pre_force_virtual_state: None, pre_force_jump_args: None, pre_force_field_refs: HashMap::new(),
         }
     }
 
