@@ -1320,6 +1320,7 @@ impl TraceFrameState {
             if is_int(lhs) && is_int(rhs) {
                 Some((w_int_get_value(lhs), w_int_get_value(rhs)))
             } else {
+                // Values might be LONG_TYPE (bigint) — not inlinable
                 None
             }
         }
