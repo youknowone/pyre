@@ -179,29 +179,42 @@ impl OptHeap {
     /// recursively forced any virtual rhs we can flush queued extra ops
     /// directly into the final output before emitting the lazy set itself.
     /// RPython heap.py:136: force_lazy_set → emit_extra(op, emit=False).
-    /// Resolves forwarding and skips virtual values that were never forced.
+    /// emit_extra routes through all passes, which calls force_box on
+    /// virtual args (optimizer.py:624). In majit, we force directly
+    /// via force_to_ops before emitting.
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext) -> bool {
         let orig_val = op.arg(1);
+
+        // RPython: emit_extra → send_extra_operation → _emit_operation
+        // → force_box(arg) for each arg. If arg is virtual, force it.
+        // Check BEFORE forwarding resolution (orig_val has ptr_info).
+        if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
+            if info.is_virtual() {
+                // RPython info.py:148: force_box → emit New + SetfieldGc
+                let forced = info.force_to_ops(orig_val, ctx);
+                // Update the op's arg to the forced concrete ref
+                op.args[1] = forced;
+                // Resolve remaining args
+                for arg in op.args.iter_mut() {
+                    *arg = ctx.get_replacement(*arg);
+                }
+                ctx.emit(op.clone());
+                return true;
+            }
+        }
+
+        // Non-virtual path: resolve forwarding and emit
         for arg in op.args.iter_mut() {
             *arg = ctx.get_replacement(*arg);
         }
         let val = op.arg(1);
 
-        // Virtual values not in JUMP args were never forced → no New in output.
-        // RPython's emit_extra forces them via downstream passes; majit skips.
+        // Skip if forwarding resolved to an undefined position
         if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000 {
-            // Check if val is defined by a result-producing op
             let defined = ctx.new_operations.iter().any(|o| {
                 o.pos == val && o.opcode.result_type() != Type::Void
             });
             if !defined {
-                // Check original value before forwarding
-                if let Some(info) = ctx.get_ptr_info(orig_val) {
-                    if info.is_virtual() {
-                        return false; // virtual never forced — skip
-                    }
-                }
-                // Forwarding target not in output and not virtual — skip
                 return false;
             }
         }
