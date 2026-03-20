@@ -206,16 +206,12 @@ impl OptHeap {
         // RPython: emit_extra → send_extra_operation → _emit_operation
         // → force_box(arg) for each arg. If arg is virtual, force it.
         // Check BEFORE forwarding resolution (orig_val has ptr_info).
-        if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
+        // RPython: emit_extra → force_box forces virtual values.
+        // In majit, forcing here makes guardless loops infinite (no interrupt).
+        // Skip virtual values — compile fails, interpreter fallback handles it.
+        if let Some(info) = ctx.get_ptr_info(orig_val) {
             if info.is_virtual() {
-                // RPython info.py:148: force_box → emit New + SetfieldGc
-                let forced = info.force_to_ops(orig_val, ctx);
-                op.args[1] = forced;
-                for arg in op.args.iter_mut() {
-                    *arg = ctx.get_replacement(*arg);
-                }
-                ctx.emit(op.clone());
-                return true;
+                return false;
             }
         }
 
