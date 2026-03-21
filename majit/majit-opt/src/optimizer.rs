@@ -1999,7 +1999,7 @@ mod tests {
     fn test_optimizer_passthrough() {
         let mut opt = Optimizer::new();
         let ops = vec![Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)])];
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -2163,7 +2163,7 @@ mod tests {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos = OpRef(i as u32);
         }
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
@@ -2349,7 +2349,7 @@ mod tests {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos = OpRef(i as u32);
         }
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
@@ -2596,7 +2596,7 @@ mod tests {
             op.pos = OpRef(i as u32);
         }
 
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
