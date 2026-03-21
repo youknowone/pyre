@@ -1389,43 +1389,7 @@ impl TraceFrameState {
         } else {
             OpCode::GuardFalse
         };
-        if self.parent_fail_args.is_some() {
-            self.record_guard(ctx, opcode, &[truth]);
-            return;
-        }
-
-        let s = self.sym();
-        let stack_only = s.stack_only_depth();
-        let current_pc = unsafe {
-            (*(self.concrete_frame as *const pyre_interp::frame::PyFrame)).next_instr
-        };
-        let pre_pop_vsd = s.valuestackdepth.saturating_add(1);
-        let branch_operand = self
-            .concrete_popped_value()
-            .map(|value| ctx.const_int(value as i64))
-            .unwrap_or(truth);
-        let branch_operand_type = self
-            .concrete_popped_value()
-            .map(concrete_value_type)
-            .unwrap_or_else(|| self.value_type(truth));
-        let current_pc_ref = ctx.const_int(current_pc as i64);
-        let pre_pop_vsd_ref = ctx.const_int(pre_pop_vsd as i64);
-        let mut fail_args = vec![s.frame, current_pc_ref, pre_pop_vsd_ref];
-        fail_args.extend_from_slice(&s.symbolic_locals);
-        fail_args.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
-        fail_args.push(branch_operand);
-        let fail_arg_types = virtualizable_fail_arg_types(
-            s.symbolic_local_types
-                .iter()
-                .copied()
-                .chain(
-                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
-                        .iter()
-                        .copied(),
-                )
-                .chain(std::iter::once(branch_operand_type)),
-        );
-        ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
+        self.record_guard(ctx, opcode, &[truth]);
     }
 
     fn concrete_popped_value(&self) -> Option<PyObjectRef> {
