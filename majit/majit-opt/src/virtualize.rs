@@ -873,7 +873,6 @@ impl OptVirtualize {
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
         );
 
-
         // RPython import_state: if this is a GetfieldGcR(pool) that loads a head
         // which was virtual in the preamble, forward to the imported virtual head.
         if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {

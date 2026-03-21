@@ -2076,10 +2076,8 @@ fn assemble_peeled_trace(
                 || carried_source_slots.contains(&arg)
                 || alias_remap.contains_key(&arg)
                 || seen_body_defs.contains(&arg)
+                || preamble_defs.contains(&arg)
             {
-                continue;
-            }
-            if preamble_defs.contains(&arg) {
                 continue;
             }
             // Body-use-before-def: a value used in the body before its
@@ -3884,7 +3882,7 @@ mod tests {
         let _ = optimizer.force_box(forced, &mut ctx2);
 
         let sp = ctx2.build_imported_short_preamble().unwrap();
-        assert_eq!(sp.used_boxes, vec![OpRef(30)]);
+        assert_eq!(sp.used_boxes, vec![imported_result]);
         assert_eq!(sp.jump_args, vec![imported_result]);
         assert_eq!(sp.ops.len(), 2);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAddOvf);
