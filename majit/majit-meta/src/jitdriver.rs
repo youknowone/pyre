@@ -1502,6 +1502,10 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// Returns `Some(resume_pc)` if compiled code ran or guard state was restored.
     #[inline]
+    /// RPython parity: pyjitpl.py handle_guard_failure → rebuild_state_after_failure.
+    /// `on_guard_failure` receives (state, meta, raw_values, exit_layout) where
+    /// exit_layout contains recovery_layout with rd_virtuals equivalent for
+    /// materializing virtual objects after guard failure.
     pub fn run_back_edge_generic(
         &mut self,
         green_values: &[i64],
@@ -1509,7 +1513,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-        on_guard_failure: impl FnOnce(&mut S, &S::Meta, &[i64]) -> Option<usize>,
+        on_guard_failure: impl FnOnce(&mut S, &S::Meta, &[i64], &crate::compile::CompiledExitLayout) -> Option<usize>,
     ) -> Option<usize> {
         if self.is_tracing() || !state.can_trace() {
             return None;
@@ -1559,6 +1563,8 @@ impl<S: JitState> JitDriver<S> {
         let result_meta = result.meta.clone();
         let typed_values = result.typed_values;
         let raw_values = result.values;
+        // RPython parity: resumedescr carries rd_virtuals for materialization.
+        let exit_layout = result.exit_layout;
 
         if is_finish || fail_index == u32::MAX {
             state.restore_values(&result_meta, &typed_values);
@@ -1570,7 +1576,7 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
         if should_bridge {
-            if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values) {
+            if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values, &exit_layout) {
                 self.sync_after(state, &result_meta, descriptor.as_ref());
                 self.start_bridge_tracing(
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
@@ -1580,7 +1586,7 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
 
-        let resume_pc = on_guard_failure(state, &result_meta, &raw_values);
+        let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
         if resume_pc.is_some() {
             self.sync_after(state, &result_meta, descriptor.as_ref());
         }
