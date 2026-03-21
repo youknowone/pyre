@@ -2093,8 +2093,12 @@ extern "C" fn gc_alloc_typed_nursery_shim(
     type_id: u64,
     size: u64,
 ) -> u64 {
+    // RPython rewrite.py: CALL_MALLOC_NURSERY fallback path.
+    // Use no-collect allocation to avoid triggering GC during compiled code
+    // execution. When nursery is full, falls back to old-gen allocation.
+    // This prevents root buffer invalidation from do_collect_nursery().
     with_gc_runtime(runtime_id, |gc| {
-        let obj = gc.alloc_nursery_typed(type_id as u32, size as usize);
+        let obj = gc.alloc_nursery_no_collect(size as usize);
         obj.0 as u64
     })
 }

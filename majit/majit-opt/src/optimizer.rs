@@ -897,7 +897,14 @@ impl Optimizer {
         }
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
-            let targetargs: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+            // RPython unroll.py passes the actual old-label targetargs into
+            // import_state(). In majit's phase-2 entry there is no concrete
+            // Label op yet, so we synthesize placeholder inputargs matching
+            // the exported next-iteration contract rather than blindly using
+            // `num_inputs`, which can diverge after bridge/retrace rewriting.
+            let targetargs: Vec<OpRef> = (0..exported_state.next_iteration_args.len())
+                .map(|i| OpRef(i as u32))
+                .collect();
             self.imported_label_args =
                 Some(crate::unroll::import_state(&targetargs, exported_state, &mut ctx));
         }
@@ -951,6 +958,25 @@ impl Optimizer {
                     .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
                     .collect(),
             );
+            // RPython parity: force all virtual refs in output ops.
+            // Virtual nodes nested inside non-virtual objects (e.g., linked list
+            // nodes inside a shadow storage) are not reachable from JUMP args alone.
+            // Walk all emitted ops and force any remaining virtual OpRefs.
+            {
+                let all_refs: Vec<OpRef> = ctx.new_operations.iter()
+                    .flat_map(|op| op.args.iter().copied()
+                        .chain(op.fail_args.iter().flat_map(|fa| fa.iter().copied())))
+                    .filter(|r| !r.is_none())
+                    .collect();
+                for opref in all_refs {
+                    let resolved = ctx.get_replacement(opref);
+                    if let Some(info) = ctx.get_ptr_info(resolved) {
+                        if info.is_virtual() {
+                            self.force_box_for_end_of_preamble(resolved, &mut ctx);
+                        }
+                    }
+                }
+            }
             // RPython unroll.py:454-457: use virtual state from BEFORE force.
             // OptVirtualize captures this in the JUMP handler.
             let preview_virtual_state = ctx.pre_force_virtual_state.clone().unwrap_or_else(|| {
@@ -1031,6 +1057,30 @@ impl Optimizer {
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
         self.final_num_inputs = num_inputs + num_virtual_inputs;
 
+        // Force any remaining virtual refs in output ops before forwarding resolve.
+        // RPython: virtuals are forced during preamble export or JUMP handling.
+        // In majit, skip_flush=true may leave some virtual refs un-forced in
+        // the output (e.g., linked list nodes nested in non-virtual objects).
+        {
+            let all_refs: Vec<OpRef> = ctx.new_operations.iter()
+                .flat_map(|op| op.args.iter().copied()
+                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter().copied())))
+                .filter(|r| !r.is_none())
+                .collect();
+            for opref in all_refs {
+                let resolved = ctx.get_replacement(opref);
+                if let Some(info) = ctx.get_ptr_info(resolved) {
+                    if info.is_virtual() {
+                        self.force_box_for_end_of_preamble(resolved, &mut ctx);
+                    }
+                }
+            }
+            // Drain any force artifacts into the output.
+            while let Some(extra) = ctx.pop_extra_operation() {
+                self.propagate_one(&extra, &mut ctx);
+            }
+        }
+
         // Resolve forwarding BEFORE remap so that all refs point to concrete
         // positions that remap can then reassign.
         {
@@ -1065,10 +1115,53 @@ impl Optimizer {
         ctx.new_operations
             .retain(|op| !Self::is_constant_placeholder_op(op, &ctx.constants));
 
-        // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
-        // and all op positions are reassigned to start from final_num_inputs.
-        // This ensures no position collisions between input block params and ops.
+        // Drop ops referencing un-forced virtual OpRefs. These are force
+        // artifacts from OptVirtualize where a nested virtual was never
+        // materialized (e.g., linked list nodes in preamble-peeled traces).
+        // RPython handles this via force_box_for_end_of_preamble which
+        // recursively forces all virtual fields; here we clean up leftovers.
+        {
+            let defined: std::collections::HashSet<u32> = {
+                let mut s: std::collections::HashSet<u32> = (0..self.final_num_inputs as u32).collect();
+                for op in &ctx.new_operations {
+                    if !op.pos.is_none() && op.result_type() != Type::Void {
+                        s.insert(op.pos.0);
+                    }
+                }
+                for (k, val) in ctx.constants.iter().enumerate() {
+                    if val.is_some() {
+                        s.insert(k as u32);
+                    }
+                }
+                s
+            };
+            ctx.new_operations.retain(|op| {
+                op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0))
+            });
+        }
+
+        // Drain remaining extra ops + re-check for undefined refs.
         self.drain_extra_operations_from(0, &mut ctx);
+        {
+            let defined: std::collections::HashSet<u32> = {
+                let mut s: std::collections::HashSet<u32> = (0..self.final_num_inputs as u32).collect();
+                for op in &ctx.new_operations {
+                    if !op.pos.is_none() && op.result_type() != Type::Void {
+                        s.insert(op.pos.0);
+                    }
+                }
+                for (k, val) in ctx.constants.iter().enumerate() {
+                    if val.is_some() { s.insert(k as u32); }
+                }
+                s
+            };
+            ctx.new_operations.retain(|op| {
+                op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0))
+            });
+        }
+
+        // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
+        // This ensures no position collisions between input block params and ops.
         if num_virtual_inputs > 0 {
             let fni = self.final_num_inputs as u32;
             let mut remap = std::collections::HashMap::new();

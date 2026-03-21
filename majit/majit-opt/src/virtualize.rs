@@ -479,6 +479,9 @@ impl OptVirtualize {
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
         }
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[virt] force_virtual_instance: opref={:?} alloc_ref={:?} replaced={}", opref, alloc_ref, opref != alloc_ref);
+        }
 
         // Emit SETFIELD_GC for each tracked field
         for (field_idx, value_ref) in vinfo.fields {
