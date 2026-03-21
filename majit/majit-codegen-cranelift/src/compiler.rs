@@ -2306,6 +2306,12 @@ fn resolve_call_assembler_target(
     };
 
     if target.inputarg_types != call_descr.arg_types() {
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[codegen] call-assembler type mismatch: target={:?} descr={:?}",
+                target.inputarg_types, call_descr.arg_types()
+            );
+        }
         return Err(unsupported_semantics(
             opcode,
             "call-assembler target input types do not match the descriptor",
