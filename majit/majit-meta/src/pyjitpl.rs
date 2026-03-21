@@ -1327,6 +1327,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|compiled| compiled.retraced_count)
             .unwrap_or(0);
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
+        unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
