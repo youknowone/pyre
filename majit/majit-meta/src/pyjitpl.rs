@@ -1293,7 +1293,7 @@ impl<M: Clone> MetaInterp<M> {
         // GUARD_NOT_INVALIDATED before the closing JUMP. fail_args = jump_args
         // so guard failure restores the same state as the JUMP target.
         {
-            let descr = crate::fail_descr::make_fail_descr(jump_args.len());
+            let descr = crate::fail_descr::make_fail_descr_typed(recorder.opref_types(jump_args));
             recorder.record_guard_with_fail_args(
                 OpCode::GuardNotInvalidated, &[], descr, jump_args,
             );
@@ -1346,7 +1346,7 @@ impl<M: Clone> MetaInterp<M> {
                 vable_config,
             )
         }));
-        let (optimized_ops, final_num_inputs) = match optimize_result {
+        let (mut optimized_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
             Err(payload) => {
                 if payload
@@ -1362,6 +1362,7 @@ impl<M: Clone> MetaInterp<M> {
                 std::panic::resume_unwind(payload);
             }
         };
+        compile::retag_fail_descrs_from_trace_types(&trace.inputargs, &mut optimized_ops);
         let num_ops_after = optimized_ops.len();
 
         // RPython compile.py keeps the root entry contract on the original
@@ -1618,11 +1619,12 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        let optimized_ops = optimizer.optimize_with_constants_and_inputs(
+        let mut optimized_ops = optimizer.optimize_with_constants_and_inputs(
             &trace_ops,
             &mut constants,
             trace.inputargs.len(),
         );
+        compile::retag_fail_descrs_from_trace_types(&trace.inputargs, &mut optimized_ops);
         let num_ops_after = optimized_ops.len();
 
         if crate::majit_log_enabled() {
@@ -2888,11 +2890,12 @@ impl<M: Clone> MetaInterp<M> {
         // Optimize the bridge trace
         let mut optimizer = self.make_optimizer();
         let mut constants = constants;
-        let optimized_ops = optimizer.optimize_with_constants_and_inputs(
+        let mut optimized_ops = optimizer.optimize_with_constants_and_inputs(
             bridge_ops,
             &mut constants,
             bridge_inputargs.len(),
         );
+        compile::retag_fail_descrs_from_trace_types(bridge_inputargs, &mut optimized_ops);
 
         // RPython parity: unbox the Finish result in bridges too.
         // Without this, bridges return boxed pointers while the caller
@@ -6445,6 +6448,39 @@ mod tests {
         assert_eq!(events[0].0, green_key, "green_key should match");
         assert!(events[0].1 > 0, "num_ops_before should be positive");
         assert!(events[0].2 > 0, "num_ops_after should be positive");
+    }
+
+    #[test]
+    fn close_and_compile_uses_typed_guard_not_invalidated_fail_args() {
+        let mut meta = MetaInterp::<()>::new(1);
+        for _ in 0..2 {
+            meta.on_back_edge_typed(
+                42,
+                None,
+                None,
+                &[Value::Ref(majit_ir::GcRef(0)), Value::Int(0)],
+            );
+        }
+        assert!(meta.tracing.is_some());
+
+        meta.close_and_compile(&[OpRef(0), OpRef(1)], ());
+        let compiled = meta.compiled_loops.get(&42).expect("compiled entry").clone();
+
+        let trace = compiled
+            .traces
+            .get(&compiled.root_trace_id)
+            .expect("root compiled trace");
+        let guard = trace
+            .ops
+            .iter()
+            .find(|op| op.opcode == OpCode::GuardNotInvalidated)
+            .expect("guard_not_invalidated");
+        let fail_descr = guard
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .expect("fail descr");
+        assert_eq!(fail_descr.fail_arg_types(), &[Type::Ref, Type::Int]);
     }
 
     #[test]
