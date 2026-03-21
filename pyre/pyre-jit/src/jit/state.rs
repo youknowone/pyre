@@ -3171,32 +3171,6 @@ impl TraceFrameState {
                         (&*code_ptr).varnames.len()
                     };
                     if nargs == 1 || crate::call_jit::callee_frame_helper(nargs).is_some() {
-                        // RPython pyjitpl.py:2019 do_residual_call step 2:
-                        // Execute callee concretely FIRST, then record
-                        // CALL_ASSEMBLER in trace with the concrete result.
-                        //
-                        // RPython: executor.execute_varargs(cpu, metainterp,
-                        //   CALL_MAY_FORCE_I, allboxes, descr)
-                        // → portal_runner → interpreter/compiled callee
-                        let concrete_args: Vec<pyre_object::PyObjectRef> = unsafe {
-                            let frame = &*(self.concrete_frame as *const pyre_interp::frame::PyFrame);
-                            let vsd = frame.valuestackdepth;
-                            (0..nargs)
-                                .map(|i| *frame.locals_cells_stack_w.ptr.add(vsd - nargs + i))
-                                .collect()
-                        };
-                        let caller_frame = unsafe {
-                            &*(self.concrete_frame as *const pyre_interp::frame::PyFrame)
-                        };
-                        // RPython pyjitpl.py:2019: portal_runner → interpreter/compiled
-                        // Use call_user_function (not _plain) so the callee can
-                        // enter compiled code if already compiled.
-                        let concrete_result = pyre_interp::call::call_user_function(
-                            caller_frame,
-                            concrete_callable,
-                            &concrete_args,
-                        )?;
-
                         return self.with_ctx(|this, ctx| {
                             if !is_self_recursive {
                                 this.guard_value(ctx, callable, concrete_callable as i64);
@@ -3282,15 +3256,6 @@ impl TraceFrameState {
                                 crate::call_jit::jit_drop_callee_frame as *const (),
                                 &[callee_frame],
                             );
-                            // RPython pyjitpl.py:2072: vable_after_residual_call
-                            // + generate_guard(GUARD_NOT_FORCED)
-                            this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-
-                            // Store concrete result for subsequent tracing.
-                            // RPython: c_result from executor.execute_varargs
-                            this.sym_mut().last_popped_concrete_value =
-                                Some(concrete_result);
-
                             let result = if inline_framestack_active {
                                 box_traced_raw_int(ctx, result)
                             } else {
