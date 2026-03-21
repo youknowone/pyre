@@ -1940,7 +1940,10 @@ fn call_assembler_fast_path(
 
     release_force_token(handle);
 
-    let callee_frame_ptr = outputs[0];
+    // RPython assembler_call_helper: force_fn receives the callee frame.
+    // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
+    // but force_fn needs the callee frame which is inputs[0].
+    let callee_frame_ptr = inputs[0];
     let result = force_fn(callee_frame_ptr);
     unsafe {
         *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -2040,7 +2043,10 @@ fn call_assembler_fast_path_heap(
 
     release_force_token(handle);
 
-    let callee_frame_ptr = outputs[0];
+    // RPython assembler_call_helper: force_fn receives the callee frame.
+    // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
+    // but force_fn needs the callee frame which is inputs[0].
+    let callee_frame_ptr = inputs[0];
     let result = force_fn(callee_frame_ptr);
     unsafe {
         *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -2078,6 +2084,12 @@ extern "C" fn call_assembler_shim(
     let outcome = outcome_ptr as usize as *mut i64;
 
     let target = unsafe { &*fast_lookup_ca_target(target_token) };
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!(
+            "[ca-shim] token={} null={} num_inputs={} code={:?}",
+            target_token, target.code_ptr.is_null(), target.num_inputs, target.code_ptr
+        );
+    }
 
     let input_slice =
         unsafe { std::slice::from_raw_parts(args_ptr as usize as *const i64, target.num_inputs) };
@@ -5053,8 +5065,15 @@ impl CraneliftBackend {
 
                             builder.switch_to_block(direct_force_block);
                             builder.seal_block(direct_force_block);
-                            // outputs[0] = callee frame pointer
-                            let frame_ptr = builder.ins().stack_load(cl_types::I64, out_slot, 0);
+                            // RPython: force_fn receives the callee frame, which is
+                            // inputs[0] (the first CallAssemblerI arg). outputs[0]
+                            // holds the virtualizable frame (fail_args[0] = caller).
+                            let frame_ptr = builder.ins().load(
+                                cl_types::I64,
+                                MemFlags::trusted(),
+                                args_ptr,
+                                0, // inputs[0] = callee frame
+                            );
                             let force_fn_ptr = *CALL_ASSEMBLER_FORCE_FN.get().unwrap();
                             let force_result = emit_host_call(
                                 &mut builder,
