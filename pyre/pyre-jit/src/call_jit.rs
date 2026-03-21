@@ -1065,6 +1065,16 @@ extern "C" fn jit_bridge_compile_callee(
     use std::collections::HashMap;
 
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    // Reset frame state — compiled code may have modified next_instr/vsd.
+    let nlocals = unsafe { &*frame.code }.varnames.len();
+    frame.next_instr = 0;
+    frame.valuestackdepth = nlocals;
+    // If green_key=0, compute from the callee frame's code pointer.
+    let green_key = if green_key == 0 {
+        crate::eval::make_green_key(frame.code, 0)
+    } else {
+        green_key
+    };
     let protocol = finish_protocol(green_key);
     let result = match pyre_interp::eval::eval_loop_for_force(frame) {
         Ok(r) => match protocol {
