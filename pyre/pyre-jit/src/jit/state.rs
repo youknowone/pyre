@@ -1636,7 +1636,11 @@ impl TraceFrameState {
             )
         };
 
-        let mut fail_args = vec![frame, next_instr, ctx.const_int((stack_depth + 1) as i64)];
+        // RPython pyjitpl.py:514: guard fail_args capture the state AFTER
+        // the branch is resolved (comparison result already consumed).
+        // The resume PC (next_instr) is the branch target, and vsd does not
+        // include the comparison result (already popped by pop_jump_if).
+        let mut fail_args = vec![frame, next_instr, ctx.const_int(stack_depth as i64)];
         for (idx, slot) in local_values.into_iter().enumerate() {
             let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
             fail_args.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, idx));
@@ -1645,16 +1649,9 @@ impl TraceFrameState {
             let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
             fail_args.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, nlocals + stack_idx));
         }
-        let branch_type = self.value_type(branch_value);
-        fail_args.push(self.materialize_fail_arg_slot(
-            ctx,
-            branch_value,
-            branch_type,
-            nlocals + stack_types.len(),
-        ));
 
         let fail_arg_types =
-            virtualizable_fail_arg_types(local_types.into_iter().chain(stack_types).chain(std::iter::once(branch_type)));
+            virtualizable_fail_arg_types(local_types.into_iter().chain(stack_types));
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
         if self.sym().pending_branch_value.is_none() {
             self.sym_mut().last_popped_concrete_value = None;
