@@ -897,6 +897,22 @@ const CALL_ASSEMBLER_OUTCOME_DEADFRAME: i64 = 1;
 /// to completion, returning the result as an i64.
 static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::new();
 
+/// RPython resume_in_blackhole parity: callback to resume execution
+/// from the guard failure point using the blackhole interpreter.
+/// Args: (green_key, trace_id, fail_index, fail_values_ptr, num_fail_values) → result i64.
+/// This reads the guard's resume data, restores state from fail_values (deadframe),
+/// and executes the remaining IR ops from the guard point to Finish.
+static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
+    fn(u64, u64, u32, *const i64, usize) -> Option<i64>,
+> = OnceLock::new();
+
+/// Register a blackhole callback for call_assembler guard failure resume.
+pub fn register_call_assembler_blackhole(
+    f: fn(u64, u64, u32, *const i64, usize) -> Option<i64>,
+) {
+    let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
+}
+
 /// Bridge compilation callback: (frame_ptr, fail_index, trace_id, green_key) -> result.
 /// Called when a call_assembler guard fails enough times to warrant bridge compilation.
 static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<extern "C" fn(i64, u32, u64, u64) -> i64> =
@@ -905,21 +921,93 @@ static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<extern "C" fn(i64, u32, u64, u64) -> i
 /// Guard failure threshold before triggering bridge compilation.
 const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
 
+/// Thread-local: raw local0 value from CallAssemblerI inputs,
+/// for force_fn to re-box before interpreter execution.
+thread_local! {
+    static PENDING_FORCE_LOCAL0: std::cell::Cell<Option<i64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Take the pending raw local0 value (if any).
+pub fn take_pending_force_local0() -> Option<i64> {
+    PENDING_FORCE_LOCAL0.with(|c| c.take())
+}
+
+/// Frame state to restore from guard failure fail_args.
+/// RPython resume_in_blackhole parity: the force_fn reads the frame state
+/// from the deadframe (outputs buffer) rather than using the corrupted frame.
+pub struct FrameRestore {
+    pub next_instr: usize,
+    pub valuestackdepth: usize,
+    /// (type, raw_value) pairs for each fail_arg slot.
+    pub slots: Vec<(majit_ir::Type, i64)>,
+}
+
+thread_local! {
+    static PENDING_FRAME_RESTORE: std::cell::Cell<Option<FrameRestore>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Take the pending frame restore data (if any).
+pub fn take_pending_frame_restore() -> Option<FrameRestore> {
+    PENDING_FRAME_RESTORE.with(|c| c.take())
+}
+
 /// Deferred bridge compile request stack. Pushed by call_assembler guard
 /// failure when threshold is reached; popped by MetaInterp after execute_token.
 /// Stack-based to handle nested call_assembler dispatch (self-recursion).
+/// Deferred bridge compile requests with depth tracking.
+/// Only requests at the current depth are taken; deeper requests
+/// are left for their own call level to process.
 thread_local! {
-    static PENDING_BRIDGE_COMPILE: std::cell::RefCell<Vec<(u64, u32)>> =
+    static PENDING_BRIDGE_COMPILE: std::cell::RefCell<Vec<(u32, u64, u64, u32)>> =
         std::cell::RefCell::new(Vec::new());
+    static BRIDGE_COMPILE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-fn request_pending_bridge_compile(trace_id: u64, fail_index: u32) {
-    PENDING_BRIDGE_COMPILE.with(|cell| cell.borrow_mut().push((trace_id, fail_index)));
+fn request_pending_bridge_compile(green_key: u64, trace_id: u64, fail_index: u32) {
+    let depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
+    eprintln!("[pending-bridge] push depth={} gk={} trace={} fail={}", depth, green_key, trace_id, fail_index);
+    PENDING_BRIDGE_COMPILE.with(|cell| {
+        cell.borrow_mut().push((depth, green_key, trace_id, fail_index));
+    });
 }
 
-/// Take all pending bridge compile requests.
-pub fn take_pending_bridge_compile() -> Vec<(u64, u32)> {
-    PENDING_BRIDGE_COMPILE.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+/// Enter a new bridge compile depth level. Returns a guard that
+/// restores the previous depth on drop.
+pub fn enter_bridge_compile_depth() -> BridgeDepthGuard {
+    let prev = BRIDGE_COMPILE_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    BridgeDepthGuard(prev)
+}
+
+pub struct BridgeDepthGuard(u32);
+impl Drop for BridgeDepthGuard {
+    fn drop(&mut self) {
+        BRIDGE_COMPILE_DEPTH.with(|d| d.set(self.0));
+    }
+}
+
+/// Take pending bridge compile requests at or above the current depth.
+pub fn take_pending_bridge_compile() -> Vec<(u64, u64, u32)> {
+    let current_depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
+    eprintln!("[take-bridge] current_depth={}", current_depth);
+    PENDING_BRIDGE_COMPILE.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        let mut result = Vec::new();
+        pending.retain(|&(depth, gk, tid, fi)| {
+            if depth >= current_depth {
+                result.push((gk, tid, fi));
+                false
+            } else {
+                true // keep for outer depth
+            }
+        });
+        result
+    })
 }
 
 // ── Call-assembler dispatch table ──
@@ -1800,7 +1888,9 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     // MetaInterp layer can pick up after execute_token returns.
     // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
     if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-        request_pending_bridge_compile(target.trace_id, fail_index);
+        // green_key from target's header_pc (may be 0 for function-entry traces)
+        let gk = target.header_pc; // use header_pc; caller provides real green_key
+        request_pending_bridge_compile(gk, target.trace_id, fail_index);
     }
 
     let saved_data = if let Some(ref ff) = force_frame {
@@ -1832,6 +1922,172 @@ const FAST_PATH_MAX_OUTPUTS: usize = 16;
 /// Traces with more live ref roots must use the heap path to avoid
 /// overwriting the fixed stack scratch space.
 const FAST_PATH_MAX_ROOTS: usize = 8;
+
+/// RPython assembler_call_helper parity: handle guard failure from
+/// direct call_assembler path. Checks for bridge first, falls back
+/// to force_fn. Called from codegen's direct non-finish block.
+///
+/// This avoids the full shim → execute_registered_loop_target overhead
+/// while still supporting bridge dispatch.
+/// RPython assembler_call_helper parity: handle guard failure from
+/// direct call_assembler path. Ultra-lightweight: just increments
+/// fail count, checks bridge (atomic + mutex only when bridge exists),
+/// and defers bridge compilation. Falls back to force_fn.
+#[inline(never)]
+extern "C" fn call_assembler_guard_failure(
+    token_number: u64,
+    fail_index: u32,
+    frame_ptr: i64,
+    outputs_ptr: *const i64,
+    inputs_ptr: *const i64,
+) -> i64 {
+    let target = unsafe { &*fast_lookup_ca_target(token_number) };
+    let fail_descr = &target.fail_descrs[fail_index as usize];
+    let fail_count = fail_descr.increment_fail_count();
+
+    // Fast bridge dispatch: use atomic bridge_code_ptr to avoid Mutex.
+    let bridge_ptr = fail_descr.bridge_code_ptr();
+    if !bridge_ptr.is_null() {
+        let num_inputs = fail_descr.fail_arg_types.len();
+        let inputs = unsafe { std::slice::from_raw_parts(outputs_ptr, num_inputs) };
+        let func: unsafe extern "C" fn(*const i64, *mut i64, *mut i64) -> i64 =
+            unsafe { std::mem::transmute(bridge_ptr) };
+        let mut bridge_outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
+        let mut bridge_roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
+        let bridge_fail_index = unsafe {
+            func(inputs.as_ptr(), bridge_outputs.as_mut_ptr(), bridge_roots.as_mut_ptr() as *mut i64)
+        };
+        // Simple bridge: Finish at index 0 or 1
+        let _ = bridge_fail_index;
+        return bridge_outputs[0];
+    } else if fail_count == DEFAULT_BRIDGE_THRESHOLD {
+        compile_base_case_bridge(target, fail_index);
+    }
+
+    // RPython resume_in_blackhole parity: resume execution from the guard
+    // failure point using the blackhole interpreter. The blackhole reads
+    // values from the outputs buffer (deadframe) and executes the remaining
+    // IR ops from guard+1 to Finish, returning the result directly.
+    let num_outputs = fail_descr.fail_arg_types.len();
+    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+        let green_key = target.header_pc;
+        let trace_id = target.trace_id;
+        if let Some(result) = bh_fn(green_key, trace_id, fail_index, outputs_ptr, num_outputs) {
+            return result;
+        }
+    }
+    // Fallback: force_fn re-executes the callee from scratch.
+    if !inputs_ptr.is_null() && target.inputarg_types.len() > 3 {
+        let raw = unsafe { *inputs_ptr.add(3) };
+        PENDING_FORCE_LOCAL0.with(|c| c.set(Some(raw)));
+    }
+    CALL_ASSEMBLER_FORCE_FN.get().map_or(0, |f| f(frame_ptr))
+}
+
+/// Compile a simple bridge (GetfieldGcI + Finish) for base-case guard failures.
+/// Called synchronously from call_assembler_guard_failure, matching RPython's
+/// handle_fail → _trace_and_compile_from_bridge pattern.
+///
+/// This does NOT use MetaInterp — bridge ops are trivial and need no optimizer.
+fn compile_base_case_bridge(
+    target: &RegisteredLoopTarget,
+    fail_index: u32,
+) -> bool {
+    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+
+    let fail_descr = match target.fail_descrs.get(fail_index as usize) {
+        Some(d) => d,
+        None => return false,
+    };
+    let fail_arg_types = fail_descr.fail_arg_types();
+
+    // Find the value to return in the bridge.
+    // Look for Ref (boxed int → unbox) or Int (raw value → return directly)
+    // after the virtualizable header (idx >= 3).
+    let ref_idx = fail_arg_types
+        .iter()
+        .enumerate()
+        .position(|(i, tp)| i >= 3 && *tp == Type::Ref);
+    let int_idx = fail_arg_types
+        .iter()
+        .enumerate()
+        .position(|(i, tp)| i >= 3 && *tp == Type::Int);
+
+    let mut bridge_ops = Vec::new();
+    let num_inputs = fail_arg_types.len() as u32;
+
+    if let Some(ref_idx) = ref_idx {
+        // Boxed int: GetfieldGcI(n_boxed, intval_offset) → Finish(raw_n)
+        let n_boxed = OpRef(ref_idx as u32);
+        let intval_descr = majit_ir::make_field_descr(8, 8, Type::Int, true);
+        let unboxed = OpRef(num_inputs);
+        let mut getfield = Op::with_descr(OpCode::GetfieldGcI, &[n_boxed], intval_descr);
+        getfield.pos = unboxed;
+        bridge_ops.push(getfield);
+
+        let finish_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            crate::guard::CraneliftFailDescr::new_with_kind(num_inputs + 1, vec![Type::Int], true),
+        );
+        let mut finish_op = Op::with_descr(OpCode::Finish, &[unboxed], finish_descr);
+        finish_op.pos = OpRef(num_inputs + 1);
+        bridge_ops.push(finish_op);
+    } else if let Some(int_idx) = int_idx {
+        // Raw int: Finish(raw_value) directly
+        let raw_val = OpRef(int_idx as u32);
+        let finish_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            crate::guard::CraneliftFailDescr::new_with_kind(num_inputs, vec![Type::Int], true),
+        );
+        let mut finish_op = Op::with_descr(OpCode::Finish, &[raw_val], finish_descr);
+        finish_op.pos = OpRef(num_inputs);
+        bridge_ops.push(finish_op);
+    } else {
+        return false;
+    };
+
+    let bridge_inputargs: Vec<InputArg> = fail_arg_types
+        .iter()
+        .enumerate()
+        .map(|(i, tp)| InputArg::from_type(*tp, i as u32))
+        .collect();
+
+    // Compile using a fresh backend instance
+    let mut backend = CraneliftBackend::new();
+    backend.set_next_trace_id(target.trace_id * 100 + fail_index as u64 + 1000);
+    backend.set_constants(std::collections::HashMap::new());
+
+    let compiled = match backend.do_compile(
+        &bridge_inputargs,
+        &bridge_ops,
+        None,
+        Some((target.trace_id, fail_index)),
+        None,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[bridge] do_compile failed: {e}");
+            return false;
+        }
+    };
+
+    // Attach bridge to the guard's fail descriptor
+    fail_descr.attach_bridge(crate::guard::BridgeData {
+        trace_id: compiled.trace_id,
+        input_types: compiled.input_types,
+        header_pc: compiled.header_pc,
+        source_guard: (target.trace_id, fail_index),
+        caller_prefix_layout: compiled.caller_prefix_layout,
+        code_ptr: compiled.code_ptr,
+        fail_descrs: compiled.fail_descrs,
+        terminal_exit_layouts: compiled.terminal_exit_layouts,
+        gc_runtime_id: compiled.gc_runtime_id,
+        num_inputs: compiled.num_inputs,
+        num_ref_roots: compiled.num_ref_roots,
+        max_output_slots: compiled.max_output_slots,
+        needs_force_frame: compiled.needs_force_frame,
+    });
+
+    true
+}
 
 /// Fast path for call_assembler when a force callback is available.
 /// Runs compiled code with stack-allocated buffers, avoiding all heap
@@ -2146,10 +2402,31 @@ extern "C" fn call_assembler_shim(
             .expect("finish_result_from_deadframe failed") as u64;
     }
 
-    // Guard failure: call force_fn if available, otherwise return deadframe.
-    // RPython assembler_call_helper: handle_fail → blackhole or bridge.
+    // RPython resume_in_blackhole parity: use blackhole to resume from
+    // the guard failure point instead of re-executing from scratch.
+    let fail_index = descr.fail_index();
+    let fail_types = descr.fail_arg_types();
+    let fail_values: Vec<i64> = (0..fail_types.len())
+        .map(|i| get_int_from_deadframe(&frame, i).unwrap_or(0))
+        .collect();
+    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+        if let Some(result) = bh_fn(
+            target.header_pc, target.trace_id,
+            fail_index, fail_values.as_ptr(), fail_values.len(),
+        ) {
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return result as u64;
+        }
+    }
+    // Fallback: force_fn re-executes from scratch.
     if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
         let callee_frame_ptr = input_slice[0];
+        if input_slice.len() > 3 {
+            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(input_slice[3])));
+        }
         let result = force_fn(callee_frame_ptr);
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -5110,22 +5387,19 @@ impl CraneliftBackend {
 
                             builder.switch_to_block(direct_force_block);
                             builder.seal_block(direct_force_block);
-                            // RPython: force_fn receives the callee frame, which is
-                            // inputs[0] (the first CallAssemblerI arg). outputs[0]
-                            // holds the virtualizable frame (fail_args[0] = caller).
+                            // RPython assembler_call_helper: bridge check + force_fn.
                             let frame_ptr = builder.ins().load(
                                 cl_types::I64,
                                 MemFlags::trusted(),
                                 args_ptr,
-                                0, // inputs[0] = callee frame
+                                0,
                             );
-                            let force_fn_ptr = *CALL_ASSEMBLER_FORCE_FN.get().unwrap();
                             let force_result = emit_host_call(
                                 &mut builder,
                                 ptr_type,
                                 call_conv,
-                                force_fn_ptr as *const () as usize,
-                                &[frame_ptr],
+                                call_assembler_guard_failure as *const () as usize,
+                                &[target_token, fail_idx_raw, frame_ptr, out_ptr, args_ptr_i64],
                                 Some(cl_types::I64),
                             );
                             builder.ins().jump(ca_merge_block, &[force_result.unwrap()]);

@@ -11,5 +11,7 @@ pub use compiler::{
     get_ref_from_deadframe, get_savedata_ref_from_deadframe, grab_savedata_ref_from_deadframe,
     jit_exc_is_pending, jit_exc_raise, register_call_assembler_bridge,
     register_call_assembler_force, register_pending_call_assembler_target,
+    enter_bridge_compile_depth, take_pending_force_local0, take_pending_frame_restore,
+    FrameRestore, BridgeDepthGuard, register_call_assembler_blackhole,
     set_gil_hooks, set_savedata_ref_on_deadframe, take_pending_bridge_compile,
 };

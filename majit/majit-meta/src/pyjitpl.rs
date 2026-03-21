@@ -2313,12 +2313,8 @@ impl<M: Clone> MetaInterp<M> {
 
         Self::prepare_compiled_run_io();
         let frame = self.backend.execute_token(&compiled.token, live_values);
-
-        // Process deferred bridge compile requests from call_assembler shim.
-        // The shim cannot call compile_bridge directly (MetaInterp reentrancy),
-        // so it stores a request that we process here after execute_token returns.
-        // Deferred bridge compile requests are processed in force_fn
-        // (jit_force_callee_frame) where MetaInterp is not borrowed.
+        // RPython: bridge compilation happens synchronously inside
+        // assembler_call_helper (called from compiled code). No deferred queue.
 
         let descr = self.backend.get_latest_descr(&frame);
         let fail_index = descr.fail_index();
@@ -3274,7 +3270,9 @@ impl<M: Clone> MetaInterp<M> {
         })
     }
 
-    fn blackhole_guard_failure(
+    /// RPython resume_in_blackhole parity: resume execution from the guard
+    /// failure point using the IR-based blackhole interpreter.
+    pub fn blackhole_guard_failure(
         &self,
         green_key: u64,
         trace_id: u64,

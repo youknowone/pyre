@@ -303,6 +303,18 @@ fn box_traced_raw_float(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     )
 }
 
+fn ensure_boxed_for_ca(
+    ctx: &mut TraceCtx,
+    state: &TraceFrameState,
+    value: OpRef,
+) -> OpRef {
+    match state.value_type(value) {
+        Type::Int => box_traced_raw_int(ctx, value),
+        Type::Float => box_traced_raw_float(ctx, value),
+        Type::Ref | Type::Void => value,
+    }
+}
+
 fn box_value_for_python_helper(
     state: &mut TraceFrameState,
     ctx: &mut TraceCtx,
@@ -639,6 +651,16 @@ fn concrete_value_type(value: PyObjectRef) -> Type {
     Type::Ref
 }
 
+/// RPython parity: virtualizable array slots are always GCREF (Ref).
+/// Even W_IntObject values are Ref — the trace unboxes via GetfieldGcPureI.
+fn concrete_virtualizable_slot_type(value: PyObjectRef) -> Type {
+    if value.is_null() || looks_like_heap_ref(value) {
+        Type::Ref
+    } else {
+        Type::Int
+    }
+}
+
 fn looks_like_heap_ref(value: PyObjectRef) -> bool {
     let addr = value as usize;
     let word_align = std::mem::align_of::<usize>() - 1;
@@ -679,14 +701,14 @@ fn concrete_slot_types(
     for idx in 0..num_locals {
         types.push(
             concrete_stack_value(frame, idx)
-                .map(concrete_value_type)
+                .map(concrete_virtualizable_slot_type)
                 .unwrap_or(Type::Ref),
         );
     }
     for stack_idx in 0..stack_only {
         types.push(
             concrete_stack_value(frame, num_locals + stack_idx)
-                .map(concrete_value_type)
+                .map(concrete_virtualizable_slot_type)
                 .unwrap_or(Type::Ref),
         );
     }
@@ -1265,7 +1287,7 @@ impl TraceFrameState {
     ) -> Result<(), PyError> {
         let vtype = self.value_type(value);
         let concrete_slot_type =
-            concrete_stack_value(self.concrete_frame, idx).map(concrete_value_type);
+            concrete_stack_value(self.concrete_frame, idx).map(concrete_virtualizable_slot_type);
         match (concrete_slot_type, vtype) {
             (Some(Type::Int), Type::Ref) => {
                 value = self.trace_guarded_int_payload(ctx, value);
@@ -1296,6 +1318,7 @@ impl TraceFrameState {
         s.symbolic_local_types[idx] = match concrete_slot_type {
             Some(Type::Int) => Type::Int,
             Some(Type::Float) => Type::Float,
+            Some(Type::Ref) => Type::Ref,
             _ => stored_type,
         };
         Ok(())
@@ -1407,7 +1430,7 @@ impl TraceFrameState {
     /// as raw Int values, not freshly boxed W_Int objects.
     fn materialize_loop_carried_value(
         &mut self,
-        _ctx: &mut TraceCtx,
+        ctx: &mut TraceCtx,
         value: OpRef,
         slot_type: Type,
     ) -> OpRef {
@@ -1418,6 +1441,33 @@ impl TraceFrameState {
                     // Convert boxed W_Int back to its raw payload so the loop
                     // header sees the typed INT stream expected by restore_values().
                     self.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, value))
+                }
+                _ => value,
+            },
+            Type::Ref => match self.value_type(value) {
+                Type::Int => {
+                    // Virtualizable slots are Ref — re-box raw Int for the
+                    // loop header which expects boxed W_IntObject.
+                    let int_type_addr = &INT_TYPE as *const _ as i64;
+                    crate::jit::generated::trace_box_int(
+                        ctx,
+                        value,
+                        w_int_size_descr(),
+                        ob_type_descr(),
+                        int_intval_descr(),
+                        int_type_addr,
+                    )
+                }
+                Type::Float => {
+                    let float_type_addr = &FLOAT_TYPE as *const _ as i64;
+                    crate::trace_box_float(
+                        ctx,
+                        value,
+                        w_float_size_descr(),
+                        ob_type_descr(),
+                        float_floatval_descr(),
+                        float_type_addr,
+                    )
                 }
                 _ => value,
             },
@@ -3217,38 +3267,23 @@ impl TraceFrameState {
                                 let helper_arg_types = frame_callable_arg_types(args.len());
                                 ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types)
                             };
-                            let (ca_args, callee_slot_types) =
-                                if let Some(raw_arg) = self_recursive_raw_arg {
-                                    (
-                                        synthesize_fresh_callee_entry_args(
-                                            ctx,
-                                            callee_frame,
-                                            &[raw_arg],
-                                            callee_nlocals,
-                                        ),
-                                        pending_entry_slot_types_from_args(
-                                            &[Type::Int],
-                                            callee_nlocals,
-                                            0,
-                                        ),
-                                    )
-                                } else {
-                                    let arg_slot_types: Vec<Type> =
-                                        args.iter().map(|&arg| this.value_type(arg)).collect();
-                                    (
-                                        synthesize_fresh_callee_entry_args(
-                                            ctx,
-                                            callee_frame,
-                                            args,
-                                            callee_nlocals,
-                                        ),
-                                        pending_entry_slot_types_from_args(
-                                            &arg_slot_types,
-                                            callee_nlocals,
-                                            0,
-                                        ),
-                                    )
-                                };
+                            // RPython parity: CallAssemblerI locals must be Ref
+                            // (boxed) to match the callee trace's virtualizable
+                            // array type. Raw Int args are re-boxed before passing.
+                            let ca_locals: Vec<OpRef> = if let Some(raw_arg) = self_recursive_raw_arg {
+                                vec![box_traced_raw_int(ctx, raw_arg)]
+                            } else {
+                                args.iter().map(|&arg| ensure_boxed_for_ca(ctx, &*this, arg)).collect()
+                            };
+                            let ca_args = synthesize_fresh_callee_entry_args(
+                                ctx, callee_frame, &ca_locals, callee_nlocals,
+                            );
+                            let callee_slot_types =
+                                pending_entry_slot_types_from_args(
+                                    &vec![Type::Ref; ca_locals.len()],
+                                    callee_nlocals,
+                                    0,
+                                );
                             let ca_arg_types =
                                 frame_entry_arg_types_from_slot_types(&callee_slot_types);
                             let result = ctx.call_assembler_int_by_number_typed(
@@ -3726,20 +3761,18 @@ impl TraceFrameState {
                             let code_ptr = w_func_get_code_ptr(concrete_callable) as *const pyre_bytecode::CodeObject;
                             (&*code_ptr).varnames.len()
                         };
-                        // RPython call_assembler parity: the caller must pass
-                        // the callee loop-header contract, not force all local
-                        // slots back through boxed PyObject storage. For the
-                        // raw-int self-recursive helper path, the first local
-                        // stays an Int input all the way into the callee's
-                        // function-entry trace.
+                        // RPython parity: CallAssemblerI locals must be Ref
+                        // (boxed) to match the callee trace's virtualizable
+                        // array type. Re-box the raw Int arg.
+                        let boxed_arg = box_traced_raw_int(ctx, raw_arg);
                         let ca_args = synthesize_fresh_callee_entry_args(
                             ctx,
                             callee_frame,
-                            &[raw_arg],
+                            &[boxed_arg],
                             callee_nlocals,
                         );
                         let callee_slot_types =
-                            pending_entry_slot_types_from_args(&[Type::Int], callee_nlocals, 0);
+                            pending_entry_slot_types_from_args(&[Type::Ref], callee_nlocals, 0);
                         let ca_arg_types =
                             frame_entry_arg_types_from_slot_types(&callee_slot_types);
                         let ca_result = ctx.call_assembler_int_by_number_typed(
