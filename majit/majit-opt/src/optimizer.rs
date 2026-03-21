@@ -13,7 +13,7 @@ use crate::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{Op, OpCode, OpRef, Type};
+use majit_ir::{GuardVirtualEntry, Op, OpCode, OpRef, Type};
 
 /// The optimizer: chains passes and runs them over a trace.
 ///
@@ -455,15 +455,73 @@ impl Optimizer {
     /// In majit, pending fields are currently emitted as ops before the guard
     /// (see `emit_guard_operation`) or kept deferred in heap.rs lazy sets.
     /// This method is reserved for future resume data integration.
-    pub fn store_final_boxes_in_guard(&mut self, guard_op: &mut Op) {
+    /// optimizer.py: store_final_boxes_in_guard(op)
+    ///
+    /// RPython parity: walk fail_args, detect virtual objects, expand
+    /// fail_args with virtual field values, record blueprints in rd_virtuals.
+    /// resume.py: ResumeDataVirtualAdder.finish() equivalent.
+    pub fn store_final_boxes_in_guard(&mut self, guard_op: &mut Op, ctx: &OptContext) {
         let pending = std::mem::take(&mut self.pendingfields);
         if guard_op.fail_args.is_none() {
             guard_op.fail_args = Some(Default::default());
         }
-        // Pending fields are emitted before the guard in emit_guard_operation.
-        // When full resume data encoding is implemented, they should be
-        // stored in the guard descriptor as rd_pendingfields instead.
         let _ = pending;
+
+        let Some(ref fail_args) = guard_op.fail_args else { return };
+        let original_len = fail_args.len();
+        let mut extra_args: Vec<OpRef> = Vec::new();
+        let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
+
+        for fa_idx in 0..original_len {
+            let opref = fail_args[fa_idx];
+            if opref.is_none() {
+                continue;
+            }
+            let resolved = ctx.get_replacement(opref);
+            let Some(info) = ctx.get_ptr_info(resolved) else { continue };
+
+            match info.clone() {
+                crate::info::PtrInfo::VirtualStruct(vinfo) => {
+                    let base_idx = original_len + extra_args.len();
+                    let mut fields = Vec::new();
+                    for (i, (field_idx, value_ref)) in vinfo.fields.iter().enumerate() {
+                        let resolved_val = ctx.get_replacement(*value_ref);
+                        extra_args.push(resolved_val);
+                        fields.push((*field_idx, base_idx + i));
+                    }
+                    virtual_entries.push(GuardVirtualEntry {
+                        fail_arg_index: fa_idx,
+                        descr: vinfo.descr.clone(),
+                        known_class: None,
+                        fields,
+                    });
+                }
+                crate::info::PtrInfo::Virtual(vinfo) => {
+                    let base_idx = original_len + extra_args.len();
+                    let mut fields = Vec::new();
+                    for (i, (field_idx, value_ref)) in vinfo.fields.iter().enumerate() {
+                        let resolved_val = ctx.get_replacement(*value_ref);
+                        extra_args.push(resolved_val);
+                        fields.push((*field_idx, base_idx + i));
+                    }
+                    virtual_entries.push(GuardVirtualEntry {
+                        fail_arg_index: fa_idx,
+                        descr: vinfo.descr.clone(),
+                        known_class: vinfo.known_class,
+                        fields,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if !extra_args.is_empty() {
+            let fa = guard_op.fail_args.as_mut().unwrap();
+            fa.extend(extra_args);
+        }
+        if !virtual_entries.is_empty() {
+            guard_op.rd_virtuals = Some(virtual_entries);
+        }
     }
 
     /// optimizer.py: emit_guard_operation(op, pendingfields)
@@ -504,6 +562,10 @@ impl Optimizer {
         for op in pending {
             ctx.emit(op);
         }
+
+        // RPython parity: store_final_boxes_in_guard — expand fail_args
+        // with virtual field values and record blueprints in rd_virtuals.
+        self.store_final_boxes_in_guard(&mut guard_op, ctx);
 
         // Store this guard as the new sharing source
         let emitted = ctx.emit(guard_op.clone());
@@ -618,7 +680,16 @@ impl Optimizer {
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // Follow forwarding chain first.
         let resolved = ctx.get_replacement(opref);
-        if let Some(tracked) = ctx.take_potential_extra_op(resolved) {
+        let preamble_source = ctx.imported_short_source(resolved);
+        let tracked = ctx
+            .take_potential_extra_op(resolved)
+            .or_else(|| ctx.take_potential_extra_op(opref))
+            .or_else(|| {
+                (preamble_source != resolved && preamble_source != opref)
+                    .then(|| ctx.take_potential_extra_op(preamble_source))
+                    .flatten()
+            });
+        if let Some(tracked) = tracked {
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                 // RPython unroll.py: force_op_from_preamble() routes the
                 // tracked preamble use through short_preamble_producer.use_box(...)

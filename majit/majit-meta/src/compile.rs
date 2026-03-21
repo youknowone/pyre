@@ -153,6 +153,27 @@ pub(crate) fn build_guard_metadata(
             }
         }
 
+        // RPython parity: build recovery_layout from rd_virtuals.
+        // resume.py: store_final_boxes stores VirtualInfo blueprints in the
+        // guard descriptor so guard failure can materialize virtual objects.
+        let recovery_layout = op.rd_virtuals.as_ref().map(|entries| {
+            use majit_codegen::{ExitRecoveryLayout, ExitVirtualLayout, ExitValueSourceLayout};
+            let virtual_layouts: Vec<ExitVirtualLayout> = entries.iter().map(|entry| {
+                ExitVirtualLayout::Struct {
+                    type_id: entry.known_class.map_or(0, |gc| gc.as_usize() as u32),
+                    descr_index: entry.descr.index(),
+                    fields: entry.fields.iter().map(|(field_descr_idx, fail_arg_idx)| {
+                        (*field_descr_idx, ExitValueSourceLayout::ExitValue(*fail_arg_idx))
+                    }).collect(),
+                }
+            }).collect();
+            ExitRecoveryLayout {
+                frames: vec![],
+                virtual_layouts,
+                pending_field_layouts: vec![],
+            }
+        });
+
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -165,7 +186,7 @@ pub(crate) fn build_guard_metadata(
                 force_token_slots: Vec::new(),
                 exit_types,
                 is_finish,
-                recovery_layout: None,
+                recovery_layout,
                 resume_layout,
             },
         );
