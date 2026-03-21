@@ -7,6 +7,7 @@
 /// If a virtual escapes (e.g., passed to a call or stored in a non-virtual),
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
 
 use majit_ir::{
@@ -2119,6 +2120,10 @@ fn set_field(fields: &mut Vec<(u32, OpRef)>, field_idx: u32, value_ref: OpRef) {
 }
 
 fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
+    field_descr_registry()
+        .lock()
+        .expect("field descr registry lock poisoned")
+        .insert(field_idx, descr.clone());
     for entry in field_descrs.iter_mut() {
         if entry.0 == field_idx {
             entry.1 = descr;
@@ -2133,6 +2138,11 @@ fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<D
         .iter()
         .find(|(idx, _)| *idx == field_idx)
         .map(|(_, descr)| descr.clone())
+}
+
+fn field_descr_registry() -> &'static Mutex<HashMap<u32, DescrRef>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u32, DescrRef>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
@@ -2169,8 +2179,11 @@ impl FieldDescr for FieldIndexDescr {
     }
 
     fn field_size(&self) -> usize {
-        // Decode field_size from bits 1-3
-        ((self.0 >> 1) & 0x7) as usize
+        // Match the stable field descriptor encoding used by the real
+        // pyre/majit descriptors: pointer-sized fields encode size_bits == 0
+        // because (8 & 0x7) == 0, but the runtime field width is still 8.
+        let size_bits = ((self.0 >> 1) & 0x7) as usize;
+        if size_bits == 0 { 8 } else { size_bits }
     }
 
     fn is_field_signed(&self) -> bool {
@@ -2188,6 +2201,14 @@ impl FieldDescr for FieldIndexDescr {
 }
 
 pub(crate) fn make_field_index_descr(idx: u32) -> DescrRef {
+    if let Some(descr) = field_descr_registry()
+        .lock()
+        .expect("field descr registry lock poisoned")
+        .get(&idx)
+        .cloned()
+    {
+        return descr;
+    }
     Arc::new(FieldIndexDescr(idx))
 }
 
@@ -2315,12 +2336,12 @@ mod tests {
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptVirtualize::new()));
-        opt.optimize(ops)
+        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::default_pipeline();
-        opt.optimize(ops)
+        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
@@ -2707,6 +2728,29 @@ mod tests {
 
         let result = pass.propagate_forward(&set, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
+    }
+
+    #[test]
+    fn test_field_index_descr_decodes_pointer_sized_field_width() {
+        let descr = make_field_index_descr(virtualizable_field_index(8));
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.offset(), 8);
+        assert_eq!(fd.field_size(), 8);
+        assert_eq!(fd.field_type(), Type::Int);
+    }
+
+    #[test]
+    fn test_make_field_index_descr_reuses_registered_real_descr() {
+        let field_idx = 0x1234_5678;
+        let real_descr = majit_ir::make_field_descr(0, 8, Type::Ref, false);
+        let mut field_descrs = Vec::new();
+        set_field_descr(&mut field_descrs, field_idx, real_descr.clone());
+
+        let descr = make_field_index_descr(field_idx);
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.field_size(), 8);
+        assert_eq!(fd.field_type(), Type::Ref);
+        assert_eq!(fd.offset(), 0);
     }
 
     #[test]
@@ -3178,7 +3222,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptVirtualize::new()));
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(200, 42i64); // class ptr constant
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert_eq!(
             result.len(),
             1,
@@ -3690,7 +3738,7 @@ mod tests {
 
         let mut opt = Optimizer::default_pipeline();
         let mut constants = HashMap::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         let new_positions: std::collections::HashSet<_> = result
             .iter()

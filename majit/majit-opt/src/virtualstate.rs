@@ -126,6 +126,8 @@ pub enum VirtualStateInfo {
         known_class: Option<GcRef>,
         /// Field values as VirtualStateInfo (recursive).
         fields: Vec<(u32, Box<VirtualStateInfo>)>,
+        /// Original field descriptors for each field index.
+        field_descrs: Vec<(u32, DescrRef)>,
     },
     /// Value is a virtual array with known elements.
     VirtualArray {
@@ -139,6 +141,7 @@ pub enum VirtualStateInfo {
     VirtualStruct {
         descr: DescrRef,
         fields: Vec<(u32, Box<VirtualStateInfo>)>,
+        field_descrs: Vec<(u32, DescrRef)>,
     },
     /// Value is a virtual array of structs.
     VirtualArrayStruct {
@@ -183,11 +186,13 @@ impl VirtualStateInfo {
                     descr: d1,
                     known_class: kc1,
                     fields: f1,
+                    ..
                 },
                 VirtualStateInfo::Virtual {
                     descr: d2,
                     known_class: kc2,
                     fields: f2,
+                    ..
                 },
             ) => {
                 if d1.index() != d2.index() {
@@ -238,10 +243,12 @@ impl VirtualStateInfo {
                 VirtualStateInfo::VirtualStruct {
                     descr: d1,
                     fields: f1,
+                    ..
                 },
                 VirtualStateInfo::VirtualStruct {
                     descr: d2,
                     fields: f2,
+                    ..
                 },
             ) => {
                 if d1.index() != d2.index() {
@@ -1249,6 +1256,7 @@ fn export_single_value(
                     descr: vinfo.descr.clone(),
                     known_class: vinfo.known_class,
                     fields,
+                    field_descrs: vinfo.field_descrs.clone(),
                 };
             }
             PtrInfo::VirtualArray(vinfo) => {
@@ -1279,6 +1287,7 @@ fn export_single_value(
                 return VirtualStateInfo::VirtualStruct {
                     descr: vinfo.descr.clone(),
                     fields,
+                    field_descrs: vinfo.field_descrs.clone(),
                 };
             }
             PtrInfo::VirtualArrayStruct(vinfo) => {
@@ -1339,24 +1348,6 @@ fn export_single_value(
         }
     }
 
-    // RPython virtualstate.py: not_virtual(cpu, box.type, info)
-    // When type == 'i', create NotVirtualStateInfoInt with IntBound.
-    // When type == 'r', create NotVirtualStateInfoPtr.
-    //
-    // Check imported int bounds first (from Phase 1 → Phase 2 propagation).
-    if let Some(bound) = ctx.imported_int_bounds.get(&opref) {
-        return VirtualStateInfo::IntBounded(bound.clone());
-    }
-    // Check if the producing operation returns a raw int.
-    // This ensures that IntAdd/IntSub/IntMul results are exported as
-    // IntBounded, so the peeled body knows NOT to call GetfieldGcPureI
-    // on them (they are raw ints, not boxed W_IntObject references).
-    if let Some(op) = ctx.new_operations.iter().find(|op| op.pos == opref) {
-        if op.result_type() == majit_ir::Type::Int {
-            return VirtualStateInfo::IntBounded(IntBound::unbounded());
-        }
-    }
-
     VirtualStateInfo::Unknown
 }
 
@@ -1397,6 +1388,7 @@ fn import_single_value(
             descr,
             known_class,
             fields,
+            field_descrs,
         } => {
             let mut vfields = Vec::new();
             for (field_idx, field_info) in fields {
@@ -1410,7 +1402,7 @@ fn import_single_value(
                 descr: descr.clone(),
                 known_class: *known_class,
                 fields: vfields,
-                field_descrs: Vec::new(),
+                field_descrs: field_descrs.clone(),
             }));
         }
         VirtualStateInfo::VirtualArray { descr, items, .. } => {
@@ -1426,7 +1418,11 @@ fn import_single_value(
                 items: vitems,
             }));
         }
-        VirtualStateInfo::VirtualStruct { descr, fields } => {
+        VirtualStateInfo::VirtualStruct {
+            descr,
+            fields,
+            field_descrs,
+        } => {
             let mut vfields = Vec::new();
             for (field_idx, field_info) in fields {
                 let field_opref =
@@ -1437,7 +1433,7 @@ fn import_single_value(
             ptr_info[idx] = Some(PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vfields,
-                field_descrs: Vec::new(),
+                field_descrs: field_descrs.clone(),
             }));
         }
         VirtualStateInfo::VirtualArrayStruct {
@@ -1582,6 +1578,7 @@ mod tests {
                 (0, Box::new(VirtualStateInfo::Constant(Value::Int(10)))),
                 (1, Box::new(VirtualStateInfo::Unknown)),
             ],
+            field_descrs: Vec::new(),
         };
         let v2 = VirtualStateInfo::Virtual {
             descr: descr.clone(),
@@ -1590,11 +1587,13 @@ mod tests {
                 (0, Box::new(VirtualStateInfo::Constant(Value::Int(10)))),
                 (1, Box::new(VirtualStateInfo::Constant(Value::Int(20)))),
             ],
+            field_descrs: Vec::new(),
         };
         let v3 = VirtualStateInfo::Virtual {
             descr: descr.clone(),
             known_class: None,
             fields: vec![(0, Box::new(VirtualStateInfo::Constant(Value::Int(99))))],
+            field_descrs: Vec::new(),
         };
 
         assert!(v1.is_compatible(&v2)); // field 0 matches, field 1 is Unknown (accepts anything)
@@ -1793,6 +1792,7 @@ mod tests {
                 descr: descr.clone(),
                 known_class: None,
                 fields: vec![],
+                field_descrs: Vec::new(),
             }
             .is_virtual()
         );
@@ -1818,6 +1818,7 @@ mod tests {
             VirtualStateInfo::VirtualStruct {
                 descr,
                 fields: vec![],
+                field_descrs: Vec::new(),
             },
             VirtualStateInfo::NonNull,
         ]);
@@ -1835,6 +1836,7 @@ mod tests {
             VirtualStateInfo::VirtualStruct {
                 descr,
                 fields: vec![],
+                field_descrs: Vec::new(),
             },
             VirtualStateInfo::NonNull,
         ]);
@@ -1857,6 +1859,7 @@ mod tests {
                 (0, Box::new(VirtualStateInfo::Constant(Value::Int(7)))),
                 (8, Box::new(VirtualStateInfo::NonNull)),
             ],
+            field_descrs: Vec::new(),
         }]);
         let mut ctx = OptContext::new(32);
         ctx.set_ptr_info(
@@ -1880,6 +1883,7 @@ mod tests {
                 descr: descr.clone(),
                 known_class: Some(GcRef(0x1000)),
                 fields: vec![],
+                field_descrs: Vec::new(),
             },
             VirtualStateInfo::NonNull,
             VirtualStateInfo::VirtualArray {
@@ -1907,7 +1911,7 @@ mod tests {
         let descr = test_descr(12);
         let virtual_ref = OpRef(20);
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
-        let mut ctx = OptContext::new(32);
+        let mut ctx = OptContext::with_num_inputs(32, 1024);
         ctx.set_ptr_info(
             virtual_ref,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -1935,7 +1939,12 @@ mod tests {
                 true,
             )
             .expect("force_boxes=True should retry instead of failing");
-        assert_eq!(inputargs, vec![virtual_ref]);
+        // After forcing, the virtual struct is replaced by a concrete
+        // allocation at a new position. The inputarg should be that
+        // forced allocation ref (which is what ctx.get_replacement
+        // resolves the original virtual_ref to).
+        assert_eq!(inputargs.len(), 1);
+        assert_eq!(inputargs[0], ctx.get_replacement(virtual_ref));
         assert!(virtuals.is_empty());
     }
 
@@ -1987,6 +1996,7 @@ mod tests {
                 descr,
                 known_class: None,
                 fields: vec![],
+                field_descrs: Vec::new(),
             },
             VirtualStateInfo::Unknown,
         ]);

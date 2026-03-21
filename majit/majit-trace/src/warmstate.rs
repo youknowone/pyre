@@ -292,6 +292,37 @@ pub enum HotResult {
 }
 
 impl WarmEnterState {
+    fn should_start_dont_trace_here_trace(
+        &mut self,
+        green_key_hash: u64,
+        flags: u8,
+        has_seen_a_procedure_token: bool,
+    ) -> bool {
+        if flags & jc_flags::DONT_TRACE_HERE == 0 || has_seen_a_procedure_token {
+            return false;
+        }
+        if flags & jc_flags::TRACING_OCCURRED != 0 {
+            self.counter.tick(green_key_hash)
+        } else {
+            true
+        }
+    }
+
+    fn start_tracing_cell(&mut self, green_key_hash: u64) -> HotResult {
+        self.counter.reset(green_key_hash);
+        self.tracing_generation += 1;
+        let current_generation = self.tracing_generation;
+        let cell = self
+            .cells
+            .entry(green_key_hash)
+            .or_insert_with(BaseJitCell::new);
+        cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+        cell.state = BaseJitCellState::Tracing;
+        cell.tracing_generation = current_generation;
+
+        HotResult::StartTracing(Trace::with_limit(self.trace_limit as usize))
+    }
+
     /// Create a new WarmEnterState with the given threshold.
     /// Automatically enables Logger if MAJIT_STATS=1 or MAJIT_LOG=1.
     pub fn new(threshold: u32) -> Self {
@@ -366,7 +397,7 @@ impl WarmEnterState {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
                 return false;
             }
         }
@@ -385,7 +416,7 @@ impl WarmEnterState {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
                 return false;
             }
         }
@@ -394,13 +425,24 @@ impl WarmEnterState {
 
     pub fn maybe_compile(&mut self, green_key_hash: u64) -> HotResult {
         if let Some(cell) = self.cells.get(&green_key_hash) {
-            if cell.is_compiled() {
+            let is_compiled = cell.is_compiled();
+            let is_tracing = cell.is_tracing();
+            let flags = cell.flags;
+            let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
+            if is_compiled {
                 return HotResult::RunCompiled;
             }
-            if cell.is_tracing() {
+            if is_tracing {
                 return HotResult::AlreadyTracing;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            if self.should_start_dont_trace_here_trace(
+                green_key_hash,
+                flags,
+                has_seen_a_procedure_token,
+            ) {
+                return self.start_tracing_cell(green_key_hash);
+            }
+            if flags & jc_flags::DONT_TRACE_HERE != 0 {
                 return HotResult::NotHot;
             }
         }
@@ -409,19 +451,7 @@ impl WarmEnterState {
             return HotResult::NotHot;
         }
 
-        // Threshold reached: start tracing
-        self.counter.reset(green_key_hash);
-        self.tracing_generation += 1;
-        let current_generation = self.tracing_generation;
-        let cell = self
-            .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
-        cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
-        cell.state = BaseJitCellState::Tracing;
-        cell.tracing_generation = current_generation;
-
-        HotResult::StartTracing(Trace::with_limit(self.trace_limit as usize))
+        self.start_tracing_cell(green_key_hash)
     }
 
     /// Force-start tracing for a green key, bypassing the hot counter.
@@ -436,23 +466,12 @@ impl WarmEnterState {
             if cell.is_tracing() {
                 return HotResult::AlreadyTracing;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
                 return HotResult::NotHot;
             }
         }
 
-        self.counter.reset(green_key_hash);
-        self.tracing_generation += 1;
-        let current_generation = self.tracing_generation;
-        let cell = self
-            .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
-        cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
-        cell.state = BaseJitCellState::Tracing;
-        cell.tracing_generation = current_generation;
-
-        HotResult::StartTracing(Trace::with_limit(self.trace_limit as usize))
+        self.start_tracing_cell(green_key_hash)
     }
 
     /// Start a retrace from a guard failure point.
@@ -660,6 +679,47 @@ impl WarmEnterState {
         if cell.flags & jc_flags::TRACING == 0 {
             cell.state = BaseJitCellState::DontTraceHere;
         }
+    }
+
+    /// Mirror RPython warmstate.py `mark_force_finish_tracing(greenkey)`.
+    ///
+    /// The next tracing run for this green key should segment instead of
+    /// repeatedly aborting once it approaches the trace limit.
+    pub fn mark_force_finish_tracing(&mut self, green_key_hash: u64) {
+        let cell = self
+            .cells
+            .entry(green_key_hash)
+            .or_insert_with(BaseJitCell::new);
+        cell.flags |= jc_flags::FORCE_FINISH;
+    }
+
+    pub fn should_force_finish_tracing(&self, green_key_hash: u64) -> bool {
+        self.cells
+            .get(&green_key_hash)
+            .is_some_and(|cell| cell.flags & jc_flags::FORCE_FINISH != 0)
+    }
+
+    /// Consume the one-shot segmented-trace request for `green_key_hash`.
+    ///
+    /// Mirrors how RPython's `mark_force_finish_tracing()` affects the next
+    /// tracing run only.
+    pub fn take_force_finish_tracing(&mut self, green_key_hash: u64) -> bool {
+        let Some(cell) = self.cells.get_mut(&green_key_hash) else {
+            return false;
+        };
+        let was_set = cell.flags & jc_flags::FORCE_FINISH != 0;
+        cell.flags &= !jc_flags::FORCE_FINISH;
+        was_set
+    }
+
+    /// Boost the current loop/function green key so the next execution
+    /// immediately retriggers tracing.
+    ///
+    /// Mirrors PyPy's `JitCell.trace_next_iteration()` in warmstate.py:
+    /// it does not force tracing right now, it only raises the hot counter
+    /// to ~threshold so the next hit converges quickly.
+    pub fn trace_next_iteration(&mut self, green_key_hash: u64) {
+        self.counter.change_current_fraction(green_key_hash, 0.98);
     }
 
     /// Boost a function's entry counter to threshold - 1.
@@ -1135,10 +1195,12 @@ mod tests {
         assert!(!cell.is_tracing());
         assert!(cell.flags & jc_flags::DONT_TRACE_HERE != 0);
 
-        // Now it should report NotHot because DONT_TRACE_HERE is set
+        // RPython warmstate.py: a DONT_TRACE_HERE cell with no procedure token
+        // still retriggers separate tracing after warming up again.
+        assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::NotHot => {}
-            _ => panic!("expected NotHot due to DONT_TRACE_HERE"),
+            HotResult::StartTracing(_) => {}
+            _ => panic!("expected StartTracing due to DONT_TRACE_HERE retrace"),
         }
     }
 
@@ -1419,9 +1481,10 @@ mod tests {
         assert!(cell.flags & jc_flags::DONT_TRACE_HERE != 0);
         assert!(!cell.is_tracing());
 
-        // Future maybe_compile returns NotHot even though counter might tick.
+        // RPython warmstate.py: DONT_TRACE_HERE still allows separate
+        // tracing later for keys without a procedure token.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(42), HotResult::StartTracing(_)));
     }
 
     #[test]
@@ -1828,7 +1891,7 @@ mod tests {
         // Odd-indexed loops registered at gen i should be evicted
         // when generation > i + 4.
         for i in 0..10u64 {
-            let is_alive = aging.loop_generations.contains_key(&i);
+            let is_alive = aging.contains_loop(i);
             if i % 2 == 0 {
                 assert!(is_alive, "even-indexed loop {} should be alive", i);
             }

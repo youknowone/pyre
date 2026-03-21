@@ -94,7 +94,7 @@ mod tests {
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = crate::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptSimplify::new()));
-        opt.optimize(ops)
+        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     #[test]

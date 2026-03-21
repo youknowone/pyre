@@ -678,7 +678,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // No loop to vectorize, ops should pass through
         // (pre-label ops are buffered but emitted when we hit non-Label)
@@ -700,7 +700,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // Should still have Label and Jump
         assert!(result.iter().any(|op| op.opcode == OpCode::Label));

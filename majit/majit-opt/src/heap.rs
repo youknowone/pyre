@@ -199,13 +199,17 @@ impl OptHeap {
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, _allow_force: bool) -> bool {
         let orig_val = ctx.get_replacement(op.arg(1));
 
-        // RPython heap.py:618-620: if value is virtual, do NOT emit.
-        // The virtual stays virtual — guard failure materializes it via
-        // rd_virtuals. Emitting a SetfieldGc with a virtual RHS would
-        // cause the compiled code to write an un-materialized pointer.
-        if let Some(info) = ctx.get_ptr_info(orig_val) {
+        // If value is virtual, materialize it directly (bypass pass chain
+        // to avoid re-virtualization by OptVirtualize).
+        if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
             if info.is_virtual() {
-                return false; // skip — virtual handled by guard resume data
+                let forced = info.force_to_ops_direct(orig_val, ctx);
+                op.args[1] = forced;
+                for arg in op.args.iter_mut() {
+                    *arg = ctx.get_replacement(*arg);
+                }
+                ctx.emit(op.clone());
+                return true;
             }
         }
 
@@ -632,7 +636,11 @@ impl OptHeap {
         if let Some(&cached) = ctx.imported_short_fields.get(&key) {
             let cached = ctx.force_op_from_preamble(cached);
             self.cached_fields.entry(key).or_insert(cached);
-            self.remember_field_descr(key, op);
+            if let Some(descr) = ctx.imported_short_field_descrs.get(&key) {
+                self.cached_field_descrs.insert(key, descr.clone());
+            } else {
+                self.remember_field_descr(key, op);
+            }
         }
 
         // Check immutable field cache first — these survive all invalidation.
@@ -740,7 +748,11 @@ impl OptHeap {
             if let Some(&cached) = ctx.imported_short_arrayitems.get(&key) {
                 let cached = ctx.force_op_from_preamble(cached);
                 self.cached_arrayitems.entry(key).or_insert(cached);
-                self.remember_arrayitem_descr(key, op);
+                if let Some(descr) = ctx.imported_short_arrayitem_descrs.get(&key) {
+                    self.cached_arrayitem_descrs.insert(key, descr.clone());
+                } else {
+                    self.remember_arrayitem_descr(key, op);
+                }
             }
             if let Some(&cached) = self.cached_arrayitems.get(&key) {
                 let cached = ctx.get_replacement(cached);

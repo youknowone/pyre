@@ -81,6 +81,49 @@ pub fn make_call_descr(arg_types: &[Type], result_type: Type) -> DescrRef {
     })
 }
 
+/// Create a CallDescr for CALL_MAY_FORCE_* operations.
+///
+/// RPython treats these as may-raise calls guarded by GUARD_NOT_FORCED, not as
+/// generic cannot-raise helpers.
+pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> DescrRef {
+    #[derive(Debug)]
+    struct MetaCallMayForceDescr {
+        arg_types: Vec<Type>,
+        result_type: Type,
+    }
+
+    impl majit_ir::Descr for MetaCallMayForceDescr {
+        fn index(&self) -> u32 {
+            u32::MAX
+        }
+        fn as_call_descr(&self) -> Option<&dyn CallDescr> {
+            Some(self)
+        }
+    }
+
+    impl CallDescr for MetaCallMayForceDescr {
+        fn arg_types(&self) -> &[Type] {
+            &self.arg_types
+        }
+        fn result_type(&self) -> Type {
+            self.result_type
+        }
+        fn result_size(&self) -> usize {
+            0
+        }
+        fn effect_info(&self) -> &EffectInfo {
+            static INFO: EffectInfo =
+                EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
+            &INFO
+        }
+    }
+
+    Arc::new(MetaCallMayForceDescr {
+        arg_types: arg_types.to_vec(),
+        result_type,
+    })
+}
+
 /// Create a CallDescr for `CALL_ASSEMBLER_*` with the given target token.
 pub fn make_call_assembler_descr(
     target_token: u64,

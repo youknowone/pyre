@@ -417,6 +417,7 @@ impl PtrInfo {
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 if opref != alloc_ref {
+                    ctx.set_ptr_info(alloc_ref, PtrInfo::NonNull);
                     ctx.replace_op(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
@@ -436,6 +437,7 @@ impl PtrInfo {
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 if opref != alloc_ref {
+                    ctx.set_ptr_info(alloc_ref, PtrInfo::NonNull);
                     ctx.replace_op(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {

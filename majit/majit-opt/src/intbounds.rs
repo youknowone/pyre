@@ -667,12 +667,22 @@ impl OptIntBounds {
     }
 
     fn optimize_guard_no_overflow(&mut self, op: &Op) -> OptimizationResult {
+        let _ = op;
+        let last_is_ovf = matches!(
+            self.last_emitted_opcode,
+            Some(OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf)
+        );
+        if !last_is_ovf {
+            // RPython intbounds.py: if the last emitted operation is not an
+            // INT_*_OVF anymore, the GUARD_NO_OVERFLOW is redundant and must
+            // be dropped. This also prevents late bridge traces from keeping a
+            // stray guard after the ovf-producing op was optimized away.
+            self.pending_overflow_guard = None;
+            return OptimizationResult::Remove;
+        }
         match self.pending_overflow_guard.take() {
             Some(PendingOverflowGuard::Present) => OptimizationResult::PassOn,
-            Some(PendingOverflowGuard::ProvenSafeRemoved) | None => {
-                let _ = op;
-                OptimizationResult::Remove
-            }
+            Some(PendingOverflowGuard::ProvenSafeRemoved) | None => OptimizationResult::Remove,
         }
     }
 
