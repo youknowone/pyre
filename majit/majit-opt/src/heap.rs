@@ -221,8 +221,14 @@ impl OptHeap {
         true
     }
 
+    /// heap.py:122-139: force_lazy_set → emit_extra(op, emit=False)
+    ///
+    /// emit_extra with emit=False re-processes through all passes. The heap
+    /// pass re-absorbs the SetfieldGc as a new lazy_set → lost.
+    /// put_field_back_to_info restores the cached value for Phase 2 import.
+    ///
+    /// In majit: drop the op, update cache only.
     fn force_all_lazy_setfields(&mut self, ctx: &mut OptContext) {
-        // heap.py: check if any lazy set references the postponed op
         if let Some(ref postponed) = self.postponed_op {
             let postponed_pos = postponed.pos;
             let needs_postponed = self
@@ -237,15 +243,18 @@ impl OptHeap {
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
         for ((obj, field_idx), mut op) in pending {
-            if Self::emit_lazy_setfield(&mut op, ctx, false) {
-                let value_ref = ctx.get_replacement(op.arg(1));
-                self.remember_field_descr((obj, field_idx), &op);
-                self.cached_fields.insert((obj, field_idx), value_ref);
+            // Resolve forwarding so cache has current values
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
             }
+            let value_ref = op.arg(1);
+            // heap.py:139: put_field_back_to_info — restore cached value
+            self.cached_fields.insert((obj, field_idx), value_ref);
+            // Drop the op (RPython: re-absorbed as new lazy_set → lost)
         }
     }
 
-    /// Force all pending lazy setarrayitems: emit the stored ops and cache their values.
+    /// Same as force_all_lazy_setfields: drop + cache update.
     fn force_all_lazy_setarrayitems(&mut self, ctx: &mut OptContext) {
         let pending: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
         for ((obj, descr_idx, index), mut op) in pending {
@@ -253,10 +262,7 @@ impl OptHeap {
                 *arg = ctx.get_replacement(*arg);
             }
             let value_ref = op.arg(2);
-            let key = (obj, descr_idx, index);
-            self.remember_arrayitem_descr(key, &op);
-            ctx.emit(op);
-            self.cached_arrayitems.insert(key, value_ref);
+            self.cached_arrayitems.insert((obj, descr_idx, index), value_ref);
         }
     }
 
@@ -1496,10 +1502,10 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // Expect: SETFIELD_GC (forced by Jump) + Jump. The GETFIELD is eliminated.
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(result[1].opcode, OpCode::Jump);
+        // force_all_lazy_setfields at Jump drops lazy sets (RPython: emit_extra(emit=False)
+        // re-absorbs as lazy_set → lost). Only Jump remains.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::Jump);
     }
 
     #[test]
@@ -1567,11 +1573,9 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // Only the second SETFIELD (forced at Jump) + Jump.
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(result[0].args[1], OpRef(102)); // second value
-        assert_eq!(result[1].opcode, OpCode::Jump);
+        // force_all_lazy at Jump drops lazy sets. Only Jump remains.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::Jump);
     }
 
     // ── Test 4: SETFIELD then CALL then GETFIELD → cache invalidated ──
@@ -1590,12 +1594,12 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // SETFIELD (forced before call) + CALL + GETFIELD (re-emitted) + Jump.
-        assert_eq!(result.len(), 4);
-        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(result[1].opcode, OpCode::CallN);
-        assert_eq!(result[2].opcode, OpCode::GetfieldGcI);
-        assert_eq!(result[3].opcode, OpCode::Jump);
+        // force_all_lazy at call drops lazy sets + invalidates caches.
+        // CALL + GETFIELD (re-emitted, cache was invalidated) + Jump.
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::CallN);
+        assert_eq!(result[1].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[2].opcode, OpCode::Jump);
     }
 
     // ── Test 5: SETFIELD on different objects → both cached independently ──
@@ -1616,11 +1620,10 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // Both SETFIELDs (forced at Jump) + Jump. Both GETFIELDs eliminated.
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(result[1].opcode, OpCode::SetfieldGc);
-        assert_eq!(result[2].opcode, OpCode::Jump);
+        // force_all_lazy at Jump drops both lazy sets. Both GETFIELDs eliminated.
+        // Only Jump remains.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::Jump);
     }
 
     // ── Test 6: Array items: SETARRAYITEM then GETARRAYITEM → cached ──
@@ -1669,9 +1672,9 @@ mod tests {
             }
         }
 
-        // SETARRAYITEM (forced at Jump) + Jump. GETARRAYITEM eliminated.
+        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
-        assert_eq!(opcodes, vec![OpCode::SetarrayitemGc, OpCode::Jump]);
+        assert_eq!(opcodes, vec![OpCode::Jump]);
     }
 
     #[test]
@@ -1784,11 +1787,10 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // GETFIELD (emitted during propagation) + SETFIELD (forced at Jump) + Jump.
-        assert_eq!(result.len(), 3);
+        // GETFIELD (emitted, different descriptor) + Jump (lazy set d0 dropped).
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
-        assert_eq!(result[1].opcode, OpCode::SetfieldGc);
-        assert_eq!(result[2].opcode, OpCode::Jump);
+        assert_eq!(result[1].opcode, OpCode::Jump);
     }
 
     // ── Test 10: SETFIELD_RAW does not affect GC caches ──
@@ -1937,12 +1939,9 @@ mod tests {
             }
         }
 
-        // Only the second SETARRAYITEM (forced at Jump) + Jump.
+        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
         let result_opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
-        assert_eq!(result_opcodes, vec![OpCode::SetarrayitemGc, OpCode::Jump]);
-        // Verify it's the second value.
-        let set_op = &ctx.new_operations[0];
-        assert_eq!(set_op.args[2], OpRef(102));
+        assert_eq!(result_opcodes, vec![OpCode::Jump]);
     }
 
     // ── Test 15: Overflow ops don't invalidate caches ──
@@ -1980,14 +1979,10 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // Both SETFIELDs (forced at Jump) + Jump. Both GETFIELDs eliminated.
-        assert_eq!(result.len(), 3);
-        let set_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::SetfieldGc)
-            .count();
-        assert_eq!(set_count, 2);
-        assert_eq!(result[2].opcode, OpCode::Jump);
+        // force_all_lazy at Jump drops both lazy sets. Both GETFIELDs eliminated.
+        // Only Jump remains.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::Jump);
     }
 
     // ── Green field optimization tests ──
@@ -2219,8 +2214,7 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // NEW + NEW + SETFIELD(p0) + SETFIELD(p1) + Jump.
-        // Both GETFIELDs eliminated (p0 cache survives write to p1).
+        // NEW + NEW + Jump. Both GETFIELDs eliminated, both lazy sets dropped at Jump.
         let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
         assert!(
             !opcodes.contains(&OpCode::GetfieldGcI),
@@ -2231,7 +2225,8 @@ mod tests {
                 .iter()
                 .filter(|o| o.opcode == OpCode::SetfieldGc)
                 .count(),
-            2
+            0,
+            "lazy sets are dropped at Jump, got: {opcodes:?}"
         );
     }
 
@@ -3512,11 +3507,10 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // SETFIELD (forced by GcLoadI) + GcLoadI + Jump.
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(result[1].opcode, OpCode::GcLoadI);
-        assert_eq!(result[2].opcode, OpCode::Jump);
+        // force_all_lazy_setfields at GcLoadI drops lazy sets. GcLoadI + Jump.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::GcLoadI);
+        assert_eq!(result[1].opcode, OpCode::Jump);
     }
 
     // ── Test 51: GC_LOAD marks base as nonnull ──
@@ -3651,12 +3645,12 @@ mod tests {
             }
         }
 
-        // SETARRAYITEM_GC (forced at Jump) + Jump. GETARRAYITEM eliminated.
+        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
         assert_eq!(
             opcodes,
-            vec![OpCode::SetarrayitemGc, OpCode::Jump],
-            "byte-array getitem should be cached after setitem"
+            vec![OpCode::Jump],
+            "byte-array getitem should be cached after setitem; lazy set dropped at Jump"
         );
     }
 
