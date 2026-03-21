@@ -545,33 +545,13 @@ impl OptHeap {
             if ei.check_readonly_descr_field(descr_idx) {
                 // Call reads this field → force lazy set (but keep cache)
                 if let Some(mut lazy_op) = self.lazy_setfields.remove(&(obj, descr_idx)) {
-                    for arg in lazy_op.args.iter_mut() {
-                        *arg = ctx.get_replacement(*arg);
-                    }
-                    let val = lazy_op.arg(1);
-                    if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000
-                        && !ctx.new_operations.iter().any(|o| o.pos == val)
-                    {
-                        // Value points to undrained force position — skip
-                    } else {
-                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                    }
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                 }
             }
             if ei.check_write_descr_field(descr_idx) {
                 // Call writes this field → force lazy set AND invalidate cache
                 if let Some(mut lazy_op) = self.lazy_setfields.remove(&(obj, descr_idx)) {
-                    for arg in lazy_op.args.iter_mut() {
-                        *arg = ctx.get_replacement(*arg);
-                    }
-                    let val = lazy_op.arg(1);
-                    if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000
-                        && !ctx.new_operations.iter().any(|o| o.pos == val)
-                    {
-                        // Value points to undrained force position — skip
-                    } else {
-                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                    }
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                 }
                 if !self.immutable_field_descrs.contains(&descr_idx) {
                     self.cached_fields.remove(&(obj, descr_idx));
