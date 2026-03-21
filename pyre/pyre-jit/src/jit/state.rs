@@ -563,6 +563,18 @@ pub(crate) fn frame_get_stack_depth(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
 }
 
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
+/// Get the concrete top-of-stack value for the RETURN_VALUE opcode.
+pub(crate) fn concrete_return_value(frame: usize) -> Option<PyObjectRef> {
+    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
+    let vsd = unsafe {
+        *(frame_ptr.add(crate::jit::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize)
+    };
+    if vsd == 0 {
+        return None;
+    }
+    concrete_stack_value(frame, vsd - 1)
+}
+
 pub(crate) fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let arr =
@@ -1005,6 +1017,12 @@ impl PyreSym {
 }
 
 impl TraceFrameState {
+    /// Get the concrete return value from the frame's stack top.
+    /// Used by RETURN_VALUE to determine finish type.
+    fn concrete_stack_value_at_return(&self) -> Option<PyObjectRef> {
+        concrete_return_value(self.concrete_frame)
+    }
+
     fn next_instruction_consumes_comparison_truth(&self) -> bool {
         let frame = unsafe { &*(self.concrete_frame as *const pyre_interp::frame::PyFrame) };
         let code = unsafe { &*frame.code };
@@ -4309,29 +4327,41 @@ pub(crate) fn trace_step_result_to_action(
                 loop_header_pc: Some(loop_header_pc),
             }
         }
-        Ok(pyre_runtime::StepResult::Return(value)) => TraceAction::Finish {
-            finish_args: {
-                let finish_type = match state.value_type(value) {
-                    Type::Int => Type::Int,
-                    Type::Float => Type::Float,
-                    Type::Ref | Type::Void => Type::Ref,
-                };
-                crate::eval::note_finish_protocol_hint(
-                    state.ctx().green_key(),
-                    matches!(finish_type, Type::Int),
-                );
-                vec![value]
-            },
-            // RPython parity: finishframe uses the typed result register
-            // produced by make_result_of_lastop().  The terminal finish layout
-            // must follow the traced value kind instead of assuming every
-            // Python return is already a boxed ref.
-            finish_arg_types: vec![match state.value_type(value) {
-                Type::Int => Type::Int,
-                Type::Float => Type::Float,
-                Type::Ref | Type::Void => Type::Ref,
-            }],
-        },
+        Ok(pyre_runtime::StepResult::Return(value)) => {
+            // RPython DoneWithThisFrameDescrInt parity: if the return
+            // value is a boxed W_IntObject on the virtualizable stack
+            // (type Ref), unbox it to raw Int for the Finish descriptor.
+            // This avoids New+SetfieldGc before Finish and matches RPython's
+            // done_with_this_frame_descr_int which stores raw ints.
+            let (finish_value, finish_type) = match state.value_type(value) {
+                Type::Int => (value, Type::Int),
+                Type::Float => (value, Type::Float),
+                Type::Ref | Type::Void => {
+                    // Check if the Ref is a known W_IntObject — if so, unbox
+                    let ctx = state.ctx();
+                    let concrete = state.concrete_stack_value_at_return();
+                    let is_int = concrete.map_or(false, |v| {
+                        !v.is_null() && unsafe { pyre_object::pyobject::is_int(v) }
+                    });
+                    if is_int {
+                        let unboxed = state.with_ctx(|this, ctx| {
+                            this.trace_guarded_int_payload(ctx, value)
+                        });
+                        (unboxed, Type::Int)
+                    } else {
+                        (value, Type::Ref)
+                    }
+                }
+            };
+            crate::eval::note_finish_protocol_hint(
+                state.ctx().green_key(),
+                matches!(finish_type, Type::Int),
+            );
+            TraceAction::Finish {
+                finish_args: vec![finish_value],
+                finish_arg_types: vec![finish_type],
+            }
+        }
         Ok(pyre_runtime::StepResult::Yield(value)) => TraceAction::Finish {
             finish_args: {
                 let finish_type = match state.value_type(value) {
