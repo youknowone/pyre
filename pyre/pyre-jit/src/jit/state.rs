@@ -3458,13 +3458,13 @@ impl TraceFrameState {
                     this.sync_standard_virtualizable_before_residual_call(ctx);
                     // RPython parity: use CALL_ASSEMBLER_I when a token
                     // exists for the callee (compiled or pending).
-                    // RPython parity: use CALL_ASSEMBLER_I when a compiled
-                    // token exists. Pending tokens are registered as placeholders
-                    // (null code_ptr) but shim dispatch still causes SIGSEGV
-                    // due to callee frame / force_fn arg mismatch. Compiled-only
-                    // for now; force_cache handles first execution.
+                    // RPython parity: use CALL_ASSEMBLER_I when a token
+                    // exists (compiled or pending). Pending targets have
+                    // null code_ptr — call_assembler_fast_path falls back
+                    // to force_fn (RPython compile_tmp_callback parity).
                     let ca_token = if is_self_recursive {
                         driver.get_loop_token_number(callee_key)
+                            .or_else(|| driver.get_pending_token_number(callee_key))
                     } else {
                         None
                     };
