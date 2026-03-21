@@ -2250,7 +2250,11 @@ fn assemble_peeled_trace(
     result.push(label_op);
 
     // Body: 2-pass remap (inputarg refs → label_args, op positions → fresh boxes)
-    let mut next_body_pos = next_free_pos(label_pos.saturating_add(1));
+    // Start body positions after all label arg positions (including SameAs
+    // aliases from short preamble) to prevent Cranelift variable collision
+    // where a body op result overwrites a label block parameter.
+    let max_label_arg_pos = full_label_args.iter().map(|a| a.0).max().unwrap_or(label_pos);
+    let mut next_body_pos = next_free_pos(label_pos.max(max_label_arg_pos).saturating_add(1));
     let mut input_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
     // RPython compile.py assembles `[start_label] + preamble + [label] + body`.
