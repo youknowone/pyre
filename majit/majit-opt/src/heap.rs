@@ -250,12 +250,29 @@ impl OptHeap {
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
-            let value_ref = op.arg(1);
-            // heap.py:139: put_field_back_to_info — restore cached value
-            self.cached_fields.insert((obj, field_idx), value_ref);
-            if false {
-                // Kept for reference: Phase 1 used to emit here, but
-                // RPython's emit_extra(emit=False) re-absorbs instead.
+            // Virtualizable fields must be emitted at JUMP so compiled code
+            // writes head/size to memory (guard failure needs correct state).
+            let is_vable = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
+            if is_vable {
+                let value_ref = ctx.get_replacement(op.arg(1));
+                if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
+                    if info.is_virtual() {
+                        info.force_to_ops_direct(value_ref, ctx);
+                    }
+                }
+                for arg in op.args.iter_mut() {
+                    *arg = ctx.get_replacement(*arg);
+                }
+                let final_value = op.arg(1);
+                self.remember_field_descr((obj, field_idx), &op);
+                ctx.emit(op);
+                self.cached_fields.insert((obj, field_idx), final_value);
+            } else {
+                for arg in op.args.iter_mut() {
+                    *arg = ctx.get_replacement(*arg);
+                }
+                let value_ref = op.arg(1);
+                self.cached_fields.insert((obj, field_idx), value_ref);
             }
         }
     }
@@ -306,6 +323,11 @@ impl OptHeap {
                 .as_ref()
                 .map_or(false, |d| d.is_virtualizable());
             if is_vable {
+                // RPython: virtualizable fields go to pendingfields AND
+                // are re-inserted into lazy_setfields. On guard failure,
+                // rd_pendingfields restores memory. The lazy_set survives
+                // for the next guard/JUMP.
+                pendingfields.push(op.clone());
                 vable_retain.push((key, op));
                 continue;
             }
