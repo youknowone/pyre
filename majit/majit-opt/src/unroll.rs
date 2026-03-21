@@ -1055,28 +1055,13 @@ impl OptUnroll {
             }
         }
 
-        // Propagate Phase 1 heap cache to Phase 2.
-        // Only import entries whose cached value is an end_arg (label arg),
-        // since intermediate Phase 1 values (like v9=intval) are NOT carried
-        // to the body label and would be undefined references.
-        let end_arg_set: std::collections::HashSet<OpRef> =
-            exported_state.end_args.iter().copied().collect();
-        for &(obj, descr_idx, cached_val) in &exported_state.preamble_heap_cache {
-            if obj.is_none() || cached_val.is_none() {
-                continue;
-            }
-            if (obj.0 as usize) >= targetargs.len() {
-                continue;
-            }
-            // Only import if the cached value is an end_arg (will be in the body label)
-            if !end_arg_set.contains(&cached_val) {
-                continue;
-            }
-            let forwarded_obj = ctx.get_replacement(obj);
-            let forwarded_val = ctx.get_replacement(cached_val);
-            ctx.imported_short_fields
-                .insert((forwarded_obj, descr_idx), forwarded_val);
-        }
+        // NOTE: Phase 1 heap cache propagation is disabled until
+        // the PreambleOp mechanism is implemented (RPython parity).
+        // Without it, cached intermediate values (like v9=intval) get
+        // referenced in the body but are not carried through the label,
+        // causing undefined value reads and silent guard failures.
+        // TODO: implement RPython's shortpreamble.py PreambleOp +
+        // force_op_from_preamble() + add_preamble_op() mechanism.
 
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
         let (label_args, virtuals) = exported_state
