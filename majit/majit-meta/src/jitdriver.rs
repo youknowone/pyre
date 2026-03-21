@@ -1192,6 +1192,13 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
+        if crate::majit_log_enabled() {
+            let compiled_inputs = self.meta.get_compiled_num_inputs(green_key).unwrap_or(0);
+            eprintln!(
+                "[jit][run-compiled] key={} inputs={} values={:?}",
+                green_key, compiled_inputs, live_values
+            );
+        }
         pre_run();
         let Some(result) = self
             .meta

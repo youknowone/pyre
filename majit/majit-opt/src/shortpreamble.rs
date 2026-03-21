@@ -1221,15 +1221,9 @@ impl ExtendedShortPreambleBuilder {
     }
 
     pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
-        if !self.label_args.contains(&result) {
-            self.label_args.push(result);
-        }
-        if !self.used_boxes.contains(&result) {
-            self.used_boxes.push(result);
-        }
-        if !self.short_jump_args.contains(&produced.preamble_op.pos) {
-            self.short_jump_args.push(produced.preamble_op.pos);
-        }
+        self.label_args.push(result);
+        self.used_boxes.push(result);
+        self.short_jump_args.push(produced.preamble_op.pos);
         self.extra_state.record_preamble_use(result, &produced);
     }
 
@@ -2319,6 +2313,41 @@ mod tests {
         assert_eq!(ext.extra_same_as().len(), 1);
         assert_eq!(ext.extra_same_as()[0].opcode, OpCode::SameAsI);
         assert_eq!(ext.extra_same_as()[0].pos, alias_result);
+    }
+
+    #[test]
+    fn test_rpython_extended_builder_keeps_duplicate_label_and_jump_entries() {
+        let produced = vec![(
+            OpRef(31),
+            ProducedShortOp {
+                kind: PreambleOpKind::Pure,
+                preamble_op: {
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(30), OpRef(30)]);
+                    op.pos = OpRef(31);
+                    op
+                },
+                invented_name: false,
+                same_as_source: None,
+            },
+        )];
+
+        let builder = ShortPreambleBuilder::new(&[OpRef(30)], &produced, &[OpRef(30)]);
+        let mut ext = ExtendedShortPreambleBuilder::new(7, &builder);
+        ext.setup(
+            &ShortPreamble {
+                ops: Vec::new(),
+                inputargs: vec![OpRef(30)],
+                used_boxes: vec![OpRef(30)],
+                jump_args: vec![OpRef(30)],
+                exported_state: None,
+            },
+            &[OpRef(30)],
+        );
+
+        assert!(ext.add_preamble_op(OpRef(31)));
+        assert!(ext.add_preamble_op(OpRef(31)));
+        assert_eq!(ext.label_args(), &[OpRef(30), OpRef(31), OpRef(31)]);
+        assert_eq!(ext.jump_args(), &[OpRef(30), OpRef(31), OpRef(31)]);
     }
 
 }
