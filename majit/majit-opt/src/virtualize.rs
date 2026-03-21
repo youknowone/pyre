@@ -420,11 +420,6 @@ impl OptVirtualize {
         };
         match info {
             PtrInfo::VirtualStruct(ref vinfo) => {
-                let Some(head_load_descr_index) =
-                    self.imported_head_load_descr_index(resolved, ctx)
-                else {
-                    return;
-                };
                 let fields: Vec<(majit_ir::DescrRef, crate::virtualstate::VirtualStateInfo)> =
                     vinfo
                         .fields
@@ -445,16 +440,11 @@ impl OptVirtualize {
                         jump_arg_index,
                         size_descr: vinfo.descr.clone(),
                         kind: crate::optimizer::ImportedVirtualKind::Struct,
-                        head_load_descr_index: Some(head_load_descr_index),
+                        head_load_descr_index: self.imported_head_load_descr_index(resolved, ctx),
                         fields,
                     });
             }
             PtrInfo::Virtual(ref vinfo) => {
-                let Some(head_load_descr_index) =
-                    self.imported_head_load_descr_index(resolved, ctx)
-                else {
-                    return;
-                };
                 let fields: Vec<(majit_ir::DescrRef, crate::virtualstate::VirtualStateInfo)> =
                     vinfo
                         .fields
@@ -477,7 +467,7 @@ impl OptVirtualize {
                         kind: crate::optimizer::ImportedVirtualKind::Instance {
                             known_class: vinfo.known_class,
                         },
-                        head_load_descr_index: Some(head_load_descr_index),
+                        head_load_descr_index: self.imported_head_load_descr_index(resolved, ctx),
                         fields,
                     });
             }
@@ -2833,6 +2823,31 @@ mod tests {
 
         assert_eq!(opt.final_num_inputs(), 3);
         assert_eq!(jump.args.len(), 3);
+    }
+
+    #[test]
+    fn test_export_jump_virtual_without_pool_head_descr() {
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let pass = OptVirtualize::new();
+        let field_descr = field_descr(8);
+        ctx.set_ptr_info(
+            OpRef(10),
+            PtrInfo::Virtual(crate::info::VirtualInfo {
+                descr: size_descr(1),
+                known_class: None,
+                fields: vec![(field_descr.index(), OpRef(20))],
+                field_descrs: vec![(field_descr.index(), field_descr.clone())],
+            }),
+        );
+
+        pass.export_virtual_for_preamble(OpRef(10), 3, &mut ctx);
+
+        assert_eq!(ctx.exported_jump_virtuals.len(), 1);
+        let exported = &ctx.exported_jump_virtuals[0];
+        assert_eq!(exported.jump_arg_index, 3);
+        assert_eq!(exported.head_load_descr_index, None);
+        assert_eq!(exported.fields.len(), 1);
+        assert_eq!(exported.fields[0].0.index(), field_descr.index());
     }
 
     // ── Tests ──

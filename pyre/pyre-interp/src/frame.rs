@@ -75,6 +75,14 @@ pub struct PyFrame {
     /// the interpreter replays the first CALL opcode, so this must preserve
     /// ordering instead of using a single overwrite-prone slot.
     pub pending_inline_results: VecDeque<PendingInlineResult>,
+    /// Outermost inline trace-through resumed this frame past the CALL at the
+    /// recorded pc.
+    ///
+    /// Nested inline frames already follow the MIFrame-owned
+    /// make_result_of_lastop path directly. This marker narrows the same
+    /// protocol to the outermost interpreter loop without conflating it with
+    /// unrelated next_instr changes.
+    pub pending_inline_resume_pc: Option<usize>,
 }
 
 /// Exception handler block — pushed by SETUP_FINALLY/SETUP_EXCEPT, popped by POP_BLOCK.
@@ -157,7 +165,30 @@ impl PyFrame {
             vable_token: 0,
             block_stack: Vec::new(),
             pending_inline_results: VecDeque::new(),
+            pending_inline_resume_pc: None,
         }
+    }
+
+    /// RPython MetaInterp traces against its own MIFrame stack instead of
+    /// mutating the live interpreter frame in place. pyre still executes
+    /// bytecodes concretely during tracing, so use an owned snapshot when
+    /// recording a trace to keep the real frame state unchanged until the
+    /// interpreter actually executes the same path.
+    pub fn snapshot_for_tracing(&self) -> Self {
+        let mut frame = PyFrame {
+            execution_context: self.execution_context,
+            code: self.code,
+            locals_cells_stack_w: PyObjectArray::from_vec(self.locals_cells_stack_w.to_vec()),
+            valuestackdepth: self.valuestackdepth,
+            next_instr: self.next_instr,
+            namespace: self.namespace,
+            vable_token: self.vable_token,
+            block_stack: self.block_stack.clone(),
+            pending_inline_results: self.pending_inline_results.clone(),
+            pending_inline_resume_pc: self.pending_inline_resume_pc,
+        };
+        frame.fix_array_ptrs();
+        frame
     }
 
     /// Number of local variable slots (from code object).
@@ -261,6 +292,7 @@ impl PyFrame {
             vable_token: 0,
             block_stack: Vec::new(),
             pending_inline_results: VecDeque::new(),
+            pending_inline_resume_pc: None,
         }
     }
 
