@@ -196,14 +196,17 @@ impl OptHeap {
     /// time via rd_virtuals, and the pending setfield replayed after.
     ///
     /// `allow_force`: true for call-triggered force, false for JUMP/flush.
-    /// RPython heap.py:618-620: force_lazy_set with virtual RHS.
-    /// If the value is virtual, do NOT emit — defer to pendingfields/rd_virtuals.
-    /// RPython: virtual stays virtual until guard failure materialization.
+    /// heap.py: cf.force_lazy_set(optheap, descr)
+    ///
+    /// Emit a lazy SetfieldGc. If the value is virtual, return false (the
+    /// caller should handle it via pendingfields / rd_pendingfields).
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, _allow_force: bool) -> bool {
         let orig_val = ctx.get_replacement(op.arg(1));
 
-        // RPython parity: skip SetfieldGc with virtual RHS value.
-        // The virtual will be materialized at guard failure time via rd_virtuals.
+        // heap.py:136: emit_extra(op, emit=False) re-processes through passes.
+        // If value is virtual, the op gets re-absorbed as lazy_set → lost.
+        // For majit: simply skip virtual-value setfields (handled by
+        // rd_pendingfields at guard time or dropped at JUMP).
         if let Some(info) = ctx.get_ptr_info(orig_val) {
             if info.is_virtual() {
                 return false;
@@ -269,40 +272,29 @@ impl OptHeap {
     /// guard resume data, materialized on guard failure). majit does NOT have
     /// the rd_pendingfields resume mechanism, so we must distinguish:
     ///
-    /// - Virtual container: safe to defer (container doesn't exist in memory)
-    /// - Real container + virtual value: FORCE the virtual and emit
-    /// - Real container + real value: emit directly
+    /// heap.py:608-637: force_lazy_sets_for_guard()
     ///
-    /// Returns the list of ops that should go into pendingfields (virtual
-    /// container only).
+    /// Returns pendingfields: SetfieldGc/SetarrayitemGc ops where the stored
+    /// VALUE is virtual. These go into rd_pendingfields on the guard's resume
+    /// data. Non-virtual lazy sets are emitted (forced) immediately.
     fn force_lazy_sets_for_guard(&mut self, ctx: &mut OptContext) -> Vec<Op> {
         let mut pendingfields = Vec::new();
 
+        // heap.py:610-621: iterate cached fields
         let field_entries: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
         for (key, mut op) in field_entries {
-            let obj_ref = ctx.get_replacement(op.arg(0));
+            // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
             let value_ref = ctx.get_replacement(op.arg(1));
-
-            // If the container itself is virtual, defer — it doesn't exist in memory
-            let obj_is_virtual = matches!(
-                ctx.get_ptr_info(obj_ref),
+            let is_virtual = matches!(
+                ctx.get_ptr_info(value_ref),
                 Some(info) if info.is_virtual()
             );
-            if obj_is_virtual {
+            if is_virtual {
+                // heap.py:619: pendingfields.append(op)
                 pendingfields.push(op);
                 continue;
             }
-
-            // RPython heap.py:618-620: if value is virtual, defer to pendingfields.
-            // Do NOT force — virtual stays virtual until guard failure.
-            if let Some(info) = ctx.get_ptr_info(value_ref) {
-                if info.is_virtual() {
-                    pendingfields.push(op);
-                    continue;
-                }
-            }
-
-            // Emit the SetfieldGc with resolved args
+            // heap.py:621: cf.force_lazy_set(self, descr) — emit
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
@@ -312,26 +304,19 @@ impl OptHeap {
             self.cached_fields.insert(key, final_value);
         }
 
+        // heap.py:622-636: iterate cached array items
         let array_entries: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
         for (key, mut op) in array_entries {
-            let obj_ref = ctx.get_replacement(op.arg(0));
+            // heap.py:631-633: assert container not virtual; check value virtual
             let value_ref = ctx.get_replacement(op.arg(2));
-
-            let obj_is_virtual = matches!(
-                ctx.get_ptr_info(obj_ref),
+            let is_virtual = matches!(
+                ctx.get_ptr_info(value_ref),
                 Some(info) if info.is_virtual()
             );
-            if obj_is_virtual {
+            if is_virtual {
+                // heap.py:634: pendingfields.append(op)
                 pendingfields.push(op);
                 continue;
-            }
-
-            // RPython parity: virtual value → pendingfields, don't force.
-            if let Some(info) = ctx.get_ptr_info(value_ref) {
-                if info.is_virtual() {
-                    pendingfields.push(op);
-                    continue;
-                }
             }
 
             for arg in op.args.iter_mut() {
@@ -1321,27 +1306,13 @@ impl Optimization for OptHeap {
     /// This is how the heap optimizer forces lazy sets before guards even when
     /// the guard was emitted by an earlier pass (e.g., IntBounds).
     fn emitting_operation(&mut self, op: &Op, ctx: &mut OptContext) {
-        // Only handle guards here — calls and side-effects are handled in
-        // handle_side_effects which runs when the op reaches the heap pass
-        // via propagate_forward. Guards need this callback because they're
-        // often emitted by earlier passes and never reach the heap pass.
+        // heap.py:432-434: emitting_operation(op)
+        // For guards: force non-virtual lazy sets and collect virtual-value
+        // ops into ctx.pending_for_guard (→ rd_pendingfields on the guard).
         if op.opcode.is_guard() {
             let pending_virtual = self.force_lazy_sets_for_guard(ctx);
-            for pending_op in pending_virtual {
-                if pending_op.opcode == OpCode::SetarrayitemGc {
-                    let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
-                    if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
-                        self.lazy_setarrayitems
-                            .insert((pending_op.arg(0), descr_idx, index), pending_op);
-                    } else {
-                        ctx.emit(pending_op);
-                    }
-                } else {
-                    let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
-                    self.lazy_setfields
-                        .insert((pending_op.arg(0), descr_idx), pending_op);
-                }
-            }
+            // heap.py:433: self.optimizer.pendingfields = pendingfields
+            ctx.pending_for_guard = pending_virtual;
         }
     }
 
