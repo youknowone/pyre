@@ -1288,6 +1288,8 @@ fn register_call_assembler_target(
         needs_force_frame: compiled.needs_force_frame,
     };
     validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
+    // Invalidate thread-local cache in case a pending placeholder was cached.
+    invalidate_ca_thread_cache(token.number);
     // Create/update dispatch slot for direct call
     ca_dispatch_slot(token.number, compiled.code_ptr);
     // Set the finish_index so the direct call path can check it at runtime
@@ -1768,7 +1770,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     }
 
     let fail_descr = &target.fail_descrs[fail_index as usize];
-    fail_descr.increment_fail_count();
+    let fail_count = fail_descr.increment_fail_count();
 
     let bridge_guard = fail_descr.bridge.lock().unwrap();
     if let Some(ref bridge) = *bridge_guard {
@@ -1776,6 +1778,21 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         return CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
     }
     drop(bridge_guard);
+
+    // RPython compile.py:696 (handle_fail → must_compile): trigger bridge
+    // compilation when guard fails enough times.
+    if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
+        if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
+            let callee_frame_ptr = inputs[0];
+            let trace_info = fail_descr.trace_info.lock().unwrap();
+            if let Some(ref info) = *trace_info {
+                let green_key = info.header_pc;
+                let trace_id = info.trace_id;
+                drop(trace_info);
+                bridge_fn(callee_frame_ptr, fail_index, trace_id, green_key);
+            }
+        }
+    }
 
     let saved_data = if let Some(ref ff) = force_frame {
         take_force_frame_saved_data(ff)
@@ -1852,13 +1869,28 @@ fn call_assembler_fast_path(
     let mut outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
     let mut roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
 
-    let fail_index = unsafe {
+    // RPython parity: register GC roots + force frame before compiled code.
+    if let Some(gc_id) = target.gc_runtime_id {
+        register_gc_roots(gc_id, &mut roots);
+    }
+    let (handle, _force_frame) = if target.needs_force_frame {
+        let (h, f) = register_force_frame(&target.fail_descrs, target.gc_runtime_id);
+        (h, Some(f))
+    } else {
+        (0, None)
+    };
+
+    let fail_index = with_active_force_frame(handle, || unsafe {
         func(
             inputs.as_ptr(),
             outputs.as_mut_ptr(),
             roots.as_mut_ptr() as *mut i64,
         )
-    } as u32;
+    }) as u32;
+
+    if let Some(gc_id) = target.gc_runtime_id {
+        unregister_gc_roots(gc_id, &mut roots);
+    }
     drop(_jitted_guard);
 
     // Handle nested call_assembler DEADFRAME propagation
@@ -2098,14 +2130,9 @@ extern "C" fn call_assembler_shim(
         "call_assembler shim outcome buffer must be non-null"
     );
 
-    // Fast path: when a force callback is registered, bypass DeadFrame
-    // construction. Runs compiled code directly and handles the result
-    // inline — avoids Box alloc, mutex lock, and Arc clone per call.
-    if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
-        return call_assembler_fast_path(target, input_slice, outcome, *force_fn);
-    }
-
-    // Slow path: full DeadFrame construction
+    // Use the full DeadFrame path which goes through run_compiled_code
+    // with proper GC root + force frame registration. This matches
+    // RPython's execute_token → guard-fail → assembler_call_helper flow.
     let mut frame = execute_registered_loop_target(target, input_slice);
     let descr =
         get_latest_descr_from_deadframe(&frame).expect("get_latest_descr_from_deadframe failed");
@@ -2116,6 +2143,18 @@ extern "C" fn call_assembler_shim(
         }
         return finish_result_from_deadframe(&mut frame)
             .expect("finish_result_from_deadframe failed") as u64;
+    }
+
+    // Guard failure: call force_fn if available, otherwise return deadframe.
+    // RPython assembler_call_helper: handle_fail → blackhole or bridge.
+    if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
+        let callee_frame_ptr = input_slice[0];
+        let result = force_fn(callee_frame_ptr);
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+            *outcome.add(1) = 0;
+        }
+        return result as u64;
     }
 
     let handle = store_call_assembler_deadframe(frame);
@@ -4921,12 +4960,10 @@ impl CraneliftBackend {
                         None
                     };
 
-                    // Use direct call when dispatch slot exists and result
-                    // is a primitive type (Int/Float). For self-recursion
-                    // (target unknown), finish_index is loaded from the
-                    // dispatch entry at runtime (set after compile).
-                    let has_primitive_result = finish_index.is_some() || resolved_target.is_none(); // self-recursion: assume primitive
-                    let use_direct = dispatch_slot_addr.is_some() && has_primitive_result;
+                    // RPython parity: always use the shim path which calls
+                    // call_assembler_fast_path → handles Finish/guard-fail/bridge.
+                    // The direct path is an optimization for the future.
+                    let use_direct = false;
 
                     if use_direct {
                         let slot_addr = dispatch_slot_addr.unwrap();

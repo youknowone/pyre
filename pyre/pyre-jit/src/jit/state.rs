@@ -3458,16 +3458,11 @@ impl TraceFrameState {
                     this.sync_standard_virtualizable_before_residual_call(ctx);
                     // RPython parity: use CALL_ASSEMBLER_I when a token
                     // exists for the callee (compiled or pending).
-                    // RPython parity: use CALL_ASSEMBLER_I when a compiled
-                    // token exists. Pending tokens are registered but the
-                    // direct call path crashes because force_fn never gets
-                    // called (crash in compiled code before force dispatch).
-                    // Root cause: codegen direct path for CallAssemblerI needs
-                    // to pass callee frame (inputs[0]) not outputs[0] to force_fn.
-                    // This is implemented but the compiled code itself crashes
-                    // during self-recursive dispatch — needs further codegen debug.
+                    // RPython parity: use CALL_ASSEMBLER_I when a token
+                    // exists (compiled or pending).
                     let ca_token = if is_self_recursive {
                         driver.get_loop_token_number(callee_key)
+                            .or_else(|| driver.get_pending_token_number(callee_key))
                     } else {
                         None
                     };
@@ -3488,9 +3483,23 @@ impl TraceFrameState {
                             let code_ptr = w_func_get_code_ptr(concrete_callable) as *const pyre_bytecode::CodeObject;
                             (&*code_ptr).varnames.len()
                         };
-                        let ca_args = synthesize_fresh_callee_entry_args(
-                            ctx, callee_frame, args, callee_nlocals,
-                        );
+                        // Read locals from callee frame (always boxed Ref)
+                        // instead of using args directly (may be raw Int
+                        // in inline context). The callee frame was populated
+                        // by one_arg_callee_frame_helper with boxed values.
+                        let callee_ni = ctx.const_int(0);
+                        let callee_sd = ctx.const_int(callee_nlocals as i64);
+                        let mut ca_args = vec![callee_frame, callee_ni, callee_sd];
+                        let callee_arr = frame_locals_cells_stack_array(ctx, callee_frame);
+                        for i in 0..callee_nlocals {
+                            let idx = ctx.const_int(i as i64);
+                            let val = ctx.record_op_with_descr(
+                                majit_ir::OpCode::GetarrayitemGcR,
+                                &[callee_arr, idx],
+                                pyobject_array_descr(),
+                            );
+                            ca_args.push(val);
+                        }
                         // Use the actual virtualizable input types:
                         // [Ref(frame), Int(ni), Int(vsd), Ref(local0), ...]
                         // This matches the compiled trace's inputargs layout.
