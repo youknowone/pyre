@@ -1442,7 +1442,8 @@ impl<M: Clone> MetaInterp<M> {
                 if crate::majit_log_enabled() {
                     eprintln!("[jit] compile_loop panicked, aborting trace at key={green_key}");
                 }
-                self.warm_state.abort_tracing(green_key, true);
+                // RPython: backend failure is non-permanent — allow retry.
+                self.warm_state.abort_tracing(green_key, false);
                 return;
             }
         };
@@ -1549,7 +1550,8 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
-                self.warm_state.abort_tracing(green_key, true);
+                // RPython: backend compilation failure is non-permanent.
+                self.warm_state.abort_tracing(green_key, false);
             }
         }
         // Reset per-trace function call counts.
