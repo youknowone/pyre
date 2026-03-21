@@ -80,6 +80,10 @@ pub struct Optimizer {
     /// RPython: propagate_all_forward(trace, flush=False) for Phase 2.
     /// When true, skip flush() at end of optimization.
     pub skip_flush: bool,
+    /// RPython optimizer.py: last_op/info.jump_op when flush=False.
+    /// Phase-2 loop compilation keeps the terminal JUMP/FINISH outside the
+    /// returned body ops and lets unroll/compile own it explicitly.
+    pub terminal_op: Option<Op>,
     /// Preserved final context after optimization, for jump_to_existing_trace.
     pub final_ctx: Option<OptContext>,
 }
@@ -404,6 +408,7 @@ impl Optimizer {
             imported_label_source_slots: None,
             patchguardop: None,
             skip_flush: false,
+            terminal_op: None,
             final_ctx: None,
         }
     }
@@ -615,8 +620,15 @@ impl Optimizer {
         let resolved = ctx.get_replacement(opref);
         if let Some(tracked) = ctx.take_potential_extra_op(resolved) {
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
+                // RPython unroll.py: force_op_from_preamble() routes the
+                // tracked preamble use through short_preamble_producer.use_box(...)
+                // before recording it for jump replay. This matters for ovf
+                // ops, where the short builder must materialize both the
+                // overflowing operation and its guard together.
+                let _ = builder.use_box(tracked.result);
                 builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
+                let _ = builder.use_box(tracked.result);
                 builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             }
         }
@@ -867,6 +879,7 @@ impl Optimizer {
         use majit_ir::OpRef;
         self.imported_label_args = None;
         self.imported_label_source_slots = None;
+        self.terminal_op = None;
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.
@@ -947,14 +960,18 @@ impl Optimizer {
         if !self.skip_flush {
             self.flush(&mut ctx);
         }
-        // RPython optimizer.py:555-556: after flush, send last_op (JUMP/FINISH).
-        // For Phase 2 (skip_flush), JUMP args are resolved but virtuals are
-        // NOT forced — they stay virtual for the body loop.
-        if let Some(mut jump_op) = last_op {
-            for arg in &mut jump_op.args {
+        // RPython optimizer.py:555-556: after flush, send last_op only when
+        // flush=True. With flush=False the terminal op is kept out-of-band as
+        // info.jump_op for unroll/compile to consume.
+        if let Some(mut terminal_op) = last_op {
+            for arg in &mut terminal_op.args {
                 *arg = ctx.get_replacement(*arg);
             }
-            ctx.emit(jump_op);
+            if self.skip_flush {
+                self.terminal_op = Some(terminal_op);
+            } else {
+                ctx.emit(terminal_op);
+            }
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -1143,6 +1160,19 @@ impl Optimizer {
         // RPython handles this via force_box_for_end_of_preamble which
         // recursively forces all virtual fields; here we clean up leftovers.
         {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                let pos27 = ctx
+                    .new_operations
+                    .iter()
+                    .find(|op| op.pos.0 == 27)
+                    .map(|op| op.opcode);
+                let pos52 = ctx
+                    .new_operations
+                    .iter()
+                    .find(|op| op.pos.0 == 52)
+                    .map(|op| op.opcode);
+                eprintln!("[opt-retain1] precheck pos27={pos27:?} pos52={pos52:?}");
+            }
             let defined: std::collections::HashSet<u32> = {
                 let mut s: std::collections::HashSet<u32> = (0..self.final_num_inputs as u32).collect();
                 for op in &ctx.new_operations {
@@ -1158,12 +1188,69 @@ impl Optimizer {
                 s
             };
             ctx.new_operations.retain(|op| {
-                op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0))
+                let keep = op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0));
+                if !keep
+                    && std::env::var_os("MAJIT_LOG").is_some()
+                    && (op.opcode.is_call_may_force()
+                        || matches!(
+                            op.opcode,
+                            OpCode::GuardNotForced
+                                | OpCode::GuardNotForced2
+                                | OpCode::ForceToken
+                                | OpCode::GetfieldGcPureI
+                                | OpCode::New
+                        )
+                        || matches!(op.pos.0, 27 | 32 | 52 | 57))
+                {
+                    eprintln!(
+                        "[opt-retain1] dropping {:?} pos={:?} args={:?} defined_missing={:?}",
+                        op.opcode,
+                        op.pos,
+                        op.args,
+                        op.args
+                            .iter()
+                            .copied()
+                            .filter(|arg| !arg.is_none() && !defined.contains(&arg.0))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                keep
             });
         }
 
         // Drain remaining extra ops + re-check for undefined refs.
         self.drain_extra_operations_from(0, &mut ctx);
+        // Extra operations can introduce new forwarding (for example Heap/Pure
+        // forwarding a recently-emitted boxed-field read to its raw payload).
+        // Resolve forwarding again before the second undefined-ref filter so
+        // late-emitted users don't keep stale producer OpRefs.
+        {
+            let fwd = ctx.forwarding.clone();
+            let resolve = |opref: OpRef| -> OpRef {
+                let mut cur = opref;
+                loop {
+                    let idx = cur.0 as usize;
+                    if idx >= fwd.len() {
+                        return cur;
+                    }
+                    let next = fwd[idx];
+                    if next.is_none() || next == cur {
+                        return cur;
+                    }
+                    cur = next;
+                }
+            };
+            for op in &mut ctx.new_operations {
+                for arg in &mut op.args {
+                    *arg = resolve(*arg);
+                }
+                if let Some(ref mut fa) = op.fail_args {
+                    for arg in fa.iter_mut() {
+                        *arg = resolve(*arg);
+                    }
+                }
+            }
+        }
         {
             let defined: std::collections::HashSet<u32> = {
                 let mut s: std::collections::HashSet<u32> = (0..self.final_num_inputs as u32).collect();
@@ -1178,7 +1265,8 @@ impl Optimizer {
                 s
             };
             ctx.new_operations.retain(|op| {
-                op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0))
+                let keep = op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0));
+                keep
             });
         }
 
@@ -1287,6 +1375,11 @@ impl Optimizer {
             let cmf_count = ops.iter().filter(|o| o.opcode.is_call_may_force()).count();
             let gnf_count = ops.iter().filter(|o| matches!(o.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2)).count();
             eprintln!("[opt] final ops: total={} call_may_force={} guard_not_forced={}", ops.len(), cmf_count, gnf_count);
+            if cmf_count == 0 && gnf_count > 0 {
+                for (i, op) in ops.iter().enumerate() {
+                    eprintln!("[opt] idx={} {:?} pos={:?}", i, op.opcode, op.pos);
+                }
+            }
         }
         self.final_ctx = Some(ctx);
         ops
@@ -1363,6 +1456,7 @@ impl Optimizer {
         let mut current_op = resolved_op;
 
         for pass_idx in start_pass..end_pass {
+            let pass_name = self.passes[pass_idx].name().to_string();
             let result = {
                 let pass = &mut self.passes[pass_idx];
                 pass.propagate_forward(&current_op, ctx)
@@ -1370,13 +1464,57 @@ impl Optimizer {
             self.drain_extra_operations_from(pass_idx + 1, ctx);
             match result {
                 OptimizationResult::Emit(op) => {
+                    if std::env::var_os("MAJIT_LOG").is_some()
+                        && matches!(
+                            current_op.opcode,
+                            OpCode::CallMayForceI
+                                | OpCode::CallMayForceR
+                                | OpCode::CallMayForceF
+                                | OpCode::CallMayForceN
+                        )
+                        && current_op.opcode != op.opcode
+                    {
+                        eprintln!(
+                            "[opt-pass] {} emitted {:?} -> {:?} pos={:?}",
+                            pass_name, current_op.opcode, op.opcode, current_op.pos
+                        );
+                    }
                     self.emit_with_guard_check(op, ctx);
                     return;
                 }
                 OptimizationResult::Replace(op) => {
+                    if std::env::var_os("MAJIT_LOG").is_some()
+                        && matches!(
+                            current_op.opcode,
+                            OpCode::CallMayForceI
+                                | OpCode::CallMayForceR
+                                | OpCode::CallMayForceF
+                                | OpCode::CallMayForceN
+                        )
+                        && current_op.opcode != op.opcode
+                    {
+                        eprintln!(
+                            "[opt-pass] {} replaced {:?} -> {:?} pos={:?}",
+                            pass_name, current_op.opcode, op.opcode, current_op.pos
+                        );
+                    }
                     current_op = op;
                 }
                 OptimizationResult::Remove => {
+                    if std::env::var_os("MAJIT_LOG").is_some()
+                        && matches!(
+                            current_op.opcode,
+                            OpCode::CallMayForceI
+                                | OpCode::CallMayForceR
+                                | OpCode::CallMayForceF
+                                | OpCode::CallMayForceN
+                        )
+                    {
+                        eprintln!(
+                            "[opt-pass] {} removed {:?} pos={:?}",
+                            pass_name, current_op.opcode, current_op.pos
+                        );
+                    }
                     return;
                 }
                 OptimizationResult::PassOn => {}
@@ -1396,22 +1534,25 @@ impl Optimizer {
     /// on every arg before final emission. In majit, this forces any remaining
     /// virtual args that weren't caught by pass-level handlers.
     fn emit_with_guard_check(&mut self, mut op: Op, ctx: &mut OptContext) {
+        // RPython optimizer.py: emitting_operation callback — notify all passes
+        // before any op is emitted. This is how OptHeap forces lazy sets before
+        // guards even when the guard is emitted by an earlier pass.
+        // force_to_ops_direct emits directly to new_operations, so no drain needed.
+        for pass in &mut self.passes {
+            pass.emitting_operation(&op, ctx);
+        }
+
         // RPython optimizer.py:623-625: _emit_operation calls force_box on
-        // args before emission. SetfieldGc/SetarrayitemGc go to OptHeap's
-        // lazy_set and never reach _emit_operation. Only force for ops
-        // that actually reach final emission with potentially virtual args.
+        // every arg before emission, not just virtual ones. This is also what
+        // promotes imported short-preamble producers into the loop-header
+        // contract when a later guard/JUMP still references them.
         if !matches!(op.opcode,
             OpCode::SetfieldGc | OpCode::SetfieldRaw
             | OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw)
         {
             for i in 0..op.num_args() {
                 let arg = ctx.get_replacement(op.arg(i));
-                if let Some(mut info) = ctx.get_ptr_info(arg).cloned() {
-                    if info.is_virtual() {
-                        let forced = info.force_to_ops(arg, ctx);
-                        op.args[i] = forced;
-                    }
-                }
+                op.args[i] = self.force_box(arg, ctx);
             }
         }
         if op.opcode.is_guard() {
@@ -2125,6 +2266,31 @@ mod tests {
     }
 
     #[test]
+    fn test_skip_flush_keeps_terminal_jump_out_of_result_ops() {
+        let mut opt = Optimizer::new();
+        opt.skip_flush = true;
+
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Jump, &[OpRef(2)]),
+        ];
+        ops[0].pos = OpRef(2);
+        ops[1].pos = OpRef(3);
+
+        let mut constants = std::collections::HashMap::new();
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::IntAdd);
+        let terminal = opt
+            .terminal_op
+            .as_ref()
+            .expect("skip_flush should preserve terminal jump");
+        assert_eq!(terminal.opcode, OpCode::Jump);
+        assert_eq!(terminal.args.as_ref(), &[OpRef(2)]);
+    }
+
+    #[test]
     fn test_get_count_of_ops_and_guards() {
         let mut opt = Optimizer::default_pipeline();
         let mut ops = vec![
@@ -2502,5 +2668,48 @@ mod tests {
             }
             other => panic!("expected virtual struct, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_emit_with_guard_check_forces_imported_short_guard_args() {
+        let mut opt = Optimizer::new();
+        let mut ctx = OptContext::with_num_inputs(16, 1);
+
+        let mut preamble_op = Op::new(OpCode::IntGe, &[OpRef(3), OpRef(10_000)]);
+        preamble_op.pos = OpRef(14);
+        ctx.make_constant(OpRef(10_000), majit_ir::Value::Int(0));
+        ctx.initialize_imported_short_preamble_builder(
+            &[OpRef(0)],
+            &[OpRef(0)],
+            &[crate::shortpreamble::PreambleOp {
+                op: preamble_op.clone(),
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            }],
+        );
+        ctx.potential_extra_ops.insert(
+            OpRef(14),
+            crate::TrackedPreambleUse {
+                result: OpRef(14),
+                produced: crate::shortpreamble::ProducedShortOp {
+                    kind: crate::shortpreamble::PreambleOpKind::Pure,
+                    preamble_op: preamble_op.clone(),
+                    invented_name: false,
+                    same_as_source: None,
+                },
+            },
+        );
+
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(14)]);
+        guard.pos = OpRef(15);
+        opt.emit_with_guard_check(guard, &mut ctx);
+
+        let sp = ctx
+            .build_imported_short_preamble()
+            .expect("forcing imported short guard arg should build short preamble");
+        assert_eq!(sp.used_boxes, vec![OpRef(14)]);
+        assert_eq!(sp.jump_args, vec![OpRef(14)]);
     }
 }

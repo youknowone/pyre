@@ -92,6 +92,49 @@ impl OptVirtualize {
         }
     }
 
+    fn record_known_class(
+        &mut self,
+        obj_ref: OpRef,
+        class_ptr: majit_ir::GcRef,
+        ctx: &mut OptContext,
+    ) {
+        let updated = match ctx.get_ptr_info(obj_ref).cloned() {
+            Some(PtrInfo::Virtual(mut vinfo)) => {
+                if vinfo.known_class.is_none() {
+                    vinfo.known_class = Some(class_ptr);
+                }
+                PtrInfo::Virtual(vinfo)
+            }
+            Some(PtrInfo::VirtualStruct(vinfo)) => PtrInfo::VirtualStruct(vinfo),
+            Some(PtrInfo::VirtualArray(vinfo)) => PtrInfo::VirtualArray(vinfo),
+            Some(PtrInfo::VirtualArrayStruct(vinfo)) => PtrInfo::VirtualArrayStruct(vinfo),
+            Some(PtrInfo::VirtualRawBuffer(vinfo)) => PtrInfo::VirtualRawBuffer(vinfo),
+            Some(PtrInfo::Virtualizable(vinfo)) => PtrInfo::Virtualizable(vinfo),
+            Some(PtrInfo::Instance(mut iinfo)) => {
+                if iinfo.known_class.is_none() {
+                    iinfo.known_class = Some(class_ptr);
+                }
+                PtrInfo::Instance(iinfo)
+            }
+            Some(PtrInfo::KnownClass {
+                class_ptr: existing,
+                is_nonnull,
+            }) => PtrInfo::KnownClass {
+                class_ptr: if existing.is_null() { class_ptr } else { existing },
+                is_nonnull: is_nonnull || !class_ptr.is_null(),
+            },
+            Some(PtrInfo::NonNull)
+            | Some(PtrInfo::Constant(_))
+            | Some(PtrInfo::Struct(_))
+            | Some(PtrInfo::Array(_))
+            | None => PtrInfo::KnownClass {
+                class_ptr,
+                is_nonnull: true,
+            },
+        };
+        ctx.set_ptr_info(obj_ref, updated);
+    }
+
     /// Seed virtualizable state from existing trace inputs.
     ///
     /// RPython standard virtualizables do not synthesize optimizer-owned
@@ -1122,6 +1165,15 @@ impl OptVirtualize {
 
     fn optimize_guard_class(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let obj_ref = ctx.get_replacement(op.arg(0));
+        let expected_class = if op.num_args() >= 2 {
+            ctx.get_constant(op.arg(1)).and_then(|value| match value {
+                Value::Ref(class_ref) => Some(*class_ref),
+                Value::Int(raw) => Some(majit_ir::GcRef(*raw as usize)),
+                _ => None,
+            })
+        } else {
+            None
+        };
 
         if let Some(info) = ctx.get_ptr_info(obj_ref) {
             match info {
@@ -1132,9 +1184,10 @@ impl OptVirtualize {
                 | PtrInfo::VirtualRawBuffer(_) => {
                     return OptimizationResult::Remove;
                 }
-                PtrInfo::KnownClass { .. } => {
-                    // Class already known from prior guard or virtual forcing
-                    return OptimizationResult::Remove;
+                PtrInfo::KnownClass { class_ptr, .. } => {
+                    if expected_class.is_none_or(|expected| *class_ptr == expected || class_ptr.is_null()) {
+                        return OptimizationResult::Remove;
+                    }
                 }
                 _ => {}
             }
@@ -1154,13 +1207,9 @@ impl OptVirtualize {
         }
 
         // Record the class for future lookups.
-        ctx.set_ptr_info(
-            obj_ref,
-            PtrInfo::KnownClass {
-                class_ptr: majit_ir::GcRef::NULL,
-                is_nonnull: true,
-            },
-        );
+        if let Some(class_ptr) = expected_class {
+            self.record_known_class(obj_ref, class_ptr, ctx);
+        }
 
         self.force_guard_fail_args(op, ctx)
     }
@@ -1374,6 +1423,15 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let obj_ref = ctx.get_replacement(op.arg(0));
+        let expected_class = if op.num_args() >= 2 {
+            ctx.get_constant(op.arg(1)).and_then(|value| match value {
+                Value::Ref(class_ref) => Some(*class_ref),
+                Value::Int(raw) => Some(majit_ir::GcRef(*raw as usize)),
+                _ => None,
+            })
+        } else {
+            None
+        };
 
         if let Some(info) = ctx.get_ptr_info(obj_ref) {
             match info {
@@ -1385,21 +1443,22 @@ impl OptVirtualize {
                     return OptimizationResult::Remove;
                 }
                 PtrInfo::KnownClass {
-                    is_nonnull: true, ..
+                    class_ptr,
+                    is_nonnull: true,
                 } => {
-                    return OptimizationResult::Remove;
+                    if expected_class.is_none_or(|expected| *class_ptr == expected || class_ptr.is_null()) {
+                        return OptimizationResult::Remove;
+                    }
                 }
                 _ => {}
             }
         }
 
-        ctx.set_ptr_info(
-            obj_ref,
-            PtrInfo::KnownClass {
-                class_ptr: majit_ir::GcRef::NULL,
-                is_nonnull: true,
-            },
-        );
+        if let Some(class_ptr) = expected_class {
+            self.record_known_class(obj_ref, class_ptr, ctx);
+        } else {
+            ctx.set_ptr_info(obj_ref, PtrInfo::NonNull);
+        }
         self.force_guard_fail_args(op, ctx)
     }
 
@@ -1692,6 +1751,9 @@ impl Optimization for OptVirtualize {
             OpCode::GetfieldGcI
             | OpCode::GetfieldGcR
             | OpCode::GetfieldGcF
+            | OpCode::GetfieldGcPureI
+            | OpCode::GetfieldGcPureR
+            | OpCode::GetfieldGcPureF
             | OpCode::GetfieldRawI
             | OpCode::GetfieldRawR
             | OpCode::GetfieldRawF => self.optimize_getfield_gc(op, ctx),
@@ -1944,13 +2006,7 @@ impl Optimization for OptVirtualize {
             OpCode::RecordExactClass => {
                 let ref_opref = ctx.get_replacement(op.arg(0));
                 if let Some(&Value::Ref(class_ref)) = ctx.get_constant(op.arg(1)) {
-                    ctx.set_ptr_info(
-                        ref_opref,
-                        PtrInfo::KnownClass {
-                            class_ptr: class_ref,
-                            is_nonnull: true,
-                        },
-                    );
+                    self.record_known_class(ref_opref, class_ref, ctx);
                 }
                 OptimizationResult::Remove
             }

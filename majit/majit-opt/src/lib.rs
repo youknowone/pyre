@@ -784,4 +784,10 @@ pub trait Optimization {
     fn is_virtual(&self, _opref: OpRef) -> bool {
         false
     }
+
+    /// RPython optimizer.py: emitting_operation(op)
+    /// Called before any operation is emitted to the output, regardless of
+    /// which pass emits it. This enables passes like OptHeap to force lazy
+    /// sets before guards, even when the guard is emitted by an earlier pass.
+    fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext) {}
 }
