@@ -153,6 +153,14 @@ pub struct JitDriver<S: JitState> {
     /// PyPy JitDriver(is_recursive=True): enables max_unroll_recursion
     /// for recursive portal calls (pyjitpl.py _opimpl_recursive_call).
     is_recursive: bool,
+    /// Shared quasi-immutable notifier for periodic loop invalidation.
+    /// RPython compile.py:205: loop.quasi_immutable_deps registration.
+    /// All compiled loops register their invalidation flag here.
+    /// A background thread periodically calls invalidate() to force
+    /// GUARD_NOT_INVALIDATED exits in compiled code.
+    epoch_qmut: std::sync::Arc<std::sync::Mutex<crate::quasiimmut::QuasiImmut>>,
+    /// Handle for the background invalidation thread.
+    _invalidation_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -162,6 +170,23 @@ impl<S: JitState> JitDriver<S> {
         if let Some(info) = S::__build_virtualizable_info() {
             meta.set_virtualizable_info(info);
         }
+        let epoch_qmut = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::quasiimmut::QuasiImmut::new(),
+        ));
+        // Background thread: periodically invalidate all registered loops.
+        // RPython uses GC/signal-triggered invalidation; we use a timer as
+        // a portable equivalent. Period matches PyPy's checkinterval (~10ms).
+        let invalidation_thread = {
+            let qmut = epoch_qmut.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Ok(mut qmut) = qmut.lock() {
+                    if qmut.has_watchers() {
+                        qmut.invalidate();
+                    }
+                }
+            })
+        };
         JitDriver {
             meta,
             sym: None,
@@ -170,6 +195,8 @@ impl<S: JitState> JitDriver<S> {
             bridge_info: None,
             entry_points: Vec::new(),
             is_recursive: false,
+            epoch_qmut,
+            _invalidation_thread: Some(invalidation_thread),
         }
     }
 
@@ -385,11 +412,15 @@ impl<S: JitState> JitDriver<S> {
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                loop_header_pc: _,
+                green_key: override_key,
             } => {
-                // The tracing context has already been retargeted to the
-                // reached loop header by the tracer itself. Keep the driver
-                // layer ignorant of bytecode-PC reconstruction here.
+                // RPython parity: when tracing started at function entry
+                // but CloseLoop occurs at a backward jump, update the
+                // green_key so compiled loops are stored under the
+                // backward-jump target PC (matching back_edge dispatch).
+                if let Some(key) = override_key {
+                    self.meta.update_tracing_green_key(key);
+                }
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
@@ -1166,44 +1197,14 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
-        if crate::majit_log_enabled() {
-            eprintln!("[jit][run-compiled] stage=meta key={}", green_key);
-        }
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if crate::majit_log_enabled() {
-            eprintln!("[jit][run-compiled] stage=descriptor key={}", green_key);
-        }
-        let compatible = state.is_compatible(&meta);
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit][run-compiled] stage=is_compatible key={} ok={}",
-                green_key, compatible
-            );
-        }
-        let synced = compatible && self.sync_before(state, &meta, descriptor.as_ref());
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit][run-compiled] stage=sync_before key={} ok={}",
-                green_key, synced
-            );
-        }
-        if !synced {
+        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         }
-        if crate::majit_log_enabled() {
-            eprintln!("[jit][run-compiled] stage=extract_live_values key={}", green_key);
-        }
         let live_values = state.extract_live_values(&meta);
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit][run-compiled] stage=extracted key={} len={}",
-                green_key,
-                live_values.len()
-            );
-        }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -1222,13 +1223,6 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
-        if crate::majit_log_enabled() {
-            let compiled_inputs = self.meta.get_compiled_num_inputs(green_key).unwrap_or(0);
-            eprintln!(
-                "[jit][run-compiled] key={} inputs={} values={:?}",
-                green_key, compiled_inputs, live_values
-            );
-        }
         pre_run();
         let Some(result) = self
             .meta
@@ -1733,24 +1727,14 @@ impl<S: JitState> JitDriver<S> {
         )?;
         pre_run();
 
-        // RPython parity: schedule periodic invalidation so that compiled
-        // loops with invariant guards (e.g., push(const) → pop → guard_true)
-        // eventually return to the interpreter. The invalidation flag is
-        // checked by GUARD_NOT_INVALIDATED in the compiled code.
-        let invalidation_flag = self
-            .meta
-            .get_loop_token(key_hash)
-            .map(|t| t.invalidation_flag());
-        let _invalidation_timer = invalidation_flag.map(|flag| {
-            let flag_clone = flag.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                flag_clone.store(true, std::sync::atomic::Ordering::Release);
-                if std::env::var_os("MAJIT_LOG").is_some() {
-                    eprintln!("[jit] invalidation timer fired");
-                }
-            })
-        });
+        // RPython compile.py:205-207: register loop token with
+        // quasi-immutable deps so the background invalidation thread
+        // can force GUARD_NOT_INVALIDATED exits periodically.
+        if let Some(token) = self.meta.get_loop_token(key_hash) {
+            if let Ok(mut qmut) = self.epoch_qmut.lock() {
+                qmut.register(&token.invalidation_flag());
+            }
+        }
 
         let result = self
             .meta
