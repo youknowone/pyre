@@ -80,7 +80,13 @@ pub enum TraceAction {
     /// Close the loop (back-edge to header detected).
     CloseLoop,
     /// Close the loop with explicit jump arguments supplied by the tracer.
-    CloseLoopWithArgs { jump_args: Vec<OpRef> },
+    /// `green_key` overrides the tracing context's key so compiled loops
+    /// are stored under the backward-jump target PC, matching the key
+    /// used by back_edge_or_run_compiled_keyed at the CloseLoop site.
+    CloseLoopWithArgs {
+        jump_args: Vec<OpRef>,
+        green_key: Option<u64>,
+    },
     /// Finish the trace with terminal output values.
     Finish {
         finish_args: Vec<OpRef>,

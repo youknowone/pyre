@@ -570,6 +570,15 @@ impl<M: Clone> MetaInterp<M> {
         self.trace_eagerness = eagerness;
     }
 
+    /// Update the green_key associated with the current trace.
+    /// Called when tracing started at function entry but the loop closes
+    /// at a backward jump with a different PC.
+    pub fn update_tracing_green_key(&mut self, key: u64) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.green_key = key;
+        }
+    }
+
     /// Set the bridge compilation threshold.
     pub fn set_bridge_threshold(&mut self, threshold: u32) {
         self.warm_state.set_bridge_threshold(threshold);
@@ -838,6 +847,10 @@ impl<M: Clone> MetaInterp<M> {
     /// Access the active TraceCtx (if currently tracing).
     pub fn trace_ctx(&mut self) -> Option<&mut TraceCtx> {
         self.tracing.as_mut()
+    }
+
+    pub fn force_finish_trace_enabled(&self) -> bool {
+        self.force_finish_trace
     }
 
     // ── RPython opimpl_* equivalents for virtualizable ──────────────
@@ -1227,6 +1240,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
     ) -> Option<(TreeLoop, HashMap<u32, i64>)> {
         self.forced_virtualizable = None;
+        self.force_finish_trace = false;
         let ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
         let mut recorder = ctx.recorder;
@@ -1245,6 +1259,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn close_and_compile(&mut self, jump_args: &[OpRef], meta: M) {
         let vable_config = self.current_virtualizable_optimizer_config();
         self.forced_virtualizable = None;
+        self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
         let green_key = ctx.green_key;
@@ -1509,6 +1524,7 @@ impl<M: Clone> MetaInterp<M> {
     /// If `permanent` is true, this location will never be traced again.
     pub fn abort_trace(&mut self, permanent: bool) {
         self.forced_virtualizable = None;
+        self.force_finish_trace = false;
         if let Some(ctx) = self.tracing.take() {
             self.stats.loops_aborted += 1;
             let green_key = ctx.green_key;
@@ -1539,6 +1555,7 @@ impl<M: Clone> MetaInterp<M> {
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
         self.forced_virtualizable = None;
+        self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
         let green_key = ctx.green_key;
