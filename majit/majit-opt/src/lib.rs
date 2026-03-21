@@ -109,7 +109,7 @@ pub struct OptContext {
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
     /// Next unique op position for newly emitted or queued extra operations.
-    next_pos: u32,
+    pub(crate) next_pos: u32,
     /// Extra operations requested by the current pass. The optimizer drains
     /// these through the remaining downstream passes, matching RPython
     /// send_extra_operation()/emit_operation behavior.
