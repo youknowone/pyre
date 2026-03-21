@@ -1780,19 +1780,9 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     drop(bridge_guard);
 
     // RPython compile.py:696 (handle_fail → must_compile): trigger bridge
-    // compilation when guard fails enough times.
-    if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-        if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
-            let callee_frame_ptr = inputs[0];
-            let trace_info = fail_descr.trace_info.lock().unwrap();
-            if let Some(ref info) = *trace_info {
-                let green_key = info.header_pc;
-                let trace_id = info.trace_id;
-                drop(trace_info);
-                bridge_fn(callee_frame_ptr, fail_index, trace_id, green_key);
-            }
-        }
-    }
+    // Bridge compilation is triggered by MetaInterp (trace_eagerness threshold
+    // in run_compiled_detailed_with_values), not by the codegen shim.
+    // Direct bridge_fn calls from here cause MetaInterp reentrancy issues.
 
     let saved_data = if let Some(ref ff) = force_frame {
         take_force_frame_saved_data(ff)
