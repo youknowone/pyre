@@ -29,16 +29,6 @@ use pyre_object::floatobject::W_FloatObject;
 use pyre_object::intobject::W_IntObject;
 
 const JIT_THRESHOLD: u32 = 1039;
-/// Function-entry tracing threshold.
-/// PyPy uses WarmEnterState.function_threshold (default 1619).
-/// We intentionally keep a much lower temporary threshold here because
-/// pyre's recursive function-entry path does not yet implement the full
-/// RPython/PyPy bridge/resume semantics. Using the real threshold causes
-/// fib-style recursive traces to converge to an incorrect base-case-heavy
-/// function-entry trace. Restore the true warmstate threshold only after
-/// recursive function-entry bridging matches PyPy.
-const FUNC_ENTRY_THRESHOLD: u32 = 7;
-
 type JitDriverPair = (
     JitDriver<PyreJitState>,
     majit_meta::virtualizable::VirtualizableInfo,
@@ -263,49 +253,18 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 
         // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
         //
-        // RPython warmstate.py: maybe_compile_and_run() is reached from
-        // can_enter_jit/back-edges (and function entry), not from
-        // jit_merge_point itself. jit_merge_point is the merge/compiled-run
-        // site once tracing is already active or machine code already exists.
+        // RPython interp_jit.py only reaches can_enter_jit() from
+        // jump_absolute()/back-edges (and from function entry), not from the
+        // jit_merge_point dispatch step itself.  So the portal loop records
+        // merge points here, but back-edge warmup/compiled entry stays in the
+        // explicit StepResult::CloseLoop path below.
         if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
             let concrete_frame = frame as *mut PyFrame as usize;
-            let green_key = make_green_key(frame.code, pc);
-            let env = PyreEnv;
-            let mut jit_state = build_jit_state(frame, info);
-
             if driver.is_tracing() {
                 driver.merge_point(|ctx, sym| {
                     JIT_TRACING.with(|t| t.set(true));
                     trace_bytecode(ctx, sym, code, pc, concrete_frame)
                 });
-            } else if let Some(outcome) = driver.can_enter_jit_keyed(
-                green_key,
-                pc,
-                &mut jit_state,
-                &env,
-                || {},
-            ) {
-                if let Some(result) =
-                    handle_jit_outcome(outcome, &jit_state, frame, info, green_key)
-                {
-                    return result;
-                }
-            } else if driver.has_compiled_loop(green_key) {
-                let outcome = driver.run_compiled_detailed_with_bridge_keyed(
-                    green_key,
-                    pc,
-                    &mut jit_state,
-                    &env,
-                    || {},
-                    |state, meta, raw_values, exit_layout| {
-                        restore_guard_failure_for_loop(state, meta, raw_values, exit_layout)
-                    },
-                );
-                if let Some(result) =
-                    handle_jit_outcome(outcome, &jit_state, frame, info, green_key)
-                {
-                    return result;
-                }
             }
             if !driver.is_tracing() {
                 JIT_TRACING.with(|t| t.set(false));
@@ -320,16 +279,42 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         }
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
             StepResult::Continue => {}
-            StepResult::CloseLoop { .. } => {
+            StepResult::CloseLoop { loop_header_pc, .. } => {
                 let mut jit_state = build_jit_state(frame, info);
-                let green_key = make_green_key(frame.code, frame.next_instr);
+                let green_key = make_green_key(frame.code, loop_header_pc);
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][root-backedge] enter key={} pc={} arg0={:?} has_compiled={}",
+                        green_key,
+                        loop_header_pc,
+                        debug_first_arg_int(frame),
+                        driver.has_compiled_loop(green_key)
+                    );
+                }
                 if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
                     green_key,
-                    frame.next_instr,
+                    loop_header_pc,
                     &mut jit_state,
                     &env,
                     || {},
                 ) {
+                    if majit_meta::majit_log_enabled() {
+                        let kind = match &outcome {
+                            DetailedDriverRunOutcome::Finished { .. } => "finished",
+                            DetailedDriverRunOutcome::Jump { .. } => "jump",
+                            DetailedDriverRunOutcome::Abort { .. } => "abort",
+                            DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
+                                "guard-restored"
+                            }
+                            DetailedDriverRunOutcome::GuardFailure {
+                                restored: false, ..
+                            } => "guard-unrestored",
+                        };
+                        eprintln!(
+                            "[jit][root-backedge] outcome key={} pc={} kind={}",
+                            green_key, loop_header_pc, kind
+                        );
+                    }
                     if let Some(result) =
                         handle_jit_outcome(outcome, &jit_state, frame, info, green_key)
                     {
@@ -439,7 +424,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         false
     };
 
-    if *count < FUNC_ENTRY_THRESHOLD && !boosted {
+    let function_threshold = driver.meta_interp().warm_state_ref().function_threshold();
+    if *count < function_threshold && !boosted {
         return None;
     }
 
