@@ -9,7 +9,6 @@
 
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
-use pyre_bytecode::bytecode::OpArgState;
 use pyre_interp::frame::PyFrame;
 use pyre_object::w_none;
 use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
@@ -55,11 +54,6 @@ thread_local! {
         );
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
-        // RPython compile.py:714 (_trace_and_compile_from_bridge):
-        // When guard failure threshold is reached, compile a bridge.
-        d.set_bridge_threshold_hook(Box::new(|green_key, trace_id, fail_index| {
-            crate::call_jit::jit_bridge_compile_for_guard(green_key, trace_id, fail_index);
-        }));
         (d, info)
     });
 }
@@ -84,6 +78,16 @@ thread_local! {
 #[inline]
 fn func_entry_counts() -> &'static mut HashMap<u64, u32> {
     FUNC_ENTRY_COUNTS.with(|cell| unsafe { &mut *cell.get() })
+}
+
+#[inline]
+pub(crate) fn boost_local_function_entry_counter(green_key: u64) {
+    let (driver, _) = driver_pair();
+    let threshold = driver.meta_interp().warm_state_ref().function_threshold();
+    let count = func_entry_counts().entry(green_key).or_insert(0);
+    if *count < threshold.saturating_sub(1) {
+        *count = threshold.saturating_sub(1);
+    }
 }
 
 fn raw_int_finish_hints() -> &'static mut HashSet<u64> {
@@ -223,7 +227,6 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     let code = unsafe { &*frame.code };
 
     let env = PyreEnv;
-    let mut arg_state = OpArgState::default();
     let (driver, info) = driver_pair();
 
     loop {
@@ -232,8 +235,9 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         }
 
         let pc = frame.next_instr;
-        let code_unit = code.instructions[pc];
-        let (instruction, op_arg) = arg_state.get(code_unit);
+        let Some((instruction, op_arg)) = pyre_runtime::decode_instruction_at(code, pc) else {
+            return Ok(w_none());
+        };
 
         // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
         //
@@ -317,13 +321,25 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                         driver.has_compiled_loop(green_key)
                     );
                 }
-                if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
-                    green_key,
-                    loop_header_pc,
-                    &mut jit_state,
-                    &env,
-                    || {},
-                ) {
+                let outcome = if driver.has_compiled_loop(green_key) {
+                    Some(driver.run_compiled_detailed_with_bridge_keyed(
+                        green_key,
+                        loop_header_pc,
+                        &mut jit_state,
+                        &env,
+                        || {},
+                        restore_guard_failure_for_loop,
+                    ))
+                } else {
+                    driver.back_edge_or_run_compiled_keyed(
+                        green_key,
+                        loop_header_pc,
+                        &mut jit_state,
+                        &env,
+                        || {},
+                    )
+                };
+                if let Some(outcome) = outcome {
                     if majit_meta::majit_log_enabled() {
                         let kind = match &outcome {
                             DetailedDriverRunOutcome::Finished { .. } => "finished",
@@ -378,13 +394,15 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         }
         let env = PyreEnv;
         let mut jit_state = build_jit_state(frame, info);
-        if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
+        let outcome = driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             frame.next_instr,
             &mut jit_state,
             &env,
             || {},
-        ) {
+            restore_guard_failure_for_loop,
+        );
+        {
             if majit_meta::majit_log_enabled() {
                 let kind = match &outcome {
                     DetailedDriverRunOutcome::Finished { .. } => "finished",
@@ -653,6 +671,86 @@ while i < 100:
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 4950);
+        }
+    }
+
+    #[test]
+    fn test_eval_with_jit_redecodes_opargs_after_extended_arg_jumps() {
+        let source = "\
+def fannkuch(n):
+    p = [0] * n
+    q = [0] * n
+    s = [0] * n
+    i = 0
+    while i < n:
+        p[i] = i
+        q[i] = i
+        s[i] = i
+        i = i + 1
+    maxflips = 0
+    checksum = 0
+    sign = 1
+    while True:
+        q0 = p[0]
+        if q0 != 0:
+            i = 1
+            while i < n:
+                q[i] = p[i]
+                i = i + 1
+            flips = 1
+            while True:
+                qq = q[q0]
+                if qq == 0:
+                    break
+                q[q0] = q0
+                if q0 >= 3:
+                    i = 1
+                    j = q0 - 1
+                    while i < j:
+                        t = q[i]
+                        q[i] = q[j]
+                        q[j] = t
+                        i = i + 1
+                        j = j - 1
+                q0 = qq
+                flips = flips + 1
+            if flips > maxflips:
+                maxflips = flips
+            checksum = checksum + sign * flips
+        if sign == 1:
+            t = p[0]
+            p[0] = p[1]
+            p[1] = t
+            sign = -1
+        else:
+            t = p[1]
+            p[1] = p[2]
+            p[2] = t
+            sign = 1
+            i = 2
+            while i < n:
+                sx = s[i]
+                if sx != 0:
+                    s[i] = sx - 1
+                    break
+                if i == n - 1:
+                    return 999
+                s[i] = i
+                t = p[0]
+                j = 0
+                while j < i + 1:
+                    p[j] = p[j + 1]
+                    j = j + 1
+                p[i + 1] = t
+                i = i + 1
+
+r = fannkuch(6)";
+        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let r = *(*frame.namespace).get("r").unwrap();
+            assert_eq!(pyre_object::intobject::w_int_get_value(r), 999);
         }
     }
 

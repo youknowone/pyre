@@ -755,7 +755,7 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        match crate::eval::eval_with_jit(frame) {
+        match pyre_interp::eval::eval_loop_for_force(frame) {
             Ok(result) => result as i64,
             Err(err) => panic!("jit force self-recursive call boxed failed: {err}"),
         }
@@ -830,9 +830,10 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// - `caller.namespace` is the module globals
 /// - `caller.execution_context` is the shared execution context
 ///
-/// This is closer to PyPy's recursive portal behavior, where the hot recursive
-/// path re-enters the same frame shape instead of dispatching through an
-/// additional callable metadata layer.
+/// Trace-time recursive CALL_ASSEMBLER handles the optimized path. The
+/// concrete helper should mirror RPython's force_fn behavior: execute the
+/// callee's own frame without JIT on that frame, but let nested portal
+/// calls re-enter compiled code through the normal portal runner path.
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let _force_guard = crate::eval::recursive_force_entry_bump();
@@ -848,7 +849,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = match crate::eval::eval_with_jit(frame) {
+        let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
             Ok(result) => result,
             Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
         };
