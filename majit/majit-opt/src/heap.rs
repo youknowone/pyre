@@ -262,12 +262,16 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        // JUMP/flush: allow_force=false to avoid guardless infinite loops.
-        // Call-triggered force (allow_force=true) is safe — guards follow.
-        for (key, mut op) in pending {
-            if Self::emit_lazy_setfield(&mut op, ctx, false) {
-                self.cached_fields.insert(key, op.arg(1));
-            }
+        // RPython heap.py:136: force_lazy_set → emit_extra(op, emit=False)
+        // → send_extra_operation(op, next_optimization=None)
+        // → reprocesses op through ALL passes from first_optimization.
+        //
+        // Queue lazy SetfieldGc ops for reprocessing through the full pass
+        // chain via emit_through_passes. The optimizer's drain mechanism
+        // (drain_extra_operations_from) routes them through OptVirtualize
+        // (which force_box's virtual args) and back through OptHeap.
+        for (_key, op) in pending {
+            ctx.emit_through_passes(op);
         }
     }
 
@@ -648,37 +652,7 @@ impl OptHeap {
             }
         }
 
-        // Pyre-specific: when the object is a raw Int from preamble unboxing,
-        // reading its intval field (signed, offset 8) returns the object itself
-        // (it IS the int value).  This compensates for pyre not having
-        // RPython's jitcode layer which would avoid the GetfieldGcI entirely.
-        {
-            let obj = op.arg(0);
-            if std::env::var_os("MAJIT_LOG").is_some() && !ctx.unboxed_int_args.is_empty() {
-                eprintln!("[jit][heap] getfield obj={:?} unboxed_set={:?} contains={}", obj, ctx.unboxed_int_args, ctx.unboxed_int_args.contains(&obj));
-            }
-            if ctx.unboxed_int_args.contains(&obj) {
-                if let Some(descr) = &op.descr {
-                    if let Some(fd) = descr.as_field_descr() {
-                        if fd.is_field_signed() && fd.field_type() == Type::Int {
-                            // intval field: the object IS the value
-                            ctx.replace_op(op.pos, obj);
-                            return OptimizationResult::Remove;
-                        }
-                        if fd.is_always_pure() && !fd.is_field_signed()
-                            && fd.field_type() == Type::Int
-                        {
-                            // ob_type field: constant-fold from heap cache or
-                            // Phase 1 guard. Use cached if available, else emit.
-                            if let Some(&cached) = self.cached_fields.get(&key) {
-                                ctx.replace_op(op.pos, cached);
-                                return OptimizationResult::Remove;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+
 
         // Check lazy set first: if there is a pending SETFIELD for this key,
         // the value is the second arg of that pending op.

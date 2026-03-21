@@ -451,6 +451,25 @@ impl VirtualState {
         args.into_iter().filter(|opref| !opref.is_none()).collect()
     }
 
+    /// Return the original top-level input slots corresponding to each
+    /// non-virtual inputarg produced by `make_inputargs()`.
+    ///
+    /// This mirrors RPython's top-level inputarg ownership. Leaf boxes coming
+    /// out of virtual fields do not correspond to a stable original input slot,
+    /// so they are reported as `OpRef::NONE`.
+    pub fn make_inputarg_source_slots(&self, concrete_refs: &[OpRef]) -> Vec<OpRef> {
+        let mut sources = vec![OpRef::NONE; self.num_boxes()];
+        let mut next_slot = 0usize;
+        for (idx, info) in self.state.iter().enumerate() {
+            let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
+            Self::enum_inputarg_source_slots(info, opref, true, &mut sources, &mut next_slot);
+        }
+        sources
+            .into_iter()
+            .filter(|opref| !opref.is_none())
+            .collect()
+    }
+
     /// virtualstate.py: make_inputargs_and_virtuals(oprefs)
     /// Returns `(inputargs, virtuals)` where `inputargs` contains the
     /// non-virtual boxes and `virtuals` contains the original virtual boxes.
@@ -602,6 +621,74 @@ impl VirtualState {
             | VirtualStateInfo::Unknown => {
                 if let Some(slot) = boxes.get_mut(*next_slot) {
                     *slot = ctx.get_replacement(opref);
+                }
+                *next_slot += 1;
+            }
+        }
+    }
+
+    fn enum_inputarg_source_slots(
+        info: &VirtualStateInfo,
+        opref: OpRef,
+        top_level: bool,
+        sources: &mut [OpRef],
+        next_slot: &mut usize,
+    ) {
+        match info {
+            VirtualStateInfo::Constant(_) => {}
+            VirtualStateInfo::Virtual { fields, .. }
+            | VirtualStateInfo::VirtualStruct { fields, .. } => {
+                for (_, field_state) in fields {
+                    Self::enum_inputarg_source_slots(
+                        field_state,
+                        OpRef::NONE,
+                        false,
+                        sources,
+                        next_slot,
+                    );
+                }
+            }
+            VirtualStateInfo::VirtualArray { items, .. } => {
+                for item_state in items {
+                    Self::enum_inputarg_source_slots(
+                        item_state,
+                        OpRef::NONE,
+                        false,
+                        sources,
+                        next_slot,
+                    );
+                }
+            }
+            VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => {
+                for fields in element_fields {
+                    for (_, field_state) in fields {
+                        Self::enum_inputarg_source_slots(
+                            field_state,
+                            OpRef::NONE,
+                            false,
+                            sources,
+                            next_slot,
+                        );
+                    }
+                }
+            }
+            VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
+                for (_, _, entry_state) in entries {
+                    Self::enum_inputarg_source_slots(
+                        entry_state,
+                        OpRef::NONE,
+                        false,
+                        sources,
+                        next_slot,
+                    );
+                }
+            }
+            VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull
+            | VirtualStateInfo::IntBounded(_)
+            | VirtualStateInfo::Unknown => {
+                if let Some(slot) = sources.get_mut(*next_slot) {
+                    *slot = if top_level { opref } else { OpRef::NONE };
                 }
                 *next_slot += 1;
             }
@@ -1252,6 +1339,24 @@ fn export_single_value(
         }
     }
 
+    // RPython virtualstate.py: not_virtual(cpu, box.type, info)
+    // When type == 'i', create NotVirtualStateInfoInt with IntBound.
+    // When type == 'r', create NotVirtualStateInfoPtr.
+    //
+    // Check imported int bounds first (from Phase 1 → Phase 2 propagation).
+    if let Some(bound) = ctx.imported_int_bounds.get(&opref) {
+        return VirtualStateInfo::IntBounded(bound.clone());
+    }
+    // Check if the producing operation returns a raw int.
+    // This ensures that IntAdd/IntSub/IntMul results are exported as
+    // IntBounded, so the peeled body knows NOT to call GetfieldGcPureI
+    // on them (they are raw ints, not boxed W_IntObject references).
+    if let Some(op) = ctx.new_operations.iter().find(|op| op.pos == opref) {
+        if op.result_type() == majit_ir::Type::Int {
+            return VirtualStateInfo::IntBounded(IntBound::unbounded());
+        }
+    }
+
     VirtualStateInfo::Unknown
 }
 
@@ -1377,9 +1482,15 @@ fn import_single_value(
         VirtualStateInfo::NonNull => {
             ptr_info[idx] = Some(PtrInfo::NonNull);
         }
-        VirtualStateInfo::IntBounded(_) | VirtualStateInfo::Unknown => {
-            // IntBounded would need integration with the IntBounds pass;
-            // Unknown has nothing to import.
+        VirtualStateInfo::IntBounded(bound) => {
+            // RPython virtualstate.py NotVirtualStateInfoInt: propagate
+            // IntBound info so the IntBounds pass can intersect with it.
+            // This tells the body optimizer that this value is a raw int,
+            // preventing it from being treated as a boxed Ref.
+            ctx.imported_int_bounds.insert(opref, bound.clone());
+        }
+        VirtualStateInfo::Unknown => {
+            // Nothing to import.
         }
     }
 }
