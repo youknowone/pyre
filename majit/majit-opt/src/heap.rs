@@ -242,37 +242,28 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        // RPython: emit_extra(op, emit=False) → re-absorbed → lost.
-        // This is correct for Phase 2 body (imported cache carries values).
-        // For Phase 1 preamble (skip_flush_mode=false), the JUMP loops back
-        // directly, so lazy_sets MUST be emitted to compiled code.
-        let drop_mode = ctx.skip_flush_mode;
+        // RPython heap.py:136: emit_extra(op, emit=False) → the op is
+        // re-processed through all passes. The heap pass re-absorbs the
+        // SetfieldGc as a new lazy_set → effectively dropped.
+        // This applies to BOTH Phase 1 and Phase 2.
         for ((obj, field_idx), mut op) in pending {
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
             let value_ref = op.arg(1);
+            // heap.py:139: put_field_back_to_info — restore cached value
             self.cached_fields.insert((obj, field_idx), value_ref);
-            if !drop_mode {
-                // Phase 1: emit (virtual values need materialization)
-                if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
-                    if info.is_virtual() {
-                        info.force_to_ops_direct(value_ref, ctx);
-                    }
-                }
-                let mut resolved = op.clone();
-                for arg in resolved.args.iter_mut() {
-                    *arg = ctx.get_replacement(*arg);
-                }
-                self.remember_field_descr((obj, field_idx), &resolved);
-                ctx.emit(resolved);
+            if false {
+                // Kept for reference: Phase 1 used to emit here, but
+                // RPython's emit_extra(emit=False) re-absorbs instead.
             }
         }
     }
 
     fn force_all_lazy_setarrayitems(&mut self, ctx: &mut OptContext) {
         let pending: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
-        let drop_mode = ctx.skip_flush_mode;
+        // RPython: same as force_all_lazy_setfields — emit_extra(emit=False)
+        // re-absorbs the op. Drop and update cache only.
         for ((obj, descr_idx, index), mut op) in pending {
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
@@ -280,10 +271,6 @@ impl OptHeap {
             let value_ref = op.arg(2);
             let key = (obj, descr_idx, index);
             self.cached_arrayitems.insert(key, value_ref);
-            if !drop_mode {
-                self.remember_arrayitem_descr(key, &op);
-                ctx.emit(op);
-            }
         }
     }
 
