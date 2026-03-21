@@ -80,12 +80,14 @@ pub enum TraceAction {
     /// Close the loop (back-edge to header detected).
     CloseLoop,
     /// Close the loop with explicit jump arguments supplied by the tracer.
-    /// `green_key` overrides the tracing context's key so compiled loops
-    /// are stored under the backward-jump target PC, matching the key
-    /// used by back_edge_or_run_compiled_keyed at the CloseLoop site.
+    ///
+    /// RPython parity: the tracer can also pass the explicit loop-header PC
+    /// (the backward-jump target / reached loop header).  This lets the
+    /// tracing context retarget its green key from the true merge point,
+    /// instead of trying to recover it later from virtualizable state.
     CloseLoopWithArgs {
         jump_args: Vec<OpRef>,
-        green_key: Option<u64>,
+        loop_header_pc: Option<usize>,
     },
     /// Finish the trace with terminal output values.
     Finish {

@@ -12,7 +12,10 @@ use crate::{
 pub enum StepResult<V> {
     Continue,
     Return(V),
-    CloseLoop(Vec<V>),
+    CloseLoop {
+        jump_args: Vec<V>,
+        loop_header_pc: usize,
+    },
     Yield(V),
 }
 
@@ -101,7 +104,10 @@ pub trait ControlFlowOpcodeHandler: SharedOpcodeHandler {
 
     fn close_loop(&mut self, target: usize) -> Result<StepResult<Self::Value>, PyError> {
         match self.close_loop_args(target)? {
-            Some(args) => Ok(StepResult::CloseLoop(args)),
+            Some(args) => Ok(StepResult::CloseLoop {
+                jump_args: args,
+                loop_header_pc: target,
+            }),
             None => Ok(StepResult::Continue),
         }
     }

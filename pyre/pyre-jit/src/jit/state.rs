@@ -3965,7 +3965,7 @@ pub(crate) fn trace_step_result_to_action(
                     }
                     return TraceAction::CloseLoopWithArgs {
                         jump_args,
-                        green_key: None,
+                        loop_header_pc: None,
                     };
                 }
                 note_root_trace_too_long(root_green_key);
@@ -3981,17 +3981,13 @@ pub(crate) fn trace_step_result_to_action(
                 TraceAction::Continue
             }
         }
-        Ok(pyre_runtime::StepResult::CloseLoop(jump_args)) => {
-            // RPython parity: the loop-header greenkey comes from the JUMP
-            // state itself (`next_instr` carried in jump_args[1]`), not from
-            // the mutable concrete frame. trace_bytecode() retargets the
-            // TraceCtx green_key from these jump args before compilation. If
-            // we also override it here from `frame.next_instr`, the compiled
-            // loop can end up registered under a different PC than the one
-            // carried through JUMP, and back-edge dispatch will miss it.
+        Ok(pyre_runtime::StepResult::CloseLoop {
+            jump_args,
+            loop_header_pc,
+        }) => {
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                green_key: None,
+                loop_header_pc: Some(loop_header_pc),
             }
         }
         Ok(pyre_runtime::StepResult::Return(value)) => TraceAction::Finish {
@@ -7126,7 +7122,10 @@ fn inline_trace_and_execute(
                     "concrete return/yield without trace finish",
                 ));
             }
-            StepResult::CloseLoop(_) => {
+            StepResult::CloseLoop {
+                jump_args: _,
+                loop_header_pc: _,
+            } => {
                 ctx.truncate_inline_trace_positions(inline_trace_base);
                 return Err(pyre_runtime::PyError::type_error(
                     "inline callee has loop (not supported)",

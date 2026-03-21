@@ -385,15 +385,11 @@ impl<S: JitState> JitDriver<S> {
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                green_key: override_key,
+                loop_header_pc: _,
             } => {
-                // RPython parity: when tracing started at function entry
-                // but CloseLoop occurs at a backward jump, update the
-                // green_key so compiled loops are stored under the
-                // backward-jump target PC (matching back_edge dispatch).
-                if let Some(key) = override_key {
-                    self.meta.update_tracing_green_key(key);
-                }
+                // The tracing context has already been retargeted to the
+                // reached loop header by the tracer itself. Keep the driver
+                // layer ignorant of bytecode-PC reconstruction here.
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
