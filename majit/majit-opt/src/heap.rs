@@ -505,27 +505,33 @@ impl OptHeap {
             }
         };
 
-        // If all bitstrings are zero (no specific field info), fall back
-        // to conservative invalidation of all non-immutable/non-unescaped.
+        // RPython effectinfo.py: zero bitstrings mean the call touches NO
+        // tracked heap fields (e.g., I/O). Only fall back to conservative
+        // invalidation for calls with ForcesVirtual/RandomEffects.
         let has_bitstrings = ei.readonly_descrs_fields != 0
             || ei.write_descrs_fields != 0
             || ei.readonly_descrs_arrays != 0
             || ei.write_descrs_arrays != 0;
         if !has_bitstrings {
-            self.force_all_lazy(ctx);
-            self.cached_fields.retain(|&(obj, descr_idx), _| {
-                self.immutable_field_descrs.contains(&descr_idx) || self.unescaped.contains(&obj)
-            });
-            self.cached_arrayitems
-                .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
-            self.cached_arrayitems_var
-                .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
-            if !self.seen_allocation.is_empty() {
-                self.known_nonnull
-                    .retain(|v| self.seen_allocation.contains(v));
-            } else {
-                self.known_nonnull.clear();
+            if ei.forces_virtual_or_virtualizable() || ei.has_random_effects() {
+                self.force_all_lazy(ctx);
+                self.cached_fields.retain(|&(obj, descr_idx), _| {
+                    self.immutable_field_descrs.contains(&descr_idx)
+                        || self.unescaped.contains(&obj)
+                });
+                self.cached_arrayitems
+                    .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+                self.cached_arrayitems_var
+                    .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+                if !self.seen_allocation.is_empty() {
+                    self.known_nonnull
+                        .retain(|v| self.seen_allocation.contains(v));
+                } else {
+                    self.known_nonnull.clear();
+                }
             }
+            // Zero bitstrings + CannotRaise/CanRaise: call doesn't touch
+            // any tracked heap fields → cache survives (RPython parity).
             return;
         }
 
@@ -1340,12 +1346,13 @@ impl Optimization for OptHeap {
     ///
     /// Add cached field/array reads to the short preamble so bridges
     /// can re-populate the optimizer's cache.
+    /// heap.py:360-377: export ALL cached fields to short preamble.
     fn produce_potential_short_preamble_ops(&self, sb: &mut crate::shortpreamble::ShortBoxes) {
         for (&(obj, descr_idx), &cached_val) in &self.cached_fields {
             if cached_val.is_none() || obj.is_none() {
                 continue;
             }
-            if sb.lookup_label_arg(obj).is_none() {
+            if !sb.is_reachable(obj) {
                 continue;
             }
             let Some(descr) = self.cached_field_descrs.get(&(obj, descr_idx)) else {
@@ -1364,7 +1371,7 @@ impl Optimization for OptHeap {
             if cached_val.is_none() || obj.is_none() {
                 continue;
             }
-            if sb.lookup_label_arg(obj).is_none() {
+            if !sb.is_reachable(obj) {
                 continue;
             }
             let Some(descr) = self.cached_arrayitem_descrs.get(&(obj, descr_idx, index)) else {
