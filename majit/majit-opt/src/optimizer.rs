@@ -1283,6 +1283,11 @@ impl Optimizer {
 
         // Preserve final context for jump_to_existing_trace.
         let ops = std::mem::take(&mut ctx.new_operations);
+        if crate::majit_log_enabled() {
+            let cmf_count = ops.iter().filter(|o| o.opcode.is_call_may_force()).count();
+            let gnf_count = ops.iter().filter(|o| matches!(o.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2)).count();
+            eprintln!("[opt] final ops: total={} call_may_force={} guard_not_forced={}", ops.len(), cmf_count, gnf_count);
+        }
         self.final_ctx = Some(ctx);
         ops
     }
@@ -1420,6 +1425,16 @@ impl Optimizer {
             if self.can_replace_guards {
                 if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
                     let target_pos = replacement.pos.0 as usize;
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[opt] guard replacement op={:?} pos={:?} replacement_pos={:?} target_index={} len={}",
+                            op.opcode,
+                            op.pos,
+                            replacement.pos,
+                            target_pos,
+                            ctx.new_operations.len()
+                        );
+                    }
                     if target_pos < ctx.new_operations.len() {
                         ctx.new_operations[target_pos] = op.clone();
                         return;
@@ -1434,7 +1449,17 @@ impl Optimizer {
             // Side-effecting ops reset last_guard_op
             self.last_guard_op = None;
         }
-        ctx.emit(op);
+        let emitted = ctx.emit(op.clone());
+        if std::env::var_os("MAJIT_LOG").is_some()
+            && matches!(op.opcode, OpCode::CallMayForceI | OpCode::CallMayForceR | OpCode::CallMayForceF | OpCode::CallMayForceN | OpCode::GuardNotForced | OpCode::GuardNotForced2)
+        {
+            eprintln!(
+                "[opt] emit {:?} pos={:?} len={}",
+                op.opcode,
+                emitted,
+                ctx.new_operations.len()
+            );
+        }
     }
 
     /// optimizer.py: store_final_boxes_in_guard — encode virtual objects

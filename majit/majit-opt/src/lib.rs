@@ -173,6 +173,10 @@ pub struct OptContext {
     /// RPython optimizer.py: end_args after force_box_for_end_of_preamble().
     /// export_state() prefers this over a raw get_replacement() snapshot.
     pub preamble_end_args: Option<Vec<OpRef>>,
+    /// Phase-2 loop-body mode from optimizer.skip_flush.
+    /// RPython unroll.py relies on this distinction so virtualize can keep
+    /// body-side allocations concrete when guard recovery cannot rebuild them.
+    pub skip_flush_mode: bool,
     /// Field OpRefs of virtual args before force. Maps virtual OpRef →
     /// [(field_idx, field_value_ref)]. Used by make_inputargs to flatten
     /// virtuals into label args after force has destroyed PtrInfo.
@@ -209,6 +213,7 @@ impl OptContext {
             pre_force_virtual_state: None,
             pre_force_jump_args: None,
             preamble_end_args: None,
+            skip_flush_mode: false,
             pre_force_field_refs: HashMap::new(),
         }
     }
@@ -242,6 +247,7 @@ impl OptContext {
             pre_force_virtual_state: None,
             pre_force_jump_args: None,
             preamble_end_args: None,
+            skip_flush_mode: false,
             pre_force_field_refs: HashMap::new(),
         }
     }
@@ -742,6 +748,11 @@ pub trait Optimization {
     /// Called after flush+drain to emit lazy_sets that were re-stored
     /// during drain. Virtual values should already be forced at this point.
     fn emit_remaining_lazy_directly(&mut self, _ctx: &mut OptContext) {}
+
+    /// Mark this pass as Phase 2 (loop body). Phase 2 should not fully
+    /// virtualize New() ops because guard recovery_layout is not yet
+    /// populated. Default: no-op.
+    fn set_phase2(&mut self, _phase2: bool) {}
 
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
