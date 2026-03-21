@@ -645,11 +645,14 @@ impl OptHeap {
             return OptimizationResult::Remove;
         }
 
-        if let Some(&cached) = ctx.imported_short_fields.get(&key) {
+        // Consume the imported short field: remove it so that if a later
+        // setfield/call invalidates cached_fields, the stale preamble value
+        // cannot re-populate the cache on a subsequent getfield.
+        if let Some(cached) = ctx.imported_short_fields.remove(&key) {
             let cached = ctx.force_op_from_preamble(cached);
             self.cached_fields.entry(key).or_insert(cached);
-            if let Some(descr) = ctx.imported_short_field_descrs.get(&key) {
-                self.cached_field_descrs.insert(key, descr.clone());
+            if let Some(descr) = ctx.imported_short_field_descrs.remove(&key) {
+                self.cached_field_descrs.insert(key, descr);
             } else {
                 self.remember_field_descr(key, op);
             }
@@ -757,11 +760,14 @@ impl OptHeap {
                 ctx.replace_op(op.pos, cached);
                 return OptimizationResult::Remove;
             }
-            if let Some(&cached) = ctx.imported_short_arrayitems.get(&key) {
+            // Consume the imported short arrayitem: remove it so that if a later
+            // setarrayitem/call invalidates cached_arrayitems, the stale preamble
+            // value cannot re-populate the cache on a subsequent getarrayitem.
+            if let Some(cached) = ctx.imported_short_arrayitems.remove(&key) {
                 let cached = ctx.force_op_from_preamble(cached);
                 self.cached_arrayitems.entry(key).or_insert(cached);
-                if let Some(descr) = ctx.imported_short_arrayitem_descrs.get(&key) {
-                    self.cached_arrayitem_descrs.insert(key, descr.clone());
+                if let Some(descr) = ctx.imported_short_arrayitem_descrs.remove(&key) {
+                    self.cached_arrayitem_descrs.insert(key, descr);
                 } else {
                     self.remember_arrayitem_descr(key, op);
                 }
@@ -1543,6 +1549,43 @@ mod tests {
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+    }
+
+    /// After consuming an imported short field, a cache invalidation followed
+    /// by another getfield must emit the actual load (not reuse the stale
+    /// preamble value).  This prevents null-pointer crashes when the
+    /// preamble's cached value (e.g. a linked-list head) is no longer valid
+    /// after a call/setfield that empties the container.
+    #[test]
+    fn test_imported_short_field_not_reused_after_invalidation() {
+        let d_head = descr(10); // head field
+        let d_size = descr(11); // size field (different)
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::with_num_inputs(4, 4);
+
+        // Simulate short preamble import: (obj=0, head_field) → OpRef(1)
+        ctx.imported_short_fields
+            .insert((OpRef(0), d_head.index()), OpRef(1));
+
+        // First getfield on head: consumes the import, caches the value.
+        let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], d_head.clone());
+        op1.pos = OpRef(2);
+        let result1 = heap.optimize_getfield(&op1, &mut ctx);
+        assert!(matches!(result1, OptimizationResult::Remove));
+        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+
+        // A call invalidates all mutable field caches.
+        heap.invalidate_caches();
+
+        // Second getfield on head after invalidation: must NOT return the
+        // stale preamble value.  The import was consumed, so it should emit.
+        let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], d_head.clone());
+        op2.pos = OpRef(3);
+        let result2 = heap.optimize_getfield(&op2, &mut ctx);
+        assert!(
+            matches!(result2, OptimizationResult::Emit(_)),
+            "getfield after invalidation must emit, not reuse stale import"
+        );
     }
 
     #[test]
