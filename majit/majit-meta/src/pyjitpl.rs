@@ -752,9 +752,23 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.forced_virtualizable = None;
                 self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
+                let num_inputs = ctx.recorder.num_inputargs();
+                // Virtualizable input types: [Ref(frame), Int(ni), Int(vsd), Ref(local)...]
+                let input_types: Vec<majit_ir::Type> = (0..num_inputs)
+                    .map(|i| if i == 0 || i >= 3 { majit_ir::Type::Ref } else { majit_ir::Type::Int })
+                    .collect();
                 self.tracing = Some(ctx);
                 let pending_num = self.warm_state.alloc_token_number();
                 self.pending_token = Some((green_key, pending_num));
+                // RPython compile_tmp_callback parity: register a placeholder
+                // target so call_assembler can resolve the pending token at
+                // runtime. call_assembler_fast_path detects null code_ptr and
+                // falls back to force_fn.
+                self.backend.register_pending_target(
+                    pending_num,
+                    input_types,
+                    num_inputs,
+                );
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
                 }
