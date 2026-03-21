@@ -319,9 +319,7 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                         driver.has_compiled_loop(green_key)
                     );
                 }
-                let outcome = if driver.is_tracing() {
-                    None
-                } else if driver.has_compiled_loop(green_key) {
+                let outcome = if driver.has_compiled_loop(green_key) {
                     Some(driver.run_compiled_detailed_with_bridge_keyed(
                         green_key,
                         loop_header_pc,

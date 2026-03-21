@@ -38,7 +38,7 @@ pub mod virtualref;
 
 pub use call_descr::{make_call_assembler_descr, make_call_descr};
 pub use constant_pool::ConstantPool;
-pub use fail_descr::{make_fail_descr, make_fail_descr_typed, make_fail_descr_typed_with_index};
+pub use fail_descr::{make_fail_descr, make_fail_descr_typed};
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,
     io_buffer_write_fmt, jit_write_number_i64, jit_write_utf8_codepoint,

@@ -483,7 +483,6 @@ impl UnrollOptimizer {
                 .unwrap_or(&[]),
             &exported_state.renamed_inputargs,
             &sp.used_boxes,
-            &sp.jump_args,
             p2_ni,
             jump_to_self,
             &imported_short_aliases,
@@ -1366,21 +1365,6 @@ impl OptUnroll {
             .make_inputarg_source_slots(targetargs);
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            let label_consts: Vec<_> = label_args
-                .iter()
-                .filter_map(|&arg| ctx.get_constant(arg).cloned().map(|value| (arg, value)))
-                .collect();
-            let short_consts: Vec<_> = short_args
-                .iter()
-                .filter_map(|&arg| ctx.get_constant(arg).cloned().map(|value| (arg, value)))
-                .collect();
-            if !label_consts.is_empty() || !short_consts.is_empty() {
-                eprintln!(
-                    "[jit] import_state_consts: label={label_consts:?} short={short_consts:?}"
-                );
-            }
-        }
         self.import_short_preamble_ops(&short_args, exported_state, ctx);
         // RPython: setinfo_from_preamble applies to ALL exported values,
         // including short preamble. Apply exported infos to imported
@@ -1898,11 +1882,6 @@ impl OptUnroll {
                     // operations into OptPure's CSE table. Reusing an
                     // imported INT_*_OVF result without replaying the paired
                     // GUARD_NO_OVERFLOW leaves a stray guard in phase 2.
-                    if std::env::var_os("MAJIT_LOG").is_some() {
-                        eprintln!(
-                            "[jit] import_short_pure: opcode={opcode:?} source={source:?} result={result_opref:?} args={args:?}"
-                        );
-                    }
                     if !opcode.is_ovf() {
                         ctx.imported_short_pure_ops
                             .push(crate::ImportedShortPureOp {
@@ -2102,7 +2081,6 @@ fn assemble_peeled_trace(
     label_source_slots: &[OpRef],
     start_label_args: &[OpRef],
     extra_label_args: &[OpRef],
-    extra_jump_args: &[OpRef],
     body_num_inputs: usize,
     jump_to_self: bool,
     imported_short_aliases: &[crate::ImportedShortAlias],
@@ -2113,20 +2091,11 @@ fn assemble_peeled_trace(
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
-    let mut filtered_extra_label_args = Vec::new();
-    let mut filtered_extra_jump_args = Vec::new();
-    let mut seen_extra_label_args = std::collections::HashSet::new();
-    for (idx, &label_arg) in extra_label_args.iter().enumerate() {
-        let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
-        if constants.contains_key(&label_arg.0)
-            || label_args.contains(&label_arg)
-            || !seen_extra_label_args.insert(label_arg)
-        {
-            continue;
-        }
-        filtered_extra_label_args.push(label_arg);
-        filtered_extra_jump_args.push(jump_arg);
-    }
+    let filtered_extra_label_args: Vec<OpRef> = extra_label_args
+        .iter()
+        .copied()
+        .filter(|arg| !constants.contains_key(&arg.0))
+        .collect();
 
     let mut next_free_pos = |mut next: u32| {
         next = next.max(body_num_inputs as u32);
@@ -2172,11 +2141,7 @@ fn assemble_peeled_trace(
 
     // Label position
     let label_pos = next_free_pos(max_pos);
-    let mut full_label_args: Vec<OpRef> = label_args
-        .iter()
-        .copied()
-        .filter(|arg| !constants.contains_key(&arg.0))
-        .collect();
+    let mut full_label_args = label_args.to_vec();
 
     // Collect preamble-defined OpRefs BEFORE adding extra label args,
     // so we can filter out virtual remnants (removed New ops).
@@ -2245,7 +2210,7 @@ fn assemble_peeled_trace(
         } else {
             (0..label_args.len()).map(|i| OpRef(i as u32)).collect()
         };
-    carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
+    carried_source_slots.extend(filtered_extra_label_args.iter().copied());
     let mut label_set: std::collections::HashSet<OpRef> =
         full_label_args.iter().copied().collect();
     let mut seen_body_defs = std::collections::HashSet::new();
@@ -2254,7 +2219,7 @@ fn assemble_peeled_trace(
             op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()),
         );
         for &arg in all_refs {
-            if arg.is_none() || arg.0 >= 10_000 || constants.contains_key(&arg.0) {
+            if arg.is_none() || arg.0 >= 10_000 {
                 continue; // skip NONE and constants
             }
             if label_set.contains(&arg)
@@ -2303,6 +2268,9 @@ fn assemble_peeled_trace(
     result.push(label_op);
 
     // Body: 2-pass remap (inputarg refs → label_args, op positions → fresh boxes)
+    // Start body positions after all label arg positions (including SameAs
+    // aliases from short preamble) to prevent Cranelift variable collision
+    // where a body op result overwrites a label block parameter.
     let max_label_arg_pos = full_label_args.iter().map(|a| a.0).max().unwrap_or(label_pos);
     let mut next_body_pos = next_free_pos(label_pos.max(max_label_arg_pos).saturating_add(1));
     let mut input_remap: HashMap<OpRef, OpRef> = HashMap::new();
@@ -2356,149 +2324,28 @@ fn assemble_peeled_trace(
     }
     // Pass 2: apply
     let mut seen_body_defs = std::collections::HashSet::new();
-    let mut label_scope_remap: HashMap<OpRef, OpRef> = HashMap::new();
-    let mut current_inner_label_index: Option<usize> = None;
-    let mut defs_since_inner_label: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
-    for (op_idx, op) in p2_ops.iter().enumerate() {
+    for op in p2_ops.iter() {
         let mut new_op = op.clone();
-        let mut original_args = op.args.clone();
+        let original_args = op.args.clone();
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
             new_op.pos = mapped_pos;
         }
-        let remap_body_arg = |arg: OpRef,
-                              label_scope_remap: &HashMap<OpRef, OpRef>,
-                              input_remap: &HashMap<OpRef, OpRef>,
-                              alias_remap: &HashMap<OpRef, OpRef>,
-                              short_source_map: &HashMap<OpRef, OpRef>,
-                              body_result_remap: &HashMap<OpRef, OpRef>,
-                              seen_body_defs: &std::collections::HashSet<OpRef>,
-                              visible_before_label: &std::collections::HashSet<OpRef>|
-         -> OpRef {
-            let mut current = arg;
-            for _ in 0..8 {
-                if let Some(&mapped) = label_scope_remap.get(&current) {
-                    if mapped != current {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                if let Some(&mapped) = input_remap.get(&current) {
-                    if mapped != current {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                if let Some(&mapped) = alias_remap.get(&current) {
-                    if mapped != current {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                if let Some(&mapped) = short_source_map.get(&current) {
-                    if mapped != current {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                if let Some(&mapped) = body_result_remap.get(&current) {
-                    if (seen_body_defs.contains(&current)
-                        || !visible_before_label.contains(&current))
-                        && mapped != current
-                    {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                break;
+        let mut remap_body_arg = |arg: OpRef| -> OpRef {
+            if let Some(&mapped) = input_remap.get(&arg) {
+                return mapped;
             }
-            current
+            if let Some(&mapped) = alias_remap.get(&arg) {
+                return mapped;
+            }
+            if let Some(&mapped) = body_result_remap.get(&arg) {
+                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
+                    return mapped;
+                }
+            }
+            arg
         };
         for arg in &mut new_op.args {
-                *arg = remap_body_arg(
-                    *arg,
-                    &label_scope_remap,
-                    &input_remap,
-                    &alias_remap,
-                    &short_source_map,
-                    &body_result_remap,
-                    &seen_body_defs,
-                    &visible_before_label,
-                );
-        }
-        if new_op.opcode == OpCode::Label {
-            let mut seen_after_label_defs = std::collections::HashSet::new();
-            let mut extra_inner_sources = Vec::new();
-            let mut extra_inner_set = std::collections::HashSet::new();
-            let label_arg_set: std::collections::HashSet<OpRef> =
-                original_args.iter().copied().filter(|arg| !arg.is_none()).collect();
-            for later_op in p2_ops.iter().skip(op_idx + 1) {
-                for arg in later_op
-                    .args
-                    .iter()
-                    .copied()
-                    .chain(later_op.fail_args.iter().flatten().copied())
-                {
-                    if arg.is_none()
-                        || constants.contains_key(&arg.0)
-                        || label_arg_set.contains(&arg)
-                        || extra_inner_set.contains(&arg)
-                        || seen_after_label_defs.contains(&arg)
-                    {
-                        continue;
-                    }
-                    let available_before_label = visible_before_label.contains(&arg)
-                        || seen_body_defs.contains(&arg)
-                        || short_source_map.contains_key(&arg)
-                        || input_remap.contains_key(&arg)
-                        || alias_remap.contains_key(&arg);
-                    if available_before_label {
-                        extra_inner_set.insert(arg);
-                        extra_inner_sources.push(arg);
-                    }
-                }
-                if later_op.result_type() != Type::Void && !later_op.pos.is_none() {
-                    seen_after_label_defs.insert(later_op.pos);
-                }
-            }
-            for &source_arg in &extra_inner_sources {
-                let mapped_arg = remap_body_arg(
-                    source_arg,
-                    &label_scope_remap,
-                    &input_remap,
-                    &alias_remap,
-                    &short_source_map,
-                    &body_result_remap,
-                    &seen_body_defs,
-                    &visible_before_label,
-                );
-                if new_op.args.contains(&mapped_arg) {
-                    continue;
-                }
-                new_op.args.push(mapped_arg);
-                original_args.push(source_arg);
-            }
-            if std::env::var_os("MAJIT_LOG").is_some() && !extra_inner_sources.is_empty() {
-                eprintln!(
-                    "[jit] inner_label_extend: op_idx={op_idx} extra_sources={extra_inner_sources:?} new_args={:?}",
-                    new_op.args
-                );
-            }
-            label_scope_remap.clear();
-            for (&source_arg, &mapped_arg) in original_args.iter().zip(new_op.args.iter()) {
-                if !source_arg.is_none() {
-                    label_scope_remap.insert(source_arg, mapped_arg);
-                    if let Some(imported_result) = imported_short_sources
-                        .iter()
-                        .find(|entry| entry.source == source_arg)
-                        .map(|entry| entry.result)
-                    {
-                        label_scope_remap.insert(imported_result, mapped_arg);
-                    }
-                    if let Some(&aliased_result) = alias_remap.get(&source_arg) {
-                        label_scope_remap.insert(aliased_result, mapped_arg);
-                    }
-                }
-            }
+            *arg = remap_body_arg(*arg);
         }
         if new_op.opcode == OpCode::Jump {
             let mapped_base_args: Vec<OpRef> = if !jump_to_self {
@@ -2525,29 +2372,8 @@ fn assemble_peeled_trace(
             // label contract and only swaps the descr.
             if jump_to_self {
                 while jump_args.len() < full_label_args.len() {
-                    let extra_idx = jump_args.len().saturating_sub(label_args.len());
-                    let extra_arg = filtered_extra_jump_args
-                        .get(extra_idx)
-                        .copied()
-                        .unwrap_or(full_label_args[jump_args.len()]);
-                    let remapped = input_remap
-                        .get(&extra_arg)
-                        .copied()
-                        .or_else(|| alias_remap
-                        .get(&extra_arg)
-                        .copied())
-                        .or_else(|| {
-                            body_result_remap.get(&extra_arg).copied().and_then(|mapped| {
-                                if seen_body_defs.contains(&extra_arg)
-                                    || !visible_before_label.contains(&extra_arg)
-                                {
-                                    Some(mapped)
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .unwrap_or(extra_arg);
+                    let extra_arg = full_label_args[jump_args.len()];
+                    let remapped = remap_body_arg(extra_arg);
                     jump_args.push(remapped);
                 }
             }
@@ -2555,61 +2381,12 @@ fn assemble_peeled_trace(
         }
         if let Some(ref mut fa) = new_op.fail_args {
             for a in fa.iter_mut() {
-                *a = remap_body_arg(
-                    *a,
-                    &label_scope_remap,
-                    &input_remap,
-                    &alias_remap,
-                    &short_source_map,
-                    &body_result_remap,
-                    &seen_body_defs,
-                    &visible_before_label,
-                );
-            }
-        }
-        if let Some(label_idx) = current_inner_label_index {
-            let mut extra_live_args = Vec::new();
-            let label_args = &result[label_idx].args;
-            for arg in new_op
-                .args
-                .iter()
-                .copied()
-                .chain(new_op.fail_args.iter().flatten().copied())
-            {
-                if arg.is_none()
-                    || constants.contains_key(&arg.0)
-                    || defs_since_inner_label.contains(&arg)
-                    || label_args.contains(&arg)
-                    || extra_live_args.contains(&arg)
-                {
-                    continue;
-                }
-                extra_live_args.push(arg);
-            }
-            if !extra_live_args.is_empty() {
-                let existing: std::collections::HashSet<OpRef> =
-                    result[label_idx].args.iter().copied().collect();
-                result[label_idx].args.extend(
-                    extra_live_args
-                        .into_iter()
-                        .filter(|arg| !existing.contains(arg)),
-                );
-                if std::env::var_os("MAJIT_LOG").is_some() {
-                    eprintln!(
-                        "[jit] inner_label_extend_live: label_idx={label_idx} extras={:?}",
-                        result[label_idx].args
-                    );
-                }
+                *a = remap_body_arg(*a);
             }
         }
         result.push(new_op);
-        if op.opcode == OpCode::Label {
-            current_inner_label_index = Some(result.len() - 1);
-            defs_since_inner_label.clear();
-        }
         if op.result_type() != Type::Void && !op.pos.is_none() {
             seen_body_defs.insert(op.pos);
-            defs_since_inner_label.insert(result.last().unwrap().pos);
         }
     }
 
@@ -4360,7 +4137,6 @@ mod tests {
             &[],
             &[OpRef(0)],
             &[],
-            &[],
             1,
             true,
             &[crate::ImportedShortAlias {
@@ -4415,7 +4191,6 @@ mod tests {
             &[OpRef(11)],
             &[],
             &[OpRef(0)],
-            &[],
             &[],
             1,
             true,
@@ -4480,7 +4255,6 @@ mod tests {
             &[OpRef(0)],
             &[],
             &[OpRef(0)],
-            &[],
             &[],
             1,
             true,
@@ -4653,7 +4427,6 @@ mod tests {
             &[],
             &[OpRef(0)],
             &[OpRef(50)],
-            &[OpRef(50)],
             1,
             true,
             &[crate::ImportedShortAlias {
@@ -4692,7 +4465,6 @@ mod tests {
             &[OpRef(0)],
             &[OpRef(0)],
             &[OpRef(50)],
-            &[OpRef(50)],
             1,
             true,
             &[crate::ImportedShortAlias {
@@ -4719,54 +4491,6 @@ mod tests {
     }
 
     #[test]
-    fn test_assemble_peeled_trace_self_loop_uses_short_jump_sources() {
-        let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef(0)])];
-
-        let combined = assemble_peeled_trace(
-            &[],
-            &p2_ops,
-            &[OpRef(10)],
-            &[OpRef(0)],
-            &[OpRef(0)],
-            &[OpRef(50)],
-            &[OpRef(51)],
-            1,
-            true,
-            &[
-                crate::ImportedShortAlias {
-                    result: OpRef(50),
-                    same_as_source: OpRef(10),
-                    same_as_opcode: OpCode::SameAsI,
-                },
-                crate::ImportedShortAlias {
-                    result: OpRef(51),
-                    same_as_source: OpRef(11),
-                    same_as_opcode: OpCode::SameAsI,
-                },
-            ],
-            &[],
-            &std::collections::HashMap::new(),
-            None,
-            None,
-        );
-
-        let label = combined.iter().find(|op| op.opcode == OpCode::Label).unwrap();
-        let jump = combined.iter().find(|op| op.opcode == OpCode::Jump).unwrap();
-        let used_box_alias = combined
-            .iter()
-            .find(|op| op.opcode == OpCode::SameAsI && op.args.as_slice() == &[OpRef(10)])
-            .unwrap()
-            .pos;
-        let jump_source_alias = combined
-            .iter()
-            .find(|op| op.opcode == OpCode::SameAsI && op.args.as_slice() == &[OpRef(11)])
-            .unwrap()
-            .pos;
-        assert_eq!(label.args.as_slice(), &[OpRef(10), used_box_alias]);
-        assert_eq!(jump.args.as_slice(), &[OpRef(10), jump_source_alias]);
-    }
-
-    #[test]
     fn test_assemble_peeled_trace_does_not_carry_plain_preamble_refs() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::New, &[]);
@@ -4784,7 +4508,6 @@ mod tests {
             &[OpRef(10)],
             &[],
             &[OpRef(0)],
-            &[],
             &[],
             1,
             true,
@@ -4820,7 +4543,6 @@ mod tests {
             &[OpRef(10)],
             &[],
             &[OpRef(0)],
-            &[],
             &[],
             1,
             true,
@@ -4863,7 +4585,6 @@ mod tests {
             &[OpRef(0)],
             &[OpRef(0)],
             &[],
-            &[],
             1,
             true,
             &[],
@@ -4904,7 +4625,6 @@ mod tests {
             &[],
             &[OpRef(100), OpRef(101), OpRef(102)],
             &[OpRef(13), OpRef(14)],
-            &[OpRef(13), OpRef(14)],
             5,
             false,
             &[],
@@ -4921,81 +4641,6 @@ mod tests {
             combined[2].args.as_slice(),
             &[OpRef(100), OpRef(101), OpRef(102)]
         );
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_extra_jump_args_do_not_override_base_slots() {
-        let p2_ops = vec![Op::new(
-            OpCode::Jump,
-            &[OpRef(0), OpRef(1), OpRef(2), OpRef(3), OpRef(4)],
-        )];
-
-        let combined = assemble_peeled_trace(
-            &[],
-            &p2_ops,
-            &[OpRef(10), OpRef(11), OpRef(12), OpRef(13), OpRef(14)],
-            &[OpRef(0), OpRef(1), OpRef(2), OpRef(3), OpRef(4)],
-            &[OpRef(10), OpRef(11), OpRef(12), OpRef(13), OpRef(14)],
-            &[OpRef(20)],
-            &[OpRef(4)],
-            5,
-            true,
-            &[],
-            &[],
-            &std::collections::HashMap::new(),
-            None,
-            None,
-        );
-
-        assert_eq!(combined[0].opcode, OpCode::Label);
-        assert_eq!(combined[1].opcode, OpCode::Jump);
-        assert_eq!(
-            combined[1].args.as_slice(),
-            &[OpRef(10), OpRef(11), OpRef(12), OpRef(13), OpRef(14), OpRef(14)]
-        );
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_remaps_uses_after_inner_label() {
-        let p2_ops = vec![
-            {
-                let mut label = Op::new(OpCode::Label, &[OpRef(50), OpRef(51)]);
-                label.descr = Some(TargetToken::new().as_jump_target_descr());
-                label
-            },
-            {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(50), OpRef(51)]);
-                op.pos = OpRef(60);
-                op
-            },
-            Op::new(OpCode::Jump, &[OpRef(0)]),
-        ];
-
-        let combined = assemble_peeled_trace(
-            &[],
-            &p2_ops,
-            &[OpRef(10)],
-            &[OpRef(0)],
-            &[OpRef(0)],
-            &[OpRef(50), OpRef(51)],
-            &[OpRef(50), OpRef(51)],
-            1,
-            true,
-            &[],
-            &[],
-            &std::collections::HashMap::new(),
-            None,
-            None,
-        );
-
-        let inner_label_idx = combined
-            .iter()
-            .rposition(|op| op.opcode == OpCode::Label && op.args.len() > 1)
-            .expect("inner label");
-        let inner_label = &combined[inner_label_idx];
-        let add = &combined[inner_label_idx + 1];
-        assert_eq!(add.opcode, OpCode::IntAdd);
-        assert_eq!(add.args.as_slice(), &inner_label.args[..add.args.len()]);
     }
 
     #[test]
@@ -5017,7 +4662,6 @@ mod tests {
             &[OpRef(10)],
             &[],
             &[OpRef(0)],
-            &[],
             &[],
             1,
             true,
@@ -5048,7 +4692,6 @@ mod tests {
             &[OpRef(0)],
             &[OpRef(0)],
             &[OpRef(7), OpRef(8)],
-            &[OpRef(7), OpRef(8)],
             1,
             true,
             &[],
@@ -5060,244 +4703,6 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(combined[0].args.as_slice(), &[OpRef(10), OpRef(8)]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_skips_duplicate_extra_label_pairs() {
-        let combined = assemble_peeled_trace(
-            &[],
-            &[Op::new(OpCode::Jump, &[OpRef(0), OpRef(3)])],
-            &[OpRef(0), OpRef(3)],
-            &[],
-            &[OpRef(0), OpRef(3)],
-            &[OpRef(0), OpRef(3), OpRef(9)],
-            &[OpRef(0), OpRef(3), OpRef(19)],
-            2,
-            true,
-            &[],
-            &[],
-            &std::collections::HashMap::new(),
-            None,
-            None,
-        );
-
-        assert_eq!(combined[0].opcode, OpCode::Label);
-        assert_eq!(combined[0].args.as_slice(), &[OpRef(0), OpRef(3), OpRef(9)]);
-        assert_eq!(combined.last().unwrap().opcode, OpCode::Jump);
-        assert_eq!(combined.last().unwrap().args.as_slice(), &[OpRef(0), OpRef(3), OpRef(19)]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_inner_label_does_not_carry_constants() {
-        use std::sync::Arc;
-
-        use majit_ir::Descr;
-
-        #[derive(Debug)]
-        struct TestDescr(u32);
-        impl Descr for TestDescr {
-            fn index(&self) -> u32 {
-                self.0
-            }
-        }
-
-        let inner_descr: DescrRef = Arc::new(TestDescr(1));
-        let loop_descr: DescrRef = Arc::new(TestDescr(2));
-        let constants = std::collections::HashMap::from([(7_u32, 0_i64), (8_u32, 3_i64)]);
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::Label, &[OpRef(20)]);
-                op.descr = Some(inner_descr.clone());
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::IntEq, &[OpRef(20), OpRef(7)]);
-                op.pos = OpRef(21);
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::IntGe, &[OpRef(20), OpRef(8)]);
-                op.pos = OpRef(22);
-                op
-            },
-            Op::new(OpCode::Jump, &[OpRef(20)]),
-        ];
-
-        let combined = assemble_peeled_trace(
-            &[],
-            &p2_ops,
-            &[OpRef(10)],
-            &[],
-            &[OpRef(0)],
-            &[],
-            &[],
-            1,
-            true,
-            &[],
-            &[],
-            &constants,
-            None,
-            Some(loop_descr),
-        );
-
-        let inner_label = combined
-            .iter()
-            .find(|op| {
-                op.opcode == OpCode::Label && op.descr.as_ref().is_some_and(|d| d.index() == 1)
-            })
-            .expect("inner label");
-        assert_eq!(inner_label.args.as_slice(), &[OpRef(20)]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_loop_label_does_not_carry_body_constants() {
-        use std::sync::Arc;
-
-        use majit_ir::Descr;
-
-        #[derive(Debug)]
-        struct TestDescr(u32);
-        impl Descr for TestDescr {
-            fn index(&self) -> u32 {
-                self.0
-            }
-        }
-
-        let loop_descr: DescrRef = Arc::new(TestDescr(2));
-        let constants = std::collections::HashMap::from([(7_u32, 0_i64), (8_u32, 3_i64)]);
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::IntEq, &[OpRef(0), OpRef(7)]);
-                op.pos = OpRef(21);
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::IntGe, &[OpRef(0), OpRef(8)]);
-                op.pos = OpRef(22);
-                op
-            },
-            Op::new(OpCode::Jump, &[OpRef(0)]),
-        ];
-
-        let combined = assemble_peeled_trace(
-            &[],
-            &p2_ops,
-            &[OpRef(0)],
-            &[],
-            &[OpRef(0)],
-            &[],
-            &[],
-            1,
-            true,
-            &[],
-            &[],
-            &constants,
-            None,
-            Some(loop_descr),
-        );
-
-        let loop_label = combined
-            .iter()
-            .find(|op| {
-                op.opcode == OpCode::Label && op.descr.as_ref().is_some_and(|d| d.index() == 2)
-            })
-            .expect("loop label");
-        assert_eq!(loop_label.args.as_slice(), &[OpRef(0)]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_skips_constant_label_args() {
-        use std::sync::Arc;
-
-        use majit_ir::Descr;
-
-        #[derive(Debug)]
-        struct TestDescr(u32);
-        impl Descr for TestDescr {
-            fn index(&self) -> u32 {
-                self.0
-            }
-        }
-
-        let loop_descr: DescrRef = Arc::new(TestDescr(2));
-        let constants = std::collections::HashMap::from([(7_u32, 0_i64), (8_u32, 3_i64)]);
-        let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef(0)])];
-
-        let combined = assemble_peeled_trace(
-            &[],
-            &p2_ops,
-            &[OpRef(0), OpRef(7), OpRef(8)],
-            &[],
-            &[OpRef(0)],
-            &[],
-            &[],
-            1,
-            true,
-            &[],
-            &[],
-            &constants,
-            None,
-            Some(loop_descr),
-        );
-
-        let loop_label = combined
-            .iter()
-            .find(|op| {
-                op.opcode == OpCode::Label && op.descr.as_ref().is_some_and(|d| d.index() == 2)
-            })
-            .expect("loop label");
-        assert_eq!(loop_label.args.as_slice(), &[OpRef(0)]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_inner_label_does_not_duplicate_existing_liveins() {
-        use std::sync::Arc;
-
-        use majit_ir::Descr;
-
-        #[derive(Debug)]
-        struct TestDescr(u32);
-        impl Descr for TestDescr {
-            fn index(&self) -> u32 {
-                self.0
-            }
-        }
-
-        let inner_descr: DescrRef = Arc::new(TestDescr(1));
-        let mut guard = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard.fail_args = Some(vec![OpRef(0), OpRef(3)].into());
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::Label, &[OpRef(0), OpRef(3)]);
-                op.descr = Some(inner_descr.clone());
-                op
-            },
-            guard,
-            Op::new(OpCode::Jump, &[OpRef(0), OpRef(3)]),
-        ];
-
-        let combined = assemble_peeled_trace(
-            &[],
-            &p2_ops,
-            &[OpRef(0), OpRef(3)],
-            &[],
-            &[OpRef(0), OpRef(3)],
-            &[],
-            &[],
-            2,
-            true,
-            &[],
-            &[],
-            &std::collections::HashMap::new(),
-            None,
-            None,
-        );
-
-        let inner_label = combined
-            .iter()
-            .find(|op| op.opcode == OpCode::Label && op.descr.as_ref().is_some_and(|d| d.index() == 1))
-            .expect("inner label");
-        assert_eq!(inner_label.args.as_slice(), &[OpRef(0), OpRef(3)]);
     }
 
     #[test]
@@ -5319,7 +4724,6 @@ mod tests {
             &[OpRef(200), OpRef(300)],
             &[OpRef(5), OpRef(0)],
             &[OpRef(0)],
-            &[],
             &[],
             6,
             true,

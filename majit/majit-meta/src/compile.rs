@@ -17,37 +17,6 @@ use crate::resume::{
     ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary, ResumeLayoutSummary,
 };
 
-pub(crate) fn retag_fail_descrs_from_trace_types(
-    inputargs: &[InputArg],
-    ops: &mut [majit_ir::Op],
-) {
-    let (value_types, _) = build_trace_value_maps(inputargs, ops);
-    let mut next_fail_index = 0u32;
-    for op in ops.iter_mut() {
-        let is_exit = op.opcode.is_guard() || op.opcode == OpCode::Finish;
-        if !is_exit {
-            continue;
-        }
-        let types: Vec<Type> = if op.opcode == OpCode::Finish {
-            op.args
-                .iter()
-                .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
-                .collect()
-        } else if let Some(ref fail_args) = op.fail_args {
-            fail_args
-                .iter()
-                .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
-                .collect()
-        } else {
-            inputargs.iter().map(|arg| arg.tp).collect()
-        };
-        // RPython parity: each finalized exit gets its own descriptor, and
-        // backend guard numbering is dense within the compiled trace.
-        op.descr = Some(crate::make_fail_descr_typed_with_index(next_fail_index, types));
-        next_fail_index += 1;
-    }
-}
-
 // ── Compilation result types (compile.py) ───────────────────────────────
 
 /// Static exit metadata for a compiled guard or finish point.
@@ -134,7 +103,7 @@ pub(crate) fn build_guard_metadata(
     let mut result = HashMap::new();
     let mut guard_op_indices = HashMap::new();
     let mut exit_layouts = HashMap::new();
-    let mut fallback_fail_index = 0u32;
+    let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
     let mut value_types: HashMap<u32, Type> =
         inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
@@ -149,17 +118,6 @@ pub(crate) fn build_guard_metadata(
         if !is_guard && !is_finish {
             continue;
         }
-
-        let fail_index = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_fail_descr())
-            .map(|descr| descr.fail_index())
-            .unwrap_or_else(|| {
-                let next = fallback_fail_index;
-                fallback_fail_index += 1;
-                next
-            });
 
         if is_guard {
             guard_op_indices.insert(fail_index, op_idx);
@@ -232,6 +190,7 @@ pub(crate) fn build_guard_metadata(
                 resume_layout,
             },
         );
+        fail_index += 1;
     }
 
     (result, guard_op_indices, exit_layouts)
@@ -536,22 +495,13 @@ pub(crate) fn build_trace_value_maps(
 }
 
 pub(crate) fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize) -> Option<u32> {
-    let mut fallback_fail_index = 0u32;
+    let mut fail_index = 0u32;
     for (idx, op) in ops.iter().enumerate() {
         if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-            let fail_index = op
-                .descr
-                .as_ref()
-                .and_then(|descr| descr.as_fail_descr())
-                .map(|descr| descr.fail_index())
-                .unwrap_or_else(|| {
-                    let next = fallback_fail_index;
-                    fallback_fail_index += 1;
-                    next
-                });
             if idx == op_index {
                 return Some(fail_index);
             }
+            fail_index += 1;
         }
     }
     None
