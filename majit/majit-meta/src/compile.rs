@@ -632,6 +632,7 @@ pub(crate) fn unbox_finish_result(
             {
                 let raw_int = op.args[1];
                 ops[finish_idx].args[0] = raw_int;
+                ops[finish_idx].descr = Some(crate::make_fail_descr_typed(vec![Type::Int]));
                 ops.remove(idx);
                 return (ops, true);
             }
@@ -639,6 +640,10 @@ pub(crate) fn unbox_finish_result(
     }
 
     // Pattern 2: New() + SetfieldGc chain
+    //
+    // Optimizer passes may reorder the `New` relative to its `SetfieldGc`
+    // users in the final op list, so do not assume the field stores appear
+    // textually after the allocation. Match by producer/result identity only.
     let new_idx = match ops[..finish_idx]
         .iter()
         .rposition(|op| op.pos == finish_arg && op.opcode == OpCode::New)
@@ -648,7 +653,7 @@ pub(crate) fn unbox_finish_result(
     };
 
     let mut raw_int = None;
-    for op in &ops[new_idx + 1..finish_idx] {
+    for op in &ops[..finish_idx] {
         if op.opcode == OpCode::SetfieldGc && op.args.first() == Some(&finish_arg) {
             if let Some(ref d) = op.descr {
                 let ds = format!("{d:?}");
@@ -660,12 +665,15 @@ pub(crate) fn unbox_finish_result(
     }
     if let Some(raw_int) = raw_int {
         ops[finish_idx].args[0] = raw_int;
+        ops[finish_idx].descr = Some(crate::make_fail_descr_typed(vec![Type::Int]));
         let mut to_remove = vec![new_idx];
-        for (i, op) in ops[new_idx + 1..finish_idx].iter().enumerate() {
+        for (i, op) in ops[..finish_idx].iter().enumerate() {
             if op.opcode == OpCode::SetfieldGc && op.args.first() == Some(&finish_arg) {
-                to_remove.push(new_idx + 1 + i);
+                to_remove.push(i);
             }
         }
+        to_remove.sort_unstable();
+        to_remove.dedup();
         for &idx in to_remove.iter().rev() {
             ops.remove(idx);
         }
@@ -897,6 +905,37 @@ pub(crate) fn unbox_raw_force_results(
     }
 
     ops
+}
+
+/// RPython dependency.py requires GUARD_(NO_)OVERFLOW to be scheduled only
+/// when there is a live preceding INT_*_OVF operation to consume.
+/// If a late optimizer/retrace path leaves a stray overflow guard in the final
+/// trace, drop it conservatively before backend codegen.
+pub(crate) fn strip_stray_overflow_guards(ops: Vec<Op>) -> Vec<Op> {
+    use majit_ir::OpCode;
+
+    let mut pending_ovf = false;
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op.opcode {
+            OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf => {
+                pending_ovf = true;
+                out.push(op);
+            }
+            OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
+                if pending_ovf {
+                    pending_ovf = false;
+                    out.push(op);
+                }
+            }
+            OpCode::Label | OpCode::Jump | OpCode::Finish => {
+                pending_ovf = false;
+                out.push(op);
+            }
+            _ => out.push(op),
+        }
+    }
+    out
 }
 
 /// Fold boxing into create_frame: when a box helper result feeds directly
