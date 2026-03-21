@@ -313,24 +313,7 @@ impl OptHeap {
 
         // heap.py:610-621: iterate cached fields
         let field_entries: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        let mut vable_retain = Vec::new();
         for (key, mut op) in field_entries {
-            // Virtualizable fields are not force-emitted at guards;
-            // they stay deferred (re-inserted into lazy_setfields),
-            // matching RPython's treatment of virtualizable fields.
-            let is_vable = op
-                .descr
-                .as_ref()
-                .map_or(false, |d| d.is_virtualizable());
-            if is_vable {
-                // RPython: virtualizable fields go to pendingfields AND
-                // are re-inserted into lazy_setfields. On guard failure,
-                // rd_pendingfields restores memory. The lazy_set survives
-                // for the next guard/JUMP.
-                pendingfields.push(op.clone());
-                vable_retain.push((key, op));
-                continue;
-            }
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
             let value_ref = ctx.get_replacement(op.arg(1));
             let is_virtual = matches!(
@@ -343,6 +326,11 @@ impl OptHeap {
                 continue;
             }
             // heap.py:621: cf.force_lazy_set(self, descr) — emit
+            // NOTE: virtualizable fields are also force-emitted here.
+            // RPython defers them to rd_pendingfields, but majit's backend
+            // does not yet materialize rd_pendingfields on guard failure.
+            // TODO: implement rd_pendingfields in backend, then re-add
+            // virtualizable deferral for fewer SetfieldGc emissions.
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
@@ -350,10 +338,6 @@ impl OptHeap {
             self.remember_field_descr(key, &op);
             ctx.emit(op);
             self.cached_fields.insert(key, final_value);
-        }
-        // Re-insert virtualizable lazy sets so they survive across guards
-        for (key, op) in vable_retain {
-            self.lazy_setfields.insert(key, op);
         }
 
         // heap.py:622-636: iterate cached array items
