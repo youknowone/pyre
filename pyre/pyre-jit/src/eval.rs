@@ -27,7 +27,7 @@ use majit_meta::JitDriver;
 use pyre_object::floatobject::W_FloatObject;
 use pyre_object::intobject::W_IntObject;
 
-const JIT_THRESHOLD: u32 = 1039;
+const JIT_THRESHOLD: u32 = 200;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
     majit_meta::virtualizable::VirtualizableInfo,
