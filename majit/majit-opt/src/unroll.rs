@@ -217,6 +217,8 @@ impl UnrollOptimizer {
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Don't flush lazy sets — virtuals remain virtual until JUMP handling.
         opt_p2.skip_flush = true;
+        // Phase 2: don't virtualize New() — guard recovery_layout not populated.
+        opt_p2.set_phase2(true);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
@@ -383,6 +385,10 @@ impl UnrollOptimizer {
             &p1_ops,
             &body_ops,
             &label_args,
+            opt_p2
+                .imported_label_source_slots
+                .as_deref()
+                .unwrap_or(&[]),
             &exported_state.renamed_inputargs,
             &sp.used_boxes,
             p2_ni,
@@ -1064,7 +1070,7 @@ impl OptUnroll {
         targetargs: &[OpRef],
         exported_state: &ExportedState,
         ctx: &mut OptContext,
-    ) -> Vec<OpRef> {
+    ) -> (Vec<OpRef>, Vec<OpRef>) {
         assert_eq!(
             exported_state.next_iteration_args.len(),
             targetargs.len(),
@@ -1102,7 +1108,7 @@ impl OptUnroll {
                 &exported_state.exported_short_boxes,
             );
         }
-        label_args
+        (label_args, source_slots)
     }
 
     fn collect_exported_info(
@@ -1731,6 +1737,14 @@ pub(crate) fn import_state(
     exported_state: &ExportedState,
     ctx: &mut OptContext,
 ) -> Vec<OpRef> {
+    OptUnroll::new().import_state(targetargs, exported_state, ctx).0
+}
+
+pub(crate) fn import_state_with_source_slots(
+    targetargs: &[OpRef],
+    exported_state: &ExportedState,
+    ctx: &mut OptContext,
+) -> (Vec<OpRef>, Vec<OpRef>) {
     OptUnroll::new().import_state(targetargs, exported_state, ctx)
 }
 
@@ -1764,6 +1778,7 @@ fn assemble_peeled_trace(
     p1_ops: &[Op],
     p2_ops: &[Op],
     label_args: &[OpRef],
+    label_source_slots: &[OpRef],
     start_label_args: &[OpRef],
     extra_label_args: &[OpRef],
     body_num_inputs: usize,
@@ -1846,9 +1861,17 @@ fn assemble_peeled_trace(
     }
 
     // Pass 1: collect all remappings
-    for (i, &la) in label_args.iter().enumerate() {
-        if (i as u32) < body_num_inputs as u32 {
-            input_remap.insert(OpRef(i as u32), la);
+    if !label_source_slots.is_empty() && label_source_slots.len() == label_args.len() {
+        for (&source_slot, &la) in label_source_slots.iter().zip(label_args.iter()) {
+            if !source_slot.is_none() {
+                input_remap.insert(source_slot, la);
+            }
+        }
+    } else {
+        for (i, &la) in label_args.iter().enumerate() {
+            if (i as u32) < body_num_inputs as u32 {
+                input_remap.insert(OpRef(i as u32), la);
+            }
         }
     }
     for (idx, op) in p2_ops.iter().enumerate() {
@@ -1904,12 +1927,14 @@ fn assemble_peeled_trace(
                 jump_args.truncate(start_label_args.len());
             }
             // RPython parity: carry preamble-defined values through the Jump
-            // so they match the Label's extended args. These values are
-            // loop-invariant (defined in preamble, read-only in body).
-            while jump_args.len() < full_label_args.len() {
-                let extra_arg = full_label_args[jump_args.len()];
-                let remapped = remap_body_arg(extra_arg);
-                jump_args.push(remapped);
+            // only on the self-loop edge. jump_to_preamble keeps the start
+            // label contract and only swaps the descr.
+            if jump_to_self {
+                while jump_args.len() < full_label_args.len() {
+                    let extra_arg = full_label_args[jump_args.len()];
+                    let remapped = remap_body_arg(extra_arg);
+                    jump_args.push(remapped);
+                }
             }
             new_op.args = jump_args.into();
         }
@@ -2808,7 +2833,7 @@ mod tests {
         );
 
         let mut ctx2 = crate::OptContext::with_num_inputs(8, 6);
-        let label_args = opt.import_state(
+        let (label_args, _source_slots) = opt.import_state(
             &[OpRef(0), OpRef(1), OpRef(2), OpRef(3), OpRef(4), OpRef(5)],
             &exported,
             &mut ctx2,
@@ -3511,6 +3536,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
+            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -3564,6 +3590,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(11)],
+            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -3626,6 +3653,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(0)],
+            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -3731,6 +3759,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
+            &[],
             &[OpRef(0)],
             &[OpRef(50)],
             1,
@@ -3767,6 +3796,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
+            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -3800,6 +3830,7 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
+            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -3834,6 +3865,7 @@ mod tests {
             &[],
             &p2_ops,
             &[OpRef(10), OpRef(11), OpRef(12), OpRef(13), OpRef(14)],
+            &[],
             &[OpRef(100), OpRef(101), OpRef(102)],
             &[OpRef(13), OpRef(14)],
             5,
@@ -3870,6 +3902,7 @@ mod tests {
             &[],
             &p2_ops,
             &[OpRef(10)],
+            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -3886,6 +3919,42 @@ mod tests {
         assert_ne!(combined[1].pos, OpRef(4));
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
         assert_eq!(combined[2].args[0], combined[1].pos);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_maps_body_inputs_via_source_slots() {
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(10_000, 1);
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(5), OpRef(10_000)]);
+                op.pos = OpRef(20);
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(5)]),
+        ];
+
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &[OpRef(200), OpRef(300)],
+            &[OpRef(5), OpRef(0)],
+            &[OpRef(0)],
+            &[],
+            6,
+            true,
+            &[],
+            &constants,
+            None,
+            None,
+        );
+
+        assert_eq!(combined[0].opcode, OpCode::Label);
+        assert_eq!(combined[0].args.as_slice(), &[OpRef(200), OpRef(300)]);
+        assert_eq!(combined[1].opcode, OpCode::IntAdd);
+        assert_eq!(combined[1].args[0], OpRef(200));
+        assert_eq!(combined[2].opcode, OpCode::Jump);
+        assert_eq!(combined[2].args.as_slice(), &[OpRef(200)]);
     }
 
     #[test]
