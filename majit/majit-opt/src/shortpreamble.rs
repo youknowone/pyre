@@ -1234,6 +1234,10 @@ impl ExtendedShortPreambleBuilder {
         self.use_box_recursive(result, &mut HashSet::new())
     }
 
+    pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
+        self.produced_short_boxes.get(&result).cloned()
+    }
+
     pub fn build_short_preamble_struct(&self) -> ShortPreamble {
         let mut ops = self.base_short_ops.clone();
         ops.extend(self.extra_state.short.iter().cloned());
@@ -1261,6 +1265,20 @@ impl ExtendedShortPreambleBuilder {
     pub fn jump_args(&self) -> &[OpRef] {
         &self.short_jump_args
     }
+
+    pub fn short_ops_len(&self) -> usize {
+        self.base_short_ops.len() + self.extra_state.short.len()
+    }
+
+    pub fn short_op(&self, index: usize) -> Option<&Op> {
+        if index < self.base_short_ops.len() {
+            self.base_short_ops.get(index)
+        } else {
+            self.extra_state
+                .short
+                .get(index.saturating_sub(self.base_short_ops.len()))
+        }
+    }
 }
 
 /// shortpreamble.py: build short preamble from optimizer state.
@@ -1273,9 +1291,17 @@ pub fn build_from_preamble_and_label(
     exported_state: Option<VirtualState>,
 ) -> ShortPreamble {
     let mut builder = CollectedShortPreambleBuilder::new();
+    let mut included_ovf_positions = HashSet::new();
     // Record all preamble ops
-    for op in preamble_ops {
+    for (idx, op) in preamble_ops.iter().enumerate() {
         if op.opcode.is_guard() {
+            if op.opcode.is_guard_overflow()
+                && idx > 0
+                && preamble_ops[idx - 1].opcode.is_ovf()
+                && included_ovf_positions.insert(preamble_ops[idx - 1].pos)
+            {
+                builder.add_preamble_op(&preamble_ops[idx - 1]);
+            }
             builder.add_preamble_guard(op);
         } else if op.opcode.is_always_pure() {
             builder.add_preamble_op(op);
@@ -1316,7 +1342,40 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
     // Pure ops whose results are used as label args must also be replayed
     // (e.g., GETFIELD from preamble that feeds into loop body).
     let mut entries = Vec::new();
-    for op in &peeled_ops[..label_pos] {
+    let mut included_positions = HashSet::new();
+    for (idx, op) in peeled_ops[..label_pos].iter().enumerate() {
+        let mut included_overflow_producer = false;
+        if op.opcode.is_guard_overflow() && idx > 0 {
+            let ovf_op = &peeled_ops[idx - 1];
+            if ovf_op.opcode.is_ovf() && included_positions.insert(ovf_op.pos) {
+                let ovf_arg_mapping: Vec<(usize, usize)> = ovf_op
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
+                    .collect();
+                let ovf_fail_arg_mapping: Vec<(usize, usize)> = ovf_op
+                    .fail_args
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|fail_args| fail_args.iter().enumerate())
+                    .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
+                    .collect();
+                if !ovf_arg_mapping.is_empty() || !ovf_fail_arg_mapping.is_empty() {
+                    entries.push(ShortPreambleOp {
+                        op: ovf_op.clone(),
+                        arg_mapping: ovf_arg_mapping,
+                        fail_arg_mapping: ovf_fail_arg_mapping,
+                    });
+                    included_overflow_producer = true;
+                } else {
+                    included_positions.remove(&ovf_op.pos);
+                }
+            }
+        }
+        if op.opcode.is_guard_overflow() && !included_overflow_producer {
+            continue;
+        }
         let include = op.opcode.is_guard() || op.opcode.is_always_pure();
         if !include {
             continue;
@@ -1337,7 +1396,9 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             .collect();
 
         // Only include ops that reference label args
-        if !arg_mapping.is_empty() || !fail_arg_mapping.is_empty() {
+        if (!arg_mapping.is_empty() || !fail_arg_mapping.is_empty())
+            && included_positions.insert(op.pos)
+        {
             entries.push(ShortPreambleOp {
                 op: op.clone(),
                 arg_mapping,
@@ -1458,6 +1519,40 @@ mod tests {
         ];
 
         let sp = extract_short_preamble(&ops);
+        assert!(sp.is_empty());
+    }
+
+    #[test]
+    fn test_extract_overflow_guard_includes_preceding_ovf_op() {
+        let mut ops = vec![
+            Op::new(OpCode::IntMulOvf, &[OpRef(100), OpRef(100)]),
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::Label, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[OpRef(100)]),
+        ];
+        assign_positions(&mut ops, 0);
+        ops[1].fail_args = Some(vec![OpRef(100)].into());
+
+        let sp = extract_short_preamble(&ops);
+
+        assert_eq!(sp.len(), 2);
+        assert_eq!(sp.ops[0].op.opcode, OpCode::IntMulOvf);
+        assert_eq!(sp.ops[1].op.opcode, OpCode::GuardNoOverflow);
+    }
+
+    #[test]
+    fn test_extract_overflow_guard_without_replayable_ovf_is_skipped() {
+        let mut ops = vec![
+            Op::new(OpCode::IntMulOvf, &[OpRef(200), OpRef(200)]),
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::Label, &[OpRef(100)]),
+            Op::new(OpCode::Jump, &[OpRef(100)]),
+        ];
+        assign_positions(&mut ops, 0);
+        ops[1].fail_args = Some(vec![OpRef(100)].into());
+
+        let sp = extract_short_preamble(&ops);
+
         assert!(sp.is_empty());
     }
 
