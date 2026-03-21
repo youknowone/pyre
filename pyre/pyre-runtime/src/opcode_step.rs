@@ -112,6 +112,15 @@ pub trait ControlFlowOpcodeHandler: SharedOpcodeHandler {
 }
 
 pub trait BranchOpcodeHandler: TruthOpcodeHandler + ControlFlowOpcodeHandler {
+    fn enter_branch_truth(&mut self, value: Self::Value) -> Result<(), PyError> {
+        let _ = value;
+        Ok(())
+    }
+
+    fn leave_branch_truth(&mut self) -> Result<(), PyError> {
+        Ok(())
+    }
+
     fn concrete_truth_as_bool(
         &mut self,
         value: Self::Value,
@@ -397,6 +406,7 @@ fn exec_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
     jump_if_true: bool,
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
+    handler.enter_branch_truth(value)?;
     let truth = handler.truth_value(value)?;
     let concrete_truth = handler.concrete_truth_as_bool(value, truth)?;
     let should_jump = concrete_truth == jump_if_true;
@@ -405,6 +415,7 @@ fn exec_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
         handler.set_next_instr(target)?;
     }
     handler.record_branch_guard(value, truth, concrete_truth)?;
+    handler.leave_branch_truth()?;
     let next_target = if should_jump { target } else { fallthrough };
     handler.set_next_instr(next_target)
 }

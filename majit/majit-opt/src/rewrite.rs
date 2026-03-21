@@ -1189,13 +1189,19 @@ impl Optimization for OptRewrite {
                 // postprocess_GUARD_CLASS: record known class for arg(0)
                 if op.num_args() >= 2 {
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
-                        ctx.set_ptr_info(
-                            obj,
-                            crate::info::PtrInfo::known_class(
-                                majit_ir::GcRef(class_val as usize),
-                                true,
-                            ),
-                        );
+                        let should_record = ctx
+                            .get_ptr_info(obj)
+                            .map(|info| !info.is_virtual())
+                            .unwrap_or(true);
+                        if should_record {
+                            ctx.set_ptr_info(
+                                obj,
+                                crate::info::PtrInfo::known_class(
+                                    majit_ir::GcRef(class_val as usize),
+                                    true,
+                                ),
+                            );
+                        }
                     }
                 }
                 OptimizationResult::PassOn
@@ -1230,13 +1236,19 @@ impl Optimization for OptRewrite {
                 // postprocess: record known class
                 if op.num_args() >= 2 {
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
-                        ctx.set_ptr_info(
-                            obj,
-                            crate::info::PtrInfo::known_class(
-                                majit_ir::GcRef(class_val as usize),
-                                true,
-                            ),
-                        );
+                        let should_record = ctx
+                            .get_ptr_info(obj)
+                            .map(|info| !info.is_virtual())
+                            .unwrap_or(true);
+                        if should_record {
+                            ctx.set_ptr_info(
+                                obj,
+                                crate::info::PtrInfo::known_class(
+                                    majit_ir::GcRef(class_val as usize),
+                                    true,
+                                ),
+                            );
+                        }
                     }
                 }
                 OptimizationResult::PassOn
@@ -3466,7 +3478,7 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 0i64);
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         assert!(
             result.iter().any(|o| o.opcode == OpCode::GuardFalse),
@@ -3487,7 +3499,7 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, -1i64);
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         assert!(
             result.iter().any(|o| o.opcode == OpCode::IntNeg),
@@ -3510,7 +3522,7 @@ mod tests {
         // Float constant as bits
         constants.insert(200, (-1.0f64).to_bits() as i64);
         // Need float constant support in ctx — skip for now, just test no crash
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(!result.is_empty());
     }
 
@@ -3526,7 +3538,7 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 0i64);
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::CondCallN),
             "COND_CALL_N(0, ...) should be removed"
@@ -3545,7 +3557,7 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 1i64);
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             result.iter().any(|o| o.opcode == OpCode::CallN),
             "COND_CALL_N(1, ...) should become CALL_N"

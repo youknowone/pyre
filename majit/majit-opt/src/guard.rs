@@ -538,7 +538,7 @@ mod tests {
     fn run_guard_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(GuardStrengthenOpt::new()));
-        opt.optimize(ops)
+        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     // ── Redundant Guard Removal ─────────────────────────────────────────
@@ -815,7 +815,7 @@ mod tests {
         assign_positions(&mut ops, 100);
 
         let mut opt = Optimizer::default_pipeline();
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         let guard_count = result
             .iter()
@@ -866,7 +866,7 @@ mod tests {
         assign_positions(&mut ops, 100);
 
         let mut opt = Optimizer::default_pipeline();
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
         let guard_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNoOverflow)
@@ -916,7 +916,7 @@ mod tests {
         opt.add_pass(Box::new(crate::rewrite::OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 1i64);
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         // GUARD_VALUE should be replaced with GUARD_TRUE
         assert!(

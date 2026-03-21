@@ -17,11 +17,11 @@ use crate::frame::{PendingInlineResult, PyFrame};
 
 /// Store an inline-handled concrete result on the owning caller frame.
 pub fn set_pending_inline_result(frame: &mut PyFrame, result: PendingInlineResult) {
-    frame.pending_inline_result = Some(result);
+    frame.pending_inline_results.push_back(result);
 }
 
 fn take_pending_inline_result(frame: &mut PyFrame) -> Option<PyObjectRef> {
-    match frame.pending_inline_result.take()? {
+    match frame.pending_inline_results.pop_front()? {
         PendingInlineResult::Ref(result) => Some(result),
         PendingInlineResult::Int(value) => Some(pyre_object::w_int_new(value)),
         PendingInlineResult::Float(value) => Some(pyre_object::floatobject::w_float_new(value)),

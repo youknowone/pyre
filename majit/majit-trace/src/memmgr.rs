@@ -81,6 +81,11 @@ impl LoopAging {
         self.loop_generations.len()
     }
 
+    /// Whether a loop is still tracked as alive.
+    pub fn contains_loop(&self, loop_key: u64) -> bool {
+        self.loop_generations.contains_key(&loop_key)
+    }
+
     /// Release all tracked loops. After this, no loops are tracked.
     ///
     /// Reference: memmgr.py MemoryManager.release_all_loops

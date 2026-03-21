@@ -365,7 +365,7 @@ impl OptPure {
             if entry.opcode != op.opcode {
                 return None;
             }
-            if entry.descr_idx != op.descr.as_ref().map(|d| d.index()) {
+            if entry.descr.as_ref().map(|d| d.index()) != op.descr.as_ref().map(|d| d.index()) {
                 return None;
             }
             if entry.args.len() != op.args.len() {
@@ -785,7 +785,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // Only the first IntAdd should remain.
         assert_eq!(result.len(), 1);
@@ -804,7 +804,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 2);
     }
@@ -821,7 +821,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -838,7 +838,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 2);
     }
@@ -855,7 +855,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 2);
     }
@@ -875,7 +875,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -888,7 +888,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
@@ -902,7 +902,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallR);
@@ -916,7 +916,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
@@ -934,7 +934,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -951,7 +951,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -980,7 +980,7 @@ mod tests {
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
         }));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // All 17 unique ops should be emitted, plus the re-inserted one
         // (since the first was evicted from the LRU cache of size 16).
@@ -1039,7 +1039,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1054,7 +1054,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1071,7 +1071,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 1);
     }
@@ -1086,7 +1086,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallF);
@@ -1105,7 +1105,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -1123,7 +1123,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // Only the first call should remain, demoted to CallI.
         assert_eq!(result.len(), 1);
@@ -1141,7 +1141,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallI);
@@ -1161,7 +1161,7 @@ mod tests {
 
             let mut opt = Optimizer::new();
             opt.add_pass(Box::new(OptPure::new()));
-            let result = opt.optimize(&ops);
+            let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
@@ -1188,7 +1188,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // 20 unique calls + the duplicate (#0) should be eliminated → 20 total
         assert_eq!(result.len(), 20);
@@ -1207,7 +1207,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -1272,7 +1272,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // First pair stays, second pair CSE'd → 3 ops total
         let ovf_count = result
@@ -1440,7 +1440,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // Second CALL_PURE → removed (CSE), its GUARD_NO_EXCEPTION → removed
         let gne_count = result
@@ -1498,7 +1498,7 @@ mod tests {
         ctx.imported_short_pure_ops
             .push(crate::ImportedShortPureOp {
                 opcode: OpCode::IntAdd,
-                descr_idx: None,
+                descr: None,
                 args: vec![
                     crate::ImportedShortPureArg::OpRef(OpRef(0)),
                     crate::ImportedShortPureArg::Const(majit_ir::Value::Int(7)),
@@ -1530,7 +1530,7 @@ mod tests {
         ctx.imported_short_pure_ops
             .push(crate::ImportedShortPureOp {
                 opcode: OpCode::CallPureI,
-                descr_idx: Some(77),
+                descr: Some(call_descr.clone()),
                 args: vec![
                     crate::ImportedShortPureArg::Const(majit_ir::Value::Int(0x1234)),
                     crate::ImportedShortPureArg::OpRef(OpRef(0)),
@@ -1559,7 +1559,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
-        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(2)]);
+        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(0), OpRef(1), OpRef(2)]);
         pass.produce_potential_short_preamble_ops(&mut sb);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
@@ -1593,7 +1593,7 @@ mod tests {
             other => panic!("expected emitted demoted call, got {other:?}"),
         }
 
-        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(2)]);
+        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(0), OpRef(1), OpRef(2), OpRef(100)]);
         pass.produce_potential_short_preamble_ops(&mut sb);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
@@ -1623,7 +1623,7 @@ mod tests {
             other => panic!("expected emitted demoted call, got {other:?}"),
         }
 
-        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(2)]);
+        let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(0), OpRef(2), OpRef(100)]);
         pass.produce_potential_short_preamble_ops(&mut sb);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
@@ -1684,7 +1684,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // First COND_CALL_VALUE emitted, second removed by CSE
         assert_eq!(result.len(), 1);

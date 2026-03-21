@@ -4,6 +4,7 @@
 //! local variables, and instruction pointer. The JIT virtualizes
 //! these fields so they live in registers instead of memory.
 
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use pyre_bytecode::CodeObject;
@@ -66,12 +67,14 @@ pub struct PyFrame {
     /// Exception handler block stack (PyPy: lastblock linked list).
     /// NOT repr(C)-visible to JIT — stored after vable_token.
     pub block_stack: Vec<Block>,
-    /// Concrete inline-trace replay result owned by this frame.
+    /// Concrete inline-trace replay results owned by this frame.
     ///
-    /// PyPy's frame switching keeps concrete call results scoped to the
-    /// active frame transition. We keep the pending replay result on the
-    /// concrete caller frame instead of a thread-global side channel.
-    pub pending_inline_result: Option<PendingInlineResult>,
+    /// PyPy's `finishframe()` writes each child result into the parent in
+    /// bytecode order. Tracing can run ahead of concrete execution and queue
+    /// multiple inline-handled CALL results on the same caller frame before
+    /// the interpreter replays the first CALL opcode, so this must preserve
+    /// ordering instead of using a single overwrite-prone slot.
+    pub pending_inline_results: VecDeque<PendingInlineResult>,
 }
 
 /// Exception handler block — pushed by SETUP_FINALLY/SETUP_EXCEPT, popped by POP_BLOCK.
@@ -153,7 +156,7 @@ impl PyFrame {
             namespace,
             vable_token: 0,
             block_stack: Vec::new(),
-            pending_inline_result: None,
+            pending_inline_results: VecDeque::new(),
         }
     }
 
@@ -257,7 +260,7 @@ impl PyFrame {
             namespace: globals,
             vable_token: 0,
             block_stack: Vec::new(),
-            pending_inline_result: None,
+            pending_inline_results: VecDeque::new(),
         }
     }
 

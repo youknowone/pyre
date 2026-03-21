@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::intutils::IntBound;
 use info::PtrInfo;
-use majit_ir::{Op, OpCode, OpRef, Value};
+use majit_ir::{DescrRef, Op, OpCode, OpRef, Value};
 use std::collections::VecDeque;
 
 pub(crate) fn majit_log_enabled() -> bool {
@@ -59,12 +59,21 @@ pub enum ImportedShortPureArg {
     Const(Value),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ImportedShortPureOp {
     pub opcode: OpCode,
-    pub descr_idx: Option<u32>,
+    pub descr: Option<DescrRef>,
     pub args: Vec<ImportedShortPureArg>,
     pub result: OpRef,
+}
+
+impl PartialEq for ImportedShortPureOp {
+    fn eq(&self, other: &Self) -> bool {
+        self.opcode == other.opcode
+            && self.descr.as_ref().map(|d| d.index()) == other.descr.as_ref().map(|d| d.index())
+            && self.args == other.args
+            && self.result == other.result
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,9 +133,13 @@ pub struct OptContext {
     /// preamble. Phase 2 uses these to seed Heap's read cache without
     /// re-emitting preamble heap reads.
     pub imported_short_fields: HashMap<(OpRef, u32), OpRef>,
+    /// Real descriptors for imported cached field reads.
+    pub imported_short_field_descrs: HashMap<(OpRef, u32), DescrRef>,
     /// RPython shortpreamble.py / heap.py: imported cached constant-index array
     /// reads from the preamble.
     pub imported_short_arrayitems: HashMap<(OpRef, u32, i64), OpRef>,
+    /// Real descriptors for imported cached constant-index array reads.
+    pub imported_short_arrayitem_descrs: HashMap<(OpRef, u32, i64), DescrRef>,
     /// RPython shortpreamble.py / pure.py: imported pure-operation results from
     /// the preamble. Phase 2 uses these as cross-iteration CSE facts.
     pub imported_short_pure_ops: Vec<ImportedShortPureOp>,
@@ -181,6 +194,10 @@ pub struct OptContext {
     /// [(field_idx, field_value_ref)]. Used by make_inputargs to flatten
     /// virtuals into label args after force has destroyed PtrInfo.
     pub pre_force_field_refs: HashMap<OpRef, Vec<(u32, OpRef)>>,
+    /// True while optimizer.py:_emit_operation equivalent is forcing args
+    /// just before final emission. In this phase, virtual forcing must emit
+    /// directly into new_operations instead of re-entering the pass chain.
+    pub in_final_emission: bool,
 }
 
 impl OptContext {
@@ -196,7 +213,9 @@ impl OptContext {
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
             imported_short_fields: HashMap::new(),
+            imported_short_field_descrs: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
+            imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
             imported_short_sources: Vec::new(),
@@ -215,6 +234,7 @@ impl OptContext {
             preamble_end_args: None,
             skip_flush_mode: false,
             pre_force_field_refs: HashMap::new(),
+            in_final_emission: false,
         }
     }
 
@@ -230,7 +250,9 @@ impl OptContext {
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
             imported_short_fields: HashMap::new(),
+            imported_short_field_descrs: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
+            imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
             imported_short_sources: Vec::new(),
@@ -249,6 +271,7 @@ impl OptContext {
             preamble_end_args: None,
             skip_flush_mode: false,
             pre_force_field_refs: HashMap::new(),
+            in_final_emission: false,
         }
     }
 
@@ -345,6 +368,11 @@ impl OptContext {
         let mut produced_results: Vec<OpRef> = Vec::with_capacity(exported_short_ops.len());
         let mut temporary_results: Vec<Option<OpRef>> = Vec::new();
         let mut imported_constants: HashMap<OpRef, OpRef> = HashMap::new();
+        let imported_result_for_source = |source: OpRef, this: &Self| {
+            this.imported_short_sources
+                .iter()
+                .find_map(|entry| (entry.source == source).then_some(entry.result))
+        };
 
         let mut resolve_result = |result: &ExportedShortResult, this: &mut Self| match result {
             ExportedShortResult::Slot(slot) => short_args.get(*slot).copied(),
@@ -360,9 +388,9 @@ impl OptContext {
         for entry in exported_short_ops {
             match entry {
                 ExportedShortOp::Pure {
-                    source: _,
+                    source,
                     opcode,
-                    descr_idx,
+                    descr,
                     args,
                     result,
                     invented_name,
@@ -371,7 +399,9 @@ impl OptContext {
                     if opcode.is_call() {
                         return false;
                     }
-                    let Some(result_opref) = resolve_result(result, self) else {
+                    let Some(result_opref) = imported_result_for_source(*source, self)
+                        .or_else(|| resolve_result(result, self))
+                    else {
                         return false;
                     };
                     let mut resolved_args = Vec::with_capacity(args.len());
@@ -395,11 +425,9 @@ impl OptContext {
                     }
                     let mut op = Op::new(*opcode, &resolved_args);
                     op.pos = result_opref;
-                    if let Some(descr_idx) = descr_idx {
-                        op.descr = Some(crate::virtualize::make_field_index_descr(*descr_idx));
-                    }
+                    op.descr = descr.clone();
                     produced.push((
-                        result_opref,
+                        *source,
                         ProducedShortOp {
                             kind: PreambleOpKind::Pure,
                             preamble_op: op,
@@ -410,15 +438,17 @@ impl OptContext {
                     produced_results.push(result_opref);
                 }
                 ExportedShortOp::HeapField {
-                    source: _,
+                    source,
                     object_slot,
-                    descr_idx,
+                    descr,
                     result_type,
                     result,
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(result_opref) = resolve_result(result, self) else {
+                    let Some(result_opref) = imported_result_for_source(*source, self)
+                        .or_else(|| resolve_result(result, self))
+                    else {
                         return false;
                     };
                     let Some(&obj) = short_args.get(*object_slot) else {
@@ -432,9 +462,9 @@ impl OptContext {
                     };
                     let mut op = Op::new(opcode, &[obj]);
                     op.pos = result_opref;
-                    op.descr = Some(crate::virtualize::make_field_index_descr(*descr_idx));
+                    op.descr = Some(descr.clone());
                     produced.push((
-                        result_opref,
+                        *source,
                         ProducedShortOp {
                             kind: PreambleOpKind::Heap,
                             preamble_op: op,
@@ -458,7 +488,7 @@ impl OptContext {
         let _ = self.force_op_from_preamble(result);
     }
 
-    fn imported_short_source(&self, result: OpRef) -> OpRef {
+    pub(crate) fn imported_short_source(&self, result: OpRef) -> OpRef {
         self.imported_short_sources
             .iter()
             .find_map(|entry| (entry.result == result).then_some(entry.source))

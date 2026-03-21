@@ -7,7 +7,7 @@ use majit_trace::recorder::Trace;
 use majit_codegen::JitCellToken;
 
 use crate::TraceAction;
-use crate::call_descr::{make_call_assembler_descr, make_call_descr};
+use crate::call_descr::{make_call_assembler_descr, make_call_descr, make_call_may_force_descr};
 use crate::constant_pool::ConstantPool;
 use crate::fail_descr::{make_fail_descr, make_fail_descr_typed};
 use crate::jitdriver::JitDriverStaticData;
@@ -24,9 +24,16 @@ use crate::virtualizable::VirtualizableInfo;
 pub struct TraceCtx {
     pub(crate) recorder: Trace,
     pub(crate) green_key: u64,
+    root_green_key: u64,
     pub(crate) constants: ConstantPool,
     /// Stack of inlined function frames (callee green_keys).
     inline_frames: Vec<u64>,
+    /// Start positions for currently active inlined trace-through frames.
+    ///
+    /// This mirrors the subset of PyPy's `portal_trace_positions` that we
+    /// need for `find_biggest_function()`: active inlined callees and the
+    /// trace length at which each one started tracing.
+    inline_trace_positions: Vec<(u64, usize)>,
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
@@ -67,8 +74,10 @@ impl TraceCtx {
         TraceCtx {
             recorder,
             green_key,
+            root_green_key: green_key,
             constants: ConstantPool::new(),
             inline_frames: Vec::new(),
+            inline_trace_positions: Vec::new(),
             green_key_values: None,
             driver_descriptor: None,
             virtualizable_boxes: None,
@@ -87,8 +96,10 @@ impl TraceCtx {
         TraceCtx {
             recorder,
             green_key,
+            root_green_key: green_key,
             constants: ConstantPool::new(),
             inline_frames: Vec::new(),
+            inline_trace_positions: Vec::new(),
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
             virtualizable_boxes: None,
@@ -101,6 +112,10 @@ impl TraceCtx {
     /// Get the current inlining depth.
     pub fn inline_depth(&self) -> usize {
         self.inline_frames.len()
+    }
+
+    pub fn inline_trace_depth(&self) -> usize {
+        self.inline_trace_positions.len()
     }
 
     /// Update the green key for this trace.
@@ -162,6 +177,28 @@ impl TraceCtx {
     /// Pop an inline frame (returning from a callee).
     pub(crate) fn pop_inline_frame(&mut self) {
         self.inline_frames.pop();
+    }
+
+    pub fn push_inline_trace_position(&mut self, green_key: u64) {
+        self.inline_trace_positions
+            .push((green_key, self.recorder.num_ops()));
+    }
+
+    pub fn pop_inline_trace_position(&mut self) {
+        self.inline_trace_positions.pop();
+    }
+
+    pub fn truncate_inline_trace_positions(&mut self, depth: usize) {
+        self.inline_trace_positions.truncate(depth);
+    }
+
+    pub fn find_biggest_inline_function(&self) -> Option<u64> {
+        let current_pos = self.recorder.num_ops();
+        self.inline_trace_positions
+            .iter()
+            .map(|&(green_key, start_pos)| (green_key, current_pos.saturating_sub(start_pos)))
+            .max_by_key(|&(_, size)| size)
+            .map(|(green_key, _)| green_key)
     }
 
     /// Get or create a constant OpRef for a given i64 value.
@@ -251,9 +288,23 @@ impl TraceCtx {
         self.green_key
     }
 
+    /// Root portal merge-point green key for this trace.
+    ///
+    /// Mirrors RPython's `current_merge_points[0]`: this stays anchored to the
+    /// original loop/portal merge point even if `green_key` is later retargeted
+    /// to a reached loop header during tracing.
+    pub fn root_green_key(&self) -> u64 {
+        self.root_green_key
+    }
+
     /// Number of input arguments to the current trace.
     pub fn num_inputs(&self) -> usize {
         self.recorder.num_inputargs()
+    }
+
+    /// Number of traced operations recorded so far.
+    pub fn num_ops(&self) -> usize {
+        self.recorder.num_ops()
     }
 
     /// The structured green key values, if provided.
@@ -1090,7 +1141,12 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        self.call_typed(opcode, func_ptr, args, arg_types, ret_type)
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr = make_call_may_force_descr(arg_types, ret_type);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(opcode, &call_args, descr)
     }
 
     pub fn call_may_force_void_typed(
