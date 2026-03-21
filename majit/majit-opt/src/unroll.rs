@@ -254,13 +254,22 @@ impl UnrollOptimizer {
             );
         }
 
-        // Safety: guardless body loops run forever without interrupt mechanism.
-        // RPython compiles them (uses periodic interrupts); majit falls back.
+        // Safety: body loops with no effective guard exit run forever.
+        // RPython compiles them (relies on OS signals/GIL); majit falls back.
+        // A guard is "effective" only if its condition can change at runtime
+        // (not a constant from the label args).
         {
-            let body_guards = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
-            if body_guards == 0 {
+            let has_effective_guard = p2_ops.iter().any(|o| {
+                if !o.opcode.is_guard() || o.args.is_empty() {
+                    return false;
+                }
+                let cond = o.arg(0);
+                // Guard arg that's a constant (from constants map) → always same result
+                !consts_p2.contains_key(&cond.0)
+            });
+            if !has_effective_guard {
                 if std::env::var_os("MAJIT_LOG").is_some() {
-                    eprintln!("[jit] phase 2: 0 guards in body, falling back to phase 1");
+                    eprintln!("[jit] phase 2: no effective guard exit, falling back to phase 1");
                 }
                 *constants = consts_p1;
                 return (p1_ops, p1_ni);
@@ -1068,18 +1077,26 @@ impl OptUnroll {
             }
         }
 
-        // NOTE: Phase 1 heap cache propagation is disabled until
-        // the PreambleOp mechanism is implemented (RPython parity).
-        // Without it, cached intermediate values (like v9=intval) get
-        // referenced in the body but are not carried through the label,
-        // causing undefined value reads and silent guard failures.
-        // TODO: implement RPython's shortpreamble.py PreambleOp +
-        // force_op_from_preamble() + add_preamble_op() mechanism.
-
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
         let (label_args, virtuals) = exported_state
             .virtual_state
             .make_inputargs_and_virtuals(targetargs, ctx);
+        let source_slots = exported_state
+            .virtual_state
+            .make_inputarg_source_slots(targetargs);
+        // Pyre-specific local seam: remember which original phase-2 input
+        // slots correspond to raw scalar label args. RPython does not need
+        // this because its inputargs are already typed boxes.
+        for (i, &source_slot) in source_slots.iter().enumerate() {
+            if source_slot.is_none() {
+                continue;
+            }
+            if let Some(&arg_type) = exported_state.end_arg_types.get(i) {
+                if arg_type == Type::Int || arg_type == Type::Float {
+                    ctx.unboxed_int_args.insert(source_slot);
+                }
+            }
+        }
         ctx.initialize_imported_short_preamble_builder(
             &label_args,
             &exported_state.short_inputargs,
@@ -2841,6 +2858,31 @@ mod tests {
             Some((10, 20))
         );
         assert_eq!(ctx2.int_lower_bounds.get(&OpRef(21)).copied(), Some(10));
+    }
+
+    #[test]
+    fn test_import_state_marks_source_slots_for_forwarded_raw_scalars() {
+        let exported = ExportedState {
+            end_args: vec![OpRef(21)],
+            next_iteration_args: vec![OpRef(31)],
+            end_arg_types: vec![Type::Int],
+            preamble_heap_cache: Vec::new(),
+            virtual_state: crate::virtualstate::VirtualState::new(vec![
+                crate::virtualstate::VirtualStateInfo::Unknown,
+            ]),
+            exported_infos: HashMap::new(),
+            exported_short_ops: Vec::new(),
+            exported_short_boxes: Vec::new(),
+            short_preamble: None,
+            renamed_inputargs: Vec::new(),
+            short_inputargs: vec![OpRef(21)],
+        };
+
+        let mut ctx2 = crate::OptContext::with_num_inputs(4, 1);
+        let label_args = import_state(&[OpRef(0)], &exported, &mut ctx2);
+        assert_eq!(label_args, vec![OpRef(31)]);
+        assert!(ctx2.unboxed_int_args.contains(&OpRef(0)));
+        assert!(!ctx2.unboxed_int_args.contains(&OpRef(31)));
     }
 
     #[test]

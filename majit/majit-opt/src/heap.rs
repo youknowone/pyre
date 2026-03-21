@@ -648,6 +648,38 @@ impl OptHeap {
             }
         }
 
+        // Pyre-specific: when the object is a raw Int from preamble unboxing,
+        // reading its intval field (signed, offset 8) returns the object itself
+        // (it IS the int value).  This compensates for pyre not having
+        // RPython's jitcode layer which would avoid the GetfieldGcI entirely.
+        {
+            let obj = op.arg(0);
+            if std::env::var_os("MAJIT_LOG").is_some() && !ctx.unboxed_int_args.is_empty() {
+                eprintln!("[jit][heap] getfield obj={:?} unboxed_set={:?} contains={}", obj, ctx.unboxed_int_args, ctx.unboxed_int_args.contains(&obj));
+            }
+            if ctx.unboxed_int_args.contains(&obj) {
+                if let Some(descr) = &op.descr {
+                    if let Some(fd) = descr.as_field_descr() {
+                        if fd.is_field_signed() && fd.field_type() == Type::Int {
+                            // intval field: the object IS the value
+                            ctx.replace_op(op.pos, obj);
+                            return OptimizationResult::Remove;
+                        }
+                        if fd.is_always_pure() && !fd.is_field_signed()
+                            && fd.field_type() == Type::Int
+                        {
+                            // ob_type field: constant-fold from heap cache or
+                            // Phase 1 guard. Use cached if available, else emit.
+                            if let Some(&cached) = self.cached_fields.get(&key) {
+                                ctx.replace_op(op.pos, cached);
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Check lazy set first: if there is a pending SETFIELD for this key,
         // the value is the second arg of that pending op.
         if let Some(lazy_op) = self.lazy_setfields.get(&key) {

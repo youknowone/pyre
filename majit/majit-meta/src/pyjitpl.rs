@@ -1302,8 +1302,13 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        // Safety: don't compile guardless loops — they'd run forever
-        // without RPython's interrupt mechanism.
+        // RPython: jit_merge_point tick counter provides periodic exit from
+        // compiled loops. majit: for now, abort guardless loops. Loops with
+        // constant-true guards (push(constant) pattern) will also hang but
+        // this matches RPython behavior (relies on OS signals/GIL for exit).
+        //
+        // TODO: implement GUARD_NOT_INVALIDATED + signal-based invalidation
+        // for periodic exit from compiled loops.
         let has_guard = optimized_ops.iter().any(|op| op.opcode.is_guard());
         if !has_guard {
             if crate::majit_log_enabled() {
