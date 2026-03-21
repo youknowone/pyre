@@ -276,6 +276,7 @@ impl UnrollOptimizer {
         // Build the virtual state at end of Phase 2 body.
         let imported_short_preamble_builder = opt_p2.imported_short_preamble_builder.clone();
         let imported_short_aliases = opt_p2.imported_short_aliases.clone();
+        let imported_short_sources = opt_p2.imported_short_sources.clone();
 
         // finalize_short_preamble: create TargetToken for this loop version
         let initial_sp = opt_p2.imported_short_preamble.clone().unwrap_or_else(|| {
@@ -473,6 +474,7 @@ impl UnrollOptimizer {
             p2_ni,
             jump_to_self,
             &imported_short_aliases,
+            &imported_short_sources,
             &consts_p2,
             self.target_tokens
                 .first()
@@ -2043,6 +2045,7 @@ fn assemble_peeled_trace(
     body_num_inputs: usize,
     jump_to_self: bool,
     imported_short_aliases: &[crate::ImportedShortAlias],
+    imported_short_sources: &[crate::ImportedShortSource],
     constants: &std::collections::HashMap<u32, i64>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
@@ -2122,6 +2125,29 @@ fn assemble_peeled_trace(
     // Append non-constant extra label args. The caller (unroll pass)
     // determines which extra values the loop header needs; virtual
     // remnants have already been filtered by the caller.
+    //
+    // For extra args not defined in the preamble (Phase 2-only OpRefs),
+    // emit a SameAs op mapping them from their preamble source so the
+    // Cranelift fall-through can resolve them.
+    let short_source_map: HashMap<OpRef, OpRef> = imported_short_sources
+        .iter()
+        .map(|s| (s.result, s.source))
+        .collect();
+    for &arg in &filtered_extra_label_args {
+        let mapped = alias_remap.get(&arg).copied().unwrap_or(arg);
+        if !preamble_defs.contains(&mapped) {
+            if let Some(&source) = short_source_map.get(&arg) {
+                if preamble_defs.contains(&source) {
+                    let pos = OpRef(max_pos);
+                    max_pos = next_free_pos(max_pos.saturating_add(1));
+                    let mut op = Op::new(OpCode::SameAsI, &[source]);
+                    op.pos = pos;
+                    alias_remap.insert(arg, pos);
+                    result.push(op);
+                }
+            }
+        }
+    }
     full_label_args.extend(
         filtered_extra_label_args
             .iter()
@@ -4051,6 +4077,7 @@ mod tests {
                 same_as_source: OpRef(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
+            &[],
             &std::collections::HashMap::new(),
             None,
             None,
@@ -4100,6 +4127,7 @@ mod tests {
             &[],
             1,
             true,
+            &[],
             &[],
             &constants,
             None,
@@ -4163,6 +4191,7 @@ mod tests {
             &[],
             1,
             true,
+            &[],
             &[],
             &constants,
             None,
@@ -4338,6 +4367,7 @@ mod tests {
                 same_as_source: OpRef(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
+            &[],
             &std::collections::HashMap::new(),
             None,
             None,
@@ -4375,6 +4405,7 @@ mod tests {
                 same_as_source: OpRef(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
+            &[],
             &std::collections::HashMap::new(),
             None,
             None,
@@ -4414,6 +4445,7 @@ mod tests {
             1,
             true,
             &[],
+            &[],
             &std::collections::HashMap::new(),
             None,
             None,
@@ -4447,6 +4479,7 @@ mod tests {
             &[],
             1,
             true,
+            &[],
             &[],
             &std::collections::HashMap::new(),
             None,
@@ -4488,6 +4521,7 @@ mod tests {
             1,
             true,
             &[],
+            &[],
             &constants,
             None,
             None,
@@ -4527,6 +4561,7 @@ mod tests {
             5,
             false,
             &[],
+            &[],
             &std::collections::HashMap::new(),
             Some(start_descr),
             None,
@@ -4564,6 +4599,7 @@ mod tests {
             1,
             true,
             &[],
+            &[],
             &constants,
             None,
             None,
@@ -4591,6 +4627,7 @@ mod tests {
             &[OpRef(7), OpRef(8)],
             1,
             true,
+            &[],
             &[],
             &constants,
             None,
@@ -4623,6 +4660,7 @@ mod tests {
             &[],
             6,
             true,
+            &[],
             &[],
             &constants,
             None,
