@@ -959,7 +959,7 @@ impl AbstractShortPreambleBuilderState {
             op.pos = current_result;
             self.extra_same_as.push(op);
         }
-        self.used_boxes.push(current_result);
+        self.used_boxes.push(result);
         self.short_preamble_jump.push(produced.preamble_op.clone());
     }
 
@@ -2233,9 +2233,9 @@ mod tests {
         let mut builder = ShortPreambleBuilder::new(&[OpRef(20)], &produced, &[OpRef(10)]);
 
         assert!(builder.add_preamble_op(OpRef(20)));
-        assert_eq!(builder.used_boxes(), &[OpRef(30)]);
+        assert_eq!(builder.used_boxes(), &[OpRef(20)]);
         let sp = builder.build_short_preamble_struct();
-        assert_eq!(sp.used_boxes, vec![OpRef(30)]);
+        assert_eq!(sp.used_boxes, vec![OpRef(20)]);
         assert_eq!(sp.jump_args, vec![OpRef(30)]);
     }
 
