@@ -3459,9 +3459,10 @@ impl TraceFrameState {
                     // RPython parity: use CALL_ASSEMBLER_I when a token
                     // exists for the callee (compiled or pending).
                     // RPython parity: use CALL_ASSEMBLER_I when a compiled
-                    // token exists. Pending tokens cause SIGSEGV in
-                    // call_assembler_fast_path — needs further investigation
-                    // of the codegen dispatch path for self-recursive callee.
+                    // token exists. Pending tokens are registered as placeholders
+                    // (null code_ptr) but shim dispatch still causes SIGSEGV
+                    // due to callee frame / force_fn arg mismatch. Compiled-only
+                    // for now; force_cache handles first execution.
                     let ca_token = if is_self_recursive {
                         driver.get_loop_token_number(callee_key)
                     } else {
@@ -4296,8 +4297,15 @@ impl ControlFlowOpcodeHandler for TraceFrameState {
         })
     }
 
-    fn close_loop_args(&mut self, _target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
-        self.with_ctx(|this, ctx| Ok(Some(TraceFrameState::close_loop_args(this, ctx))))
+    fn close_loop_args(&mut self, target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
+        self.with_ctx(|this, ctx| {
+            // RPython reached_loop_header(): the loop-close state must carry
+            // the explicit backward-jump target, i.e. the real loop header
+            // merge-point. Reassert it here instead of trusting whatever
+            // fallthrough pc happened to be materialized earlier in the step.
+            TraceFrameState::set_next_instr(this, ctx, target);
+            Ok(Some(TraceFrameState::close_loop_args(this, ctx)))
+        })
     }
 }
 

@@ -511,6 +511,16 @@ pub trait Backend: Send {
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
 
+    /// Register a placeholder for a pending token (RPython compile_tmp_callback).
+    /// The placeholder has null code_ptr; call_assembler_fast_path detects this
+    /// and falls back to force_fn. Replaced by the real target on compile_loop.
+    fn register_pending_target(
+        &mut self,
+        _token_number: u64,
+        _input_types: Vec<Type>,
+        _num_inputs: usize,
+    ) {}
+
     /// Compile a bridge (side exit path) and attach it to the loop.
     fn compile_bridge(
         &mut self,

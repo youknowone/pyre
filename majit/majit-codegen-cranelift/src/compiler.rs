@@ -1313,6 +1313,36 @@ fn unregister_call_assembler_target(token_number: u64) {
     }
 }
 
+/// RPython compile_tmp_callback parity: register a placeholder target
+/// with null code_ptr for a pending token. call_assembler_fast_path
+/// detects null code_ptr and falls back to force_fn (interpreter).
+/// When compilation completes, the placeholder is replaced by the real target.
+pub fn register_pending_call_assembler_target(
+    token_number: u64,
+    inputarg_types: Vec<Type>,
+    num_inputs: usize,
+) {
+    let target = RegisteredLoopTarget {
+        trace_id: 0,
+        header_pc: 0,
+        _green_key: 0,
+        source_guard: None,
+        caller_prefix_layout: None,
+        code_ptr: std::ptr::null(),
+        fail_descrs: Vec::new(),
+        gc_runtime_id: None,
+        num_inputs,
+        num_ref_roots: 0,
+        max_output_slots: 1,
+        inputarg_types,
+        needs_force_frame: false,
+    };
+    call_assembler_registry()
+        .lock()
+        .unwrap()
+        .insert(token_number, target);
+}
+
 fn lookup_call_assembler_target(token_number: u64) -> Option<RegisteredLoopTarget> {
     call_assembler_registry()
         .lock()
@@ -1786,6 +1816,20 @@ fn call_assembler_fast_path(
     outcome: *mut i64,
     force_fn: extern "C" fn(i64) -> i64,
 ) -> u64 {
+    // RPython parity: compile_tmp_callback. When target is pending
+    // (code_ptr not yet set), fall back to force_fn which runs the
+    // interpreter. The force_fn receives the callee frame pointer
+    // from the first input arg.
+    if target.code_ptr.is_null() {
+        let frame_ptr = inputs.get(0).copied().unwrap_or(0);
+        let result = force_fn(frame_ptr);
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+            *outcome.add(1) = 0;
+        }
+        return result as u64;
+    }
+
     let actual_outputs = target.max_output_slots.max(1);
     let actual_roots = target.num_ref_roots.max(1);
     if actual_outputs > FAST_PATH_MAX_OUTPUTS || actual_roots > FAST_PATH_MAX_ROOTS {
@@ -2304,6 +2348,14 @@ fn resolve_call_assembler_target(
     let Some(target) = lookup_call_assembler_target(target_token) else {
         return Ok(None);
     };
+
+    // Pending targets (null code_ptr) are placeholders — no compiled code
+    // or finish descriptors yet. Return None so codegen uses shim fallback.
+    // At runtime, call_assembler_fast_path detects null code_ptr and calls
+    // force_fn (RPython compile_tmp_callback parity).
+    if target.code_ptr.is_null() {
+        return Ok(None);
+    }
 
     if target.inputarg_types != call_descr.arg_types() {
         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -7367,6 +7419,15 @@ impl majit_codegen::Backend for CraneliftBackend {
         self.registered_call_assembler_tokens.insert(token.number);
         token.compiled = Some(Box::new(compiled));
         Ok(info)
+    }
+
+    fn register_pending_target(
+        &mut self,
+        token_number: u64,
+        input_types: Vec<majit_ir::Type>,
+        num_inputs: usize,
+    ) {
+        register_pending_call_assembler_target(token_number, input_types, num_inputs);
     }
 
     fn compile_bridge(
