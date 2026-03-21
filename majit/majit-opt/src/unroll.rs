@@ -1623,6 +1623,7 @@ impl OptUnroll {
                     let Some(result_opref) = resolve_result(result) else {
                         continue;
                     };
+                    ctx.replace_op(source, result_opref);
                     let args = args
                         .iter()
                         .map(|arg| match arg {
@@ -1687,6 +1688,7 @@ impl OptUnroll {
                     let Some(value) = resolve_result(result) else {
                         continue;
                     };
+                    ctx.replace_op(source, value);
                     ctx.imported_short_fields.insert((obj, descr_idx), value);
                     if std::env::var_os("MAJIT_LOG").is_some() {
                         eprintln!(
@@ -1724,6 +1726,7 @@ impl OptUnroll {
                     let Some(value) = resolve_result(result) else {
                         continue;
                     };
+                    ctx.replace_op(source, value);
                     ctx.imported_short_arrayitems
                         .insert((obj, descr_idx, index), value);
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
@@ -1752,6 +1755,7 @@ impl OptUnroll {
                     let Some(value) = resolve_result(result) else {
                         continue;
                     };
+                    ctx.replace_op(source, value);
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: value,
@@ -1898,29 +1902,50 @@ fn assemble_peeled_trace(
     // Label position
     let label_pos = next_free_pos(max_pos);
     let mut full_label_args = label_args.to_vec();
-    full_label_args.extend(filtered_extra_label_args.iter().map(|arg| {
-        alias_remap
-            .get(arg)
-            .copied()
-            .unwrap_or(*arg)
-    }));
 
-    // RPython compile.py parity: body ops may reference preamble-defined
-    // values in fail_args (guard resume data). These must be carried through
-    // the label so they're defined in the body. Scan body fail_args for
-    // refs that are defined in the preamble but not in the label.
-    let preamble_defs: std::collections::HashSet<OpRef> = p1_ops
-        .iter()
-        .filter(|op| !op.pos.is_none() && op.opcode != OpCode::Jump)
-        .map(|op| op.pos)
-        .collect();
-    let body_defs: std::collections::HashSet<OpRef> = p2_ops
-        .iter()
-        .filter(|op| !op.pos.is_none())
-        .map(|op| op.pos)
-        .collect();
-    let label_set: std::collections::HashSet<OpRef> =
+    // Collect preamble-defined OpRefs BEFORE adding extra label args,
+    // so we can filter out virtual remnants (removed New ops).
+    let preamble_defs: std::collections::HashSet<OpRef> = {
+        let mut s: std::collections::HashSet<OpRef> = (0..body_num_inputs)
+            .map(|i| OpRef(i as u32))
+            .collect();
+        for op in &result {
+            if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
+                s.insert(op.pos);
+            }
+        }
+        // Alias results are also defined in the preamble.
+        for (&_from, &to) in &alias_remap {
+            s.insert(to);
+        }
+        s
+    };
+
+    // Filter extra_label_args: only keep preamble-defined refs.
+    // Virtual remnants (un-forced New() results) are NOT defined in
+    // the preamble and would cause SIGBUS if carried through.
+    full_label_args.extend(
+        filtered_extra_label_args
+            .iter()
+            .map(|arg| alias_remap.get(arg).copied().unwrap_or(*arg))
+            .filter(|arg| arg.is_none() || preamble_defs.contains(arg) || constants.contains_key(&arg.0)),
+    );
+
+    // RPython compile.py parity: after the loop label, only the loop-header
+    // contract is live. When majit's detached redirected tail still mentions
+    // body temps before redefining them, carry those refs through the label
+    // so the assembled body does not contain use-before-def slots.
+    // preamble_defs already computed above (includes inputargs + alias results)
+    let mut carried_source_slots: std::collections::HashSet<OpRef> =
+        if !label_source_slots.is_empty() && label_source_slots.len() == label_args.len() {
+            label_source_slots.iter().copied().collect()
+        } else {
+            (0..label_args.len()).map(|i| OpRef(i as u32)).collect()
+        };
+    carried_source_slots.extend(filtered_extra_label_args.iter().copied());
+    let mut label_set: std::collections::HashSet<OpRef> =
         full_label_args.iter().copied().collect();
+    let mut seen_body_defs = std::collections::HashSet::new();
     for op in p2_ops {
         let all_refs = op.args.iter().chain(
             op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()),
@@ -1929,12 +1954,23 @@ fn assemble_peeled_trace(
             if arg.is_none() || arg.0 >= 10_000 {
                 continue; // skip NONE and constants
             }
-            if label_set.contains(&arg) || body_defs.contains(&arg) {
-                continue; // already available
+            if label_set.contains(&arg)
+                || carried_source_slots.contains(&arg)
+                || alias_remap.contains_key(&arg)
+                || seen_body_defs.contains(&arg)
+            {
+                continue;
             }
+            // Only carry preamble-defined values through the label.
+            // Refs NOT in preamble_defs are virtual remnants (removed New ops)
+            // that would be dangling — skip them to avoid SIGBUS.
             if preamble_defs.contains(&arg) && !full_label_args.contains(&arg) {
                 full_label_args.push(arg);
+                label_set.insert(arg);
             }
+        }
+        if op.result_type() != Type::Void && !op.pos.is_none() {
+            seen_body_defs.insert(op.pos);
         }
     }
 
@@ -1955,6 +1991,7 @@ fn assemble_peeled_trace(
         .iter()
         .copied()
         .chain(alias_remap.values().copied())
+        .chain(preamble_defs.iter().copied())
         .collect();
 
     // Pass 1: collect all remappings
@@ -2279,7 +2316,7 @@ mod tests {
     fn run_unroll_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptUnroll::new()));
-        opt.optimize(ops)
+        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     // ── Basic peeling ─────────────────────────────────────────────────
@@ -2715,7 +2752,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptUnroll::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
 
         // Expect: peeled_add, peeled_guard, Label, body_add, body_guard, Jump = 6
         assert_eq!(result.len(), 6);
@@ -3689,6 +3726,7 @@ mod tests {
                 source: OpRef(30),
             }]
         );
+        assert_eq!(ctx2.get_replacement(OpRef(30)), imported_result);
 
         let forced = ctx2.force_op_from_preamble(imported_result);
         assert_eq!(forced, OpRef(30));
@@ -4199,6 +4237,50 @@ mod tests {
             combined[2].fail_args.as_ref().expect("guard fail args").as_slice(),
             &[OpRef(10), OpRef(50)]
         );
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_carries_body_value_used_before_local_def() {
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::GuardTrue, &[OpRef(64)]);
+                op.fail_args = Some(vec![OpRef(64)].into());
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10000)]);
+                op.pos = OpRef(64);
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(64)]),
+        ];
+        let constants = std::collections::HashMap::from([(10_000_u32, 1_i64)]);
+
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &[OpRef(10)],
+            &[OpRef(0)],
+            &[OpRef(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &constants,
+            None,
+            None,
+        );
+
+        assert_eq!(combined[0].opcode, OpCode::Label);
+        assert_eq!(combined[0].args.as_slice(), &[OpRef(10), OpRef(64)]);
+        assert_eq!(combined[1].opcode, OpCode::GuardTrue);
+        assert_eq!(combined[1].args.as_slice(), &[OpRef(64)]);
+        assert_eq!(
+            combined[1].fail_args.as_ref().expect("guard fail args").as_slice(),
+            &[OpRef(64)]
+        );
+        assert_eq!(combined[2].opcode, OpCode::IntAdd);
+        assert_ne!(combined[2].pos, OpRef(64));
     }
 
     #[test]
