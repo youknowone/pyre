@@ -403,26 +403,18 @@ impl UnrollOptimizer {
                     .and_then(|o| o.descr.as_ref())
                     .map(|d| d.index());
                 if redirected_jump_descr_idx != current_body_descr_idx {
+                    // RPython parity: the Cranelift backend can't jump to
+                    // code from a previous compilation (separate function).
+                    // Fall back to jump_to_preamble, matching RPython's
+                    // behavior when the target isn't reachable (unroll.py:228).
                     if std::env::var_os("MAJIT_LOG").is_some() {
                         eprintln!(
-                            "[jit] jump_to_existing_trace: external target {:?} != body {:?}, restoring self-loop",
+                            "[jit] jump_to_existing_trace: external target {:?} != body {:?}, falling back to preamble",
                             redirected_jump_descr_idx, current_body_descr_idx
                         );
                     }
-                    // Restore the original terminal Jump as a self-loop.
-                    // Phase 2's terminal_op was extracted from body_ops;
-                    // splice it back with the current body Label's descr.
                     redirected_tail_ops.clear();
-                    if let Some(mut original_jump) = body_terminal_op.clone() {
-                        if let Some(body_descr) = self
-                            .target_tokens
-                            .last()
-                            .map(|t| t.as_jump_target_descr())
-                        {
-                            original_jump.descr = Some(body_descr);
-                        }
-                        redirected_tail_ops.push(original_jump);
-                    }
+                    jumped = false;
                 }
             }
             jumped
