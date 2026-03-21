@@ -574,12 +574,20 @@ impl OpCode {
 
     pub fn is_always_pure(self) -> bool {
         let n = self.as_u16();
-        ALWAYS_PURE_FIRST <= n && n <= ALWAYS_PURE_LAST
+        (ALWAYS_PURE_FIRST <= n && n <= ALWAYS_PURE_LAST)
+            || matches!(
+                self,
+                OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF
+            )
     }
 
     pub fn has_no_side_effect(self) -> bool {
         let n = self.as_u16();
-        NOSIDEEFFECT_FIRST <= n && n <= NOSIDEEFFECT_LAST
+        (NOSIDEEFFECT_FIRST <= n && n <= NOSIDEEFFECT_LAST)
+            || matches!(
+                self,
+                OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF
+            )
     }
 
     pub fn is_malloc(self) -> bool {
@@ -2371,6 +2379,7 @@ mod tests {
 
         assert!(OpCode::IntAdd.is_always_pure());
         assert!(OpCode::FloatMul.is_always_pure());
+        assert!(OpCode::GetfieldGcPureI.is_always_pure());
         assert!(!OpCode::SetfieldGc.is_always_pure());
 
         assert!(OpCode::IntAddOvf.is_ovf());

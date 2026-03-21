@@ -6,20 +6,22 @@
 /// the cached result is returned instead of recomputing.
 use std::collections::HashMap;
 
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
 use crate::{OptContext, Optimization, OptimizationResult};
 
 /// Key for looking up a previously computed pure operation.
 ///
-/// Identifies an operation by its opcode and argument OpRefs.
-/// For operations with a descriptor, the descriptor identity is not tracked
-/// here because pure ops in the always-pure range don't use descriptors
-/// for identity purposes.
+/// Identifies an operation by its opcode, argument OpRefs, and descriptor.
+///
+/// RPython's optimizeopt/pure.py includes the descriptor in pure-op identity
+/// checks for operations like GETFIELD_GC_PURE_*; otherwise distinct immutable
+/// fields on the same object can be incorrectly CSE'd together.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PureOpKey {
     opcode: OpCode,
     args: Vec<OpRef>,
+    descr_index: Option<u32>,
 }
 
 impl PureOpKey {
@@ -27,6 +29,7 @@ impl PureOpKey {
         PureOpKey {
             opcode: op.opcode,
             args: op.args.to_vec(),
+            descr_index: op.descr.as_ref().map(|d| d.index()),
         }
     }
 
@@ -38,6 +41,7 @@ impl PureOpKey {
         PureOpKey {
             opcode: self.opcode,
             args: swapped,
+            descr_index: self.descr_index,
         }
     }
 }
@@ -88,6 +92,7 @@ impl RecentPureOps {
         let key = PureOpKey {
             opcode,
             args: vec![arg0],
+            descr_index: None,
         };
         self.map.get(&key).copied()
     }
@@ -104,6 +109,7 @@ impl RecentPureOps {
         let key = PureOpKey {
             opcode,
             args: vec![arg0, arg1],
+            descr_index: None,
         };
         if let Some(result) = self.map.get(&key).copied() {
             return Some(result);
@@ -112,6 +118,7 @@ impl RecentPureOps {
             let key_swapped = PureOpKey {
                 opcode,
                 args: vec![arg1, arg0],
+                descr_index: None,
             };
             return self.map.get(&key_swapped).copied();
         }
@@ -185,6 +192,7 @@ impl OptPure {
                 let key = PureOpKey {
                     opcode: OpCode::CallPureI,
                     args,
+                    descr_index: None,
                 };
                 (key, result)
             })
@@ -236,6 +244,7 @@ impl OptPure {
         let key = PureOpKey {
             opcode,
             args: args.to_vec(),
+            descr_index: None,
         };
         self.cache.insert(key, result);
     }
@@ -281,6 +290,7 @@ impl OptPure {
         let key = PureOpKey {
             opcode: OpCode::CallPureI,
             args: args.to_vec(),
+            descr_index: None,
         };
         self.known_result_call_pure.push((key, result));
     }
@@ -384,7 +394,7 @@ impl OptPure {
 ///
 /// RPython equivalent: pure.py constant folding in optimize_default().
 /// Returns the constant result value if successful.
-fn try_constant_fold_value(op: &Op, ctx: &OptContext) -> Option<i64> {
+fn try_constant_fold_int_value(op: &Op, ctx: &OptContext) -> Option<i64> {
     // Only fold binary int operations for now (most common case).
     if op.num_args() != 2 {
         return None;
@@ -435,6 +445,63 @@ fn try_constant_fold_value(op: &Op, ctx: &OptContext) -> Option<i64> {
     Some(result)
 }
 
+fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
+    match ctx.get_constant(arg)? {
+        Value::Int(ptr) if *ptr != 0 => Some(*ptr as usize),
+        Value::Ref(ptr) if !ptr.is_null() => Some(ptr.as_usize()),
+        _ => None,
+    }
+}
+
+fn try_constant_fold_pure_getfield(op: &Op, ctx: &OptContext) -> Option<Value> {
+    let descr = op.descr.as_ref()?;
+    let field_descr = descr.as_field_descr()?;
+    let addr = constant_ptr_value(op.arg(0), ctx)? + field_descr.offset();
+
+    match op.opcode {
+        OpCode::GetfieldGcPureI => {
+            let value = match (field_descr.field_size(), field_descr.is_field_signed()) {
+                (8, true) => unsafe { *(addr as *const i64) },
+                (8, false) => unsafe { *(addr as *const u64) as i64 },
+                (4, true) => unsafe { *(addr as *const i32) as i64 },
+                (4, false) => unsafe { *(addr as *const u32) as i64 },
+                (2, true) => unsafe { *(addr as *const i16) as i64 },
+                (2, false) => unsafe { *(addr as *const u16) as i64 },
+                (1, true) => unsafe { *(addr as *const i8) as i64 },
+                (1, false) => unsafe { *(addr as *const u8) as i64 },
+                _ => return None,
+            };
+            Some(Value::Int(value))
+        }
+        OpCode::GetfieldGcPureF => {
+            if field_descr.field_size() != std::mem::size_of::<f64>() {
+                return None;
+            }
+            Some(Value::Float(unsafe { *(addr as *const f64) }))
+        }
+        OpCode::GetfieldGcPureR => {
+            if field_descr.field_size() != std::mem::size_of::<usize>() {
+                return None;
+            }
+            Some(Value::Ref(GcRef(unsafe { *(addr as *const usize) })))
+        }
+        _ => None,
+    }
+}
+
+fn try_constant_fold_pure_value(op: &Op, ctx: &OptContext) -> Option<Value> {
+    if let Some(result) = try_constant_fold_int_value(op, ctx) {
+        return Some(Value::Int(result));
+    }
+
+    match op.opcode {
+        OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF => {
+            try_constant_fold_pure_getfield(op, ctx)
+        }
+        _ => None,
+    }
+}
+
 impl Default for OptPure {
     fn default() -> Self {
         Self::new()
@@ -460,7 +527,7 @@ impl Optimization for OptPure {
         if let Some(postponed) = self.postponed_op.take() {
             if op.opcode == OpCode::GuardNoOverflow {
                 // Try constant folding on the OVF op.
-                if let Some(folded) = try_constant_fold_value(&postponed, ctx) {
+                if let Some(folded) = try_constant_fold_int_value(&postponed, ctx) {
                     ctx.find_or_record_constant_int(postponed.pos, folded);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -495,6 +562,7 @@ impl Optimization for OptPure {
                     let non_ovf_key = PureOpKey {
                         opcode: non_ovf,
                         args: postponed.args.to_vec(),
+                        descr_index: None,
                     };
                     if let Some(cached_ref) = self.lookup_pure(&non_ovf_key) {
                         // A non-OVF version exists. We CAN'T reuse it for OVF
@@ -530,6 +598,7 @@ impl Optimization for OptPure {
                 let key = PureOpKey {
                     opcode: OpCode::CallPureI,
                     args: op.args[1..].to_vec(),
+                    descr_index: None,
                 };
                 self.known_result_call_pure.push((key, result));
             }
@@ -538,11 +607,8 @@ impl Optimization for OptPure {
 
         if op.opcode.is_always_pure() {
             // Constant folding: all args are constants → compute at opt time.
-            if let Some(folded_value) = try_constant_fold_value(op, ctx) {
-                let const_ref = ctx.find_or_record_constant_int(op.pos, folded_value);
-                if const_ref != op.pos {
-                    ctx.replace_op(op.pos, const_ref);
-                }
+            if let Some(folded_value) = try_constant_fold_pure_value(op, ctx) {
+                ctx.make_constant(op.pos, folded_value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -613,6 +679,7 @@ impl Optimization for OptPure {
             let key = PureOpKey {
                 opcode: OpCode::CallPureI,
                 args: op.args[1..].to_vec(),
+                descr_index: None,
             };
 
             if let Some(cached_ref) = self.lookup_pure(&key) {
@@ -648,6 +715,7 @@ impl Optimization for OptPure {
                 let key = PureOpKey {
                     opcode: op.opcode,
                     args: op.args[1..].to_vec(),
+                    descr_index: None,
                 };
                 if let Some(cached_ref) = self.lookup_pure(&key) {
                     let cached_ref = ctx.get_replacement(cached_ref);
@@ -697,6 +765,8 @@ impl Optimization for OptPure {
 mod tests {
     use super::*;
     use crate::optimizer::Optimizer;
+    use majit_ir::descr::make_field_descr_full;
+    use majit_ir::Type;
     /// Helper: assign sequential positions to ops.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
@@ -1234,6 +1304,107 @@ mod tests {
             .filter(|o| o.opcode == OpCode::IntAddOvf)
             .count();
         assert_eq!(ovf_count, 0, "OVF(3,4) should be constant-folded");
+    }
+
+    #[repr(C)]
+    struct TestIntFieldObject {
+        value: i64,
+    }
+
+    #[repr(C)]
+    struct TestFloatFieldObject {
+        value: f64,
+    }
+
+    #[repr(C)]
+    struct TestRefFieldObject {
+        value: usize,
+    }
+
+    #[test]
+    fn test_constant_fold_getfield_gc_pure_i_from_constant_object() {
+        let object = Box::new(TestIntFieldObject { value: 123 });
+        let ptr = Box::into_raw(object) as usize;
+
+        let descr = make_field_descr_full(1, 0, 8, Type::Int, true);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef(10)], descr);
+        op.pos = OpRef(0);
+
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(4, 0);
+        ctx.make_constant(OpRef(10), Value::Int(ptr as i64));
+        pass.setup();
+
+        assert_eq!(try_constant_fold_pure_value(&op, &ctx), Some(Value::Int(123)));
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert_eq!(ctx.get_constant_int(OpRef(0)), Some(123));
+
+        unsafe {
+            drop(Box::from_raw(ptr as *mut TestIntFieldObject));
+        }
+    }
+
+    #[test]
+    fn test_constant_fold_getfield_gc_pure_f_from_constant_object() {
+        let object = Box::new(TestFloatFieldObject { value: 3.5 });
+        let ptr = Box::into_raw(object) as usize;
+
+        let descr = make_field_descr_full(2, 0, 8, Type::Float, true);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[OpRef(10)], descr);
+        op.pos = OpRef(0);
+
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(4, 0);
+        ctx.make_constant(OpRef(10), Value::Int(ptr as i64));
+        pass.setup();
+
+        assert_eq!(try_constant_fold_pure_value(&op, &ctx), Some(Value::Float(3.5)));
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert_eq!(ctx.get_constant_float(OpRef(0)), Some(3.5));
+
+        unsafe {
+            drop(Box::from_raw(ptr as *mut TestFloatFieldObject));
+        }
+    }
+
+    #[test]
+    fn test_constant_fold_getfield_gc_pure_r_from_constant_object() {
+        let object = Box::new(TestRefFieldObject {
+            value: 0x1234_5678usize,
+        });
+        let ptr = Box::into_raw(object) as usize;
+
+        let descr = make_field_descr_full(
+            3,
+            0,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            true,
+        );
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[OpRef(10)], descr);
+        op.pos = OpRef(0);
+
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(4, 0);
+        ctx.make_constant(OpRef(10), Value::Int(ptr as i64));
+        pass.setup();
+
+        assert_eq!(
+            try_constant_fold_pure_value(&op, &ctx),
+            Some(Value::Ref(GcRef(0x1234_5678usize)))
+        );
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert_eq!(
+            ctx.get_constant(OpRef(0)),
+            Some(&Value::Ref(GcRef(0x1234_5678usize)))
+        );
+
+        unsafe {
+            drop(Box::from_raw(ptr as *mut TestRefFieldObject));
+        }
     }
 
     #[test]

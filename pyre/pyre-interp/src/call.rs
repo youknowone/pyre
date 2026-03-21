@@ -30,13 +30,22 @@ fn take_pending_inline_result(frame: &mut PyFrame) -> Option<PyObjectRef> {
 
 /// Replay the concrete result of a just-traced inline call.
 ///
-/// PyPy's `finishframe()` feeds the result back to the parent frame's
-/// registers and resumes from there; it does not route the value through the
-/// generic call dispatcher.  Keep pyre's concrete replay explicit as well:
-/// the interpreter loop that replays the CALL bytecode consumes the pending
+/// PyPy's `finishframe()` writes the return value into the parent frame and
+/// resumes there; it does not route the value through the generic call
+/// dispatcher.  Keep pyre's concrete replay explicit as well: when the
+/// interpreter reaches the original CALL opcode, it consumes the pending
 /// result, pops callable/args, and pushes the materialized return value.
-pub fn replay_pending_inline_result(frame: &mut PyFrame) -> Option<PyObjectRef> {
-    take_pending_inline_result(frame)
+pub fn replay_pending_inline_call(frame: &mut PyFrame, nargs: usize) -> bool {
+    let Some(result) = take_pending_inline_result(frame) else {
+        return false;
+    };
+    for _ in 0..nargs {
+        let _ = frame.pop();
+    }
+    let _ = frame.pop(); // null_or_self
+    let _ = frame.pop(); // callable
+    frame.push(result);
+    true
 }
 
 // ── Eval function injection ──────────────────────────────────────

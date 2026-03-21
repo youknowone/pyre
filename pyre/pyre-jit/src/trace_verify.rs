@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::jit::descr::{make_field_descr, make_size_descr};
+    use crate::jit::descr::{make_field_descr, make_immutable_field_descr, make_size_descr};
     use majit_ir::{OpCode, OpRef};
     use majit_meta::TraceCtx;
 
@@ -12,8 +12,17 @@ mod tests {
     fn intval_descr() -> majit_ir::DescrRef {
         make_field_descr(8, 8, majit_ir::Type::Int, true)
     }
+    fn immutable_ob_type_descr() -> majit_ir::DescrRef {
+        make_immutable_field_descr(0, 8, majit_ir::Type::Int, false)
+    }
+    fn immutable_intval_descr() -> majit_ir::DescrRef {
+        make_immutable_field_descr(8, 8, majit_ir::Type::Int, true)
+    }
     fn floatval_descr() -> majit_ir::DescrRef {
         make_field_descr(8, 8, majit_ir::Type::Float, false)
+    }
+    fn immutable_floatval_descr() -> majit_ir::DescrRef {
+        make_immutable_field_descr(8, 8, majit_ir::Type::Float, false)
     }
     fn w_int_size_descr() -> majit_ir::DescrRef {
         make_size_descr(16)
@@ -137,6 +146,52 @@ mod tests {
             ]
         );
         eprintln!("✓ trace_unbox_float: {:?}", ops);
+    }
+
+    #[test]
+    fn test_unbox_int_ops_use_pure_reads_for_immutable_descrs() {
+        let mut ctx = TraceCtx::for_test(1);
+        let obj = OpRef(0);
+        let _intval = crate::trace_unbox_int(
+            &mut ctx,
+            obj,
+            FAKE_INT_TYPE,
+            immutable_ob_type_descr(),
+            immutable_intval_descr(),
+            &[obj],
+        );
+        let ops = get_ops(ctx);
+        assert_eq!(
+            ops,
+            vec![
+                OpCode::GetfieldGcPureI,
+                OpCode::GuardClass,
+                OpCode::GetfieldGcPureI,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unbox_float_ops_use_pure_reads_for_immutable_descrs() {
+        let mut ctx = TraceCtx::for_test(1);
+        let obj = OpRef(0);
+        let _floatval = crate::trace_unbox_float(
+            &mut ctx,
+            obj,
+            FAKE_FLOAT_TYPE,
+            immutable_ob_type_descr(),
+            immutable_floatval_descr(),
+            &[obj],
+        );
+        let ops = get_ops(ctx);
+        assert_eq!(
+            ops,
+            vec![
+                OpCode::GetfieldGcPureI,
+                OpCode::GuardClass,
+                OpCode::GetfieldGcPureF,
+            ]
+        );
     }
 
     #[test]
