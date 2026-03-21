@@ -361,7 +361,19 @@ impl UnrollOptimizer {
                             self.retraced_count, self.retrace_limit
                         );
                     }
-                    // Allow retrace: jumped stays false → new target_token
+                    // RPython: retrace allowed → body self-loops to the new
+                    // target_token. Restore terminal Jump with body descr.
+                    jumped = true;
+                    if let Some(mut self_loop_jump) = body_terminal_op.clone() {
+                        if let Some(body_descr) = self
+                            .target_tokens
+                            .last()
+                            .map(|t| t.as_jump_target_descr())
+                        {
+                            self_loop_jump.descr = Some(body_descr);
+                        }
+                        redirected_tail_ops.push(self_loop_jump);
+                    }
                 } else {
                     // unroll.py:220-226: limit reached, try force_boxes=true
                     jump_ctx.clear_newoperations();
