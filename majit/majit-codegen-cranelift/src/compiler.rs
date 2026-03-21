@@ -905,6 +905,23 @@ static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<extern "C" fn(i64, u32, u64, u64) -> i
 /// Guard failure threshold before triggering bridge compilation.
 const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
 
+/// Deferred bridge compile request stack. Pushed by call_assembler guard
+/// failure when threshold is reached; popped by MetaInterp after execute_token.
+/// Stack-based to handle nested call_assembler dispatch (self-recursion).
+thread_local! {
+    static PENDING_BRIDGE_COMPILE: std::cell::RefCell<Vec<(u64, u32)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+fn request_pending_bridge_compile(trace_id: u64, fail_index: u32) {
+    PENDING_BRIDGE_COMPILE.with(|cell| cell.borrow_mut().push((trace_id, fail_index)));
+}
+
+/// Take all pending bridge compile requests.
+pub fn take_pending_bridge_compile() -> Vec<(u64, u32)> {
+    PENDING_BRIDGE_COMPILE.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
 // ── Call-assembler dispatch table ──
 // Each token gets a stable dispatch entry holding code_ptr + finish_index.
 // Compiled code loads both from the entry via memory reads.
@@ -1771,7 +1788,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
 
     let fail_descr = &target.fail_descrs[fail_index as usize];
     let fail_count = fail_descr.increment_fail_count();
-
     let bridge_guard = fail_descr.bridge.lock().unwrap();
     if let Some(ref bridge) = *bridge_guard {
         release_force_token(handle);
@@ -1780,9 +1796,12 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     drop(bridge_guard);
 
     // RPython compile.py:696 (handle_fail → must_compile): trigger bridge
-    // Bridge compilation is triggered by MetaInterp (trace_eagerness threshold
-    // in run_compiled_detailed_with_values), not by the codegen shim.
-    // Direct bridge_fn calls from here cause MetaInterp reentrancy issues.
+    // Bridge compilation is deferred: store a pending request that the
+    // MetaInterp layer can pick up after execute_token returns.
+    // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
+    if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
+        request_pending_bridge_compile(target.trace_id, fail_index);
+    }
 
     let saved_data = if let Some(ref ff) = force_frame {
         take_force_frame_saved_data(ff)
@@ -2106,12 +2125,6 @@ extern "C" fn call_assembler_shim(
     let outcome = outcome_ptr as usize as *mut i64;
 
     let target = unsafe { &*fast_lookup_ca_target(target_token) };
-    if std::env::var_os("MAJIT_LOG").is_some() {
-        eprintln!(
-            "[ca-shim] token={} null={} num_inputs={} code={:?}",
-            target_token, target.code_ptr.is_null(), target.num_inputs, target.code_ptr
-        );
-    }
 
     let input_slice =
         unsafe { std::slice::from_raw_parts(args_ptr as usize as *const i64, target.num_inputs) };
