@@ -4385,13 +4385,17 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardNoOverflow => {
+                    // RPython intbounds.py:217-220: if the preceding op
+                    // is not an overflow op, the guard is redundant (the
+                    // overflow was already proven impossible or optimized away).
+                    if last_ovf_flag.is_none() {
+                        guard_idx += 1; // consume guard_info slot
+                        continue;
+                    }
                     // Side-exit if overflow DID occur (ovf != 0).
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
-
-                    let ovf = last_ovf_flag
-                        .take()
-                        .expect("GuardNoOverflow without preceding overflow op");
+                    let ovf = last_ovf_flag.take().unwrap();
                     let exit_block = builder.create_block();
                     let cont_block = builder.create_block();
 
