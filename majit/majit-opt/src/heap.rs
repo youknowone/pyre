@@ -263,21 +263,40 @@ impl OptHeap {
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
         // RPython heap.py:136: force_lazy_set → emit_extra(op, emit=False)
-        // → send_extra_operation(op, next_optimization=None)
-        // → reprocesses op through ALL passes from first_optimization.
+        // emit=False means the op is NOT directly appended to _newoperations.
+        // It's re-processed through all passes → re-stored as lazy_set → LOST.
+        // But put_field_back_to_info restores the cached value for Phase 2.
         //
-        // Queue lazy SetfieldGc ops for reprocessing through the full pass
-        // chain via emit_through_passes. The optimizer's drain mechanism
-        // (drain_extra_operations_from) routes them through OptVirtualize
-        // (which force_box's virtual args) and back through OptHeap.
-        for (_key, op) in pending {
-            ctx.emit_through_passes(op);
+        // In majit: just update the cache and drop the op. The Phase 2 body
+        // reads from the imported heap cache, not from memory. Call-triggered
+        // force (earlier in the trace) already emitted the pool writebacks
+        // that the compiled code needs.
+        for ((obj, field_idx), mut op) in pending {
+            // Resolve forwarding so cache has current values
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+            let value_ref = op.arg(1);
+            // Update heap cache (RPython put_field_back_to_info)
+            self.cached_fields.insert((obj, field_idx), value_ref);
+            // Drop the op — RPython also loses re-stored lazy_sets
         }
     }
 
     /// Force all pending lazy setarrayitems: emit the stored ops and cache their values.
     fn force_all_lazy_setarrayitems(&mut self, ctx: &mut OptContext) {
+        // Same as force_all_lazy_setfields: drop ops, update cache only.
         let pending: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
+        for ((obj, descr_idx, index), mut op) in pending {
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+            let value_ref = op.arg(2);
+            self.cached_arrayitems.insert((obj, descr_idx, index), value_ref);
+        }
+        // Original code below is dead — we dropped all ops above.
+        // Keep the struct for compatibility but skip.
+        let pending: Vec<(ArrayItemKey, Op)> = Vec::new();
         for (_key, op) in &pending {
             let orig_val = op.arg(2);
             if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {

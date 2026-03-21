@@ -1389,7 +1389,43 @@ impl TraceFrameState {
         } else {
             OpCode::GuardFalse
         };
-        self.record_guard(ctx, opcode, &[truth]);
+        if self.parent_fail_args.is_some() {
+            self.record_guard(ctx, opcode, &[truth]);
+            return;
+        }
+
+        let s = self.sym();
+        let stack_only = s.stack_only_depth();
+        let current_pc = unsafe {
+            (*(self.concrete_frame as *const pyre_interp::frame::PyFrame)).next_instr
+        };
+        let pre_pop_vsd = s.valuestackdepth.saturating_add(1);
+        let branch_operand = self
+            .concrete_popped_value()
+            .map(|value| ctx.const_int(value as i64))
+            .unwrap_or(truth);
+        let branch_operand_type = self
+            .concrete_popped_value()
+            .map(concrete_value_type)
+            .unwrap_or_else(|| self.value_type(truth));
+        let current_pc_ref = ctx.const_int(current_pc as i64);
+        let pre_pop_vsd_ref = ctx.const_int(pre_pop_vsd as i64);
+        let mut fail_args = vec![s.frame, current_pc_ref, pre_pop_vsd_ref];
+        fail_args.extend_from_slice(&s.symbolic_locals);
+        fail_args.extend_from_slice(&s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())]);
+        fail_args.push(branch_operand);
+        let fail_arg_types = virtualizable_fail_arg_types(
+            s.symbolic_local_types
+                .iter()
+                .copied()
+                .chain(
+                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
+                        .iter()
+                        .copied(),
+                )
+                .chain(std::iter::once(branch_operand_type)),
+        );
+        ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
     }
 
     fn concrete_popped_value(&self) -> Option<PyObjectRef> {
@@ -1400,7 +1436,7 @@ impl TraceFrameState {
         let vsd = self.sym().valuestackdepth;
         Some((
             concrete_stack_value(self.concrete_frame, vsd)?,
-            concrete_stack_value(self.concrete_frame, vsd + 1)?,
+            concrete_stack_value(self.concrete_frame, vsd.checked_add(1)?)?,
         ))
     }
 
@@ -1408,8 +1444,8 @@ impl TraceFrameState {
         let vsd = self.sym().valuestackdepth;
         Some((
             concrete_stack_value(self.concrete_frame, vsd)?,
-            concrete_stack_value(self.concrete_frame, vsd + 1)?,
-            concrete_stack_value(self.concrete_frame, vsd + 2)?,
+            concrete_stack_value(self.concrete_frame, vsd.checked_add(1)?)?,
+            concrete_stack_value(self.concrete_frame, vsd.checked_add(2)?)?,
         ))
     }
 
@@ -1929,12 +1965,18 @@ impl TraceFrameState {
                     &fail_args,
                 )
             };
-            let result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+            let raw_result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
             if has_overflow {
                 this.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
             }
-            this.remember_value_type(result, Type::Int);
-            Ok(result)
+            // RPython parity: wrapint(space, z) re-boxes the raw int result.
+            // Record New(W_IntObject) + SetfieldGc so optimizer can virtualize.
+            // pypy/objspace/std/intobject.py:671 wrapint
+            // MUST come after GuardNoOverflow — can't insert ops between
+            // IntAddOvf and its guard.
+            let boxed = box_traced_raw_int(ctx, raw_result);
+            this.remember_value_type(boxed, Type::Ref);
+            Ok(boxed)
         })
     }
 
@@ -4623,20 +4665,20 @@ impl JitState for PyreJitState {
         meta: &Self::Meta,
         jump_args: &[OpRef],
     ) -> bool {
-        // [frame, next_instr, valuestackdepth, locals..., stack...]
-        let stack_only = meta.valuestackdepth.saturating_sub(meta.num_locals);
-        let expected = 3 + meta.num_locals + stack_only;
-        let ok = jump_args.len() == expected;
-        if !ok && majit_meta::majit_log_enabled() {
-            eprintln!(
-                "[jit][abort-reason] validate_close_with_jump_args expected={} actual={} num_locals={} valuestackdepth={}",
-                expected,
-                jump_args.len(),
-                meta.num_locals,
-                meta.valuestackdepth
-            );
-        }
-        ok
+        let _ = meta;
+        // pyre does not close loops by re-reading symbolic stack state from
+        // the trace header.  Instead it materializes explicit jump args from
+        // the concrete frame-backed virtualizable state at the merge point:
+        //   [frame, next_instr, valuestackdepth, locals..., stack...]
+        //
+        // Retraces/bridges may start from a transient stackful state
+        // (e.g. direct-call trace-through in progress) and still legally
+        // jump back to a target loop whose merge-point stack is smaller.
+        // RPython closes those traces against the target token contract, not
+        // the retrace entry state's stack depth.  So for pyre's explicit
+        // jump-arg model, the trace-start `meta.valuestackdepth` is not a
+        // sound validator here.
+        jump_args.len() >= 3
     }
 
     /// RPython resume.py: materialize a virtual object from resume data.
@@ -4937,7 +4979,7 @@ mod tests {
         use pyre_bytecode::compile_exec;
         use pyre_interp::frame::PyFrame;
 
-        let code = compile_exec("pass").expect("test code should compile");
+        let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -5519,6 +5561,224 @@ mod tests {
             state.sym().last_comparison_truth,
             Some(OpRef(123)),
             "comparison truth cache should survive trivia until the real branch consumer"
+        );
+    }
+
+    #[test]
+    fn test_concrete_popped_value_reads_last_popped_slot() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("1 + 2").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.push(w_int_new(11));
+        frame.push(w_int_new(22));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_initialized = true;
+        sym.nlocals = frame.nlocals();
+        sym.valuestackdepth = frame.valuestackdepth - 1;
+
+        let state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let top = state
+            .concrete_popped_value()
+            .expect("top-of-stack value should be readable");
+        assert!(unsafe { is_int(top) });
+        assert_eq!(unsafe { w_int_get_value(top) }, 22);
+    }
+
+    #[test]
+    fn test_concrete_binary_operands_read_last_two_popped_slots() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("a = [0]\na[0] = 1\n").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.push(w_int_new(11));
+        frame.push(w_int_new(22));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_initialized = true;
+        sym.nlocals = frame.nlocals();
+        sym.valuestackdepth = frame.valuestackdepth - 2;
+
+        let state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let (lhs, rhs) = state
+            .concrete_binary_operands()
+            .expect("binary operands should be readable");
+        assert_eq!(unsafe { w_int_get_value(lhs) }, 11);
+        assert_eq!(unsafe { w_int_get_value(rhs) }, 22);
+    }
+
+    #[test]
+    fn test_concrete_store_subscr_operands_read_last_three_popped_slots() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let module = compile_exec("def f(a, b, c):\n    a[b] = c\nf([], 0, 0)\n")
+            .expect("test code should compile");
+        let code = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                pyre_bytecode::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                    Some((**code).clone())
+                }
+                _ => None,
+            })
+            .expect("test source should contain function code");
+        let mut frame = Box::new(PyFrame::new(code));
+        let value = w_int_new(7);
+        let obj = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let key = w_int_new(1);
+        frame.push(value);
+        frame.push(obj);
+        frame.push(key);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_initialized = true;
+        sym.nlocals = frame.nlocals();
+        sym.valuestackdepth = frame.valuestackdepth - 3;
+
+        let state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let (concrete_value, concrete_obj, concrete_key) = state
+            .concrete_store_subscr_operands()
+            .expect("store_subscr operands should be readable");
+        assert_eq!(concrete_value, value);
+        assert_eq!(concrete_obj, obj);
+        assert_eq!(unsafe { w_int_get_value(concrete_key) }, 1);
+    }
+
+    #[test]
+    fn test_concrete_branch_truth_reads_last_popped_slot() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("1 + 2").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.push(w_int_new(0));
+        frame.push(w_int_new(1));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_initialized = true;
+        sym.nlocals = frame.nlocals();
+        sym.valuestackdepth = frame.valuestackdepth - 1;
+
+        let state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        assert!(
+            state
+                .concrete_branch_truth()
+                .expect("branch truth should read the popped branch operand")
+        );
+    }
+
+    #[test]
+    fn test_record_branch_guard_uses_branch_pc_and_pre_pop_stack_shape() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("1 + 2").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.next_instr = 456;
+        let lower_value = w_int_new(0);
+        let branch_value = w_int_new(1);
+        frame.push(lower_value);
+        frame.push(branch_value);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(3);
+        let expected_pc = ctx.const_int(456);
+        let expected_vsd = ctx.const_int(2);
+        let expected_branch_value = ctx.const_int(branch_value as i64);
+        let frame_ref = OpRef(0);
+        let lower_stack = OpRef(1);
+        let truth = OpRef(2);
+
+        let mut sym = PyreSym::new_uninit(frame_ref);
+        sym.symbolic_initialized = true;
+        sym.nlocals = frame.nlocals();
+        sym.valuestackdepth = frame.valuestackdepth - 1;
+        sym.symbolic_stack = vec![lower_stack];
+        sym.symbolic_stack_types = vec![Type::Ref];
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 459,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        state.with_ctx(|this, ctx| {
+            this.record_branch_guard(ctx, truth, true);
+        });
+
+        let recorder = ctx.into_recorder();
+        let guard = recorder.last_op().expect("branch guard should be recorded");
+        let fail_args = guard
+            .fail_args
+            .as_ref()
+            .expect("branch guard should carry explicit fail args");
+        assert_eq!(guard.opcode, OpCode::GuardTrue);
+        assert_eq!(
+            fail_args.as_slice(),
+            &[frame_ref, expected_pc, expected_vsd, lower_stack, expected_branch_value]
         );
     }
 

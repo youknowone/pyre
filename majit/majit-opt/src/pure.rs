@@ -6,7 +6,7 @@
 /// the cached result is returned instead of recomputing.
 use std::collections::HashMap;
 
-use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{GcRef, Op, OpCode, OpRef, Type, Value};
 
 use crate::{OptContext, Optimization, OptimizationResult};
 
@@ -447,7 +447,6 @@ fn try_constant_fold_int_value(op: &Op, ctx: &OptContext) -> Option<i64> {
 
 fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
     match ctx.get_constant(arg)? {
-        Value::Int(ptr) if *ptr != 0 => Some(*ptr as usize),
         Value::Ref(ptr) if !ptr.is_null() => Some(ptr.as_usize()),
         _ => None,
     }
@@ -1014,14 +1013,17 @@ mod tests {
         let key1 = PureOpKey {
             opcode: OpCode::IntAdd,
             args: vec![OpRef(0), OpRef(1)],
+            descr_index: None,
         };
         let key2 = PureOpKey {
             opcode: OpCode::IntAdd,
             args: vec![OpRef(0), OpRef(1)],
+            descr_index: None,
         };
         let key3 = PureOpKey {
             opcode: OpCode::IntAdd,
             args: vec![OpRef(1), OpRef(0)],
+            descr_index: None,
         };
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
@@ -1332,7 +1334,7 @@ mod tests {
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef(10), Value::Int(ptr as i64));
+        ctx.make_constant(OpRef(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(try_constant_fold_pure_value(&op, &ctx), Some(Value::Int(123)));
@@ -1356,7 +1358,7 @@ mod tests {
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef(10), Value::Int(ptr as i64));
+        ctx.make_constant(OpRef(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(try_constant_fold_pure_value(&op, &ctx), Some(Value::Float(3.5)));
@@ -1388,7 +1390,7 @@ mod tests {
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef(10), Value::Int(ptr as i64));
+        ctx.make_constant(OpRef(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(
@@ -1405,6 +1407,23 @@ mod tests {
         unsafe {
             drop(Box::from_raw(ptr as *mut TestRefFieldObject));
         }
+    }
+
+    #[test]
+    fn test_constant_fold_getfield_gc_pure_does_not_treat_int_constant_as_gc_pointer() {
+        let descr = make_field_descr_full(4, 0, 8, Type::Int, true);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef(10)], descr);
+        op.pos = OpRef(0);
+
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(4, 0);
+        ctx.make_constant(OpRef(10), Value::Int(2));
+        pass.setup();
+
+        assert_eq!(try_constant_fold_pure_value(&op, &ctx), None);
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::PassOn));
+        assert_eq!(ctx.get_constant(OpRef(0)), None);
     }
 
     #[test]
@@ -1466,6 +1485,7 @@ mod tests {
         let key = super::PureOpKey {
             opcode: OpCode::CallPureI,
             args,
+            descr_index: None,
         };
         assert_eq!(pass.lookup_known_result(&key), Some(OpRef(50)));
     }
