@@ -950,6 +950,7 @@ struct AbstractShortPreambleBuilderState {
 impl AbstractShortPreambleBuilderState {
     fn record_preamble_use(&mut self, result: OpRef, produced: &ProducedShortOp) {
         let current_result = produced.preamble_op.pos;
+        let used_box = result;
         if produced.invented_name {
             let source = produced.same_as_source.unwrap_or(result);
             let mut op = Op::new(
@@ -959,7 +960,7 @@ impl AbstractShortPreambleBuilderState {
             op.pos = current_result;
             self.extra_same_as.push(op);
         }
-        self.used_boxes.push(current_result);
+        self.used_boxes.push(used_box);
         self.short_preamble_jump.push(produced.preamble_op.clone());
     }
 
@@ -1221,15 +1222,9 @@ impl ExtendedShortPreambleBuilder {
     }
 
     pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
-        if !self.label_args.contains(&result) {
-            self.label_args.push(result);
-        }
-        if !self.used_boxes.contains(&result) {
-            self.used_boxes.push(result);
-        }
-        if !self.short_jump_args.contains(&produced.preamble_op.pos) {
-            self.short_jump_args.push(produced.preamble_op.pos);
-        }
+        self.label_args.push(result);
+        self.used_boxes.push(result);
+        self.short_jump_args.push(produced.preamble_op.pos);
         self.extra_state.record_preamble_use(result, &produced);
     }
 
@@ -2239,9 +2234,9 @@ mod tests {
         let mut builder = ShortPreambleBuilder::new(&[OpRef(20)], &produced, &[OpRef(10)]);
 
         assert!(builder.add_preamble_op(OpRef(20)));
-        assert_eq!(builder.used_boxes(), &[OpRef(30)]);
+        assert_eq!(builder.used_boxes(), &[OpRef(20)]);
         let sp = builder.build_short_preamble_struct();
-        assert_eq!(sp.used_boxes, vec![OpRef(30)]);
+        assert_eq!(sp.used_boxes, vec![OpRef(20)]);
         assert_eq!(sp.jump_args, vec![OpRef(30)]);
     }
 
