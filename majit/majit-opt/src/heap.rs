@@ -188,60 +188,30 @@ impl OptHeap {
     /// Emit a lazy setfield after resolving forwarding and forcing a virtual
     /// rhs if needed.
     ///
-    /// RPython heap.py: force_lazy_set() invalidates cache and then
-    /// emit_extra(op, emit=False); it does not suppress "undefined" rhs boxes.
-    /// The earlier majit check for "defined SSA value" diverged from that and
-    /// dropped real writes during forcing.
+    /// RPython heap.py: force_lazy_set → emit_extra(op, emit=False).
     ///
-    /// OptHeap is the last pass in the current pipeline, so once we have
-    /// recursively forced any virtual rhs we can flush queued extra ops
-    /// directly into the final output before emitting the lazy set itself.
-    /// RPython heap.py:136: force_lazy_set → emit_extra(op, emit=False).
-    /// emit_extra routes through all passes, which calls force_box on
-    /// virtual args (optimizer.py:624). In majit, we force directly
-    /// via force_to_ops before emitting.
-    /// RPython heap.py:136: force_lazy_set → emit_extra(op, emit=False).
-    /// `allow_force`: true for call-triggered force (safe — guards follow),
-    /// false for JUMP/flush force (unsafe — may create guardless loops).
-    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, allow_force: bool) -> bool {
-        let orig_val = op.arg(1);
+    /// RPython parity: if the RHS value is virtual, do NOT emit the SetfieldGc.
+    /// Instead, add it to pendingfields for the guard's resume data
+    /// (heap.py:618-620). The virtual will be materialized at guard failure
+    /// time via rd_virtuals, and the pending setfield replayed after.
+    ///
+    /// `allow_force`: true for call-triggered force, false for JUMP/flush.
+    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, _allow_force: bool) -> bool {
+        let orig_val = ctx.get_replacement(op.arg(1));
 
-        // Check if value is virtual BEFORE forwarding resolution.
-        if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
+        // RPython heap.py:618-620: if value is virtual, do NOT emit.
+        // The virtual stays virtual — guard failure materializes it via
+        // rd_virtuals. Emitting a SetfieldGc with a virtual RHS would
+        // cause the compiled code to write an un-materialized pointer.
+        if let Some(info) = ctx.get_ptr_info(orig_val) {
             if info.is_virtual() {
-                if allow_force {
-                    // RPython info.py:148: force_box → emit New + SetfieldGc.
-                    // Safe here because this is call-triggered — the trace
-                    // continues after this with guards that provide loop exit.
-                    let forced = info.force_to_ops(orig_val, ctx);
-                    op.args[1] = forced;
-                    for arg in op.args.iter_mut() {
-                        *arg = ctx.get_replacement(*arg);
-                    }
-                    ctx.emit(op.clone());
-                    return true;
-                } else {
-                    // JUMP/flush path: skip to avoid guardless infinite loops.
-                    // majit lacks RPython's interrupt mechanism.
-                    return false;
-                }
+                return false; // skip — virtual handled by guard resume data
             }
         }
 
         // Non-virtual path: resolve forwarding and emit
         for arg in op.args.iter_mut() {
             *arg = ctx.get_replacement(*arg);
-        }
-        let val = op.arg(1);
-
-        // Skip if forwarding resolved to an undefined position
-        if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000 {
-            let defined = ctx.new_operations.iter().any(|o| {
-                o.pos == val && o.opcode.result_type() != Type::Void
-            });
-            if !defined {
-                return false;
-            }
         }
         ctx.emit(op.clone());
         true
@@ -625,12 +595,12 @@ impl OptHeap {
         if let Some(descr) = &op.descr {
             if descr.is_always_pure() {
                 let obj_ref = op.arg(0);
-                if let Some(ptr_val) = ctx.get_constant_int(obj_ref) {
-                    if ptr_val != 0 {
+                if let Some(majit_ir::Value::Ref(ptr_val)) = ctx.get_constant(obj_ref).cloned() {
+                    if !ptr_val.is_null() {
                         if let Some((offset, field_size, _field_type)) =
                             majit_ir::unpack_fielddescr(descr)
                         {
-                            let addr = ptr_val as usize + offset;
+                            let addr = ptr_val.0 + offset;
                             let folded = match field_size {
                                 8 => Some(unsafe { *(addr as *const i64) }),
                                 4 => Some(unsafe { *(addr as *const i32) as i64 }),
@@ -1517,11 +1487,15 @@ mod tests {
     }
 
     /// Run a single OptHeap pass over the given ops.
+    ///
+    /// Uses num_inputs=1024 so that high-numbered OpRef values used as
+    /// input arguments in tests (e.g. OpRef(100), OpRef(500)) are treated
+    /// as valid defined positions by the optimizer's undefined-ref filter.
     fn run_heap_opt(ops: &mut [Op]) -> Vec<Op> {
         assign_positions(ops);
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptHeap::new()));
-        opt.optimize(ops)
+        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     // ── Test 1: SETFIELD then GETFIELD → read from cache ──
@@ -2178,11 +2152,19 @@ mod tests {
         pass.cached_field_descrs.insert(key, descr);
 
         let mut sb = crate::shortpreamble::ShortBoxes::with_label_args(&[OpRef(100), OpRef(101)]);
+        // Register input args so produce_arg can resolve them.
+        sb.add_short_input_arg(OpRef(100));
+        sb.add_short_input_arg(OpRef(101));
         pass.produce_potential_short_preamble_ops(&mut sb);
         let produced = sb.produced_ops();
 
-        assert_eq!(produced.len(), 1);
-        assert_eq!(produced[0].1.preamble_op.opcode, OpCode::GetfieldGcR);
+        // Filter to heap-produced ops (exclude SameAsI from add_short_input_arg).
+        let heap_ops: Vec<_> = produced
+            .iter()
+            .filter(|(_, p)| p.preamble_op.opcode != OpCode::SameAsI)
+            .collect();
+        assert_eq!(heap_ops.len(), 1);
+        assert_eq!(heap_ops[0].1.preamble_op.opcode, OpCode::GetfieldGcR);
     }
 
     // ── Test 22: Immutable field survives multiple calls ──
@@ -3815,7 +3797,11 @@ mod tests {
         assign_positions(&mut ops);
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptHeap::new()));
-        let result = opt.optimize(&ops);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
         let len_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::ArraylenGc)
