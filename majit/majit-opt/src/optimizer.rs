@@ -1391,10 +1391,10 @@ impl Optimizer {
         ctx.new_operations
             .retain(|op| !Self::is_constant_placeholder_op(op, &ctx.constants));
 
-        // RPython parity: _emit_operation calls force_box on every arg,
-        // ensuring no dangling virtual OpRefs. Drop ops whose args reference
-        // undefined OpRefs (un-forced virtual remnants). Guard failure uses
-        // rd_virtuals/ExitRecoveryLayout to materialize these at runtime.
+        // Drop ops whose args reference undefined OpRefs (un-forced virtual
+        // remnants). Include imported OpRefs (from import_state forwarding and
+        // short preamble) in the defined set — RPython doesn't have this
+        // cleanup at all, but we keep it to catch genuinely dangling refs.
         {
             let defined: std::collections::HashSet<u32> = {
                 let mut s: std::collections::HashSet<u32> = (0..self.final_num_inputs as u32).collect();
@@ -1406,6 +1406,13 @@ impl Optimizer {
                 for (k, val) in ctx.constants.iter().enumerate() {
                     if val.is_some() {
                         s.insert(k as u32);
+                    }
+                }
+                // Include all OpRefs reachable via forwarding (import_state
+                // maps original input args to preamble OpRefs through forwarding).
+                for (i, &fwd) in ctx.forwarding.iter().enumerate() {
+                    if !fwd.is_none() && fwd != OpRef(i as u32) {
+                        s.insert(fwd.0);
                     }
                 }
                 s
@@ -1459,11 +1466,15 @@ impl Optimizer {
                 for (k, val) in ctx.constants.iter().enumerate() {
                     if val.is_some() { s.insert(k as u32); }
                 }
+                for (i, &fwd) in ctx.forwarding.iter().enumerate() {
+                    if !fwd.is_none() && fwd != OpRef(i as u32) {
+                        s.insert(fwd.0);
+                    }
+                }
                 s
             };
             ctx.new_operations.retain(|op| {
-                let keep = op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0));
-                keep
+                op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0))
             });
         }
 
@@ -1661,57 +1672,13 @@ impl Optimizer {
             self.drain_extra_operations_from(pass_idx + 1, ctx);
             match result {
                 OptimizationResult::Emit(op) => {
-                    if std::env::var_os("MAJIT_LOG").is_some()
-                        && matches!(
-                            current_op.opcode,
-                            OpCode::CallMayForceI
-                                | OpCode::CallMayForceR
-                                | OpCode::CallMayForceF
-                                | OpCode::CallMayForceN
-                        )
-                        && current_op.opcode != op.opcode
-                    {
-                        eprintln!(
-                            "[opt-pass] {} emitted {:?} -> {:?} pos={:?}",
-                            pass_name, current_op.opcode, op.opcode, current_op.pos
-                        );
-                    }
                     self.emit_with_guard_check(op, ctx);
                     return;
                 }
                 OptimizationResult::Replace(op) => {
-                    if std::env::var_os("MAJIT_LOG").is_some()
-                        && matches!(
-                            current_op.opcode,
-                            OpCode::CallMayForceI
-                                | OpCode::CallMayForceR
-                                | OpCode::CallMayForceF
-                                | OpCode::CallMayForceN
-                        )
-                        && current_op.opcode != op.opcode
-                    {
-                        eprintln!(
-                            "[opt-pass] {} replaced {:?} -> {:?} pos={:?}",
-                            pass_name, current_op.opcode, op.opcode, current_op.pos
-                        );
-                    }
                     current_op = op;
                 }
                 OptimizationResult::Remove => {
-                    if std::env::var_os("MAJIT_LOG").is_some()
-                        && matches!(
-                            current_op.opcode,
-                            OpCode::CallMayForceI
-                                | OpCode::CallMayForceR
-                                | OpCode::CallMayForceF
-                                | OpCode::CallMayForceN
-                        )
-                    {
-                        eprintln!(
-                            "[opt-pass] {} removed {:?} pos={:?}",
-                            pass_name, current_op.opcode, current_op.pos
-                        );
-                    }
                     return;
                 }
                 OptimizationResult::PassOn => {}
