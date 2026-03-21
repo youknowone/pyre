@@ -1166,14 +1166,44 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
+        if crate::majit_log_enabled() {
+            eprintln!("[jit][run-compiled] stage=meta key={}", green_key);
+        }
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
+        if crate::majit_log_enabled() {
+            eprintln!("[jit][run-compiled] stage=descriptor key={}", green_key);
+        }
+        let compatible = state.is_compatible(&meta);
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit][run-compiled] stage=is_compatible key={} ok={}",
+                green_key, compatible
+            );
+        }
+        let synced = compatible && self.sync_before(state, &meta, descriptor.as_ref());
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit][run-compiled] stage=sync_before key={} ok={}",
+                green_key, synced
+            );
+        }
+        if !synced {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         }
+        if crate::majit_log_enabled() {
+            eprintln!("[jit][run-compiled] stage=extract_live_values key={}", green_key);
+        }
         let live_values = state.extract_live_values(&meta);
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit][run-compiled] stage=extracted key={} len={}",
+                green_key,
+                live_values.len()
+            );
+        }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
