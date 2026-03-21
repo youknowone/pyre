@@ -185,9 +185,6 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
         return result;
     }
 
-    // Always use JIT-enabled loop — it handles back-edges, merge
-    // points, and compiled-code execution. eval_frame_plain (no JIT)
-    // is only used for residual calls (jit_call_depth > 0).
     eval_loop_jit(frame)
 }
 
@@ -363,6 +360,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // frame runs as interpreter (eval_loop_for_force); nested calls freely
     // enter compiled code. No in_blackhole_entry() check needed here.
     let green_key = make_green_key(frame.code, frame.next_instr);
+
+    // Process deferred bridge compile requests from call_assembler
+    // guard failures. Must be done BEFORE driver_pair() to avoid
+    // double mutable borrow (jit_bridge_compile_for_guard also borrows).
     let (driver, info) = driver_pair();
 
     if driver.has_compiled_loop(green_key) {

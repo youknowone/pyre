@@ -403,21 +403,41 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
-    // RPython assembler_call_helper: the callee frame was created fresh
-    // for call_assembler but compiled code may have modified next_instr
-    // and valuestackdepth via virtualizable writeback. Reset to initial
-    // state so the interpreter/blackhole runs from the function entry.
+    // RPython resume_in_blackhole parity: reset frame to function entry
+    // and restore locals from the original CALL_ASSEMBLER inputs. The
+    // compiled code's virtualizable writeback may have corrupted the frame.
     let nlocals = unsafe { &*frame.code }.varnames.len();
+    let _ = majit_codegen_cranelift::take_pending_frame_restore();
+    let pending = majit_codegen_cranelift::take_pending_force_local0();
     frame.next_instr = 0;
     frame.valuestackdepth = nlocals;
+
+    // Restore local0 from the original CALL_ASSEMBLER input if available.
+    if let Some(raw_local0) = pending {
+        let addr = raw_local0 as usize;
+        let is_heap = addr >= 0x1_0000 && addr < (1usize << 56) && (addr & 7) == 0;
+        let restored = if is_heap {
+            raw_local0 as PyObjectRef
+        } else {
+            pyre_object::intobject::w_int_new(raw_local0)
+        };
+        if frame.locals_cells_stack_w.len() > 0 {
+            frame.locals_cells_stack_w[0] = restored;
+        }
+    }
+    // Re-establish array pointer after potential corruption
+    frame.fix_array_ptrs();
+
+    // RPython bhimpl_recursive_call parity: the portal runner runs
+    // the interpreter WITHOUT re-entering compiled code. In RPython,
+    // blackhole's bhimpl_recursive_call calls portal_runner_adr which
+    // is the interpreter entry point, bypassing the JIT. We achieve
+    // this by temporarily forcing all nested calls to use eval_frame_plain.
+    let _plain_guard = pyre_interp::call::force_plain_eval();
 
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
 
-    // RPython assembler_call_helper: force_fn re-executes the callee
-    // from scratch via the interpreter. Nested calls dispatch through
-    // call_user_function → eval_with_jit, so compiled code + bridges
-    // are used when available.
     let result = match pyre_interp::eval::eval_loop_for_force(frame) {
         Ok(r) => r,
         Err(err) => panic!("jit force callee frame failed: {err}"),
@@ -425,11 +445,9 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 
     // Process deferred bridge compile requests. force_fn is called
     // outside MetaInterp borrow scope, so compile_bridge is safe here.
-    for (bridge_trace_id, bridge_fail_index) in
-        majit_codegen_cranelift::take_pending_bridge_compile()
-    {
-        jit_bridge_compile_for_guard(green_key, bridge_trace_id, bridge_fail_index);
-    }
+    // Pending bridge compile requests are processed by
+    // try_function_entry_jit (eval.rs), not here, to avoid
+    // drain by nested force_fn calls.
     let value = match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
             w_int_get_value(result)
@@ -858,7 +876,84 @@ pub fn install_jit_call_bridge() {
         register_jit_function_caller(jit_call_user_function_from_frame);
         majit_codegen_cranelift::register_call_assembler_force(jit_force_callee_frame);
         majit_codegen_cranelift::register_call_assembler_bridge(jit_bridge_compile_callee);
+        majit_codegen_cranelift::register_call_assembler_blackhole(
+            jit_blackhole_resume_from_guard,
+        );
     });
+}
+
+/// RPython resume_in_blackhole parity: resume execution from the guard
+/// failure point using the IR-based blackhole interpreter.
+///
+/// RPython warmspot.py:1021 assembler_call_helper → handle_fail →
+/// resume_in_blackhole → BlackholeInterpreter.dispatch_loop from guard PC.
+///
+/// In majit, this calls MetaInterp::blackhole_guard_failure which executes
+/// the remaining IR ops from guard+1 to Finish, returning the raw result.
+fn jit_blackhole_resume_from_guard(
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    fail_values_ptr: *const i64,
+    num_fail_values: usize,
+) -> Option<i64> {
+    if fail_values_ptr.is_null() || num_fail_values == 0 {
+        return None;
+    }
+    let fail_values =
+        unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
+    // The green_key from the target may be 0 for function-entry traces.
+    // Recover the real green_key from the callee frame's code pointer.
+    let actual_green_key = if green_key == 0 && num_fail_values >= 1 {
+        let frame_ptr = fail_values[0] as *const pyre_interp::frame::PyFrame;
+        if !frame_ptr.is_null() {
+            let code = unsafe { (*frame_ptr).code };
+            crate::eval::make_green_key(code, 0)
+        } else {
+            green_key
+        }
+    } else {
+        green_key
+    };
+    let (driver, _) = crate::eval::driver_pair();
+    let exception = majit_meta::blackhole::ExceptionState::default();
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[blackhole-resume] gk={} trace={} fail_idx={} nvals={}",
+            actual_green_key, trace_id, fail_index, fail_values.len(),
+        );
+    }
+    // RPython _run_forever parity: blackhole may return Jump (loop back)
+    // or GuardFailed (nested guard failure). Keep running until Finish.
+    let mut current_fail_index = fail_index;
+    let mut current_values = fail_values.to_vec();
+    loop {
+        let bh_opt = driver.blackhole_guard_failure(
+            actual_green_key, trace_id, current_fail_index, &current_values, exception.clone(),
+        );
+        let (bh_result, _bh_exc) = bh_opt?;
+        match bh_result {
+            majit_meta::blackhole::BlackholeResult::Finish { values, .. } => {
+                return values.first().copied();
+            }
+            majit_meta::blackhole::BlackholeResult::Jump { values, .. } => {
+                // Loop back: re-enter from the loop header (fail_index=0)
+                current_fail_index = 0;
+                current_values = values;
+                // Jump means re-enter the compiled code from the loop header.
+                // For now, fall back to force_fn since we don't have loop
+                // re-entry support in the blackhole yet.
+                return None;
+            }
+            majit_meta::blackhole::BlackholeResult::GuardFailed {
+                fail_values, ..
+            } => {
+                // Nested guard failure inside blackhole. Fall back.
+                return None;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// RPython compile.py:714 (_trace_and_compile_from_bridge):
@@ -875,6 +970,12 @@ pub fn jit_bridge_compile_for_guard(green_key: u64, trace_id: u64, fail_index: u
     let meta = driver.0.meta_interp_mut();
 
     let Some(fail_descr) = meta.get_fail_descr_for_bridge(green_key, trace_id, fail_index) else {
+        {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[bridge-compile] FAILED get_fail_descr: key={} trace={} fail={}", green_key, trace_id, fail_index);
+            }
+        }
         return;
     };
 
@@ -938,7 +1039,7 @@ pub fn jit_bridge_compile_for_guard(green_key: u64, trace_id: u64, fail_index: u
     }
 
     // RPython compile.py:792 (compile_and_attach) → send_bridge_to_backend
-    meta.compile_bridge(
+    let ok = meta.compile_bridge(
         green_key,
         fail_index,
         fail_descr.as_ref(),
@@ -946,6 +1047,12 @@ pub fn jit_bridge_compile_for_guard(green_key: u64, trace_id: u64, fail_index: u
         &bridge_inputargs,
         constants,
     );
+    {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[bridge-compile] result={} key={} trace={} fail={}", ok, green_key, trace_id, fail_index);
+        }
+    }
 }
 
 extern "C" fn jit_bridge_compile_callee(

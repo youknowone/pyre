@@ -67,6 +67,28 @@ pub fn register_eval_override(f: EvalFn) {
     let _ = EVAL_OVERRIDE.set(f);
 }
 
+thread_local! {
+    static FORCE_PLAIN_EVAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard that temporarily forces all nested calls to use the plain
+/// interpreter, bypassing eval_with_jit. Used by force_fn to avoid
+/// re-entering compiled code from blackhole execution.
+pub struct ForcePlainEvalGuard;
+
+impl Drop for ForcePlainEvalGuard {
+    fn drop(&mut self) {
+        let _ = FORCE_PLAIN_EVAL.try_with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Enter "force plain eval" mode. While active, `call_user_function` uses
+/// `eval_frame_plain` instead of the JIT-aware eval override.
+pub fn force_plain_eval() -> ForcePlainEvalGuard {
+    FORCE_PLAIN_EVAL.with(|c| c.set(c.get() + 1));
+    ForcePlainEvalGuard
+}
+
 /// Register the JIT call-depth bump function. Called by pyre-jit at startup.
 pub fn register_depth_bump(f: DepthBumpFn) {
     let _ = DEPTH_BUMP_OVERRIDE.set(f);
@@ -184,7 +206,12 @@ pub fn call_user_function(
     }
 
     let _guard = DEPTH_BUMP_OVERRIDE.get().and_then(|f| f());
-    let eval_fn = EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain);
+    let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
+    let eval_fn = if plain_mode {
+        eval_frame_plain
+    } else {
+        EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain)
+    };
     call_user_function_with_eval(frame, callable, args, eval_fn)
 }
 

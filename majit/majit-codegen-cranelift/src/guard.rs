@@ -94,6 +94,8 @@ pub struct CraneliftFailDescr {
     pub fail_count: AtomicU32,
     /// Compiled bridge attached to this guard, if any.
     pub bridge: Mutex<Option<BridgeData>>,
+    /// Atomic cache of bridge code_ptr for lock-free dispatch.
+    pub bridge_code_ptr_cache: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for CraneliftFailDescr {
@@ -189,6 +191,7 @@ impl CraneliftFailDescr {
             recovery_layout: Mutex::new(recovery_layout),
             fail_count: AtomicU32::new(0),
             bridge: Mutex::new(None),
+            bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -204,12 +207,19 @@ impl CraneliftFailDescr {
 
     /// Whether a bridge has been attached to this guard.
     pub fn has_bridge(&self) -> bool {
-        self.bridge.lock().unwrap().is_some()
+        self.bridge_code_ptr_cache.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Get bridge code_ptr without Mutex lock (atomic read).
+    pub fn bridge_code_ptr(&self) -> *const u8 {
+        self.bridge_code_ptr_cache.load(std::sync::atomic::Ordering::Relaxed) as *const u8
     }
 
     /// Attach a compiled bridge to this guard.
     pub fn attach_bridge(&self, bridge: BridgeData) {
+        let code_ptr = bridge.code_ptr as usize;
         *self.bridge.lock().unwrap() = Some(bridge);
+        self.bridge_code_ptr_cache.store(code_ptr, std::sync::atomic::Ordering::Release);
     }
 
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {

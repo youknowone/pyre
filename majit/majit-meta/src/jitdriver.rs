@@ -227,6 +227,19 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_compiled_num_inputs(green_key)
     }
 
+    /// RPython resume_in_blackhole parity: resume execution from the guard
+    /// failure point using the IR-based blackhole interpreter.
+    pub fn blackhole_guard_failure(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+        exception: crate::blackhole::ExceptionState,
+    ) -> Option<(crate::blackhole::BlackholeResult, crate::blackhole::ExceptionState)> {
+        self.meta.blackhole_guard_failure(green_key, trace_id, fail_index, fail_values, exception)
+    }
+
     /// Register an interpreter boxing helper for the raw-int finish protocol.
     pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
         self.meta.register_raw_int_box_helper(helper);
