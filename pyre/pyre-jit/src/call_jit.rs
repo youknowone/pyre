@@ -279,23 +279,12 @@ thread_local! {
 
 #[inline]
 fn force_cache_lookup(
-    protocol: FinishProtocol,
-    hash_idx: usize,
-    code_key: usize,
-    arg_key: usize,
+    _protocol: FinishProtocol,
+    _hash_idx: usize,
+    _code_key: usize,
+    _arg_key: usize,
 ) -> Option<i64> {
-    if !matches!(protocol, FinishProtocol::RawInt) {
-        return None;
-    }
-    FORCE_CACHE.with(|cell| {
-        let cache = unsafe { &*cell.get() };
-        let entry = &cache[hash_idx];
-        if entry.valid && entry.code_key == code_key && entry.arg_key == arg_key {
-            Some(entry.value)
-        } else {
-            None
-        }
-    })
+    None // disabled for bridge testing
 }
 
 #[inline]
@@ -478,6 +467,14 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         Ok(r) => r,
         Err(err) => panic!("jit force callee frame failed: {err}"),
     };
+
+    // Process deferred bridge compile requests. force_fn is called
+    // outside MetaInterp borrow scope, so compile_bridge is safe here.
+    for (bridge_trace_id, bridge_fail_index) in
+        majit_codegen_cranelift::take_pending_bridge_compile()
+    {
+        jit_bridge_compile_for_guard(green_key, bridge_trace_id, bridge_fail_index);
+    }
     let value = match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
             w_int_get_value(result)
