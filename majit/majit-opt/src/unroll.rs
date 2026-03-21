@@ -258,6 +258,14 @@ impl UnrollOptimizer {
             .expect("phase 2 missing import_state label_args");
 
         if std::env::var_os("MAJIT_LOG").is_some() {
+            for op in &p2_ops {
+                if op.opcode.is_guard() {
+                    if let Some(ref fa) = op.fail_args {
+                        let fa_raw: Vec<String> = fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
+                        eprintln!("[jit] p2 guard {:?} fail_args_raw=[{}]", op.opcode, fa_raw.join(", "));
+                    }
+                }
+            }
             let nc = p2_ops
                 .iter()
                 .filter(|o| o.opcode == OpCode::New || o.opcode == OpCode::NewWithVtable)
