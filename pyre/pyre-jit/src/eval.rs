@@ -591,6 +591,13 @@ fn restore_guard_failure_for_loop(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) -> Option<usize> {
+    // RPython parity note: virtualizable slots should always be GCREF in
+    // the output buffer. But the optimizer may replace virtual Ref values
+    // with their Int field values (via force_guard_fail_args). This means
+    // raw_values at virtualizable positions may contain raw ints, not
+    // PyObjectRef pointers. We must use exit_layout types to correctly
+    // re-box them. The fix must be at the optimizer level (don't expand
+    // virtualizable-slot virtuals, or expand them as Ref).
     let typed = decode_exit_layout_values(raw_values, exit_layout);
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     restored.then_some(jit_state.next_instr)

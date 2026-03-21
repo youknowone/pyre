@@ -4754,6 +4754,40 @@ impl OpcodeStepExecutor for TraceFrameState {
 }
 
 impl PyreJitState {
+    /// RPython resume.py parity: restore virtualizable frame state directly
+    /// from raw output buffer values, bypassing exit_layout type decoding.
+    ///
+    /// The optimizer may type virtualizable slots as Int (after unboxing),
+    /// but the raw values in the output buffer are always the actual Python
+    /// objects (PyObjectRef pointers). RPython uses FieldDescr at decode time
+    /// to determine types; pyre uses the virtualizable layout to know that
+    /// all array slots (locals + stack) are always Ref (GCREF).
+    pub fn restore_virtualizable_from_raw(&mut self, raw_values: &[i64]) -> bool {
+        if raw_values.is_empty() {
+            return false;
+        }
+        self.frame = raw_values[0] as usize;
+        self.next_instr = raw_values.get(1).copied().unwrap_or(0) as usize;
+        self.valuestackdepth = raw_values.get(2).copied().unwrap_or(0) as usize;
+
+        let nlocals = self.local_count();
+        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        let mut idx = 3;
+        for local_idx in 0..nlocals {
+            if let Some(&raw) = raw_values.get(idx) {
+                let _ = self.set_local_at(local_idx, raw as PyObjectRef);
+            }
+            idx += 1;
+        }
+        for stack_idx in 0..stack_only {
+            if let Some(&raw) = raw_values.get(idx) {
+                let _ = self.set_stack_at(stack_idx, raw as PyObjectRef);
+            }
+            idx += 1;
+        }
+        self.sync_scalar_fields_to_frame()
+    }
+
     /// Returns true if the optimizer virtualizable mechanism is active.
     fn has_virtualizable_info(&self) -> bool {
         // pyre always uses virtualizable (JitDriverStaticData::with_virtualizable)
