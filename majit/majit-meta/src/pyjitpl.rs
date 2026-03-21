@@ -118,6 +118,62 @@ impl StoredExitLayout {
     }
 }
 
+fn normalize_root_loop_entry_contract(
+    mut inputargs: Vec<InputArg>,
+    mut optimized_ops: Vec<Op>,
+) -> Result<(Vec<InputArg>, Vec<Op>), (usize, usize)> {
+    let last_jump = optimized_ops
+        .iter()
+        .rev()
+        .find(|op| op.opcode == OpCode::Jump);
+    let jump_arg_count = last_jump.map(|op| op.args.len()).unwrap_or(0);
+    let label_op = optimized_ops
+        .iter()
+        .rev()
+        .find(|op| op.opcode == OpCode::Label);
+    let label_arg_count = label_op.map(|op| op.args.len()).unwrap_or(0);
+    let label_descr_index = label_op
+        .and_then(|op| op.descr.as_ref())
+        .map(|descr| descr.index());
+    let jump_targets_current_loop = last_jump.is_some_and(|op| {
+        let jump_descr_index = op.descr.as_ref().map(|descr| descr.index());
+        match (jump_descr_index, label_descr_index) {
+            (Some(jump_idx), Some(label_idx)) => jump_idx == label_idx,
+            (None, None) => true,
+            _ => false,
+        }
+    });
+
+    if label_arg_count == 0 && jump_arg_count > 0 {
+        if inputargs.len() > jump_arg_count {
+            inputargs.truncate(jump_arg_count);
+        }
+        while inputargs.len() < jump_arg_count {
+            inputargs.push(InputArg::from_type(Type::Int, inputargs.len() as u32));
+        }
+        let label_args: Vec<OpRef> = (0..inputargs.len() as u32).map(OpRef).collect();
+        let mut label_op = Op::new(OpCode::Label, &label_args);
+        label_op.pos = OpRef::NONE;
+        optimized_ops.insert(0, label_op);
+    } else if jump_targets_current_loop && label_arg_count != jump_arg_count {
+        return Err((label_arg_count, jump_arg_count));
+    }
+
+    Ok((inputargs, optimized_ops))
+}
+
+fn root_loop_inputargs_from_optimizer(
+    trace_inputargs: &[InputArg],
+    final_num_inputs: usize,
+) -> Vec<InputArg> {
+    let mut inputargs = trace_inputargs.to_vec();
+    inputargs.truncate(final_num_inputs);
+    while inputargs.len() < final_num_inputs {
+        inputargs.push(InputArg::from_type(Type::Int, inputargs.len() as u32));
+    }
+    inputargs
+}
+
 pub(crate) struct CompiledEntry<M> {
     pub(crate) token: JitCellToken,
     pub(crate) num_inputs: usize,
@@ -187,6 +243,10 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) create_frame_raw_map: HashMap<i64, i64>,
     /// PyPy warmspot.py max_unroll_recursion (default 7).
     pub(crate) max_unroll_recursion: usize,
+    /// RPython parity: `prepare_trace_segmenting()` marks the next tracing run
+    /// for a green key so the loop should finish early instead of repeatedly
+    /// aborting once it nears the trace limit.
+    pub(crate) force_finish_trace: bool,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -474,6 +534,7 @@ impl<M: Clone> MetaInterp<M> {
             raw_int_force_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
+            force_finish_trace: false,
         }
     }
 
@@ -681,6 +742,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 }
                 self.forced_virtualizable = None;
+                self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
                 self.tracing = Some(ctx);
                 let pending_num = self.warm_state.alloc_token_number();
                 self.pending_token = Some((green_key, pending_num));
@@ -756,6 +818,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
 
                 self.forced_virtualizable = None;
+                self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
                 self.tracing = Some(ctx);
                 // Pre-allocate a token number for this trace so that
                 // self-recursive calls can emit call_assembler targeting
@@ -1187,6 +1250,19 @@ impl<M: Clone> MetaInterp<M> {
         let green_key = ctx.green_key;
 
         let mut recorder = ctx.recorder;
+        // RPython heapcache.py:176: every trace gets at least one
+        // GUARD_NOT_INVALIDATED. This allows external invalidation
+        // (via JitCellToken.invalidate()) to force compiled loops
+        // back to the interpreter.
+        // RPython heapcache.py:176: every trace gets at least one
+        // GUARD_NOT_INVALIDATED before the closing JUMP. fail_args = jump_args
+        // so guard failure restores the same state as the JUMP target.
+        {
+            let descr = crate::fail_descr::make_fail_descr(jump_args.len());
+            recorder.record_guard_with_fail_args(
+                OpCode::GuardNotInvalidated, &[], descr, jump_args,
+            );
+        }
         recorder.close_loop(jump_args);
         let trace = recorder.get_trace();
 
@@ -1245,59 +1321,23 @@ impl<M: Clone> MetaInterp<M> {
         };
         let num_ops_after = optimized_ops.len();
 
-        // RPython compile.py compiles the root loop with the original trace
-        // inputargs. Extra boxes introduced by peeling live at the loop
-        // LABEL/JUMP boundary, not at the external entry point.
-        let mut inputargs = trace.inputargs.clone();
-        let last_jump = optimized_ops
-            .iter()
-            .rev()
-            .find(|op| op.opcode == majit_ir::OpCode::Jump);
-        let jump_arg_count = last_jump.map(|op| op.args.len()).unwrap_or(0);
-        let label_op = optimized_ops
-            .iter()
-            .rev()
-            .find(|op| op.opcode == majit_ir::OpCode::Label);
-        let label_arg_count = label_op.map(|op| op.args.len()).unwrap_or(0);
-        let label_descr_index = label_op
-            .and_then(|op| op.descr.as_ref())
-            .map(|descr| descr.index());
-        let jump_targets_current_loop = last_jump.is_some_and(|op| {
-            let jump_descr_index = op.descr.as_ref().map(|descr| descr.index());
-            match (jump_descr_index, label_descr_index) {
-                (Some(jump_idx), Some(label_idx)) => jump_idx == label_idx,
-                (None, None) => true,
-                _ => false,
-            }
-        });
-        // When preamble peeling is not active, there's no Label op.
-        // In that case, inputargs serve as the loop entry contract.
-        // Extend Label or insert one to match Jump arity.
-        let mut optimized_ops = optimized_ops;
-        if label_arg_count == 0 && jump_arg_count > 0 {
-            // No Label — insert one at the beginning with Jump-matching args
-            let label_args: Vec<OpRef> = (0..jump_arg_count as u32).map(OpRef).collect();
-            let mut label_op =
-                majit_ir::resoperation::Op::new(majit_ir::OpCode::Label, &label_args);
-            label_op.pos = OpRef::NONE;
-            optimized_ops.insert(0, label_op);
-            // Extend inputargs to match
-            while inputargs.len() < jump_arg_count {
-                inputargs.push(majit_ir::InputArg {
-                    tp: majit_ir::Type::Int,
-                    index: inputargs.len() as u32,
-                });
-            }
-        } else if jump_targets_current_loop && label_arg_count != jump_arg_count {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] abort compile: optimized label/jump arity mismatch label={} jump={}",
-                    label_arg_count, jump_arg_count,
-                );
-            }
-            return;
-        }
-        let optimized_ops = optimized_ops;
+        // RPython compile.py keeps the root entry contract on the original
+        // loop inputargs. Simple loops synthesize a LABEL from that contract;
+        // they do not grow inputargs to match a rewritten JUMP arity.
+        let root_inputargs = root_loop_inputargs_from_optimizer(&trace.inputargs, final_num_inputs);
+        let (inputargs, optimized_ops) =
+            match normalize_root_loop_entry_contract(root_inputargs, optimized_ops) {
+                Ok(normalized) => normalized,
+                Err((expected, actual)) => {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] abort compile: root loop entry/jump arity mismatch input={} jump={}",
+                            expected, actual,
+                        );
+                    }
+                    return;
+                }
+            };
 
         // RPython virtualizable parity: standard virtualizable fields and
         // arrays stay in the trace as first-class virtualizable boxes.
@@ -1392,7 +1432,7 @@ impl<M: Clone> MetaInterp<M> {
                     &mut resume_data,
                     &mut exit_layouts,
                     trace_id,
-                    &trace.inputargs,
+                    &inputargs,
                     trace_info.as_ref(),
                 );
                 compile::patch_backend_guard_recovery_layouts_for_trace(
@@ -1411,7 +1451,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: trace.inputargs.clone(),
+                        inputargs: inputargs.clone(),
                         resume_data,
                         ops: optimized_ops,
                         constants: compiled_constants,
@@ -1556,6 +1596,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             optimized_ops
         };
+        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         if crate::majit_log_enabled() {
             eprintln!("--- finish trace (after unbox) ---");
@@ -2581,7 +2622,9 @@ impl<M: Clone> MetaInterp<M> {
     /// Check whether a compiled loop exists for a given green key.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
-        self.compiled_loops.contains_key(&green_key)
+        self.compiled_loops
+            .get(&green_key)
+            .map_or(false, |c| !c.token.is_invalidated())
     }
 
     /// Whether the compiled Finish for this green_key returns a raw int.
@@ -2797,6 +2840,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             optimized_ops
         };
+        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
@@ -2951,6 +2995,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let recorder = self.warm_state.start_retrace(&fail_descr.fail_arg_types);
         self.forced_virtualizable = None;
+        self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
 
         if let Some(ref hook) = self.hooks.on_trace_start {
@@ -4044,6 +4089,53 @@ mod tests {
         let mut op = Op::with_descr(opcode, args, descr);
         op.pos = OpRef(pos);
         op
+    }
+
+    #[test]
+    fn test_normalize_root_loop_entry_contract_inserts_label_from_inputargs() {
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1), InputArg::new_int(2)];
+        let ops = vec![
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 3),
+            mk_op(OpCode::Jump, &[OpRef(3), OpRef(2), OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let (normalized_inputargs, normalized_ops) =
+            normalize_root_loop_entry_contract(inputargs.clone(), ops).expect("should normalize");
+
+        assert_eq!(normalized_inputargs.len(), inputargs.len());
+        assert_eq!(normalized_ops[0].opcode, OpCode::Label);
+        assert_eq!(
+            normalized_ops[0].args.as_slice(),
+            &[OpRef(0), OpRef(1), OpRef(2)],
+            "synthetic root label must follow original inputargs contract"
+        );
+    }
+
+    #[test]
+    fn test_normalize_root_loop_entry_contract_uses_simple_loop_jump_contract() {
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1), InputArg::new_int(2)];
+        let ops = vec![mk_op(OpCode::Jump, &[OpRef(0), OpRef(1)], OpRef::NONE.0)];
+
+        let (normalized_inputargs, normalized_ops) =
+            normalize_root_loop_entry_contract(inputargs, ops).expect("should normalize");
+        assert_eq!(normalized_inputargs.len(), 2);
+        assert_eq!(normalized_ops[0].opcode, OpCode::Label);
+        assert_eq!(normalized_ops[0].args.as_slice(), &[OpRef(0), OpRef(1)]);
+    }
+
+    #[test]
+    fn test_root_loop_inputargs_from_optimizer_truncates_to_optimizer_contract() {
+        let trace_inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_int(1),
+            InputArg::new_ref(2),
+        ];
+
+        let inputargs = root_loop_inputargs_from_optimizer(&trace_inputargs, 2);
+
+        assert_eq!(inputargs.len(), 2);
+        assert_eq!(inputargs[0].tp, Type::Ref);
+        assert_eq!(inputargs[1].tp, Type::Int);
     }
 
     #[derive(Debug)]
@@ -7563,6 +7655,42 @@ mod raw_int_postprocess_tests {
         constants.insert(func_const.0, dummy_box_helper as *const () as i64);
 
         let (ops, changed) = unbox_finish_result(vec![call, finish], &constants, &helpers);
+
+        assert!(changed);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::Finish);
+        assert_eq!(ops[0].args.as_slice(), &[raw]);
+    }
+
+    #[test]
+    fn unbox_finish_result_rewrites_new_setfield_chain_even_if_new_is_last() {
+        let new_op = mk_op_with_descr(
+            OpCode::New,
+            &[],
+            25,
+            majit_ir::descr::make_size_descr(16),
+        );
+        let set_type = mk_op_with_descr(
+            OpCode::SetfieldGc,
+            &[OpRef(25), OpRef(99)],
+            1,
+            make_field_descr(0, 8, Type::Int, false),
+        );
+        let raw = OpRef(13);
+        let set_payload = mk_op_with_descr(
+            OpCode::SetfieldGc,
+            &[OpRef(25), raw],
+            2,
+            make_field_descr(8, 8, Type::Int, true),
+        );
+        let finish = Op::with_descr(
+            OpCode::Finish,
+            &[OpRef(25)],
+            crate::make_fail_descr_typed(vec![Type::Ref]),
+        );
+
+        let (ops, changed) =
+            unbox_finish_result(vec![set_type, set_payload, new_op, finish], &HashMap::new(), &HashSet::new());
 
         assert!(changed);
         assert_eq!(ops.len(), 1);
