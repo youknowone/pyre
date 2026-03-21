@@ -815,6 +815,8 @@ impl VirtualState {
             | VirtualStateInfo::Unknown => {
                 let resolved = ctx.get_replacement(opref);
                 let forced = match ctx.get_ptr_info(resolved) {
+                    // RPython: Virtualizable refs stay virtual across iterations.
+                    Some(PtrInfo::Virtualizable(_)) => resolved,
                     Some(ptr_info) if ptr_info.is_virtual() => {
                         if !force_boxes {
                             return Err(());
