@@ -2145,6 +2145,10 @@ extern "C" fn gc_unregister_roots_shim(runtime_id: u64, roots_ptr: u64, num_root
     });
 }
 
+thread_local! {
+    static DECLARED_VARS_DEBUG: std::cell::RefCell<Option<std::collections::HashSet<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn resolve_opref(
     builder: &mut FunctionBuilder,
     constants: &HashMap<u32, i64>,
@@ -2156,6 +2160,13 @@ fn resolve_opref(
     if opref.is_none() {
         return builder.ins().iconst(cl_types::I64, 0);
     }
+    DECLARED_VARS_DEBUG.with(|cell| {
+        if let Some(ref dv) = *cell.borrow() {
+            if !dv.contains(&opref.0) {
+                eprintln!("[cranelift] UNDECLARED var{} at use_var", opref.0);
+            }
+        }
+    });
     builder.use_var(var(opref.0))
 }
 
@@ -3681,15 +3692,35 @@ impl CraneliftBackend {
         let inputs_ptr = builder.block_params(entry_block)[0];
         let outputs_ptr = builder.block_params(entry_block)[1];
         let roots_ptr = builder.block_params(entry_block)[2];
+        let debug_declares = std::env::var_os("MAJIT_DEBUG_DECLARES").is_some();
 
-        // Declare variables for inputs
-        for i in 0..num_inputs {
-            builder.declare_var(var(i as u32), cl_types::I64);
+        let label_indices: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| (op.opcode == OpCode::Label).then_some(idx))
+            .collect();
+        let has_entry_label = label_indices.first().copied() == Some(0);
+
+        // RPython compile.py sends loops to the backend as:
+        // [start_label] + preamble_ops + [loop_label] + body_ops.
+        // When a trace starts with LABEL, its box namespace is defined by the
+        // LABEL block params, not by a parallel "input var" namespace.
+        // Keep the input buffer as raw incoming values and bind them only when
+        // entering the first LABEL block.
+        if !has_entry_label {
+            for i in 0..num_inputs {
+                if debug_declares {
+                    eprintln!("[jit][declare] input var{}", i);
+                }
+                builder.declare_var(var(i as u32), cl_types::I64);
+            }
         }
         // Declare variables for op results
         let mut declared_vars = std::collections::HashSet::new();
-        for i in 0..num_inputs {
-            declared_vars.insert(i as u32);
+        if !has_entry_label {
+            for i in 0..num_inputs {
+                declared_vars.insert(i as u32);
+            }
         }
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
@@ -3707,6 +3738,9 @@ impl CraneliftBackend {
                 } else {
                     cl_types::I64
                 };
+                if debug_declares {
+                    eprintln!("[jit][declare] op-result var{} opcode={:?}", vi, op.opcode);
+                }
                 builder.declare_var(var(vi as u32), cl_type);
             }
             // Ensure all fail_arg OpRefs are declared as variables.
@@ -3720,6 +3754,12 @@ impl CraneliftBackend {
                         && !constants.contains_key(&arg.0)
                     {
                         declared_vars.insert(arg.0);
+                        if debug_declares {
+                            eprintln!(
+                                "[jit][declare] fail-arg var{} owner={:?}",
+                                arg.0, op.opcode
+                            );
+                        }
                         builder.declare_var(var(arg.0), cl_types::I64);
                     }
                 }
@@ -3739,18 +3779,32 @@ impl CraneliftBackend {
                     continue;
                 }
                 declared_vars.insert(arg.0);
+                if debug_declares {
+                    eprintln!("[jit][declare] label-arg var{}", arg.0);
+                }
                 builder.declare_var(var(arg.0), cl_types::I64);
             }
         }
 
-        // Load inputs from input buffer
-        for i in 0..num_inputs {
-            let offset = (i as i32) * 8;
-            let addr = builder.ins().iadd_imm(inputs_ptr, offset as i64);
-            let val = builder
-                .ins()
-                .load(cl_types::I64, MemFlags::trusted(), addr, 0);
-            builder.def_var(var(i as u32), val);
+        // Debug: save declared_vars snapshot for resolve_opref checking.
+        DECLARED_VARS_DEBUG.with(|cell| {
+            *cell.borrow_mut() = Some(declared_vars.clone());
+        });
+
+        let entry_input_vals: Vec<CValue> = (0..num_inputs)
+            .map(|i| {
+                let offset = (i as i32) * 8;
+                let addr = builder.ins().iadd_imm(inputs_ptr, offset as i64);
+                builder
+                    .ins()
+                    .load(cl_types::I64, MemFlags::trusted(), addr, 0)
+            })
+            .collect();
+
+        if !has_entry_label {
+            for (i, val) in entry_input_vals.iter().copied().enumerate() {
+                builder.def_var(var(i as u32), val);
+            }
         }
 
         // RPython parity: GC roots are registered by run_compiled_code()
@@ -3762,12 +3816,6 @@ impl CraneliftBackend {
         // [start_label] + preamble_ops + [loop_label] + body_ops
         // and JUMPs target LABEL descrs. Model that directly by creating
         // a Cranelift block per LABEL descr.
-        let label_indices: Vec<usize> = ops
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, op)| (op.opcode == OpCode::Label).then_some(idx))
-            .collect();
-
         let loop_param_count = if let Some(&li) = label_indices.last() {
             ops[li].args.len()
         } else {
@@ -3816,11 +3864,15 @@ impl CraneliftBackend {
         let mut last_ovf_flag: Option<CValue> = None;
 
         if let Some(&(entry_label_idx, entry_label_block)) = label_blocks.first() {
-            let vals: Vec<CValue> = ops[entry_label_idx]
-                .args
-                .iter()
-                .map(|&r| resolve_opref(&mut builder, &constants, r))
-                .collect();
+            let vals: Vec<CValue> = if has_entry_label {
+                entry_input_vals.clone()
+            } else {
+                ops[entry_label_idx]
+                    .args
+                    .iter()
+                    .map(|&r| resolve_opref(&mut builder, &constants, r))
+                    .collect()
+            };
             builder.ins().jump(entry_label_block, &vals);
             builder.switch_to_block(entry_label_block);
             for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
@@ -3858,12 +3910,19 @@ impl CraneliftBackend {
                 // The first LABEL is already the current block. Later LABELs
                 // are explicit jump targets inside the same compiled loop.
                 if Some(op_idx) != label_blocks.first().map(|(label_idx, _)| *label_idx) {
-                    let vals: Vec<CValue> = ops[op_idx]
-                        .args
-                        .iter()
-                        .map(|&r| resolve_opref(&mut builder, &constants, r))
-                        .collect();
-                    builder.ins().jump(*label_block, &vals);
+                    let prev_terminated = op_idx
+                        .checked_sub(1)
+                        .and_then(|prev_idx| ops.get(prev_idx))
+                        .map(|prev| prev.opcode == OpCode::Jump || prev.opcode == OpCode::Finish)
+                        .unwrap_or(false);
+                    if !prev_terminated {
+                        let vals: Vec<CValue> = ops[op_idx]
+                            .args
+                            .iter()
+                            .map(|&r| resolve_opref(&mut builder, &constants, r))
+                            .collect();
+                        builder.ins().jump(*label_block, &vals);
+                    }
                     builder.switch_to_block(*label_block);
                     for (i, &arg_ref) in ops[op_idx].args.iter().enumerate() {
                         let param = builder.block_params(*label_block)[i];
@@ -4186,7 +4245,7 @@ impl CraneliftBackend {
                     builder.seal_block(cont_block);
                 }
 
-                OpCode::GuardClass | OpCode::GuardNonnullClass => {
+                OpCode::GuardClass => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
@@ -4195,6 +4254,40 @@ impl CraneliftBackend {
                     let cont_block = builder.create_block();
 
                     let neq = builder.ins().icmp(IntCC::NotEqual, a, b);
+                    builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+
+                    builder.switch_to_block(cont_block);
+                    builder.seal_block(cont_block);
+                }
+
+                OpCode::GuardNonnullClass => {
+                    let info = &guard_infos[guard_idx];
+                    guard_idx += 1;
+
+                    let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
+                    let zero = builder.ins().iconst(ptr_type, 0);
+                    let exit_block = builder.create_block();
+                    let class_check_block = builder.create_block();
+                    let cont_block = builder.create_block();
+
+                    let is_null = builder.ins().icmp(IntCC::Equal, obj, zero);
+                    builder
+                        .ins()
+                        .brif(is_null, exit_block, &[], class_check_block, &[]);
+
+                    builder.switch_to_block(class_check_block);
+                    builder.seal_block(class_check_block);
+                    let actual_class =
+                        builder
+                            .ins()
+                            .load(ptr_type, MemFlags::trusted(), obj, 0);
+                    let neq = builder
+                        .ins()
+                        .icmp(IntCC::NotEqual, actual_class, expected_class);
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);
@@ -10470,6 +10563,60 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
+    }
+
+    #[test]
+    fn test_compile_loop_with_start_and_loop_labels_can_reuse_input_box_names() {
+        let mut backend = CraneliftBackend::new();
+        let start_descr = make_label_descr(76_100);
+        let loop_descr = make_label_descr(76_101);
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let ops = vec![
+            mk_op_with_descr(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0, start_descr),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
+            mk_op_with_descr(OpCode::Label, &[OpRef(0), OpRef(2)], OpRef::NONE.0, loop_descr),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(76_102);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(41), Value::Int(1)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 41);
+    }
+
+    #[test]
+    fn test_guard_nonnull_class_checks_object_header_and_null() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_ref(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::GuardNonnullClass, &[OpRef(0), OpRef(100)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        let mut constants = HashMap::new();
+        constants.insert(100, 0xCAFE_BABEu64 as i64);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(76_002);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let mut object_words = vec![0xCAFE_BABEu64 as i64, 123];
+        let ptr = object_words.as_mut_ptr() as usize;
+
+        let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert_eq!(backend.get_ref_value(&frame, 0), GcRef(ptr));
+
+        object_words[0] = 0xDEAD_BEEFu64 as i64;
+        let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+
+        let frame = backend.execute_token(&token, &[Value::Ref(GcRef(0))]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
     }
 
     // ── Overflow detection tests ──
