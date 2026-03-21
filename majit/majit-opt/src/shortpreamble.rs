@@ -499,6 +499,13 @@ impl ShortBoxes {
         self.label_arg_positions.get(&opref).copied()
     }
 
+    /// RPython parity: check if opref is reachable in the short preamble.
+    pub fn is_reachable(&self, opref: OpRef) -> bool {
+        self.label_arg_positions.contains_key(&opref)
+            || self.known_constants.contains(&opref)
+            || self.potential_ops.contains_key(&opref)
+    }
+
     pub fn note_known_constant(&mut self, opref: OpRef) {
         self.known_constants.insert(opref);
         self.next_synthetic_pos = self.next_synthetic_pos.max(opref.0.saturating_add(1));
