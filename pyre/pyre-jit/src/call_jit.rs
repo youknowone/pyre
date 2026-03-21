@@ -414,25 +414,6 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
 
-    if majit_meta::majit_log_enabled() {
-        let arg0 = if frame.locals_cells_stack_w.len() > 0
-            && !frame.locals_cells_stack_w[0].is_null()
-            && unsafe { is_int(frame.locals_cells_stack_w[0]) }
-        {
-            Some(unsafe { w_int_get_value(frame.locals_cells_stack_w[0]) })
-        } else {
-            None
-        };
-        eprintln!(
-            "[jit][force-boxed] enter key={} ni={} vsd={} arg0={:?} raw_finish={}",
-            green_key,
-            frame.next_instr,
-            frame.valuestackdepth,
-            arg0,
-            matches!(protocol, FinishProtocol::RawInt)
-        );
-    }
-
     // RPython assembler_call_helper: force_fn re-executes the callee
     // from scratch via the interpreter. Nested calls dispatch through
     // call_user_function → eval_with_jit, so compiled code + bridges
@@ -1128,6 +1109,47 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let globals = caller.namespace;
     let execution_context = caller.execution_context;
 
+    let arena = arena_ref();
+    if let Some((ptr, was_init)) = arena.take() {
+        if was_init {
+            let f = unsafe { &mut *ptr };
+            if f.code == func_code
+                && f.namespace == globals
+                && f.execution_context == execution_context
+            {
+                reset_reused_call_frame(f, &[boxed_arg]);
+            } else {
+                unsafe {
+                    std::ptr::write(
+                        ptr,
+                        PyFrame::new_for_call(
+                            func_code,
+                            &[boxed_arg],
+                            globals,
+                            execution_context,
+                        ),
+                    );
+                    (&mut *ptr).fix_array_ptrs();
+                }
+            }
+        } else {
+            unsafe {
+                std::ptr::write(
+                    ptr,
+                    PyFrame::new_for_call(
+                        func_code,
+                        &[boxed_arg],
+                        globals,
+                        execution_context,
+                    ),
+                );
+                (&mut *ptr).fix_array_ptrs();
+            }
+            arena.mark_initialized();
+        }
+        return ptr as i64;
+    }
+
     let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
         func_code,
         &[boxed_arg],
@@ -1312,7 +1334,8 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     }
     let ptr = frame_ptr as *mut PyFrame;
     let arena = arena_ref();
-    if !arena.put(ptr) {
+    let reused = arena.put(ptr);
+    if !reused {
         // Not an arena frame (heap fallback) — free it
         unsafe { drop(Box::from_raw(ptr)) };
     }
