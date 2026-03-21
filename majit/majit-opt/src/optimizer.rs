@@ -946,10 +946,22 @@ impl Optimizer {
         // through the passes — it's returned as last_op for the caller.
         let mut last_op = None;
         for op in ops {
-            if self.skip_flush
-                && matches!(op.opcode, OpCode::Jump | OpCode::Finish)
-            {
+            if self.skip_flush && op.opcode == OpCode::Jump {
                 last_op = Some(op.clone());
+                break;
+            }
+            // Finish must go through passes even with skip_flush=true:
+            // OptVirtualize.optimize_escaping_op forces virtual args,
+            // emitting New + SetfieldGc. Without this, Finish receives
+            // an empty New() with no fields set.
+            if self.skip_flush && op.opcode == OpCode::Finish {
+                self.propagate_one(op, &mut ctx);
+                // The Finish op was replaced by propagate_one; grab it.
+                if let Some(finish_op) = ctx.new_operations.iter().rev()
+                    .find(|o| o.opcode == OpCode::Finish)
+                {
+                    last_op = Some(finish_op.clone());
+                }
                 break;
             }
             self.propagate_one(op, &mut ctx);
