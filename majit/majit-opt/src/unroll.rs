@@ -43,6 +43,9 @@ pub struct UnrollOptimizer {
     /// this limit, jump_to_preamble is forced instead of creating a new
     /// target token.
     pub retrace_limit: u32,
+    /// warmstate.py: max_retrace_guards parameter. If a compiled trace has
+    /// more guards than this, retracing is permanently disabled.
+    pub max_retrace_guards: u32,
 }
 
 impl UnrollOptimizer {
@@ -52,6 +55,7 @@ impl UnrollOptimizer {
             target_tokens: Vec::new(),
             retraced_count: 0,
             retrace_limit: 5,
+            max_retrace_guards: 15,
         }
     }
 
@@ -289,6 +293,17 @@ impl UnrollOptimizer {
             imported_short_preamble_builder.as_ref(),
         );
         self.target_tokens.push(target_token);
+
+        // unroll.py:176-177: disable_retracing_if_max_retrace_guards
+        if Self::disable_retracing_if_max_retrace_guards(&p2_ops, self.max_retrace_guards) {
+            self.retraced_count = u32::MAX;
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[jit] too many guards (>{}), disabling retracing",
+                    self.max_retrace_guards
+                );
+            }
+        }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
