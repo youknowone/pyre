@@ -5339,18 +5339,25 @@ impl JitState for PyreJitState {
         let mut idx = 3;
         for local_idx in 0..nlocals {
             if let Some(value) = values.get(idx) {
-                // RPython parity: virtualizable array slots are always GCREF.
-                // Values with trace-level Int type that are actually heap
-                // pointers must be treated as Ref for the Python frame.
-                let boxed = boxed_slot_value_from_runtime_kind(value);
-                let _ = self.set_local_at(local_idx, boxed);
+                // RPython parity: OpRef::NONE (u32::MAX) in fail_args means
+                // this slot was not modified by compiled code. The value is
+                // output as null (0x0). In this case, keep the frame's
+                // existing local value — RPython reads it from virtualizable.
+                let is_none_slot = matches!(value, Value::Ref(majit_ir::GcRef(0)));
+                if !is_none_slot {
+                    let boxed = boxed_slot_value_from_runtime_kind(value);
+                    let _ = self.set_local_at(local_idx, boxed);
+                }
             }
             idx += 1;
         }
         for stack_idx in 0..stack_only {
             if let Some(value) = values.get(idx) {
-                let boxed = boxed_slot_value_from_runtime_kind(value);
-                let _ = self.set_stack_at(stack_idx, boxed);
+                let is_none_slot = matches!(value, Value::Ref(majit_ir::GcRef(0)));
+                if !is_none_slot {
+                    let boxed = boxed_slot_value_from_runtime_kind(value);
+                    let _ = self.set_stack_at(stack_idx, boxed);
+                }
             }
             idx += 1;
         }
