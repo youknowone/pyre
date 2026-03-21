@@ -734,6 +734,35 @@ fn boxed_slot_value_for_type(slot_type: Type, value: &Value) -> PyObjectRef {
     }
 }
 
+/// RPython parity: virtualizable array slots are always GCREF.
+/// When restoring from guard failure, treat ALL values as Ref (PyObjectRef).
+/// Int values that look like heap pointers are used directly; otherwise box.
+/// RPython parity: virtualizable array slots are always GCREF.
+/// When restoring from guard failure, treat ALL values as Ref (PyObjectRef).
+/// Int values that look like heap pointers are used directly (they are
+/// PyObjectRef that the optimizer typed as Int during unboxing). Zero/null
+/// values become PY_NULL. Only true small ints (non-zero, non-pointer)
+/// need boxing.
+fn boxed_slot_value_as_ref(value: &Value) -> PyObjectRef {
+    match value {
+        Value::Ref(r) => r.as_usize() as PyObjectRef,
+        Value::Int(v) => {
+            let addr = *v as usize;
+            if addr == 0 {
+                PY_NULL
+            } else if addr >= 0x1_0000 && addr < (1usize << 56) && (addr & 7) == 0 {
+                // Heap pointer — use as PyObjectRef directly
+                *v as PyObjectRef
+            } else {
+                // Small int — box it
+                w_int_new(*v)
+            }
+        }
+        Value::Float(v) => pyre_object::floatobject::w_float_new(*v),
+        Value::Void => PY_NULL,
+    }
+}
+
 fn boxed_slot_value_from_runtime_kind(value: &Value) -> PyObjectRef {
     match value {
         Value::Int(v) => w_int_new(*v),
@@ -1096,16 +1125,24 @@ impl TraceFrameState {
     fn build_single_frame_fail_arg_types(&self) -> Vec<Type> {
         let s = self.sym();
         let stack_only = s.stack_only_depth();
-        let slot_types = s
-            .symbolic_local_types
-            .iter()
-            .copied()
-            .chain(
-                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
-                    .iter()
-                    .copied(),
-            );
-        virtualizable_fail_arg_types(slot_types)
+        if s.vable_array_base.is_some() {
+            // RPython parity: virtualizable array slots are always GCREF.
+            // Both locals and stack slots must be Ref in fail_arg_types
+            // so that guard-failure restoration boxes raw values correctly.
+            let total_slots = s.symbolic_local_types.len() + stack_only;
+            virtualizable_fail_arg_types(std::iter::repeat_n(Type::Ref, total_slots))
+        } else {
+            let slot_types = s
+                .symbolic_local_types
+                .iter()
+                .copied()
+                .chain(
+                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
+                        .iter()
+                        .copied(),
+                );
+            virtualizable_fail_arg_types(slot_types)
+        }
     }
 
     fn remember_value_type(&mut self, value: OpRef, value_type: Type) {
@@ -1132,7 +1169,16 @@ impl TraceFrameState {
             s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
         }
         s.symbolic_stack[stack_idx] = value;
-        s.symbolic_stack_types[stack_idx] = value_type;
+        // RPython parity: virtualizable array slots (including stack) are
+        // always GCREF (Ref). The optimizer may track unboxed Int/Float
+        // internally, but the fail_args/guard descriptors must use Ref so
+        // that guard-failure restoration can correctly re-box values for
+        // the Python interpreter frame.
+        s.symbolic_stack_types[stack_idx] = if s.vable_array_base.is_some() {
+            Type::Ref
+        } else {
+            value_type
+        };
         s.valuestackdepth += 1;
     }
 
@@ -1595,20 +1641,7 @@ impl TraceFrameState {
         }
 
         self.flush_to_frame(ctx);
-        let fail_arg_types = {
-            let s = self.sym();
-            let stack_only = s.stack_only_depth();
-            virtualizable_fail_arg_types(
-                s.symbolic_local_types
-                    .iter()
-                    .copied()
-                    .chain(
-                        s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
-                            .iter()
-                            .copied(),
-                    ),
-            )
-        };
+        let fail_arg_types = self.build_single_frame_fail_arg_types();
         let fail_args = self.build_single_frame_fail_args(ctx);
         ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
     }
@@ -5242,13 +5275,18 @@ impl JitState for PyreJitState {
         let mut idx = 3;
         for local_idx in 0..nlocals {
             if let Some(value) = values.get(idx) {
-                let _ = self.set_local_at(local_idx, boxed_slot_value_from_runtime_kind(value));
+                // RPython parity: virtualizable array slots are always GCREF.
+                // Values with trace-level Int type that are actually heap
+                // pointers must be treated as Ref for the Python frame.
+                let boxed = boxed_slot_value_from_runtime_kind(value);
+                let _ = self.set_local_at(local_idx, boxed);
             }
             idx += 1;
         }
         for stack_idx in 0..stack_only {
             if let Some(value) = values.get(idx) {
-                let _ = self.set_stack_at(stack_idx, boxed_slot_value_from_runtime_kind(value));
+                let boxed = boxed_slot_value_from_runtime_kind(value);
+                let _ = self.set_stack_at(stack_idx, boxed);
             }
             idx += 1;
         }
@@ -5571,6 +5609,15 @@ fn value_to_ptr(value: &Value) -> PyObjectRef {
         Value::Ref(gc_ref) => gc_ref.0 as PyObjectRef,
         Value::Int(n) => *n as PyObjectRef,
         _ => std::ptr::null_mut(),
+    }
+}
+
+fn value_to_raw(value: &Value) -> usize {
+    match value {
+        Value::Ref(gc_ref) => gc_ref.0,
+        Value::Int(n) => *n as usize,
+        Value::Float(f) => f.to_bits() as usize,
+        Value::Void => 0,
     }
 }
 
