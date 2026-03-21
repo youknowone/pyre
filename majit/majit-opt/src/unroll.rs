@@ -2190,7 +2190,24 @@ fn assemble_peeled_trace(
             // Body-use-before-def: a value used in the body before its
             // defining op is encountered. Carry it through the label so
             // the assembled body has it available.
+            // If the value comes from short preamble import, emit a SameAs
+            // in the preamble to make its source visible.
             if !full_label_args.contains(&arg) {
+                if let Some(&source) = short_source_map.get(&arg) {
+                    if preamble_defs.contains(&source) && !alias_remap.contains_key(&arg) {
+                        let pos = OpRef(max_pos);
+                        max_pos = next_free_pos(max_pos.saturating_add(1));
+                        let same_as_opcode = OpCode::SameAsI; // default to Int
+                        let mut op = Op::new(same_as_opcode, &[source]);
+                        op.pos = pos;
+                        alias_remap.insert(arg, pos);
+                        // Insert before the label (which is at the end of result)
+                        result.push(op);
+                        full_label_args.push(pos);
+                        label_set.insert(pos);
+                        continue;
+                    }
+                }
                 full_label_args.push(arg);
                 label_set.insert(arg);
             }
