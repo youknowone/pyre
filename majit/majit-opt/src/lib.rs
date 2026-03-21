@@ -199,6 +199,7 @@ impl OptContext {
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
             imported_short_preamble_used: HashSet::new(),
+
             potential_extra_ops: HashMap::new(),
             active_short_preamble_producer: None,
             exported_jump_virtuals: Vec::new(),
@@ -231,6 +232,7 @@ impl OptContext {
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
             imported_short_preamble_used: HashSet::new(),
+
             potential_extra_ops: HashMap::new(),
             active_short_preamble_producer: None,
             exported_jump_virtuals: Vec::new(),
@@ -323,6 +325,129 @@ impl OptContext {
         self.imported_short_preamble_used.clear();
     }
 
+    pub fn initialize_imported_short_preamble_builder_from_exported_ops(
+        &mut self,
+        short_args: &[OpRef],
+        short_inputargs: &[OpRef],
+        exported_short_ops: &[crate::unroll::ExportedShortOp],
+    ) -> bool {
+        use crate::shortpreamble::{PreambleOpKind, ProducedShortOp, ShortPreambleBuilder};
+        use crate::unroll::{ExportedShortArg, ExportedShortOp, ExportedShortResult};
+
+        let mut produced: Vec<(OpRef, ProducedShortOp)> =
+            Vec::with_capacity(exported_short_ops.len());
+        let mut produced_results: Vec<OpRef> = Vec::with_capacity(exported_short_ops.len());
+        let mut temporary_results: Vec<Option<OpRef>> = Vec::new();
+        let mut imported_constants: HashMap<OpRef, OpRef> = HashMap::new();
+
+        let mut resolve_result = |result: &ExportedShortResult, this: &mut Self| match result {
+            ExportedShortResult::Slot(slot) => short_args.get(*slot).copied(),
+            ExportedShortResult::Temporary(index) => {
+                if *index >= temporary_results.len() {
+                    temporary_results.resize(index + 1, None);
+                }
+                let slot = &mut temporary_results[*index];
+                Some(*slot.get_or_insert_with(|| this.alloc_op_position()))
+            }
+        };
+
+        for entry in exported_short_ops {
+            match entry {
+                ExportedShortOp::Pure {
+                    source: _,
+                    opcode,
+                    descr_idx,
+                    args,
+                    result,
+                    invented_name,
+                    same_as_source,
+                } => {
+                    if opcode.is_call() {
+                        return false;
+                    }
+                    let Some(result_opref) = resolve_result(result, self) else {
+                        return false;
+                    };
+                    let mut resolved_args = Vec::with_capacity(args.len());
+                    for arg in args {
+                        let resolved = match arg {
+                            ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
+                            ExportedShortArg::Produced(index) => produced_results.get(*index).copied(),
+                            ExportedShortArg::Const { source, value } => {
+                                let opref = imported_constants.entry(*source).or_insert_with(|| {
+                                    let opref = self.alloc_op_position();
+                                    self.make_constant(opref, value.clone());
+                                    opref
+                                });
+                                Some(*opref)
+                            }
+                        };
+                        let Some(resolved) = resolved else {
+                            return false;
+                        };
+                        resolved_args.push(resolved);
+                    }
+                    let mut op = Op::new(*opcode, &resolved_args);
+                    op.pos = result_opref;
+                    if let Some(descr_idx) = descr_idx {
+                        op.descr = Some(crate::virtualize::make_field_index_descr(*descr_idx));
+                    }
+                    produced.push((
+                        result_opref,
+                        ProducedShortOp {
+                            kind: PreambleOpKind::Pure,
+                            preamble_op: op,
+                            invented_name: *invented_name,
+                            same_as_source: *same_as_source,
+                        },
+                    ));
+                    produced_results.push(result_opref);
+                }
+                ExportedShortOp::HeapField {
+                    source: _,
+                    object_slot,
+                    descr_idx,
+                    result_type,
+                    result,
+                    invented_name,
+                    same_as_source,
+                } => {
+                    let Some(result_opref) = resolve_result(result, self) else {
+                        return false;
+                    };
+                    let Some(&obj) = short_args.get(*object_slot) else {
+                        return false;
+                    };
+                    let opcode = match result_type {
+                        majit_ir::Type::Int => OpCode::GetfieldGcI,
+                        majit_ir::Type::Ref => OpCode::GetfieldGcR,
+                        majit_ir::Type::Float => OpCode::GetfieldGcF,
+                        majit_ir::Type::Void => return false,
+                    };
+                    let mut op = Op::new(opcode, &[obj]);
+                    op.pos = result_opref;
+                    op.descr = Some(crate::virtualize::make_field_index_descr(*descr_idx));
+                    produced.push((
+                        result_opref,
+                        ProducedShortOp {
+                            kind: PreambleOpKind::Heap,
+                            preamble_op: op,
+                            invented_name: *invented_name,
+                            same_as_source: *same_as_source,
+                        },
+                    ));
+                    produced_results.push(result_opref);
+                }
+                _ => return false,
+            }
+        }
+
+        self.imported_short_preamble_builder =
+            Some(ShortPreambleBuilder::new(short_args, &produced, short_inputargs));
+        self.imported_short_preamble_used.clear();
+        true
+    }
+
     pub fn note_imported_short_use(&mut self, result: OpRef) {
         let _ = self.force_op_from_preamble(result);
     }
@@ -412,6 +537,10 @@ impl OptContext {
 
     pub(crate) fn pop_extra_operation(&mut self) -> Option<Op> {
         self.extra_operations.pop_front()
+    }
+
+    pub(crate) fn has_extra_operations(&self) -> bool {
+        !self.extra_operations.is_empty()
     }
 
     pub(crate) fn flush_extra_operations_raw(&mut self) {
@@ -593,6 +722,11 @@ pub trait Optimization {
 
     /// Called after all operations have been processed.
     fn flush(&mut self, _ctx: &mut OptContext) {}
+
+    /// Emit any remaining lazy sets directly (not through pass chain).
+    /// Called after flush+drain to emit lazy_sets that were re-stored
+    /// during drain. Virtual values should already be forced at this point.
+    fn emit_remaining_lazy_directly(&mut self, _ctx: &mut OptContext) {}
 
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;

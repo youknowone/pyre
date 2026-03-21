@@ -1383,6 +1383,23 @@ impl Optimization for OptHeap {
         "heap"
     }
 
+    fn emit_remaining_lazy_directly(&mut self, ctx: &mut OptContext) {
+        let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
+        for (_key, mut op) in pending {
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+            ctx.emit(op);
+        }
+        let pending: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
+        for (_key, mut op) in pending {
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+            ctx.emit(op);
+        }
+    }
+
     fn export_cached_fields(&self) -> Vec<(OpRef, u32, OpRef)> {
         self.cached_fields
             .iter()
