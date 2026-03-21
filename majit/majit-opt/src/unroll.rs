@@ -444,8 +444,16 @@ impl UnrollOptimizer {
                 .first()
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
+            let preamble_arity = exported_state.renamed_inputargs.len();
             if let Some(mut end_jump) = body_terminal_op {
                 end_jump.descr = Some(preamble_target.as_jump_target_descr());
+                // Truncate Jump args to match preamble start Label arity.
+                // Body Jump may have N+M args (short preamble), but preamble
+                // Label only has N args. RPython backend ignores extras;
+                // Cranelift requires exact match.
+                if end_jump.args.len() > preamble_arity {
+                    end_jump.args.truncate(preamble_arity);
+                }
                 body_ops = replace_terminal_jump(&body_ops, end_jump);
             } else {
                 body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
