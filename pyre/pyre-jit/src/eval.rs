@@ -185,6 +185,12 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
         return result;
     }
 
+    // RPython parity: after guard-restored fallback from compiled code,
+    // the interpreter must not re-enter compiled code for nested calls.
+    // In RPython, blackhole's bhimpl_recursive_call calls portal_runner
+    // directly without JIT re-entry. Use force_plain_eval to ensure
+    // nested calls use eval_frame_plain.
+    let _plain_guard = pyre_interp::call::force_plain_eval();
     eval_loop_jit(frame)
 }
 
@@ -598,6 +604,14 @@ fn restore_guard_failure_for_loop(
     // PyObjectRef pointers. We must use exit_layout types to correctly
     // re-box them. The fix must be at the optimizer level (don't expand
     // virtualizable-slot virtuals, or expand them as Ref).
+    {
+        let nraw = raw_values.len().min(7);
+        let slots: Vec<String> = (0..nraw).map(|i| format!("{:#x}", raw_values[i] as usize)).collect();
+        eprintln!(
+            "[restore-loop] fail_idx={} types={:?} raw=[{}]",
+            exit_layout.fail_index, exit_layout.exit_types, slots.join(", "),
+        );
+    }
     let typed = decode_exit_layout_values(raw_values, exit_layout);
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     restored.then_some(jit_state.next_instr)
