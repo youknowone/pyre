@@ -3458,9 +3458,10 @@ impl TraceFrameState {
                     this.sync_standard_virtualizable_before_residual_call(ctx);
                     // RPython parity: use CALL_ASSEMBLER_I when a token
                     // exists for the callee (compiled or pending).
-                    // Use CALL_ASSEMBLER_I only when callee is already compiled
-                    // (loop token exists). Pending tokens have incomplete type
-                    // info which causes descriptor mismatches.
+                    // RPython parity: use CALL_ASSEMBLER_I when a compiled
+                    // token exists. Pending tokens cause SIGSEGV in
+                    // call_assembler_fast_path — needs further investigation
+                    // of the codegen dispatch path for self-recursive callee.
                     let ca_token = if is_self_recursive {
                         driver.get_loop_token_number(callee_key)
                     } else {
@@ -3486,12 +3487,11 @@ impl TraceFrameState {
                         let ca_args = synthesize_fresh_callee_entry_args(
                             ctx, callee_frame, args, callee_nlocals,
                         );
-                        let arg_slot_types: Vec<Type> =
-                            args.iter().map(|&arg| this.value_type(arg)).collect();
-                        let callee_slot_types =
-                            pending_entry_slot_types_from_args(&arg_slot_types, callee_nlocals, 0);
+                        // Use the actual virtualizable input types:
+                        // [Ref(frame), Int(ni), Int(vsd), Ref(local0), ...]
+                        // This matches the compiled trace's inputargs layout.
                         let ca_arg_types =
-                            frame_entry_arg_types_from_slot_types(&callee_slot_types);
+                            fail_arg_types_for_virtualizable_state(ca_args.len());
                         let ca_result = ctx.call_assembler_int_by_number_typed(
                             token_number,
                             &ca_args,
@@ -3978,13 +3978,16 @@ pub(crate) fn trace_step_result_to_action(
             }
         }
         Ok(pyre_runtime::StepResult::CloseLoop(jump_args)) => {
-            // RPython parity: use backward-jump target PC as green_key
-            // so compiled loop matches back_edge_or_run_compiled_keyed.
-            let frame = unsafe { &*(state.concrete_frame as *const pyre_interp::frame::PyFrame) };
-            let close_key = crate::eval::make_green_key(frame.code, frame.next_instr);
+            // RPython parity: the loop-header greenkey comes from the JUMP
+            // state itself (`next_instr` carried in jump_args[1]`), not from
+            // the mutable concrete frame. trace_bytecode() retargets the
+            // TraceCtx green_key from these jump args before compilation. If
+            // we also override it here from `frame.next_instr`, the compiled
+            // loop can end up registered under a different PC than the one
+            // carried through JUMP, and back-edge dispatch will miss it.
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                green_key: Some(close_key),
+                green_key: None,
             }
         }
         Ok(pyre_runtime::StepResult::Return(value)) => TraceAction::Finish {
