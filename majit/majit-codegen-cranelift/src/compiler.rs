@@ -7647,8 +7647,29 @@ fn collect_guards(
             };
             (refs, types)
         } else {
-            let refs: Vec<OpRef> = (0..num_inputs as u32).map(OpRef).collect();
-            let types: Vec<Type> = inputargs.iter().map(|ia| ia.tp).collect();
+            // RPython: every guard stores its own fail_args via
+            // guard_op.setfailargs(). The backend uses each guard's
+            // fail_args to determine what to save on guard failure.
+            // No preamble/body distinction needed.
+            let refs: Vec<OpRef> = if let Some(ref fa) = op.fail_args {
+                fa.iter().copied().collect()
+            } else {
+                (0..num_inputs as u32).map(OpRef).collect()
+            };
+            let types: Vec<Type> = if let Some(ref descr) = op.descr {
+                if let Some(fd) = descr.as_fail_descr() {
+                    let dt = fd.fail_arg_types();
+                    if dt.len() == refs.len() {
+                        dt.to_vec()
+                    } else {
+                        infer_fail_arg_types(&refs, &value_types)?
+                    }
+                } else {
+                    infer_fail_arg_types(&refs, &value_types)?
+                }
+            } else {
+                infer_fail_arg_types(&refs, &value_types)?
+            };
             (refs, types)
         };
 

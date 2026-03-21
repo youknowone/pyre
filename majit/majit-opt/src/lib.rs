@@ -147,6 +147,9 @@ pub struct OptContext {
     /// short boxes. Phase 2 can later re-materialize these aliases when
     /// building the short preamble for bridges.
     pub imported_short_aliases: Vec<ImportedShortAlias>,
+    /// (base_len, short_args): virtual field values start at base_len
+    /// within short_args. Used by install_imported_virtuals.
+    pub imported_virtual_args: Option<(usize, Vec<OpRef>)>,
     /// Original preamble result box for each imported short-box result.
     /// This preserves RPython PreambleOp.op identity so phase 2 assembly
     /// can remap any surviving synthetic imported boxes back to the
@@ -223,6 +226,7 @@ impl OptContext {
             imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
+            imported_virtual_args: None,
             imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
@@ -261,6 +265,7 @@ impl OptContext {
             imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
+            imported_virtual_args: None,
             imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,

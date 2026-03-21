@@ -701,7 +701,13 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<DetailedDriverRunOutcome> {
-        if self.meta.is_tracing() || !state.can_trace() {
+        if self.meta.is_tracing() {
+            return None;
+        }
+        if !state.can_trace() {
+            if crate::majit_log_enabled() {
+                eprintln!("[jit] back_edge blocked: can_trace=false key={}", green_key);
+            }
             return None;
         }
 
@@ -1200,6 +1206,11 @@ impl<S: JitState> JitDriver<S> {
             };
         }
         let live_values = state.extract_live_values(&meta);
+        if crate::majit_log_enabled() {
+            let vals: Vec<String> = live_values.iter().enumerate()
+                .map(|(i, v)| format!("[{}]={:?}", i, v)).collect();
+            eprintln!("[jit] run_bridge live_values: {}", vals.join(", "));
+        }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -1277,7 +1288,15 @@ impl<S: JitState> JitDriver<S> {
             };
         }
         let live_values = state.extract_live_values(&meta);
+        if crate::majit_log_enabled() {
+            let vals: Vec<String> = live_values.iter().enumerate()
+                .map(|(i, v)| format!("[{}]={:?}", i, v)).collect();
+            eprintln!("[jit] BRIDGE live_values: {}", vals.join(", "));
+        }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            if crate::majit_log_enabled() {
+                eprintln!("[jit] BRIDGE abort: live_values mismatch");
+            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,

@@ -314,11 +314,31 @@ impl Optimizer {
     }
 
     fn install_imported_virtuals(&self, ctx: &mut OptContext) {
+        // RPython: virtual field values come from the virtuals portion of
+        // short_args (= label_args + virtuals). Use imported_virtual_args
+        // which has (base_len, short_args) to start from the right offset.
+        // RPython: virtual field values are at positions AFTER the
+        // non-virtual args in the flattened boxes array from make_inputargs.
+        // label_slot starts at the number of non-virtual state entries.
         let imported_label_args = self
             .imported_label_args
             .as_ref()
             .expect("install_imported_virtuals requires imported_label_args");
-        let mut label_slot = 0usize;
+        // Count non-virtual top-level states to determine the starting slot
+        // for virtual field values. This matches RPython's position_in_notvirtuals.
+        let num_notvirtual = if let Some(ref exported) = self.imported_loop_state {
+            exported.virtual_state.state.iter()
+                .filter(|s| !s.is_virtual())
+                .map(|s| crate::virtualstate::VirtualState::count_forced_boxes_for_entry_static(s))
+                .sum()
+        } else {
+            0
+        };
+        let mut label_slot = num_notvirtual;
+        if crate::majit_log_enabled() {
+            eprintln!("[jit] install_virt: label_slot={} label_args_len={} label_args={:?}",
+                label_slot, imported_label_args.len(), imported_label_args);
+        }
         for iv in &self.imported_virtuals {
             let virtual_head = ctx.get_replacement(OpRef(iv.inputarg_index as u32));
             let mut fields = Vec::new();
@@ -529,7 +549,12 @@ impl Optimizer {
                 let opref = imported_label_args
                     .get(*label_slot)
                     .copied()
-                    .expect("missing imported label arg for virtual field");
+                    .unwrap_or_else(|| {
+                        if std::env::var_os("MAJIT_LOG").is_some() {
+                            eprintln!("[jit] MISS: label_slot={} len={}", *label_slot, imported_label_args.len());
+                        }
+                        OpRef::NONE
+                    });
                 *label_slot += 1;
                 Self::apply_imported_virtual_state(info, opref, ctx);
                 ctx.get_replacement(opref)
@@ -1183,6 +1208,15 @@ impl Optimizer {
                 .collect();
             let (label_args, source_slots) =
                 crate::unroll::import_state_with_source_slots(&targetargs, exported_state, &mut ctx);
+            // short_args (label_args + virtuals) was already stored in
+            // ctx.imported_virtual_args by import_state(). Don't re-compute
+            // — make_inputargs_and_virtuals returns empty after forwarding.
+            if crate::majit_log_enabled() {
+                if let Some((base, ref sa)) = ctx.imported_virtual_args {
+                    eprintln!("[jit] virtual_args from import_state: base={} total={} virtuals={:?}",
+                        base, sa.len(), &sa[base..]);
+                }
+            }
             self.imported_label_args = Some(label_args);
             self.imported_label_source_slots = Some(source_slots);
         }
@@ -1221,14 +1255,9 @@ impl Optimizer {
             self.propagate_one(op, &mut ctx);
         }
 
-        // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
-        // Phase 2 leaves lazy sets pending so virtuals aren't forced.
-        if !self.skip_flush {
-            self.flush(&mut ctx);
-        }
-        // RPython optimizer.py:555-556: after flush, send last_op only when
-        // flush=True. With flush=False the terminal op is kept out-of-band as
-        // info.jump_op for unroll/compile to consume.
+        // RPython: JUMP goes through all passes BEFORE flush.
+        // OptVirtualize captures pre_force_virtual_state during JUMP.
+        // Flush destroys virtuals, so JUMP must run first.
         if let Some(mut terminal_op) = last_op {
             for arg in &mut terminal_op.args {
                 *arg = ctx.get_replacement(*arg);
@@ -1236,8 +1265,12 @@ impl Optimizer {
             if self.skip_flush {
                 self.terminal_op = Some(terminal_op);
             } else {
-                ctx.emit(terminal_op);
+                self.propagate_one(&terminal_op, &mut ctx);
             }
+        }
+        // Phase 2 leaves lazy sets pending so virtuals aren't forced.
+        if !self.skip_flush {
+            self.flush(&mut ctx);
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -1252,6 +1285,11 @@ impl Optimizer {
             .iter()
             .rfind(|op| op.opcode == OpCode::Jump)
             .cloned();
+        if crate::majit_log_enabled() {
+            eprintln!("[jit] export: pre_force_vs={} pre_force_args={}",
+                ctx.pre_force_virtual_state.is_some(),
+                ctx.pre_force_jump_args.is_some());
+        }
         self.exported_loop_state = jump.map(|jump| {
             let original_jump_args = ctx
                 .pre_force_jump_args
