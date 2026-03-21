@@ -425,7 +425,7 @@ impl<S: JitState> JitDriver<S> {
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                loop_header_pc,
+                loop_header_pc: _loop_header_pc,
             } => {
                 // RPython parity: the active trace green key is already
                 // retargeted by the tracer when it reaches the loop header.
@@ -457,16 +457,7 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 };
                 if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
-                    let meta = if let Some(loop_header_pc) = loop_header_pc {
-                        S::retarget_loop_close_meta(
-                            self.trace_meta.as_ref().unwrap(),
-                            loop_header_pc,
-                            &jump_args,
-                        )
-                    } else {
-                        self.trace_meta.as_ref().unwrap().clone()
-                    };
-                    self.trace_meta = None;
+                    let meta = self.trace_meta.take().unwrap();
                     self.meta.close_and_compile(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
@@ -1273,37 +1264,13 @@ impl<S: JitState> JitDriver<S> {
         ) -> Option<usize>,
     ) -> DetailedDriverRunOutcome {
         let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit][compiled-abort] key={} target_pc={} reason=no-compiled-meta",
-                    green_key, target_pc
-                );
-            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !state.is_compatible(&meta) {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit][compiled-abort] key={} target_pc={} reason=incompatible-state",
-                    green_key, target_pc
-                );
-            }
-            return DetailedDriverRunOutcome::Abort {
-                restored: false,
-                via_blackhole: false,
-            };
-        }
-        if !self.sync_before(state, &meta, descriptor.as_ref()) {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit][compiled-abort] key={} target_pc={} reason=sync-before-failed",
-                    green_key, target_pc
-                );
-            }
+        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -1311,14 +1278,6 @@ impl<S: JitState> JitDriver<S> {
         }
         let live_values = state.extract_live_values(&meta);
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit][compiled-abort] key={} target_pc={} reason=live-values-mismatch live_len={}",
-                    green_key,
-                    target_pc,
-                    live_values.len()
-                );
-            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -1331,12 +1290,6 @@ impl<S: JitState> JitDriver<S> {
             descriptor.as_ref(),
             live_values,
         ) else {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit][compiled-abort] key={} target_pc={} reason=extend-live-values-failed",
-                    green_key, target_pc
-                );
-            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -1347,14 +1300,6 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .run_compiled_detailed_with_values(green_key, &live_values)
         else {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit][compiled-abort] key={} target_pc={} reason=backend-returned-none inputs={}",
-                    green_key,
-                    target_pc,
-                    live_values.len()
-                );
-            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -1392,12 +1337,6 @@ impl<S: JitState> JitDriver<S> {
             .should_compile_bridge_in_trace(green_key, trace_id, fail_index);
         let resume_pc = on_guard_failure(state, &exit_meta, &raw_values, &exit_layout);
         let restored = resume_pc.is_some();
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit][guard-failure] key={} trace_id={} fail_index={} restored={} resume_pc={:?}",
-                green_key, trace_id, fail_index, restored, resume_pc
-            );
-        }
         if restored {
             self.sync_after(state, &exit_meta, descriptor.as_ref());
             if should_bridge {
@@ -1865,9 +1804,6 @@ mod tests {
     #[derive(Default)]
     struct NonTraceableState;
 
-    #[derive(Default)]
-    struct HeaderPcMetaState;
-
     impl JitState for TypedRestoreState {
         type Meta = ();
         type Sym = ();
@@ -1938,52 +1874,6 @@ mod tests {
 
         fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
             true
-        }
-    }
-
-    impl JitState for HeaderPcMetaState {
-        type Meta = usize;
-        type Sym = ();
-        type Env = ();
-
-        fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
-            header_pc
-        }
-
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
-            vec![0]
-        }
-
-        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
-
-        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
-            true
-        }
-
-        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
-
-        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
-            Vec::new()
-        }
-
-        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
-            true
-        }
-
-        fn validate_close_with_jump_args(
-            _sym: &Self::Sym,
-            _meta: &Self::Meta,
-            jump_args: &[OpRef],
-        ) -> bool {
-            !jump_args.is_empty()
-        }
-
-        fn retarget_loop_close_meta(
-            _meta: &Self::Meta,
-            loop_header_pc: usize,
-            _jump_args: &[OpRef],
-        ) -> Self::Meta {
-            loop_header_pc
         }
     }
 
@@ -2669,29 +2559,6 @@ mod tests {
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 0);
         assert_eq!(stats.loops_aborted, 1);
-    }
-
-    #[test]
-    fn test_close_loop_with_args_retargets_compiled_meta_to_loop_header() {
-        let mut driver = JitDriver::<HeaderPcMetaState>::new(1);
-        let mut state = HeaderPcMetaState;
-        driver.force_start_tracing(77, 127, &mut state, &());
-        assert!(driver.meta.is_tracing());
-
-        driver.merge_point(|ctx, _sym| {
-            let i0 = OpRef(0);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[]);
-            TraceAction::CloseLoopWithArgs {
-                jump_args: vec![i0],
-                loop_header_pc: Some(171),
-            }
-        });
-
-        let compiled_meta = *driver
-            .meta_interp()
-            .get_compiled_meta(77)
-            .expect("close loop should compile");
-        assert_eq!(compiled_meta, 171);
     }
 
     #[test]

@@ -301,21 +301,6 @@ pub trait JitState: Sized {
         Self::validate_close(sym, meta)
     }
 
-    /// Retarget loop metadata when a trace closes against an explicit loop
-    /// header merge point different from the trace start.
-    ///
-    /// RPython compile.py closes loops against the loop header target token,
-    /// not necessarily the original trace start. Interpreters that encode the
-    /// loop header directly inside their metadata should override this hook so
-    /// the stored compiled entry matches the final closed-loop header.
-    fn retarget_loop_close_meta(
-        meta: &Self::Meta,
-        _loop_header_pc: usize,
-        _jump_args: &[OpRef],
-    ) -> Self::Meta {
-        meta.clone()
-    }
-
     /// Push a reconstructed caller frame onto the interpreter's call stack.
     /// Called during multi-frame deopt: innermost frame is current,
     /// outer frames are pushed in reverse order (outermost first).

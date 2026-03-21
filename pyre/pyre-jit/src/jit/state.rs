@@ -72,8 +72,8 @@ pub struct PyreMeta {
     pub merge_pc: usize,
     /// Number of fast local variable slots.
     pub num_locals: usize,
-    /// Namespace size at the merge point.
-    pub ns_len: usize,
+    /// Sorted namespace keys expected by this trace.
+    pub ns_keys: Vec<String>,
     /// Absolute valuestackdepth at the merge point.
     pub valuestackdepth: usize,
     /// Whether the optimizer uses the virtualizable mechanism.
@@ -1145,76 +1145,6 @@ impl TraceFrameState {
         }
     }
 
-    fn build_single_frame_fail_args_with_extra_stack(
-        &mut self,
-        ctx: &mut TraceCtx,
-        extra_stack_values: &[(OpRef, Type)],
-    ) -> Vec<OpRef> {
-        self.flush_to_frame(ctx);
-        let (frame, next_instr, stack_depth, nlocals, local_values, local_types, stack_values, stack_types) = {
-            let s = self.sym();
-            let stack_only = s.stack_only_depth();
-            (
-                s.frame,
-                s.vable_next_instr,
-                ctx.const_int((s.valuestackdepth + extra_stack_values.len()) as i64),
-                s.nlocals,
-                s.symbolic_locals.clone(),
-                s.symbolic_local_types.clone(),
-                s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
-                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
-            )
-        };
-        let mut fa = vec![frame, next_instr, stack_depth];
-        for (idx, slot) in local_values.into_iter().enumerate() {
-            let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
-            fa.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, idx));
-        }
-        let stack_values_len = stack_values.len();
-        for (stack_idx, slot) in stack_values.into_iter().enumerate() {
-            let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
-            fa.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, nlocals + stack_idx));
-        }
-        let base_stack_idx = nlocals + stack_values_len;
-        for (extra_idx, (slot, slot_type)) in extra_stack_values.iter().copied().enumerate() {
-            fa.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, base_stack_idx + extra_idx));
-        }
-        fa
-    }
-
-    fn build_single_frame_fail_arg_types_with_extra_stack(
-        &self,
-        extra_stack_types: &[Type],
-    ) -> Vec<Type> {
-        let s = self.sym();
-        let stack_only = s.stack_only_depth();
-        let slot_types = s
-            .symbolic_local_types
-            .iter()
-            .copied()
-            .chain(
-                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
-                    .iter()
-                    .copied(),
-            )
-            .chain(extra_stack_types.iter().copied());
-        virtualizable_fail_arg_types(slot_types)
-    }
-
-    fn with_overridden_fail_args<R>(
-        &mut self,
-        fail_args: Vec<OpRef>,
-        fail_arg_types: Vec<Type>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let prev_fail_args = self.parent_fail_args.replace(fail_args);
-        let prev_fail_arg_types = self.parent_fail_arg_types.replace(fail_arg_types);
-        let result = f(self);
-        self.parent_fail_args = prev_fail_args;
-        self.parent_fail_arg_types = prev_fail_arg_types;
-        result
-    }
-
     fn remember_value_type(&mut self, value: OpRef, value_type: Type) {
         if value.is_none() {
             return;
@@ -2155,125 +2085,109 @@ impl TraceFrameState {
         let Some((concrete_obj, concrete_key)) = self.concrete_binary_operands() else {
             return self.trace_binary_value(a, b, BinaryOperator::Subscr);
         };
-        let stack_suffix = [(a, self.value_type(a)), (b, self.value_type(b))];
-        let (subscr_fail_args, subscr_fail_arg_types) = self.with_ctx(|this, ctx| {
-            (
-                this.build_single_frame_fail_args_with_extra_stack(ctx, &stack_suffix),
-                this.build_single_frame_fail_arg_types_with_extra_stack(&[
-                    stack_suffix[0].1,
-                    stack_suffix[1].1,
-                ]),
-            )
-        });
 
         unsafe {
             if is_int(concrete_key) {
                 let index = w_int_get_value(concrete_key);
-                return self.with_overridden_fail_args(
-                    subscr_fail_args,
-                    subscr_fail_arg_types,
-                    |this| {
-                        this.with_ctx(|this, ctx| {
-                            if is_tuple(concrete_obj) {
-                                let concrete_len = w_tuple_len(concrete_obj);
-                                if index >= 0 {
-                                    let index = index as usize;
-                                    if index < concrete_len {
-                                        return Ok(this.trace_direct_tuple_getitem(
-                                            ctx,
-                                            a,
-                                            b,
-                                            &TUPLE_TYPE as *const PyType,
-                                            tuple_items_ptr_descr(),
-                                            tuple_items_len_descr(),
-                                            index,
-                                        ));
-                                    }
-                                } else if let Some(abs_index) = index
-                                    .checked_neg()
-                                    .and_then(|value| usize::try_from(value).ok())
-                                {
-                                    if abs_index <= concrete_len {
-                                        return Ok(this.trace_direct_negative_tuple_getitem(
-                                            ctx,
-                                            a,
-                                            b,
-                                            &TUPLE_TYPE as *const PyType,
-                                            tuple_items_ptr_descr(),
-                                            tuple_items_len_descr(),
-                                            index,
-                                            concrete_len,
-                                        ));
-                                    }
-                                }
-                            } else if is_list(concrete_obj) && w_list_uses_object_storage(concrete_obj) {
-                                let concrete_len = w_list_len(concrete_obj);
-                                if index >= 0 {
-                                    let index = index as usize;
-                                    if index < concrete_len {
-                                        return Ok(this.trace_direct_object_list_getitem(ctx, a, b, index));
-                                    }
-                                } else if let Some(abs_index) = index
-                                    .checked_neg()
-                                    .and_then(|value| usize::try_from(value).ok())
-                                {
-                                    if abs_index <= concrete_len {
-                                        return Ok(this.trace_direct_negative_object_list_getitem(
-                                            ctx,
-                                            a,
-                                            b,
-                                            index,
-                                            concrete_len,
-                                        ));
-                                    }
-                                }
-                            } else if is_list(concrete_obj) && w_list_uses_int_storage(concrete_obj) {
-                                let concrete_len = w_list_len(concrete_obj);
-                                if index >= 0 {
-                                    let index = index as usize;
-                                    if index < concrete_len {
-                                        return Ok(this.trace_direct_int_list_getitem(ctx, a, b, index));
-                                    }
-                                } else if let Some(abs_index) = index
-                                    .checked_neg()
-                                    .and_then(|value| usize::try_from(value).ok())
-                                {
-                                    if abs_index <= concrete_len {
-                                        return Ok(this.trace_direct_negative_int_list_getitem(
-                                            ctx,
-                                            a,
-                                            b,
-                                            index,
-                                            concrete_len,
-                                        ));
-                                    }
-                                }
-                            } else if is_list(concrete_obj) && w_list_uses_float_storage(concrete_obj) {
-                                let concrete_len = w_list_len(concrete_obj);
-                                if index >= 0 {
-                                    let index = index as usize;
-                                    if index < concrete_len {
-                                        return Ok(this.trace_direct_float_list_getitem(ctx, a, b, index));
-                                    }
-                                } else if let Some(abs_index) = index
-                                    .checked_neg()
-                                    .and_then(|value| usize::try_from(value).ok())
-                                {
-                                    if abs_index <= concrete_len {
-                                        return Ok(this.trace_direct_negative_float_list_getitem(
-                                            ctx,
-                                            a,
-                                            b,
-                                            index,
-                                            concrete_len,
-                                        ));
-                                    }
-                                }
+                return self.with_ctx(|this, ctx| {
+                    if is_tuple(concrete_obj) {
+                        let concrete_len = w_tuple_len(concrete_obj);
+                        if index >= 0 {
+                            let index = index as usize;
+                            if index < concrete_len {
+                                return Ok(this.trace_direct_tuple_getitem(
+                                    ctx,
+                                    a,
+                                    b,
+                                    &TUPLE_TYPE as *const PyType,
+                                    tuple_items_ptr_descr(),
+                                    tuple_items_len_descr(),
+                                    index,
+                                ));
                             }
-                            this.trace_binary_value(a, b, BinaryOperator::Subscr)
-                        })
-                    },
-                );
+                        } else if let Some(abs_index) = index
+                            .checked_neg()
+                            .and_then(|value| usize::try_from(value).ok())
+                        {
+                            if abs_index <= concrete_len {
+                                return Ok(this.trace_direct_negative_tuple_getitem(
+                                    ctx,
+                                    a,
+                                    b,
+                                    &TUPLE_TYPE as *const PyType,
+                                    tuple_items_ptr_descr(),
+                                    tuple_items_len_descr(),
+                                    index,
+                                    concrete_len,
+                                ));
+                            }
+                        }
+                    } else if is_list(concrete_obj) && w_list_uses_object_storage(concrete_obj) {
+                        let concrete_len = w_list_len(concrete_obj);
+                        if index >= 0 {
+                            let index = index as usize;
+                            if index < concrete_len {
+                                return Ok(this.trace_direct_object_list_getitem(ctx, a, b, index));
+                            }
+                        } else if let Some(abs_index) = index
+                            .checked_neg()
+                            .and_then(|value| usize::try_from(value).ok())
+                        {
+                            if abs_index <= concrete_len {
+                                return Ok(this.trace_direct_negative_object_list_getitem(
+                                    ctx,
+                                    a,
+                                    b,
+                                    index,
+                                    concrete_len,
+                                ));
+                            }
+                        }
+                    } else if is_list(concrete_obj) && w_list_uses_int_storage(concrete_obj) {
+                        let concrete_len = w_list_len(concrete_obj);
+                        if index >= 0 {
+                            let index = index as usize;
+                            if index < concrete_len {
+                                return Ok(this.trace_direct_int_list_getitem(ctx, a, b, index));
+                            }
+                        } else if let Some(abs_index) = index
+                            .checked_neg()
+                            .and_then(|value| usize::try_from(value).ok())
+                        {
+                            if abs_index <= concrete_len {
+                                return Ok(this.trace_direct_negative_int_list_getitem(
+                                    ctx,
+                                    a,
+                                    b,
+                                    index,
+                                    concrete_len,
+                                ));
+                            }
+                        }
+                    } else if is_list(concrete_obj) && w_list_uses_float_storage(concrete_obj) {
+                        let concrete_len = w_list_len(concrete_obj);
+                        if index >= 0 {
+                            let index = index as usize;
+                            if index < concrete_len {
+                                return Ok(this.trace_direct_float_list_getitem(ctx, a, b, index));
+                            }
+                        } else if let Some(abs_index) = index
+                            .checked_neg()
+                            .and_then(|value| usize::try_from(value).ok())
+                        {
+                            if abs_index <= concrete_len {
+                                return Ok(this.trace_direct_negative_float_list_getitem(
+                                    ctx,
+                                    a,
+                                    b,
+                                    index,
+                                    concrete_len,
+                                ));
+                            }
+                        }
+                    }
+                    this.trace_binary_value(a, b, BinaryOperator::Subscr)
+                });
             }
         }
 
@@ -2567,21 +2481,6 @@ impl TraceFrameState {
         else {
             return self.trace_store_subscr(obj, key, value);
         };
-        let stack_suffix = [
-            (value, self.value_type(value)),
-            (obj, self.value_type(obj)),
-            (key, self.value_type(key)),
-        ];
-        let (store_fail_args, store_fail_arg_types) = self.with_ctx(|this, ctx| {
-            (
-                this.build_single_frame_fail_args_with_extra_stack(ctx, &stack_suffix),
-                this.build_single_frame_fail_arg_types_with_extra_stack(&[
-                    stack_suffix[0].1,
-                    stack_suffix[1].1,
-                    stack_suffix[2].1,
-                ]),
-            )
-        });
 
         unsafe {
             if is_list(concrete_obj)
@@ -2593,54 +2492,30 @@ impl TraceFrameState {
                 if index >= 0 {
                     let index = index as usize;
                     if index < concrete_len {
-                        return self.with_overridden_fail_args(
-                            store_fail_args.clone(),
-                            store_fail_arg_types.clone(),
-                            |this| {
-                                this.with_ctx(|this, ctx| {
-                                    this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                                    this.guard_list_strategy(ctx, obj, 0);
-                                    let len =
-                                        trace_gc_object_int_field(ctx, obj, list_items_len_descr());
-                                    let index =
-                                        this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                                    let items_ptr = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_items_ptr_descr(),
-                                    );
-                                    trace_raw_array_setitem_value(ctx, items_ptr, index, value);
-                                    Ok(())
-                                })
-                            },
-                        );
+                        return self.with_ctx(|this, ctx| {
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
+                            this.guard_list_strategy(ctx, obj, 0);
+                            let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
+                            trace_raw_array_setitem_value(ctx, items_ptr, index, value);
+                            Ok(())
+                        });
                     }
                 } else if let Some(abs_index) = index
                     .checked_neg()
                     .and_then(|value| usize::try_from(value).ok())
                 {
                     if abs_index <= concrete_len {
-                        return self.with_overridden_fail_args(
-                            store_fail_args.clone(),
-                            store_fail_arg_types.clone(),
-                            |this| {
-                                this.with_ctx(|this, ctx| {
-                                    this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                                    this.guard_list_strategy(ctx, obj, 0);
-                                    let len =
-                                        trace_gc_object_int_field(ctx, obj, list_items_len_descr());
-                                    let index =
-                                        this.trace_dynamic_list_index(ctx, key, len, index);
-                                    let items_ptr = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_items_ptr_descr(),
-                                    );
-                                    trace_raw_array_setitem_value(ctx, items_ptr, index, value);
-                                    Ok(())
-                                })
-                            },
-                        );
+                        return self.with_ctx(|this, ctx| {
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
+                            this.guard_list_strategy(ctx, obj, 0);
+                            let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
+                            trace_raw_array_setitem_value(ctx, items_ptr, index, value);
+                            Ok(())
+                        });
                     }
                 }
             } else if is_list(concrete_obj)
@@ -2653,86 +2528,56 @@ impl TraceFrameState {
                 if index >= 0 {
                     let index = index as usize;
                     if index < concrete_len {
-                        return self.with_overridden_fail_args(
-                            store_fail_args.clone(),
-                            store_fail_arg_types.clone(),
-                            |this| {
-                                this.with_ctx(|this, ctx| {
-                                    this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                                    this.guard_list_strategy(ctx, obj, 1);
-                                    let len = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_int_items_len_descr(),
-                                    );
-                                    let index =
-                                        this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                                    let items_ptr = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_int_items_ptr_descr(),
-                                    );
-                                    let fail_args = this.current_fail_args(ctx);
-                                    let raw = if this.value_type(value) == Type::Int {
-                                        value
-                                    } else {
-                                        crate::jit::generated::trace_unbox_int(
-                                            ctx,
-                                            value,
-                                            &INT_TYPE as *const _ as i64,
-                                            ob_type_descr(),
-                                            int_intval_descr(),
-                                            &fail_args,
-                                        )
-                                    };
-                                    trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
-                                    Ok(())
-                                })
-                            },
-                        );
+                        return self.with_ctx(|this, ctx| {
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
+                            this.guard_list_strategy(ctx, obj, 1);
+                            let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
+                            let fail_args = this.current_fail_args(ctx);
+                            let raw = if this.value_type(value) == Type::Int {
+                                value
+                            } else {
+                                crate::jit::generated::trace_unbox_int(
+                                    ctx,
+                                    value,
+                                    &INT_TYPE as *const _ as i64,
+                                    ob_type_descr(),
+                                    int_intval_descr(),
+                                    &fail_args,
+                                )
+                            };
+                            trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
+                            Ok(())
+                        });
                     }
                 } else if let Some(abs_index) = index
                     .checked_neg()
                     .and_then(|value| usize::try_from(value).ok())
                 {
                     if abs_index <= concrete_len {
-                        return self.with_overridden_fail_args(
-                            store_fail_args.clone(),
-                            store_fail_arg_types.clone(),
-                            |this| {
-                                this.with_ctx(|this, ctx| {
-                                    this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                                    this.guard_list_strategy(ctx, obj, 1);
-                                    let len = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_int_items_len_descr(),
-                                    );
-                                    let index =
-                                        this.trace_dynamic_list_index(ctx, key, len, index);
-                                    let items_ptr = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_int_items_ptr_descr(),
-                                    );
-                                    let fail_args = this.current_fail_args(ctx);
-                                    let raw = if this.value_type(value) == Type::Int {
-                                        value
-                                    } else {
-                                        crate::jit::generated::trace_unbox_int(
-                                            ctx,
-                                            value,
-                                            &INT_TYPE as *const _ as i64,
-                                            ob_type_descr(),
-                                            int_intval_descr(),
-                                            &fail_args,
-                                        )
-                                    };
-                                    trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
-                                    Ok(())
-                                })
-                            },
-                        );
+                        return self.with_ctx(|this, ctx| {
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
+                            this.guard_list_strategy(ctx, obj, 1);
+                            let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
+                            let fail_args = this.current_fail_args(ctx);
+                            let raw = if this.value_type(value) == Type::Int {
+                                value
+                            } else {
+                                crate::jit::generated::trace_unbox_int(
+                                    ctx,
+                                    value,
+                                    &INT_TYPE as *const _ as i64,
+                                    ob_type_descr(),
+                                    int_intval_descr(),
+                                    &fail_args,
+                                )
+                            };
+                            trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
+                            Ok(())
+                        });
                     }
                 }
             } else if is_list(concrete_obj)
@@ -2745,86 +2590,56 @@ impl TraceFrameState {
                 if index >= 0 {
                     let index = index as usize;
                     if index < concrete_len {
-                        return self.with_overridden_fail_args(
-                            store_fail_args.clone(),
-                            store_fail_arg_types.clone(),
-                            |this| {
-                                this.with_ctx(|this, ctx| {
-                                    this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                                    this.guard_list_strategy(ctx, obj, 2);
-                                    let len = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_float_items_len_descr(),
-                                    );
-                                    let index =
-                                        this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                                    let items_ptr = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_float_items_ptr_descr(),
-                                    );
-                                    let fail_args = this.current_fail_args(ctx);
-                                    let raw = if this.value_type(value) == Type::Float {
-                                        value
-                                    } else {
-                                        crate::jit::generated::trace_unbox_float(
-                                            ctx,
-                                            value,
-                                            &FLOAT_TYPE as *const _ as i64,
-                                            ob_type_descr(),
-                                            float_floatval_descr(),
-                                            &fail_args,
-                                        )
-                                    };
-                                    trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
-                                    Ok(())
-                                })
-                            },
-                        );
+                        return self.with_ctx(|this, ctx| {
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
+                            this.guard_list_strategy(ctx, obj, 2);
+                            let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
+                            let fail_args = this.current_fail_args(ctx);
+                            let raw = if this.value_type(value) == Type::Float {
+                                value
+                            } else {
+                                crate::jit::generated::trace_unbox_float(
+                                    ctx,
+                                    value,
+                                    &FLOAT_TYPE as *const _ as i64,
+                                    ob_type_descr(),
+                                    float_floatval_descr(),
+                                    &fail_args,
+                                )
+                            };
+                            trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
+                            Ok(())
+                        });
                     }
                 } else if let Some(abs_index) = index
                     .checked_neg()
                     .and_then(|value| usize::try_from(value).ok())
                 {
                     if abs_index <= concrete_len {
-                        return self.with_overridden_fail_args(
-                            store_fail_args.clone(),
-                            store_fail_arg_types.clone(),
-                            |this| {
-                                this.with_ctx(|this, ctx| {
-                                    this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                                    this.guard_list_strategy(ctx, obj, 2);
-                                    let len = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_float_items_len_descr(),
-                                    );
-                                    let index =
-                                        this.trace_dynamic_list_index(ctx, key, len, index);
-                                    let items_ptr = trace_gc_object_int_field(
-                                        ctx,
-                                        obj,
-                                        list_float_items_ptr_descr(),
-                                    );
-                                    let fail_args = this.current_fail_args(ctx);
-                                    let raw = if this.value_type(value) == Type::Float {
-                                        value
-                                    } else {
-                                        crate::jit::generated::trace_unbox_float(
-                                            ctx,
-                                            value,
-                                            &FLOAT_TYPE as *const _ as i64,
-                                            ob_type_descr(),
-                                            float_floatval_descr(),
-                                            &fail_args,
-                                        )
-                                    };
-                                    trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
-                                    Ok(())
-                                })
-                            },
-                        );
+                        return self.with_ctx(|this, ctx| {
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
+                            this.guard_list_strategy(ctx, obj, 2);
+                            let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
+                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
+                            let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
+                            let fail_args = this.current_fail_args(ctx);
+                            let raw = if this.value_type(value) == Type::Float {
+                                value
+                            } else {
+                                crate::jit::generated::trace_unbox_float(
+                                    ctx,
+                                    value,
+                                    &FLOAT_TYPE as *const _ as i64,
+                                    ob_type_descr(),
+                                    float_floatval_descr(),
+                                    &fail_args,
+                                )
+                            };
+                            trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
+                            Ok(())
+                        });
                     }
                 }
             }
@@ -5030,6 +4845,16 @@ impl PyreJitState {
         unsafe { (*namespace_ptr).len() }
     }
 
+    fn namespace_keys(&self) -> Vec<String> {
+        let Some(namespace_ptr) = self.namespace_ptr() else {
+            return Vec::new();
+        };
+        let namespace = unsafe { &*namespace_ptr };
+        let mut keys: Vec<String> = namespace.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     fn restore_single_frame(&mut self, meta: &PyreMeta, values: &[i64]) {
         let Some(&frame) = values.first() else {
             return;
@@ -5260,7 +5085,7 @@ impl JitState for PyreJitState {
         PyreMeta {
             merge_pc: header_pc,
             num_locals,
-            ns_len: self.namespace_len(),
+            ns_keys: self.namespace_keys(),
             valuestackdepth: self.valuestackdepth,
             has_virtualizable: self.has_virtualizable_info(),
             slot_types,
@@ -5327,28 +5152,11 @@ impl JitState for PyreJitState {
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        let slot_types = concrete_slot_types(self.frame, meta.num_locals, self.valuestackdepth);
-        let compatible = self.next_instr == meta.merge_pc
+        self.next_instr == meta.merge_pc
             && self.local_count() == meta.num_locals
-            && self.namespace_len() == meta.ns_len
+            && self.namespace_len() == meta.ns_keys.len()
             && self.valuestackdepth == meta.valuestackdepth
-            && slot_types == meta.slot_types;
-        if !compatible && majit_meta::majit_log_enabled() {
-            eprintln!(
-                "[jit][state-incompatible] next_instr={} meta_pc={} locals={} meta_locals={} ns={} meta_ns={} vsd={} meta_vsd={} slot_types={:?} meta_slot_types={:?}",
-                self.next_instr,
-                meta.merge_pc,
-                self.local_count(),
-                meta.num_locals,
-                self.namespace_len(),
-                meta.ns_len,
-                self.valuestackdepth,
-                meta.valuestackdepth,
-                slot_types,
-                meta.slot_types
-            );
-        }
-        compatible
+            && concrete_slot_types(self.frame, meta.num_locals, self.valuestackdepth) == meta.slot_types
     }
 
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
@@ -5491,16 +5299,10 @@ impl JitState for PyreJitState {
             .get(1)
             .map(value_to_usize)
             .unwrap_or(self.next_instr);
-        let restored_vsd = values
+        self.valuestackdepth = values
             .get(2)
             .map(value_to_usize)
             .unwrap_or(self.valuestackdepth);
-        // RPython resume.py rebuilds the resumed frame layout from the
-        // guard's resume data. Extra fail args that optimizations keep around
-        // for guards are not implicit stack suffixes and must not inflate the
-        // resumed valuestack depth. The restored VSD carried by the guard is
-        // authoritative here.
-        self.valuestackdepth = restored_vsd;
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
@@ -5522,16 +5324,8 @@ impl JitState for PyreJitState {
             }
             idx += 1;
         }
-        let synced = self.sync_scalar_fields_to_frame();
-        if synced {
-            if let Some(frame_ptr) = self.frame_ptr() {
-                let info = build_pyframe_virtualizable_info();
-                unsafe {
-                    info.reset_vable_token(frame_ptr);
-                }
-            }
-        }
-        synced
+
+        self.sync_scalar_fields_to_frame()
     }
 
     fn reconstructed_frame_value_types(
@@ -5600,25 +5394,13 @@ impl JitState for PyreJitState {
         &mut self,
         _meta: &Self::Meta,
         _virtualizable: &str,
-        info: &VirtualizableInfo,
+        _info: &VirtualizableInfo,
     ) -> bool {
-        // RPython warmstate.execute_assembler() clears the virtualizable token
-        // before entering compiled code, ensuring the backend never re-enters
-        // with a stale active token from a previous run.
-        //
-        // Pyre likewise uses the concrete PyFrame as the authoritative source
-        // of locals/stack on entry, so we refresh scalar fields and force the
-        // heap token back to TOKEN_NONE before handing control to compiled
-        // code.
-        let refreshed = self.refresh_from_frame();
-        if refreshed {
-            if let Some(frame_ptr) = self.frame_ptr() {
-                unsafe {
-                    info.reset_vable_token(frame_ptr);
-                }
-            }
-        }
-        refreshed
+        // RPython enters compiled code with the concrete virtualizable already
+        // authoritative.  PyreJitState does not maintain a detached copy of
+        // locals/stack, so importing resume-data back into the frame here
+        // would mutate the live PyFrame before the compiled trace runs.
+        self.refresh_from_frame()
     }
 
     fn sync_virtualizable_after_jit(
@@ -5724,16 +5506,6 @@ impl JitState for PyreJitState {
         // jump-arg model, the trace-start `meta.valuestackdepth` is not a
         // sound validator here.
         jump_args.len() >= 3
-    }
-
-    fn retarget_loop_close_meta(
-        meta: &Self::Meta,
-        loop_header_pc: usize,
-        _jump_args: &[OpRef],
-    ) -> Self::Meta {
-        let mut retargeted = meta.clone();
-        retargeted.merge_pc = loop_header_pc;
-        retargeted
     }
 
     /// RPython resume.py: materialize a virtual object from resume data.
@@ -5904,11 +5676,8 @@ fn extract_pyre_field_offset(descr_idx: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::GcRef;
     use majit_meta::JitState;
     use majit_meta::resume::{MaterializedValue, MaterializedVirtual};
-    use pyre_bytecode::ConstantData;
-    use pyre_interp::frame::PyFrame;
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
     use pyre_object::OB_TYPE_OFFSET;
@@ -5917,7 +5686,7 @@ mod tests {
         PyreMeta {
             merge_pc: 0,
             num_locals: 0,
-            ns_len: 0,
+            ns_keys: Vec::new(),
             valuestackdepth: 0,
             slot_types: Vec::new(),
             has_virtualizable: false,
@@ -6222,7 +5991,7 @@ mod tests {
         let meta = PyreMeta {
             merge_pc: 0,
             num_locals: 4,
-            ns_len: 0,
+            ns_keys: Vec::new(),
             valuestackdepth: 4,
             has_virtualizable: true,
             // Stale trace-entry types: all locals looked boxed refs when the
@@ -6252,56 +6021,6 @@ mod tests {
         let restored_i = state.local_at(3).expect("local i should be restored");
         assert!(unsafe { is_int(restored_i) });
         assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
-    }
-
-    #[test]
-    fn test_restore_guard_failure_values_ignores_extra_failargs_beyond_frame_shape() {
-        let source = "def f(a, b, c, d):\n    return a + b + c + d\n";
-        let module = pyre_bytecode::compile_exec(source).expect("compile failed");
-        let code = module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                ConstantData::Code { code } if code.obj_name.as_str() == "f" => Some((**code).clone()),
-                _ => None,
-            })
-            .expect("test source should contain function code");
-
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut state = PyreJitState {
-            frame: frame_ptr,
-            next_instr: 0,
-            valuestackdepth: 4,
-        };
-        let meta = PyreMeta {
-            merge_pc: 95,
-            num_locals: 14,
-            ns_len: 0,
-            valuestackdepth: 14,
-            has_virtualizable: true,
-            slot_types: vec![Type::Ref; 14],
-        };
-        let mut values = vec![
-            Value::Ref(GcRef(frame_ptr)),
-            Value::Int(95),
-            Value::Int(14),
-        ];
-        values.extend((0..14).map(|i| Value::Ref(GcRef(w_int_new(i) as usize))));
-        values.push(Value::Int(12345));
-        values.push(Value::Ref(GcRef(w_int_new(67890) as usize)));
-
-        assert!(<PyreJitState as JitState>::restore_guard_failure_values(
-            &mut state,
-            &meta,
-            &values,
-            &majit_meta::blackhole::ExceptionState::default(),
-        ));
-
-        assert_eq!(state.next_instr, 95);
-        assert_eq!(state.valuestackdepth, 14);
     }
 
     #[test]
@@ -7273,81 +6992,6 @@ mod tests {
         assert!(
             fail_args.iter().all(|arg| !arg.is_none()),
             "materialized fail args should not contain OpRef::NONE holes"
-        );
-    }
-
-    #[test]
-    fn test_store_subscr_fail_args_restore_popped_stack_operands() {
-        use pyre_bytecode::compile_exec;
-        use pyre_interp::frame::PyFrame;
-
-        let module = compile_exec("def f(a, b, c):\n    a[b] = c\nf([], 0, 0)\n")
-            .expect("test code should compile");
-        let code = module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                pyre_bytecode::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
-                    Some((**code).clone())
-                }
-                _ => None,
-            })
-            .expect("test source should contain function code");
-        let mut frame = Box::new(PyFrame::new(code));
-        let value_ref = OpRef(1);
-        let obj_ref = OpRef(2);
-        let key_ref = OpRef(3);
-        let concrete_value = w_int_new(7);
-        let concrete_obj = w_list_new(vec![w_int_new(1), w_int_new(2)]);
-        let concrete_key = w_int_new(1);
-        frame.push(concrete_value);
-        frame.push(concrete_obj);
-        frame.push(concrete_key);
-        frame.next_instr = 17;
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(4);
-        let frame_ref = OpRef(0);
-        let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.symbolic_initialized = true;
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth - 3;
-        sym.vable_next_instr = ctx.const_int(17);
-        sym.vable_valuestackdepth = ctx.const_int(sym.valuestackdepth as i64);
-        sym.symbolic_stack = vec![];
-        sym.symbolic_stack_types = vec![];
-        sym.transient_value_types.insert(value_ref, Type::Int);
-        sym.transient_value_types.insert(obj_ref, Type::Ref);
-        sym.transient_value_types.insert(key_ref, Type::Int);
-
-        let mut state = TraceFrameState {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            concrete_frame: frame_ptr,
-            ob_type_fd: trace_ob_type_descr(),
-            fallthrough_pc: 0,
-            parent_fail_args: None,
-            parent_fail_arg_types: None,
-            pending_inline_frame: None,
-        };
-
-        let extras = [(value_ref, Type::Int), (obj_ref, Type::Ref), (key_ref, Type::Int)];
-        let fail_args =
-            state.with_ctx(|this, ctx| this.build_single_frame_fail_args_with_extra_stack(ctx, &extras));
-        let fail_arg_types =
-            state.build_single_frame_fail_arg_types_with_extra_stack(&[Type::Int, Type::Ref, Type::Int]);
-
-        assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(state.with_ctx(|_, ctx| ctx.const_value(fail_args[1])), Some(17));
-        assert_eq!(
-            state.with_ctx(|_, ctx| ctx.const_value(fail_args[2])),
-            Some(frame.valuestackdepth as i64)
-        );
-        assert_eq!(&fail_args[3..], &[value_ref, obj_ref, key_ref]);
-        assert_eq!(
-            fail_arg_types,
-            vec![Type::Ref, Type::Int, Type::Int, Type::Int, Type::Ref, Type::Int]
         );
     }
 
