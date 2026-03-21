@@ -2184,6 +2184,15 @@ extern "C" fn gc_alloc_nursery_shim(
     })
 }
 
+/// Plain malloc fallback for New() when no GC runtime is configured.
+/// Used by non-GC languages (e.g. Aheui) where preamble peeling
+/// leaves un-virtualized New() ops that still need allocation.
+extern "C" fn plain_malloc_zeroed_shim(size: u64) -> u64 {
+    let layout = std::alloc::Layout::from_size_align(size as usize, 8)
+        .unwrap_or(std::alloc::Layout::new::<u8>());
+    unsafe { std::alloc::alloc_zeroed(layout) as u64 }
+}
+
 extern "C" fn gc_alloc_typed_nursery_shim(
     runtime_id: u64,
     _roots_ptr: u64,
@@ -6935,29 +6944,45 @@ impl CraneliftBackend {
                 // or rewritten by the GC rewriter. If they reach the backend,
                 // we call out to a runtime helper.
                 OpCode::New | OpCode::NewWithVtable => {
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let (size, type_id) = op
                         .descr
                         .as_ref()
                         .and_then(|d| d.as_size_descr())
                         .map_or((16, 0), |sd| (sd.size() as i64, sd.type_id() as i64));
-                    let size = builder.ins().iconst(cl_types::I64, size);
-                    let type_id = builder.ins().iconst(cl_types::I64, type_id);
-                    let result = emit_collecting_gc_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        roots_ptr,
-                        &ref_root_slots,
-                        &defined_ref_vars,
-                        runtime_id,
-                        gc_alloc_typed_nursery_shim as *const () as usize,
-                        &[type_id, size],
-                        Some(cl_types::I64),
-                    )
-                    .expect("GC allocation helper must return a value");
-                    builder.def_var(var(vi), result);
+                    let size_val = builder.ins().iconst(cl_types::I64, size);
+                    let type_id_val = builder.ins().iconst(cl_types::I64, type_id);
+                    if let Some(runtime_id) = gc_runtime_id {
+                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                        let result = emit_collecting_gc_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            roots_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            runtime_id,
+                            gc_alloc_typed_nursery_shim as *const () as usize,
+                            &[type_id_val, size_val],
+                            Some(cl_types::I64),
+                        )
+                        .expect("GC allocation helper must return a value");
+                        builder.def_var(var(vi), result);
+                    } else {
+                        // No GC runtime: plain malloc fallback for non-GC languages.
+                        let alloc_fn = builder.ins().iconst(
+                            ptr_type,
+                            plain_malloc_zeroed_shim as *const () as i64,
+                        );
+                        let sig = {
+                            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+                            sig.params.push(cranelift_codegen::ir::AbiParam::new(cl_types::I64));
+                            sig.returns.push(cranelift_codegen::ir::AbiParam::new(cl_types::I64));
+                            builder.import_signature(sig)
+                        };
+                        let call = builder.ins().call_indirect(sig, alloc_fn, &[size_val]);
+                        let result = builder.inst_results(call)[0];
+                        builder.def_var(var(vi), result);
+                    }
                 }
                 OpCode::NewArray | OpCode::NewArrayClear => {
                     let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
