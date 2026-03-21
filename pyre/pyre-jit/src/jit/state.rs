@@ -3458,13 +3458,16 @@ impl TraceFrameState {
                     this.sync_standard_virtualizable_before_residual_call(ctx);
                     // RPython parity: use CALL_ASSEMBLER_I when a token
                     // exists for the callee (compiled or pending).
-                    // RPython parity: use CALL_ASSEMBLER_I when a token
-                    // exists (compiled or pending). Pending targets have
-                    // null code_ptr — call_assembler_fast_path falls back
-                    // to force_fn (RPython compile_tmp_callback parity).
+                    // RPython parity: use CALL_ASSEMBLER_I when a compiled
+                    // token exists. Pending tokens are registered but the
+                    // direct call path crashes because force_fn never gets
+                    // called (crash in compiled code before force dispatch).
+                    // Root cause: codegen direct path for CallAssemblerI needs
+                    // to pass callee frame (inputs[0]) not outputs[0] to force_fn.
+                    // This is implemented but the compiled code itself crashes
+                    // during self-recursive dispatch — needs further codegen debug.
                     let ca_token = if is_self_recursive {
                         driver.get_loop_token_number(callee_key)
-                            .or_else(|| driver.get_pending_token_number(callee_key))
                     } else {
                         None
                     };
