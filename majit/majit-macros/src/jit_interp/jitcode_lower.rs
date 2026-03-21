@@ -387,6 +387,17 @@ impl<'c> Lowerer<'c> {
 
         // Try normal lowering
         if let Some(binding) = self.lower_value_expr(&init.expr) {
+            // When a stack pop is lowered to a JitCode register, also emit a
+            // Rust `let` binding so that subsequent un-lowered code (e.g.,
+            // complex expressions referencing the variable) can still compile.
+            // The value is 0 — only the JitCode register carries the real
+            // runtime value, but this prevents "cannot find value" errors.
+            if binding.depends_on_stack {
+                let ident = &pat_ident.ident;
+                self.statements.push(quote! {
+                    let #ident: i64 = 0;
+                });
+            }
             self.bindings.insert(pat_ident.ident.to_string(), binding);
             return Some(());
         }
