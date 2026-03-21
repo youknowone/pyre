@@ -7585,7 +7585,21 @@ fn collect_guards(
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
-            let types = infer_fail_arg_types(&refs, &value_types)?;
+            // RPython parity: use the guard descriptor's fail_arg_types when
+            // available. The tracer sets these to match the virtualizable
+            // layout (all slots as Ref/GCREF). infer_fail_arg_types re-infers
+            // from op result types, which may produce Int for values that the
+            // optimizer unboxed — but the Python frame always needs Ref.
+            let types = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+                let dt = fd.fail_arg_types();
+                if dt.len() == refs.len() {
+                    dt.to_vec()
+                } else {
+                    infer_fail_arg_types(&refs, &value_types)?
+                }
+            } else {
+                infer_fail_arg_types(&refs, &value_types)?
+            };
             (refs, types)
         } else {
             let refs: Vec<OpRef> = (0..num_inputs as u32).map(OpRef).collect();
