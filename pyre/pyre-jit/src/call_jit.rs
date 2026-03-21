@@ -251,6 +251,9 @@ pub fn maybe_handle_inline_concrete_call(
     let _suspend_inline_override = pyre_interp::call::suspend_inline_call_override();
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let _jit_depth = crate::eval::jit_call_depth_bump();
+    // RPython parity: concrete execution during tracing must not re-enter
+    // the JIT portal (eval_with_jit). Nested calls use eval_frame_plain.
+    let _plain_guard = pyre_interp::call::force_plain_eval();
     let forced = if code_ptr == frame.code as *const () {
         jit_force_self_recursive_call_raw_1(frame as *const PyFrame as i64, raw_arg)
     } else {
@@ -805,6 +808,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
+    let _plain_guard = pyre_interp::call::force_plain_eval();
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
         let bh_result = resume_in_blackhole(frame);
@@ -846,6 +850,10 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
+    // RPython parity: concrete execution during tracing must not re-enter
+    // the JIT portal. Use force_plain_eval to ensure nested calls use
+    // eval_frame_plain instead of eval_with_jit.
+    let _plain_guard = pyre_interp::call::force_plain_eval();
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
         let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
