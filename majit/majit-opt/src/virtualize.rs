@@ -873,6 +873,11 @@ impl OptVirtualize {
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
         );
 
+        // TODO: RPython parity — when GetfieldGcPureI reads intval from
+        // a known raw int (after preamble peeling virtualizes re-boxing),
+        // the raw int IS the intval. Need safe way to detect raw ints
+        // vs boxed W_IntObject refs in the body.
+
         // RPython import_state: if this is a GetfieldGcR(pool) that loads a head
         // which was virtual in the preamble, forward to the imported virtual head.
         if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {
