@@ -7871,6 +7871,37 @@ mod raw_int_postprocess_tests {
     }
 
     #[test]
+    fn unbox_call_assembler_results_rewrites_gc_pure_int_payload_unboxing() {
+        let ca = mk_op_with_descr(
+            OpCode::CallAssemblerI,
+            &[OpRef(0)],
+            1,
+            crate::make_call_assembler_descr(1, &[Type::Int], Type::Int),
+        );
+        let get_type = mk_op_with_descr(
+            OpCode::GetfieldGcPureI,
+            &[OpRef(1)],
+            2,
+            make_field_descr(0, 8, Type::Int, false),
+        );
+        let guard = Op::new(OpCode::GuardClass, &[OpRef(2), OpRef(99_999)]);
+        let get_int = mk_op_with_descr(
+            OpCode::GetfieldGcPureI,
+            &[OpRef(1)],
+            3,
+            make_field_descr(8, 8, Type::Int, true),
+        );
+        let add = mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(0)], 4);
+
+        let ops = unbox_call_assembler_results(vec![ca, get_type, guard, get_int, add]);
+
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::CallAssemblerI);
+        assert_eq!(ops[1].opcode, OpCode::IntAdd);
+        assert_eq!(ops[1].args[0], OpRef(1));
+    }
+
+    #[test]
     fn unbox_raw_force_results_rewrites_only_int_payload_unboxing() {
         let helper_const = OpRef(90_000);
         let mut constants = HashMap::new();

@@ -1971,10 +1971,9 @@ fn call_assembler_fast_path(
             let callee_frame_ptr = outputs[0];
             let trace_info = fail_descr.trace_info.lock().unwrap();
             if let Some(ref info) = *trace_info {
-                let green_key = info.header_pc;
                 let trace_id = info.trace_id;
                 drop(trace_info);
-                bridge_fn(callee_frame_ptr, fail_index, trace_id, green_key);
+                bridge_fn(callee_frame_ptr, fail_index, trace_id, 0);
             }
         }
     }
@@ -2074,10 +2073,9 @@ fn call_assembler_fast_path_heap(
             let callee_frame_ptr = outputs[0];
             let trace_info = fail_descr.trace_info.lock().unwrap();
             if let Some(ref info) = *trace_info {
-                let green_key = info.header_pc;
                 let trace_id = info.trace_id;
                 drop(trace_info);
-                bridge_fn(callee_frame_ptr, fail_index, trace_id, green_key);
+                bridge_fn(callee_frame_ptr, fail_index, trace_id, 0);
             }
         }
     }
