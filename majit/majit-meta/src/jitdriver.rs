@@ -1590,13 +1590,11 @@ impl<S: JitState> JitDriver<S> {
         trace_id: u64,
         fail_index: u32,
         state: &mut S,
-        _env: &S::Env,
-        _resume_pc: usize,
-        loop_header_pc: usize,
+        env: &S::Env,
+        resume_pc: usize,
+        _loop_header_pc: usize,
     ) -> bool {
-        // Use the compiled loop's meta so the bridge's FINISH args
-        // match the parent loop's inputargs exactly.
-        let Some(loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+        let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
             return false;
         };
 
@@ -1604,14 +1602,14 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
 
-        // Verify the current state is compatible with the loop's meta.
-        // If guard failure changed storage depths, bridge tracing cannot
-        // produce FINISH args matching the parent loop — skip.
-        if !state.is_compatible(&loop_meta) {
-            return false;
-        }
+        // RPython parity: bridge tracing starts from the state rebuilt after
+        // guard failure, not from the original loop-header metadata.
+        // compile.py handle_fail -> pyjitpl.handle_guard_failure ->
+        // rebuild_state_after_failure() resumes the current interpreter
+        // position and traces forward from there.
+        let trace_meta = state.build_meta(resume_pc, env);
 
-        let live_values = state.extract_live(&loop_meta);
+        let live_values = state.extract_live(&trace_meta);
 
         if !self
             .meta
@@ -1620,8 +1618,8 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
 
-        self.sym = Some(S::create_sym(&loop_meta, loop_header_pc));
-        self.trace_meta = Some(loop_meta);
+        self.sym = Some(S::create_sym(&trace_meta, resume_pc));
+        self.trace_meta = Some(trace_meta);
         self.bridge_info = Some((green_key, trace_id, fail_index));
         true
     }
@@ -1691,6 +1689,25 @@ impl<S: JitState> JitDriver<S> {
             live_values,
         )?;
         pre_run();
+
+        // RPython parity: schedule periodic invalidation so that compiled
+        // loops with invariant guards (e.g., push(const) → pop → guard_true)
+        // eventually return to the interpreter. The invalidation flag is
+        // checked by GUARD_NOT_INVALIDATED in the compiled code.
+        let invalidation_flag = self
+            .meta
+            .get_loop_token(key_hash)
+            .map(|t| t.invalidation_flag());
+        let _invalidation_timer = invalidation_flag.map(|flag| {
+            let flag_clone = flag.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                flag_clone.store(true, std::sync::atomic::Ordering::Release);
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!("[jit] invalidation timer fired");
+                }
+            })
+        });
 
         let result = self
             .meta
