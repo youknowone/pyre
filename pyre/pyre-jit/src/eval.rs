@@ -274,6 +274,11 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let (instruction, op_arg) = arg_state.get(code_unit);
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
+        if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
+            if pyre_interp::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize) {
+                continue;
+            }
+        }
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
             StepResult::Continue => {}
             StepResult::CloseLoop(_) => {
@@ -625,6 +630,35 @@ while i < 300:
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 224_250);
+        }
+    }
+
+    #[test]
+    fn test_nested_direct_helper_calls_stay_correct() {
+        let source = "\
+def add(a, b):
+    return a + b
+
+def mul(a, b):
+    return a * b
+
+def square(x):
+    return mul(x, x)
+
+def compute(i):
+    return add(square(i), i)
+
+s = 0
+i = 0
+while i < 300:
+    s = add(s, compute(i))
+    i = add(i, 1)";
+        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let s = *(*frame.namespace).get("s").unwrap();
+            assert_eq!(pyre_object::intobject::w_int_get_value(s), 8_977_550);
         }
     }
 

@@ -150,10 +150,24 @@ fn generate_trace_functions(out: &mut String) {
     // They mirror PyPy's RPython-generated unbox/box sequences.
 
     out.push_str(r#"
-/// Unbox a Python int object: emit GuardClass + GetfieldRawI.
+/// Unbox a Python int object: emit GuardClass + GetfieldGc(I|PureI).
 ///
 /// Auto-generated equivalent of PyPy's int_unbox annotation.
 /// Returns the raw i64 OpRef.
+fn trace_getfield_gc_int_pureornot(
+    ctx: &mut majit_meta::TraceCtx,
+    obj: majit_ir::OpRef,
+    descr: majit_ir::DescrRef,
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+    let opcode = if descr.is_always_pure() {
+        OpCode::GetfieldGcPureI
+    } else {
+        OpCode::GetfieldGcI
+    };
+    ctx.record_op_with_descr(opcode, &[obj], descr)
+}
+
 pub fn trace_unbox_int(
     ctx: &mut majit_meta::TraceCtx,
     obj: majit_ir::OpRef,
@@ -163,13 +177,13 @@ pub fn trace_unbox_int(
     fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let ob_type = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], ob_type_descr);
+    let ob_type = trace_getfield_gc_int_pureornot(ctx, obj, ob_type_descr);
     let type_const = ctx.const_int(int_type_addr);
     ctx.record_guard_typed_with_fail_args(
         OpCode::GuardClass, &[ob_type, type_const],
         vec![majit_ir::Type::Int; fail_args.len()], fail_args,
     );
-    ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], intval_descr)
+    trace_getfield_gc_int_pureornot(ctx, obj, intval_descr)
 }
 
 /// Box a raw i64 into a Python int object.
@@ -255,9 +269,23 @@ pub fn trace_int_compare(
     ctx.record_op(opcode, &[a_val, b_val])
 }
 
-/// Unbox a Python float object: emit GuardClass + GetfieldGcF.
+/// Unbox a Python float object: emit GuardClass + GetfieldGc(F|PureF).
 ///
 /// Returns the raw f64 OpRef.
+fn trace_getfield_gc_float_pureornot(
+    ctx: &mut majit_meta::TraceCtx,
+    obj: majit_ir::OpRef,
+    descr: majit_ir::DescrRef,
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+    let opcode = if descr.is_always_pure() {
+        OpCode::GetfieldGcPureF
+    } else {
+        OpCode::GetfieldGcF
+    };
+    ctx.record_op_with_descr(opcode, &[obj], descr)
+}
+
 pub fn trace_unbox_float(
     ctx: &mut majit_meta::TraceCtx,
     obj: majit_ir::OpRef,
@@ -267,13 +295,13 @@ pub fn trace_unbox_float(
     fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let ob_type = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], ob_type_descr);
+    let ob_type = trace_getfield_gc_int_pureornot(ctx, obj, ob_type_descr);
     let type_const = ctx.const_int(float_type_addr);
     ctx.record_guard_typed_with_fail_args(
         OpCode::GuardClass, &[ob_type, type_const],
         vec![majit_ir::Type::Int; fail_args.len()], fail_args,
     );
-    ctx.record_op_with_descr(OpCode::GetfieldGcF, &[obj], floatval_descr)
+    trace_getfield_gc_float_pureornot(ctx, obj, floatval_descr)
 }
 
 /// Box a raw f64 into a Python float object: emit New + SetfieldGc.
