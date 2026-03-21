@@ -235,9 +235,55 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let code_unit = code.instructions[pc];
         let (instruction, op_arg) = arg_state.get(code_unit);
 
-        // RPython finishframe() resumes the parent after the CALL. Our
-        // pending-inline replay is the concrete analogue of that handoff, so
-        // replay-only CALL sites must not become separate hot green keys.
+        // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
+        //
+        // RPython interp_jit.py/warmspot.py: jit_merge_point runs at the
+        // dispatch-loop head, but can_enter_jit is rewritten to
+        // maybe_compile_and_run() and can also start tracing from a back-edge.
+        // Keep the loop-head merge point here, but let back-edges own their
+        // own tracing/compiled dispatch too.
+        if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
+            let concrete_frame = frame as *mut PyFrame as usize;
+            let green_key = make_green_key(frame.code, pc);
+            let mut jit_state = build_jit_state(frame, info);
+            if let Some(outcome) = driver.jit_merge_point_keyed(
+                green_key,
+                pc,
+                &mut jit_state,
+                &env,
+                || {},
+                |ctx, sym| {
+                    JIT_TRACING.with(|t| t.set(true));
+                    let mut trace_frame = frame.snapshot_for_tracing();
+                    let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
+                    let _ = concrete_frame;
+                    trace_bytecode(ctx, sym, code, pc, trace_frame_ptr)
+                },
+            ) {
+                if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+                    return result;
+                }
+            }
+            if !driver.is_tracing() {
+                JIT_TRACING.with(|t| t.set(false));
+            }
+        }
+
+        // RPython perform_call()/finishframe() resumes the parent frame
+        // immediately after an inlined child returns. If tracing already
+        // concretely executed the CALL and advanced next_instr, do not replay
+        // or execute the original opcode again here.
+        if matches!(instruction, pyre_bytecode::bytecode::Instruction::Call { .. }) {
+            if frame.pending_inline_resume_pc == Some(pc) {
+                frame.pending_inline_resume_pc = None;
+                continue;
+            }
+        }
+
+        // RPython interp_jit.py places jit_merge_point at the dispatch-loop
+        // head, before any opcode-specific handoff. Keep replay-only CALL
+        // result delivery after jit_merge_point so loop headers at CALL sites
+        // still warm up under the same ownership as PyPy.
         if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
             if !frame.pending_inline_results.is_empty() {
                 frame.next_instr = pc + 1;
@@ -248,26 +294,6 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     continue;
                 }
                 frame.next_instr = pc;
-            }
-        }
-
-        // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
-        //
-        // RPython interp_jit.py only reaches can_enter_jit() from
-        // jump_absolute()/back-edges (and from function entry), not from the
-        // jit_merge_point dispatch step itself.  So the portal loop records
-        // merge points here, but back-edge warmup/compiled entry stays in the
-        // explicit StepResult::CloseLoop path below.
-        if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
-            let concrete_frame = frame as *mut PyFrame as usize;
-            if driver.is_tracing() {
-                driver.merge_point(|ctx, sym| {
-                    JIT_TRACING.with(|t| t.set(true));
-                    trace_bytecode(ctx, sym, code, pc, concrete_frame)
-                });
-            }
-            if !driver.is_tracing() {
-                JIT_TRACING.with(|t| t.set(false));
             }
         }
         frame.next_instr += 1;
@@ -401,6 +427,17 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
 
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][func-entry] probe key={} arg0={:?} tracing={} recursive_entry={} self_recursive_candidate={}",
+            green_key,
+            debug_first_arg_int(frame),
+            driver.is_tracing(),
+            in_recursive_force_entry(),
+            crate::call_jit::self_recursive_function_entry_candidate(frame),
+        );
+    }
+
     if driver.is_tracing() {
         return None;
     }
@@ -408,16 +445,15 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let counts = func_entry_counts();
     let count = counts.entry(green_key).or_insert(0);
     *count += 1;
-    let recursive_entry = in_recursive_force_entry();
     let self_recursive_candidate = crate::call_jit::self_recursive_function_entry_candidate(frame);
     let boosted = if driver.is_function_boosted(green_key) {
         true
-    } else if *count == 1 && recursive_entry && self_recursive_candidate {
-        // PyPy converges recursive hot paths by boosting the callee toward a
-        // separate function-entry trace once recursion becomes obvious.  We
-        // only fast-track entries reached through our recursive force helper,
-        // not the outermost user call, so warmup stays close to PyPy's
-        // "recursion became hot" behavior.
+    } else if *count == 1 && self_recursive_candidate {
+        // RPython routes recursive portal calls through perform_call(jitcode,
+        // ..., greenkey), so self-recursion is visible as soon as the callee
+        // re-enters at pc=0.  pyre reaches the same point through eval-time
+        // frame entry, not only through helper-boundary force paths, so
+        // boost the first self-recursive portal candidate directly.
         driver.boost_function_entry(green_key);
         true
     } else {
@@ -425,6 +461,16 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     };
 
     let function_threshold = driver.meta_interp().warm_state_ref().function_threshold();
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][func-entry] count key={} arg0={:?} count={} boosted={} threshold={}",
+            green_key,
+            debug_first_arg_int(frame),
+            *count,
+            boosted,
+            function_threshold
+        );
+    }
     if *count < function_threshold && !boosted {
         return None;
     }
@@ -446,9 +492,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
 
 fn handle_jit_outcome(
     outcome: DetailedDriverRunOutcome,
-    jit_state: &PyreJitState,
+    _jit_state: &PyreJitState,
     frame: &mut PyFrame,
-    info: &majit_meta::virtualizable::VirtualizableInfo,
+    _info: &majit_meta::virtualizable::VirtualizableInfo,
     green_key: u64,
 ) -> Option<PyResult> {
     match outcome {
@@ -497,18 +543,16 @@ fn handle_jit_outcome(
             Some(Ok(value))
         }
         DetailedDriverRunOutcome::Jump { .. } => {
-            // Jump = guard failure that restored frame state.
-            // Return None to let the caller's interpreter loop continue.
-            // in_blackhole_entry() prevents JIT re-entry from nested calls.
-            sync_jit_state_to_frame(jit_state, frame, info);
+            // RPython run_compiled path already restored the loop-header state
+            // into the virtualizable before returning a Jump outcome.
+            // Do not perform an extra interpreter-side writeback here.
+            let _ = frame;
             None
         }
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            // Guard failure: restore frame state and return to interpreter.
-            // RPython uses resume_in_blackhole here, but the interpreter
-            // fallback is sufficient when in_blackhole_entry() prevents
-            // JIT re-entry from nested calls.
-            sync_jit_state_to_frame(jit_state, frame, info);
+            // Guard-recovery paths already rebuild the restored frame state
+            // before returning to the interpreter. Avoid a second writeback.
+            let _ = frame;
             None
         }
         DetailedDriverRunOutcome::GuardFailure {
@@ -639,6 +683,38 @@ result = fib(12)";
                 driver.has_raw_int_finish(fib_key) || has_finish_protocol_hint(fib_key),
                 "recursive fib compiled finish should use the raw-int protocol"
             );
+        }
+    }
+
+    #[test]
+    fn test_recursive_fib_callable_prefers_function_entry() {
+        let source = "\
+def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+";
+        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let fib = *(*frame.namespace).get("fib").unwrap();
+            assert!(crate::call_jit::callable_prefers_function_entry(fib));
+        }
+    }
+
+    #[test]
+    fn test_nonrecursive_helper_does_not_prefer_function_entry() {
+        let source = "\
+def add(a, b):
+    return a + b
+";
+        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let add = *(*frame.namespace).get("add").unwrap();
+            assert!(!crate::call_jit::callable_prefers_function_entry(add));
         }
     }
 

@@ -965,11 +965,12 @@ impl AbstractShortPreambleBuilderState {
     }
 
     fn use_box(&mut self, result: OpRef, produced: &ProducedShortOp) -> Op {
-        if self.short_results.contains(&result) {
+        let canonical_result = produced.preamble_op.pos;
+        if self.short_results.contains(&canonical_result) {
             return produced.preamble_op.clone();
         }
         let preamble_op = produced.preamble_op.clone();
-        self.short_results.insert(result);
+        self.short_results.insert(canonical_result);
         self.short.push(preamble_op.clone());
         if preamble_op.opcode.is_ovf() {
             self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
@@ -1069,7 +1070,8 @@ impl ShortPreambleBuilder {
 
     fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
-        if self.state.short_results.contains(&result) {
+        let canonical_result = produced.preamble_op.pos;
+        if self.state.short_results.contains(&canonical_result) {
             return Some(produced.preamble_op);
         }
         if !visiting.insert(result) {
@@ -1206,7 +1208,10 @@ impl ExtendedShortPreambleBuilder {
 
     fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
-        if self.extra_state.short_results.contains(&result) || self.base_results.contains(&result) {
+        let canonical_result = produced.preamble_op.pos;
+        if self.extra_state.short_results.contains(&canonical_result)
+            || self.base_results.contains(&canonical_result)
+        {
             return Some(produced.preamble_op);
         }
         if !visiting.insert(result) {

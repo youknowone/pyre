@@ -302,6 +302,11 @@ impl TraceCtx {
         self.recorder.num_inputargs()
     }
 
+    /// Input argument types in loop-header order.
+    pub fn inputarg_types(&self) -> Vec<Type> {
+        self.recorder.inputarg_types()
+    }
+
     /// Number of traced operations recorded so far.
     pub fn num_ops(&self) -> usize {
         self.recorder.num_ops()

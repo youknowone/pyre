@@ -433,15 +433,16 @@ impl OptContext {
                     let mut op = Op::new(*opcode, &resolved_args);
                     op.pos = result_opref;
                     op.descr = descr.clone();
-                    produced.push((
-                        *source,
-                        ProducedShortOp {
-                            kind: PreambleOpKind::Pure,
-                            preamble_op: op,
-                            invented_name: *invented_name,
-                            same_as_source: *same_as_source,
-                        },
-                    ));
+                    let produced_op = ProducedShortOp {
+                        kind: PreambleOpKind::Pure,
+                        preamble_op: op,
+                        invented_name: *invented_name,
+                        same_as_source: *same_as_source,
+                    };
+                    produced.push((*source, produced_op.clone()));
+                    if *source != result_opref {
+                        produced.push((result_opref, produced_op));
+                    }
                     produced_results.push(result_opref);
                 }
                 ExportedShortOp::HeapField {
@@ -470,15 +471,16 @@ impl OptContext {
                     let mut op = Op::new(opcode, &[obj]);
                     op.pos = result_opref;
                     op.descr = Some(descr.clone());
-                    produced.push((
-                        *source,
-                        ProducedShortOp {
-                            kind: PreambleOpKind::Heap,
-                            preamble_op: op,
-                            invented_name: *invented_name,
-                            same_as_source: *same_as_source,
-                        },
-                    ));
+                    let produced_op = ProducedShortOp {
+                        kind: PreambleOpKind::Heap,
+                        preamble_op: op,
+                        invented_name: *invented_name,
+                        same_as_source: *same_as_source,
+                    };
+                    produced.push((*source, produced_op.clone()));
+                    if *source != result_opref {
+                        produced.push((result_opref, produced_op));
+                    }
                     produced_results.push(result_opref);
                 }
                 _ => return false,

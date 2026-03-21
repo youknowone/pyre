@@ -412,15 +412,12 @@ impl<S: JitState> JitDriver<S> {
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                loop_header_pc: override_key,
+                loop_header_pc: _loop_header_pc,
             } => {
-                // RPython parity: when tracing started at function entry
-                // but CloseLoop occurs at a backward jump, update the
-                // green_key so compiled loops are stored under the
-                // backward-jump target PC (matching back_edge dispatch).
-                if let Some(key) = override_key {
-                    self.meta.update_tracing_green_key(key as u64);
-                }
+                // RPython parity: the active trace green key is already
+                // retargeted by the tracer when it reaches the loop header.
+                // `loop_header_pc` is the bytecode merge point, not a hashed
+                // green key, so do not overwrite the tracing key here.
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
@@ -569,38 +566,23 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_or_run_compiled_internal(green_key, None, target_pc, state, env, pre_run)
     }
 
-    /// RPython-style jit_merge_point slow path.
+    /// RPython-style jit_merge_point dispatch hook.
     ///
     /// Called from the outer interpreter dispatch loop on every iteration.
-    /// This is the only path that bumps the hot counter and starts tracing.
-    /// If compiled code already exists, it runs it immediately instead.
+    /// This hook only feeds the active trace. Warmup counting, tracing start,
+    /// and compiled-code entry belong to `can_enter_jit`/function-entry paths.
     pub fn jit_merge_point_keyed<F>(
         &mut self,
-        green_key: u64,
-        target_pc: usize,
-        state: &mut S,
-        env: &S::Env,
-        pre_run: impl FnOnce(),
+        _green_key: u64,
+        _target_pc: usize,
+        _state: &mut S,
+        _env: &S::Env,
+        _pre_run: impl FnOnce(),
         trace_fn: F,
     ) -> Option<DetailedDriverRunOutcome>
     where
         F: FnOnce(&mut TraceCtx, &mut S::Sym) -> TraceAction,
     {
-        if self.meta.is_tracing() {
-            self.merge_point(trace_fn);
-            return None;
-        }
-        if !state.can_trace() {
-            return None;
-        }
-        if self.meta.has_compiled_loop(green_key) {
-            return Some(self.run_compiled_detailed_keyed(green_key, state, pre_run));
-        }
-        if !self.meta.warm_state_mut().counter_tick_checked(green_key) {
-            return None;
-        }
-
-        self.force_start_tracing(green_key, target_pc, state, env);
         if self.meta.is_tracing() {
             self.merge_point(trace_fn);
         }
@@ -1959,7 +1941,7 @@ mod tests {
     }
 
     #[test]
-    fn can_enter_jit_does_not_start_tracing_but_jit_merge_point_does() {
+    fn jit_merge_point_only_drives_active_trace() {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         let key = 123u64;
         let mut state = TypedRestoreState {
@@ -1969,21 +1951,6 @@ mod tests {
 
         assert!(
             driver
-                .can_enter_jit_keyed(key, 7, &mut state, &(), || {})
-                .is_none()
-        );
-        assert!(
-            driver
-                .can_enter_jit_keyed(key, 7, &mut state, &(), || {})
-                .is_none()
-        );
-        assert!(
-            !driver.is_tracing(),
-            "can_enter_jit must not start tracing from a back-edge"
-        );
-
-        assert!(
-            driver
                 .jit_merge_point_keyed(
                     key,
                     7,
@@ -1996,25 +1963,22 @@ mod tests {
         );
         assert!(
             !driver.is_tracing(),
-            "first merge_point call should only warm up"
+            "jit_merge_point must not warm up or start tracing by itself"
         );
 
         assert!(
             driver
-                .jit_merge_point_keyed(
-                    key,
-                    7,
-                    &mut state,
-                    &(),
-                    || {},
-                    |_ctx, _sym| { TraceAction::Continue }
-                )
+                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
                 .is_none()
         );
+        assert!(!driver.is_tracing(), "first back-edge should only warm up");
+
         assert!(
-            driver.is_tracing(),
-            "jit_merge_point should start tracing once the hot counter fires"
+            driver
+                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+                .is_none()
         );
+        assert!(driver.is_tracing(), "back-edge should start tracing once hot");
     }
 
     #[test]

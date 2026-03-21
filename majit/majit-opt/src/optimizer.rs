@@ -314,33 +314,22 @@ impl Optimizer {
     }
 
     fn install_imported_virtuals(&self, ctx: &mut OptContext) {
-        // Track label arg positions for non-constant virtual fields.
-        // The flatten skips constants, so non-constant fields map to
-        // consecutive label positions starting after the virtual's position.
+        let imported_label_args = self
+            .imported_label_args
+            .as_ref()
+            .expect("install_imported_virtuals requires imported_label_args");
         let mut label_slot = 0usize;
-        for iv in &self.imported_virtuals {
-            // Count non-virtual inputargs before this virtual
-            label_slot = iv.inputarg_index;
-        }
         for iv in &self.imported_virtuals {
             let virtual_head = ctx.get_replacement(OpRef(iv.inputarg_index as u32));
             let mut fields = Vec::new();
             let mut field_descrs = Vec::new();
             for (descr, field_info) in &iv.fields {
-                use crate::virtualstate::VirtualStateInfo;
-                let field_ref = match field_info {
-                    VirtualStateInfo::Constant(_) => {
-                        // Constant fields don't occupy a label arg slot
-                        Self::import_virtual_state_value(field_info, ctx)
-                    }
-                    _ => {
-                        // Non-constant fields use the next label arg slot
-                        let slot_ref = OpRef(label_slot as u32);
-                        label_slot += 1;
-                        Self::apply_imported_virtual_state(field_info, slot_ref, ctx);
-                        slot_ref
-                    }
-                };
+                let field_ref = Self::import_virtual_state_from_label_args(
+                    field_info,
+                    imported_label_args,
+                    &mut label_slot,
+                    ctx,
+                );
                 fields.push((descr.index(), field_ref));
                 field_descrs.push((descr.index(), descr.clone()));
             }
@@ -376,6 +365,174 @@ impl Optimizer {
             if let Some(descr_idx) = iv.head_load_descr_index {
                 ctx.imported_virtual_heads
                     .push((descr_idx as usize, virtual_head));
+            }
+        }
+    }
+
+    fn import_virtual_state_from_label_args(
+        info: &crate::virtualstate::VirtualStateInfo,
+        imported_label_args: &[OpRef],
+        label_slot: &mut usize,
+        ctx: &mut OptContext,
+    ) -> OpRef {
+        use crate::virtualstate::VirtualStateInfo;
+
+        match info {
+            VirtualStateInfo::Constant(_) => Self::import_virtual_state_value(info, ctx),
+            VirtualStateInfo::Virtual {
+                descr,
+                known_class,
+                fields,
+                field_descrs,
+            } => {
+                let opref = ctx.alloc_op_position();
+                let imported_fields = fields
+                    .iter()
+                    .map(|(field_idx, field_info)| {
+                        (
+                            *field_idx,
+                            Self::import_virtual_state_from_label_args(
+                                field_info,
+                                imported_label_args,
+                                label_slot,
+                                ctx,
+                            ),
+                        )
+                    })
+                    .collect();
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::Virtual(crate::info::VirtualInfo {
+                        descr: descr.clone(),
+                        known_class: *known_class,
+                        fields: imported_fields,
+                        field_descrs: field_descrs.clone(),
+                    }),
+                );
+                opref
+            }
+            VirtualStateInfo::VirtualArray { descr, items, .. } => {
+                let opref = ctx.alloc_op_position();
+                let imported_items = items
+                    .iter()
+                    .map(|item_info| {
+                        Self::import_virtual_state_from_label_args(
+                            item_info,
+                            imported_label_args,
+                            label_slot,
+                            ctx,
+                        )
+                    })
+                    .collect();
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualArray(crate::info::VirtualArrayInfo {
+                        descr: descr.clone(),
+                        items: imported_items,
+                    }),
+                );
+                opref
+            }
+            VirtualStateInfo::VirtualStruct {
+                descr,
+                fields,
+                field_descrs,
+            } => {
+                let opref = ctx.alloc_op_position();
+                let imported_fields = fields
+                    .iter()
+                    .map(|(field_idx, field_info)| {
+                        (
+                            *field_idx,
+                            Self::import_virtual_state_from_label_args(
+                                field_info,
+                                imported_label_args,
+                                label_slot,
+                                ctx,
+                            ),
+                        )
+                    })
+                    .collect();
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualStruct(crate::info::VirtualStructInfo {
+                        descr: descr.clone(),
+                        fields: imported_fields,
+                        field_descrs: field_descrs.clone(),
+                    }),
+                );
+                opref
+            }
+            VirtualStateInfo::VirtualArrayStruct {
+                descr,
+                element_fields,
+            } => {
+                let opref = ctx.alloc_op_position();
+                let imported_elements = element_fields
+                    .iter()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|(field_idx, field_info)| {
+                                (
+                                    *field_idx,
+                                    Self::import_virtual_state_from_label_args(
+                                        field_info,
+                                        imported_label_args,
+                                        label_slot,
+                                        ctx,
+                                    ),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualArrayStruct(crate::info::VirtualArrayStructInfo {
+                        descr: descr.clone(),
+                        element_fields: imported_elements,
+                    }),
+                );
+                opref
+            }
+            VirtualStateInfo::VirtualRawBuffer { size, entries } => {
+                let opref = ctx.alloc_op_position();
+                let imported_entries = entries
+                    .iter()
+                    .map(|(offset, length, entry_info)| {
+                        (
+                            *offset,
+                            *length,
+                            Self::import_virtual_state_from_label_args(
+                                entry_info,
+                                imported_label_args,
+                                label_slot,
+                                ctx,
+                            ),
+                        )
+                    })
+                    .collect();
+                ctx.set_ptr_info(
+                    opref,
+                    crate::info::PtrInfo::VirtualRawBuffer(crate::info::VirtualRawBufferInfo {
+                        size: *size,
+                        entries: imported_entries,
+                    }),
+                );
+                opref
+            }
+            VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull
+            | VirtualStateInfo::IntBounded(_)
+            | VirtualStateInfo::Unknown => {
+                let opref = imported_label_args
+                    .get(*label_slot)
+                    .copied()
+                    .expect("missing imported label arg for virtual field");
+                *label_slot += 1;
+                Self::apply_imported_virtual_state(info, opref, ctx);
+                ctx.get_replacement(opref)
             }
         }
     }
@@ -732,19 +889,12 @@ impl Optimizer {
             return resolved;
         };
 
-        if matches!(
-            info,
-            crate::info::PtrInfo::Virtual(_)
-                | crate::info::PtrInfo::VirtualStruct(_)
-                | crate::info::PtrInfo::VirtualArray(_)
-                | crate::info::PtrInfo::VirtualArrayStruct(_)
-        ) {
+        if matches!(info, crate::info::PtrInfo::Virtual(_)) {
             if !rec.insert(resolved) {
                 return resolved;
             }
-            // RPython info.py: _force_at_the_end_of_preamble() falls back to
-            // force_box() for top-level virtual ptrs. Outside the pass chain we
-            // materialize directly into new_operations via force_to_ops_direct().
+            // RPython AbstractVirtualPtrInfo._force_at_the_end_of_preamble():
+            // top-level instance-like virtuals fall back to force_box().
             let forced_ref = info.force_to_ops_direct(resolved, ctx);
             if let Some(new_info) = ctx.get_ptr_info(forced_ref).cloned() {
                 let mut updated = new_info;
@@ -754,6 +904,26 @@ impl Optimizer {
                 ctx.set_ptr_info(forced_ref, updated);
             }
             return forced_ref;
+        }
+
+        if matches!(
+            info,
+            crate::info::PtrInfo::VirtualStruct(_)
+                | crate::info::PtrInfo::VirtualArray(_)
+                | crate::info::PtrInfo::VirtualArrayStruct(_)
+                | crate::info::PtrInfo::VirtualRawBuffer(_)
+        ) {
+            if !rec.insert(resolved) {
+                return resolved;
+            }
+            // RPython AbstractStructPtrInfo/ArrayPtrInfo override
+            // _force_at_the_end_of_preamble() to recurse into children while
+            // leaving the top-level virtual in the exported virtual state.
+            info.force_at_the_end_of_preamble(|child| {
+                self.force_box_for_end_of_preamble_rec(child, ctx, rec)
+            });
+            ctx.set_ptr_info(resolved, info);
+            return resolved;
         }
 
         if info.is_virtual() {
@@ -1151,11 +1321,13 @@ impl Optimizer {
         });
         self.exported_jump_virtuals = exported_jump_virtuals;
 
-        // Discard extra_operations from force_box_for_end_of_preamble.
-        // These are force artifacts (New/SetfieldGc for exported state info)
-        // that should NOT appear in the trace output. RPython's emit_extra
-        // processes them but the results feed into exported_state, not the trace.
-        while ctx.pop_extra_operation().is_some() {}
+        // RPython export_state() flushes force artifacts into the preamble
+        // before building the exported loop state. If the loop header needs
+        // additional inputargs, the corresponding SETFIELD/SETARRAYITEM must
+        // remain in the trace rather than being silently discarded.
+        while let Some(extra) = ctx.pop_extra_operation() {
+            self.propagate_one(&extra, &mut ctx);
+        }
 
         // final_num_inputs = original inputs + virtual inputs added by passes.
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);

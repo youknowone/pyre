@@ -85,6 +85,11 @@ fn debug_instruction_window(frame: &PyFrame) -> String {
 }
 
 #[inline]
+pub(crate) extern "C" fn jit_loop_arg_box_int(raw: i64) -> i64 {
+    w_int_new(raw) as i64
+}
+
+#[inline]
 pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
     unsafe {
         if !w_func_get_closure(callable).is_null() {
@@ -93,6 +98,7 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
         let code = &*(w_func_get_code_ptr(callable) as *const pyre_bytecode::CodeObject);
         let func_name = w_func_get_name(callable);
         let mut arg_state = OpArgState::default();
+        let mut saw_self_reference = false;
 
         for code_unit in code.instructions.iter().copied() {
             let (instruction, op_arg) = arg_state.get(code_unit);
@@ -102,6 +108,7 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
                     if code.names[idx].as_str() != func_name {
                         return false;
                     }
+                    saw_self_reference = true;
                 }
                 Instruction::LoadGlobal { namei } => {
                     let raw = namei.get(op_arg) as usize;
@@ -109,6 +116,7 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
                     if code.names[name_idx].as_str() != func_name {
                         return false;
                     }
+                    saw_self_reference = true;
                 }
                 Instruction::StoreName { .. }
                 | Instruction::StoreGlobal { .. }
@@ -123,6 +131,10 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
                 | Instruction::CopyFreeVars { .. } => return false,
                 _ => {}
             }
+        }
+
+        if !saw_self_reference {
+            return false;
         }
     }
 
@@ -161,6 +173,43 @@ pub(crate) fn self_recursive_function_entry_candidate(frame: &PyFrame) -> bool {
         };
         if is_candidate && recursive_force_cache_safe(value) {
             return true;
+        }
+    }
+
+    false
+}
+
+/// Whether calling this function should prefer its own function-entry portal
+/// over caller-side trace-through.
+///
+/// This mirrors `self_recursive_function_entry_candidate(frame)` but starts
+/// from the callee object directly so caller-side inline decisions can leave
+/// recursive pure functions on the dedicated function-entry path.
+pub(crate) fn callable_prefers_function_entry(callable: PyObjectRef) -> bool {
+    unsafe {
+        if !is_func(callable) || !w_func_get_closure(callable).is_null() {
+            return false;
+        }
+        let globals = w_func_get_globals(callable);
+        let Some(namespace) = (!globals.is_null()).then_some(&*globals) else {
+            return false;
+        };
+        let code_ptr = w_func_get_code_ptr(callable);
+
+        for idx in 0..namespace.len() {
+            let Some(value) = namespace.get_slot(idx) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            let is_candidate = is_func(value)
+                && w_func_get_code_ptr(value) == code_ptr
+                && w_func_get_globals(value) == globals
+                && w_func_get_closure(value).is_null();
+            if is_candidate && recursive_force_cache_safe(value) {
+                return true;
+            }
         }
     }
 
@@ -690,6 +739,7 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
 /// the callee frame is created directly from the caller's code/globals.
 pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _force_guard = crate::eval::recursive_force_entry_bump();
     let boxed_arg_ref = boxed_arg as PyObjectRef;
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let green_key = crate::eval::make_green_key(caller.code, 0);
@@ -705,7 +755,7 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        match pyre_interp::eval::eval_loop_for_force(frame) {
+        match crate::eval::eval_with_jit(frame) {
             Ok(result) => result as i64,
             Err(err) => panic!("jit force self-recursive call boxed failed: {err}"),
         }
@@ -785,6 +835,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// additional callable metadata layer.
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _force_guard = crate::eval::recursive_force_entry_bump();
     if majit_meta::majit_log_enabled() && raw_int_arg <= 4 {
         eprintln!("[jit][force-self-recursive] enter arg={}", raw_int_arg);
     }
@@ -797,7 +848,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
+        let bh_result = match crate::eval::eval_with_jit(frame) {
             Ok(result) => result,
             Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
         };
@@ -1003,6 +1054,7 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     frame.vable_token = 0;
     frame.block_stack.clear();
     frame.pending_inline_results.clear();
+    frame.pending_inline_resume_pc = None;
 }
 
 fn create_callee_frame_impl_1_boxed(

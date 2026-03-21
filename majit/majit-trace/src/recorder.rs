@@ -234,6 +234,11 @@ impl Trace {
         self.inputargs.len()
     }
 
+    /// Input argument types in loop-header order.
+    pub fn inputarg_types(&self) -> Vec<Type> {
+        self.inputargs.iter().map(|arg| arg.tp).collect()
+    }
+
     /// Whether the trace has exceeded the maximum allowed length.
     pub fn is_too_long(&self) -> bool {
         self.ops.len() >= self.trace_limit

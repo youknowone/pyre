@@ -35,10 +35,11 @@ use pyre_interp::frame::PendingInlineResult;
 
 use crate::jit::descr::{
     bool_boolval_descr, dict_len_descr, float_floatval_descr, int_intval_descr,
+    list_float_items_heap_cap_descr,
     list_float_items_len_descr, list_float_items_ptr_descr, list_int_items_len_descr,
-    list_int_items_ptr_descr, list_items_heap_cap_descr, list_items_len_descr,
-    list_items_ptr_descr, list_strategy_descr, make_array_descr, make_field_descr,
-    namespace_values_len_descr, namespace_values_ptr_descr, ob_type_descr,
+    list_int_items_heap_cap_descr, list_int_items_ptr_descr, list_items_heap_cap_descr,
+    list_items_len_descr, list_items_ptr_descr, list_strategy_descr, make_array_descr,
+    make_field_descr, namespace_values_len_descr, namespace_values_ptr_descr, ob_type_descr,
     range_iter_current_descr, range_iter_step_descr, range_iter_stop_descr, str_len_descr,
     tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr, w_int_size_descr,
 };
@@ -607,16 +608,18 @@ fn virtualizable_fail_arg_types(slot_types: impl IntoIterator<Item = Type>) -> V
 }
 
 fn concrete_value_type(value: PyObjectRef) -> Type {
-    // RPython virtualizable.py:69 — arrayitem_extra_types = [getkind(ARRAY.OF)]
-    // For locals_cells_stack_w: ARRAY.OF = GCREF → kind = 'ref'.
-    // Frame slots always hold boxed object pointers (Ref), never raw ints.
-    // A boxed W_Int is still Ref — unboxing via GetfieldGcI produces Int.
     if value.is_null() {
         return Type::Ref;
     }
     if !looks_like_heap_ref(value) {
         // Non-heap value (e.g. PY_NULL sentinel or leaked raw int)
         return Type::Int;
+    }
+    if unsafe { is_int(value) } {
+        return Type::Int;
+    }
+    if unsafe { is_float(value) } {
+        return Type::Float;
     }
     Type::Ref
 }
@@ -1241,11 +1244,32 @@ impl TraceFrameState {
 
     pub(crate) fn store_local_value(
         &mut self,
-        _ctx: &mut TraceCtx,
+        ctx: &mut TraceCtx,
         idx: usize,
-        value: OpRef,
+        mut value: OpRef,
     ) -> Result<(), PyError> {
         let vtype = self.value_type(value);
+        let concrete_slot_type =
+            concrete_stack_value(self.concrete_frame, idx).map(concrete_value_type);
+        match (concrete_slot_type, vtype) {
+            (Some(Type::Int), Type::Ref) => {
+                value = self.trace_guarded_int_payload(ctx, value);
+            }
+            (Some(Type::Float), Type::Ref) => {
+                let fail_args = self.current_fail_args(ctx);
+                let float_type_addr = &FLOAT_TYPE as *const _ as i64;
+                value = crate::jit::generated::trace_unbox_float(
+                    ctx,
+                    value,
+                    float_type_addr,
+                    crate::jit::descr::ob_type_descr(),
+                    crate::jit::descr::float_floatval_descr(),
+                    &fail_args,
+                );
+            }
+            _ => {}
+        }
+        let stored_type = self.value_type(value);
         let s = self.sym_mut();
         if idx >= s.symbolic_locals.len() {
             return Err(PyError::type_error("local index out of range in trace"));
@@ -1254,7 +1278,11 @@ impl TraceFrameState {
         if idx >= s.symbolic_local_types.len() {
             s.symbolic_local_types.resize(idx + 1, Type::Ref);
         }
-        s.symbolic_local_types[idx] = vtype;
+        s.symbolic_local_types[idx] = match concrete_slot_type {
+            Some(Type::Int) => Type::Int,
+            Some(Type::Float) => Type::Float,
+            _ => stored_type,
+        };
         Ok(())
     }
 
@@ -1357,18 +1385,29 @@ impl TraceFrameState {
         unsafe { info.tracing_after_residual_call(obj_ptr) }
     }
 
-    /// RPython parity: virtualizable_boxes carry boxed ptrs through JUMP.
-    /// The symbolic value (OpRef) is passed directly — no re-boxing needed.
-    /// RPython's close_loop_args simply passes virtualizable_boxes[i] as-is.
+    /// Loop-carried values must follow the typed live-state contract used by
+    /// PyreMeta::slot_types / restore_values().
+    ///
+    /// In pyre's typed INT/REF/FLOAT model, integer locals cross a loop JUMP
+    /// as raw Int values, not freshly boxed W_Int objects.
     fn materialize_loop_carried_value(
         &mut self,
         _ctx: &mut TraceCtx,
         value: OpRef,
-        _concrete_value: Option<PyObjectRef>,
+        slot_type: Type,
     ) -> OpRef {
-        // RPython: JUMP args = virtualizable_boxes, already boxed ptrs.
-        // No New + SetfieldGc — just pass the symbolic value through.
-        value
+        match slot_type {
+            Type::Int => match self.value_type(value) {
+                Type::Int => value,
+                Type::Ref => {
+                    // Convert boxed W_Int back to its raw payload so the loop
+                    // header sees the typed INT stream expected by restore_values().
+                    self.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, value))
+                }
+                _ => value,
+            },
+            _ => value,
+        }
     }
 
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
@@ -1431,7 +1470,7 @@ impl TraceFrameState {
                 }
             }
         }
-        let (frame, next_instr, stack_depth, nlocals, locals, stack) = {
+        let (frame, next_instr, stack_depth, nlocals, locals, stack, local_types, stack_types) = {
             let s = self.sym();
             let stack_only = s.stack_only_depth();
             (
@@ -1441,16 +1480,18 @@ impl TraceFrameState {
                 s.nlocals,
                 s.symbolic_locals.clone(),
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
+                s.symbolic_local_types.clone(),
+                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
             )
         };
         let mut args = vec![frame, next_instr, stack_depth];
         for (idx, value) in locals.into_iter().enumerate() {
-            let concrete_value = concrete_stack_value(self.concrete_frame, idx);
-            args.push(self.materialize_loop_carried_value(ctx, value, concrete_value));
+            let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
+            args.push(self.materialize_loop_carried_value(ctx, value, slot_type));
         }
         for (stack_idx, value) in stack.into_iter().enumerate() {
-            let concrete_value = concrete_stack_value(self.concrete_frame, nlocals + stack_idx);
-            args.push(self.materialize_loop_carried_value(ctx, value, concrete_value));
+            let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
+            args.push(self.materialize_loop_carried_value(ctx, value, slot_type));
         }
         args
     }
@@ -2537,6 +2578,94 @@ impl TraceFrameState {
                     );
                     Ok(())
                 });
+            } else if is_list(concrete_list)
+                && w_list_uses_int_storage(concrete_list)
+                && w_list_can_append_without_realloc(concrete_list)
+            {
+                let concrete_len = w_list_len(concrete_list);
+                return self.with_ctx(|this, ctx| {
+                    this.guard_object_class(ctx, list, &LIST_TYPE as *const PyType);
+                    this.guard_list_strategy(ctx, list, 1);
+                    if w_list_is_inline_storage(concrete_list) {
+                        let heap_cap = ctx.record_op_with_descr(
+                            OpCode::GetfieldGcI,
+                            &[list],
+                            list_int_items_heap_cap_descr(),
+                        );
+                        this.guard_value(ctx, heap_cap, 0);
+                    } else {
+                        let len = trace_gc_object_int_field(ctx, list, list_int_items_len_descr());
+                        this.guard_value(ctx, len, concrete_len as i64);
+                    }
+                    let items_ptr = trace_gc_object_int_field(ctx, list, list_int_items_ptr_descr());
+                    let index = ctx.const_int(concrete_len as i64);
+                    let fail_args = this.current_fail_args(ctx);
+                    let raw = if this.value_type(value) == Type::Int {
+                        value
+                    } else {
+                        crate::jit::generated::trace_unbox_int(
+                            ctx,
+                            value,
+                            &INT_TYPE as *const _ as i64,
+                            ob_type_descr(),
+                            int_intval_descr(),
+                            &fail_args,
+                        )
+                    };
+                    trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
+                    let new_len = ctx.const_int((concrete_len + 1) as i64);
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[list, new_len],
+                        list_int_items_len_descr(),
+                    );
+                    Ok(())
+                });
+            } else if is_list(concrete_list)
+                && w_list_uses_float_storage(concrete_list)
+                && w_list_can_append_without_realloc(concrete_list)
+            {
+                let concrete_len = w_list_len(concrete_list);
+                return self.with_ctx(|this, ctx| {
+                    this.guard_object_class(ctx, list, &LIST_TYPE as *const PyType);
+                    this.guard_list_strategy(ctx, list, 2);
+                    if w_list_is_inline_storage(concrete_list) {
+                        let heap_cap = ctx.record_op_with_descr(
+                            OpCode::GetfieldGcI,
+                            &[list],
+                            list_float_items_heap_cap_descr(),
+                        );
+                        this.guard_value(ctx, heap_cap, 0);
+                    } else {
+                        let len =
+                            trace_gc_object_int_field(ctx, list, list_float_items_len_descr());
+                        this.guard_value(ctx, len, concrete_len as i64);
+                    }
+                    let items_ptr =
+                        trace_gc_object_int_field(ctx, list, list_float_items_ptr_descr());
+                    let index = ctx.const_int(concrete_len as i64);
+                    let fail_args = this.current_fail_args(ctx);
+                    let raw = if this.value_type(value) == Type::Float {
+                        value
+                    } else {
+                        crate::jit::generated::trace_unbox_float(
+                            ctx,
+                            value,
+                            &FLOAT_TYPE as *const _ as i64,
+                            ob_type_descr(),
+                            float_floatval_descr(),
+                            &fail_args,
+                        )
+                    };
+                    trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
+                    let new_len = ctx.const_int((concrete_len + 1) as i64);
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[list, new_len],
+                        list_float_items_len_descr(),
+                    );
+                    Ok(())
+                });
             }
         }
 
@@ -2855,6 +2984,8 @@ impl TraceFrameState {
                     .meta_interp()
                     .warm_state_ref()
                     .can_inline_callable(callee_key);
+                let callee_prefers_function_entry =
+                    crate::call_jit::callable_prefers_function_entry(concrete_callable);
                 
                 // RPython traces through regular callees, but recursive
                 // calls converge to separate functraces + call_assembler.
@@ -2865,8 +2996,41 @@ impl TraceFrameState {
                 // regular compiled-call helpers below.
                 let can_trace_through = callee_inline_eligible
                     && !is_self_recursive
+                    && !callee_prefers_function_entry
                     && nargs <= 4
                     && !callee_has_loop;
+
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][direct-call] key={} nargs={} inline_eligible={} self_recursive={} prefers_func_entry={} has_loop={} inline_active={} can_trace_through={}",
+                        callee_key,
+                        nargs,
+                        callee_inline_eligible,
+                        is_self_recursive,
+                        callee_prefers_function_entry,
+                        callee_has_loop,
+                        inline_framestack_active,
+                        can_trace_through,
+                    );
+                }
+
+                if callee_prefers_function_entry && !is_self_recursive {
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
+                    return self.with_ctx(|this, ctx| {
+                        this.guard_value(ctx, callable, concrete_callable as i64);
+                        let boxed_args = box_args_for_python_helper(this, ctx, args);
+                        let result = crate::jit::helpers::emit_trace_call_known_function(
+                            ctx,
+                            this.frame(),
+                            callable,
+                            &boxed_args,
+                        )?;
+                        this.push_call_replay_stack(ctx, callable, args, call_pc);
+                        this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                        this.pop_call_replay_stack(ctx, args.len())?;
+                        Ok(result)
+                    });
+                }
 
                 if can_trace_through {
                     if inline_framestack_active {
@@ -3399,15 +3563,21 @@ impl TraceFrameState {
         }
         self.remember_value_type(result_opref, result_type);
 
-        // Write the concrete result onto the owning caller frame so the
-        // following concrete CALL replay can consume it without a
-        // thread-global side channel.
+        // RPython finishframe()/ChangeFrame parity: once the inlined callee
+        // has concretely returned, store its result in the parent frame and
+        // advance that caller past the CALL immediately. Do not route the
+        // outermost inline result through a deferred replay queue.
         let caller_frame =
             unsafe { &mut *(self.concrete_frame as *mut pyre_interp::frame::PyFrame) };
-        pyre_interp::call::set_pending_inline_result(
-            caller_frame,
-            pending_inline_result_from_concrete(result_type, concrete_result),
-        );
+        let call_pc = self.fallthrough_pc.saturating_sub(1);
+        for _ in 0..args.len() {
+            let _ = caller_frame.pop();
+        }
+        let _ = caller_frame.pop(); // null_or_self
+        let _ = caller_frame.pop(); // callable
+        caller_frame.push(concrete_result);
+        caller_frame.next_instr = self.fallthrough_pc;
+        caller_frame.pending_inline_resume_pc = Some(call_pc);
 
         Ok(result_opref)
     }
@@ -3483,28 +3653,22 @@ impl TraceFrameState {
                             let code_ptr = w_func_get_code_ptr(concrete_callable) as *const pyre_bytecode::CodeObject;
                             (&*code_ptr).varnames.len()
                         };
-                        // Read locals from callee frame (always boxed Ref)
-                        // instead of using args directly (may be raw Int
-                        // in inline context). The callee frame was populated
-                        // by one_arg_callee_frame_helper with boxed values.
-                        let callee_ni = ctx.const_int(0);
-                        let callee_sd = ctx.const_int(callee_nlocals as i64);
-                        let mut ca_args = vec![callee_frame, callee_ni, callee_sd];
-                        let callee_arr = frame_locals_cells_stack_array(ctx, callee_frame);
-                        for i in 0..callee_nlocals {
-                            let idx = ctx.const_int(i as i64);
-                            let val = ctx.record_op_with_descr(
-                                majit_ir::OpCode::GetarrayitemGcR,
-                                &[callee_arr, idx],
-                                pyobject_array_descr(),
-                            );
-                            ca_args.push(val);
-                        }
-                        // Use the actual virtualizable input types:
-                        // [Ref(frame), Int(ni), Int(vsd), Ref(local0), ...]
-                        // This matches the compiled trace's inputargs layout.
+                        // RPython call_assembler parity: the caller must pass
+                        // the callee loop-header contract, not force all local
+                        // slots back through boxed PyObject storage. For the
+                        // raw-int self-recursive helper path, the first local
+                        // stays an Int input all the way into the callee's
+                        // function-entry trace.
+                        let ca_args = synthesize_fresh_callee_entry_args(
+                            ctx,
+                            callee_frame,
+                            &[raw_arg],
+                            callee_nlocals,
+                        );
+                        let callee_slot_types =
+                            pending_entry_slot_types_from_args(&[Type::Int], callee_nlocals, 0);
                         let ca_arg_types =
-                            fail_arg_types_for_virtualizable_state(ca_args.len());
+                            frame_entry_arg_types_from_slot_types(&callee_slot_types);
                         let ca_result = ctx.call_assembler_int_by_number_typed(
                             token_number,
                             &ca_args,
@@ -4732,11 +4896,11 @@ impl JitState for PyreJitState {
     type Sym = PyreSym;
     type Env = PyreEnv;
 
-    fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {
+    fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
         let num_locals = self.local_count();
         let slot_types = concrete_slot_types(self.frame, num_locals, self.valuestackdepth);
         PyreMeta {
-            merge_pc: self.next_instr,
+            merge_pc: header_pc,
             num_locals,
             ns_keys: self.namespace_keys(),
             valuestackdepth: self.valuestackdepth,
@@ -4762,7 +4926,7 @@ impl JitState for PyreJitState {
         let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
         let mut vals = vec![
             Value::Ref(majit_ir::GcRef(self.frame)),
-            Value::Int(self.next_instr as i64),
+            Value::Int(meta.merge_pc as i64),
             Value::Int(self.valuestackdepth as i64),
         ];
         for i in 0..nlocals {
@@ -4859,16 +5023,15 @@ impl JitState for PyreJitState {
         }
 
         if meta.has_virtualizable {
-            // Virtualizable exits carry the current frame state, not the
-            // merge-point state from `meta`.
-            self.next_instr = values
-                .get(1)
-                .map(value_to_usize)
-                .unwrap_or(self.next_instr);
-            self.valuestackdepth = values
-                .get(2)
-                .map(value_to_usize)
-                .unwrap_or(self.valuestackdepth);
+            // RPython parity:
+            // - normal compiled loop JUMPs resume at the loop header merge point
+            // - guard failures rebuild the current frame state separately via
+            //   restore_guard_failure_values()
+            //
+            // So restore_values() must treat virtualizable jump outcomes as
+            // loop-header state, not as "current opcode" state.
+            self.next_instr = meta.merge_pc;
+            self.valuestackdepth = meta.valuestackdepth;
             let nlocals = self.local_count();
             let stack_only = self.valuestackdepth.saturating_sub(nlocals);
             let mut idx = 3;
@@ -5050,6 +5213,26 @@ impl JitState for PyreJitState {
         // locals/stack, so importing resume-data back into the frame here
         // would mutate the live PyFrame before the compiled trace runs.
         self.refresh_from_frame()
+    }
+
+    fn sync_virtualizable_after_jit(
+        &mut self,
+        _meta: &Self::Meta,
+        _virtualizable: &str,
+        info: &VirtualizableInfo,
+    ) {
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
+        // RPython writes detached virtualizable_boxes back here. Pyre keeps
+        // locals/stack in the concrete PyFrame throughout execution, so after
+        // restore_values() the heap frame is already authoritative. Replaying
+        // exported resume-data back into the frame would reinterpret those
+        // live slots as detached boxes and can corrupt normal Jump recovery.
+        let _ = self.sync_scalar_fields_to_frame();
+        unsafe {
+            info.reset_vable_token(frame_ptr);
+        }
     }
 
     fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
@@ -6733,6 +6916,212 @@ mod tests {
             "float-list fast path should not use raw field loads on GC list objects"
         );
         assert!(saw_raw_array, "payload array access stays raw");
+    }
+
+    #[test]
+    fn test_list_append_value_uses_raw_int_storage_fast_path() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let mut ctx = TraceCtx::for_test(2);
+        let list = OpRef(0);
+        let value = OpRef(1);
+        let concrete_list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        unsafe {
+            assert!(w_list_uses_int_storage(concrete_list));
+            assert!(w_list_can_append_without_realloc(concrete_list));
+        }
+
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![list, value];
+        sym.symbolic_local_types = vec![Type::Ref, Type::Int];
+        sym.nlocals = 2;
+        sym.symbolic_initialized = true;
+        sym.last_popped_concrete_value = Some(concrete_list);
+        sym.transient_value_types.insert(value, Type::Int);
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        state
+            .list_append_value(list, value)
+            .expect("integer-list append fast path should trace");
+
+        let recorder = ctx.into_recorder();
+        let mut saw_raw_setitem = false;
+        let mut saw_len_update = false;
+        let mut saw_call = false;
+        let mut saw_new = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if matches!(op.opcode, OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF) {
+                saw_call = true;
+            }
+            if op.opcode == OpCode::New {
+                saw_new = true;
+            }
+            if op.opcode == OpCode::SetarrayitemRaw
+                && op.descr.as_ref().map(|d| d.index()) == Some(int_array_descr().index())
+            {
+                saw_raw_setitem = true;
+            }
+            if op.opcode == OpCode::SetfieldGc
+                && op.descr.as_ref().map(|d| d.index()) == Some(list_int_items_len_descr().index())
+            {
+                saw_len_update = true;
+            }
+        }
+
+        assert!(saw_raw_setitem, "integer-list append should write through the raw int array");
+        assert!(saw_len_update, "integer-list append should update the integer-list length field");
+        assert!(!saw_call, "integer-list append should not fall back to jit_list_append");
+        assert!(!saw_new, "integer-list append should not allocate a W_Int box in the trace");
+    }
+
+    #[test]
+    fn test_list_append_value_uses_raw_float_storage_fast_path() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let mut ctx = TraceCtx::for_test(2);
+        let list = OpRef(0);
+        let value = OpRef(1);
+        let concrete_list = w_list_new(vec![
+            pyre_object::floatobject::w_float_new(1.5),
+            pyre_object::floatobject::w_float_new(2.5),
+        ]);
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        unsafe {
+            assert!(w_list_uses_float_storage(concrete_list));
+            assert!(w_list_can_append_without_realloc(concrete_list));
+        }
+
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![list, value];
+        sym.symbolic_local_types = vec![Type::Ref, Type::Float];
+        sym.nlocals = 2;
+        sym.symbolic_initialized = true;
+        sym.last_popped_concrete_value = Some(concrete_list);
+        sym.transient_value_types.insert(value, Type::Float);
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        state
+            .list_append_value(list, value)
+            .expect("float-list append fast path should trace");
+
+        let recorder = ctx.into_recorder();
+        let mut saw_raw_setitem = false;
+        let mut saw_len_update = false;
+        let mut saw_call = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if matches!(op.opcode, OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF) {
+                saw_call = true;
+            }
+            if op.opcode == OpCode::SetarrayitemRaw
+                && op.descr.as_ref().map(|d| d.index()) == Some(float_array_descr().index())
+            {
+                saw_raw_setitem = true;
+            }
+            if op.opcode == OpCode::SetfieldGc
+                && op.descr.as_ref().map(|d| d.index()) == Some(list_float_items_len_descr().index())
+            {
+                saw_len_update = true;
+            }
+        }
+
+        assert!(saw_raw_setitem, "float-list append should write through the raw float array");
+        assert!(saw_len_update, "float-list append should update the float-list length field");
+        assert!(!saw_call, "float-list append should not fall back to jit_list_append");
+    }
+
+    #[test]
+    fn test_close_loop_args_keeps_traced_raw_int_box_identity() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.locals_cells_stack_w[0] = w_int_new(41);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(2);
+        let frame_ref = OpRef(0);
+        let local_raw = OpRef(1);
+        let mut sym = PyreSym::new_uninit(frame_ref);
+        sym.symbolic_initialized = true;
+        sym.nlocals = 1;
+        sym.valuestackdepth = 1;
+        sym.symbolic_locals = vec![local_raw];
+        sym.symbolic_local_types = vec![Type::Int];
+        sym.vable_next_instr = ctx.const_int(11);
+        sym.vable_valuestackdepth = ctx.const_int(1);
+        sym.transient_value_types.insert(local_raw, Type::Int);
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        let args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
+        assert_eq!(args.len(), 4);
+        assert_eq!(
+            args[3], local_raw,
+            "loop-close args should keep the traced raw int instead of allocating a new W_Int"
+        );
+
+        let recorder = ctx.into_recorder();
+        let mut saw_box_call = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if matches!(op.opcode, OpCode::CallI | OpCode::CallR)
+                && op.args.as_slice() == [local_raw]
+            {
+                saw_box_call = true;
+            }
+        }
+        assert!(
+            !saw_box_call,
+            "close_loop_args should not rematerialize a boxed W_Int for raw int locals"
+        );
     }
 
     #[test]
