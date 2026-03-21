@@ -2147,12 +2147,12 @@ impl TraceFrameState {
             if has_overflow {
                 this.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
             }
-            // RPython `finishframe -> make_result_of_lastop` keeps integer
-            // arithmetic as typed boxes inside the trace and only re-boxes
-            // at object-space boundaries. Keep the symbolic stack raw-int
-            // here and let helper-call boundaries box explicitly.
-            this.remember_value_type(raw_result, Type::Int);
-            Ok(raw_result)
+            // RPython parity: wrapint(space, z) re-boxes the raw int result.
+            // Record New(W_IntObject) + SetfieldGc so optimizer can virtualize.
+            // pypy/objspace/std/intobject.py:671 wrapint
+            let boxed = box_traced_raw_int(ctx, raw_result);
+            this.remember_value_type(boxed, Type::Ref);
+            Ok(boxed)
         })
     }
 

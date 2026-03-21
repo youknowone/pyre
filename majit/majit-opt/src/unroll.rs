@@ -2076,8 +2076,10 @@ fn assemble_peeled_trace(
                 || carried_source_slots.contains(&arg)
                 || alias_remap.contains_key(&arg)
                 || seen_body_defs.contains(&arg)
-                || preamble_defs.contains(&arg)
             {
+                continue;
+            }
+            if preamble_defs.contains(&arg) {
                 continue;
             }
             // Body-use-before-def: a value used in the body before its
