@@ -187,11 +187,15 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
 
     // RPython parity: after guard-restored fallback from compiled code,
     // prevent nested calls from re-entering compiled code. In RPython,
-    // blackhole's recursive calls go through portal_runner which CAN
-    // dispatch to compiled code, but the blackhole itself runs on jitcode
-    // bytecodes. Since pyre doesn't have a jitcode-based blackhole,
-    // use force_plain_eval to prevent frame corruption from nested
-    // compiled code dispatch.
+    // guard failure → resume_in_blackhole → blackhole runs on jitcode
+    // bytecodes, and nested calls go through portal_runner (which CAN
+    // dispatch to compiled code independently). Since pyre doesn't have
+    // a jitcode-based blackhole, use force_plain_eval to ensure nested
+    // calls from the guard-restored interpreter don't corrupt frame state
+    // through recursive compiled code dispatch.
+    //
+    // TODO: implement jitcode-based blackhole to allow nested compiled
+    // code dispatch (RPython blackhole.py dispatch_loop parity).
     let _plain_guard = pyre_interp::call::force_plain_eval();
     eval_loop_jit(frame)
 }
@@ -434,6 +438,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 return Some(result);
             }
         }
+        // After compiled code guard-restored fallback, re-establish the
+        // frame's array pointer. Compiled code may have read the ptr field
+        // but virtualizable sync does not write it; however fix_array_ptrs
+        // ensures inline-mode consistency for the interpreter.
+        frame.fix_array_ptrs();
         return None;
     }
 
