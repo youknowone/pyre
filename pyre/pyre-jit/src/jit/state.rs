@@ -235,19 +235,35 @@ fn box_traced_raw_int(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     )
 }
 
-fn note_inline_trace_too_long(callee_key: u64, caller_key: u64, err: &PyError) {
+fn note_inline_trace_too_long(
+    callee_key: u64,
+    caller_function_key: u64,
+    root_trace_key: u64,
+    err: &PyError,
+) {
     if err.message != "inline trace aborted" {
         return;
     }
     let (driver, _) = crate::eval::driver_pair();
     let warm_state = driver.meta_interp_mut().warm_state_mut();
     warm_state.disable_noninlinable_function(callee_key);
-    warm_state.trace_next_iteration(caller_key);
+    if callee_key == caller_function_key {
+        // RPython converges the next portal entry quickly after marking the
+        // huge function non-inlinable. pyre's function-entry path is driven
+        // by a separate function counter, so same-key recursive traces need
+        // a function-entry boost instead of only a backedge hot-counter bump.
+        warm_state.boost_function_entry(caller_function_key);
+        crate::eval::boost_local_function_entry_counter(caller_function_key);
+    } else {
+        warm_state.trace_next_iteration(root_trace_key);
+    }
     if majit_meta::majit_log_enabled() {
         eprintln!(
-            "[jit][trace-through] disable_noninlinable_function key={} trace_next_iteration caller_key={}",
+            "[jit][trace-through] disable_noninlinable_function key={} caller_function_key={} root_trace_key={} same_key={}",
             callee_key,
-            caller_key
+            caller_function_key,
+            root_trace_key,
+            callee_key == caller_function_key
         );
     }
 }
@@ -2984,6 +3000,11 @@ impl TraceFrameState {
                     .meta_interp()
                     .warm_state_ref()
                     .can_inline_callable(callee_key);
+                let concrete_arg0 = if nargs == 1 {
+                    self.concrete_call_arg_after_pops(0)
+                } else {
+                    None
+                };
                 let callee_prefers_function_entry =
                     crate::call_jit::callable_prefers_function_entry(concrete_callable);
                 
@@ -2995,10 +3016,12 @@ impl TraceFrameState {
                 // calls out of the trace-through path.  They still use the
                 // regular compiled-call helpers below.
                 let can_trace_through = callee_inline_eligible
-                    && !is_self_recursive
-                    && !callee_prefers_function_entry
                     && nargs <= 4
-                    && !callee_has_loop;
+                    && if is_self_recursive {
+                        inline_decision == majit_meta::InlineDecision::Inline
+                    } else {
+                        !callee_prefers_function_entry && !callee_has_loop
+                    };
 
                 if majit_meta::majit_log_enabled() {
                     eprintln!(
@@ -3065,6 +3088,7 @@ impl TraceFrameState {
                             let inline_too_long = err.message == "inline trace aborted";
                             note_inline_trace_too_long(
                                 callee_key,
+                                current_function_key,
                                 root_trace_green_key,
                                 &err,
                             );
@@ -3140,7 +3164,23 @@ impl TraceFrameState {
                             if !is_self_recursive {
                                 this.guard_value(ctx, callable, concrete_callable as i64);
                             }
-                            let callee_frame = if nargs == 1 {
+                            let self_recursive_raw_arg = if is_self_recursive
+                                && nargs == 1
+                                && matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) })
+                            {
+                                Some(this.trace_guarded_int_payload(ctx, args[0]))
+                            } else {
+                                None
+                            };
+                            let callee_frame = if let Some(raw_arg) = self_recursive_raw_arg {
+                                let (helper, helper_arg_types) =
+                                    one_arg_callee_frame_helper(Type::Int, true);
+                                ctx.call_ref_typed(
+                                    helper,
+                                    &[this.frame(), raw_arg],
+                                    &helper_arg_types,
+                                )
+                            } else if nargs == 1 {
                                 let (helper, helper_arg_types) = one_arg_callee_frame_helper(
                                     this.value_type(args[0]),
                                     is_self_recursive,
@@ -3150,11 +3190,7 @@ impl TraceFrameState {
                                 } else {
                                     vec![this.frame(), callable, args[0]]
                                 };
-                                ctx.call_ref_typed(
-                                    helper,
-                                    &helper_args,
-                                    &helper_arg_types,
-                                )
+                                ctx.call_ref_typed(helper, &helper_args, &helper_arg_types)
                             } else {
                                 let frame_helper = crate::call_jit::callee_frame_helper(nargs).unwrap();
                                 let mut helper_args = if is_self_recursive {
@@ -3166,16 +3202,38 @@ impl TraceFrameState {
                                 let helper_arg_types = frame_callable_arg_types(args.len());
                                 ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types)
                             };
-                            let ca_args = synthesize_fresh_callee_entry_args(
-                                ctx,
-                                callee_frame,
-                                args,
-                                callee_nlocals,
-                            );
-                            let arg_slot_types: Vec<Type> =
-                                args.iter().map(|&arg| this.value_type(arg)).collect();
-                            let callee_slot_types =
-                                pending_entry_slot_types_from_args(&arg_slot_types, callee_nlocals, 0);
+                            let (ca_args, callee_slot_types) =
+                                if let Some(raw_arg) = self_recursive_raw_arg {
+                                    (
+                                        synthesize_fresh_callee_entry_args(
+                                            ctx,
+                                            callee_frame,
+                                            &[raw_arg],
+                                            callee_nlocals,
+                                        ),
+                                        pending_entry_slot_types_from_args(
+                                            &[Type::Int],
+                                            callee_nlocals,
+                                            0,
+                                        ),
+                                    )
+                                } else {
+                                    let arg_slot_types: Vec<Type> =
+                                        args.iter().map(|&arg| this.value_type(arg)).collect();
+                                    (
+                                        synthesize_fresh_callee_entry_args(
+                                            ctx,
+                                            callee_frame,
+                                            args,
+                                            callee_nlocals,
+                                        ),
+                                        pending_entry_slot_types_from_args(
+                                            &arg_slot_types,
+                                            callee_nlocals,
+                                            0,
+                                        ),
+                                    )
+                                };
                             let ca_arg_types =
                                 frame_entry_arg_types_from_slot_types(&callee_slot_types);
                             let result = ctx.call_assembler_int_by_number_typed(
@@ -3217,6 +3275,7 @@ impl TraceFrameState {
                                     let inline_too_long = err.message == "inline trace aborted";
                                     note_inline_trace_too_long(
                                         callee_key,
+                                        current_function_key,
                                         root_trace_green_key,
                                         &err,
                                     );
@@ -3444,9 +3503,8 @@ impl TraceFrameState {
         let callee_nlocals = callee_code.varnames.len();
         let caller_namespace = caller.namespace;
         let callee_globals = unsafe { w_func_get_globals(concrete_callable) };
-        let can_skip_traced_callee_frame = !is_self_recursive
-            && callee_globals == caller_namespace
-            && callee_nlocals == args.len();
+        let can_skip_traced_callee_frame =
+            callee_globals == caller_namespace && callee_nlocals == args.len();
 
         let (callee_sym, drop_frame_opref) = if can_skip_traced_callee_frame {
             let frame = self.frame();

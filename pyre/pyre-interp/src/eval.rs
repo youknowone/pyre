@@ -4,17 +4,17 @@
 //! JIT-free: it processes bytecode instructions with no tracing,
 //! no merge points, and no compiled-code hooks.
 
-use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction, OpArgState};
+use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction};
 use pyre_object::*;
 use pyre_objspace::*;
 use pyre_runtime::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
-    build_list_from_refs, build_map_from_refs, build_tuple_from_refs, ensure_range_iter,
-    execute_opcode_step, make_function_from_code_obj, namespace_load, namespace_store,
-    range_iter_continues, range_iter_next_or_null, stack_underflow_error, unpack_sequence_exact,
-    w_code_new,
+    build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_at,
+    ensure_range_iter, execute_opcode_step, make_function_from_code_obj, namespace_load,
+    namespace_store, range_iter_continues, range_iter_next_or_null, stack_underflow_error,
+    unpack_sequence_exact, w_code_new,
 };
 
 use crate::call::call_callable;
@@ -32,7 +32,6 @@ pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
 }
 
 fn eval_loop(frame: &mut PyFrame) -> PyResult {
-    let mut arg_state = OpArgState::default();
     let code = unsafe { &*frame.code };
 
     loop {
@@ -40,8 +39,10 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
             return Ok(w_none());
         }
 
-        let code_unit = code.instructions[frame.next_instr];
-        let (instruction, op_arg) = arg_state.get(code_unit);
+        let pc = frame.next_instr;
+        let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
+            return Ok(w_none());
+        };
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
@@ -1228,6 +1229,86 @@ mod tests {
         unsafe {
             let i = *(*frame.namespace).get("i").unwrap();
             assert_eq!(w_int_get_value(i), 10);
+        }
+    }
+
+    #[test]
+    fn test_eval_loop_redecodes_opargs_after_extended_arg_jumps() {
+        let source = "\
+def fannkuch(n):
+    p = [0] * n
+    q = [0] * n
+    s = [0] * n
+    i = 0
+    while i < n:
+        p[i] = i
+        q[i] = i
+        s[i] = i
+        i = i + 1
+    maxflips = 0
+    checksum = 0
+    sign = 1
+    while True:
+        q0 = p[0]
+        if q0 != 0:
+            i = 1
+            while i < n:
+                q[i] = p[i]
+                i = i + 1
+            flips = 1
+            while True:
+                qq = q[q0]
+                if qq == 0:
+                    break
+                q[q0] = q0
+                if q0 >= 3:
+                    i = 1
+                    j = q0 - 1
+                    while i < j:
+                        t = q[i]
+                        q[i] = q[j]
+                        q[j] = t
+                        i = i + 1
+                        j = j - 1
+                q0 = qq
+                flips = flips + 1
+            if flips > maxflips:
+                maxflips = flips
+            checksum = checksum + sign * flips
+        if sign == 1:
+            t = p[0]
+            p[0] = p[1]
+            p[1] = t
+            sign = -1
+        else:
+            t = p[1]
+            p[1] = p[2]
+            p[2] = t
+            sign = 1
+            i = 2
+            while i < n:
+                sx = s[i]
+                if sx != 0:
+                    s[i] = sx - 1
+                    break
+                if i == n - 1:
+                    return 999
+                s[i] = i
+                t = p[0]
+                j = 0
+                while j < i + 1:
+                    p[j] = p[j + 1]
+                    j = j + 1
+                p[i + 1] = t
+                i = i + 1
+
+r = fannkuch(6)";
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_frame_plain(&mut frame);
+        unsafe {
+            let r = *(*frame.namespace).get("r").unwrap();
+            assert_eq!(w_int_get_value(r), 999);
         }
     }
 
