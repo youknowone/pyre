@@ -19,10 +19,8 @@ use pyre_runtime::{
 
 use pyre_interp::frame::PyFrame;
 
-// Hash-table memoization cache for self-recursive force results.
-// Safe for RawInt protocol (stores raw i64, no GC pointers).
-// Boxed protocol entries are not cached to avoid GC root issues.
-const FORCE_CACHE_SIZE: usize = 64;
+// Force cache removed: CallAssemblerI + bridge handles recursion
+// natively without memoization.
 
 thread_local! {
     static RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, FinishProtocol, Option<u64>, bool)>> =
@@ -37,10 +35,7 @@ enum FinishProtocol {
     Boxed,
 }
 
-#[inline]
-fn force_cache_index(code_key: usize, arg_key: usize) -> usize {
-    (code_key.wrapping_mul(2654435761) ^ arg_key) % FORCE_CACHE_SIZE
-}
+// force_cache_index removed
 
 #[inline]
 fn finish_protocol(green_key: u64) -> FinishProtocol {
@@ -261,66 +256,8 @@ fn self_recursive_dispatch(green_key: u64) -> (FinishProtocol, Option<u64>) {
     })
 }
 
-/// Thread-local force cache: 64-entry direct-mapped hash table.
-/// Only caches RawInt results (raw i64 values, no GC pointers).
-struct ForceCacheEntry {
-    code_key: usize,
-    arg_key: usize,
-    value: i64,
-    valid: bool,
-}
-
-thread_local! {
-    static FORCE_CACHE: std::cell::UnsafeCell<[ForceCacheEntry; FORCE_CACHE_SIZE]> = {
-        const EMPTY: ForceCacheEntry = ForceCacheEntry { code_key: 0, arg_key: 0, value: 0, valid: false };
-        std::cell::UnsafeCell::new([EMPTY; FORCE_CACHE_SIZE])
-    };
-}
-
-#[inline]
-fn force_cache_lookup(
-    _protocol: FinishProtocol,
-    _hash_idx: usize,
-    _code_key: usize,
-    _arg_key: usize,
-) -> Option<i64> {
-    None // disabled for bridge testing
-}
-
-#[inline]
-fn force_cache_store(
-    protocol: FinishProtocol,
-    hash_idx: usize,
-    code_key: usize,
-    arg_key: usize,
-    value: i64,
-) {
-    if !matches!(protocol, FinishProtocol::RawInt) {
-        return;
-    }
-    FORCE_CACHE.with(|cell| {
-        let cache = unsafe { &mut *cell.get() };
-        cache[hash_idx] = ForceCacheEntry {
-            code_key,
-            arg_key,
-            value,
-            valid: true,
-        };
-    });
-}
-
-#[inline]
-fn force_cache_arg_key(arg: PyObjectRef) -> usize {
-    if arg as usize == 0 {
-        return 0;
-    }
-    if unsafe { is_int(arg) } {
-        let v = unsafe { w_int_get_value(arg) };
-        ((v as usize) << 1) | 1
-    } else {
-        arg as usize
-    }
-}
+// Force cache implementation removed — CallAssemblerI + bridge
+// handles recursive dispatch natively.
 
 // ── Callee frame arena (RPython nursery bump equivalent) ─────────
 //
@@ -425,20 +362,8 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     frame.next_instr = 0;
     frame.valuestackdepth = nlocals;
 
-    let code_key = frame.code as usize;
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
-    let arg_key = if frame.locals_cells_stack_w.len() > 0 {
-        force_cache_arg_key(frame.locals_cells_stack_w[0])
-    } else {
-        0
-    };
-
-    // Hash-based force cache lookup (64 entries)
-    let hash_idx = force_cache_index(code_key, arg_key);
-    if let Some(cached) = force_cache_lookup(protocol, hash_idx, code_key, arg_key) {
-        return cached;
-    }
 
     if majit_meta::majit_log_enabled() {
         let arg0 = if frame.locals_cells_stack_w.len() > 0
@@ -482,33 +407,15 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         FinishProtocol::RawInt => result as i64,
         FinishProtocol::Boxed => result as i64,
     };
-    force_cache_store(protocol, hash_idx, code_key, arg_key, value);
-    match protocol {
-        // RPython parity: CallAssemblerI keeps the callee's unboxed INT
-        // result all the way through the force path as well.  Re-boxing here
-        // corrupts callers that already treat the result as a raw int.
-        FinishProtocol::RawInt => value,
-        FinishProtocol::Boxed => value,
-    }
+    value
 }
 
 fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
-    let code_key = frame.code as usize;
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
-    let arg_key = if frame.locals_cells_stack_w.len() > 0 {
-        force_cache_arg_key(frame.locals_cells_stack_w[0])
-    } else {
-        0
-    };
-
-    let hash_idx = force_cache_index(code_key, arg_key);
-    if let Some(cached) = force_cache_lookup(protocol, hash_idx, code_key, arg_key) {
-        return cached;
-    }
 
     let (driver, _) = crate::eval::driver_pair();
     if let Some(token) = driver.get_loop_token(green_key) {
@@ -531,7 +438,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
                 FinishProtocol::RawInt => normalize_direct_finish_result(protocol, raw),
                 FinishProtocol::Boxed => w_int_new(raw) as i64,
             };
-            force_cache_store(protocol, hash_idx, code_key, arg_key, value);
+            // force cache removed
             return value;
         }
     }
@@ -545,7 +452,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
                 FinishProtocol::RawInt => result as i64,
                 FinishProtocol::Boxed => result as i64,
             };
-            force_cache_store(protocol, hash_idx, code_key, arg_key, value);
+            // force cache removed
             value
         }
         Err(err) => panic!("jit force callee frame raw failed: {err}"),
@@ -559,34 +466,18 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     // RPython: blackhole interp — no blackhole_entry_bump needed.
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
-    let code_key = frame.code as usize;
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
-    let arg_key = if frame.locals_cells_stack_w.len() > 0 {
-        force_cache_arg_key(frame.locals_cells_stack_w[0])
-    } else {
-        0
-    };
 
-    let hash_idx = force_cache_index(code_key, arg_key);
-    if let Some(cached) = force_cache_lookup(protocol, hash_idx, code_key, arg_key) {
-        return cached;
-    }
-
-    // RPython: ResumeGuardForcedDescr.handle_fail() calls
-    // resume_in_blackhole() which runs the blackhole interpreter
-    // on jitcode bytecodes. This ensures no JIT re-entry.
     let result = resume_in_blackhole(frame);
 
-    let value = match protocol {
+    match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
             w_int_get_value(result)
         },
         FinishProtocol::RawInt => result as i64,
         FinishProtocol::Boxed => result as i64,
-    };
-    force_cache_store(protocol, hash_idx, code_key, arg_key, value);
-    value
+    }
 }
 
 /// RPython: blackhole.py resume_in_blackhole()
@@ -861,23 +752,12 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     let callable_ref = callable as PyObjectRef;
     let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
-    let code_key = code_ptr as usize;
-    let (protocol, token_num, memo_safe) = recursive_dispatch(callable_ref, green_key);
-    let arg_key = ((raw_int_arg as usize) << 1) | 1;
-
-    let hash_idx = force_cache_index(code_key, arg_key);
-    if memo_safe {
-        if let Some(cached) = force_cache_lookup(protocol, hash_idx, code_key, arg_key) {
-            return cached;
-        }
-    }
+    let (protocol, _token_num, _memo_safe) = recursive_dispatch(callable_ref, green_key);
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        // RPython parity: force callbacks always use blackhole, never
-        // re-enter compiled code (no execute_call_assembler_direct).
         let bh_result = resume_in_blackhole(frame);
         match protocol {
             FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
@@ -888,10 +768,6 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
         }
     };
     jit_drop_callee_frame(frame_ptr);
-
-    if memo_safe {
-        force_cache_store(protocol, hash_idx, code_key, arg_key, result);
-    }
     result
 }
 
@@ -915,23 +791,12 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let code_ptr = caller.code;
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
-    let code_key = code_ptr as usize;
     let (protocol, _token_num) = self_recursive_dispatch(green_key);
-    let arg_key = ((raw_int_arg as usize) << 1) | 1;
-
-    let hash_idx = force_cache_index(code_key, arg_key);
-    if let Some(cached) = force_cache_lookup(protocol, hash_idx, code_key, arg_key) {
-        return cached;
-    }
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        // RPython assembler_call_helper: use interpreter for the callee frame.
-        // Nested calls dispatch through call_user_function → eval_with_jit,
-        // so compiled code + bridges are used when available.
-        // The force_cache above memoizes results for repeated calls.
         let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
             Ok(result) => result,
             Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
@@ -945,7 +810,6 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
         }
     };
     jit_drop_callee_frame(frame_ptr);
-    force_cache_store(protocol, hash_idx, code_key, arg_key, result);
     if majit_meta::majit_log_enabled() && raw_int_arg <= 4 {
         eprintln!(
             "[jit][force-self-recursive] exit arg={} result={} protocol={:?}",
@@ -1083,15 +947,6 @@ extern "C" fn jit_bridge_compile_callee(
         },
         Err(e) => panic!("bridge force failed: {e}"),
     };
-
-    let code_key = frame.code as usize;
-    let arg_key = if frame.locals_cells_stack_w.len() > 0 {
-        force_cache_arg_key(frame.locals_cells_stack_w[0])
-    } else {
-        0
-    };
-    let hash_idx = force_cache_index(code_key, arg_key);
-    force_cache_store(protocol, hash_idx, code_key, arg_key, result);
 
     let bridge_inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let frame_opref = OpRef(0);
