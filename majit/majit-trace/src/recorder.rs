@@ -239,6 +239,27 @@ impl Trace {
         self.inputargs.iter().map(|arg| arg.tp).collect()
     }
 
+    /// Resolve the recorded type for each OpRef.
+    ///
+    /// Input args occupy the first contiguous OpRef range, so they can be
+    /// resolved directly. Later OpRefs are recorded operations and use the
+    /// operation result type.
+    pub fn opref_types(&self, oprefs: &[OpRef]) -> Vec<Type> {
+        oprefs
+            .iter()
+            .map(|opref| {
+                let idx = opref.0 as usize;
+                if idx < self.inputargs.len() {
+                    self.inputargs[idx].tp
+                } else {
+                    self.get_op_by_pos(*opref)
+                        .map(|op| op.result_type())
+                        .unwrap_or(Type::Int)
+                }
+            })
+            .collect()
+    }
+
     /// Whether the trace has exceeded the maximum allowed length.
     pub fn is_too_long(&self) -> bool {
         self.ops.len() >= self.trace_limit
