@@ -412,6 +412,10 @@ pub struct ShortBoxes {
     produced_order: Vec<OpRef>,
     /// shortpreamble.py: const_short_boxes
     const_short_boxes: Vec<PreambleOp>,
+    /// RPython shortpreamble.py: Const boxes are directly admissible in
+    /// produce_arg(). majit models constants as OpRef entries in OptContext,
+    /// so we track which OpRefs correspond to constants here.
+    known_constants: HashSet<OpRef>,
     /// shortpreamble.py: short_inputargs
     short_inputargs: Vec<OpRef>,
     /// shortpreamble.py: boxes_in_production
@@ -467,6 +471,7 @@ impl ShortBoxes {
             produced_short_boxes: HashMap::new(),
             produced_order: Vec::new(),
             const_short_boxes: Vec::new(),
+            known_constants: HashSet::new(),
             short_inputargs: Vec::new(),
             boxes_in_production: HashSet::new(),
             next_synthetic_pos: 0,
@@ -486,6 +491,19 @@ impl ShortBoxes {
 
     pub fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
         self.label_arg_positions.get(&opref).copied()
+    }
+
+    pub fn note_known_constant(&mut self, opref: OpRef) {
+        self.known_constants.insert(opref);
+        self.next_synthetic_pos = self.next_synthetic_pos.max(opref.0.saturating_add(1));
+    }
+
+    pub fn note_known_constants_from_ctx(&mut self, ctx: &crate::OptContext) {
+        for (idx, value) in ctx.constants.iter().enumerate() {
+            if value.is_some() {
+                self.note_known_constant(OpRef(idx as u32));
+            }
+        }
     }
 
     fn add_op(&mut self, result: OpRef, pop: PotentialShortOp) {
@@ -559,12 +577,15 @@ impl ShortBoxes {
         if self.boxes_in_production.contains(&opref) {
             return None;
         }
+        if self.known_constants.contains(&opref) {
+            return Some(opref);
+        }
         if self.potential_ops.contains_key(&opref) {
             return self
                 .materialize_one(opref)
                 .map(|produced| produced.preamble_op.pos);
         }
-        Some(opref)
+        None
     }
 
     fn pick_produced_op_index(candidates: &[ProducedShortOp], pick_other: bool) -> usize {
@@ -1216,8 +1237,13 @@ impl ExtendedShortPreambleBuilder {
     pub fn build_short_preamble_struct(&self) -> ShortPreamble {
         let mut ops = self.base_short_ops.clone();
         ops.extend(self.extra_state.short.iter().cloned());
+        let inputargs = if self.label_args.is_empty() {
+            &self.short_inputargs
+        } else {
+            &self.label_args
+        };
         build_short_preamble_struct_from_ops(
-            &self.short_inputargs,
+            inputargs,
             &ops,
             &self.used_boxes,
             &self.short_jump_args,
@@ -1855,6 +1881,34 @@ mod tests {
         sb.add_heap_op(heap);
         let produced = sb.produced_ops();
         assert_eq!(produced.len(), 2);
+    }
+
+    #[test]
+    fn test_short_boxes_reject_unknown_nonconstant_dependency() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(10)]);
+        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef(999)]);
+        pure.pos = OpRef(20);
+        sb.add_pure_op(pure);
+
+        let produced = sb.produced_ops();
+        assert!(produced.is_empty());
+    }
+
+    #[test]
+    fn test_short_boxes_accept_known_constant_dependency() {
+        let mut sb = ShortBoxes::with_label_args(&[OpRef(10)]);
+        sb.note_known_constant(OpRef(999));
+        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef(999)]);
+        pure.pos = OpRef(20);
+        sb.add_pure_op(pure);
+
+        let produced = sb.produced_ops();
+        assert_eq!(produced.len(), 2);
+        let pure = produced
+            .iter()
+            .find(|(result, _)| *result == OpRef(20))
+            .expect("missing produced pure op");
+        assert_eq!(pure.1.preamble_op.args.as_slice(), &[OpRef(10), OpRef(999)]);
     }
 
     #[test]

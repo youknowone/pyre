@@ -769,8 +769,11 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let _recursive_entry = crate::eval::recursive_force_entry_bump();
-        match crate::eval::eval_with_jit(frame) {
+        // RPython parity: force callbacks use interpreter without JIT re-entry.
+        // blackhole_entry_bump prevents try_function_entry_jit from re-entering
+        // compiled code for THIS call, avoiding infinite guard-fail loops.
+        let _bh_guard = crate::eval::blackhole_entry_bump();
+        match pyre_interp::eval::eval_loop_for_force(frame) {
             Ok(result) => result as i64,
             Err(err) => panic!("jit force self-recursive call boxed failed: {err}"),
         }
@@ -884,16 +887,18 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let _recursive_entry = crate::eval::recursive_force_entry_bump();
-        match crate::eval::eval_with_jit(frame) {
-            Ok(result) => match protocol {
-                FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-                    w_int_get_value(result)
-                },
-                FinishProtocol::RawInt => result as i64,
-                FinishProtocol::Boxed => result as i64,
-            },
+        // RPython parity: force callbacks use interpreter without JIT re-entry.
+        let _bh_guard = crate::eval::blackhole_entry_bump();
+        let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
+            Ok(result) => result,
             Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
+        };
+        match protocol {
+            FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
+                w_int_get_value(bh_result)
+            },
+            FinishProtocol::RawInt => bh_result as i64,
+            FinishProtocol::Boxed => bh_result as i64,
         }
     };
     jit_drop_callee_frame(frame_ptr);

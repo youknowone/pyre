@@ -761,6 +761,10 @@ impl OptUnroll {
         let exported_short_boxes = ctx.exported_short_boxes.clone();
 
         ExportedState::new(
+            // RPython unroll.py exports:
+            //   ExportedState(label_args, end_args, ...)
+            // where `label_args` become end_args for the peeled preamble and
+            // `end_args` are the next_iteration_args used by import_state().
             label_args.clone(),
             end_args,
             virtual_state,
@@ -1084,14 +1088,20 @@ impl OptUnroll {
         let source_slots = exported_state
             .virtual_state
             .make_inputarg_source_slots(targetargs);
-        ctx.initialize_imported_short_preamble_builder(
-            &label_args,
-            &exported_state.short_inputargs,
-            &exported_state.exported_short_boxes,
-        );
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
         self.import_short_preamble_ops(&short_args, exported_state, ctx);
+        if !ctx.initialize_imported_short_preamble_builder_from_exported_ops(
+            &short_args,
+            &exported_state.short_inputargs,
+            &exported_state.exported_short_ops,
+        ) {
+            ctx.initialize_imported_short_preamble_builder(
+                &label_args,
+                &exported_state.short_inputargs,
+                &exported_state.exported_short_boxes,
+            );
+        }
         label_args
     }
 
@@ -1817,48 +1827,6 @@ fn assemble_peeled_trace(
             .copied()
             .unwrap_or(*arg)
     }));
-
-    // RPython parity: ensure all preamble-defined values referenced by the
-    // loop body are carried through the Label as block parameters. Without
-    // this, cranelift's SSA builder cannot see preamble variables from the
-    // loop block. RPython handles this via VirtualState.make_inputargs which
-    // includes all live boxes.
-    {
-        let mut preamble_defs: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
-        for op in &result {
-            if op.result_type() != Type::Void && !op.pos.is_none() {
-                preamble_defs.insert(op.pos);
-            }
-        }
-        let label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
-        // Also include inputargs (OpRef(0)..OpRef(num_inputs-1))
-        let mut all_known: std::collections::HashSet<OpRef> = label_set.clone();
-        for i in 0..body_num_inputs {
-            all_known.insert(OpRef(i as u32));
-        }
-        for op in p2_ops {
-            for &arg in &op.args {
-                if arg.is_none() || constants.contains_key(&arg.0) {
-                    continue;
-                }
-                if preamble_defs.contains(&arg) && !all_known.contains(&arg) {
-                    full_label_args.push(arg);
-                    all_known.insert(arg);
-                }
-            }
-            if let Some(ref fa) = op.fail_args {
-                for &arg in fa.iter() {
-                    if arg.is_none() || constants.contains_key(&arg.0) {
-                        continue;
-                    }
-                    if preamble_defs.contains(&arg) && !all_known.contains(&arg) {
-                        full_label_args.push(arg);
-                        all_known.insert(arg);
-                    }
-                }
-            }
-        }
-    }
 
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
     label_op.pos = OpRef(label_pos);
@@ -3815,6 +3783,39 @@ mod tests {
         assert_eq!(combined[2].args.as_slice(), &[OpRef(10), OpRef(50)]);
         assert_eq!(combined[3].opcode, OpCode::Jump);
         assert_eq!(combined[3].args.as_slice(), &[OpRef(10)]);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_does_not_carry_preamble_defs_from_fail_args() {
+        let p1_ops = vec![{
+            let mut op = Op::new(OpCode::New, &[]);
+            op.pos = OpRef(50);
+            op
+        }];
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
+        guard.fail_args = Some(vec![OpRef(10), OpRef(50)].into());
+        let p2_ops = vec![guard, Op::new(OpCode::Jump, &[OpRef(10)])];
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef(10)],
+            &[OpRef(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+
+        assert_eq!(combined[1].opcode, OpCode::Label);
+        assert_eq!(combined[1].args.as_slice(), &[OpRef(10)]);
+        assert_eq!(
+            combined[2].fail_args.as_ref().expect("guard fail args").as_slice(),
+            &[OpRef(10), OpRef(50)]
+        );
     }
 
     #[test]

@@ -920,19 +920,12 @@ impl Optimizer {
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Phase 2 leaves lazy sets pending so virtuals aren't forced.
         if !self.skip_flush {
-            // RPython: flush (once) + drain. Lazy sets re-stored during
-            // drain remain — they're lost (RPython keeps them for the
-            // next guard/call boundary, but majit's trace ends here).
+            // RPython: flush → force_all_lazy_sets → force_lazy_set →
+            // emit_extra(op, emit=False) → re-process → re-store → LOST.
+            // The cache is updated but the op is dropped. Phase 2 body
+            // reads from the imported heap cache, not from memory.
+            // Call-triggered force (during trace) already emitted writebacks.
             self.flush(&mut ctx);
-            if ctx.has_extra_operations() {
-                self.drain_extra_operations_from(0, &mut ctx);
-            }
-            // After 1st drain, any lazy sets re-stored by OptHeap have concrete
-            // (non-virtual) values. Emit them directly without re-entering the
-            // pass chain (which would re-store them as lazy_set again).
-            for pass in &mut self.passes {
-                pass.emit_remaining_lazy_directly(&mut ctx);
-            }
         }
 
         // Transfer exported virtual state from context to optimizer
