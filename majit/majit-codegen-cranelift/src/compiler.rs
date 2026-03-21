@@ -4963,10 +4963,8 @@ impl CraneliftBackend {
                         None
                     };
 
-                    // RPython parity: always use the shim path which calls
-                    // call_assembler_fast_path → handles Finish/guard-fail/bridge.
-                    // The direct path is an optimization for the future.
-                    let use_direct = false;
+                    let has_primitive_result = finish_index.is_some() || resolved_target.is_none();
+                    let use_direct = dispatch_slot_addr.is_some() && has_primitive_result;
 
                     if use_direct {
                         let slot_addr = dispatch_slot_addr.unwrap();
