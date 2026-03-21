@@ -2172,13 +2172,18 @@ fn assemble_peeled_trace(
         .iter()
         .map(|s| (s.result, s.source))
         .collect();
+    // Use a separate position counter for extra SameAs ops, starting after
+    // label_pos to avoid colliding with it or with imported_short_aliases.
+    // Do NOT modify max_pos — it's used by body-use-before-def below and
+    // changing it breaks int loops where no extra SameAs is generated.
+    let mut extra_pos = next_free_pos(label_pos.saturating_add(1));
     for &arg in &filtered_extra_label_args {
         let mapped = alias_remap.get(&arg).copied().unwrap_or(arg);
         if !preamble_defs.contains(&mapped) {
             if let Some(&source) = short_source_map.get(&arg) {
                 if preamble_defs.contains(&source) {
-                    let pos = OpRef(max_pos);
-                    max_pos = next_free_pos(max_pos.saturating_add(1));
+                    let pos = OpRef(extra_pos);
+                    extra_pos = next_free_pos(extra_pos.saturating_add(1));
                     let mut op = Op::new(OpCode::SameAsI, &[source]);
                     op.pos = pos;
                     alias_remap.insert(arg, pos);
@@ -2187,6 +2192,7 @@ fn assemble_peeled_trace(
             }
         }
     }
+    let extra_label_start_idx = full_label_args.len();
     full_label_args.extend(
         filtered_extra_label_args
             .iter()
@@ -2300,12 +2306,13 @@ fn assemble_peeled_trace(
     // appended label args. Remap the original carried source refs to the
     // appended label args so phase-2 body ops keep seeing the extended
     // loop-header contract instead of dangling preamble positions.
-    for (&source_slot, &extended_label_arg) in filtered_extra_label_args
-        .iter()
-        .zip(full_label_args.iter().skip(label_args.len()))
-    {
+    // Use extra_label_start_idx (not label_args.len()) because
+    // body-use-before-def may insert entries between label_args and extras.
+    for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if !source_slot.is_none() {
-            input_remap.insert(source_slot, extended_label_arg);
+            if let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) {
+                input_remap.insert(source_slot, extended_label_arg);
+            }
         }
     }
     for (idx, op) in p2_ops.iter().enumerate() {
