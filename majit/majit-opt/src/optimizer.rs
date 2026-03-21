@@ -13,7 +13,7 @@ use crate::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRef, Type};
 
 /// The optimizer: chains passes and runs them over a trace.
 ///
@@ -79,6 +79,28 @@ pub struct Optimizer {
     pub skip_flush: bool,
     /// Preserved final context after optimization, for jump_to_existing_trace.
     pub final_ctx: Option<OptContext>,
+}
+
+fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
+    let result_type = ops
+        .iter()
+        .find(|op| op.pos == opref)
+        .map(|op| op.result_type())
+        .unwrap_or(Type::Int);
+    match result_type {
+        Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
+        Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
+        Type::Int | Type::Void => majit_ir::Value::Int(raw),
+    }
+}
+
+fn value_to_backend_constant_bits(value: &majit_ir::Value) -> i64 {
+    match value {
+        majit_ir::Value::Int(v) => *v,
+        majit_ir::Value::Ref(r) => r.0 as i64,
+        majit_ir::Value::Float(f) => f.to_bits() as i64,
+        majit_ir::Value::Void => 0,
+    }
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.
@@ -589,9 +611,9 @@ impl Optimizer {
         let resolved = ctx.get_replacement(opref);
         if let Some(tracked) = ctx.take_potential_extra_op(resolved) {
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
+                let _ = builder.use_box(tracked.result);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
+                let _ = builder.use_box(tracked.result);
             }
         }
         // Check if any pass considers this a virtual.
@@ -807,9 +829,10 @@ impl Optimizer {
 
     /// Run all optimization passes, with known constants pre-populated.
     ///
-    /// `constants` maps OpRef indices to their integer values. This allows the
-    /// optimizer to constant-fold and eliminate guards on known-constant values
-    /// (e.g., constants from the trace's constant pool).
+    /// `constants` maps OpRef indices to raw backend bits. RPython keeps typed
+    /// Const boxes in the optimized trace; majit threads the same information
+    /// through this side table and recovers Int/Ref/Float from the producing
+    /// op's result type.
     ///
     /// After optimization, newly-discovered constants (from constant folding)
     /// are written back into the map so the backend can resolve them.
@@ -830,7 +853,7 @@ impl Optimizer {
         constants: &mut std::collections::HashMap<u32, i64>,
         num_inputs: usize,
     ) -> Vec<Op> {
-        use majit_ir::{OpRef, Value};
+        use majit_ir::OpRef;
         self.imported_label_args = None;
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
@@ -846,7 +869,7 @@ impl Optimizer {
 
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {
-            ctx.make_constant(OpRef(idx), Value::Int(val));
+            ctx.make_constant(OpRef(idx), value_from_backend_constant_bits(OpRef(idx), val, ops));
         }
 
         // Setup all passes
@@ -890,8 +913,19 @@ impl Optimizer {
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Phase 2 leaves lazy sets pending so virtuals aren't forced.
         if !self.skip_flush {
+            // RPython: flush (once) + drain. Lazy sets re-stored during
+            // drain remain — they're lost (RPython keeps them for the
+            // next guard/call boundary, but majit's trace ends here).
             self.flush(&mut ctx);
-            self.drain_extra_operations_from(0, &mut ctx);
+            if ctx.has_extra_operations() {
+                self.drain_extra_operations_from(0, &mut ctx);
+            }
+            // After 1st drain, any lazy sets re-stored by OptHeap have concrete
+            // (non-virtual) values. Emit them directly without re-entering the
+            // pass chain (which would re-store them as lazy_set again).
+            for pass in &mut self.passes {
+                pass.emit_remaining_lazy_directly(&mut ctx);
+            }
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -931,6 +965,7 @@ impl Optimizer {
             preview_short_args.extend(preview_virtuals);
             let mut short_boxes =
                 crate::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
+            short_boxes.note_known_constants_from_ctx(&ctx);
             for &arg in &preview_short_args {
                 short_boxes.add_short_input_arg(arg);
             }
@@ -938,12 +973,25 @@ impl Optimizer {
             let produced = short_boxes.produced_ops();
             ctx.exported_short_boxes = produced
                 .into_iter()
-                .map(|(result, produced)| crate::shortpreamble::PreambleOp {
-                    op: produced.preamble_op,
-                    kind: produced.kind,
-                    label_arg_idx: short_boxes.lookup_label_arg(result),
-                    invented_name: produced.invented_name,
-                    same_as_source: produced.same_as_source,
+                .map(|(result, produced)| {
+                    let canonical_result = ctx.get_replacement(result);
+                    let mut preamble_op = produced.preamble_op;
+                    preamble_op.pos = ctx.get_replacement(preamble_op.pos);
+                    for arg in &mut preamble_op.args {
+                        *arg = ctx.get_replacement(*arg);
+                    }
+                    if let Some(fail_args) = preamble_op.fail_args.as_mut() {
+                        for arg in fail_args {
+                            *arg = ctx.get_replacement(*arg);
+                        }
+                    }
+                    crate::shortpreamble::PreambleOp {
+                        op: preamble_op,
+                        kind: produced.kind,
+                        label_arg_idx: short_boxes.lookup_label_arg(canonical_result),
+                        invented_name: produced.invented_name,
+                        same_as_source: produced.same_as_source.map(|src| ctx.get_replacement(src)),
+                    }
                 })
                 .collect();
             if std::env::var_os("MAJIT_LOG").is_some() {
@@ -1111,8 +1159,10 @@ impl Optimizer {
 
         // Export newly-discovered constants back to the caller's map.
         for (idx, val) in ctx.constants.iter().enumerate() {
-            if let Some(Value::Int(v)) = val {
-                constants.entry(idx as u32).or_insert(*v);
+            if let Some(value) = val {
+                constants
+                    .entry(idx as u32)
+                    .or_insert_with(|| value_to_backend_constant_bits(value));
             }
         }
 
@@ -1222,7 +1272,28 @@ impl Optimizer {
     /// When emitting a guard, check replaces_guard to see if this guard
     /// should replace a previously emitted one (guard strengthening).
     /// Also track last_guard_op for consecutive guard descriptor sharing.
+    /// RPython optimizer.py:623-625: _emit_operation calls force_box(arg)
+    /// on every arg before final emission. In majit, this forces any remaining
+    /// virtual args that weren't caught by pass-level handlers.
     fn emit_with_guard_check(&mut self, mut op: Op, ctx: &mut OptContext) {
+        // RPython optimizer.py:623-625: _emit_operation calls force_box on
+        // args before emission. SetfieldGc/SetarrayitemGc go to OptHeap's
+        // lazy_set and never reach _emit_operation. Only force for ops
+        // that actually reach final emission with potentially virtual args.
+        if !matches!(op.opcode,
+            OpCode::SetfieldGc | OpCode::SetfieldRaw
+            | OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw)
+        {
+            for i in 0..op.num_args() {
+                let arg = ctx.get_replacement(op.arg(i));
+                if let Some(mut info) = ctx.get_ptr_info(arg).cloned() {
+                    if info.is_virtual() {
+                        let forced = info.force_to_ops(arg, ctx);
+                        op.args[i] = forced;
+                    }
+                }
+            }
+        }
         if op.opcode.is_guard() {
             // optimizer.py: store_final_boxes_in_guard — encode virtual
             // objects in fail_args as rd_virtuals instead of forcing them.
@@ -1496,6 +1567,25 @@ mod tests {
         }
     }
 
+    struct RemoveAsTypedConstant {
+        target: OpRef,
+        value: majit_ir::Value,
+    }
+
+    impl Optimization for RemoveAsTypedConstant {
+        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+            if op.pos == self.target {
+                ctx.make_constant(op.pos, self.value.clone());
+                return OptimizationResult::Remove;
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "remove_as_typed_constant"
+        }
+    }
+
     #[derive(Debug)]
     struct TestDescr(u32);
 
@@ -1642,6 +1732,67 @@ mod tests {
         assert_eq!(result[0].pos, OpRef(3));
         assert_eq!(result[0].arg(0), OpRef(2));
         assert_eq!(constants.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn test_imports_typed_ref_and_float_constants_from_backend_map() {
+        let mut opt = Optimizer::new();
+        let ptr = majit_ir::GcRef(0x1234);
+        let float = 3.25f64;
+
+        let mut ops = vec![
+            Op::new(OpCode::SameAsR, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::Jump, &[OpRef(2), OpRef(3)]),
+        ];
+        ops[0].pos = OpRef(2);
+        ops[1].pos = OpRef(3);
+        ops[2].pos = OpRef(4);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(2, ptr.0 as i64);
+        constants.insert(3, float.to_bits() as i64);
+
+        let _ = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+        let ctx = opt.final_ctx.as_ref().expect("optimizer should preserve final ctx");
+
+        assert_eq!(ctx.get_constant(OpRef(2)), Some(&majit_ir::Value::Ref(ptr)));
+        assert_eq!(
+            ctx.get_constant(OpRef(3)),
+            Some(&majit_ir::Value::Float(float))
+        );
+    }
+
+    #[test]
+    fn test_exports_typed_ref_and_float_constants_back_to_backend_map() {
+        let mut opt = Optimizer::new();
+        let ptr = majit_ir::GcRef(0x5678);
+        let float = 9.5f64;
+        opt.add_pass(Box::new(RemoveAsTypedConstant {
+            target: OpRef(5),
+            value: majit_ir::Value::Ref(ptr),
+        }));
+        opt.add_pass(Box::new(RemoveAsTypedConstant {
+            target: OpRef(6),
+            value: majit_ir::Value::Float(float),
+        }));
+
+        let mut ops = vec![
+            Op::new(OpCode::SameAsR, &[]),
+            Op::new(OpCode::SameAsF, &[]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        ops[0].pos = OpRef(5);
+        ops[1].pos = OpRef(6);
+        ops[2].pos = OpRef(7);
+
+        let mut constants = std::collections::HashMap::new();
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::Jump);
+        assert_eq!(constants.get(&5), Some(&(ptr.0 as i64)));
+        assert_eq!(constants.get(&6), Some(&(float.to_bits() as i64)));
     }
 
     #[test]

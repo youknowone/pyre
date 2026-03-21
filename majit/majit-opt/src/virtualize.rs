@@ -806,6 +806,9 @@ impl OptVirtualize {
                 }
             }
         }
+        // RPython: virtual value is NOT forced in optimize_SETFIELD_GC.
+        // It's forced by _emit_operation (optimizer.py:623-625) at final emit.
+        // In majit, this is handled by emit_with_guard_check or force_all_lazy.
         OptimizationResult::PassOn
     }
 
