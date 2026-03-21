@@ -137,6 +137,22 @@ pub fn make_field_descr(
     })
 }
 
+pub fn make_field_descr_full(
+    _index: u32,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    immutable: bool,
+) -> DescrRef {
+    Arc::new(PyreFieldDescr {
+        offset,
+        field_size,
+        field_type,
+        signed: false,
+        immutable,
+    })
+}
+
 /// Create a field descriptor for an immutable field (RPython is_immutable_field).
 /// Cache entries for immutable fields survive call invalidation.
 pub fn make_immutable_field_descr(
@@ -256,7 +272,11 @@ pub fn list_items_ptr_descr() -> DescrRef {
 }
 
 pub fn list_strategy_descr() -> DescrRef {
-    make_field_descr(
+    // RPython parity: list strategy is immutable once set at allocation.
+    // Marking immutable lets the heap cache survive calls (boxing etc.),
+    // eliminating repeated GetfieldGcI(strategy) + GuardValue(strategy)
+    // within the same loop body.
+    make_immutable_field_descr(
         std::mem::offset_of!(W_ListObject, strategy),
         1,
         Type::Int,
