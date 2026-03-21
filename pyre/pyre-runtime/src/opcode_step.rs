@@ -112,7 +112,11 @@ pub trait ControlFlowOpcodeHandler: SharedOpcodeHandler {
 }
 
 pub trait BranchOpcodeHandler: TruthOpcodeHandler + ControlFlowOpcodeHandler {
-    fn concrete_truth_as_bool(&mut self, truth: Self::Truth) -> Result<bool, PyError>;
+    fn concrete_truth_as_bool(
+        &mut self,
+        value: Self::Value,
+        truth: Self::Truth,
+    ) -> Result<bool, PyError>;
     fn guard_truth_value(&mut self, truth: Self::Truth, expect_true: bool) -> Result<(), PyError> {
         let _ = (truth, expect_true);
         Ok(())
@@ -120,9 +124,11 @@ pub trait BranchOpcodeHandler: TruthOpcodeHandler + ControlFlowOpcodeHandler {
 
     fn record_branch_guard(
         &mut self,
+        value: Self::Value,
         truth: Self::Truth,
         concrete_truth: bool,
     ) -> Result<(), PyError> {
+        let _ = value;
         self.guard_truth_value(truth, concrete_truth)
     }
 }
@@ -392,13 +398,13 @@ fn exec_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
     let truth = handler.truth_value(value)?;
-    let concrete_truth = handler.concrete_truth_as_bool(truth)?;
+    let concrete_truth = handler.concrete_truth_as_bool(value, truth)?;
     let should_jump = concrete_truth == jump_if_true;
     let fallthrough = handler.fallthrough_target();
     if !should_jump {
         handler.set_next_instr(target)?;
     }
-    handler.record_branch_guard(truth, concrete_truth)?;
+    handler.record_branch_guard(value, truth, concrete_truth)?;
     let next_target = if should_jump { target } else { fallthrough };
     handler.set_next_instr(next_target)
 }
