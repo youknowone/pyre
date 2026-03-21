@@ -1259,7 +1259,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                             offset,
                             8,
                             majit_ir::Type::Ref,
-                            false,
+                            true, // immutable: stack_ptrs never change after init
                         ),
                     ))
                 }
