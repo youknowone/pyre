@@ -249,11 +249,10 @@ fn note_inline_trace_too_long(
     warm_state.disable_noninlinable_function(callee_key);
     if callee_key == caller_function_key {
         // RPython converges the next portal entry quickly after marking the
-        // huge function non-inlinable. pyre's function-entry path is driven
-        // by a separate function counter, so same-key recursive traces need
-        // a function-entry boost instead of only a backedge hot-counter bump.
+        // huge function non-inlinable. Mirror that by priming the warmstate-
+        // owned function-entry counter instead of only bumping a backedge
+        // hot counter.
         warm_state.boost_function_entry(caller_function_key);
-        crate::eval::boost_local_function_entry_counter(caller_function_key);
     } else {
         warm_state.trace_next_iteration(root_trace_key);
     }
@@ -2996,6 +2995,12 @@ impl TraceFrameState {
                     .meta_interp()
                     .warm_state_ref()
                     .can_inline_callable(callee_key);
+                let max_unroll_recursion = driver
+                    .meta_interp()
+                    .warm_state_ref()
+                    .max_unroll_recursion() as usize;
+                let recursive_depth =
+                    self.with_ctx(|_, ctx| ctx.recursive_depth(callee_key));
                 let concrete_arg0 = if nargs == 1 {
                     self.concrete_call_arg_after_pops(0)
                 } else {
@@ -3003,28 +3008,39 @@ impl TraceFrameState {
                 };
                 let callee_prefers_function_entry =
                     crate::call_jit::callable_prefers_function_entry(concrete_callable);
-                
-                // RPython _opimpl_recursive_call() still follows recursion
-                // via perform_call() until the recursion is no longer
-                // inlined. Mirror that here: self-recursive calls remain
-                // eligible for trace-through, but only while warmstate still
-                // wants them inlined. We keep the more fragile frame-skip
-                // optimization disabled for self-recursion below.
+                if is_self_recursive
+                    && inline_decision == majit_meta::InlineDecision::Inline
+                    && recursive_depth >= max_unroll_recursion
+                {
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_mut()
+                        .disable_noninlinable_function(callee_key);
+                }
+
+                // RPython _opimpl_recursive_call() traces recursive portal
+                // calls via perform_call() only until max_unroll_recursion is
+                // hit, then forces the residual/assembler path so the current
+                // trace can converge. Mirror that here instead of letting
+                // self-recursive trace-through run until trace-too-long.
                 let can_trace_through = callee_inline_eligible
                     && nargs <= 4
                     && if is_self_recursive {
                         inline_decision == majit_meta::InlineDecision::Inline
+                            && recursive_depth < max_unroll_recursion
                     } else {
                         !callee_prefers_function_entry && !callee_has_loop
                     };
 
                 if majit_meta::majit_log_enabled() {
                     eprintln!(
-                        "[jit][direct-call] key={} nargs={} inline_eligible={} self_recursive={} prefers_func_entry={} has_loop={} inline_active={} can_trace_through={}",
+                        "[jit][direct-call] key={} nargs={} inline_eligible={} self_recursive={} recursive_depth={} max_unroll_recursion={} prefers_func_entry={} has_loop={} inline_active={} can_trace_through={}",
                         callee_key,
                         nargs,
                         callee_inline_eligible,
                         is_self_recursive,
+                        recursive_depth,
+                        max_unroll_recursion,
                         callee_prefers_function_entry,
                         callee_has_loop,
                         inline_framestack_active,
