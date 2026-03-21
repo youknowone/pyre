@@ -764,7 +764,16 @@ impl OptRewrite {
         // with GUARD_FALSE(arg0) or GUARD_TRUE(arg0). This is better because
         // GUARD_TRUE/FALSE are foldable and can be eliminated by guard
         // strengthening, while GUARD_VALUE cannot.
+        //
+        // RPython also makes arg0 a known constant here, so that
+        // export_state carries it to Phase 2 via setinfo_from_preamble.
         if let Some(expected) = ctx.get_constant_int(arg1) {
+            // RPython: GuardValue makes arg0 a known constant in the
+            // optimizer context. Also set on the resolved target so
+            // export_state picks it up regardless of forwarding.
+            ctx.make_constant(arg0, majit_ir::Value::Int(expected));
+            let resolved_arg0 = ctx.get_replacement(arg0);
+            ctx.make_constant(resolved_arg0, majit_ir::Value::Int(expected));
             if expected == 0 {
                 let mut new_op = Op::new(OpCode::GuardFalse, &[arg0]);
                 new_op.pos = op.pos;

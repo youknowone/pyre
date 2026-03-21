@@ -977,6 +977,19 @@ impl OptUnroll {
         let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
         let exported_short_boxes = ctx.exported_short_boxes.clone();
 
+        // RPython: setinfo_from_preamble applies to short preamble sources
+        // too. Collect infos for short preamble source OpRefs so Phase 2
+        // can see constants (e.g. strategy==1 from GuardValue).
+        for entry in &exported_short_ops {
+            let source = match entry {
+                ExportedShortOp::Pure { source, .. }
+                | ExportedShortOp::HeapField { source, .. }
+                | ExportedShortOp::HeapArrayItem { source, .. } => *source,
+                _ => continue,
+            };
+            self.expand_info(source, ctx, exported_int_bounds, &mut infos);
+        }
+
         ExportedState::new(
             // RPython unroll.py exports:
             //   ExportedState(label_args, end_args, ...)
@@ -1341,6 +1354,20 @@ impl OptUnroll {
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
         self.import_short_preamble_ops(&short_args, exported_state, ctx);
+        // RPython: setinfo_from_preamble applies to ALL exported values,
+        // including short preamble. Apply exported infos to imported
+        // short preamble sources so Phase 2 knows about constants.
+        for entry in &exported_state.exported_short_ops {
+            let source = match entry {
+                ExportedShortOp::Pure { source, .. }
+                | ExportedShortOp::HeapField { source, .. }
+                | ExportedShortOp::HeapArrayItem { source, .. } => *source,
+                _ => continue,
+            };
+            if let Some(info) = exported_state.exported_infos.get(&source) {
+                self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
+            }
+        }
         if !ctx.initialize_imported_short_preamble_builder_from_exported_ops(
             &short_args,
             &exported_state.short_inputargs,

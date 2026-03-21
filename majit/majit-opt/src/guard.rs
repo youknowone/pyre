@@ -536,6 +536,14 @@ impl Optimization for GuardStrengthenOpt {
         // The guard is not redundant – record it and emit.
         self.record_implications(op, ctx);
 
+        // RPython: GuardValue makes the value a known constant in the
+        // optimizer context, enabling export to Phase 2.
+        if op.opcode == OpCode::GuardValue {
+            if let Some(c) = ctx.get_constant_int(op.arg(1)) {
+                ctx.make_constant(op.arg(0), majit_ir::Value::Int(c));
+            }
+        }
+
         // --- Consecutive guard fusion ---
         let mut fused_op = op.clone();
         self.try_fuse_descr(&mut fused_op);
