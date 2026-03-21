@@ -1302,6 +1302,17 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
+        // Safety: don't compile guardless loops — they'd run forever
+        // without RPython's interrupt mechanism.
+        let has_guard = optimized_ops.iter().any(|op| op.opcode.is_guard());
+        if !has_guard {
+            if crate::majit_log_enabled() {
+                eprintln!("[jit] abort: guardless loop (no interrupt support)");
+            }
+            self.warm_state.abort_tracing(green_key, true);
+            return;
+        }
+
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
 

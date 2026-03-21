@@ -262,8 +262,8 @@ impl OptHeap {
             }
         }
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        // JUMP/flush path: allow_force=false (no virtual force — avoids
-        // guardless infinite loops without interrupt mechanism).
+        // JUMP/flush: allow_force=false to avoid guardless infinite loops.
+        // Call-triggered force (allow_force=true) is safe — guards follow.
         for (key, mut op) in pending {
             if Self::emit_lazy_setfield(&mut op, ctx, false) {
                 self.cached_fields.insert(key, op.arg(1));
