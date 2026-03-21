@@ -72,6 +72,9 @@ pub struct Optimizer {
     /// RPython unroll.py: `label_args = import_state(...)`.
     /// The peeled loop's LABEL must use these args, not the phase-1 end_args.
     pub imported_label_args: Option<Vec<OpRef>>,
+    /// Local slot-map needed because majit assembles the peeled trace from a
+    /// slot-indexed body trace. RPython keeps forwarded boxes directly.
+    pub imported_label_source_slots: Option<Vec<OpRef>>,
     /// simplify.py: patchguardop recorded from GUARD_FUTURE_CONDITION.
     pub patchguardop: Option<Op>,
     /// RPython: propagate_all_forward(trace, flush=False) for Phase 2.
@@ -398,6 +401,7 @@ impl Optimizer {
             imported_short_preamble: None,
             imported_short_preamble_builder: None,
             imported_label_args: None,
+            imported_label_source_slots: None,
             patchguardop: None,
             skip_flush: false,
             final_ctx: None,
@@ -611,9 +615,9 @@ impl Optimizer {
         let resolved = ctx.get_replacement(opref);
         if let Some(tracked) = ctx.take_potential_extra_op(resolved) {
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                let _ = builder.use_box(tracked.result);
+                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                let _ = builder.use_box(tracked.result);
+                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             }
         }
         // Check if any pass considers this a virtual.
@@ -820,6 +824,13 @@ impl Optimizer {
         self.passes.push(pass);
     }
 
+    /// Mark all passes as Phase 2 (loop body).
+    pub fn set_phase2(&mut self, phase2: bool) {
+        for pass in &mut self.passes {
+            pass.set_phase2(phase2);
+        }
+    }
+
     /// Run all optimization passes over a list of operations.
     ///
     /// Returns the optimized operation list.
@@ -855,6 +866,7 @@ impl Optimizer {
     ) -> Vec<Op> {
         use majit_ir::OpRef;
         self.imported_label_args = None;
+        self.imported_label_source_slots = None;
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.
@@ -866,6 +878,7 @@ impl Optimizer {
             .unwrap_or(0);
         let effective_inputs = num_inputs.max((max_pos + 1) as usize);
         let mut ctx = OptContext::with_num_inputs(ops.len(), effective_inputs);
+        ctx.skip_flush_mode = self.skip_flush;
 
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {
@@ -905,27 +918,43 @@ impl Optimizer {
             let targetargs: Vec<OpRef> = (0..exported_state.next_iteration_args.len())
                 .map(|i| OpRef(i as u32))
                 .collect();
-            self.imported_label_args =
-                Some(crate::unroll::import_state(&targetargs, exported_state, &mut ctx));
+            let (label_args, source_slots) =
+                crate::unroll::import_state_with_source_slots(&targetargs, exported_state, &mut ctx);
+            self.imported_label_args = Some(label_args);
+            self.imported_label_source_slots = Some(source_slots);
         }
 
         if !self.imported_virtuals.is_empty() {
             self.install_imported_virtuals(&mut ctx);
         }
 
+        // RPython optimizer.py:536-556: JUMP/FINISH is separated from
+        // the main loop. With flush=False (Phase 2), JUMP is NOT processed
+        // through the passes — it's returned as last_op for the caller.
+        let mut last_op = None;
         for op in ops {
+            if self.skip_flush
+                && matches!(op.opcode, OpCode::Jump | OpCode::Finish)
+            {
+                last_op = Some(op.clone());
+                break;
+            }
             self.propagate_one(op, &mut ctx);
         }
 
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Phase 2 leaves lazy sets pending so virtuals aren't forced.
         if !self.skip_flush {
-            // RPython: flush → force_all_lazy_sets → force_lazy_set →
-            // emit_extra(op, emit=False) → re-process → re-store → LOST.
-            // The cache is updated but the op is dropped. Phase 2 body
-            // reads from the imported heap cache, not from memory.
-            // Call-triggered force (during trace) already emitted writebacks.
             self.flush(&mut ctx);
+        }
+        // RPython optimizer.py:555-556: after flush, send last_op (JUMP/FINISH).
+        // For Phase 2 (skip_flush), JUMP args are resolved but virtuals are
+        // NOT forced — they stay virtual for the body loop.
+        if let Some(mut jump_op) = last_op {
+            for arg in &mut jump_op.args {
+                *arg = ctx.get_replacement(*arg);
+            }
+            ctx.emit(jump_op);
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -1571,11 +1600,13 @@ impl Default for Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex, make_fail_descr};
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
-    use majit_ir::{OpCode, OpRef};
+    use majit_ir::{DescrRef, OpCode, OpRef};
     use std::cell::Cell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     /// A trivial pass that removes INT_ADD(x, 0) -> x
     struct AddZeroElimination;
@@ -1681,6 +1712,53 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TestCallDescr {
+        idx: u32,
+        effect: EffectInfo,
+        result_type: majit_ir::Type,
+    }
+
+    impl majit_ir::Descr for TestCallDescr {
+        fn index(&self) -> u32 {
+            self.idx
+        }
+
+        fn as_call_descr(&self) -> Option<&dyn CallDescr> {
+            Some(self)
+        }
+    }
+
+    impl CallDescr for TestCallDescr {
+        fn arg_types(&self) -> &[majit_ir::Type] {
+            &[]
+        }
+
+        fn result_type(&self) -> majit_ir::Type {
+            self.result_type
+        }
+
+        fn result_size(&self) -> usize {
+            8
+        }
+
+        fn effect_info(&self) -> &EffectInfo {
+            &self.effect
+        }
+    }
+
+    fn call_may_force_descr(idx: u32, result_type: majit_ir::Type) -> DescrRef {
+        Arc::new(TestCallDescr {
+            idx,
+            effect: EffectInfo {
+                extra_effect: ExtraEffect::CanRaise,
+                oopspec_index: OopSpecIndex::None,
+                ..Default::default()
+            },
+            result_type,
+        })
+    }
+
     struct QueueForceLikeExtraOps {
         queued: bool,
         field_descr: majit_ir::DescrRef,
@@ -1711,6 +1789,146 @@ mod tests {
         let result = opt.optimize(&ops);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
+    }
+
+    #[test]
+    fn test_default_pipeline_keeps_call_may_force_pairs_alive_when_results_are_used() {
+        let field_descr = Arc::new(TestDescr(91));
+        let call_descr_a = call_may_force_descr(81, majit_ir::Type::Ref);
+        let call_descr_b = call_may_force_descr(82, majit_ir::Type::Ref);
+        let mut ops = vec![
+            Op::with_descr(OpCode::CallMayForceR, &[OpRef(0), OpRef(1)], call_descr_a),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef(3)], field_descr.clone()),
+            Op::with_descr(OpCode::CallMayForceR, &[OpRef(0), OpRef(2)], call_descr_b),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef(6)], field_descr),
+            Op::new(OpCode::IntAdd, &[OpRef(5), OpRef(8)]),
+            Op::new(OpCode::Finish, &[OpRef(9)]),
+        ];
+        for (idx, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef((idx as u32) + 3);
+        }
+
+        let mut opt = Optimizer::default_pipeline();
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            3,
+        );
+
+        let call_count = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::CallMayForceR)
+            .count();
+        let guard_count = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::GuardNotForced)
+            .count();
+        assert_eq!(call_count, 2, "optimized trace lost CallMayForceR ops: {result:?}");
+        assert_eq!(guard_count, 2, "optimized trace lost GuardNotForced ops: {result:?}");
+    }
+
+    #[test]
+    fn test_default_pipeline_keeps_call_may_force_when_guard_fail_args_reference_results() {
+        let field_descr = Arc::new(TestDescr(101));
+        let call_descr_a = call_may_force_descr(83, majit_ir::Type::Ref);
+        let call_descr_b = call_may_force_descr(84, majit_ir::Type::Ref);
+        let guard_descr_a = make_fail_descr(
+            1,
+            vec![
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+            ],
+        );
+        let guard_descr_b = make_fail_descr(
+            2,
+            vec![
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+            ],
+        );
+
+        let mut call_a = Op::with_descr(OpCode::CallMayForceR, &[OpRef(0), OpRef(1)], call_descr_a);
+        let mut guard_a = Op::with_descr(OpCode::GuardNotForced, &[], guard_descr_a);
+        guard_a.fail_args = Some(vec![
+            OpRef(0),
+            OpRef(2000),
+            OpRef(2001),
+            OpRef(3),
+            OpRef(3000),
+            OpRef(3001),
+            OpRef(4),
+        ].into());
+        let get_a_type = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef(3)], field_descr.clone());
+        let get_a_val = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef(3)], field_descr.clone());
+        let mut call_b = Op::with_descr(OpCode::CallMayForceR, &[OpRef(0), OpRef(2)], call_descr_b);
+        let mut guard_b = Op::with_descr(OpCode::GuardNotForced, &[], guard_descr_b);
+        guard_b.fail_args = Some(vec![
+            OpRef(0),
+            OpRef(2002),
+            OpRef(2003),
+            OpRef(3),
+            OpRef(6),
+            OpRef(3002),
+            OpRef(3003),
+            OpRef(7),
+        ].into());
+        let get_b_type = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef(6)], field_descr.clone());
+        let get_b_val = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef(6)], field_descr);
+        let add = Op::new(OpCode::IntAdd, &[OpRef(5), OpRef(8)]);
+        let finish = Op::new(OpCode::Finish, &[OpRef(9)]);
+
+        let mut ops = vec![
+            call_a.clone(),
+            guard_a,
+            get_a_type,
+            get_a_val,
+            call_b.clone(),
+            guard_b,
+            get_b_type,
+            get_b_val,
+            add,
+            finish,
+        ];
+        for (idx, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef((idx as u32) + 3);
+        }
+        call_a.pos = ops[0].pos;
+        call_b.pos = ops[4].pos;
+
+        let mut opt = Optimizer::default_pipeline();
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            3,
+        );
+
+        let call_positions: std::collections::HashSet<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::CallMayForceR)
+            .map(|op| op.pos)
+            .collect();
+        assert!(
+            call_positions.contains(&call_a.pos) && call_positions.contains(&call_b.pos),
+            "optimized trace lost CallMayForceR producer(s): {result:?}"
+        );
+        let guarded = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::GuardNotForced)
+            .count();
+        assert_eq!(guarded, 2, "optimized trace lost GuardNotForced ops: {result:?}");
     }
 
     #[test]

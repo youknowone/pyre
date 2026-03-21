@@ -52,6 +52,9 @@ const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
 /// The virtualize optimization pass.
 pub struct OptVirtualize {
+    /// Phase 2 (loop body): don't virtualize New() because guard failure
+    /// recovery_layout is not yet populated (RPython rd_virtuals equivalent).
+    pub is_phase2: bool,
     /// If set, frame OpRef(0) is treated as a virtualizable object
     /// whose field accesses are absorbed by the optimizer.
     vable_config: Option<VirtualizableConfig>,
@@ -70,6 +73,7 @@ pub struct OptVirtualize {
 impl OptVirtualize {
     pub fn new() -> Self {
         OptVirtualize {
+            is_phase2: false,
             vable_config: None,
             vable_array_ptrs: HashMap::new(),
             vable_initialized: false,
@@ -80,6 +84,7 @@ impl OptVirtualize {
     /// Create with virtualizable config for frame field tracking.
     pub fn with_virtualizable(config: VirtualizableConfig) -> Self {
         OptVirtualize {
+            is_phase2: false,
             vable_config: Some(config),
             vable_array_ptrs: HashMap::new(),
             vable_initialized: false,
@@ -550,15 +555,20 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // Emit SETFIELD_GC for each tracked field
+        // Emit SETFIELD_GC for each tracked field.
+        // Use ctx.emit() to bypass Heap pass lazy_set — when skip_flush=true
+        // (Phase 2), lazy sets are never flushed, causing missing SetfieldGc.
+        // RPython: force_box emits via send_extra_operation which routes
+        // through all passes, but RPython flushes before JUMP processing.
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
             let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+            set_op.pos = ctx.reserve_pos();
             set_op.descr = Some(descr);
-            ctx.emit_through_passes(set_op);
+            ctx.emit(set_op);
         }
 
         alloc_ref
@@ -726,6 +736,13 @@ impl OptVirtualize {
     }
 
     fn optimize_new(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // RPython parity: virtual objects need rd_virtuals in guard resume data
+        // for materialization at guard failure. Until recovery_layout is
+        // populated with virtual blueprints, Phase 2 (loop body) must keep
+        // New ops concrete so guard failure restore works correctly.
+        if self.is_phase2 {
+            return OptimizationResult::PassOn;
+        }
         let descr = op.descr.clone().expect("NEW needs descr");
         let vinfo = VirtualStructInfo {
             descr,
@@ -2015,6 +2032,9 @@ impl Optimization for OptVirtualize {
         "virtualize"
     }
 
+    fn set_phase2(&mut self, phase2: bool) {
+        self.is_phase2 = phase2;
+    }
 }
 
 // PtrInfo helpers (is_nonnull, is_virtual, etc.) are in info.rs.
