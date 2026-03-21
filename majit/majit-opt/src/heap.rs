@@ -325,50 +325,79 @@ impl OptHeap {
 
     /// heap.py: force_lazy_sets_for_guard()
     ///
-    /// For guards, we don't need to force ALL lazy sets. Virtual values
-    /// that would be written by lazy sets can be recorded as pendingfields
-    /// instead (they'll be materialized on guard failure). Only non-virtual
-    /// lazy sets need to be emitted before the guard.
+    /// RPython defers virtual-value SetfieldGc to pendingfields (stored in
+    /// guard resume data, materialized on guard failure). majit does NOT have
+    /// the rd_pendingfields resume mechanism, so we must distinguish:
     ///
-    /// Returns the list of ops that should go into pendingfields.
+    /// - Virtual container: safe to defer (container doesn't exist in memory)
+    /// - Real container + virtual value: FORCE the virtual and emit
+    /// - Real container + real value: emit directly
+    ///
+    /// Returns the list of ops that should go into pendingfields (virtual
+    /// container only).
     fn force_lazy_sets_for_guard(&mut self, ctx: &mut OptContext) -> Vec<Op> {
         let mut pendingfields = Vec::new();
 
-        // Force lazy setfields: virtual values → pendingfields, rest → emit
         let field_entries: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
-        for (key, op) in field_entries {
+        for (key, mut op) in field_entries {
+            let obj_ref = ctx.get_replacement(op.arg(0));
             let value_ref = ctx.get_replacement(op.arg(1));
-            // heap.py: if value is virtual or unescaped, defer to pendingfields
-            let is_virtual = matches!(
-                ctx.get_ptr_info(value_ref),
+
+            // If the container itself is virtual, defer — it doesn't exist in memory
+            let obj_is_virtual = matches!(
+                ctx.get_ptr_info(obj_ref),
                 Some(info) if info.is_virtual()
             );
-            if is_virtual || self.unescaped.contains(&value_ref) {
+            if obj_is_virtual {
                 pendingfields.push(op);
-            } else {
-                self.remember_field_descr(key, &op);
-                ctx.emit(op);
-                self.cached_fields.insert(key, value_ref);
+                continue;
             }
+
+            // Container is real. If value is virtual, materialize it directly
+            // to new_operations (bypass pass chain to avoid re-virtualization).
+            if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
+                if info.is_virtual() {
+                    info.force_to_ops_direct(value_ref, ctx);
+                }
+            }
+
+            // Emit the SetfieldGc with resolved args
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+            let final_value = op.arg(1);
+            self.remember_field_descr(key, &op);
+            ctx.emit(op);
+            self.cached_fields.insert(key, final_value);
         }
 
-        // Force lazy setarrayitems: same logic.
-        // heap.py line 631-632: the struct/array pointer must NOT be virtual
-        // (only the stored value can be virtual/unescaped).
         let array_entries: Vec<(ArrayItemKey, Op)> = self.lazy_setarrayitems.drain().collect();
-        for (key, op) in array_entries {
+        for (key, mut op) in array_entries {
+            let obj_ref = ctx.get_replacement(op.arg(0));
             let value_ref = ctx.get_replacement(op.arg(2));
-            let is_virtual = matches!(
-                ctx.get_ptr_info(value_ref),
+
+            let obj_is_virtual = matches!(
+                ctx.get_ptr_info(obj_ref),
                 Some(info) if info.is_virtual()
             );
-            if is_virtual || self.unescaped.contains(&value_ref) {
+            if obj_is_virtual {
                 pendingfields.push(op);
-            } else {
-                self.remember_arrayitem_descr(key, &op);
-                ctx.emit(op);
-                self.cached_arrayitems.insert(key, value_ref);
+                continue;
             }
+
+            if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
+                if info.is_virtual() {
+                    info.force_to_ops_direct(value_ref, ctx);
+                }
+            }
+
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+            let final_value = op.arg(2);
+            self.remember_arrayitem_descr(key, &op);
+            ctx.emit(op);
+            self.cached_arrayitems.insert(key, final_value);
         }
 
         pendingfields
@@ -933,28 +962,9 @@ impl OptHeap {
                 _ => {}
             }
 
-            // heap.py: guards only force non-virtual lazy sets.
-            // Virtual lazy sets stay deferred — the virtual object hasn't
-            // escaped, so the write can be postponed. RPython stores them
-            // in optimizer.pendingfields for guard resume data; here we
-            // keep them in lazy_setfields/lazy_setarrayitems until the
-            // final JUMP/Finish forces everything.
-            let pending_virtual = self.force_lazy_sets_for_guard(ctx);
-            for pending_op in pending_virtual {
-                if pending_op.opcode == OpCode::SetarrayitemGc {
-                    let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
-                    if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
-                        self.lazy_setarrayitems
-                            .insert((pending_op.arg(0), descr_idx, index), pending_op);
-                    } else {
-                        ctx.emit(pending_op);
-                    }
-                } else {
-                    let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
-                    self.lazy_setfields
-                        .insert((pending_op.arg(0), descr_idx), pending_op);
-                }
-            }
+            // force_lazy_sets_for_guard is now called via emitting_operation
+            // callback (which runs for ALL guards regardless of which pass emits
+            // them). No need to force here — it was already done.
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -1051,7 +1061,12 @@ impl Optimization for OptHeap {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             // ── Field reads ──
-            OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
+            OpCode::GetfieldGcI
+            | OpCode::GetfieldGcR
+            | OpCode::GetfieldGcF
+            | OpCode::GetfieldGcPureI
+            | OpCode::GetfieldGcPureR
+            | OpCode::GetfieldGcPureF => {
                 self.optimize_getfield(op, ctx)
             }
 
@@ -1146,6 +1161,12 @@ impl Optimization for OptHeap {
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN => {
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[opt-heap] postpone {:?} pos={:?} descr={:?}",
+                        op.opcode, op.pos, op.descr
+                    );
+                }
                 // RPython emitting_operation: calls go through
                 // force_from_effectinfo (selective) or clean_caches,
                 // NOT force_all_lazy. force_all_lazy is only in flush().
@@ -1169,7 +1190,18 @@ impl Optimization for OptHeap {
             // (not force_all_lazy) — immutable caches survive.
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
                 if let Some(postponed) = self.postponed_op.take() {
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
+                            postponed.opcode, postponed.pos, op.opcode, op.pos
+                        );
+                    }
                     ctx.emit(postponed);
+                } else if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[opt-heap] no postponed op before {:?} pos={:?}",
+                        op.opcode, op.pos
+                    );
                 }
                 // RPython emitting_operation for guards:
                 //   self.optimizer.pendingfields = self.force_lazy_sets_for_guard()
@@ -1330,6 +1362,35 @@ impl Optimization for OptHeap {
         self.force_all_lazy(ctx);
         if let Some(postponed) = self.postponed_op.take() {
             ctx.emit(postponed);
+        }
+    }
+
+    /// RPython heap.py: emitting_operation(op)
+    /// Called for EVERY op about to be emitted, regardless of which pass emits it.
+    /// This is how the heap optimizer forces lazy sets before guards even when
+    /// the guard was emitted by an earlier pass (e.g., IntBounds).
+    fn emitting_operation(&mut self, op: &Op, ctx: &mut OptContext) {
+        // Only handle guards here — calls and side-effects are handled in
+        // handle_side_effects which runs when the op reaches the heap pass
+        // via propagate_forward. Guards need this callback because they're
+        // often emitted by earlier passes and never reach the heap pass.
+        if op.opcode.is_guard() {
+            let pending_virtual = self.force_lazy_sets_for_guard(ctx);
+            for pending_op in pending_virtual {
+                if pending_op.opcode == OpCode::SetarrayitemGc {
+                    let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
+                    if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
+                        self.lazy_setarrayitems
+                            .insert((pending_op.arg(0), descr_idx, index), pending_op);
+                    } else {
+                        ctx.emit(pending_op);
+                    }
+                } else {
+                    let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
+                    self.lazy_setfields
+                        .insert((pending_op.arg(0), descr_idx), pending_op);
+                }
+            }
         }
     }
 

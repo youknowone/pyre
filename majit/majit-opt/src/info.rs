@@ -380,35 +380,53 @@ impl PtrInfo {
     /// optimizer chain can observe them again. Callers that are outside the
     /// pass chain must explicitly drain ctx.extra_operations afterward.
     pub fn force_to_ops(&mut self, opref: OpRef, ctx: &mut crate::OptContext) -> OpRef {
+        self.force_to_ops_impl(opref, ctx, false)
+    }
+
+    /// Like force_to_ops but emits directly to new_operations (bypasses pass
+    /// chain). Used by emitting_operation where drain would re-virtualize.
+    pub fn force_to_ops_direct(&mut self, opref: OpRef, ctx: &mut crate::OptContext) -> OpRef {
+        self.force_to_ops_impl(opref, ctx, true)
+    }
+
+    fn force_to_ops_impl(&mut self, opref: OpRef, ctx: &mut crate::OptContext, direct: bool) -> OpRef {
         use majit_ir::{Op, OpCode};
 
-        fn force_child(value_ref: OpRef, ctx: &mut crate::OptContext) -> OpRef {
+        fn force_child(value_ref: OpRef, ctx: &mut crate::OptContext, direct: bool) -> OpRef {
             let value_ref = ctx.get_replacement(value_ref);
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
-                    return info.force_to_ops(value_ref, ctx);
+                    return info.force_to_ops_impl(value_ref, ctx, direct);
                 }
             }
             value_ref
         }
+
+        let emit_op = |ctx: &mut crate::OptContext, op: Op| -> OpRef {
+            if direct {
+                ctx.emit(op)
+            } else {
+                ctx.emit_through_passes(op)
+            }
+        };
 
         match self {
             PtrInfo::VirtualStruct(vinfo) => {
                 ctx.set_ptr_info(opref, PtrInfo::NonNull);
                 let mut new_op = Op::new(OpCode::New, &[]);
                 new_op.descr = Some(vinfo.descr.clone());
-                let alloc_ref = ctx.emit_through_passes(new_op);
+                let alloc_ref = emit_op(ctx, new_op);
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                    let value_ref = force_child(value_ref, ctx);
+                    let value_ref = force_child(value_ref, ctx, direct);
                     let descr = vinfo.field_descrs.iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
                     let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
                     set_op.descr = descr;
-                    ctx.emit_through_passes(set_op);
+                    emit_op(ctx, set_op);
                 }
                 alloc_ref
             }
@@ -416,18 +434,18 @@ impl PtrInfo {
                 ctx.set_ptr_info(opref, PtrInfo::NonNull);
                 let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
                 new_op.descr = Some(vinfo.descr.clone());
-                let alloc_ref = ctx.emit_through_passes(new_op);
+                let alloc_ref = emit_op(ctx, new_op);
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                    let value_ref = force_child(value_ref, ctx);
+                    let value_ref = force_child(value_ref, ctx, direct);
                     let descr = vinfo.field_descrs.iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
                     let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
                     set_op.descr = descr;
-                    ctx.emit_through_passes(set_op);
+                    emit_op(ctx, set_op);
                 }
                 alloc_ref
             }
