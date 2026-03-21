@@ -1539,9 +1539,14 @@ impl OptUnroll {
         }
         let mut produced_results = Vec::with_capacity(exported_state.exported_short_ops.len());
         for entry in &exported_state.exported_short_ops {
-            let mut resolve_result = |result: &ExportedShortResult| match result {
+            let resolve_result = |source: OpRef, result: &ExportedShortResult| match result {
                 ExportedShortResult::Slot(slot) => short_args.get(*slot).copied(),
-                ExportedShortResult::Temporary(_) => Some(ctx.alloc_op_position()),
+                // RPython shortpreamble.py `produce_op()` keeps the original
+                // short-box result identity (`self.res`) and registers the
+                // preamble-producing op against that box. Do not invent a
+                // synthetic temp OpRef here: later imported pure ops must refer
+                // to the original producer box, not a fresh local placeholder.
+                ExportedShortResult::Temporary(_) => Some(source),
             };
             match *entry {
                 ExportedShortOp::Pure {
@@ -1553,7 +1558,7 @@ impl OptUnroll {
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(result_opref) = resolve_result(result) else {
+                    let Some(result_opref) = resolve_result(source, result) else {
                         continue;
                     };
                     let args = args
@@ -1609,7 +1614,7 @@ impl OptUnroll {
                     let Some(&obj) = short_args.get(object_slot) else {
                         continue;
                     };
-                    let Some(value) = resolve_result(result) else {
+                    let Some(value) = resolve_result(source, result) else {
                         continue;
                     };
                     ctx.imported_short_fields.insert((obj, descr_idx), value);
@@ -1646,7 +1651,7 @@ impl OptUnroll {
                     let Some(&obj) = short_args.get(object_slot) else {
                         continue;
                     };
-                    let Some(value) = resolve_result(result) else {
+                    let Some(value) = resolve_result(source, result) else {
                         continue;
                     };
                     ctx.imported_short_arrayitems
@@ -1674,7 +1679,7 @@ impl OptUnroll {
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(value) = resolve_result(result) else {
+                    let Some(value) = resolve_result(source, result) else {
                         continue;
                     };
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
@@ -3233,9 +3238,7 @@ mod tests {
         assert_eq!(label_args, vec![OpRef(12), OpRef(13), OpRef(14)]);
         assert_eq!(ctx2.imported_short_pure_ops.len(), 2);
         let temp_result = ctx2.imported_short_pure_ops[0].result;
-        assert_ne!(temp_result, OpRef(12));
-        assert_ne!(temp_result, OpRef(13));
-        assert_ne!(temp_result, OpRef(14));
+        assert_eq!(temp_result, OpRef(11));
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![
@@ -3410,6 +3413,7 @@ mod tests {
         let mut ctx2 = crate::OptContext::with_num_inputs(6, 3);
         import_state(&[OpRef(0), OpRef(1), OpRef(2)], &exported, &mut ctx2);
         let imported_result = ctx2.imported_short_pure_ops[0].result;
+        assert_eq!(imported_result, OpRef(30));
         let forced = ctx2.force_op_from_preamble(imported_result);
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
         assert_eq!(
