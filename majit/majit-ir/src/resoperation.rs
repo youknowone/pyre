@@ -40,6 +40,21 @@ pub struct GuardVirtualEntry {
     pub fields: Vec<(u32, usize)>,
 }
 
+/// resume.py: _add_pending_fields — a deferred SETFIELD_GC/SETARRAYITEM_GC
+/// where the stored value is virtual. Encoded into the guard's resume data
+/// and replayed on guard failure after virtual materialization.
+#[derive(Clone, Debug)]
+pub struct GuardPendingFieldEntry {
+    /// Descriptor index of the field/array descriptor.
+    pub descr_index: u32,
+    /// For SETARRAYITEM_GC: the constant array index. -1 for SETFIELD_GC.
+    pub item_index: i32,
+    /// OpRef of the target struct/array (real object, in fail_args or constant).
+    pub target: OpRef,
+    /// OpRef of the value being stored (virtual — encoded via rd_virtuals).
+    pub value: OpRef,
+}
+
 /// A single IR operation.
 #[derive(Clone, Debug)]
 pub struct Op {
@@ -58,6 +73,10 @@ pub struct Op {
     /// resume.py: ResumeDataVirtualAdder encodes virtual shapes so the
     /// backend can lazily reconstruct them from stored field values.
     pub rd_virtuals: Option<Vec<GuardVirtualEntry>>,
+    /// Deferred heap writes (SETFIELD_GC/SETARRAYITEM_GC with virtual values)
+    /// to replay on guard failure after virtual materialization.
+    /// resume.py: rd_pendingfields
+    pub rd_pendingfields: Option<Vec<GuardPendingFieldEntry>>,
 }
 
 impl Op {
@@ -69,6 +88,7 @@ impl Op {
             pos: OpRef::NONE,
             fail_args: None,
             rd_virtuals: None,
+            rd_pendingfields: None,
         }
     }
 
@@ -80,6 +100,7 @@ impl Op {
             pos: OpRef::NONE,
             fail_args: None,
             rd_virtuals: None,
+            rd_pendingfields: None,
         }
     }
 
@@ -2982,6 +3003,7 @@ mod tests {
             pos: OpRef(6),
             fail_args: None,
             rd_virtuals: None,
+            rd_pendingfields: None,
         };
         let s = format!("{op}");
         assert_eq!(s, "v6 = IntAdd(v1, v2)");
@@ -2996,6 +3018,7 @@ mod tests {
             pos: OpRef::NONE,
             fail_args: None,
             rd_virtuals: None,
+            rd_pendingfields: None,
         };
         let s = format!("{op}");
         assert_eq!(s, "SetfieldGc(v0, v1)");
@@ -3024,6 +3047,7 @@ mod tests {
             pos: OpRef::NONE,
             fail_args: None,
             rd_virtuals: None,
+            rd_pendingfields: None,
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0)");
@@ -3038,6 +3062,7 @@ mod tests {
             pos: OpRef(1),
             fail_args: None,
             rd_virtuals: None,
+            rd_pendingfields: None,
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 42);
@@ -3223,6 +3248,7 @@ mod tests {
             pos: OpRef::NONE,
             fail_args: None,
             rd_virtuals: None,
+            rd_pendingfields: None,
         }];
         let constants = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);

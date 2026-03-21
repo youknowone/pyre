@@ -194,6 +194,11 @@ pub struct OptContext {
     /// [(field_idx, field_value_ref)]. Used by make_inputargs to flatten
     /// virtuals into label args after force has destroyed PtrInfo.
     pub pre_force_field_refs: HashMap<OpRef, Vec<(u32, OpRef)>>,
+    /// optimizer.py: pendingfields — deferred SetfieldGc/SetarrayitemGc ops
+    /// where the stored value is virtual. Set by OptHeap.emitting_operation()
+    /// before a guard, consumed by emit_with_guard_check() to encode into
+    /// the guard's rd_pendingfields.
+    pub pending_for_guard: Vec<Op>,
     /// True while optimizer.py:_emit_operation equivalent is forcing args
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
@@ -235,6 +240,7 @@ impl OptContext {
             skip_flush_mode: false,
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
+            pending_for_guard: Vec::new(),
         }
     }
 
@@ -272,6 +278,7 @@ impl OptContext {
             skip_flush_mode: false,
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
+            pending_for_guard: Vec::new(),
         }
     }
 

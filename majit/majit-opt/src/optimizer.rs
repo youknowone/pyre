@@ -1589,6 +1589,37 @@ impl Optimizer {
             // get virtual encoding regardless of which pass emits them.
             op = Self::encode_guard_virtuals(op, ctx);
 
+            // optimizer.py:630-631: pendingfields → rd_pendingfields
+            // resume.py:428-445: encode pending SetfieldGc/SetarrayitemGc
+            let pending = std::mem::take(&mut ctx.pending_for_guard);
+            if !pending.is_empty() {
+                op.rd_pendingfields = Some(
+                    pending
+                        .into_iter()
+                        .map(|pf_op| {
+                            let (target, value, item_index) =
+                                if pf_op.opcode == OpCode::SetarrayitemGc {
+                                    let idx = ctx
+                                        .get_constant_int(ctx.get_replacement(pf_op.arg(1)))
+                                        .unwrap_or(0);
+                                    (pf_op.arg(0), pf_op.arg(2), idx as i32)
+                                } else {
+                                    (pf_op.arg(0), pf_op.arg(1), -1i32)
+                                };
+                            majit_ir::GuardPendingFieldEntry {
+                                descr_index: pf_op
+                                    .descr
+                                    .as_ref()
+                                    .map_or(0, |d| d.index()),
+                                item_index,
+                                target: ctx.get_replacement(target),
+                                value: ctx.get_replacement(value),
+                            }
+                        })
+                        .collect(),
+                );
+            }
+
             // optimizer.py: if orig_op in replaces_guard → replace_guard_op
             if self.can_replace_guards {
                 if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
