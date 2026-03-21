@@ -185,9 +185,9 @@ const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
 /// PyPy default: trace_limit = 6000
 const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
 
-/// Maximum number of non-permanent trace aborts before giving up on a green key.
-/// RPython default from rlib/jit.py: retrace_limit = 0.
-const DEFAULT_RETRACE_LIMIT: u32 = 0;
+/// Maximum number of retrace attempts before forcing jump_to_preamble.
+/// RPython default from warmspot.py: retrace_limit = 5.
+const DEFAULT_RETRACE_LIMIT: u32 = 5;
 
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
 

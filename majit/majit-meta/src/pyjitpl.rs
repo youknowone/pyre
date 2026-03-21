@@ -181,6 +181,9 @@ pub(crate) struct CompiledEntry<M> {
     /// Front-end loop-version state, mirroring RPython's
     /// jitcell_token.target_tokens ownership across recompilations.
     pub(crate) front_target_tokens: Vec<majit_opt::unroll::TargetToken>,
+    /// history.py: JitCellToken.retraced_count — how many times this loop
+    /// has been retraced. Persisted across recompilations.
+    pub(crate) retraced_count: u32,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Per-guard failure tracking, keyed by (trace_id, fail_index).
@@ -753,10 +756,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.forced_virtualizable = None;
                 self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
                 let num_inputs = ctx.recorder.num_inputargs();
-                // Virtualizable input types: [Ref(frame), Int(ni), Int(vsd), Ref(local)...]
-                let input_types: Vec<majit_ir::Type> = (0..num_inputs)
-                    .map(|i| if i == 0 || i >= 3 { majit_ir::Type::Ref } else { majit_ir::Type::Int })
-                    .collect();
+                let input_types = ctx.inputarg_types();
                 self.tracing = Some(ctx);
                 let pending_num = self.warm_state.alloc_token_number();
                 self.pending_token = Some((green_key, pending_num));
@@ -1320,6 +1320,13 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or_default();
         let mut unroll_opt = majit_opt::unroll::UnrollOptimizer::new();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        // history.py: carry retraced_count across recompilations
+        unroll_opt.retraced_count = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| compiled.retraced_count)
+            .unwrap_or(0);
+        unroll_opt.retrace_limit = self.warm_state.retrace_limit();
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
@@ -1501,6 +1508,7 @@ impl<M: Clone> MetaInterp<M> {
                         } else {
                             unroll_opt.target_tokens.clone()
                         },
+                        retraced_count: unroll_opt.retraced_count,
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
                         traces,
@@ -1729,6 +1737,11 @@ impl<M: Clone> MetaInterp<M> {
                             .get(&green_key)
                             .map(|compiled| compiled.front_target_tokens.clone())
                             .unwrap_or_default(),
+                        retraced_count: self
+                            .compiled_loops
+                            .get(&green_key)
+                            .map(|compiled| compiled.retraced_count)
+                            .unwrap_or(0),
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
                         traces,
@@ -4315,6 +4328,7 @@ mod tests {
                 num_inputs: inputargs.len(),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                retraced_count: 0,
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
@@ -4775,6 +4789,7 @@ mod tests {
                 num_inputs: 2,
                 meta: (),
                 front_target_tokens: Vec::new(),
+                retraced_count: 0,
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
@@ -4874,6 +4889,7 @@ mod tests {
                 num_inputs: 2,
                 meta: (),
                 front_target_tokens: Vec::new(),
+                retraced_count: 0,
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
@@ -5160,6 +5176,7 @@ mod tests {
                 num_inputs: 1,
                 meta: (),
                 front_target_tokens: Vec::new(),
+                retraced_count: 0,
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
@@ -6249,6 +6266,7 @@ mod tests {
                 num_inputs: 0,
                 meta: (),
                 front_target_tokens: Vec::new(),
+                retraced_count: 0,
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
