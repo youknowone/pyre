@@ -122,6 +122,9 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) token: JitCellToken,
     pub(crate) num_inputs: usize,
     pub(crate) meta: M,
+    /// Front-end loop-version state, mirroring RPython's
+    /// jitcell_token.target_tokens ownership across recompilations.
+    pub(crate) front_target_tokens: Vec<majit_opt::unroll::TargetToken>,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Per-guard failure tracking, keyed by (trace_id, fail_index).
@@ -216,6 +219,10 @@ pub struct JitHooks {
     pub on_compile_bridge: Option<Box<dyn Fn(u64, u32, usize) + Send>>,
     /// Called on guard failure. Args: (green_key, fail_index, fail_count).
     pub on_guard_failure: Option<Box<dyn Fn(u64, u32, u32) + Send>>,
+    /// RPython compile.py:714 (_trace_and_compile_from_bridge):
+    /// Called when guard failure threshold is reached to trigger bridge
+    /// compilation. Args: (green_key, trace_id, fail_index).
+    pub on_bridge_threshold: Option<Box<dyn Fn(u64, u64, u32) + Send>>,
     /// Called when tracing starts. Args: (green_key).
     pub on_trace_start: Option<Box<dyn Fn(u64) + Send>>,
     /// Called when tracing is aborted. Args: (green_key, permanent).
@@ -1201,7 +1208,13 @@ impl<M: Clone> MetaInterp<M> {
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
+        let prior_front_target_tokens = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| compiled.front_target_tokens.clone())
+            .unwrap_or_default();
         let mut unroll_opt = majit_opt::unroll::UnrollOptimizer::new();
+        unroll_opt.target_tokens = prior_front_target_tokens.clone();
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
@@ -1414,6 +1427,11 @@ impl<M: Clone> MetaInterp<M> {
                         token,
                         num_inputs: inputargs.len(),
                         meta,
+                        front_target_tokens: if unroll_opt.target_tokens.is_empty() {
+                            prior_front_target_tokens
+                        } else {
+                            unroll_opt.target_tokens.clone()
+                        },
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
                         traces,
@@ -1634,6 +1652,11 @@ impl<M: Clone> MetaInterp<M> {
                         token,
                         num_inputs: inputargs.len(),
                         meta,
+                        front_target_tokens: self
+                            .compiled_loops
+                            .get(&green_key)
+                            .map(|compiled| compiled.front_target_tokens.clone())
+                            .unwrap_or_default(),
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
                         traces,
@@ -2193,6 +2216,8 @@ impl<M: Clone> MetaInterp<M> {
         let is_finish = descr.is_finish();
         Self::finish_compiled_run_io(is_finish);
 
+        // RPython compile.py:696 (handle_fail):
+        // Guard failure counter + bridge compilation trigger.
         if !is_finish {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
@@ -2203,11 +2228,39 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_compiled: false,
                 });
             info.fail_count += 1;
+            let fail_count = info.fail_count;
+            let bridge_compiled = info.bridge_compiled;
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, info.fail_count);
+                hook(green_key, fail_index, fail_count);
+            }
+
+            // RPython compile.py:697-706 (must_compile → _trace_and_compile_from_bridge):
+            // When guard fails >= trace_eagerness times, trigger bridge hook.
+            // The hook (set by pyre) compiles a bridge for the alternative path.
+            if fail_count >= self.trace_eagerness
+                && self.trace_eagerness > 0
+                && !bridge_compiled
+            {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] bridge threshold reached: key={} trace={} guard={} count={}",
+                        green_key, trace_id, fail_index, fail_count
+                    );
+                }
+                if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
+                    if let Some(info) = compiled.guard_failures.get_mut(&(trace_id, fail_index)) {
+                        info.bridge_compiled = true;
+                    }
+                }
+                // RPython compile.py:714: invoke bridge compilation callback.
+                // pyre's call_jit.rs sets this hook to compile a bridge
+                // that handles the alternative path (e.g., fib base case).
+                if let Some(ref hook) = self.hooks.on_bridge_threshold {
+                    hook(green_key, trace_id, fail_index);
+                }
             }
         }
 
@@ -4132,6 +4185,7 @@ mod tests {
                 token,
                 num_inputs: inputargs.len(),
                 meta: (),
+                front_target_tokens: Vec::new(),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
@@ -4591,6 +4645,7 @@ mod tests {
                 token: JitCellToken::new(1),
                 num_inputs: 2,
                 meta: (),
+                front_target_tokens: Vec::new(),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
@@ -4689,6 +4744,7 @@ mod tests {
                 token: JitCellToken::new(100),
                 num_inputs: 2,
                 meta: (),
+                front_target_tokens: Vec::new(),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
@@ -4974,6 +5030,7 @@ mod tests {
                 token: JitCellToken::new(2),
                 num_inputs: 1,
                 meta: (),
+                front_target_tokens: Vec::new(),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
@@ -6062,6 +6119,7 @@ mod tests {
                 token: JitCellToken::new(700),
                 num_inputs: 0,
                 meta: (),
+                front_target_tokens: Vec::new(),
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,

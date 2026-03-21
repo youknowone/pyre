@@ -227,6 +227,12 @@ impl<S: JitState> JitDriver<S> {
         self.is_recursive = value;
     }
 
+    /// RPython compile.py:714: set callback for bridge compilation on
+    /// guard failure threshold.
+    pub fn set_bridge_threshold_hook(&mut self, hook: Box<dyn Fn(u64, u64, u32) + Send>) {
+        self.meta.hooks.on_bridge_threshold = Some(hook);
+    }
+
     /// PyPy warmspot.py set_param_max_unroll_recursion().
     pub fn set_max_unroll_recursion(&mut self, value: usize) {
         self.meta.set_max_unroll_recursion(value);
@@ -393,6 +399,12 @@ impl<S: JitState> JitDriver<S> {
                     let meta = self.trace_meta.take().unwrap();
                     self.meta.close_and_compile(&jump_args, meta);
                 } else {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[mp] abort:validate_close_with_jump_args actual_len={}",
+                            jump_args.len()
+                        );
+                    }
                     self.meta.abort_trace(false);
                     self.trace_meta = None;
                 }

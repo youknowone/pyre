@@ -3206,13 +3206,44 @@ fn run_compiled_code(
         }
     }
 
-    let fail_index = with_active_force_frame(handle, || unsafe {
+    let mut fail_index = with_active_force_frame(handle, || unsafe {
         func(
             inputs.as_ptr(),
             outputs.as_mut_ptr(),
             roots.as_mut_ptr() as *mut i64,
         )
     }) as u32;
+
+    // RPython parity: after compiled code returns, check if the failed
+    // guard has an attached bridge. If so, execute the bridge directly.
+    // This is the pyre equivalent of RPython's patched JMP instruction
+    // (assembler.py:965 patch_jump_for_descr).
+    if (fail_index as usize) < fail_descrs.len() {
+        let fail_descr = &fail_descrs[fail_index as usize];
+        if !fail_descr.is_finish() {
+            let bridge_guard = fail_descr.bridge.lock().unwrap();
+            if let Some(ref bridge) = *bridge_guard {
+                let actual_outputs = fail_descr.fail_arg_types().len().max(1);
+                let outputs_slice = &outputs[..actual_outputs];
+                let mut bridge_frame = CraneliftBackend::execute_bridge(
+                    bridge,
+                    outputs_slice,
+                    &fail_descr.fail_arg_types,
+                );
+                let bridge_is_finish = {
+                    let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
+                        .expect("bridge deadframe must have a descriptor");
+                    (bridge_descr.is_finish(), bridge_descr.fail_index())
+                };
+                if bridge_is_finish.0 {
+                    let bridge_result = finish_result_from_deadframe(&mut bridge_frame)
+                        .expect("bridge finish result failed");
+                    outputs[0] = bridge_result as i64;
+                    fail_index = bridge_is_finish.1;
+                }
+            }
+        }
+    }
 
     // RPython parity: _call_footer_shadowstack (assembler.py:1130-1136)
     // pops jitframe from shadowstack at exit.
