@@ -1599,7 +1599,9 @@ impl TraceFrameState {
         let fail_arg_types =
             virtualizable_fail_arg_types(local_types.into_iter().chain(stack_types).chain(std::iter::once(branch_type)));
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
-        self.sym_mut().last_popped_concrete_value = None;
+        if self.sym().pending_branch_value.is_none() {
+            self.sym_mut().last_popped_concrete_value = None;
+        }
     }
 
     fn concrete_popped_value(&self) -> Option<PyObjectRef> {
@@ -3068,12 +3070,10 @@ impl TraceFrameState {
                                 }
                             }
                         }
-                        // RPython warmstate.py:714: get_assembler_token checks
-                        // compiled token first, then pending_token (for self-recursive
-                        // calls being traced for the first time).
+                        // Use compiled loop token only (not pending_token)
+                        // to avoid type descriptor mismatches.
                         let Some(token_number) = driver
                             .get_loop_token_number(callee_key)
-                            .or_else(|| driver.get_pending_token_number(callee_key))
                         else {
                             let call_pc = self.fallthrough_pc.saturating_sub(1);
                             return self.with_ctx(|this, ctx| {
@@ -3458,9 +3458,11 @@ impl TraceFrameState {
                     this.sync_standard_virtualizable_before_residual_call(ctx);
                     // RPython parity: use CALL_ASSEMBLER_I when a token
                     // exists for the callee (compiled or pending).
+                    // Use CALL_ASSEMBLER_I only when callee is already compiled
+                    // (loop token exists). Pending tokens have incomplete type
+                    // info which causes descriptor mismatches.
                     let ca_token = if is_self_recursive {
                         driver.get_loop_token_number(callee_key)
-                            .or_else(|| driver.get_pending_token_number(callee_key))
                     } else {
                         None
                     };
@@ -3517,7 +3519,12 @@ impl TraceFrameState {
                             &[Type::Ref, Type::Ref, Type::Int],
                         )
                     };
-                    if !this.sync_standard_virtualizable_after_residual_call() {
+                    // CallAssemblerI handles guard failures internally
+                    // (call_assembler_fast_path). No GuardNotForced needed,
+                    // but virtualizable token must be cleaned up.
+                    if ca_token.is_some() {
+                        this.sync_standard_virtualizable_after_residual_call();
+                    } else if !this.sync_standard_virtualizable_after_residual_call() {
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.record_guard(ctx, OpCode::GuardNotForced, &[]);
                         this.pop_call_replay_stack(ctx, args.len())?;
@@ -4298,7 +4305,9 @@ impl BranchOpcodeHandler for TraceFrameState {
     }
 
     fn leave_branch_truth(&mut self) -> Result<(), PyError> {
-        self.sym_mut().pending_branch_value = None;
+        let sym = self.sym_mut();
+        sym.pending_branch_value = None;
+        sym.last_popped_concrete_value = None;
         Ok(())
     }
 
@@ -6449,6 +6458,48 @@ mod tests {
             fail_args.as_slice(),
             &[frame_ref, expected_pc, expected_vsd, lower_stack, expected_branch_value]
         );
+    }
+
+    #[test]
+    fn test_branch_truth_keeps_concrete_popped_value_until_leave() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("1 + 2").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.push(w_int_new(1));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(2);
+        let frame_ref = OpRef(0);
+        let truth = OpRef(1);
+        let mut sym = PyreSym::new_uninit(frame_ref);
+        sym.symbolic_initialized = true;
+        sym.nlocals = frame.nlocals();
+        sym.valuestackdepth = frame.valuestackdepth;
+        sym.symbolic_stack = vec![truth];
+        sym.symbolic_stack_types = vec![Type::Int];
+        sym.last_popped_concrete_value = Some(w_int_new(1));
+        sym.pending_branch_value = Some(truth);
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        state.with_ctx(|this, ctx| {
+            this.record_guard(ctx, OpCode::GuardTrue, &[truth]);
+        });
+        assert_eq!(state.concrete_branch_truth_for_value(truth).unwrap(), true);
+        <TraceFrameState as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
+        assert!(state.sym().last_popped_concrete_value.is_none());
     }
 
     #[test]
