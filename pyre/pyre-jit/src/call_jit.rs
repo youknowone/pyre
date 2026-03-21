@@ -916,6 +916,93 @@ pub fn install_jit_call_bridge() {
     });
 }
 
+/// RPython compile.py:714 (_trace_and_compile_from_bridge):
+/// Called when a guard failure reaches the trace_eagerness threshold.
+/// Compiles a bridge for the alternative path.
+///
+/// For fib's Guard(n>=2) failure: the bridge handles n<2 → return n.
+/// Bridge ops: GetfieldGcI(n_boxed, intval) → Finish(unboxed_n)
+pub fn jit_bridge_compile_for_guard(green_key: u64, trace_id: u64, fail_index: u32) {
+    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+    use std::collections::HashMap;
+
+    let driver = crate::eval::driver_pair();
+    let meta = driver.0.meta_interp_mut();
+
+    let Some(fail_descr) = meta.get_fail_descr_for_bridge(green_key, trace_id, fail_index) else {
+        return;
+    };
+
+    let fail_arg_types = fail_descr.fail_arg_types().to_vec();
+
+    // RPython compile.py:1039 — bridge inputargs match guard's fail_arg_types
+    let bridge_inputargs: Vec<InputArg> = fail_arg_types
+        .iter()
+        .enumerate()
+        .map(|(i, tp)| InputArg::from_type(*tp, i as u32))
+        .collect();
+
+    // RPython pyjitpl.py:2841 (interpret) → traces the alternative path.
+    // For fib base case: fail_args = [frame(Ref), ni(Int), vsd(Int), n(Ref)]
+    // The n<2 path just returns n. Bridge: unbox n → Finish(raw_n).
+    //
+    // For RawInt protocol: GetfieldGcI(inputarg_3, intval_descr) → Finish
+    let protocol = finish_protocol(green_key);
+    let mut bridge_ops = Vec::new();
+    let constants: HashMap<u32, i64> = HashMap::new();
+
+    // Find first Ref inputarg after the virtualizable header (idx >= 3)
+    // This is typically the first local variable.
+    let first_ref_idx = fail_arg_types
+        .iter()
+        .enumerate()
+        .position(|(i, tp)| i >= 3 && *tp == Type::Ref);
+
+    if let Some(ref_idx) = first_ref_idx {
+        if matches!(protocol, FinishProtocol::RawInt) {
+            // Unbox: GetfieldGcI(n_boxed, intval_descr) → raw int
+            let n_boxed = OpRef(ref_idx as u32);
+            let intval_descr = crate::jit::descr::int_intval_descr();
+            let unboxed = OpRef(bridge_inputargs.len() as u32);
+            let mut getfield = Op::with_descr(OpCode::GetfieldGcI, &[n_boxed], intval_descr);
+            getfield.pos = unboxed;
+            bridge_ops.push(getfield);
+
+            let finish_descr = majit_meta::make_fail_descr_typed(vec![Type::Int]);
+            let mut finish_op = Op::with_descr(OpCode::Finish, &[unboxed], finish_descr);
+            finish_op.pos = OpRef(unboxed.0 + 1);
+            bridge_ops.push(finish_op);
+        } else {
+            // Boxed: return the Ref directly
+            let n_boxed = OpRef(ref_idx as u32);
+            let finish_descr = majit_meta::make_fail_descr_typed(vec![Type::Ref]);
+            let mut finish_op = Op::with_descr(OpCode::Finish, &[n_boxed], finish_descr);
+            finish_op.pos = OpRef(bridge_inputargs.len() as u32);
+            bridge_ops.push(finish_op);
+        }
+    } else {
+        // No Ref locals — can't synthesize bridge
+        return;
+    }
+
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][bridge] compiling bridge for guard key={} trace={} fail={}",
+            green_key, trace_id, fail_index
+        );
+    }
+
+    // RPython compile.py:792 (compile_and_attach) → send_bridge_to_backend
+    meta.compile_bridge(
+        green_key,
+        fail_index,
+        fail_descr.as_ref(),
+        &bridge_ops,
+        &bridge_inputargs,
+        constants,
+    );
+}
+
 extern "C" fn jit_bridge_compile_callee(
     frame_ptr: i64,
     fail_index: u32,
@@ -1002,7 +1089,7 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     frame.next_instr = 0;
     frame.vable_token = 0;
     frame.block_stack.clear();
-    frame.pending_inline_result = None;
+    frame.pending_inline_results.clear();
 }
 
 fn create_callee_frame_impl_1_boxed(

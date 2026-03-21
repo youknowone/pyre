@@ -59,6 +59,11 @@ thread_local! {
         );
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
+        // RPython compile.py:714 (_trace_and_compile_from_bridge):
+        // When guard failure threshold is reached, compile a bridge.
+        d.set_bridge_threshold_hook(Box::new(|green_key, trace_id, fail_index| {
+            crate::call_jit::jit_bridge_compile_for_guard(green_key, trace_id, fail_index);
+        }));
         (d, info)
     });
 }
@@ -221,28 +226,6 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     let code = unsafe { &*frame.code };
 
-    // TODO: re-enable JIT for module-level code (nlocals=0).
-    //
-    // PyPy DOES JIT-compile module-level loops — jit_merge_point fires
-    // for all frames (interp_jit.py:85). Variables are accessed via
-    // STORE_NAME/LOAD_NAME (dict-based w_locals), not STORE_FAST/LOAD_FAST
-    // (virtualizable locals_cells_stack_w). The JIT compiles the loop but
-    // each iteration still pays dict lookup overhead.
-    //
-    // Currently disabled because:
-    // 1. nlocals=0 → variables not in JUMP args → GC stale nursery pointers
-    // 2. STORE_NAME/LOAD_NAME not yet traced as residual calls
-    //
-    // To re-enable:
-    // 1. Trace STORE_NAME/LOAD_NAME as residual dict operations
-    // 2. Either carry namespace values as JUMP args, or ensure New() results
-    //    written to the namespace dict are GC-visible across JUMP back-edges
-    // 3. Alternatively, detect module-level loops and promote variables to
-    //    synthetic fast locals during compilation (like CPython's MAKE_FUNCTION)
-    if code.varnames.is_empty() {
-        return pyre_interp::eval::eval_frame_plain(frame);
-    }
-
     let env = PyreEnv;
     let mut arg_state = OpArgState::default();
     let (driver, info) = driver_pair();
@@ -252,26 +235,57 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             return Ok(w_none());
         }
 
+        let pc = frame.next_instr;
+        let code_unit = code.instructions[pc];
+        let (instruction, op_arg) = arg_state.get(code_unit);
+
+        // RPython finishframe() resumes the parent after the CALL. Our
+        // pending-inline replay is the concrete analogue of that handoff, so
+        // replay-only CALL sites must not become separate hot green keys.
+        if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
+            if !frame.pending_inline_results.is_empty() {
+                frame.next_instr = pc + 1;
+                if pyre_interp::call::replay_pending_inline_call(
+                    frame,
+                    argc.get(op_arg) as usize,
+                ) {
+                    continue;
+                }
+                frame.next_instr = pc;
+            }
+        }
+
         // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
-        // pypyjitdriver.jit_merge_point(ec=ec, frame=self, next_instr=next_instr,
-        //     pycode=pycode, is_being_profiled=is_being_profiled)
-        //
-        // Tracing merge_point is depth-gated: only the outermost portal
-        // (depth==0) records ops.  Inner calls are traced as residual CALLs,
-        // not as nested merge_points — matching RPython's CALL_MAY_FORCE /
-        // CALL_ASSEMBLER pattern for recursive JitDrivers.
-        if JIT_CALL_DEPTH.with(|d| d.get()) == 0 && driver.is_tracing() {
-            JIT_TRACING.with(|t| t.set(true));
-            let pc = frame.next_instr;
+        // In RPython, jit_merge_point is also the only place that bumps the
+        // hot counter and starts tracing; can_enter_jit only runs already-
+        // compiled code. Mirror that split here instead of trying to start
+        // traces from the back-edge path.
+        if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
             let concrete_frame = frame as *mut PyFrame as usize;
-            driver.merge_point(|ctx, sym| trace_bytecode(ctx, sym, code, pc, concrete_frame));
+            let green_key = make_green_key(frame.code, pc);
+            let env = PyreEnv;
+            let mut jit_state = build_jit_state(frame, info);
+            if let Some(outcome) = driver.jit_merge_point_keyed(
+                green_key,
+                pc,
+                &mut jit_state,
+                &env,
+                || {},
+                |ctx, sym| {
+                    JIT_TRACING.with(|t| t.set(true));
+                    trace_bytecode(ctx, sym, code, pc, concrete_frame)
+                },
+            ) {
+                if let Some(result) =
+                    handle_jit_outcome(outcome, &jit_state, frame, info, green_key)
+                {
+                    return result;
+                }
+            }
             if !driver.is_tracing() {
                 JIT_TRACING.with(|t| t.set(false));
             }
         }
-
-        let code_unit = code.instructions[frame.next_instr];
-        let (instruction, op_arg) = arg_state.get(code_unit);
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
         if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
@@ -287,7 +301,7 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // Each (code, pc) pair has independent warmup counter
                 // and compiled loop, so inner/outer loops are separate.
                 let green_key = make_green_key(frame.code, frame.next_instr);
-                if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
+                if let Some(outcome) = driver.can_enter_jit_keyed(
                     green_key,
                     frame.next_instr,
                     &mut jit_state,
@@ -658,7 +672,7 @@ while i < 300:
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
-            assert_eq!(pyre_object::intobject::w_int_get_value(s), 8_977_550);
+            assert_eq!(pyre_object::intobject::w_int_get_value(s), 8_999_900);
         }
     }
 

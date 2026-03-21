@@ -1215,6 +1215,41 @@ impl TraceFrameState {
     }
 
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
+        // RPython parity: loop-carried live state comes from the current
+        // virtualizable frame state at the merge point. If symbolic stack
+        // accounting drifted during tracing, resync depth/shape from the
+        // concrete frame before materializing JUMP args.
+        let concrete_frame = self.concrete_frame;
+        let concrete_nlocals = concrete_nlocals(concrete_frame).unwrap_or(self.sym().nlocals);
+        let concrete_vsd = concrete_stack_depth(concrete_frame).unwrap_or_else(|| {
+            self.sym().valuestackdepth.max(concrete_nlocals)
+        });
+        {
+            let s = self.sym_mut();
+            s.nlocals = concrete_nlocals;
+            s.valuestackdepth = concrete_vsd;
+            let stack_only = s.stack_only_depth();
+            if s.symbolic_local_types.len() != concrete_nlocals {
+                s.symbolic_local_types = concrete_slot_types(
+                    concrete_frame,
+                    concrete_nlocals,
+                    concrete_nlocals,
+                );
+            }
+            if s.symbolic_stack_types.len() != stack_only {
+                s.symbolic_stack_types = concrete_slot_types(
+                    concrete_frame,
+                    concrete_nlocals,
+                    concrete_vsd,
+                )
+                .into_iter()
+                .skip(concrete_nlocals)
+                .collect();
+            }
+            if s.symbolic_stack.len() < stack_only {
+                s.symbolic_stack.resize(stack_only, OpRef::NONE);
+            }
+        }
         self.flush_to_frame(ctx);
         // If nlocals was lost (e.g., inline tracing reset symbolic_initialized),
         // re-derive from concrete frame. RPython keeps virtualizable_boxes in
@@ -1320,10 +1355,7 @@ impl TraceFrameState {
     }
 
     pub(crate) fn guard_range_iter(&mut self, ctx: &mut TraceCtx, obj: OpRef) {
-        let range_iter_type_ptr = &RANGE_ITER_TYPE as *const PyType as usize as i64;
-        let actual_type = trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected = ctx.const_int(range_iter_type_ptr);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected]);
+        self.guard_object_class(ctx, obj, &RANGE_ITER_TYPE as *const PyType);
     }
 
     pub(crate) fn record_for_iter_guard(
@@ -1396,10 +1428,8 @@ impl TraceFrameState {
     }
 
     fn guard_object_class(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected_type: *const PyType) {
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
         let expected_type = ctx.const_int(expected_type as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.record_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type]);
     }
 
     fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
@@ -1507,10 +1537,7 @@ impl TraceFrameState {
         items_len_descr: DescrRef,
         concrete_index: usize,
     ) -> OpRef {
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected_type = ctx.const_int(expected_type as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.guard_object_class(ctx, obj, expected_type);
         self.guard_int_like_value(ctx, key, concrete_index as i64);
         let len = trace_gc_object_int_field(ctx, obj, items_len_descr);
         self.guard_len_gt_index(ctx, len, concrete_index);
@@ -1531,10 +1558,7 @@ impl TraceFrameState {
         concrete_len: usize,
     ) -> OpRef {
         let normalized = (concrete_len as i64 + concrete_key) as usize;
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected_type = ctx.const_int(expected_type as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.guard_object_class(ctx, obj, expected_type);
         self.guard_int_like_value(ctx, key, concrete_key);
         let len = trace_gc_object_int_field(ctx, obj, items_len_descr);
         self.guard_len_eq(ctx, len, concrete_len);
@@ -1550,10 +1574,7 @@ impl TraceFrameState {
         key: OpRef,
         concrete_index: usize,
     ) -> OpRef {
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 0);
         let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
@@ -1569,10 +1590,7 @@ impl TraceFrameState {
         concrete_key: i64,
         _concrete_len: usize,
     ) -> OpRef {
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 0);
         let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
@@ -1587,10 +1605,7 @@ impl TraceFrameState {
         key: OpRef,
         concrete_index: usize,
     ) -> OpRef {
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 1);
         let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
@@ -1608,10 +1623,7 @@ impl TraceFrameState {
         concrete_key: i64,
         _concrete_len: usize,
     ) -> OpRef {
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 1);
         let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
@@ -1628,10 +1640,7 @@ impl TraceFrameState {
         key: OpRef,
         concrete_index: usize,
     ) -> OpRef {
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 2);
         let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
@@ -1649,10 +1658,7 @@ impl TraceFrameState {
         concrete_key: i64,
         _concrete_len: usize,
     ) -> OpRef {
-        let actual_type =
-            trace_gc_object_type_field(ctx, obj, self.ob_type_fd.clone());
-        let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 2);
         let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
@@ -1671,10 +1677,7 @@ impl TraceFrameState {
         items_ptr_descr: DescrRef,
         items_len_descr: DescrRef,
     ) -> Vec<OpRef> {
-        let actual_type =
-            trace_gc_object_type_field(ctx, seq, self.ob_type_fd.clone());
-        let expected = ctx.const_int(expected_type as usize as i64);
-        self.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected]);
+        self.guard_object_class(ctx, seq, expected_type);
 
         let len = trace_gc_object_int_field(ctx, seq, items_len_descr);
         self.guard_value(ctx, len, count as i64);
@@ -2121,15 +2124,7 @@ impl TraceFrameState {
                     let index = index as usize;
                     if index < concrete_len {
                         return self.with_ctx(|this, ctx| {
-                            let actual_type =
-                                trace_gc_object_type_field(ctx, obj, this.ob_type_fd.clone());
-                            let expected_type =
-                                ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-                            this.record_guard(
-                                ctx,
-                                OpCode::GuardClass,
-                                &[actual_type, expected_type],
-                            );
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 0);
                             let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
@@ -2144,15 +2139,7 @@ impl TraceFrameState {
                 {
                     if abs_index <= concrete_len {
                         return self.with_ctx(|this, ctx| {
-                            let actual_type =
-                                trace_gc_object_type_field(ctx, obj, this.ob_type_fd.clone());
-                            let expected_type =
-                                ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-                            this.record_guard(
-                                ctx,
-                                OpCode::GuardClass,
-                                &[actual_type, expected_type],
-                            );
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 0);
                             let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
@@ -2173,15 +2160,7 @@ impl TraceFrameState {
                     let index = index as usize;
                     if index < concrete_len {
                         return self.with_ctx(|this, ctx| {
-                            let actual_type =
-                                trace_gc_object_type_field(ctx, obj, this.ob_type_fd.clone());
-                            let expected_type =
-                                ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-                            this.record_guard(
-                                ctx,
-                                OpCode::GuardClass,
-                                &[actual_type, expected_type],
-                            );
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 1);
                             let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
@@ -2209,15 +2188,7 @@ impl TraceFrameState {
                 {
                     if abs_index <= concrete_len {
                         return self.with_ctx(|this, ctx| {
-                            let actual_type =
-                                trace_gc_object_type_field(ctx, obj, this.ob_type_fd.clone());
-                            let expected_type =
-                                ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-                            this.record_guard(
-                                ctx,
-                                OpCode::GuardClass,
-                                &[actual_type, expected_type],
-                            );
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 1);
                             let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
@@ -2251,15 +2222,7 @@ impl TraceFrameState {
                     let index = index as usize;
                     if index < concrete_len {
                         return self.with_ctx(|this, ctx| {
-                            let actual_type =
-                                trace_gc_object_type_field(ctx, obj, this.ob_type_fd.clone());
-                            let expected_type =
-                                ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-                            this.record_guard(
-                                ctx,
-                                OpCode::GuardClass,
-                                &[actual_type, expected_type],
-                            );
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 2);
                             let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
@@ -2287,15 +2250,7 @@ impl TraceFrameState {
                 {
                     if abs_index <= concrete_len {
                         return self.with_ctx(|this, ctx| {
-                            let actual_type =
-                                trace_gc_object_type_field(ctx, obj, this.ob_type_fd.clone());
-                            let expected_type =
-                                ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-                            this.record_guard(
-                                ctx,
-                                OpCode::GuardClass,
-                                &[actual_type, expected_type],
-                            );
+                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 2);
                             let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
@@ -2336,10 +2291,7 @@ impl TraceFrameState {
             {
                 let concrete_len = w_list_len(concrete_list);
                 return self.with_ctx(|this, ctx| {
-                    let actual_type =
-                        trace_gc_object_type_field(ctx, list, this.ob_type_fd.clone());
-                    let expected_type = ctx.const_int(&LIST_TYPE as *const PyType as usize as i64);
-                    this.record_guard(ctx, OpCode::GuardClass, &[actual_type, expected_type]);
+                    this.guard_object_class(ctx, list, &LIST_TYPE as *const PyType);
                     this.guard_list_strategy(ctx, list, 0);
                     if w_list_is_inline_storage(concrete_list) {
                         let heap_cap = ctx.record_op_with_descr(
@@ -3532,10 +3484,20 @@ impl TraceFrameState {
 
     pub(crate) fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
         if pc >= code.instructions.len() {
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][abort-reason] trace_code_step pc_oob pc={} code_len={}",
+                    pc,
+                    code.instructions.len()
+                );
+            }
             return TraceAction::Abort;
         }
 
         let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
+            if majit_meta::majit_log_enabled() {
+                eprintln!("[jit][abort-reason] trace_code_step decode_failed pc={}", pc);
+            }
             return TraceAction::Abort;
         };
 
@@ -3561,10 +3523,23 @@ impl TraceFrameState {
         pc: usize,
     ) -> InlineTraceStepAction {
         if pc >= code.instructions.len() {
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][abort-reason] trace_code_step_inline pc_oob pc={} code_len={}",
+                    pc,
+                    code.instructions.len()
+                );
+            }
             return InlineTraceStepAction::Trace(TraceAction::Abort);
         }
 
         let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][abort-reason] trace_code_step_inline decode_failed pc={}",
+                    pc
+                );
+            }
             return InlineTraceStepAction::Trace(TraceAction::Abort);
         };
 
@@ -3583,8 +3558,7 @@ impl TraceFrameState {
                 if let Some(mut pending) = self.pending_inline_frame.take() {
                     let result_idx = self
                         .sym()
-                        .symbolic_stack
-                        .len()
+                        .stack_only_depth()
                         .checked_sub(1)
                         .expect("pending inline frame missing caller result slot");
                     pending.caller_result_stack_idx = Some(result_idx);
@@ -3605,6 +3579,12 @@ pub(crate) fn trace_step_result_to_action(
     match result {
         Ok(pyre_runtime::StepResult::Continue) => {
             if state.ctx().is_too_long() {
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][abort-reason] trace_too_long key={}",
+                        state.ctx().green_key()
+                    );
+                }
                 TraceAction::Abort
             } else {
                 TraceAction::Continue
@@ -3655,7 +3635,16 @@ pub(crate) fn trace_step_result_to_action(
                 Type::Ref | Type::Void => Type::Ref,
             }],
         },
-        Err(_) => TraceAction::Abort,
+        Err(err) => {
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][abort-reason] step_error key={} err={}",
+                    state.ctx().green_key(),
+                    err
+                );
+            }
+            TraceAction::Abort
+        }
     }
 }
 
@@ -4637,7 +4626,17 @@ impl JitState for PyreJitState {
         // [frame, next_instr, valuestackdepth, locals..., stack...]
         let stack_only = meta.valuestackdepth.saturating_sub(meta.num_locals);
         let expected = 3 + meta.num_locals + stack_only;
-        jump_args.len() == expected
+        let ok = jump_args.len() == expected;
+        if !ok && majit_meta::majit_log_enabled() {
+            eprintln!(
+                "[jit][abort-reason] validate_close_with_jump_args expected={} actual={} num_locals={} valuestackdepth={}",
+                expected,
+                jump_args.len(),
+                meta.num_locals,
+                meta.valuestackdepth
+            );
+        }
+        ok
     }
 
     /// RPython resume.py: materialize a virtual object from resume data.
@@ -4844,19 +4843,50 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_gc_object_type_field_uses_raw_getfield_for_header() {
+    fn test_trace_gc_object_type_field_uses_pure_getfield_for_immutable_header() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef(0);
         let _ = trace_gc_object_type_field(&mut ctx, obj, trace_ob_type_descr());
 
         let recorder = ctx.into_recorder();
         let op = recorder.last_op().expect("getfield op should be present");
-        assert_eq!(op.opcode, OpCode::GetfieldRawI);
+        assert_eq!(op.opcode, OpCode::GetfieldGcPureI);
         assert_eq!(op.args.as_slice(), &[obj]);
     }
 
     #[test]
-    fn test_trace_guarded_int_payload_uses_pure_getfield_for_immutable_intval() {
+    fn test_guard_object_class_uses_guard_nonnull_class() {
+        let mut ctx = TraceCtx::for_test(1);
+        let obj = OpRef(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_locals = vec![obj];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.nlocals = 1;
+        sym.symbolic_initialized = true;
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: 1,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        state.with_ctx(|this, ctx| {
+            this.guard_object_class(ctx, obj, &INT_TYPE as *const PyType);
+        });
+
+        let recorder = ctx.into_recorder();
+        let op = recorder.last_op().expect("guard op should be present");
+        assert_eq!(op.opcode, OpCode::GuardNonnullClass);
+        assert_eq!(op.args[0], obj);
+    }
+
+    #[test]
+    fn test_trace_guarded_int_payload_uses_guard_nonnull_class_and_pure_payload() {
         let mut ctx = TraceCtx::for_test(1);
         let int_obj = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -4879,9 +4909,27 @@ mod tests {
         let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
 
         let recorder = ctx.into_recorder();
-        let op = recorder.last_op().expect("intval read should be present");
-        assert_eq!(op.opcode, OpCode::GetfieldGcPureI);
-        assert_eq!(op.args.as_slice(), &[int_obj]);
+        let mut saw_guard_nonnull_class = false;
+        let mut saw_pure_payload = false;
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if op.opcode == OpCode::GuardNonnullClass {
+                saw_guard_nonnull_class = true;
+            }
+            if op.opcode == OpCode::GetfieldGcPureI && op.args.as_slice() == &[int_obj] {
+                saw_pure_payload = true;
+            }
+        }
+        assert!(
+            saw_guard_nonnull_class,
+            "int payload fast path should guard object class via GuardNonnullClass"
+        );
+        assert!(
+            saw_pure_payload,
+            "int payload fast path should read the immutable payload with GetfieldGcPureI"
+        );
     }
 
     #[test]
