@@ -345,6 +345,43 @@ impl UnrollOptimizer {
             }
             if jumped {
                 redirected_tail_ops = jump_ctx.new_operations;
+                // Check if the redirected Jump targets the current body token
+                // (last in target_tokens) or an external token from a previous
+                // compilation.  The Cranelift backend compiles each trace as a
+                // single function — cross-function jumps to external target
+                // tokens are not supported.  Discard the redirected tail and
+                // restore the body's original self-loop Jump instead.
+                let current_body_descr_idx = self
+                    .target_tokens
+                    .last()
+                    .map(|t| t.as_jump_target_descr().index());
+                let redirected_jump_descr_idx = redirected_tail_ops
+                    .iter()
+                    .rfind(|o| o.opcode == OpCode::Jump)
+                    .and_then(|o| o.descr.as_ref())
+                    .map(|d| d.index());
+                if redirected_jump_descr_idx != current_body_descr_idx {
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[jit] jump_to_existing_trace: external target {:?} != body {:?}, restoring self-loop",
+                            redirected_jump_descr_idx, current_body_descr_idx
+                        );
+                    }
+                    // Restore the original terminal Jump as a self-loop.
+                    // Phase 2's terminal_op was extracted from body_ops;
+                    // splice it back with the current body Label's descr.
+                    redirected_tail_ops.clear();
+                    if let Some(mut original_jump) = body_terminal_op.clone() {
+                        if let Some(body_descr) = self
+                            .target_tokens
+                            .last()
+                            .map(|t| t.as_jump_target_descr())
+                        {
+                            original_jump.descr = Some(body_descr);
+                        }
+                        redirected_tail_ops.push(original_jump);
+                    }
+                }
             }
             jumped
         };
