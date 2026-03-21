@@ -62,6 +62,15 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether this descriptor refers to a virtualizable field.
+    ///
+    /// Virtualizable fields (e.g. linked-list head/size) are not force-emitted
+    /// at guards; they go into pendingfields instead, matching RPython's
+    /// treatment of virtualizable fields in force_lazy_sets_for_guard.
+    fn is_virtualizable(&self) -> bool {
+        false
+    }
+
     /// intbounds.py: descr.is_integer_bounded() / get_integer_min/max.
     /// Returns (field_size_bytes, is_signed) if this is a field descriptor.
     /// Used by intbounds to narrow GETFIELD result bounds.
@@ -708,6 +717,7 @@ pub struct SimpleFieldDescr {
     field_type: Type,
     is_immutable: bool,
     is_signed: bool,
+    virtualizable: bool,
 }
 
 impl SimpleFieldDescr {
@@ -725,11 +735,17 @@ impl SimpleFieldDescr {
             field_type,
             is_immutable,
             is_signed: true,
+            virtualizable: false,
         }
     }
 
     pub fn with_signed(mut self, signed: bool) -> Self {
         self.is_signed = signed;
+        self
+    }
+
+    pub fn with_virtualizable(mut self, virtualizable: bool) -> Self {
+        self.virtualizable = virtualizable;
         self
     }
 }
@@ -740,6 +756,9 @@ impl Descr for SimpleFieldDescr {
     }
     fn is_always_pure(&self) -> bool {
         self.is_immutable
+    }
+    fn is_virtualizable(&self) -> bool {
+        self.virtualizable
     }
     fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
         Some(self)

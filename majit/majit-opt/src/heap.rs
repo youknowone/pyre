@@ -296,7 +296,19 @@ impl OptHeap {
 
         // heap.py:610-621: iterate cached fields
         let field_entries: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
+        let mut vable_retain = Vec::new();
         for (key, mut op) in field_entries {
+            // Virtualizable fields are not force-emitted at guards;
+            // they stay deferred (re-inserted into lazy_setfields),
+            // matching RPython's treatment of virtualizable fields.
+            let is_vable = op
+                .descr
+                .as_ref()
+                .map_or(false, |d| d.is_virtualizable());
+            if is_vable {
+                vable_retain.push((key, op));
+                continue;
+            }
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
             let value_ref = ctx.get_replacement(op.arg(1));
             let is_virtual = matches!(
@@ -316,6 +328,10 @@ impl OptHeap {
             self.remember_field_descr(key, &op);
             ctx.emit(op);
             self.cached_fields.insert(key, final_value);
+        }
+        // Re-insert virtualizable lazy sets so they survive across guards
+        for (key, op) in vable_retain {
+            self.lazy_setfields.insert(key, op);
         }
 
         // heap.py:622-636: iterate cached array items
