@@ -2256,7 +2256,11 @@ impl TraceFrameState {
             };
             let result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
             this.remember_value_type(result, Type::Float);
-            Ok(result)
+            // RPython parity: wrapfloat(space, z) re-boxes the raw float result.
+            // pypy/objspace/std/floatobject.py
+            let boxed = box_traced_raw_float(ctx, result);
+            this.remember_value_type(boxed, Type::Ref);
+            Ok(boxed)
         })
     }
 
@@ -4605,7 +4609,10 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
     ) -> Result<Self::Value, PyError> {
         if matches!(op, BinaryOperator::Subscr) {
             self.binary_subscr_value(a, b)
-        } else if self.concrete_binary_float_operands() {
+        } else if self.concrete_binary_float_operands()
+            || self.value_type(a) == Type::Float
+            || self.value_type(b) == Type::Float
+        {
             self.binary_float_value(a, b, op)
         } else {
             self.binary_int_value(a, b, op)
