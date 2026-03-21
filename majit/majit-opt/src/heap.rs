@@ -196,20 +196,17 @@ impl OptHeap {
     /// time via rd_virtuals, and the pending setfield replayed after.
     ///
     /// `allow_force`: true for call-triggered force, false for JUMP/flush.
+    /// RPython heap.py:618-620: force_lazy_set with virtual RHS.
+    /// If the value is virtual, do NOT emit — defer to pendingfields/rd_virtuals.
+    /// RPython: virtual stays virtual until guard failure materialization.
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, _allow_force: bool) -> bool {
         let orig_val = ctx.get_replacement(op.arg(1));
 
-        // If value is virtual, materialize it directly (bypass pass chain
-        // to avoid re-virtualization by OptVirtualize).
-        if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
+        // RPython parity: skip SetfieldGc with virtual RHS value.
+        // The virtual will be materialized at guard failure time via rd_virtuals.
+        if let Some(info) = ctx.get_ptr_info(orig_val) {
             if info.is_virtual() {
-                let forced = info.force_to_ops_direct(orig_val, ctx);
-                op.args[1] = forced;
-                for arg in op.args.iter_mut() {
-                    *arg = ctx.get_replacement(*arg);
-                }
-                ctx.emit(op.clone());
-                return true;
+                return false;
             }
         }
 
@@ -296,11 +293,12 @@ impl OptHeap {
                 continue;
             }
 
-            // Container is real. If value is virtual, materialize it directly
-            // to new_operations (bypass pass chain to avoid re-virtualization).
-            if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
+            // RPython heap.py:618-620: if value is virtual, defer to pendingfields.
+            // Do NOT force — virtual stays virtual until guard failure.
+            if let Some(info) = ctx.get_ptr_info(value_ref) {
                 if info.is_virtual() {
-                    info.force_to_ops_direct(value_ref, ctx);
+                    pendingfields.push(op);
+                    continue;
                 }
             }
 
@@ -328,9 +326,11 @@ impl OptHeap {
                 continue;
             }
 
-            if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
+            // RPython parity: virtual value → pendingfields, don't force.
+            if let Some(info) = ctx.get_ptr_info(value_ref) {
                 if info.is_virtual() {
-                    info.force_to_ops_direct(value_ref, ctx);
+                    pendingfields.push(op);
+                    continue;
                 }
             }
 
