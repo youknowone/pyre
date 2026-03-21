@@ -1385,9 +1385,28 @@ impl Optimization for OptHeap {
 
     fn emit_remaining_lazy_directly(&mut self, ctx: &mut OptContext) {
         let pending: Vec<(FieldKey, Op)> = self.lazy_setfields.drain().collect();
+        // Force any remaining virtual values before emit.
+        // These should have been forced in the 1st drain, but if the
+        // drain re-stored them in lazy_set with an intermediate forwarding
+        // position, the original virtual may still need force_to_ops.
+        for (_key, op) in &pending {
+            let orig_val = op.arg(1);
+            if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
+                if info.is_virtual() {
+                    info.force_to_ops(orig_val, ctx);
+                }
+            }
+        }
         for (_key, mut op) in pending {
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
+            }
+            // Skip if value points to undefined position (intermediate forwarding)
+            let val = op.arg(1);
+            if !val.is_none() && val.0 >= ctx.num_inputs() as u32 && val.0 < 10_000
+                && !ctx.new_operations.iter().any(|o| o.pos == val && o.opcode.result_type() != Type::Void)
+            {
+                continue;
             }
             ctx.emit(op);
         }
