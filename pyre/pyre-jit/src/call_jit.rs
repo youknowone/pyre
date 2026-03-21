@@ -19,11 +19,10 @@ use pyre_runtime::{
 
 use pyre_interp::frame::PyFrame;
 
-// RPython/PyPy's call_assembler path does not memoize recursive helper
-// results in a side cache. Keep the plumbing sites in place, but make the
-// cache a no-op so boxed results do not escape the GC's root graph through
-// ad-hoc global storage.
-const FORCE_CACHE_SIZE: usize = 1;
+// Hash-table memoization cache for self-recursive force results.
+// Safe for RawInt protocol (stores raw i64, no GC pointers).
+// Boxed protocol entries are not cached to avoid GC root issues.
+const FORCE_CACHE_SIZE: usize = 64;
 
 thread_local! {
     static RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, FinishProtocol, Option<u64>, bool)>> =
@@ -262,24 +261,63 @@ fn self_recursive_dispatch(green_key: u64) -> (FinishProtocol, Option<u64>) {
     })
 }
 
+/// Thread-local force cache: 64-entry direct-mapped hash table.
+/// Only caches RawInt results (raw i64 values, no GC pointers).
+struct ForceCacheEntry {
+    code_key: usize,
+    arg_key: usize,
+    value: i64,
+    valid: bool,
+}
+
+thread_local! {
+    static FORCE_CACHE: std::cell::UnsafeCell<[ForceCacheEntry; FORCE_CACHE_SIZE]> = {
+        const EMPTY: ForceCacheEntry = ForceCacheEntry { code_key: 0, arg_key: 0, value: 0, valid: false };
+        std::cell::UnsafeCell::new([EMPTY; FORCE_CACHE_SIZE])
+    };
+}
+
 #[inline]
 fn force_cache_lookup(
-    _protocol: FinishProtocol,
-    _hash_idx: usize,
-    _code_key: usize,
-    _arg_key: usize,
+    protocol: FinishProtocol,
+    hash_idx: usize,
+    code_key: usize,
+    arg_key: usize,
 ) -> Option<i64> {
-    None
+    if !matches!(protocol, FinishProtocol::RawInt) {
+        return None;
+    }
+    FORCE_CACHE.with(|cell| {
+        let cache = unsafe { &*cell.get() };
+        let entry = &cache[hash_idx];
+        if entry.valid && entry.code_key == code_key && entry.arg_key == arg_key {
+            Some(entry.value)
+        } else {
+            None
+        }
+    })
 }
 
 #[inline]
 fn force_cache_store(
-    _protocol: FinishProtocol,
-    _hash_idx: usize,
-    _code_key: usize,
-    _arg_key: usize,
-    _value: i64,
+    protocol: FinishProtocol,
+    hash_idx: usize,
+    code_key: usize,
+    arg_key: usize,
+    value: i64,
 ) {
+    if !matches!(protocol, FinishProtocol::RawInt) {
+        return;
+    }
+    FORCE_CACHE.with(|cell| {
+        let cache = unsafe { &mut *cell.get() };
+        cache[hash_idx] = ForceCacheEntry {
+            code_key,
+            arg_key,
+            value,
+            valid: true,
+        };
+    });
 }
 
 #[inline]
@@ -883,10 +921,10 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        // Use plain interpreter for the callee frame. Recursive sub-calls
-        // within eval_loop_for_force dispatch through call_user_function →
-        // eval_with_jit, so they use compiled code when available.
-        // The force_cache above short-circuits repeated base-case lookups.
+        // RPython assembler_call_helper: use interpreter for the callee frame.
+        // Nested calls dispatch through call_user_function → eval_with_jit,
+        // so compiled code + bridges are used when available.
+        // The force_cache above memoizes results for repeated calls.
         let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
             Ok(result) => result,
             Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
