@@ -464,18 +464,33 @@ impl OptContext {
         let preamble_result = self.imported_short_source(result);
         let is_constant = self.get_constant(preamble_result).is_some();
         if self.imported_short_preamble_used.insert(preamble_result) {
-            if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                let tracked = builder.use_box(preamble_result).is_some();
-                if tracked && !is_constant {
+            let tracked = if let Some(builder) = self.active_short_preamble_producer.as_mut() {
+                builder.use_box(preamble_result).is_some()
+            } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+                builder.use_box(preamble_result).is_some()
+            } else {
+                false
+            };
+            if tracked && !is_constant {
+                if let Some(builder) = self.imported_short_preamble_builder.as_ref() {
                     if let Some(produced) = builder.produced_short_op(preamble_result) {
-                        self.potential_extra_ops
-                            .insert(
-                                preamble_result,
-                                TrackedPreambleUse {
-                                    result: preamble_result,
-                                    produced,
-                                },
-                            );
+                        self.potential_extra_ops.insert(
+                            preamble_result,
+                            TrackedPreambleUse {
+                                result: preamble_result,
+                                produced,
+                            },
+                        );
+                    }
+                } else if let Some(builder) = self.active_short_preamble_producer.as_ref() {
+                    if let Some(produced) = builder.produced_short_op(preamble_result) {
+                        self.potential_extra_ops.insert(
+                            preamble_result,
+                            TrackedPreambleUse {
+                                result: preamble_result,
+                                produced,
+                            },
+                        );
                     }
                 }
             }
