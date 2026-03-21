@@ -186,16 +186,15 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     }
 
     // RPython parity: after guard-restored fallback from compiled code,
-    // prevent nested calls from re-entering compiled code. In RPython,
-    // guard failure → resume_in_blackhole → blackhole runs on jitcode
-    // bytecodes, and nested calls go through portal_runner (which CAN
-    // dispatch to compiled code independently). Since pyre doesn't have
-    // a jitcode-based blackhole, use force_plain_eval to ensure nested
-    // calls from the guard-restored interpreter don't corrupt frame state
-    // through recursive compiled code dispatch.
+    // prevent nested calls from re-entering compiled code. The Finish
+    // result's forced-virtual W_IntObject (New+SetfieldGc in unbox pass)
+    // has corrupted ob_type when executed through nested compiled code
+    // dispatch. Root cause: optimizer's virtual forcing emits New with
+    // ob_type SetfieldGc, but the Cranelift-compiled execution order or
+    // allocation lifecycle differs from the trace's expectations.
     //
-    // TODO: implement jitcode-based blackhole to allow nested compiled
-    // code dispatch (RPython blackhole.py dispatch_loop parity).
+    // TODO: fix New/SetfieldGc execution order for forced virtuals in
+    // the unbox pass to allow nested compiled code dispatch.
     let _plain_guard = pyre_interp::call::force_plain_eval();
     eval_loop_jit(frame)
 }
@@ -298,6 +297,13 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             if pyre_interp::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize) {
                 continue;
             }
+        }
+        if matches!(instruction, pyre_bytecode::bytecode::Instruction::BinaryOp { .. }) {
+            let top1 = if frame.valuestackdepth > 0 { frame.locals_cells_stack_w[frame.valuestackdepth - 1] as usize } else { 0 };
+            let top2 = if frame.valuestackdepth > 1 { frame.locals_cells_stack_w[frame.valuestackdepth - 2] as usize } else { 0 };
+            let t1_int = top1 >= 0x1000 && unsafe { pyre_object::pyobject::is_int(top1 as pyre_object::PyObjectRef) };
+            let t2_int = top2 >= 0x1000 && unsafe { pyre_object::pyobject::is_int(top2 as pyre_object::PyObjectRef) };
+            eprintln!("[BINOP] pc={} vsd={} top={:#x}(int={}) second={:#x}(int={})", pc, frame.valuestackdepth, top1, t1_int, top2, t2_int);
         }
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
             StepResult::Continue => {}

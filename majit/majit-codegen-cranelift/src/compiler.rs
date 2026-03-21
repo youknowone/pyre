@@ -7568,20 +7568,11 @@ fn collect_guards(
 
         let (fail_arg_refs, fail_arg_types) = if is_finish {
             let refs: Vec<OpRef> = op.args.iter().copied().collect();
-            // Use the descriptor's explicit types for FINISH args — these are
-            // set by the tracer and represent the caller's view of the return
-            // type, which may differ from the op's inferred type (e.g. New
-            // produces Ref but the value is treated as Int by the caller).
-            let types = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
-                let dt = fd.fail_arg_types();
-                if dt.len() == refs.len() {
-                    dt.to_vec()
-                } else {
-                    infer_fail_arg_types(&refs, &value_types)?
-                }
-            } else {
-                infer_fail_arg_types(&refs, &value_types)?
-            };
+            // Finish args: use infer_fail_arg_types to get the actual runtime
+            // types. The Finish value may be a raw Int (e.g. unboxed
+            // CallAssemblerI result) which handle_jit_outcome must re-box.
+            // Using descriptor types here would mistype Int as Ref.
+            let types = infer_fail_arg_types(&refs, &value_types)?;
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
