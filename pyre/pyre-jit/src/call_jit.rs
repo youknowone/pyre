@@ -428,8 +428,16 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
+    // RPython assembler_call_helper: the callee frame was created fresh
+    // for call_assembler but compiled code may have modified next_instr
+    // and valuestackdepth via virtualizable writeback. Reset to initial
+    // state so the interpreter/blackhole runs from the function entry.
+    let nlocals = unsafe { &*frame.code }.varnames.len();
+    frame.next_instr = 0;
+    frame.valuestackdepth = nlocals;
+
     let code_key = frame.code as usize;
-    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
+    let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
     let arg_key = if frame.locals_cells_stack_w.len() > 0 {
         force_cache_arg_key(frame.locals_cells_stack_w[0])
@@ -462,12 +470,14 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         );
     }
 
-    // RPython: resume_in_blackhole for THIS frame.
-    // TODO: RPython allows nested bhimpl_recursive_call to use
-    // RPython: resume_in_blackhole runs jitcode (no jit_merge_point).
-    // bhimpl_recursive_call → portal_runner → JIT allowed for callees.
-    // No blackhole_entry_bump needed — structural isolation via jitcode.
-    let result = resume_in_blackhole(frame);
+    // RPython assembler_call_helper: force_fn re-executes the callee
+    // from scratch via the interpreter. Nested calls dispatch through
+    // call_user_function → eval_with_jit, so compiled code + bridges
+    // are used when available.
+    let result = match pyre_interp::eval::eval_loop_for_force(frame) {
+        Ok(r) => r,
+        Err(err) => panic!("jit force callee frame failed: {err}"),
+    };
     let value = match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
             w_int_get_value(result)
