@@ -190,6 +190,12 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) guard_failures: HashMap<(u64, u32), GuardFailureInfo>,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
     pub(crate) traces: HashMap<u64, CompiledTrace>,
+    /// RPython parity: previous compiled entries for this green_key.
+    /// In RPython, JitCellToken keeps all target_tokens' code alive.
+    /// In majit, each retrace produces a new Cranelift function;
+    /// previous functions are kept here so external target_token JUMPs
+    /// can redirect to them via runtime trampoline.
+    pub(crate) previous_tokens: Vec<JitCellToken>,
 }
 
 /// The meta-tracing JIT engine.
@@ -1498,6 +1504,13 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
+                // RPython parity: keep previous compiled tokens alive so
+                // external target_token JUMPs can redirect to them.
+                let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                    previous_tokens.push(old_entry.token);
+                    previous_tokens.extend(old_entry.previous_tokens);
+                }
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
@@ -1513,6 +1526,7 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         guard_failures: HashMap::new(),
                         traces,
+                        previous_tokens,
                     },
                 );
                 let install_num = self.warm_state.alloc_token_number();
@@ -1727,27 +1741,31 @@ impl<M: Clone> MetaInterp<M> {
                         terminal_exit_layouts,
                     },
                 );
-                self.compiled_loops.insert(
-                    green_key,
-                    CompiledEntry {
-                        token,
-                        num_inputs: inputargs.len(),
-                        meta,
-                        front_target_tokens: self
-                            .compiled_loops
-                            .get(&green_key)
-                            .map(|compiled| compiled.front_target_tokens.clone())
-                            .unwrap_or_default(),
-                        retraced_count: self
-                            .compiled_loops
-                            .get(&green_key)
-                            .map(|compiled| compiled.retraced_count)
-                            .unwrap_or(0),
-                        root_trace_id: trace_id,
-                        guard_failures: HashMap::new(),
-                        traces,
-                    },
-                );
+                {
+                    let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                    let ft = self.compiled_loops.get(&green_key)
+                        .map(|c| c.front_target_tokens.clone()).unwrap_or_default();
+                    let rc = self.compiled_loops.get(&green_key)
+                        .map(|c| c.retraced_count).unwrap_or(0);
+                    if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                        previous_tokens.push(old_entry.token);
+                        previous_tokens.extend(old_entry.previous_tokens);
+                    }
+                    self.compiled_loops.insert(
+                        green_key,
+                        CompiledEntry {
+                            token,
+                            num_inputs: inputargs.len(),
+                            meta,
+                            front_target_tokens: ft,
+                            retraced_count: rc,
+                            root_trace_id: trace_id,
+                            guard_failures: HashMap::new(),
+                            traces,
+                            previous_tokens,
+                        },
+                    );
+                }
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
                 self.warm_state
@@ -4333,6 +4351,7 @@ mod tests {
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
+                previous_tokens: Vec::new(),
             },
         );
     }
@@ -4794,6 +4813,7 @@ mod tests {
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
+                previous_tokens: Vec::new(),
             },
         );
 
@@ -4894,6 +4914,7 @@ mod tests {
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
+                previous_tokens: Vec::new(),
             },
         );
 
@@ -5181,6 +5202,7 @@ mod tests {
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
+                previous_tokens: Vec::new(),
             },
         );
 
@@ -6271,6 +6293,7 @@ mod tests {
                 root_trace_id: trace_id,
                 guard_failures: HashMap::new(),
                 traces,
+                previous_tokens: Vec::new(),
             },
         );
 
