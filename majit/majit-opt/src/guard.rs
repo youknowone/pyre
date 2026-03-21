@@ -407,14 +407,32 @@ impl GuardStrengthenOpt {
                 }
                 false
             }
-            OpCode::GuardNonnull => self.truthy_values.contains(&op.arg(0)),
+            OpCode::GuardNonnull => {
+                if self.truthy_values.contains(&op.arg(0)) {
+                    return true;
+                }
+                // RPython: import_state sets PtrInfo with is_nonnull for
+                // values that the preamble proved nonnull.
+                if let Some(info) = ctx.get_ptr_info(op.arg(0)) {
+                    if info.is_nonnull() {
+                        return true;
+                    }
+                }
+                false
+            }
             // rewrite.py: optimize_GUARD_CLASS — if the class is already
             // known for this value, and it matches, remove the guard.
             OpCode::GuardClass if op.num_args() >= 2 => {
                 if let Some(&known_class) = self.known_classes.get(&op.arg(0)) {
-                    // Check if the expected class matches the known class.
                     if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
                         return known_class.0 as i64 == expected;
+                    }
+                }
+                // RPython: setinfo_from_preamble sets PtrInfo.KnownClass or
+                // Instance with known_class. Check ctx for imported info.
+                if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                    if let Some(class_ptr) = ctx.get_known_class(op.arg(0)) {
+                        return class_ptr.0 as i64 == expected;
                     }
                 }
                 false
@@ -431,7 +449,26 @@ impl GuardStrengthenOpt {
             }
             // guard.py: GUARD_NONNULL_CLASS subsumed if value is known nonnull
             // AND a previous GUARD_CLASS with same args was already seen.
-            OpCode::GuardNonnullClass if self.truthy_values.contains(&op.arg(0)) => {
+            OpCode::GuardNonnullClass if op.num_args() >= 2 => {
+                // RPython: subsumed if nonnull is known AND class matches.
+                let nonnull_known = self.truthy_values.contains(&op.arg(0))
+                    || ctx.get_ptr_info(op.arg(0)).is_some_and(|i| i.is_nonnull());
+                if !nonnull_known {
+                    return false;
+                }
+                // Check class via guard pass state
+                if let Some(&known_class) = self.known_classes.get(&op.arg(0)) {
+                    if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                        return known_class.0 as i64 == expected;
+                    }
+                }
+                // Check class via imported PtrInfo
+                if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                    if let Some(class_ptr) = ctx.get_known_class(op.arg(0)) {
+                        return class_ptr.0 as i64 == expected;
+                    }
+                }
+                // Fallback: seen as a previous GuardClass with same args
                 let class_key = GuardKey {
                     opcode: OpCode::GuardClass,
                     args: op.args.to_vec(),

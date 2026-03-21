@@ -734,6 +734,17 @@ impl OptContext {
         self.ptr_info.get(opref.0 as usize).and_then(|v| v.as_ref())
     }
 
+    /// Extract known class from PtrInfo, if available.
+    /// RPython: preamble_info.get_known_class(cpu) — used by guard pass
+    /// to eliminate redundant GuardClass/GuardNonnullClass in Phase 2.
+    pub fn get_known_class(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
+        match self.get_ptr_info(opref)? {
+            PtrInfo::KnownClass { class_ptr, .. } => Some(*class_ptr),
+            PtrInfo::Instance(info) => info.known_class,
+            _ => None,
+        }
+    }
+
     /// info.py: getptrinfo(op) — mutable variant.
     pub fn get_ptr_info_mut(&mut self, opref: OpRef) -> Option<&mut PtrInfo> {
         let opref = self.get_replacement(opref);
