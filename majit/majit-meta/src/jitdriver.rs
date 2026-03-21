@@ -384,6 +384,20 @@ impl<S: JitState> JitDriver<S> {
                 self.sym = None;
             }
             TraceAction::CloseLoopWithArgs { jump_args } => {
+                // Bridge tracing: close as bridge instead of loop.
+                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
+                    self.bridge_info.take()
+                {
+                    self.sym = None;
+                    self.trace_meta = None;
+                    self.meta.close_bridge_with_finish(
+                        bridge_key,
+                        bridge_trace_id,
+                        bridge_fail_index,
+                        &jump_args,
+                    );
+                    return;
+                }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
                     self.meta.abort_trace(false);
                     self.sym = None;
@@ -1195,6 +1209,118 @@ impl<S: JitState> JitDriver<S> {
         state.restore_values(&exit_meta, &result.typed_values);
         self.sync_after(state, &exit_meta, descriptor.as_ref());
         DetailedDriverRunOutcome::Jump {
+            via_blackhole: false,
+        }
+    }
+
+    /// RPython compile.py:714 + pyjitpl.py rebuild_state_after_failure():
+    /// run compiled code, distinguish normal JUMP from guard failure, and
+    /// allow the caller to rebuild interpreter state and start bridge tracing
+    /// from the recovered resume pc.
+    pub fn run_compiled_detailed_with_bridge_keyed(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+        on_guard_failure: impl FnOnce(
+            &mut S,
+            &S::Meta,
+            &[i64],
+            &crate::compile::CompiledExitLayout,
+        ) -> Option<usize>,
+    ) -> DetailedDriverRunOutcome {
+        let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
+        let descriptor = self.driver_descriptor_for(state, &meta);
+        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        }
+        let live_values = state.extract_live_values(&meta);
+        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        }
+        let Some(live_values) = self.extend_compiled_live_values(
+            green_key,
+            state,
+            &meta,
+            descriptor.as_ref(),
+            live_values,
+        ) else {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
+        pre_run();
+        let Some(result) = self
+            .meta
+            .run_compiled_detailed_with_values(green_key, &live_values)
+        else {
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
+
+        let is_finish = result.is_finish;
+        let exit_meta = result.meta.clone();
+        let fail_index = result.fail_index;
+        let trace_id = result.trace_id;
+        let exit_layout = result.exit_layout.clone();
+        let typed_values = result.typed_values.clone();
+        let raw_values = result.values.clone();
+        drop(result);
+
+        if is_finish {
+            return DetailedDriverRunOutcome::Finished {
+                typed_values,
+                via_blackhole: false,
+                raw_int_result: self.meta.has_raw_int_finish(green_key),
+            };
+        }
+
+        // Normal loop back-edge JUMP, not a guard failure.
+        if fail_index == u32::MAX {
+            state.restore_values(&exit_meta, &typed_values);
+            self.sync_after(state, &exit_meta, descriptor.as_ref());
+            return DetailedDriverRunOutcome::Jump {
+                via_blackhole: false,
+            };
+        }
+
+        let should_bridge = self
+            .meta
+            .should_compile_bridge_in_trace(green_key, trace_id, fail_index);
+        let resume_pc = on_guard_failure(state, &exit_meta, &raw_values, &exit_layout);
+        let restored = resume_pc.is_some();
+        if restored {
+            self.sync_after(state, &exit_meta, descriptor.as_ref());
+            if should_bridge {
+                self.start_bridge_tracing(
+                    green_key,
+                    trace_id,
+                    fail_index,
+                    state,
+                    env,
+                    resume_pc.unwrap(),
+                    target_pc,
+                );
+            }
+        }
+        DetailedDriverRunOutcome::GuardFailure {
+            restored,
             via_blackhole: false,
         }
     }

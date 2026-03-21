@@ -538,6 +538,9 @@ impl OptVirtualize {
         vinfo: VirtualStructInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[jit][force-struct] opref={opref:?} fields={:?}", vinfo.fields);
+        }
         // Mark as no longer virtual FIRST (avoids infinite recursion)
         ctx.set_ptr_info(opref, PtrInfo::NonNull);
 
@@ -759,6 +762,10 @@ impl OptVirtualize {
         let struct_ref = ctx.get_replacement(op.arg(0));
         let value_ref = ctx.get_replacement(op.arg(1));
         let field_idx = descr_index(&op.descr);
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            let info_kind = ctx.get_ptr_info(struct_ref).map(|i| format!("{:?}", std::mem::discriminant(i))).unwrap_or("None".into());
+            eprintln!("[jit][setfield] arg0={:?} resolved={struct_ref:?} info={info_kind} field_idx={field_idx}", op.arg(0));
+        }
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
 
         // RPython import_state parity: imported virtual heads already have
@@ -791,6 +798,9 @@ impl OptVirtualize {
                         return OptimizationResult::Remove;
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
+                        if std::env::var_os("MAJIT_LOG").is_some() {
+                            eprintln!("[jit][virt-setfield] struct={struct_ref:?} field_idx={field_idx} value={value_ref:?}");
+                        }
                         set_field(&mut vinfo.fields, field_idx, value_ref);
                         if let Some(descr) = &op.descr {
                             set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());

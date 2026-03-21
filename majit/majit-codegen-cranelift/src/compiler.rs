@@ -3691,7 +3691,12 @@ impl CraneliftBackend {
         // Take constants out of self to avoid borrow conflicts with func_ctx
         let constants = std::mem::take(&mut self.constants);
 
-        let mut builder = FunctionBuilder::new(&mut func, &mut self.func_ctx);
+        // Recursive tracing/bridge compilation can re-enter backend compilation
+        // before an outer compile has restored its frontend context. Mirror the
+        // effective RPython behavior by treating the frontend builder context as
+        // compile-local state for the duration of this invocation.
+        let mut func_ctx = std::mem::replace(&mut self.func_ctx, FunctionBuilderContext::new());
+        let mut builder = FunctionBuilder::new(&mut func, &mut func_ctx);
 
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -7050,6 +7055,7 @@ impl CraneliftBackend {
             builder.seal_block(loop_block);
         }
         builder.finalize();
+        self.func_ctx = func_ctx;
 
         // Compile
         let mut ctx = Context::for_function(func);
