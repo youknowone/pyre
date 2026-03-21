@@ -309,7 +309,11 @@ impl ControlFlowOpcodeHandler for PyFrame {
 }
 
 impl BranchOpcodeHandler for PyFrame {
-    fn concrete_truth_as_bool(&mut self, truth: Self::Truth) -> Result<bool, PyError> {
+    fn concrete_truth_as_bool(
+        &mut self,
+        _value: Self::Value,
+        truth: Self::Truth,
+    ) -> Result<bool, PyError> {
         Ok(truth)
     }
 }
