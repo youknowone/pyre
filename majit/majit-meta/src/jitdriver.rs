@@ -316,7 +316,7 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // Phase 1: split-borrow self into meta (for ctx) and sym, run closure
-        let action = {
+        let mut action = {
             let Some(ctx) = self.meta.trace_ctx() else {
                 if crate::majit_log_enabled() {
                     eprintln!("[mp] abort:ctx_none");
@@ -383,7 +383,17 @@ impl<S: JitState> JitDriver<S> {
                 }
                 self.sym = None;
             }
-            TraceAction::CloseLoopWithArgs { jump_args } => {
+            TraceAction::CloseLoopWithArgs {
+                jump_args,
+                green_key: override_key,
+            } => {
+                // RPython parity: when tracing started at function entry
+                // but CloseLoop occurs at a backward jump, update the
+                // green_key so compiled loops are stored under the
+                // backward-jump target PC (matching back_edge dispatch).
+                if let Some(key) = override_key {
+                    self.meta.update_tracing_green_key(key);
+                }
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
