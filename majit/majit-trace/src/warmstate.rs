@@ -180,7 +180,7 @@ const DEFAULT_BRIDGE_THRESHOLD: u32 = 200;
 const DEFAULT_FUNCTION_THRESHOLD: u32 = 1619;
 
 /// PyPy default: max_unroll_recursion = 7
-const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
+const DEFAULT_MAX_INLINE_DEPTH: u32 = 3;
 
 /// PyPy default: trace_limit = 6000
 const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
