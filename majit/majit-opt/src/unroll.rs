@@ -361,6 +361,9 @@ impl UnrollOptimizer {
                     false,
                 )
                 .is_none(); // None = jumped successfully
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[jit] jump_to_existing_trace result: jumped={}", jumped);
+            }
 
             if !jumped {
                 // unroll.py:214-230: retrace_limit check
@@ -409,7 +412,9 @@ impl UnrollOptimizer {
                     }
                 }
             }
-            if jumped {
+            if jumped && redirected_tail_ops.is_empty() {
+                // Only take jump_ctx ops if we don't already have
+                // a self-loop Jump from the retrace path.
                 redirected_tail_ops = jump_ctx.new_operations;
                 // Check if the redirected Jump targets the current body token
                 // (last in target_tokens) or an external token from a previous
@@ -509,6 +514,7 @@ impl UnrollOptimizer {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("--- peeled trace (assembled) ---");
             eprint!("{}", majit_ir::format_trace(&combined, &consts_p2));
+            eprintln!("[jit] consts_p2 keys: {:?}", consts_p2.keys().collect::<Vec<_>>());
         }
         *constants = consts_p2;
         (combined, p2_ni)
@@ -995,6 +1001,13 @@ impl OptUnroll {
         for &arg in &label_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
+        // Also collect infos from pre-force args so virtual field values
+        // are available in Phase 2 (RPython setinfo_from_preamble).
+        if let Some(ref pre_args) = ctx.pre_force_jump_args {
+            for &arg in pre_args {
+                self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
+            }
+        }
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
         let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
@@ -1367,7 +1380,53 @@ impl OptUnroll {
             }
         }
 
+        // RPython setinfo_from_preamble: for virtual args, set PtrInfo::Virtual
+        // BEFORE make_inputargs so it can flatten field values.
+        for (i, info) in exported_state.virtual_state.state.iter().enumerate() {
+            if let crate::virtualstate::VirtualStateInfo::Virtual { descr, known_class, fields, field_descrs } = info {
+                let opref = ctx.get_replacement(targetargs[i]);
+                let virtual_fields: Vec<(u32, OpRef)> = fields
+                    .iter()
+                    .filter_map(|(idx, child)| {
+                        // For non-constant child fields, find the value from
+                        // exported_infos or the forwarding chain.
+                        match child.as_ref() {
+                            crate::virtualstate::VirtualStateInfo::Constant(val) => {
+                                let c = ctx.alloc_op_position();
+                                ctx.make_constant(c, val.clone());
+                                Some((*idx, c))
+                            }
+                            _ => {
+                                // Field value comes from the exported virtual's
+                                // pre-force field refs, carried via exported_infos.
+                                // Try the forwarded value of the virtual head.
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                if !virtual_fields.is_empty() {
+                    ctx.set_ptr_info(
+                        opref,
+                        crate::info::PtrInfo::Virtual(crate::info::VirtualInfo {
+                            descr: descr.clone(),
+                            known_class: *known_class,
+                            fields: virtual_fields,
+                            field_descrs: field_descrs.clone(),
+                        }),
+                    );
+                }
+            }
+        }
+
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[jit] import_state: vs.state.len={} vs.states={:?}",
+                exported_state.virtual_state.state.len(),
+                exported_state.virtual_state.state.iter()
+                    .map(|s| format!("{}", if s.is_virtual() { "V" } else { "N" }))
+                    .collect::<Vec<_>>().join(","));
+        }
         let (label_args, virtuals) = exported_state
             .virtual_state
             .make_inputargs_and_virtuals(targetargs, ctx);
@@ -1375,7 +1434,10 @@ impl OptUnroll {
             .virtual_state
             .make_inputarg_source_slots(targetargs);
         let mut short_args = label_args.clone();
-        short_args.extend(virtuals);
+        short_args.extend(virtuals.iter().copied());
+        // Store short_args in ctx for install_imported_virtuals to use.
+        // Virtual field values are at positions label_args.len()..
+        ctx.imported_virtual_args = Some((label_args.len(), short_args.clone()));
         self.import_short_preamble_ops(&short_args, exported_state, ctx);
         // RPython: setinfo_from_preamble applies to ALL exported values,
         // including short preamble. Apply exported infos to imported

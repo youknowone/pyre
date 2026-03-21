@@ -309,6 +309,9 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     );
                 }
                 let outcome = if driver.has_compiled_loop(green_key) {
+                    if majit_meta::majit_log_enabled() {
+                        eprintln!("[jit] ENTERING run_compiled_with_bridge key={}", green_key);
+                    }
                     Some(driver.run_compiled_detailed_with_bridge_keyed(
                         green_key,
                         loop_header_pc,
@@ -612,8 +615,19 @@ fn restore_guard_failure_for_loop(
     // PyObjectRef pointers. We must use exit_layout types to correctly
     // re-box them. The fix must be at the optimizer level (don't expand
     // virtualizable-slot virtuals, or expand them as Ref).
+    if majit_meta::majit_log_enabled() {
+        let nraw = raw_values.len().min(8);
+        let slots: Vec<String> = (0..nraw).map(|i| format!("{:#x}", raw_values[i] as usize)).collect();
+        eprintln!(
+            "[jit] guard-fail: fail_idx={} types={:?} raw=[{}]",
+            exit_layout.fail_index, exit_layout.exit_types, slots.join(", ")
+        );
+    }
     let typed = decode_exit_layout_values(raw_values, exit_layout);
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
+    if majit_meta::majit_log_enabled() {
+        eprintln!("[jit] guard-fail restored: ni={} vsd={}", jit_state.next_instr, jit_state.valuestackdepth);
+    }
     restored.then_some(jit_state.next_instr)
 }
 

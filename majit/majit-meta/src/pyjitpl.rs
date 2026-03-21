@@ -1396,6 +1396,14 @@ impl<M: Clone> MetaInterp<M> {
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
+            for op in &optimized_ops {
+                if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
+                    if let Some(ref fa) = op.fail_args {
+                        let raw: Vec<String> = fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
+                        eprintln!("[jit] FINAL GuardNotInv fail_args=[{}]", raw.join(", "));
+                    }
+                }
+            }
         }
 
         // RPython: jit_merge_point tick counter provides periodic exit from

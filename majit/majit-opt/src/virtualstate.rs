@@ -389,6 +389,9 @@ impl VirtualState {
         }
     }
 
+    pub fn count_forced_boxes_for_entry_static(info: &VirtualStateInfo) -> usize {
+        Self::count_forced_boxes_for_entry(info)
+    }
     fn count_forced_boxes_for_entry(info: &VirtualStateInfo) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,

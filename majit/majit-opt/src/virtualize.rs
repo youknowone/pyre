@@ -1926,6 +1926,40 @@ impl Optimization for OptVirtualize {
                 // New() results to the frame's namespace storage.
 
                 let mut jump_op = op.clone();
+                // RPython: capture pre-force virtual state before forcing.
+                let pre_force_args: Vec<OpRef> = jump_op
+                    .args
+                    .iter()
+                    .map(|a| ctx.get_replacement(*a))
+                    .collect();
+                let pre_force_vs =
+                    crate::virtualstate::export_state(&pre_force_args, ctx, &ctx.ptr_info);
+                ctx.pre_force_virtual_state = Some(pre_force_vs);
+                ctx.pre_force_jump_args = Some(pre_force_args.clone());
+                // Save virtual field OpRefs before force destroys them.
+                for &arg in &pre_force_args {
+                    if let Some(info) = ctx.get_ptr_info(arg).cloned() {
+                        match info {
+                            PtrInfo::Virtual(ref v) => {
+                                for &(field_idx, ref val) in &v.fields {
+                                    ctx.pre_force_field_refs
+                                        .entry(arg)
+                                        .or_insert_with(Vec::new)
+                                        .push((field_idx, *val));
+                                }
+                            }
+                            PtrInfo::VirtualStruct(ref vs) => {
+                                for &(field_idx, ref val) in &vs.fields {
+                                    ctx.pre_force_field_refs
+                                        .entry(arg)
+                                        .or_insert_with(Vec::new)
+                                        .push((field_idx, *val));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
                     let resolved = ctx.get_replacement(*arg);
                     if resolved == frame_ref {
