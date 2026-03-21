@@ -45,7 +45,11 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
-            Ok(StepResult::Continue) | Ok(StepResult::CloseLoop(_)) => {}
+            Ok(StepResult::Continue)
+            | Ok(StepResult::CloseLoop {
+                jump_args: _,
+                loop_header_pc: _,
+            }) => {}
             Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => return Ok(result),
             Err(err) => {
@@ -301,10 +305,13 @@ impl ControlFlowOpcodeHandler for PyFrame {
         Ok(())
     }
 
-    fn close_loop(&mut self, _target: usize) -> Result<StepResult<Self::Value>, PyError> {
+    fn close_loop(&mut self, target: usize) -> Result<StepResult<Self::Value>, PyError> {
         // Signal a back-edge to the main eval_loop, which handles
         // JIT counting and compiled code execution via try_back_edge_jit.
-        Ok(StepResult::CloseLoop(vec![]))
+        Ok(StepResult::CloseLoop {
+            jump_args: vec![],
+            loop_header_pc: target,
+        })
     }
 }
 

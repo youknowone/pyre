@@ -50,16 +50,15 @@ pub fn trace_bytecode(
 
     let action = frame_state.trace_code_step(code, pc);
 
-    // RPython pyjitpl.py reached_loop_header(): when a back-edge closes
-    // the loop, the compiled trace must be registered under the back-edge's
-    // green key, not the function-entry key.  Without this, func-entry
-    // tracing stores the loop under PC=0, causing infinite re-entry.
-    if let TraceAction::CloseLoopWithArgs { ref jump_args, .. } = action {
-        let target_pc = jump_args
-            .get(1)
-            .and_then(|&opref| ctx.const_value(opref))
-            .map(|pc| pc as usize)
-            .unwrap_or(pc);
+    // RPython pyjitpl.py reached_loop_header(): a loop-closing back-edge
+    // carries its merge-point explicitly. Retarget the trace green key from
+    // that loop-header PC instead of trying to infer it from jump args or
+    // virtualizable state later.
+    if let TraceAction::CloseLoopWithArgs {
+        loop_header_pc: Some(target_pc),
+        ..
+    } = action
+    {
         let back_edge_key = crate::eval::make_green_key(code as *const CodeObject, target_pc);
         ctx.set_green_key(back_edge_key);
     } else if matches!(action, TraceAction::CloseLoop) {

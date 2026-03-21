@@ -320,7 +320,7 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         }
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
             StepResult::Continue => {}
-            StepResult::CloseLoop(_) => {
+            StepResult::CloseLoop { .. } => {
                 let mut jit_state = build_jit_state(frame, info);
                 let green_key = make_green_key(frame.code, frame.next_instr);
                 if let Some(outcome) = driver.back_edge_or_run_compiled_keyed(
