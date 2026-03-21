@@ -168,7 +168,8 @@ impl UnrollOptimizer {
             Some(state) => state,
             None => {
                 *constants = consts_p1;
-                return (p1_ops, p1_ni);
+                let loop_arity = closing_loop_contract_arity(&p1_ops, p1_ni);
+                return (p1_ops, loop_arity);
             }
         };
         // Determine types of end_args from Phase 1's output ops.
@@ -235,6 +236,7 @@ impl UnrollOptimizer {
             &mut consts_p2,
             body_num_inputs,
         );
+        let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
         let label_args = opt_p2
             .imported_label_args
@@ -254,28 +256,6 @@ impl UnrollOptimizer {
                 gc,
                 p2_ni
             );
-        }
-
-        // Safety: body loops with no effective guard exit run forever.
-        // RPython compiles them (relies on OS signals/GIL); majit falls back.
-        // A guard is "effective" only if its condition can change at runtime
-        // (not a constant from the label args).
-        {
-            let has_effective_guard = p2_ops.iter().any(|o| {
-                if !o.opcode.is_guard() || o.args.is_empty() {
-                    return false;
-                }
-                let cond = o.arg(0);
-                // Guard arg that's a constant (from constants map) → always same result
-                !consts_p2.contains_key(&cond.0)
-            });
-            if !has_effective_guard {
-                if std::env::var_os("MAJIT_LOG").is_some() {
-                    eprintln!("[jit] phase 2: no effective guard exit, falling back to phase 1");
-                }
-                *constants = consts_p1;
-                return (p1_ops, p1_ni);
-            }
         }
 
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
@@ -313,10 +293,15 @@ impl UnrollOptimizer {
         let mut body_ops = p2_ops;
         let mut redirected_tail_ops = Vec::new();
         let jump_to_self = {
-            let body_jump_args: Vec<OpRef> = body_ops
-                .iter()
-                .rfind(|o| o.opcode == OpCode::Jump)
-                .map(|j| j.args.to_vec())
+            let body_jump_args: Vec<OpRef> = body_terminal_op
+                .as_ref()
+                .map(|jump| jump.args.to_vec())
+                .or_else(|| {
+                    body_ops
+                        .iter()
+                        .rfind(|o| o.opcode == OpCode::Jump)
+                        .map(|j| j.args.to_vec())
+                })
                 .unwrap_or_default();
             let mut current_label_args = label_args.clone();
             current_label_args.extend(initial_sp.used_boxes.iter().copied());
@@ -326,6 +311,11 @@ impl UnrollOptimizer {
                 .final_ctx
                 .take()
                 .unwrap_or_else(|| crate::OptContext::with_num_inputs(32, body_num_inputs));
+            // RPython reuses the live optimizer state here, but only the
+            // extra operations emitted by jump_to_existing_trace() belong in
+            // the redirected tail. The already-optimized phase-2 body must
+            // not be spliced back in a second time.
+            jump_ctx.clear_newoperations();
             let mut jumped = opt_unroll
                 .jump_to_existing_trace(
                     &body_jump_args,
@@ -337,6 +327,11 @@ impl UnrollOptimizer {
                 )
                 .is_none(); // None = jumped successfully
             if !jumped {
+                // RPython retries on the live optimizer tail. In majit's
+                // detached jump_ctx split, stale extra ops from the first
+                // failed attempt must not leak into the redirected tail of a
+                // later successful retry.
+                jump_ctx.clear_newoperations();
                 jumped = opt_unroll
                     .jump_to_existing_trace(
                         &body_jump_args,
@@ -370,7 +365,12 @@ impl UnrollOptimizer {
                 .first()
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
-            body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
+            if let Some(mut end_jump) = body_terminal_op {
+                end_jump.descr = Some(preamble_target.as_jump_target_descr());
+                body_ops = replace_terminal_jump(&body_ops, end_jump);
+            } else {
+                body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
+            }
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!("[jit] jump_to_preamble: body JUMP retargeted to start descr");
             }
@@ -408,6 +408,13 @@ impl UnrollOptimizer {
         }
         *constants = consts_p2;
         (combined, p2_ni)
+    }
+
+    /// RPython compile.py uses the optimized loop state's inputargs contract,
+    /// not a stale input counter. When majit falls back to the phase-1 trace,
+    /// derive the live loop arity from the actual closing Label/Jump.
+    pub fn closing_loop_contract_arity(ops: &[Op], fallback: usize) -> usize {
+        closing_loop_contract_arity(ops, fallback)
     }
 
     /// Count the guards in an optimized trace (for retrace_limit checks).
@@ -456,6 +463,16 @@ impl UnrollOptimizer {
     ) -> crate::virtualstate::VirtualState {
         crate::virtualstate::export_state(args, ctx, ptr_info)
     }
+}
+
+fn closing_loop_contract_arity(ops: &[Op], fallback: usize) -> usize {
+    ops.iter()
+        .rev()
+        .find_map(|op| match op.opcode {
+            OpCode::Label | OpCode::Jump => Some(op.args.len()),
+            _ => None,
+        })
+        .unwrap_or(fallback)
 }
 
 impl Default for UnrollOptimizer {
@@ -886,8 +903,20 @@ impl OptUnroll {
     ) -> Option<crate::virtualstate::VirtualState> {
         let mut virtual_state = crate::virtualstate::export_state(jump_args, ctx, &ctx.ptr_info);
         let mut args: Vec<OpRef> = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
+        let mut first_target_attempt = true;
 
         for target_token in target_tokens {
+            if !first_target_attempt {
+                // RPython unroll.py leaves bogus ops from failed target-token
+                // attempts at the end of the live trace, which is safe there.
+                // majit's detached jump_ctx later splices the redirected tail
+                // back into the body, so stale extra guards/short-preamble ops
+                // from an earlier failed target must not leak into a later
+                // successful redirect.
+                ctx.clear_newoperations();
+            }
+            first_target_attempt = false;
+
             let target_vs = match &target_token.virtual_state {
                 Some(vs) => vs,
                 None => continue,
@@ -992,31 +1021,56 @@ impl OptUnroll {
             }
         }
 
-        let mut active_short = short_preamble.clone();
         let mut replay_index = 0;
 
+        fn current_short_len(
+            short_preamble: &crate::shortpreamble::ShortPreamble,
+            ctx: &OptContext,
+        ) -> usize {
+            ctx.active_short_preamble_producer
+                .as_ref()
+                .map(|builder| builder.short_ops_len())
+                .unwrap_or_else(|| short_preamble.ops.len())
+        }
+
+        fn current_short_op(
+            short_preamble: &crate::shortpreamble::ShortPreamble,
+            ctx: &OptContext,
+            index: usize,
+        ) -> Option<Op> {
+            if let Some(builder) = ctx.active_short_preamble_producer.as_ref() {
+                builder.short_op(index).cloned()
+            } else {
+                short_preamble.ops.get(index).map(|entry| entry.op.clone())
+            }
+        }
+
+        fn current_short_jump_args(
+            short_preamble: &crate::shortpreamble::ShortPreamble,
+            ctx: &OptContext,
+        ) -> Vec<OpRef> {
+            ctx.active_short_preamble_producer
+                .as_ref()
+                .map(|builder| builder.jump_args().to_vec())
+                .unwrap_or_else(|| short_preamble.jump_args.clone())
+        }
+
         loop {
-            while replay_index < active_short.ops.len() {
-                let sp_op = &active_short.ops[replay_index];
-                let mut new_op = sp_op.op.clone();
-                // Remap args from arg_mapping (label idx → jump arg)
-                for &(arg_pos, label_idx) in &sp_op.arg_mapping {
-                    if arg_pos < new_op.args.len() && label_idx < jump_args.len() {
-                        new_op.args[arg_pos] = jump_args[label_idx];
-                    }
-                }
-                // Remap remaining args from the mapping table
+            while replay_index < current_short_len(short_preamble, ctx) {
+                let Some(sp_op) = current_short_op(short_preamble, ctx, replay_index) else {
+                    break;
+                };
+                let mut new_op = sp_op.clone();
+                // RPython unroll.py remaps raw short-preamble ops through the
+                // current mapping dict. When the active extended builder grows,
+                // the replay loop must see its live `short` list directly
+                // instead of a rebuilt snapshot.
                 for arg in &mut new_op.args {
                     if let Some(&mapped) = mapping.get(arg) {
                         *arg = mapped;
                     }
                 }
                 if let Some(ref mut fail_args) = new_op.fail_args {
-                    for &(fail_arg_pos, label_idx) in &sp_op.fail_arg_mapping {
-                        if fail_arg_pos < fail_args.len() && label_idx < jump_args.len() {
-                            fail_args[fail_arg_pos] = jump_args[label_idx];
-                        }
-                    }
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(arg) {
                             *arg = mapped;
@@ -1026,35 +1080,31 @@ impl OptUnroll {
                 let new_ref = ctx.alloc_op_position();
                 new_op.pos = new_ref;
                 optimizer.send_extra_operation(&new_op, ctx);
-                mapping.insert(sp_op.op.pos, new_ref);
+                mapping.insert(sp_op.pos, new_ref);
                 replay_index += 1;
             }
 
-            let Some(current_short) = ctx.build_active_short_preamble() else {
-                break;
-            };
-            let old_len = current_short.ops.len();
-            let old_jump_args = current_short.jump_args.len();
-            let mapped_jump_args: Vec<OpRef> = active_short
-                .jump_args
-                .iter()
-                .map(|jump_arg| *mapping.get(jump_arg).unwrap_or(jump_arg))
-                .collect();
-            for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
-                let _ = optimizer.force_box(arg, ctx);
+            loop {
+                let short_jump_args = current_short_jump_args(short_preamble, ctx);
+                let num_short_jump_args = short_jump_args.len();
+                let mapped_jump_args: Vec<OpRef> = short_jump_args
+                    .iter()
+                    .map(|jump_arg| *mapping.get(jump_arg).unwrap_or(jump_arg))
+                    .collect();
+                for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
+                    let _ = optimizer.force_box(arg, ctx);
+                }
+                if current_short_jump_args(short_preamble, ctx).len() == num_short_jump_args {
+                    break;
+                }
             }
             optimizer.flush(ctx);
-            let Some(builder) = ctx.active_short_preamble_producer_mut() else {
-                break;
-            };
-            active_short = builder.build_short_preamble_struct();
-            if active_short.ops.len() == old_len && active_short.jump_args.len() == old_jump_args {
+            if replay_index == current_short_len(short_preamble, ctx) {
                 break;
             }
         }
 
-        active_short
-            .jump_args
+        current_short_jump_args(short_preamble, ctx)
             .iter()
             .map(|&jump_arg| *mapping.get(&jump_arg).unwrap_or(&jump_arg))
             .collect()
@@ -1593,13 +1643,20 @@ impl OptUnroll {
                     let Some(args) = args else {
                         continue;
                     };
-                    ctx.imported_short_pure_ops
-                        .push(crate::ImportedShortPureOp {
-                            opcode,
-                            descr_idx,
-                            args,
-                            result: result_opref,
-                        });
+                    // RPython import_state() replays short boxes via
+                    // produced_op.produce_op(); it does not preload OVF
+                    // operations into OptPure's CSE table. Reusing an
+                    // imported INT_*_OVF result without replaying the paired
+                    // GUARD_NO_OVERFLOW leaves a stray guard in phase 2.
+                    if !opcode.is_ovf() {
+                        ctx.imported_short_pure_ops
+                            .push(crate::ImportedShortPureOp {
+                                opcode,
+                                descr_idx,
+                                args,
+                                result: result_opref,
+                            });
+                    }
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: result_opref,
                         source,
@@ -1790,6 +1847,11 @@ fn assemble_peeled_trace(
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
+    let filtered_extra_label_args: Vec<OpRef> = extra_label_args
+        .iter()
+        .copied()
+        .filter(|arg| !constants.contains_key(&arg.0))
+        .collect();
 
     let mut next_free_pos = |mut next: u32| {
         next = next.max(body_num_inputs as u32);
@@ -1836,12 +1898,45 @@ fn assemble_peeled_trace(
     // Label position
     let label_pos = next_free_pos(max_pos);
     let mut full_label_args = label_args.to_vec();
-    full_label_args.extend(extra_label_args.iter().map(|arg| {
+    full_label_args.extend(filtered_extra_label_args.iter().map(|arg| {
         alias_remap
             .get(arg)
             .copied()
             .unwrap_or(*arg)
     }));
+
+    // RPython compile.py parity: body ops may reference preamble-defined
+    // values in fail_args (guard resume data). These must be carried through
+    // the label so they're defined in the body. Scan body fail_args for
+    // refs that are defined in the preamble but not in the label.
+    let preamble_defs: std::collections::HashSet<OpRef> = p1_ops
+        .iter()
+        .filter(|op| !op.pos.is_none() && op.opcode != OpCode::Jump)
+        .map(|op| op.pos)
+        .collect();
+    let body_defs: std::collections::HashSet<OpRef> = p2_ops
+        .iter()
+        .filter(|op| !op.pos.is_none())
+        .map(|op| op.pos)
+        .collect();
+    let label_set: std::collections::HashSet<OpRef> =
+        full_label_args.iter().copied().collect();
+    for op in p2_ops {
+        let all_refs = op.args.iter().chain(
+            op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()),
+        );
+        for &arg in all_refs {
+            if arg.is_none() || arg.0 >= 10_000 {
+                continue; // skip NONE and constants
+            }
+            if label_set.contains(&arg) || body_defs.contains(&arg) {
+                continue; // already available
+            }
+            if preamble_defs.contains(&arg) && !full_label_args.contains(&arg) {
+                full_label_args.push(arg);
+            }
+        }
+    }
 
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
     label_op.pos = OpRef(label_pos);
@@ -1852,13 +1947,15 @@ fn assemble_peeled_trace(
     let mut next_body_pos = next_free_pos(label_pos.saturating_add(1));
     let mut input_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
-    let mut visible_before_label: std::collections::HashSet<OpRef> =
-        full_label_args.iter().copied().collect();
-    for op in &result {
-        if op.result_type() != Type::Void && !op.pos.is_none() {
-            visible_before_label.insert(op.pos);
-        }
-    }
+    // RPython compile.py assembles `[start_label] + preamble + [label] + body`.
+    // After the loop label, only the loop-header contract (label args plus
+    // explicit invented-name aliases) is allowed to stay live. Other preamble
+    // temporaries must remap to the body copy, not leak past the Label.
+    let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
+        .iter()
+        .copied()
+        .chain(alias_remap.values().copied())
+        .collect();
 
     // Pass 1: collect all remappings
     if !label_source_slots.is_empty() && label_source_slots.len() == label_args.len() {
@@ -1872,6 +1969,20 @@ fn assemble_peeled_trace(
             if (i as u32) < body_num_inputs as u32 {
                 input_remap.insert(OpRef(i as u32), la);
             }
+        }
+    }
+    // RPython unroll.py grows the loop header contract with sb.used_boxes.
+    // The body may still reference the original preamble result boxes for
+    // those carried values, even though the assembled label now uses the
+    // appended label args. Remap the original carried source refs to the
+    // appended label args so phase-2 body ops keep seeing the extended
+    // loop-header contract instead of dangling preamble positions.
+    for (&source_slot, &extended_label_arg) in filtered_extra_label_args
+        .iter()
+        .zip(full_label_args.iter().skip(label_args.len()))
+    {
+        if !source_slot.is_none() {
+            input_remap.insert(source_slot, extended_label_arg);
         }
     }
     for (idx, op) in p2_ops.iter().enumerate() {
@@ -1960,6 +2071,17 @@ fn splice_redirected_tail(body_ops: &[Op], redirected_tail_ops: &[Op]) -> Vec<Op
         .unwrap_or(body_ops.len());
     result.extend_from_slice(&body_ops[..split_idx]);
     result.extend_from_slice(redirected_tail_ops);
+    result
+}
+
+fn replace_terminal_jump(body_ops: &[Op], jump_op: Op) -> Vec<Op> {
+    let mut result = Vec::with_capacity(body_ops.len() + 1);
+    let split_idx = body_ops
+        .iter()
+        .rposition(|op| op.opcode == OpCode::Jump)
+        .unwrap_or(body_ops.len());
+    result.extend_from_slice(&body_ops[..split_idx]);
+    result.push(jump_op);
     result
 }
 
@@ -2210,6 +2332,28 @@ mod tests {
         let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target);
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(result[1].args.as_slice(), &[OpRef(0), OpRef(2), OpRef(50)]);
+        assert_eq!(
+            result[1].descr.as_ref().map(|descr| descr.repr()),
+            Some("LoopTargetDescr(start:7)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_replace_terminal_jump_appends_when_body_prefix_has_no_jump() {
+        let body_ops = vec![{
+            let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+            op.pos = OpRef(2);
+            op
+        }];
+        let mut jump = Op::new(OpCode::Jump, &[OpRef(2)]);
+        jump.descr = Some(TargetToken::new_preamble(7).as_jump_target_descr());
+
+        let result = replace_terminal_jump(&body_ops, jump);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::IntAdd);
+        assert_eq!(result[1].opcode, OpCode::Jump);
+        assert_eq!(result[1].args.as_slice(), &[OpRef(2)]);
         assert_eq!(
             result[1].descr.as_ref().map(|descr| descr.repr()),
             Some("LoopTargetDescr(start:7)".to_string())
@@ -3293,6 +3437,60 @@ mod tests {
     }
 
     #[test]
+    fn test_import_state_does_not_seed_ovf_short_op_into_pure_cache() {
+        let mut ctx = crate::OptContext::with_num_inputs(8, 0);
+        ctx.make_constant(OpRef(10), Value::Int(7));
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntAddOvf, &[OpRef(12), OpRef(10)]);
+                    op.pos = OpRef(11);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: Some(1),
+                invented_name: false,
+                same_as_source: None,
+            });
+
+        let exported = export_state(&[OpRef(12), OpRef(11)], &[], &ctx, None);
+        assert_eq!(
+            exported.exported_short_ops,
+            vec![ExportedShortOp::Pure {
+                source: OpRef(11),
+                opcode: OpCode::IntAddOvf,
+                descr_idx: None,
+                args: vec![
+                    ExportedShortArg::Slot(0),
+                    ExportedShortArg::Const {
+                        source: OpRef(10),
+                        value: Value::Int(7),
+                    },
+                ],
+                result: ExportedShortResult::Slot(1),
+                invented_name: false,
+                same_as_source: None,
+            }]
+        );
+
+        let mut ctx2 = crate::OptContext::with_num_inputs(8, 2);
+        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
+        assert_eq!(label_args, vec![OpRef(12), OpRef(11)]);
+        assert_eq!(ctx2.get_constant(OpRef(10)), Some(&Value::Int(7)));
+        assert!(
+            ctx2.imported_short_pure_ops.is_empty(),
+            "ovf short ops must be replayed via short preamble, not imported pure cache"
+        );
+        assert_eq!(
+            ctx2.imported_short_sources,
+            vec![crate::ImportedShortSource {
+                result: OpRef(11),
+                source: OpRef(11),
+            }]
+        );
+    }
+
+    #[test]
     fn test_import_state_reimports_short_ref_constant_identity() {
         let mut ctx = crate::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
@@ -3457,6 +3655,53 @@ mod tests {
         let sp = ctx.build_imported_short_preamble().unwrap();
         assert_eq!(sp.used_boxes, vec![OpRef(19)]);
         assert_eq!(sp.jump_args, vec![OpRef(19)]);
+    }
+
+    #[test]
+    fn test_imported_exported_short_builder_tracks_original_source_identity() {
+        let mut ctx = crate::OptContext::with_num_inputs(16, 0);
+        ctx.exported_short_boxes
+            .push(crate::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::new(OpCode::IntAddOvf, &[OpRef(12), OpRef(13)]);
+                    op.pos = OpRef(30);
+                    op
+                },
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            });
+
+        let exported = export_state(&[OpRef(12), OpRef(13)], &[], &ctx, None);
+        let mut ctx2 = crate::OptContext::with_num_inputs(16, 2);
+        import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
+
+        assert!(
+            ctx2.imported_short_pure_ops.is_empty(),
+            "OVF short ops should not seed imported pure cache",
+        );
+        let imported_result = ctx2.imported_short_sources[0].result;
+        assert_eq!(
+            ctx2.imported_short_sources,
+            vec![crate::ImportedShortSource {
+                result: imported_result,
+                source: OpRef(30),
+            }]
+        );
+
+        let forced = ctx2.force_op_from_preamble(imported_result);
+        assert_eq!(forced, OpRef(30));
+
+        let mut optimizer = crate::optimizer::Optimizer::new();
+        let _ = optimizer.force_box(forced, &mut ctx2);
+
+        let sp = ctx2.build_imported_short_preamble().unwrap();
+        assert_eq!(sp.used_boxes, vec![imported_result]);
+        assert_eq!(sp.jump_args, vec![imported_result]);
+        assert_eq!(sp.ops.len(), 2);
+        assert_eq!(sp.ops[0].op.opcode, OpCode::IntAddOvf);
+        assert_eq!(sp.ops[1].op.opcode, OpCode::GuardNoOverflow);
     }
 
     #[test]
@@ -3740,6 +3985,70 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_short_preamble_live_builder_replays_ovf_and_guard_together() {
+        let produced = vec![(
+            OpRef(20),
+            crate::shortpreamble::ProducedShortOp {
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                preamble_op: {
+                    let mut op = Op::new(OpCode::IntAddOvf, &[OpRef(0), OpRef(1)]);
+                    op.pos = OpRef(20);
+                    op
+                },
+                invented_name: false,
+                same_as_source: None,
+            },
+        )];
+
+        let imported_label_args = [OpRef(0), OpRef(1)];
+        let mut ctx = crate::OptContext::with_num_inputs(32, 2);
+        ctx.initialize_imported_short_preamble_builder(
+            &imported_label_args,
+            &imported_label_args,
+            &[crate::shortpreamble::PreambleOp {
+                op: produced[0].1.preamble_op.clone(),
+                kind: crate::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            }],
+        );
+        ctx.note_imported_short_use(OpRef(20));
+
+        let base_builder = crate::shortpreamble::ShortPreambleBuilder::new(
+            &imported_label_args,
+            &produced,
+            &imported_label_args,
+        );
+        let mut ext = crate::shortpreamble::ExtendedShortPreambleBuilder::new(7, &base_builder);
+        ext.setup(
+            &crate::shortpreamble::ShortPreamble {
+                ops: Vec::new(),
+                inputargs: imported_label_args.to_vec(),
+                used_boxes: Vec::new(),
+                jump_args: Vec::new(),
+                exported_state: None,
+            },
+            &imported_label_args,
+        );
+        ctx.activate_short_preamble_producer(ext);
+
+        let mut optimizer = crate::optimizer::Optimizer::new();
+        let extra = OptUnroll::inline_short_preamble(
+            &imported_label_args,
+            &[OpRef(20)],
+            &crate::shortpreamble::ShortPreamble::empty(),
+            &mut optimizer,
+            &mut ctx,
+        );
+
+        assert_eq!(ctx.new_operations.len(), 2);
+        assert_eq!(ctx.new_operations[0].opcode, OpCode::IntAddOvf);
+        assert_eq!(ctx.new_operations[1].opcode, OpCode::GuardNoOverflow);
+        assert_eq!(extra, vec![ctx.new_operations[0].pos]);
+    }
+
+    #[test]
     fn test_assemble_peeled_trace_extends_label_with_used_boxes() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
@@ -3778,6 +4087,49 @@ mod tests {
         assert_eq!(combined[2].args.as_slice(), &[OpRef(10), combined[1].pos]);
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(combined[4].args.as_slice(), &[OpRef(10), combined[1].pos]);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_remaps_extra_label_source_slots() {
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef(50)]);
+                op.pos = OpRef(1);
+                op.descr = Some(majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true));
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(0), OpRef(50)]),
+        ];
+
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &[OpRef(10)],
+            &[OpRef(0)],
+            &[OpRef(0)],
+            &[OpRef(50)],
+            1,
+            true,
+            &[crate::ImportedShortAlias {
+                result: OpRef(50),
+                same_as_source: OpRef(10),
+                same_as_opcode: OpCode::SameAsI,
+            }],
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+
+        let label_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Label)
+            .expect("label");
+        let label = &combined[label_idx];
+        let extra_label_arg = label.args[1];
+        assert_eq!(label.args.as_slice(), &[OpRef(10), extra_label_arg]);
+        let body_getfield = &combined[label_idx + 1];
+        assert_eq!(body_getfield.opcode, OpCode::GetfieldGcPureI);
+        assert_eq!(body_getfield.args.as_slice(), &[extra_label_arg]);
     }
 
     #[test]
@@ -3922,6 +4274,30 @@ mod tests {
     }
 
     #[test]
+    fn test_assemble_peeled_trace_skips_constant_extra_label_args() {
+        let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef(0)])];
+        let constants = std::collections::HashMap::from([(7_u32, 606_i64)]);
+
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &[OpRef(10)],
+            &[OpRef(0)],
+            &[OpRef(0)],
+            &[OpRef(7), OpRef(8)],
+            1,
+            true,
+            &[],
+            &constants,
+            None,
+            None,
+        );
+
+        assert_eq!(combined[0].opcode, OpCode::Label);
+        assert_eq!(combined[0].args.as_slice(), &[OpRef(10), OpRef(8)]);
+    }
+
+    #[test]
     fn test_assemble_peeled_trace_maps_body_inputs_via_source_slots() {
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 1);
@@ -3954,7 +4330,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::IntAdd);
         assert_eq!(combined[1].args[0], OpRef(200));
         assert_eq!(combined[2].opcode, OpCode::Jump);
-        assert_eq!(combined[2].args.as_slice(), &[OpRef(200)]);
+        assert_eq!(combined[2].args.as_slice(), &[OpRef(200), OpRef(300)]);
     }
 
     #[test]
@@ -3982,6 +4358,13 @@ mod tests {
         assert_eq!(spliced[1].opcode, OpCode::GuardTrue);
         assert_eq!(spliced[2].opcode, OpCode::Jump);
         assert_eq!(spliced[2].args.as_slice(), &[OpRef(3), OpRef(4)]);
+    }
+
+    #[test]
+    fn test_closing_loop_contract_arity_uses_actual_jump_contract() {
+        let ops = vec![Op::new(OpCode::Jump, &[OpRef(0), OpRef(1), OpRef(2)])];
+
+        assert_eq!(closing_loop_contract_arity(&ops, 5), 3);
     }
 
     #[test]
