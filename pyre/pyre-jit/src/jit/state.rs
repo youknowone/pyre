@@ -1293,15 +1293,18 @@ impl TraceFrameState {
                 value = self.trace_guarded_int_payload(ctx, value);
             }
             (Some(Type::Float), Type::Ref) => {
-                let fail_args = self.current_fail_args(ctx);
+                // Inline unbox with record_guard for correct fail_arg types.
                 let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                value = crate::jit::generated::trace_unbox_float(
-                    ctx,
-                    value,
-                    float_type_addr,
-                    crate::jit::descr::ob_type_descr(),
+                if value.0 < 10_000 {
+                    let ob_type = trace_gc_object_int_field(
+                        ctx, value, crate::jit::descr::ob_type_descr(),
+                    );
+                    let type_const = ctx.const_int(float_type_addr);
+                    self.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+                }
+                value = ctx.record_op_with_descr(
+                    OpCode::GetfieldGcPureF, &[value],
                     crate::jit::descr::float_floatval_descr(),
-                    &fail_args,
                 );
             }
             _ => {}
@@ -2278,31 +2281,35 @@ impl TraceFrameState {
         };
 
         self.with_ctx(|this, ctx| {
-            let fail_args = this.current_fail_args(ctx);
             let float_type_addr = &FLOAT_TYPE as *const _ as i64;
+            // Inline trace_unbox_float but use this.record_guard for correct
+            // fail_arg types (generated trace_unbox_float hardcodes all types
+            // as Int, losing Float type info needed for guard recovery).
+            let unbox_float = |this: &mut TraceFrameState, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
+                // Skip GuardClass for constant objects (ob_type is known at
+                // trace time). RPython optimizer constant-folds these, but
+                // pyre's optimizer doesn't always catch it.
+                if obj.0 < 10_000 {
+                    let ob_type = trace_gc_object_int_field(
+                        ctx, obj, crate::jit::descr::ob_type_descr(),
+                    );
+                    let type_const = ctx.const_int(float_type_addr);
+                    this.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+                }
+                ctx.record_op_with_descr(
+                    OpCode::GetfieldGcPureF, &[obj],
+                    crate::jit::descr::float_floatval_descr(),
+                )
+            };
             let lhs_raw = if this.value_type(a) == Type::Float {
                 a
             } else {
-                crate::jit::generated::trace_unbox_float(
-                    ctx,
-                    a,
-                    float_type_addr,
-                    crate::jit::descr::ob_type_descr(),
-                    crate::jit::descr::float_floatval_descr(),
-                    &fail_args,
-                )
+                unbox_float(this, ctx, a)
             };
             let rhs_raw = if this.value_type(b) == Type::Float {
                 b
             } else {
-                crate::jit::generated::trace_unbox_float(
-                    ctx,
-                    b,
-                    float_type_addr,
-                    crate::jit::descr::ob_type_descr(),
-                    crate::jit::descr::float_floatval_descr(),
-                    &fail_args,
-                )
+                unbox_float(this, ctx, b)
             };
             let result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
             this.remember_value_type(result, Type::Float);
