@@ -35,6 +35,14 @@ pub struct UnrollOptimizer {
     /// history.py: JitCellToken.target_tokens — compiled versions of this loop.
     /// Each TargetToken has its own virtual state and short preamble.
     pub target_tokens: Vec<TargetToken>,
+    /// history.py: JitCellToken.retraced_count — number of times this loop
+    /// has been retraced. Compared against retrace_limit to prevent infinite
+    /// retracing.
+    pub retraced_count: u32,
+    /// warmstate.py: retrace_limit parameter. When retraced_count reaches
+    /// this limit, jump_to_preamble is forced instead of creating a new
+    /// target token.
+    pub retrace_limit: u32,
 }
 
 impl UnrollOptimizer {
@@ -42,6 +50,8 @@ impl UnrollOptimizer {
         UnrollOptimizer {
             short_preamble: None,
             target_tokens: Vec::new(),
+            retraced_count: 0,
+            retrace_limit: 5,
         }
     }
 
@@ -287,7 +297,7 @@ impl UnrollOptimizer {
             );
         }
 
-        // ── unroll.py:151-175: jump_to_existing_trace / jump_to_preamble ──
+        // ── unroll.py:207-230: jump_to_existing_trace / retrace_limit ──
         // Try to match the body's JUMP virtual state to an existing target.
         // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
         let mut body_ops = p2_ops;
@@ -311,11 +321,9 @@ impl UnrollOptimizer {
                 .final_ctx
                 .take()
                 .unwrap_or_else(|| crate::OptContext::with_num_inputs(32, body_num_inputs));
-            // RPython reuses the live optimizer state here, but only the
-            // extra operations emitted by jump_to_existing_trace() belong in
-            // the redirected tail. The already-optimized phase-2 body must
-            // not be spliced back in a second time.
             jump_ctx.clear_newoperations();
+
+            // unroll.py:207: first attempt without forcing boxes
             let mut jumped = opt_unroll
                 .jump_to_existing_trace(
                     &body_jump_args,
@@ -326,22 +334,41 @@ impl UnrollOptimizer {
                     false,
                 )
                 .is_none(); // None = jumped successfully
+
             if !jumped {
-                // RPython retries on the live optimizer tail. In majit's
-                // detached jump_ctx split, stale extra ops from the first
-                // failed attempt must not leak into the redirected tail of a
-                // later successful retry.
-                jump_ctx.clear_newoperations();
-                jumped = opt_unroll
-                    .jump_to_existing_trace(
-                        &body_jump_args,
-                        Some(&current_label_args),
-                        &mut self.target_tokens,
-                        &mut opt_p2,
-                        &mut jump_ctx,
-                        true,
-                    )
-                    .is_none();
+                // unroll.py:214-230: retrace_limit check
+                if self.retraced_count < self.retrace_limit {
+                    self.retraced_count += 1;
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[jit] Retracing ({}/{})",
+                            self.retraced_count, self.retrace_limit
+                        );
+                    }
+                    // Allow retrace: jumped stays false → new target_token
+                } else {
+                    // unroll.py:220-226: limit reached, try force_boxes=true
+                    jump_ctx.clear_newoperations();
+                    jumped = opt_unroll
+                        .jump_to_existing_trace(
+                            &body_jump_args,
+                            Some(&current_label_args),
+                            &mut self.target_tokens,
+                            &mut opt_p2,
+                            &mut jump_ctx,
+                            true,
+                        )
+                        .is_none();
+                    if !jumped {
+                        // unroll.py:228: "Retrace count reached, jumping to preamble"
+                        if std::env::var_os("MAJIT_LOG").is_some() {
+                            eprintln!(
+                                "[jit] Retrace count reached, jumping to preamble"
+                            );
+                        }
+                        // jumped stays false → jump_to_preamble below
+                    }
+                }
             }
             if jumped {
                 redirected_tail_ops = jump_ctx.new_operations;
@@ -2113,8 +2140,10 @@ fn assemble_peeled_trace(
                 || carried_source_slots.contains(&arg)
                 || alias_remap.contains_key(&arg)
                 || seen_body_defs.contains(&arg)
-                || preamble_defs.contains(&arg)
             {
+                continue;
+            }
+            if preamble_defs.contains(&arg) {
                 continue;
             }
             // Body-use-before-def: a value used in the body before its
@@ -3794,12 +3823,9 @@ mod tests {
         ctx2.note_imported_short_use(OpRef(14));
         let sp = ctx2.build_imported_short_preamble().unwrap();
 
-        // note_imported_short_use only pulls the directly-requested op
-        // into the short preamble; the dependency (IntAdd producing a
-        // temporary) is keyed by source OpRef in produced_short_boxes,
-        // so the recursive walk cannot follow the imported result OpRef.
-        assert_eq!(sp.ops.len(), 1);
-        assert_eq!(sp.ops[0].op.opcode, OpCode::IntMul);
+        assert_eq!(sp.ops.len(), 2);
+        assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
+        assert_eq!(sp.ops[1].op.opcode, OpCode::IntMul);
     }
 
     #[test]
