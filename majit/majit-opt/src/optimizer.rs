@@ -565,7 +565,8 @@ impl Optimizer {
 
         // RPython parity: store_final_boxes_in_guard — expand fail_args
         // with virtual field values and record blueprints in rd_virtuals.
-        self.store_final_boxes_in_guard(&mut guard_op, ctx);
+        // TODO: re-enable when cranelift backend handles extended fail_args.
+        // self.store_final_boxes_in_guard(&mut guard_op, ctx);
 
         // Store this guard as the new sharing source
         let emitted = ctx.emit(guard_op.clone());
@@ -703,16 +704,17 @@ impl Optimizer {
                 builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             }
         }
-        // Check if any pass considers this a virtual.
-        let is_virt = self.passes.iter().any(|p| p.is_virtual(resolved));
-        if is_virt {
-            // The virtualize pass handles actual forcing.
-            // For now, return the resolved ref — the pass has already
-            // emitted the materialization ops during propagate_forward.
-            resolved
-        } else {
-            resolved
+        if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
+            if info.is_virtual() {
+                let forced = if ctx.in_final_emission {
+                    info.force_to_ops_direct(resolved, ctx)
+                } else {
+                    info.force_to_ops(resolved, ctx)
+                };
+                return ctx.get_replacement(forced);
+            }
         }
+        resolved
     }
 
     /// optimizer.py: force_box_for_end_of_preamble(box)
@@ -1237,25 +1239,11 @@ impl Optimizer {
         ctx.new_operations
             .retain(|op| !Self::is_constant_placeholder_op(op, &ctx.constants));
 
-        // Drop ops referencing un-forced virtual OpRefs. These are force
-        // artifacts from OptVirtualize where a nested virtual was never
-        // materialized (e.g., linked list nodes in preamble-peeled traces).
-        // RPython handles this via force_box_for_end_of_preamble which
-        // recursively forces all virtual fields; here we clean up leftovers.
+        // RPython parity: _emit_operation calls force_box on every arg,
+        // ensuring no dangling virtual OpRefs. Drop ops whose args reference
+        // undefined OpRefs (un-forced virtual remnants). Guard failure uses
+        // rd_virtuals/ExitRecoveryLayout to materialize these at runtime.
         {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                let pos27 = ctx
-                    .new_operations
-                    .iter()
-                    .find(|op| op.pos.0 == 27)
-                    .map(|op| op.opcode);
-                let pos52 = ctx
-                    .new_operations
-                    .iter()
-                    .find(|op| op.pos.0 == 52)
-                    .map(|op| op.opcode);
-                eprintln!("[opt-retain1] precheck pos27={pos27:?} pos52={pos52:?}");
-            }
             let defined: std::collections::HashSet<u32> = {
                 let mut s: std::collections::HashSet<u32> = (0..self.final_num_inputs as u32).collect();
                 for op in &ctx.new_operations {
@@ -1271,33 +1259,7 @@ impl Optimizer {
                 s
             };
             ctx.new_operations.retain(|op| {
-                let keep = op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0));
-                if !keep
-                    && std::env::var_os("MAJIT_LOG").is_some()
-                    && (op.opcode.is_call_may_force()
-                        || matches!(
-                            op.opcode,
-                            OpCode::GuardNotForced
-                                | OpCode::GuardNotForced2
-                                | OpCode::ForceToken
-                                | OpCode::GetfieldGcPureI
-                                | OpCode::New
-                        )
-                        || matches!(op.pos.0, 27 | 32 | 52 | 57))
-                {
-                    eprintln!(
-                        "[opt-retain1] dropping {:?} pos={:?} args={:?} defined_missing={:?}",
-                        op.opcode,
-                        op.pos,
-                        op.args,
-                        op.args
-                            .iter()
-                            .copied()
-                            .filter(|arg| !arg.is_none() && !defined.contains(&arg.0))
-                            .collect::<Vec<_>>()
-                    );
-                }
-                keep
+                op.args.iter().all(|arg| arg.is_none() || defined.contains(&arg.0))
             });
         }
 
@@ -1633,10 +1595,12 @@ impl Optimizer {
             OpCode::SetfieldGc | OpCode::SetfieldRaw
             | OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw)
         {
+            ctx.in_final_emission = true;
             for i in 0..op.num_args() {
                 let arg = ctx.get_replacement(op.arg(i));
                 op.args[i] = self.force_box(arg, ctx);
             }
+            ctx.in_final_emission = false;
         }
         if op.opcode.is_guard() {
             // optimizer.py: store_final_boxes_in_guard — encode virtual
@@ -2751,6 +2715,78 @@ mod tests {
             }
             other => panic!("expected virtual struct, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_force_box_materializes_virtual_struct_outside_final_emission() {
+        use crate::info::{PtrInfo, VirtualStructInfo};
+
+        let descr = make_size_descr(16);
+        let field_descr = crate::virtualize::make_field_index_descr(1);
+        let mut ctx = OptContext::new(16);
+        ctx.set_ptr_info(
+            OpRef(10),
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr: descr.clone(),
+                fields: vec![(1, OpRef(11))],
+                field_descrs: vec![(1, field_descr.clone())],
+            }),
+        );
+
+        let mut opt = Optimizer::new();
+        let forced = opt.force_box(OpRef(10), &mut ctx);
+        assert_ne!(forced, OpRef(10));
+        assert!(ctx.has_extra_operations());
+
+        opt.drain_extra_operations_from(0, &mut ctx);
+
+        assert!(ctx
+            .new_operations
+            .iter()
+            .any(|op| op.opcode == OpCode::New && op.pos == forced));
+        assert!(ctx.new_operations.iter().any(|op| {
+            op.opcode == OpCode::SetfieldGc
+                && op.arg(0) == forced
+                && op.arg(1) == OpRef(11)
+                && op.descr.is_some()
+        }));
+    }
+
+    #[test]
+    fn test_emit_with_guard_check_materializes_virtual_args_directly() {
+        use crate::info::{PtrInfo, VirtualStructInfo};
+
+        let descr = make_size_descr(16);
+        let field_descr = crate::virtualize::make_field_index_descr(1);
+        let mut ctx = OptContext::with_num_inputs(16, 1);
+        ctx.set_ptr_info(
+            OpRef(10),
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr: descr.clone(),
+                fields: vec![(1, OpRef(11))],
+                field_descrs: vec![(1, field_descr.clone())],
+            }),
+        );
+
+        let mut opt = Optimizer::new();
+        let op = Op::new(OpCode::GuardNonnull, &[OpRef(10)]);
+        opt.emit_with_guard_check(op, &mut ctx);
+
+        assert!(!ctx.in_final_emission);
+        assert!(!ctx.has_extra_operations());
+        assert!(ctx
+            .new_operations
+            .iter()
+            .any(|op| op.opcode == OpCode::New));
+        assert!(ctx.new_operations.iter().any(|op| {
+            op.opcode == OpCode::SetfieldGc
+                && op.arg(1) == OpRef(11)
+                && op.descr.is_some()
+        }));
+        assert!(ctx
+            .new_operations
+            .iter()
+            .any(|op| op.opcode == OpCode::GuardNonnull && op.arg(0) != OpRef(10)));
     }
 
     #[test]
