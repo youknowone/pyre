@@ -254,6 +254,19 @@ impl UnrollOptimizer {
             );
         }
 
+        // Safety: guardless body loops run forever without interrupt mechanism.
+        // RPython compiles them (uses periodic interrupts); majit falls back.
+        {
+            let body_guards = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
+            if body_guards == 0 {
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!("[jit] phase 2: 0 guards in body, falling back to phase 1");
+                }
+                *constants = consts_p1;
+                return (p1_ops, p1_ni);
+            }
+        }
+
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
         // Build the virtual state at end of Phase 2 body.
         let imported_short_preamble_builder = opt_p2.imported_short_preamble_builder.clone();
