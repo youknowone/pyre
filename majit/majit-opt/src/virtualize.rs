@@ -598,20 +598,16 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // Emit SETFIELD_GC for each tracked field.
-        // Use ctx.emit() to bypass Heap pass lazy_set — when skip_flush=true
-        // (Phase 2), lazy sets are never flushed, causing missing SetfieldGc.
-        // RPython: force_box emits via send_extra_operation which routes
-        // through all passes, but RPython flushes before JUMP processing.
+        // RPython info.py:226: optforce.emit_extra(setfieldop)
+        // Emit through remaining passes, same as New().
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_replacement(value_ref);
             let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-            set_op.pos = ctx.reserve_pos();
             set_op.descr = Some(descr);
-            ctx.emit(set_op);
+            ctx.emit_through_passes(set_op);
         }
 
         alloc_ref
@@ -779,13 +775,6 @@ impl OptVirtualize {
     }
 
     fn optimize_new(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        // RPython parity: virtual objects need rd_virtuals in guard resume data
-        // for materialization at guard failure. Until recovery_layout is
-        // populated with virtual blueprints, Phase 2 (loop body) must keep
-        // New ops concrete so guard failure restore works correctly.
-        if self.is_phase2 {
-            return OptimizationResult::PassOn;
-        }
         let descr = op.descr.clone().expect("NEW needs descr");
         let vinfo = VirtualStructInfo {
             descr,
@@ -1243,10 +1232,32 @@ impl OptVirtualize {
         // RPython parity: don't force fail_args.
         // encode_guard_virtuals handles encoding at emit time.
         let mut guard_op = op.clone();
+
+        // RPython parity: isinstance(box, Const) → skip forcing.
+        // In RPython, Const objects (ConstInt, ConstFloat) skip virtualization
+        // entirely because they're a different class from AbstractResOp.
+        // In majit, Int/Float-typed fail_args are scalar values (e.g.,
+        // next_instr, valuestackdepth) that must NOT be forced as virtual Ref
+        // objects even if their OpRef index collides with a virtual's position.
+        let fail_arg_types: Vec<majit_ir::Type> = guard_op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map(|fd| fd.fail_arg_types().to_vec())
+            .unwrap_or_default();
+
         if let Some(ref mut fa) = guard_op.fail_args {
-            for arg in fa.iter_mut() {
+            for (i, arg) in fa.iter_mut().enumerate() {
                 let resolved = ctx.get_replacement(*arg);
-                *arg = self.prepare_guard_fail_arg(resolved, ctx);
+                // Int/Float fail_args are scalar constants, never virtual objects.
+                let is_scalar = fail_arg_types
+                    .get(i)
+                    .is_some_and(|t| matches!(t, majit_ir::Type::Int | majit_ir::Type::Float));
+                if is_scalar {
+                    *arg = resolved;
+                } else {
+                    *arg = self.prepare_guard_fail_arg(resolved, ctx);
+                }
             }
         }
         for arg in &mut guard_op.args {
