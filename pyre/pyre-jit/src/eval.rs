@@ -13,7 +13,7 @@ use pyre_interp::frame::PyFrame;
 use pyre_object::w_none;
 use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
 use std::cell::{Cell, UnsafeCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use majit_gc::trace::TypeInfo;
 use majit_ir::Value;
@@ -64,6 +64,8 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 }
 
 thread_local! {
+    static FUNC_ENTRY_COUNTS: UnsafeCell<HashMap<u64, u32>> =
+        UnsafeCell::new(HashMap::new());
     static PYRE_RAW_INT_FINISH_HINTS: UnsafeCell<HashSet<u64>> =
         UnsafeCell::new(HashSet::new());
 
@@ -71,6 +73,21 @@ thread_local! {
     static JIT_TRACING: Cell<bool> = Cell::new(false);
     static RECURSIVE_FORCE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
     static BLACKHOLE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
+}
+
+#[inline]
+fn func_entry_counts() -> &'static mut HashMap<u64, u32> {
+    FUNC_ENTRY_COUNTS.with(|cell| unsafe { &mut *cell.get() })
+}
+
+#[inline]
+pub(crate) fn boost_local_function_entry_counter(green_key: u64) {
+    let (driver, _) = driver_pair();
+    let threshold = driver.meta_interp().warm_state_ref().function_threshold();
+    let count = func_entry_counts().entry(green_key).or_insert(0);
+    if *count < threshold.saturating_sub(1) {
+        *count = threshold.saturating_sub(1);
+    }
 }
 
 fn raw_int_finish_hints() -> &'static mut HashSet<u64> {
@@ -443,48 +460,47 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
 
+    let counts = func_entry_counts();
+    let count = counts.entry(green_key).or_insert(0);
+    *count += 1;
     let self_recursive_candidate = crate::call_jit::self_recursive_function_entry_candidate(frame);
-    if !driver.is_function_boosted(green_key) && self_recursive_candidate {
-        // WarmState boosts are "trace the next entry quickly", not "trace the
-        // current entry immediately". Mirror that RPython behavior here so
-        // the first outermost recursive call only seeds the counter and the
-        // next recursive portal entry starts the separate function trace.
+    let boosted = if driver.is_function_boosted(green_key) {
+        true
+    } else if *count == 1 && self_recursive_candidate {
+        // RPython routes recursive portal calls through perform_call(jitcode,
+        // ..., greenkey), so self-recursion is visible as soon as the callee
+        // re-enters at pc=0.  pyre reaches the same point through eval-time
+        // frame entry, not only through helper-boundary force paths, so
+        // boost the first self-recursive portal candidate directly.
         driver.boost_function_entry(green_key);
-        return None;
-    }
-    let should_trace = driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .should_trace_function_entry(green_key);
-    let count = driver.meta_interp().warm_state_ref().function_entry_count(green_key);
+        true
+    } else {
+        false
+    };
+
     let function_threshold = driver.meta_interp().warm_state_ref().function_threshold();
-    let boosted = driver.is_function_boosted(green_key);
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit][func-entry] count key={} arg0={:?} count={} boosted={} threshold={}",
             green_key,
             debug_first_arg_int(frame),
-            count,
+            *count,
             boosted,
             function_threshold
         );
     }
-    if !should_trace {
+    if *count < function_threshold && !boosted {
         return None;
     }
 
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .reset_function_entry_count(green_key);
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit][func-entry] start tracing key={} arg0={:?} count={} boosted={}",
             green_key,
             debug_first_arg_int(frame),
-            count,
+            *count,
             boosted
         );
     }

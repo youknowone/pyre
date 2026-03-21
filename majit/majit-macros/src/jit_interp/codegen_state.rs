@@ -1189,39 +1189,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         return Some(head);
                     }
                     let stack_ref = self.ensure_linked_list_stack_ref(ctx, selected)?;
-
-                    // Guard that the stack is non-empty before reading head.
-                    // Without this, the body loop can dereference a null head
-                    // pointer when the stack becomes empty after JUMP back to
-                    // the Label.
-                    let size_descr = self.linked_list_stack_size_descr()?;
-                    let size = ctx.record_op_with_descr(
-                        majit_ir::OpCode::GetfieldGcI,
-                        &[stack_ref],
-                        size_descr,
-                    );
-                    let one = ctx.const_int(1);
-                    let ge = ctx.record_op(majit_ir::OpCode::IntGe, &[size, one]);
-                    let stacksize = self.current_stacksize_value
-                        .unwrap_or(size);
-                    let selected_val = self.current_selected_value
-                        .unwrap_or_else(|| ctx.const_int(self.current_selected as i64));
-                    let selected_ref = self.current_selected_ref
-                        .unwrap_or(stack_ref);
-                    let fail_args = vec![stacksize, self.pool_ref, selected_val, selected_ref];
-                    let fail_types = vec![
-                        majit_ir::Type::Int,
-                        majit_ir::Type::Ref,
-                        majit_ir::Type::Int,
-                        majit_ir::Type::Ref,
-                    ];
-                    ctx.record_guard_typed_with_fail_args(
-                        majit_ir::OpCode::GuardTrue,
-                        &[ge],
-                        fail_types,
-                        &fail_args,
-                    );
-
                     let head_descr = self.linked_list_stack_head_descr()?;
                     let head = ctx.record_op_with_descr(
                         majit_ir::OpCode::GetfieldGcR,
@@ -1259,7 +1226,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                             offset,
                             8,
                             majit_ir::Type::Ref,
-                            true, // immutable: stack_ptrs never change after init
+                            false,
                         ),
                     ))
                 }

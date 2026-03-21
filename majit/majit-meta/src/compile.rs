@@ -726,10 +726,8 @@ pub(crate) fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
         let mut ob_type_refs: Vec<(usize, OpRef)> = Vec::new();
 
         for (idx, op) in ops.iter().enumerate() {
-            if !matches!(
-                op.opcode,
-                OpCode::GetfieldRawI | OpCode::GetfieldGcI | OpCode::GetfieldGcPureI
-            ) || op.args.first() != Some(ca_ref)
+            if !matches!(op.opcode, OpCode::GetfieldRawI | OpCode::GetfieldGcI)
+                || op.args.first() != Some(ca_ref)
             {
                 continue;
             }

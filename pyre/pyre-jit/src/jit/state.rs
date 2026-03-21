@@ -249,10 +249,11 @@ fn note_inline_trace_too_long(
     warm_state.disable_noninlinable_function(callee_key);
     if callee_key == caller_function_key {
         // RPython converges the next portal entry quickly after marking the
-        // huge function non-inlinable. Mirror that by priming the warmstate-
-        // owned function-entry counter instead of only bumping a backedge
-        // hot counter.
+        // huge function non-inlinable. pyre's function-entry path is driven
+        // by a separate function counter, so same-key recursive traces need
+        // a function-entry boost instead of only a backedge hot-counter bump.
         warm_state.boost_function_entry(caller_function_key);
+        crate::eval::boost_local_function_entry_counter(caller_function_key);
     } else {
         warm_state.trace_next_iteration(root_trace_key);
     }
@@ -639,6 +640,14 @@ fn concrete_value_type(value: PyObjectRef) -> Type {
     Type::Ref
 }
 
+fn concrete_virtualizable_slot_type(value: PyObjectRef) -> Type {
+    if value.is_null() || looks_like_heap_ref(value) {
+        Type::Ref
+    } else {
+        Type::Int
+    }
+}
+
 fn looks_like_heap_ref(value: PyObjectRef) -> bool {
     let addr = value as usize;
     let word_align = std::mem::align_of::<usize>() - 1;
@@ -679,14 +688,14 @@ fn concrete_slot_types(
     for idx in 0..num_locals {
         types.push(
             concrete_stack_value(frame, idx)
-                .map(concrete_value_type)
+                .map(concrete_virtualizable_slot_type)
                 .unwrap_or(Type::Ref),
         );
     }
     for stack_idx in 0..stack_only {
         types.push(
             concrete_stack_value(frame, num_locals + stack_idx)
-                .map(concrete_value_type)
+                .map(concrete_virtualizable_slot_type)
                 .unwrap_or(Type::Ref),
         );
     }
@@ -1265,7 +1274,7 @@ impl TraceFrameState {
     ) -> Result<(), PyError> {
         let vtype = self.value_type(value);
         let concrete_slot_type =
-            concrete_stack_value(self.concrete_frame, idx).map(concrete_value_type);
+            concrete_stack_value(self.concrete_frame, idx).map(concrete_virtualizable_slot_type);
         match (concrete_slot_type, vtype) {
             (Some(Type::Int), Type::Ref) => {
                 value = self.trace_guarded_int_payload(ctx, value);
@@ -1296,6 +1305,7 @@ impl TraceFrameState {
         s.symbolic_local_types[idx] = match concrete_slot_type {
             Some(Type::Int) => Type::Int,
             Some(Type::Float) => Type::Float,
+            Some(Type::Ref) => Type::Ref,
             _ => stored_type,
         };
         Ok(())
@@ -1407,7 +1417,7 @@ impl TraceFrameState {
     /// as raw Int values, not freshly boxed W_Int objects.
     fn materialize_loop_carried_value(
         &mut self,
-        _ctx: &mut TraceCtx,
+        ctx: &mut TraceCtx,
         value: OpRef,
         slot_type: Type,
     ) -> OpRef {
@@ -1418,6 +1428,31 @@ impl TraceFrameState {
                     // Convert boxed W_Int back to its raw payload so the loop
                     // header sees the typed INT stream expected by restore_values().
                     self.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, value))
+                }
+                _ => value,
+            },
+            Type::Ref => match self.value_type(value) {
+                Type::Int => {
+                    let int_type_addr = &INT_TYPE as *const _ as i64;
+                    crate::jit::generated::trace_box_int(
+                        ctx,
+                        value,
+                        w_int_size_descr(),
+                        ob_type_descr(),
+                        int_intval_descr(),
+                        int_type_addr,
+                    )
+                }
+                Type::Float => {
+                    let float_type_addr = &FLOAT_TYPE as *const _ as i64;
+                    crate::trace_box_float(
+                        ctx,
+                        value,
+                        w_float_size_descr(),
+                        ob_type_descr(),
+                        float_floatval_descr(),
+                        float_type_addr,
+                    )
                 }
                 _ => value,
             },
@@ -1635,11 +1670,7 @@ impl TraceFrameState {
             )
         };
 
-        // RPython pyjitpl.py:514: guard fail_args capture the state AFTER
-        // the branch is resolved (comparison result already consumed).
-        // The resume PC (next_instr) is the branch target, and vsd does not
-        // include the comparison result (already popped by pop_jump_if).
-        let mut fail_args = vec![frame, next_instr, ctx.const_int(stack_depth as i64)];
+        let mut fail_args = vec![frame, next_instr, ctx.const_int((stack_depth + 1) as i64)];
         for (idx, slot) in local_values.into_iter().enumerate() {
             let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
             fail_args.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, idx));
@@ -1648,9 +1679,16 @@ impl TraceFrameState {
             let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
             fail_args.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, nlocals + stack_idx));
         }
+        let branch_type = self.value_type(branch_value);
+        fail_args.push(self.materialize_fail_arg_slot(
+            ctx,
+            branch_value,
+            branch_type,
+            nlocals + stack_types.len(),
+        ));
 
         let fail_arg_types =
-            virtualizable_fail_arg_types(local_types.into_iter().chain(stack_types));
+            virtualizable_fail_arg_types(local_types.into_iter().chain(stack_types).chain(std::iter::once(branch_type)));
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
         if self.sym().pending_branch_value.is_none() {
             self.sym_mut().last_popped_concrete_value = None;
@@ -2983,6 +3021,7 @@ impl TraceFrameState {
                 // if we know the callee body and it is a small acyclic helper,
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
+                let current_trace_green_key = current_trace_green_key(self);
                 let root_trace_green_key = root_trace_green_key(self);
                 let current_function_key = unsafe {
                     let cf = &*(self.concrete_frame as *const pyre_interp::frame::PyFrame);
@@ -2995,12 +3034,6 @@ impl TraceFrameState {
                     .meta_interp()
                     .warm_state_ref()
                     .can_inline_callable(callee_key);
-                let max_unroll_recursion = driver
-                    .meta_interp()
-                    .warm_state_ref()
-                    .max_unroll_recursion() as usize;
-                let recursive_depth =
-                    self.with_ctx(|_, ctx| ctx.recursive_depth(callee_key));
                 let concrete_arg0 = if nargs == 1 {
                     self.concrete_call_arg_after_pops(0)
                 } else {
@@ -3008,39 +3041,29 @@ impl TraceFrameState {
                 };
                 let callee_prefers_function_entry =
                     crate::call_jit::callable_prefers_function_entry(concrete_callable);
-                if is_self_recursive
-                    && inline_decision == majit_meta::InlineDecision::Inline
-                    && recursive_depth >= max_unroll_recursion
-                {
-                    driver
-                        .meta_interp_mut()
-                        .warm_state_mut()
-                        .disable_noninlinable_function(callee_key);
-                }
-
-                // RPython _opimpl_recursive_call() traces recursive portal
-                // calls via perform_call() only until max_unroll_recursion is
-                // hit, then forces the residual/assembler path so the current
-                // trace can converge. Mirror that here instead of letting
-                // self-recursive trace-through run until trace-too-long.
+                
+                // RPython traces through regular callees, but recursive
+                // calls converge to separate functraces + call_assembler.
+                //
+                // We do not yet have full multi-frame resumedata / ChangeFrame
+                // recovery for trace-through recursion, so keep self-recursive
+                // calls out of the trace-through path.  They still use the
+                // regular compiled-call helpers below.
                 let can_trace_through = callee_inline_eligible
                     && nargs <= 4
                     && if is_self_recursive {
                         inline_decision == majit_meta::InlineDecision::Inline
-                            && recursive_depth < max_unroll_recursion
                     } else {
                         !callee_prefers_function_entry && !callee_has_loop
                     };
 
                 if majit_meta::majit_log_enabled() {
                     eprintln!(
-                        "[jit][direct-call] key={} nargs={} inline_eligible={} self_recursive={} recursive_depth={} max_unroll_recursion={} prefers_func_entry={} has_loop={} inline_active={} can_trace_through={}",
+                        "[jit][direct-call] key={} nargs={} inline_eligible={} self_recursive={} prefers_func_entry={} has_loop={} inline_active={} can_trace_through={}",
                         callee_key,
                         nargs,
                         callee_inline_eligible,
                         is_self_recursive,
-                        recursive_depth,
-                        max_unroll_recursion,
                         callee_prefers_function_entry,
                         callee_has_loop,
                         inline_framestack_active,
@@ -3515,7 +3538,7 @@ impl TraceFrameState {
         let caller_namespace = caller.namespace;
         let callee_globals = unsafe { w_func_get_globals(concrete_callable) };
         let can_skip_traced_callee_frame =
-            !is_self_recursive && callee_globals == caller_namespace && callee_nlocals == args.len();
+            callee_globals == caller_namespace && callee_nlocals == args.len();
 
         let (callee_sym, drop_frame_opref) = if can_skip_traced_callee_frame {
             let frame = self.frame();
@@ -5896,6 +5919,68 @@ mod tests {
     }
 
     #[test]
+    fn test_concrete_slot_types_treat_virtualizable_object_slots_as_refs() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.locals_cells_stack_w[0] = w_int_new(41);
+        frame.locals_cells_stack_w[1] = w_int_new(7);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        assert_eq!(
+            concrete_slot_types(frame_ptr, 1, 2),
+            vec![Type::Ref, Type::Ref]
+        );
+    }
+
+    #[test]
+    fn test_store_local_value_keeps_virtualizable_object_slot_typed_ref() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interp::frame::PyFrame;
+
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.locals_cells_stack_w[0] = w_int_new(41);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(1);
+        let frame_ref = OpRef(0);
+        let raw_int = ctx.const_int(7);
+        let mut sym = PyreSym::new_uninit(frame_ref);
+        sym.symbolic_initialized = true;
+        sym.nlocals = 1;
+        sym.valuestackdepth = 1;
+        sym.symbolic_locals = vec![OpRef::NONE];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.transient_value_types.insert(raw_int, Type::Int);
+
+        let mut state = TraceFrameState {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            concrete_frame: frame_ptr,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_fail_args: None,
+            parent_fail_arg_types: None,
+            pending_inline_frame: None,
+        };
+
+        state
+            .with_ctx(|this, ctx| this.store_local_value(ctx, 0, raw_int))
+            .expect("store_local_value should accept raw int for a virtualizable object slot");
+
+        assert_eq!(
+            state.sym().symbolic_local_types,
+            vec![Type::Ref],
+            "virtualizable object slots must keep Ref type even when carrying a boxed-int value"
+        );
+    }
+
+    #[test]
     fn test_load_local_checked_value_skips_nonnull_guard_for_typed_int_local() {
         let mut ctx = TraceCtx::for_test(1);
         let local = OpRef(0);
@@ -7134,7 +7219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_close_loop_args_keeps_traced_raw_int_box_identity() {
+    fn test_close_loop_args_boxes_raw_int_for_virtualizable_object_slot() {
         use pyre_bytecode::compile_exec;
         use pyre_interp::frame::PyFrame;
 
@@ -7152,7 +7237,7 @@ mod tests {
         sym.nlocals = 1;
         sym.valuestackdepth = 1;
         sym.symbolic_locals = vec![local_raw];
-        sym.symbolic_local_types = vec![Type::Int];
+        sym.symbolic_local_types = vec![Type::Ref];
         sym.vable_next_instr = ctx.const_int(11);
         sym.vable_valuestackdepth = ctx.const_int(1);
         sym.transient_value_types.insert(local_raw, Type::Int);
@@ -7170,26 +7255,30 @@ mod tests {
 
         let args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
         assert_eq!(args.len(), 4);
-        assert_eq!(
+        assert_ne!(
             args[3], local_raw,
-            "loop-close args should keep the traced raw int instead of allocating a new W_Int"
+            "loop-close args should rematerialize a boxed W_Int for virtualizable object slots"
         );
 
         let recorder = ctx.into_recorder();
-        let mut saw_box_call = false;
+        let mut saw_new = false;
+        let mut saw_payload_store = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
             let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
-            if matches!(op.opcode, OpCode::CallI | OpCode::CallR)
-                && op.args.as_slice() == [local_raw]
+            if op.opcode == OpCode::New {
+                saw_new = true;
+            }
+            if op.opcode == OpCode::SetfieldGc
+                && op.descr.as_ref().map(|d| d.index()) == Some(int_intval_descr().index())
             {
-                saw_box_call = true;
+                saw_payload_store = true;
             }
         }
         assert!(
-            !saw_box_call,
-            "close_loop_args should not rematerialize a boxed W_Int for raw int locals"
+            saw_new && saw_payload_store,
+            "close_loop_args should box a raw int back into a W_Int before carrying it through a Ref slot"
         );
     }
 
