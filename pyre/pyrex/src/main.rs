@@ -1,33 +1,103 @@
 //! pyre — A Rust meta-tracing JIT Python interpreter.
-//!
-//! Usage:
-//!   pyre <script.py>       Execute a Python script
-//!   pyre -c <code>         Execute a Python expression/statement
-//!   pyre                   Interactive REPL
 
 use std::io::{self, BufRead, Write};
 use std::rc::Rc;
+
+use lexopt::Arg::*;
+use lexopt::ValueExt;
 
 use pyre_bytecode::*;
 use pyre_interp::frame::PyFrame;
 use pyre_jit::eval::eval_with_jit;
 use pyre_runtime::{PyDisplay, PyExecutionContext};
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+enum RunMode {
+    Script(String),
+    Command(String),
+    Repl,
+}
 
-    if args.len() >= 3 && args[1] == "-c" {
-        run_source(&args[2], Mode::Exec);
-    } else if args.len() >= 2 {
-        match std::fs::read_to_string(&args[1]) {
-            Ok(content) => run_source(&content, Mode::Exec),
-            Err(e) => {
-                eprintln!("pyre: cannot open '{}': {}", args[1], e);
-                std::process::exit(1);
+const USAGE: &str = "\
+usage: pyre [option] ... [-c cmd | file | -] [arg] ...
+Options:
+-c cmd : program passed in as string (terminates option list)
+-h     : print this help message and exit (also --help)
+-i     : inspect interactively after running script
+-O     : optimize (no-op, reserved for compatibility)
+-q     : don't print version on interactive startup
+-V     : print the Python version number and exit (also --version)
+file   : program read from script file
+-      : program read from stdin (default; interactive mode if a tty)
+arg ...: arguments passed to program in sys.argv[1:]
+";
+
+fn parse_args() -> Result<(RunMode, bool, bool), lexopt::Error> {
+    let mut parser = lexopt::Parser::from_env();
+    let mut inspect = false;
+    let mut quiet = false;
+
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('c') => {
+                let cmd = parser.value()?.string()?;
+                return Ok((RunMode::Command(cmd), inspect, quiet));
+            }
+            Short('h') | Long("help") => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            Short('i') => inspect = true,
+            Short('O') => {} // no-op
+            Short('q') => quiet = true,
+            Short('V') | Long("version") => {
+                println!("pyre 0.0.1");
+                std::process::exit(0);
+            }
+            Value(script) => {
+                let script = script.string()?;
+                let mode = if script == "-" {
+                    RunMode::Repl
+                } else {
+                    RunMode::Script(script)
+                };
+                return Ok((mode, inspect, quiet));
+            }
+            _ => return Err(arg.unexpected()),
+        }
+    }
+    Ok((RunMode::Repl, inspect, quiet))
+}
+
+fn main() {
+    let (mode, inspect, quiet) = match parse_args() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pyre: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    match mode {
+        RunMode::Command(cmd) => {
+            run_source(&cmd, Mode::Exec);
+            if inspect {
+                run_repl(true);
             }
         }
-    } else {
-        run_repl();
+        RunMode::Script(path) => {
+            let source = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("pyre: cannot open '{path}': {e}");
+                    std::process::exit(1);
+                }
+            };
+            run_source(&source, Mode::Exec);
+            if inspect {
+                run_repl(true);
+            }
+        }
+        RunMode::Repl => run_repl(quiet),
     }
 }
 
@@ -56,7 +126,7 @@ fn run_source(source: &str, mode: Mode) {
     }
 }
 
-fn run_repl() {
+fn run_repl(quiet: bool) {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let execution_context = Rc::new(PyExecutionContext::default());
@@ -67,8 +137,10 @@ fn run_repl() {
     namespace.fix_ptr();
     let namespace = Box::into_raw(namespace);
 
-    println!("pyre 0.0.1 (Rust meta-tracing JIT)");
-    println!("Type \"exit()\" or Ctrl-D to exit.");
+    if !quiet {
+        println!("pyre 0.0.1 (Rust meta-tracing JIT)");
+        println!("Type \"exit()\" or Ctrl-D to exit.");
+    }
 
     let mut buffer = String::new();
     let mut continuation = false;
@@ -165,8 +237,6 @@ fn try_compile_single(source: &str) -> CompileResult {
     match compile_source(&with_one, Mode::Single) {
         Ok(code) => CompileResult::Complete(code),
         Err(e1) => {
-            // RustPython's parser doesn't support PyCF_DONT_IMPLY_DEDENT,
-            // so detect incomplete input by error message patterns.
             if is_incomplete_error(&e1) {
                 return CompileResult::Incomplete;
             }

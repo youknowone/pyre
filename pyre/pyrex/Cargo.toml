@@ -14,3 +14,4 @@ pyre-runtime = { workspace = true }
 pyre-bytecode = { workspace = true }
 pyre-interp = { workspace = true }
 pyre-jit = { path = "../pyre-jit" }
+lexopt = "0.3"
