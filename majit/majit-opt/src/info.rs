@@ -599,6 +599,18 @@ impl PtrInfo {
         }
     }
 
+    /// heap.py:194: opinfo._fields[descr.get_index()] = None
+    /// Clear a cached field value. Used by CachedField.invalidate().
+    pub fn clear_field(&mut self, field_idx: u32) {
+        match self {
+            PtrInfo::Instance(v) => v.fields.retain(|(k, _)| *k != field_idx),
+            PtrInfo::Struct(v) => v.fields.retain(|(k, _)| *k != field_idx),
+            PtrInfo::Virtual(v) => v.fields.retain(|(k, _)| *k != field_idx),
+            PtrInfo::VirtualStruct(v) => v.fields.retain(|(k, _)| *k != field_idx),
+            _ => {}
+        }
+    }
+
     /// info.py: getfield(field_descr) — get a field from a virtual object.
     pub fn get_field(&self, field_idx: u32) -> Option<OpRef> {
         match self {
