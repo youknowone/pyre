@@ -2332,6 +2332,40 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
+    // RPython parity: each label position must be a distinct OpRef so the
+    // backend assigns independent register slots. When make_inputargs produces
+    // duplicates (e.g. [v0, v3, v20, v20, v30, v20]), create SameAs aliases
+    // for the second and subsequent occurrences. This mirrors RPython where
+    // each label arg is a distinct Box even when forwarded to the same value.
+    {
+        let mut seen_in_label: HashMap<OpRef, usize> = HashMap::new();
+        let mut label_scope_dedup: HashMap<OpRef, OpRef> = HashMap::new();
+        let n_label = full_label_args.len();
+        for i in 0..n_label {
+            let arg = full_label_args[i];
+            if arg.is_none() || constants.contains_key(&arg.0) {
+                continue;
+            }
+            if let Some(&first_idx) = seen_in_label.get(&arg) {
+                let fresh = OpRef(next_free_pos(max_pos.saturating_add(1)));
+                max_pos = fresh.0;
+                let source = full_label_args[first_idx];
+                let mut same_op = Op::new(OpCode::SameAsI, &[source]);
+                same_op.pos = fresh;
+                result.push(same_op);
+                label_scope_dedup.insert(fresh, arg);
+                full_label_args[i] = fresh;
+            } else {
+                seen_in_label.insert(arg, i);
+            }
+        }
+        // Also remap body ops that reference the original duplicate OpRefs
+        // to the fresh aliases. Store in alias_remap for remap_body_arg.
+        for (fresh, original) in &label_scope_dedup {
+            alias_remap.insert(*original, *fresh);
+        }
+    }
+
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
     label_op.pos = OpRef(label_pos);
     label_op.descr = loop_label_descr;
