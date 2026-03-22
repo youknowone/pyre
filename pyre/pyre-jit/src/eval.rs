@@ -232,14 +232,12 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 
         // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
         //
-        // RPython interp_jit.py/warmspot.py: jit_merge_point runs at the
-        // dispatch-loop head, but can_enter_jit is rewritten to
-        // maybe_compile_and_run() and can also start tracing from a back-edge.
-        // Keep the loop-head merge point here, but let back-edges own their
-        // own tracing/compiled dispatch too.
-        // RPython parity: jit_merge_point is only in the portal function
-        // (interp_jit.py dispatch). Module-level code (<module>) does NOT
-        // have jit_merge_point — only user-defined functions do.
+        // RPython interp_jit.py dispatch() calls jit_merge_point for ALL
+        // Python code, including <module>-level loops. However, module-level
+        // code uses LOAD_NAME/STORE_NAME (dict access) instead of
+        // LOAD_FAST/STORE_FAST, so the virtualizable mechanism cannot carry
+        // locals as loop-carried values. Skip <module> until dict caching
+        // is implemented in the optimizer (RPython OptHeap dict caching).
         let is_portal: bool = {
             let name: &str = &code.obj_name;
             name != "<module>"
