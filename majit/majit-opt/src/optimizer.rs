@@ -1648,7 +1648,14 @@ impl Optimizer {
     /// appropriate loop body target token, falling back to the preamble
     /// when no match is found.
     ///
-    /// Returns the final optimized ops with JUMP redirected.
+    /// `retraced_count` / `retrace_limit`: RPython history.py
+    /// JitCellToken.retraced_count tracking. When retrace_limit > 0 and
+    /// no existing trace matches, export_state creates a new specialization.
+    /// Default retrace_limit = 0 (disabled, warmstate.py PARAMETERS).
+    ///
+    /// Returns `(optimized_ops, retrace_requested)`. When retrace_requested
+    /// is true, the caller should increment retraced_count and may use the
+    /// optimizer's exported_loop_state for the new target token.
     pub fn optimize_bridge(
         &mut self,
         ops: &[Op],
@@ -1656,9 +1663,11 @@ impl Optimizer {
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::unroll::TargetToken>,
         inline_short_preamble: bool,
+        retraced_count: u32,
+        retrace_limit: u32,
         // runtime_boxes: Option<&[Value]>,  // B4 TODO
         // resumestorage: Option<...>,        // B3 TODO
-    ) -> Vec<Op> {
+    ) -> (Vec<Op>, bool) {
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
         let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
 
@@ -1668,7 +1677,7 @@ impl Optimizer {
             .map_or(false, |op| op.opcode == OpCode::Jump);
 
         if !ends_with_jump {
-            return optimized_ops;
+            return (optimized_ops, false);
         }
 
         let jump_args = optimized_ops.last().unwrap().args.to_vec();
@@ -1676,9 +1685,9 @@ impl Optimizer {
         // unroll.py:198-200: not inline_short_preamble or single target → jump_to_preamble
         if !inline_short_preamble || front_target_tokens.len() <= 1 {
             if let Some(preamble_token) = front_target_tokens.first() {
-                return crate::unroll::UnrollOptimizer::jump_to_preamble(&optimized_ops, preamble_token);
+                return (crate::unroll::UnrollOptimizer::jump_to_preamble(&optimized_ops, preamble_token), false);
             }
-            return optimized_ops;
+            return (optimized_ops, false);
         }
 
         // unroll.py:203: self.flush()
@@ -1702,7 +1711,7 @@ impl Optimizer {
             .map(|&a| ctx.get_replacement(a))
             .collect();
 
-        // unroll.py:207-208: jump_to_existing_trace(jump_op, None, runtime_boxes, force_boxes=False)
+        // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
         let opt_unroll = crate::unroll::OptUnroll::new();
         let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
@@ -1714,14 +1723,28 @@ impl Optimizer {
         );
 
         if vs.is_none() {
-            // unroll.py:212-213: matched → return ops with redirected JUMP
+            // unroll.py:212-213: matched → JUMP redirected
             let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
             result.extend(ctx.new_operations.drain(..));
-            return result;
+            return (result, false);
         }
 
-        // unroll.py:214-218: retrace logic (B7 TODO — for now skip retrace, go to force)
-        // Try force_boxes=true (unroll.py:221-223)
+        // unroll.py:214-218: retrace check
+        if retraced_count < retrace_limit {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] Retracing ({}/{})",
+                    retraced_count + 1,
+                    retrace_limit
+                );
+            }
+            // unroll.py:231-236: export_state for new specialization.
+            // The caller uses self.exported_loop_state (populated by
+            // optimize_with_constants_and_inputs) to create a new target_token.
+            return (optimized_ops, true);
+        }
+
+        // unroll.py:220-230: retrace limit reached, try force_boxes=true
         ctx.clear_newoperations();
         let vs2 = opt_unroll.jump_to_existing_trace(
             &jump_args,
@@ -1733,17 +1756,21 @@ impl Optimizer {
         );
 
         if vs2.is_none() {
+            // unroll.py:226-227: matched with forced boxes
             let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
             result.extend(ctx.new_operations.drain(..));
-            return result;
+            return (result, false);
         }
 
         // unroll.py:228-229: jump_to_preamble fallback
+        if crate::majit_log_enabled() {
+            eprintln!("[jit] Retrace count reached, jumping to preamble");
+        }
         if let Some(preamble_token) = front_target_tokens.first() {
-            return crate::unroll::UnrollOptimizer::jump_to_preamble(&optimized_ops, preamble_token);
+            return (crate::unroll::UnrollOptimizer::jump_to_preamble(&optimized_ops, preamble_token), false);
         }
 
-        optimized_ops
+        (optimized_ops, false)
     }
 
     fn collect_exported_int_bounds(

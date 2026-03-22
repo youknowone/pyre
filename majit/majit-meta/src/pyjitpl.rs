@@ -2946,13 +2946,40 @@ impl<M: Clone> MetaInterp<M> {
         // for ResumeAtPositionDescr guards. Default to true.
         let inline_short_preamble = true;
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-        let optimized_ops = optimizer.optimize_bridge(
+        let retraced_count = compiled.retraced_count;
+        // RPython warmstate.py: PARAMETERS['retrace_limit'] = 0 (disabled by default)
+        let retrace_limit = 0u32;
+        let (optimized_ops, retrace_requested) = optimizer.optimize_bridge(
             bridge_ops,
             &mut constants,
             bridge_inputargs.len(),
             &mut compiled.front_target_tokens,
             inline_short_preamble,
+            retraced_count,
+            retrace_limit,
         );
+        if retrace_requested {
+            // unroll.py:217: cell_token.retraced_count += 1
+            compiled.retraced_count += 1;
+            // unroll.py:231-236: export_state creates a new target token.
+            // The optimizer's exported_loop_state has the virtual state for
+            // the new specialization. Add a new target token to
+            // front_target_tokens so future bridges/loops can match it.
+            if let Some(exported) = optimizer.exported_loop_state.take() {
+                let mut new_token = majit_opt::unroll::TargetToken::new_preamble(
+                    compiled.front_target_tokens.len() as u64,
+                );
+                new_token.virtual_state = Some(exported.virtual_state);
+                compiled.front_target_tokens.push(new_token);
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] bridge retrace: added target_token #{}, total={}",
+                        compiled.front_target_tokens.len() - 1,
+                        compiled.front_target_tokens.len()
+                    );
+                }
+            }
+        }
 
         // RPython parity: unbox the Finish result in bridges too.
         // Without this, bridges return boxed pointers while the caller
