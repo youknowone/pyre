@@ -1,16 +1,17 @@
+use pyre_object::excobject::{ExcKind, exc_kind_name, w_exception_new};
 use pyre_object::PyObjectRef;
 
 /// Result type for Python operations.
 pub type PyResult = Result<PyObjectRef, PyError>;
 
-/// Python exception (simplified for Phase 1).
+/// Python exception.
 #[derive(Debug, Clone)]
 pub struct PyError {
     pub kind: PyErrorKind,
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PyErrorKind {
     TypeError,
     ValueError,
@@ -19,6 +20,13 @@ pub enum PyErrorKind {
     IndexError,
     KeyError,
     AttributeError,
+    RuntimeError,
+    StopIteration,
+    OverflowError,
+    ArithmeticError,
+    ImportError,
+    NotImplementedError,
+    AssertionError,
 }
 
 impl PyError {
@@ -42,10 +50,82 @@ impl PyError {
             message: msg.into(),
         }
     }
+
+    pub fn runtime_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::RuntimeError,
+            message: msg.into(),
+        }
+    }
+
+    pub fn stop_iteration() -> Self {
+        PyError {
+            kind: PyErrorKind::StopIteration,
+            message: String::new(),
+        }
+    }
+
+    /// Convert to a W_ExceptionObject for pushing onto the value stack.
+    pub fn to_exc_object(&self) -> PyObjectRef {
+        w_exception_new(self.to_exc_kind(), &self.message)
+    }
+
+    fn to_exc_kind(&self) -> ExcKind {
+        match self.kind {
+            PyErrorKind::TypeError => ExcKind::TypeError,
+            PyErrorKind::ValueError => ExcKind::ValueError,
+            PyErrorKind::ZeroDivisionError => ExcKind::ZeroDivisionError,
+            PyErrorKind::NameError => ExcKind::NameError,
+            PyErrorKind::IndexError => ExcKind::IndexError,
+            PyErrorKind::KeyError => ExcKind::KeyError,
+            PyErrorKind::AttributeError => ExcKind::AttributeError,
+            PyErrorKind::RuntimeError => ExcKind::RuntimeError,
+            PyErrorKind::StopIteration => ExcKind::StopIteration,
+            PyErrorKind::OverflowError => ExcKind::OverflowError,
+            PyErrorKind::ArithmeticError => ExcKind::ArithmeticError,
+            PyErrorKind::ImportError => ExcKind::ImportError,
+            PyErrorKind::NotImplementedError => ExcKind::NotImplementedError,
+            PyErrorKind::AssertionError => ExcKind::AssertionError,
+        }
+    }
+
+    /// Create a PyError from a W_ExceptionObject.
+    ///
+    /// # Safety
+    /// `obj` must point to a valid `W_ExceptionObject`.
+    pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
+        let kind = pyre_object::excobject::w_exception_get_kind(obj);
+        let message = pyre_object::excobject::w_exception_get_message(obj).to_string();
+        PyError {
+            kind: Self::kind_from_exc(kind),
+            message,
+        }
+    }
+
+    fn kind_from_exc(kind: ExcKind) -> PyErrorKind {
+        match kind {
+            ExcKind::TypeError => PyErrorKind::TypeError,
+            ExcKind::ValueError => PyErrorKind::ValueError,
+            ExcKind::ZeroDivisionError => PyErrorKind::ZeroDivisionError,
+            ExcKind::NameError => PyErrorKind::NameError,
+            ExcKind::IndexError => PyErrorKind::IndexError,
+            ExcKind::KeyError => PyErrorKind::KeyError,
+            ExcKind::AttributeError => PyErrorKind::AttributeError,
+            ExcKind::RuntimeError => PyErrorKind::RuntimeError,
+            ExcKind::StopIteration => PyErrorKind::StopIteration,
+            ExcKind::OverflowError => PyErrorKind::OverflowError,
+            ExcKind::ArithmeticError => PyErrorKind::ArithmeticError,
+            ExcKind::ImportError => PyErrorKind::ImportError,
+            ExcKind::NotImplementedError => PyErrorKind::NotImplementedError,
+            ExcKind::AssertionError => PyErrorKind::AssertionError,
+            ExcKind::BaseException | ExcKind::Exception => PyErrorKind::RuntimeError,
+        }
+    }
 }
 
 impl std::fmt::Display for PyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.message)
+        let name = exc_kind_name(self.to_exc_kind());
+        write!(f, "{}: {}", name, self.message)
     }
 }

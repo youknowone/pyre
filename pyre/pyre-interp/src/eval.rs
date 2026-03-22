@@ -20,6 +20,48 @@ use pyre_runtime::{
 use crate::call::call_callable;
 use crate::frame::PyFrame;
 
+/// Try to dispatch an exception using the exception table or block stack.
+///
+/// Returns `true` if a handler was found (frame.next_instr updated to handler),
+/// `false` if the exception should propagate to the caller.
+pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
+    let code = unsafe { &*frame.code };
+    let pc = frame.next_instr.saturating_sub(1) as u32;
+
+    // Python 3.11+ exception table dispatch
+    if let Some(entry) = pyre_bytecode::bytecode::find_exception_handler(
+        &code.exceptiontable,
+        pc,
+    ) {
+        // Unwind stack to handler's expected depth
+        let target_depth = frame.nlocals() + frame.ncells() + entry.depth as usize;
+        while frame.valuestackdepth > target_depth {
+            frame.pop();
+        }
+        if entry.push_lasti {
+            frame.push(pyre_object::w_int_new(pc as i64));
+        }
+        // Push exception value as W_ExceptionObject
+        let exc_obj = err.to_exc_object();
+        frame.push(exc_obj);
+        frame.next_instr = entry.target as usize;
+        return true;
+    }
+
+    // Fallback: block_stack (old-style SETUP_FINALLY/SETUP_EXCEPT)
+    if let Some(block) = frame.block_stack.pop() {
+        while frame.valuestackdepth > block.level {
+            frame.pop();
+        }
+        let exc_obj = err.to_exc_object();
+        frame.push(exc_obj);
+        frame.next_instr = block.handler;
+        return true;
+    }
+
+    false
+}
+
 /// Execute a frame — pure interpreter, no JIT.
 pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     frame.fix_array_ptrs();
@@ -54,40 +96,7 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
             Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => return Ok(result),
             Err(err) => {
-                // CPython 3.13: use exception table to find handler
-                let pc = frame.next_instr.saturating_sub(1) as u32;
-                let entries = pyre_bytecode::bytecode::decode_exception_table(&code.exceptiontable);
-                let mut found_handler = false;
-                for entry in &entries {
-                    if pc >= entry.start && pc < entry.end {
-                        // Unwind stack to handler's expected depth
-                        let target_depth = frame.nlocals() + frame.ncells() + entry.depth as usize;
-                        while frame.valuestackdepth > target_depth {
-                            frame.pop();
-                        }
-                        // CPython: if push_lasti, push the instruction offset
-                        if entry.push_lasti {
-                            frame.push(pyre_object::w_int_new(pc as i64));
-                        }
-                        // Push exception value
-                        let exc_obj = pyre_object::w_str_new(&err.message);
-                        frame.push(exc_obj);
-                        frame.next_instr = entry.target as usize;
-                        found_handler = true;
-                        break;
-                    }
-                }
-                if found_handler {
-                    continue;
-                }
-                // Also try block_stack (fallback for old-style opcodes)
-                if let Some(block) = frame.block_stack.pop() {
-                    while frame.valuestackdepth > block.level {
-                        frame.pop();
-                    }
-                    let exc_obj = pyre_object::w_str_new(&err.message);
-                    frame.push(exc_obj);
-                    frame.next_instr = block.handler;
+                if handle_exception(frame, &err) {
                     continue;
                 }
                 return Err(err);
@@ -444,12 +453,16 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
         match argc {
-            0 => Err(PyError::type_error("no active exception to re-raise")),
+            0 => Err(PyError::runtime_error("no active exception to re-raise")),
             1 => {
                 let exc = self.pop();
-                // For Phase 1: treat the exception object as an error message
-                let _ = exc; // TODO: proper exception propagation
-                Err(PyError::type_error("exception raised"))
+                unsafe {
+                    if pyre_object::is_exception(exc) {
+                        Err(PyError::from_exc_object(exc))
+                    } else {
+                        Err(PyError::runtime_error("exceptions must derive from BaseException"))
+                    }
+                }
             }
             _ => Err(PyError::type_error("too many arguments for raise")),
         }
@@ -632,14 +645,28 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── CheckExcMatch ──
-    // CPython 3.13: TOS = exception type to match, TOS1 = caught exception
-    // Pops type, peeks exc, pushes bool
+    // TOS = exception type to match, TOS1 = caught exception
+    // Pops type, peeks exc, pushes bool result
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
         let exc_type = self.pop();
-        let _exc_value = self.peek();
-        // Phase 1: always match (proper isinstance needs exception type hierarchy)
-        let _ = exc_type;
-        self.push(pyre_object::w_bool_from(true));
+        let exc_value = self.peek();
+        let matched = unsafe {
+            if !pyre_object::is_exception(exc_value) {
+                true // not a proper exception object — match everything
+            } else {
+                let kind = pyre_object::w_exception_get_kind(exc_value);
+                if pyre_object::is_str(exc_type) {
+                    let type_name = pyre_object::w_str_get_value(exc_type);
+                    pyre_object::exc_kind_matches(kind, type_name)
+                } else if pyre_runtime::is_builtin_func(exc_type) {
+                    let type_name = pyre_runtime::w_builtin_func_name(exc_type);
+                    pyre_object::exc_kind_matches(kind, type_name)
+                } else {
+                    true
+                }
+            }
+        };
+        self.push(pyre_object::w_bool_from(matched));
         Ok(())
     }
 
@@ -653,18 +680,19 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── Reraise ──
     fn reraise(&mut self) -> Result<(), Self::Error> {
-        // CPython: pop exception values and re-raise
-        // In Phase 1: pop the exc value and return error
         let exc = self.pop();
         let _prev = self.pop(); // previous exc_info
-        let msg = unsafe {
-            if pyre_object::is_str(exc) {
-                pyre_object::w_str_get_value(exc).to_string()
+        unsafe {
+            if pyre_object::is_exception(exc) {
+                Err(PyError::from_exc_object(exc))
+            } else if pyre_object::is_str(exc) {
+                Err(PyError::runtime_error(
+                    pyre_object::w_str_get_value(exc).to_string(),
+                ))
             } else {
-                "exception re-raised".to_string()
+                Err(PyError::runtime_error("exception re-raised"))
             }
-        };
-        Err(PyError::type_error(msg))
+        }
     }
 
     // ── LoadFromDictOrGlobals ──

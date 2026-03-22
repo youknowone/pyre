@@ -118,6 +118,7 @@ run_bench       "inline_helper"  "$BENCH/inline_helper.py"      "333333333333000
 run_bench       "fib_recursive"  "$BENCH/fib_recursive.py"      "2178309"                     30       ""       3
 run_bench       "nbody"          "$BENCH/nbody_50k.py"          "-0.035132020348426815"        30       ""       8
 run_bench       "fannkuch"       "$BENCH/fannkuch_9.py"         "$(printf '8629\n30')"          30
+run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"   "1142858"                       30
 
 echo ""
 
