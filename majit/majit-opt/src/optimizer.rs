@@ -1712,6 +1712,7 @@ impl Optimizer {
             .collect();
 
         // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
+        // Bridge path: no runtime_boxes available (RPython passes None)
         let opt_unroll = crate::unroll::OptUnroll::new();
         let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
@@ -1720,6 +1721,7 @@ impl Optimizer {
             self,
             &mut ctx,
             false,
+            None, // runtime_boxes
         );
 
         if vs.is_none() {
@@ -1752,7 +1754,8 @@ impl Optimizer {
             front_target_tokens,
             self,
             &mut ctx,
-            true, // force_boxes
+            true,  // force_boxes
+            None,  // runtime_boxes
         );
 
         if vs2.is_none() {
