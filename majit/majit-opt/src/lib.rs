@@ -105,6 +105,11 @@ pub struct OptContext {
     pub constants: Vec<Option<Value>>,
     /// Forwarding chain: maps old OpRef to replacement OpRef.
     pub forwarding: Vec<OpRef>,
+    /// RPython Box identity parity: positions marked as import-frozen
+    /// return their DIRECT forwarding target (1-hop) in get_replacement,
+    /// without following further chains. This prevents import_state's
+    /// forwarding from accidentally chaining through shared OpRef slots.
+    import_frozen: std::collections::HashSet<u32>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -245,6 +250,7 @@ impl OptContext {
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
+            import_frozen: std::collections::HashSet::new(),
         }
     }
 
@@ -284,6 +290,7 @@ impl OptContext {
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
+            import_frozen: std::collections::HashSet::new(),
         }
     }
 
@@ -634,8 +641,16 @@ impl OptContext {
         self.forwarding[idx] = new;
     }
 
+    /// Mark a position as import-frozen: get_replacement returns its
+    /// direct forwarding target (1-hop) without following further chains.
+    pub fn freeze_import(&mut self, opref: OpRef) {
+        self.import_frozen.insert(opref.0);
+    }
+
     /// Follow the forwarding chain to get the current replacement for `opref`.
+    /// Import-frozen positions stop after 1 hop (RPython Box identity parity).
     pub fn get_replacement(&self, mut opref: OpRef) -> OpRef {
+        let mut first = true;
         loop {
             let idx = opref.0 as usize;
             if idx >= self.forwarding.len() {
@@ -645,6 +660,11 @@ impl OptContext {
             if next.is_none() {
                 return opref;
             }
+            // Import-frozen: return the direct target without chaining.
+            if first && self.import_frozen.contains(&(idx as u32)) {
+                return next;
+            }
+            first = false;
             opref = next;
         }
     }

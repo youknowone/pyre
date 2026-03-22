@@ -1369,10 +1369,22 @@ impl OptUnroll {
         );
 
         // unroll.py:483-490: source.set_forwarded(target); setinfo_from_preamble
+        //
+        // RPython Box identity parity: set_forwarded(target) only affects
+        // the source Box. In majit's flat forwarding table, setting
+        // forwarding[4]=OpRef(5) then forwarding[5]=OpRef(20) creates a
+        // chain 4→5→20. RPython avoids this because v5_box never has
+        // set_forwarded called on it — only targetargs[4] does.
+        //
+        // Fix: mark targetarg positions as "import-frozen". When
+        // get_replacement encounters a frozen position, it returns the
+        // DIRECT forwarding target (1-hop) without further chain following.
+        // This emulates RPython's Box identity where each source has
+        // independent forwarding.
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
             ctx.replace_op(source, *target);
-            // unroll.py:487: info = exported_state.exported_infos.get(target, None)
+            ctx.freeze_import(source);
             if let Some(info) = exported_state.exported_infos.get(target) {
                 self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
             }
