@@ -2959,14 +2959,33 @@ impl<M: Clone> MetaInterp<M> {
         let optimized_ops = if ends_with_jump {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             if compiled.front_target_tokens.len() > 1 {
-                // Multiple target_tokens → try to match body
+                // RPython optimize_bridge (unroll.py:201-212):
+                // flush + force_box_for_end_of_preamble + jump_to_existing_trace
                 let jump_args = optimized_ops
                     .last()
                     .unwrap()
                     .args
                     .to_vec();
-                let final_ni = optimizer.final_num_inputs();
-                let mut jump_ctx = majit_opt::OptContext::with_num_inputs(32, final_ni);
+                // Use the optimizer's final context (carries forwarding,
+                // ptr_info, etc. from the optimization pass).
+                let mut jump_ctx = optimizer
+                    .final_ctx
+                    .take()
+                    .unwrap_or_else(|| {
+                        let ni = optimizer.final_num_inputs();
+                        majit_opt::OptContext::with_num_inputs(32, ni)
+                    });
+                // RPython line 203: self.flush()
+                optimizer.flush(&mut jump_ctx);
+                // RPython line 204-205: force_box_for_end_of_preamble
+                for &arg in &jump_args {
+                    let _ = optimizer.force_box_for_end_of_preamble(arg, &mut jump_ctx);
+                }
+                // Resolve JUMP args after forcing
+                let jump_args: Vec<_> = jump_args
+                    .iter()
+                    .map(|&a| jump_ctx.get_replacement(a))
+                    .collect();
                 let opt_unroll = majit_opt::unroll::OptUnroll::new();
                 if crate::majit_log_enabled() {
                     eprintln!("[jit] bridge: calling jump_to_existing_trace with {} args, {} tokens",
@@ -2974,23 +2993,46 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 let vs = opt_unroll.jump_to_existing_trace(
                     &jump_args,
-                    None, // no label_args for bridges
+                    None, // no label_args for bridges (RPython line 207)
                     &mut compiled.front_target_tokens,
                     &mut optimizer,
                     &mut jump_ctx,
                     false,
                 );
                 if vs.is_none() {
-                    // Matched — JUMP was redirected. Collect the new ops.
+                    // RPython line 212: matched → JUMP redirected
                     let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
                     result.extend(jump_ctx.new_operations.drain(..));
                     if crate::majit_log_enabled() {
-                        eprintln!("[jit] bridge: jump_to_existing_trace matched");
+                        eprintln!("[jit] bridge: jump_to_existing_trace matched, {} extra ops",
+                            result.len() - (optimized_ops.len() - 1));
                     }
                     result
                 } else {
-                    // No match — fall through to Finish path below
-                    optimized_ops
+                    // No match — try force_boxes=true (RPython line 220-223)
+                    jump_ctx.clear_newoperations();
+                    let vs2 = opt_unroll.jump_to_existing_trace(
+                        &jump_args,
+                        None,
+                        &mut compiled.front_target_tokens,
+                        &mut optimizer,
+                        &mut jump_ctx,
+                        true, // force_boxes
+                    );
+                    if vs2.is_none() {
+                        let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+                        result.extend(jump_ctx.new_operations.drain(..));
+                        if crate::majit_log_enabled() {
+                            eprintln!("[jit] bridge: jump_to_existing_trace matched (forced)");
+                        }
+                        result
+                    } else {
+                        // RPython line 228: jump_to_preamble fallback
+                        if crate::majit_log_enabled() {
+                            eprintln!("[jit] bridge: jump_to_existing_trace failed, using Finish");
+                        }
+                        optimized_ops
+                    }
                 }
             } else {
                 optimized_ops
