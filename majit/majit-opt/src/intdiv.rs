@@ -17,7 +17,6 @@ use crate::OptContext;
 pub fn magic_numbers(m: i64) -> (u64, u32) {
     debug_assert!(m >= 3);
     debug_assert!(m & (m - 1) != 0, "m must not be a power of two");
-    debug_assert!(m == m as i64, "m must fit in signed i64"); // always true
 
     let m_u = m as u64;
 
@@ -344,18 +343,21 @@ mod tests {
 
     #[test]
     #[should_panic]
+    #[cfg(debug_assertions)]
     fn test_magic_numbers_panics_for_power_of_two() {
         magic_numbers(4);
     }
 
     #[test]
     #[should_panic]
+    #[cfg(debug_assertions)]
     fn test_magic_numbers_panics_for_two() {
         magic_numbers(2);
     }
 
     #[test]
     #[should_panic]
+    #[cfg(debug_assertions)]
     fn test_magic_numbers_panics_for_one() {
         magic_numbers(1);
     }
