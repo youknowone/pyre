@@ -4,6 +4,7 @@ edition = "2024"
 
 [workspace]
 resolver = "2"
+default-members = ["pyre/pyrex"]
 members = [
     # majit
     "majit/majit",

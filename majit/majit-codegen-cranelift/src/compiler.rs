@@ -3442,13 +3442,48 @@ fn emit_indirect_call_from_parts(
     }
 }
 
-/// Emit a guard side-exit: store fail args to outputs_ptr and return fail_index.
+/// Emit a guard side-exit: execute pending field stores, then store fail args
+/// to outputs_ptr and return fail_index.
+///
+/// rd_pendingfields: deferred SETFIELD_GC / SETARRAYITEM_GC where the value
+/// was virtual at optimization time.  On guard failure the virtual has been
+/// materialized into fail_args, so we write the field value to memory here
+/// — before the trampoline returns — making heap state consistent for the
+/// interpreter.
 fn emit_guard_exit(
     builder: &mut FunctionBuilder,
     constants: &HashMap<u32, i64>,
     outputs_ptr: CValue,
     info: &GuardInfo,
 ) {
+    // rd_pendingfields: emit deferred stores before saving fail_args.
+    for ps in &info.pending_stores {
+        let struct_ptr = resolve_opref(builder, constants, ps.target_ref);
+        let value = resolve_opref(builder, constants, ps.value_ref);
+        let addr = builder.ins().iadd_imm(struct_ptr, ps.field_offset as i64);
+        match ps.field_type {
+            Type::Float => {
+                let fval = builder.ins().bitcast(cl_types::F64, MemFlags::new(), value);
+                builder.ins().store(MemFlags::trusted(), fval, addr, 0);
+            }
+            Type::Int | Type::Ref => {
+                let mem_ty = match ps.field_size {
+                    1 => cl_types::I8,
+                    2 => cl_types::I16,
+                    4 => cl_types::I32,
+                    _ => cl_types::I64,
+                };
+                let store_val = if mem_ty == cl_types::I64 {
+                    value
+                } else {
+                    builder.ins().ireduce(mem_ty, value)
+                };
+                builder.ins().store(MemFlags::trusted(), store_val, addr, 0);
+            }
+            Type::Void => {}
+        }
+    }
+
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
         let val = resolve_opref(builder, constants, arg_ref);
         let offset = (slot as i32) * 8;
@@ -3631,9 +3666,27 @@ fn run_compiled_code(
     (fail_index, outputs, handle, force_frame)
 }
 
+/// Deferred field store to emit in the guard exit block.
+/// resume.py: rd_pendingfields — materialized as native stores before
+/// the guard failure trampoline returns.
+struct GuardPendingStore {
+    /// OpRef of the struct/array pointer.
+    target_ref: OpRef,
+    /// OpRef of the value to store.
+    value_ref: OpRef,
+    /// Byte offset into the struct.
+    field_offset: usize,
+    /// Size of the field in bytes.
+    field_size: usize,
+    /// Type of the stored value.
+    field_type: Type,
+}
+
 struct GuardInfo {
     fail_index: u32,
     fail_arg_refs: Vec<OpRef>,
+    /// Deferred heap writes to execute in the guard exit block.
+    pending_stores: Vec<GuardPendingStore>,
 }
 
 fn identity_recovery_layout(
@@ -7659,6 +7712,34 @@ fn collect_guards(
                 }
             }
         }
+        // rd_pendingfields: encode pending field layouts into recovery metadata.
+        if let Some(ref entries) = op.rd_pendingfields {
+            for entry in entries {
+                let target = fail_arg_refs
+                    .iter()
+                    .position(|&a| a == entry.target)
+                    .map(ExitValueSourceLayout::ExitValue)
+                    .unwrap_or(ExitValueSourceLayout::Constant(entry.target.0 as i64));
+                let value = fail_arg_refs
+                    .iter()
+                    .position(|&a| a == entry.value)
+                    .map(ExitValueSourceLayout::ExitValue)
+                    .unwrap_or(ExitValueSourceLayout::Constant(entry.value.0 as i64));
+                recovery_layout
+                    .pending_field_layouts
+                    .push(majit_codegen::ExitPendingFieldLayout {
+                        descr_index: entry.descr_index,
+                        item_index: if entry.item_index >= 0 {
+                            Some(entry.item_index as usize)
+                        } else {
+                            None
+                        },
+                        is_array_item: entry.item_index >= 0,
+                        target,
+                        value,
+                    });
+            }
+        }
         let recovery_layout = Some(recovery_layout);
         let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
             fail_index,
@@ -7671,9 +7752,29 @@ fn collect_guards(
         descr.set_source_op_index(op_idx);
         let descr = Arc::new(descr);
         fail_descrs.push(descr);
+
+        // rd_pendingfields: collect deferred heap writes for guard exit emission.
+        let pending_stores = op
+            .rd_pendingfields
+            .as_ref()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| GuardPendingStore {
+                        target_ref: entry.target,
+                        value_ref: entry.value,
+                        field_offset: entry.field_offset,
+                        field_size: entry.field_size,
+                        field_type: entry.field_type,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         guard_infos.push(GuardInfo {
             fail_index,
             fail_arg_refs,
+            pending_stores,
         });
     }
 

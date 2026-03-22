@@ -1745,6 +1745,22 @@ impl Optimizer {
                                 } else {
                                     (pf_op.arg(0), pf_op.arg(1), -1i32)
                                 };
+                            // Extract field layout from the descriptor for backend
+                            // store emission on guard failure.
+                            let (field_offset, field_size, field_type) =
+                                if let Some(ref descr) = pf_op.descr {
+                                    if let Some(fd) = descr.as_field_descr() {
+                                        (fd.offset(), fd.field_size(), fd.field_type())
+                                    } else if let Some(ad) = descr.as_array_descr() {
+                                        let offset = ad.base_size()
+                                            + (item_index.max(0) as usize) * ad.item_size();
+                                        (offset, ad.item_size(), ad.item_type())
+                                    } else {
+                                        (0, 8, majit_ir::Type::Int)
+                                    }
+                                } else {
+                                    (0, 8, majit_ir::Type::Int)
+                                };
                             majit_ir::GuardPendingFieldEntry {
                                 descr_index: pf_op
                                     .descr
@@ -1753,6 +1769,9 @@ impl Optimizer {
                                 item_index,
                                 target: ctx.get_replacement(target),
                                 value: ctx.get_replacement(value),
+                                field_offset,
+                                field_size,
+                                field_type,
                             }
                         })
                         .collect(),

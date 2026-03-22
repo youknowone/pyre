@@ -53,6 +53,13 @@ pub struct GuardPendingFieldEntry {
     pub target: OpRef,
     /// OpRef of the value being stored (virtual — encoded via rd_virtuals).
     pub value: OpRef,
+    /// Byte offset of the field on the struct (from FieldDescr/ArrayDescr).
+    /// For array items: base_size + item_index * item_size (precomputed).
+    pub field_offset: usize,
+    /// Size of the field in bytes.
+    pub field_size: usize,
+    /// Type of the stored value.
+    pub field_type: Type,
 }
 
 /// A single IR operation.

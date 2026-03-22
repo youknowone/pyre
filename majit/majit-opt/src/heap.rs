@@ -325,12 +325,13 @@ impl OptHeap {
                 pendingfields.push(op);
                 continue;
             }
+            // heap.py:614-616: virtualizable fields are deferred to
+            // rd_pendingfields instead of force-emitted, since the backend
+            // materializes them on guard failure.
+            // TODO: re-enable virtualizable deferral when guard exit pending
+            // stores don't cause icache pressure (shared trampoline needed).
+            // For now, force all lazy sets at guards (SetfieldGc emitted).
             // heap.py:621: cf.force_lazy_set(self, descr) — emit
-            // NOTE: virtualizable fields are also force-emitted here.
-            // RPython defers them to rd_pendingfields, but majit's backend
-            // does not yet materialize rd_pendingfields on guard failure.
-            // TODO: implement rd_pendingfields in backend, then re-add
-            // virtualizable deferral for fewer SetfieldGc emissions.
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
