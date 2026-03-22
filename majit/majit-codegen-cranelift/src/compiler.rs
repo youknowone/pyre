@@ -2084,6 +2084,7 @@ fn compile_base_case_bridge(
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
         needs_force_frame: compiled.needs_force_frame,
+        loop_reentry: false,
     });
 
     true
@@ -7990,6 +7991,7 @@ impl majit_codegen::Backend for CraneliftBackend {
             num_ref_roots: compiled.num_ref_roots,
             max_output_slots: compiled.max_output_slots,
             needs_force_frame: compiled.needs_force_frame,
+            loop_reentry: false,
         });
 
         Ok(info)
