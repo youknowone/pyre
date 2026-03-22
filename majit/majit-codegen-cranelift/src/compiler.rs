@@ -2425,8 +2425,25 @@ extern "C" fn call_assembler_shim(
     // the guard failure point instead of re-executing from scratch.
     let fail_index = descr.fail_index();
     let fail_types = descr.fail_arg_types();
+    // Read raw i64 values regardless of type — blackhole needs raw values,
+    // not type-checked ones. Ref/Float values are valid as raw i64.
     let fail_values: Vec<i64> = (0..fail_types.len())
-        .map(|i| get_int_from_deadframe(&frame, i).unwrap_or(0))
+        .map(|i| {
+            match fail_types[i] {
+                Type::Int => get_int_from_deadframe(&frame, i).unwrap_or(0),
+                Type::Float => {
+                    get_float_from_deadframe(&frame, i)
+                        .map(|f| f.to_bits() as i64)
+                        .unwrap_or(0)
+                }
+                Type::Ref => {
+                    get_ref_from_deadframe(&frame, i)
+                        .map(|r| r.as_usize() as i64)
+                        .unwrap_or(0)
+                }
+                Type::Void => 0,
+            }
+        })
         .collect();
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         if let Some(result) = bh_fn(
