@@ -733,24 +733,6 @@ impl OptHeap {
         let (obj, field_idx) = key;
         let new_value = op.arg(1);
 
-        // RPython parity: immutable field SetfieldGc (e.g. ob_type, intval
-        // in constructor) must not be deferred. force_virtual_instance emits
-        // New + SetfieldGc, and the SetfieldGc must complete before ANY call
-        // that uses the object. Lazy deferral causes the object to be used
-        // uninitialized in frame helpers.
-        let is_immutable = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_field_descr())
-            .is_some_and(|fd| fd.is_immutable());
-        if is_immutable {
-            self.cached_fields.insert(key, new_value);
-            if let Some(info) = ctx.get_ptr_info_mut(ctx.get_replacement(obj)) {
-                info.set_field(field_idx, new_value);
-            }
-            return OptimizationResult::Emit(op.clone());
-        }
-
         // The stored value escapes (it becomes reachable via the heap).
         self.unescaped.remove(&new_value);
 
