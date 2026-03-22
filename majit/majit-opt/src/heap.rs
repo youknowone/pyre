@@ -1142,6 +1142,45 @@ impl Optimization for OptHeap {
                 OptimizationResult::PassOn
             }
 
+            // RPython heap.py: CALL_ASSEMBLER — force all lazy sets before
+            // the call. The callee reads from the allocated objects passed
+            // in the args array; any pending SetfieldGc must be flushed to
+            // memory before execution transfers to the callee.
+            //
+            // Unlike force_all_lazy_setfields (which mirrors RPython's
+            // emit_extra(emit=False) and drops non-virtualizable ops),
+            // CALL_ASSEMBLER REQUIRES the SetfieldGc ops to reach the
+            // compiled code so that forced-virtual objects have their
+            // fields initialized before the callee reads them.
+            OpCode::CallAssemblerI
+            | OpCode::CallAssemblerR
+            | OpCode::CallAssemblerF
+            | OpCode::CallAssemblerN => {
+                self.mark_args_escaped(op);
+                // Emit ALL pending lazy setfields — unlike the generic
+                // force_all_lazy which drops non-vable ops, we must emit
+                // them so the callee sees initialized memory.
+                let pending_fields: Vec<(FieldKey, Op)> =
+                    self.lazy_setfields.drain().collect();
+                for ((_obj, _field_idx), mut set_op) in pending_fields {
+                    for arg in set_op.args.iter_mut() {
+                        *arg = ctx.get_replacement(*arg);
+                    }
+                    ctx.emit(set_op);
+                }
+                let pending_items: Vec<(ArrayItemKey, Op)> =
+                    self.lazy_setarrayitems.drain().collect();
+                for ((_obj, _descr_idx, _index), mut set_op) in pending_items {
+                    for arg in set_op.args.iter_mut() {
+                        *arg = ctx.get_replacement(*arg);
+                    }
+                    ctx.emit(set_op);
+                }
+                self.invalidate_caches();
+                self.last_call_did_not_raise = false;
+                return OptimizationResult::Emit(op.clone());
+            }
+
             // ── heap.py: CALL_MAY_FORCE — postpone until GUARD_NOT_FORCED ──
             // These calls may force virtualizable objects, so we defer emission
             // until the guard arrives, ensuring correct exception semantics.
