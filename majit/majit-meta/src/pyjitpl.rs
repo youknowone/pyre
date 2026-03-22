@@ -2845,7 +2845,18 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         let mut recorder = ctx.recorder;
-        recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
+        // RPython parity: if the target loop has compiled target_tokens,
+        // close with JUMP (so optimize_bridge can jump_to_existing_trace).
+        // Otherwise fall back to Finish.
+        let has_targets = self
+            .compiled_loops
+            .get(&green_key)
+            .map_or(false, |c| !c.front_target_tokens.is_empty());
+        if has_targets {
+            recorder.close_loop(finish_args);
+        } else {
+            recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
+        }
         let trace = recorder.get_trace();
 
         let constants = ctx.constants.into_inner();
@@ -2934,6 +2945,59 @@ impl<M: Clone> MetaInterp<M> {
             &mut constants,
             bridge_inputargs.len(),
         );
+
+        // RPython optimize_bridge: if trace ends with JUMP, try
+        // jump_to_existing_trace to redirect into loop body.
+        let ends_with_jump = optimized_ops
+            .last()
+            .map_or(false, |op| op.opcode == majit_ir::OpCode::Jump);
+        if crate::majit_log_enabled() {
+            let tt_count = self.compiled_loops.get(&green_key)
+                .map_or(0, |c| c.front_target_tokens.len());
+            eprintln!("[jit] compile_bridge: ends_with_jump={ends_with_jump} target_tokens={tt_count}");
+        }
+        let optimized_ops = if ends_with_jump {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            if compiled.front_target_tokens.len() > 1 {
+                // Multiple target_tokens → try to match body
+                let jump_args = optimized_ops
+                    .last()
+                    .unwrap()
+                    .args
+                    .to_vec();
+                let final_ni = optimizer.final_num_inputs();
+                let mut jump_ctx = majit_opt::OptContext::with_num_inputs(32, final_ni);
+                let opt_unroll = majit_opt::unroll::OptUnroll::new();
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit] bridge: calling jump_to_existing_trace with {} args, {} tokens",
+                        jump_args.len(), compiled.front_target_tokens.len());
+                }
+                let vs = opt_unroll.jump_to_existing_trace(
+                    &jump_args,
+                    None, // no label_args for bridges
+                    &mut compiled.front_target_tokens,
+                    &mut optimizer,
+                    &mut jump_ctx,
+                    false,
+                );
+                if vs.is_none() {
+                    // Matched — JUMP was redirected. Collect the new ops.
+                    let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+                    result.extend(jump_ctx.new_operations.drain(..));
+                    if crate::majit_log_enabled() {
+                        eprintln!("[jit] bridge: jump_to_existing_trace matched");
+                    }
+                    result
+                } else {
+                    // No match — fall through to Finish path below
+                    optimized_ops
+                }
+            } else {
+                optimized_ops
+            }
+        } else {
+            optimized_ops
+        };
 
         // RPython parity: unbox the Finish result in bridges too.
         // Without this, bridges return boxed pointers while the caller
