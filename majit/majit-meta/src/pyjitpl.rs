@@ -2991,19 +2991,48 @@ impl<M: Clone> MetaInterp<M> {
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
         let retraced_count = compiled.retraced_count;
         let retrace_limit = 0u32;
-        // bridgeopt.py: retrieve optimizer knowledge from the source trace.
-        // The knowledge captures heap cache state at the guard point, so the
-        // bridge optimizer can start with cached field values.
+        // bridgeopt.py: retrieve optimizer knowledge from the source trace
+        // and remap OpRefs from the source trace's numbering to the bridge's
+        // inputarg numbering. The bridge inputargs correspond to the guard's
+        // fail_args in order, so source_opref → bridge_inputarg_index.
         let bridge_knowledge: Option<Vec<(majit_ir::OpRef, u32, majit_ir::OpRef)>> = {
             let source_trace_id = {
                 let tid = fail_descr.trace_id();
                 if tid == 0 { compiled.root_trace_id } else { tid }
             };
-            compiled
-                .traces
-                .get(&source_trace_id)
-                .map(|t| t.optimizer_knowledge.clone())
-                .filter(|k| !k.is_empty())
+            compiled.traces.get(&source_trace_id).and_then(|trace| {
+                if trace.optimizer_knowledge.is_empty() {
+                    return None;
+                }
+                // Build mapping: source_trace_opref → bridge_inputarg_index.
+                // The guard's fail_args list which source-trace OpRefs are
+                // saved; the bridge's inputargs are OpRef(0..n) in that order.
+                let guard_op_idx = trace.guard_op_indices.get(&fail_index)?;
+                let guard_op = trace.ops.get(*guard_op_idx)?;
+                let fail_args = guard_op.fail_args.as_ref()?;
+                let mut remap: HashMap<majit_ir::OpRef, majit_ir::OpRef> = HashMap::new();
+                for (i, &src_ref) in fail_args.iter().enumerate() {
+                    if !src_ref.is_none() {
+                        remap.insert(src_ref, majit_ir::OpRef(i as u32));
+                    }
+                }
+                // Also map constants: they keep their original OpRef
+                // (constants are in the bridge's constant pool too).
+                for (&idx, _) in trace.constants.iter() {
+                    let opref = majit_ir::OpRef(idx);
+                    remap.entry(opref).or_insert(opref);
+                }
+                let remapped: Vec<_> = trace
+                    .optimizer_knowledge
+                    .iter()
+                    .filter_map(|&(obj, field_idx, val)| {
+                        let new_obj = remap.get(&obj)?;
+                        let new_val = remap.get(&val)?;
+                        Some((*new_obj, field_idx, *new_val))
+                    })
+                    .collect();
+                if remapped.is_empty() { None } else { Some(remapped) }
+            })
         };
         let (optimized_ops, retrace_requested) = optimizer.optimize_bridge(
             bridge_ops,

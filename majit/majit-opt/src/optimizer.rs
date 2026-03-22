@@ -89,6 +89,9 @@ pub struct Optimizer {
     pub terminal_op: Option<Op>,
     /// Preserved final context after optimization, for jump_to_existing_trace.
     pub final_ctx: Option<OptContext>,
+    /// bridgeopt.py: pending bridge knowledge to apply after setup().
+    /// Stored here so it survives the setup() clear in optimize_with_constants_and_inputs.
+    pending_bridge_knowledge: Option<Vec<(OpRef, u32, OpRef)>>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -591,6 +594,7 @@ impl Optimizer {
             skip_flush: false,
             terminal_op: None,
             final_ctx: None,
+            pending_bridge_knowledge: None,
         }
     }
 
@@ -1200,6 +1204,22 @@ impl Optimizer {
             pass.setup();
         }
 
+        // bridgeopt.py:124-185: apply pending bridge knowledge AFTER setup.
+        // RPython calls deserialize_optimizer_knowledge before propagate_all_forward
+        // but after the optimizer is constructed (setup already done at __init__).
+        if let Some(knowledge) = self.pending_bridge_knowledge.take() {
+            // heap.py:870-894: deserialize_optheap — import into passes AND
+            // set PtrInfo fields so other passes see the cached values.
+            self.deserialize_optimizer_knowledge(&knowledge);
+            for &(obj, field_idx, val) in &knowledge {
+                if !obj.is_none() && !val.is_none() {
+                    if let Some(info) = ctx.get_ptr_info_mut(obj) {
+                        info.set_field(field_idx, val);
+                    }
+                }
+            }
+        }
+
         // optimizer.py: inject call_pure_results into OptPure so it can
         // constant-fold repeated pure calls across loop iterations.
         if !self.call_pure_results.is_empty() {
@@ -1691,11 +1711,10 @@ impl Optimizer {
         bridge_knowledge: Option<&[(OpRef, u32, OpRef)]>,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
-        // Pre-populate the optimizer's heap cache with knowledge from
-        // the guard's resume data, so the bridge optimizer starts with
-        // the same field values the original loop had at the guard point.
+        // Store as pending — setup() inside optimize_with_constants_and_inputs
+        // clears pass state, so we apply AFTER setup.
         if let Some(knowledge) = bridge_knowledge {
-            self.deserialize_optimizer_knowledge(knowledge);
+            self.pending_bridge_knowledge = Some(knowledge.to_vec());
         }
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
         let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
