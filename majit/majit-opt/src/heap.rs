@@ -325,29 +325,29 @@ impl OptHeap {
                 Some(info) if info.is_virtual()
             );
             if is_virtual {
-                // heap.py:619: pendingfields.append(op)
+                // heap.py:618-619: virtual value → pendingfields
                 pendingfields.push(op);
                 continue;
             }
-            // RPython parity (heap.py:614-616): virtualizable fields deferred
-            // to rd_pendingfields. Materialized via materialize_pending_fields
-            // in jitdriver.rs on guard failure.
-            let is_vable = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
-            if is_vable {
-                for arg in op.args.iter_mut() {
-                    *arg = ctx.get_replacement(*arg);
-                }
-                pendingfields.push(op);
-                continue;
-            }
-            // heap.py:621: cf.force_lazy_set(self, descr) — emit
+            // heap.py:621: cf.force_lazy_set(self, descr) →
+            // emit_extra(op, emit=False) routes through downstream passes
+            // (skipping heap to avoid re-absorption), then
+            // put_field_back_to_info() restores the cache.
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
+            let (obj, field_idx) = key;
             let final_value = op.arg(1);
             self.remember_field_descr(key, &op);
-            ctx.emit(op);
+            // emit_extra(op, emit=False): route through passes after heap.
+            ctx.emit_through_passes_after(ctx.current_pass_idx, op);
+            // put_field_back_to_info: restore cached value in both
+            // the flat HashMap and the per-object PtrInfo.
             self.cached_fields.insert(key, final_value);
+            let obj_resolved = ctx.get_replacement(obj);
+            if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
+                info.set_field(field_idx, final_value);
+            }
         }
 
         // heap.py:622-636: iterate cached array items

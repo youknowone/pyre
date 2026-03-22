@@ -119,6 +119,11 @@ pub struct OptContext {
     /// these through the remaining downstream passes, matching RPython
     /// send_extra_operation()/emit_operation behavior.
     extra_operations: VecDeque<Op>,
+    /// RPython emit_extra(op, emit=False) parity: ops queued to be
+    /// processed starting from a specific pass index (skipping earlier passes).
+    /// Used by heap's force_lazy_set to route ops through remaining passes
+    /// without re-entering the heap pass itself.
+    pub(crate) extra_operations_after: VecDeque<(usize, Op)>,
     /// info.py: per-OpRef pointer info, shared across all passes.
     ///
     /// RPython attaches info objects directly to operations via
@@ -198,6 +203,11 @@ pub struct OptContext {
     /// RPython unroll.py relies on this distinction so virtualize can keep
     /// body-side allocations concrete when guard recovery cannot rebuild them.
     pub skip_flush_mode: bool,
+    /// Index of the pass currently executing propagate_forward.
+    /// Used by passes to call send_extra_operation_after(self_idx, ..)
+    /// matching RPython's emit_extra(op, emit=False) which routes to
+    /// self.next_optimization.
+    pub current_pass_idx: usize,
     /// Field OpRefs of virtual args before force. Maps virtual OpRef →
     /// [(field_idx, field_value_ref)]. Used by make_inputargs to flatten
     /// virtuals into label args after force has destroyed PtrInfo.
@@ -222,6 +232,7 @@ impl OptContext {
             num_inputs: 0,
             next_pos: 0,
             extra_operations: VecDeque::new(),
+            extra_operations_after: VecDeque::new(),
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
@@ -247,6 +258,7 @@ impl OptContext {
             pre_force_jump_args: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            current_pass_idx: 0,
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
@@ -262,6 +274,7 @@ impl OptContext {
             num_inputs: num_inputs as u32,
             next_pos: num_inputs as u32,
             extra_operations: VecDeque::new(),
+            extra_operations_after: VecDeque::new(),
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
@@ -287,6 +300,7 @@ impl OptContext {
             pre_force_jump_args: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            current_pass_idx: 0,
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
@@ -352,6 +366,21 @@ impl OptContext {
         }
         let pos_ref = op.pos;
         self.extra_operations.push_back(op);
+        pos_ref
+    }
+
+    /// RPython emit_extra(op, emit=False) parity: queue an operation to
+    /// be processed through passes AFTER the calling pass. Skips earlier
+    /// passes (including the caller) to avoid re-absorption loops.
+    /// `after_pass_idx`: index of the calling pass (op starts from idx+1).
+    pub fn emit_through_passes_after(&mut self, after_pass_idx: usize, mut op: Op) -> OpRef {
+        if op.pos.is_none() {
+            op.pos = self.reserve_pos();
+        } else {
+            self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
+        }
+        let pos_ref = op.pos;
+        self.extra_operations_after.push_back((after_pass_idx + 1, op));
         pos_ref
     }
 
