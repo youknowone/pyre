@@ -1548,6 +1548,16 @@ impl Optimization for OptHeap {
             .collect()
     }
 
+    /// heap.py:870-890: deserialize_optheap — restore cached field
+    /// knowledge from the preamble into Phase 2's heap cache.
+    fn import_cached_fields(&mut self, entries: &[(OpRef, u32, OpRef)]) {
+        for &(obj, descr_idx, val) in entries {
+            if !obj.is_none() && !val.is_none() {
+                self.cached_fields.insert((obj, descr_idx), val);
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]

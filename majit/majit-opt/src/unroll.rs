@@ -54,7 +54,7 @@ impl UnrollOptimizer {
             short_preamble: None,
             target_tokens: Vec::new(),
             retraced_count: 0,
-            retrace_limit: 5,
+            retrace_limit: 0,
             max_retrace_guards: 15,
         }
     }
@@ -234,6 +234,13 @@ impl UnrollOptimizer {
         opt_p2.skip_flush = true;
         // Phase 2: don't virtualize New() — guard recovery_layout not populated.
         opt_p2.set_phase2(true);
+        // heap.py:870: deserialize_optheap — import preamble heap cache.
+        // TODO: enabled once OpRef remapping for Phase 2 context is implemented.
+        // Currently causes performance regression (stale cache entries from
+        // Phase 1 OpRef namespace conflict with Phase 2 values).
+        // if !exported_state.preamble_heap_cache.is_empty() {
+        //     opt_p2.import_all_cached_fields(&exported_state.preamble_heap_cache);
+        // }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();

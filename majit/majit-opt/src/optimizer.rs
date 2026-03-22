@@ -823,6 +823,13 @@ impl Optimizer {
         result
     }
 
+    /// heap.py: deserialize_optheap — import preamble heap cache into Phase 2.
+    pub fn import_all_cached_fields(&mut self, entries: &[(OpRef, u32, OpRef)]) {
+        for pass in &mut self.passes {
+            pass.import_cached_fields(entries);
+        }
+    }
+
     /// Flush only virtualizable lazy SetfieldGc ops from the heap pass.
     /// Called before JUMP in Phase 2 (skip_flush=true) so compiled code
     /// writes head/size to memory for guard failure recovery.
