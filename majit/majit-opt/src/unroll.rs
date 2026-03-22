@@ -612,6 +612,10 @@ pub struct ExportedState {
     pub preamble_heap_cache: Vec<(OpRef, u32, OpRef)>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::virtualstate::VirtualState,
+    /// Pre-force JUMP args from Phase 1. These are the JUMP args BEFORE
+    /// force_box_for_end_of_preamble destroyed virtuals. Used by import_state
+    /// to match pre_force_field_refs keys to Phase 2 inputarg positions.
+    pub pre_force_args: Vec<OpRef>,
     /// Pre-force virtual field refs from Phase 1.
     /// Needed by import_state to reconstruct PtrInfo::Virtual for
     /// make_inputargs before virtual args are force-materialized.
@@ -743,6 +747,7 @@ impl ExportedState {
             short_preamble: None,
             renamed_inputargs,
             short_inputargs,
+            pre_force_args: Vec::new(),
             pre_force_field_refs: HashMap::new(),
         }
     }
@@ -1044,6 +1049,9 @@ impl OptUnroll {
         // Carry pre-force field refs so Phase 2 can reconstruct
         // PtrInfo::Virtual for make_inputargs.
         es.pre_force_field_refs = ctx.pre_force_field_refs.clone();
+        // Store pre-force JUMP args so import_state can match
+        // pre_force_field_refs keys to Phase 2 inputarg positions.
+        es.pre_force_args = ctx.pre_force_jump_args.clone().unwrap_or_default();
         es
     }
 
@@ -1386,17 +1394,27 @@ impl OptUnroll {
         }
 
         // Carry pre-force field refs from Phase 1 to Phase 2 ctx.
-        // make_inputargs uses these to get virtual field values.
+        // Match pre_force_field_refs keys against pre_force_args (the JUMP
+        // args BEFORE forcing) to find which Phase 2 inputarg position
+        // corresponds to each key.
         for (key, refs) in &exported_state.pre_force_field_refs {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[jit] carry field_refs: key={:?} resolved={:?} refs={:?}",
-                    key, ctx.get_replacement(*key), refs);
+            // Match via pre_force_args (pre-force JUMP args) — these use
+            // the same OpRef namespace as the pre_force_field_refs keys.
+            for (i, pre_arg) in exported_state.pre_force_args.iter().enumerate() {
+                if *pre_arg == *key {
+                    let source = targetargs[i];
+                    // Store under all forwarding chain nodes
+                    let mut current = source;
+                    for _ in 0..10 {
+                        ctx.pre_force_field_refs.entry(current)
+                            .or_insert_with(Vec::new)
+                            .extend(refs.iter().cloned());
+                        let next = ctx.get_replacement(current);
+                        if next == current { break; }
+                        current = next;
+                    }
+                }
             }
-            // Store under both original and resolved keys.
-            let resolved = ctx.get_replacement(*key);
-            ctx.pre_force_field_refs.entry(resolved)
-                .or_insert_with(Vec::new)
-                .extend(refs.iter().cloned());
             ctx.pre_force_field_refs.entry(*key)
                 .or_insert_with(Vec::new)
                 .extend(refs.iter().cloned());
@@ -1404,14 +1422,14 @@ impl OptUnroll {
 
         // RPython setinfo_from_preamble: for virtual args, set PtrInfo::Virtual
         // BEFORE make_inputargs so it can flatten field values.
+        // RPython reuses Phase 1's PtrInfo directly (source.set_forwarded(preamble_info));
+        // majit reconstructs the virtual with field values from pre_force_field_refs.
         for (i, info) in exported_state.virtual_state.state.iter().enumerate() {
             if let crate::virtualstate::VirtualStateInfo::Virtual { descr, known_class, fields, field_descrs } = info {
                 let opref = ctx.get_replacement(targetargs[i]);
                 let virtual_fields: Vec<(u32, OpRef)> = fields
                     .iter()
                     .filter_map(|(idx, child)| {
-                        // For non-constant child fields, find the value from
-                        // exported_infos or the forwarding chain.
                         match child.as_ref() {
                             crate::virtualstate::VirtualStateInfo::Constant(val) => {
                                 let c = ctx.alloc_op_position();
@@ -1419,10 +1437,18 @@ impl OptUnroll {
                                 Some((*idx, c))
                             }
                             _ => {
-                                // Field value comes from the exported virtual's
-                                // pre-force field refs, carried via exported_infos.
-                                // Try the forwarded value of the virtual head.
-                                None
+                                // Non-constant field: look up from pre_force_field_refs.
+                                // RPython's setinfo_from_preamble reuses Phase 1's
+                                // PtrInfo._fields directly; we reconstruct from the
+                                // saved field refs.
+                                ctx.pre_force_field_refs
+                                    .get(&opref)
+                                    .or_else(|| ctx.pre_force_field_refs.get(&targetargs[i]))
+                                    .and_then(|flds| {
+                                        flds.iter()
+                                            .find(|(fld_idx, _)| *fld_idx == *idx)
+                                            .map(|(_, r)| (*idx, *r))
+                                    })
                             }
                         }
                     })
