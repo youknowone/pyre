@@ -852,6 +852,13 @@ impl Optimizer {
         self.propagate_from_pass(0, op, ctx);
     }
 
+    /// RPython optimizer.py: emit_extra(op, emit=False) parity.
+    /// Route an operation through passes starting AFTER `after_pass_idx`,
+    /// matching RPython's `send_extra_operation(op, self.next_optimization)`.
+    pub fn send_extra_operation_after(&mut self, after_pass_idx: usize, op: &Op, ctx: &mut OptContext) {
+        self.propagate_from_pass(after_pass_idx + 1, op, ctx);
+    }
+
     /// optimizer.py: force_box(opref, ctx) — force a virtual to be materialized.
     /// If the opref refers to a virtual object, emit the allocation and field writes.
     /// Returns the concrete OpRef (unchanged if not virtual).
@@ -1659,12 +1666,20 @@ impl Optimizer {
         let end_pass = self.extra_operation_end_pass();
         let mut pending = std::collections::VecDeque::new();
         while let Some(op) = ctx.pop_extra_operation() {
-            pending.push_back(op);
+            pending.push_back((start_pass, op));
         }
-        while let Some(op) = pending.pop_front() {
-            self.propagate_from_pass_range(start_pass, end_pass, &op, ctx);
+        // RPython emit_extra(op, emit=False) parity: operations queued
+        // with a specific start pass skip earlier passes.
+        while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
+            pending.push_back((start, op));
+        }
+        while let Some((from_pass, op)) = pending.pop_front() {
+            self.propagate_from_pass_range(from_pass, end_pass, &op, ctx);
             while let Some(child) = ctx.pop_extra_operation() {
-                pending.push_front(child);
+                pending.push_front((start_pass, child));
+            }
+            while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
+                pending.push_front((start, op));
             }
         }
     }
@@ -1702,6 +1717,7 @@ impl Optimizer {
         let mut current_op = resolved_op;
 
         for pass_idx in start_pass..end_pass {
+            ctx.current_pass_idx = pass_idx;
             let pass_name = self.passes[pass_idx].name().to_string();
             let result = {
                 let pass = &mut self.passes[pass_idx];
@@ -1742,6 +1758,15 @@ impl Optimizer {
         // force_to_ops_direct emits directly to new_operations, so no drain needed.
         for pass in &mut self.passes {
             pass.emitting_operation(&op, ctx);
+        }
+        // RPython emit_extra(op, emit=False) parity: drain operations
+        // queued by emitting_operation (e.g., heap's force_lazy_set)
+        // BEFORE the current op is emitted, preserving correct ordering.
+        {
+            let end_pass = self.extra_operation_end_pass();
+            while let Some((start, queued_op)) = ctx.extra_operations_after.pop_front() {
+                self.propagate_from_pass_range(start, end_pass, &queued_op, ctx);
+            }
         }
 
         // RPython optimizer.py:623-625: _emit_operation calls force_box on
