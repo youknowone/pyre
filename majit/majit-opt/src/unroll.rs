@@ -356,6 +356,9 @@ impl UnrollOptimizer {
             jump_ctx.clear_newoperations();
 
             // unroll.py:207: first attempt without forcing boxes
+            // runtime_boxes: in loop optimization, the JUMP args ARE the
+            // runtime boxes (they represent live values at the back-edge).
+            let runtime_boxes = body_jump_args.clone();
             let mut jumped = opt_unroll
                 .jump_to_existing_trace(
                     &body_jump_args,
@@ -364,6 +367,7 @@ impl UnrollOptimizer {
                     &mut opt_p2,
                     &mut jump_ctx,
                     false,
+                    Some(&runtime_boxes),
                 )
                 .is_none(); // None = jumped successfully
             if std::env::var_os("MAJIT_LOG").is_some() {
@@ -395,6 +399,7 @@ impl UnrollOptimizer {
                             &mut opt_p2,
                             &mut jump_ctx,
                             true,
+                            Some(&runtime_boxes),
                         )
                         .is_none();
                     if !jumped {
@@ -1158,6 +1163,11 @@ impl OptUnroll {
     /// If so, generate extra guards, inline short preamble, and redirect jump.
     ///
     /// Returns None if jumped successfully, Some(virtual_state) otherwise.
+    /// unroll.py:304-362: jump_to_existing_trace
+    ///
+    /// `runtime_boxes`: live values at the jump point, used by
+    /// generate_guards to emit GUARD_VALUE when the runtime value
+    /// matches a known constant. Pass None when unavailable (bridges).
     pub fn jump_to_existing_trace(
         &self,
         jump_args: &[OpRef],
@@ -1166,6 +1176,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
+        runtime_boxes: Option<&[OpRef]>,
     ) -> Option<crate::virtualstate::VirtualState> {
         optimizer.disable_guard_replacement();
         let result = self.jump_to_existing_trace_impl(
@@ -1175,6 +1186,7 @@ impl OptUnroll {
             optimizer,
             ctx,
             force_boxes,
+            runtime_boxes,
         );
         optimizer.enable_guard_replacement();
         result
@@ -1188,6 +1200,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
+        _runtime_boxes: Option<&[OpRef]>,
     ) -> Option<crate::virtualstate::VirtualState> {
         let mut virtual_state = crate::virtualstate::export_state(jump_args, ctx, &ctx.ptr_info);
         let mut args: Vec<OpRef> = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
