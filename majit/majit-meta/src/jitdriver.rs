@@ -1731,6 +1731,8 @@ impl<S: JitState> JitDriver<S> {
             }
         }
 
+        let mut live_values = live_values;
+        loop {
         let result = self
             .meta
             .run_compiled_raw_detailed_with_values(key_hash, &live_values)?;
@@ -1740,12 +1742,28 @@ impl<S: JitState> JitDriver<S> {
         let result_meta = result.meta.clone();
         let typed_values = result.typed_values;
         let raw_values = result.values;
-        // RPython parity: resumedescr carries rd_virtuals for materialization.
         let exit_layout = result.exit_layout;
 
         if is_finish || fail_index == u32::MAX {
             state.restore_values(&result_meta, &typed_values);
             self.sync_after(state, &result_meta, descriptor.as_ref());
+            // Re-enter compiled code if state is still compatible
+            if let Some(meta) = self.meta.get_compiled_meta(key_hash) {
+                if state.is_compatible(meta) {
+                    let meta = meta.clone();
+                    let nd = self.driver_descriptor_for(state, &meta);
+                    if self.sync_before(state, &meta, nd.as_ref()) {
+                        let nl = state.extract_live_values(&meta);
+                        if Self::live_values_match_descriptor(nd.as_ref(), &nl) {
+                            if let Some(v) = self.extend_compiled_live_values(
+                                key_hash, state, &meta, nd.as_ref(), nl) {
+                                live_values = v;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             return Some(target_pc);
         }
 
@@ -1767,7 +1785,8 @@ impl<S: JitState> JitDriver<S> {
         if resume_pc.is_some() {
             self.sync_after(state, &result_meta, descriptor.as_ref());
         }
-        resume_pc
+        return resume_pc;
+        } // end loop { run_compiled ... }
     }
 }
 
