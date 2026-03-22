@@ -48,6 +48,10 @@ pub struct BridgeData {
     pub needs_force_frame: bool,
     /// Static terminal-exit layouts within the bridge trace.
     pub terminal_exit_layouts: Mutex<Vec<TerminalExitLayout>>,
+    /// When true, a bridge Finish with matching arity should re-enter
+    /// the parent loop instead of returning to the interpreter.
+    /// Set for bridges that reach the loop's merge_point.
+    pub loop_reentry: bool,
 }
 
 unsafe impl Send for BridgeData {}
