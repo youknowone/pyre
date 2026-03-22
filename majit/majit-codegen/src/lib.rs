@@ -557,6 +557,18 @@ pub trait Backend: Send {
         Ok(results)
     }
 
+    /// Mark the most recently compiled bridge on the given guard as a
+    /// loop-closing bridge: on Finish, its outputs should re-enter the
+    /// parent loop instead of returning to the interpreter.
+    fn mark_bridge_loop_reentry(
+        &self,
+        _original_token: &JitCellToken,
+        _source_trace_id: u64,
+        _fail_index: u32,
+    ) {
+        // Default no-op — backends that support bridge re-entry override this.
+    }
+
     /// Execute compiled code starting at the given token.
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame;
 
