@@ -5377,13 +5377,15 @@ impl CraneliftBackend {
                     if use_direct {
                         let slot_addr = dispatch_slot_addr.unwrap();
 
-                        // For self-recursion (target unknown), use safe defaults
+                        // For self-recursion (target unknown), use the
+                        // current trace's own root/output counts as defaults
+                        // since the callee IS the same compiled code.
                         let out_slots = resolved_target
                             .as_ref()
-                            .map_or(16, |t| t.max_output_slots.max(1));
-                        let num_ref_roots = resolved_target
+                            .map_or(max_output_slots.max(16), |t| t.max_output_slots.max(1));
+                        let ca_num_ref_roots = resolved_target
                             .as_ref()
-                            .map_or(8, |t| t.num_ref_roots.max(1));
+                            .map_or(ref_root_slots.len().max(8), |t| t.num_ref_roots.max(1));
 
                         // Allocate output and roots buffers on stack
                         let out_bytes = (out_slots * 8) as u32;
@@ -5394,7 +5396,7 @@ impl CraneliftBackend {
                         ));
                         let out_ptr = builder.ins().stack_addr(ptr_type, out_slot, 0);
 
-                        let roots_bytes = (num_ref_roots * 8) as u32;
+                        let roots_bytes = (ca_num_ref_roots * 8) as u32;
                         let ca_roots_slot = builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
                             roots_bytes,
