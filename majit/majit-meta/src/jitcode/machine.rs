@@ -58,13 +58,6 @@ pub trait JitCodeSym {
     fn begin_portal_op(&mut self, _pc: usize) {}
     fn commit_portal_op(&mut self) {}
     fn abort_portal_op(&mut self) {}
-
-    /// Set the current resume PC for internal guards (e.g. ensure_linked_list_head).
-    /// The machine calls this before operations that may emit lazy guards.
-    fn set_guard_resume_pc(&mut self, _pc: OpRef) {}
-    /// Get the current resume PC for internal guards.
-    fn guard_resume_pc(&self) -> Option<OpRef> { None }
-
     fn stack(&self, selected: usize) -> Option<&SymbolicStack>;
     fn stack_mut(&mut self, selected: usize) -> Option<&mut SymbolicStack>;
     fn total_slots(&self) -> usize;
