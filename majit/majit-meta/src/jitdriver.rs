@@ -1419,6 +1419,8 @@ impl<S: JitState> JitDriver<S> {
         DetailedDriverRunOutcome::GuardFailure {
             restored,
             via_blackhole: false,
+            fail_index: Some(fail_index),
+            trace_id: Some(trace_id),
         }
     }
 

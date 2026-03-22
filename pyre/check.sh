@@ -116,7 +116,7 @@ run_bench       "int_loop"       "$BENCH/int_loop.py"           "49999995000000"
 run_bench       "fib_loop"       "$BENCH/fib_loop.py"           "967618232"                   30       ""       1
 run_bench       "inline_helper"  "$BENCH/inline_helper.py"      "333333333333000000"          30       5.0
 run_bench       "fib_recursive"  "$BENCH/fib_recursive.py"      "2178309"                     30
-run_bench       "nbody"          "$BENCH/nbody_50k.py"          "-0.035132020348426815"        30       ""       6
+run_bench       "nbody"          "$BENCH/nbody_50k.py"          "-0.035132020348426815"        30       ""       8
 run_bench       "fannkuch"       "$BENCH/fannkuch_9.py"         "$(printf '8629\n30')"          30
 
 echo ""
