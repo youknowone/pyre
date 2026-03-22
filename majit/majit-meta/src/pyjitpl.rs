@@ -61,6 +61,10 @@ pub(crate) struct CompiledTrace {
     pub(crate) exit_layouts: HashMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
     pub(crate) terminal_exit_layouts: HashMap<usize, StoredExitLayout>,
+    /// bridgeopt.py: serialized optimizer knowledge per guard.
+    /// Heap cache (struct, field_idx, value) triples known at guard time.
+    /// Used by deserialize_optimizer_knowledge when compiling a bridge.
+    pub(crate) optimizer_knowledge: Vec<(majit_ir::OpRef, u32, majit_ir::OpRef)>,
 }
 
 pub(crate) struct StoredResumeData {
@@ -1544,6 +1548,7 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
+                        optimizer_knowledge: Vec::new(), // TODO: serialize from optimizer
                     },
                 );
 
@@ -1784,6 +1789,7 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
+                        optimizer_knowledge: optimizer.serialize_optimizer_knowledge(),
                     },
                 );
                 {
@@ -2942,13 +2948,24 @@ impl<M: Clone> MetaInterp<M> {
         // RPython unroll.py:183-236: Optimizer.optimize_bridge()
         let mut optimizer = self.make_optimizer();
         let mut constants = constants;
-        // RPython compile.py:1035-1038: inline_short_preamble is false only
-        // for ResumeAtPositionDescr guards. Default to true.
         let inline_short_preamble = true;
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
         let retraced_count = compiled.retraced_count;
-        // RPython warmstate.py: PARAMETERS['retrace_limit'] = 0 (disabled by default)
         let retrace_limit = 0u32;
+        // bridgeopt.py: retrieve optimizer knowledge from the source trace.
+        // The knowledge captures heap cache state at the guard point, so the
+        // bridge optimizer can start with cached field values.
+        let bridge_knowledge: Option<Vec<(majit_ir::OpRef, u32, majit_ir::OpRef)>> = {
+            let source_trace_id = {
+                let tid = fail_descr.trace_id();
+                if tid == 0 { compiled.root_trace_id } else { tid }
+            };
+            compiled
+                .traces
+                .get(&source_trace_id)
+                .map(|t| t.optimizer_knowledge.clone())
+                .filter(|k| !k.is_empty())
+        };
         let (optimized_ops, retrace_requested) = optimizer.optimize_bridge(
             bridge_ops,
             &mut constants,
@@ -2957,6 +2974,7 @@ impl<M: Clone> MetaInterp<M> {
             inline_short_preamble,
             retraced_count,
             retrace_limit,
+            bridge_knowledge.as_deref(),
         );
         if retrace_requested {
             // unroll.py:217: cell_token.retraced_count += 1
@@ -3100,6 +3118,7 @@ impl<M: Clone> MetaInterp<M> {
                             guard_op_indices,
                             exit_layouts,
                             terminal_exit_layouts,
+                            optimizer_knowledge: Vec::new(),
                         },
                     );
                 }

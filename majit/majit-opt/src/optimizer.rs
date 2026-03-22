@@ -605,6 +605,29 @@ impl Optimizer {
         self.call_pure_results.get(args)
     }
 
+    /// bridgeopt.py:63-122: serialize_optimizer_knowledge
+    /// Export the optimizer's heap cache knowledge for storage in guard resume data.
+    /// Called after optimization to capture what the optimizer knows at each guard.
+    pub fn serialize_optimizer_knowledge(&self) -> Vec<(OpRef, u32, OpRef)> {
+        let mut result = Vec::new();
+        for pass in &self.passes {
+            result.extend(pass.export_cached_fields());
+        }
+        result
+    }
+
+    /// bridgeopt.py:124-185: deserialize_optimizer_knowledge
+    /// Import optimizer knowledge from the guard's resume data into this optimizer.
+    /// Called before bridge optimization to pre-populate the heap cache.
+    pub fn deserialize_optimizer_knowledge(&mut self, entries: &[(OpRef, u32, OpRef)]) {
+        if entries.is_empty() {
+            return;
+        }
+        for pass in &mut self.passes {
+            pass.import_cached_fields(entries);
+        }
+    }
+
     /// Get the final num_inputs after optimization.
     /// May be larger than the original if virtualizable added virtual input args.
     pub fn final_num_inputs(&self) -> usize {
@@ -1665,9 +1688,15 @@ impl Optimizer {
         inline_short_preamble: bool,
         retraced_count: u32,
         retrace_limit: u32,
-        // runtime_boxes: Option<&[Value]>,  // B4 TODO
-        // resumestorage: Option<...>,        // B3 TODO
+        bridge_knowledge: Option<&[(OpRef, u32, OpRef)]>,
     ) -> (Vec<Op>, bool) {
+        // bridgeopt.py:124-185: deserialize_optimizer_knowledge
+        // Pre-populate the optimizer's heap cache with knowledge from
+        // the guard's resume data, so the bridge optimizer starts with
+        // the same field values the original loop had at the guard point.
+        if let Some(knowledge) = bridge_knowledge {
+            self.deserialize_optimizer_knowledge(knowledge);
+        }
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
         let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
 
