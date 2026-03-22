@@ -828,12 +828,16 @@ r = fannkuch(6)";
 
     #[test]
     fn test_eval_recursive_fib_compiles_function_entry_trace() {
+        // RPython test_recursive.py: warmup with repeated calls so the
+        // trace compiles from a well-formed entry (function portal).
         let source = "\
 def fib(n):
     if n < 2:
         return n
     return fib(n - 1) + fib(n - 2)
 
+for i in range(15):
+    fib(i)
 result = fib(12)";
         let code = pyre_bytecode::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);

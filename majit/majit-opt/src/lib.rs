@@ -838,6 +838,9 @@ pub trait Optimization {
         Vec::new()
     }
 
+    /// heap.py: deserialize_optheap — import cached fields into this pass.
+    fn import_cached_fields(&mut self, _entries: &[(OpRef, u32, OpRef)]) {}
+
     /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
     fn export_arg_int_bounds(
         &self,
