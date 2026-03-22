@@ -967,8 +967,10 @@ impl AbstractShortPreambleBuilderState {
             op.pos = current_result;
             self.extra_same_as.push(op);
         }
-        self.used_boxes.push(used_box);
-        self.short_preamble_jump.push(produced.preamble_op.clone());
+        if used_box.0 < 10_000 {
+            self.used_boxes.push(used_box);
+            self.short_preamble_jump.push(produced.preamble_op.clone());
+        }
     }
 
     fn use_box(&mut self, result: OpRef, produced: &ProducedShortOp) -> Op {
@@ -1234,9 +1236,11 @@ impl ExtendedShortPreambleBuilder {
     }
 
     pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
-        self.label_args.push(result);
-        self.used_boxes.push(result);
-        self.short_jump_args.push(produced.preamble_op.pos);
+        if result.0 < 10_000 {
+            self.label_args.push(result);
+            self.used_boxes.push(result);
+            self.short_jump_args.push(produced.preamble_op.pos);
+        }
         self.extra_state.record_preamble_use(result, &produced);
     }
 
@@ -1475,7 +1479,6 @@ pub fn build_short_preamble_from_exported_boxes(
     let mut builder = ShortPreambleBuilder::new(label_args, &produced, short_inputargs);
     for (result, _) in &produced {
         let _ = builder.use_box(*result);
-        let _ = builder.add_preamble_op(*result);
     }
     builder.build_short_preamble_struct()
 }
@@ -1926,6 +1929,32 @@ mod tests {
     }
 
     #[test]
+    fn test_build_short_preamble_from_exported_boxes_does_not_preseed_used_boxes() {
+        let exported = vec![PreambleOp {
+            op: {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                op.pos = OpRef(7);
+                op
+            },
+            kind: PreambleOpKind::Pure,
+            label_arg_idx: None,
+            invented_name: false,
+            same_as_source: None,
+        }];
+
+        let sp = build_short_preamble_from_exported_boxes(
+            &[OpRef(0), OpRef(1)],
+            &[OpRef(10), OpRef(11)],
+            &exported,
+        );
+
+        assert_eq!(sp.used_boxes, Vec::<OpRef>::new());
+        assert_eq!(sp.jump_args, Vec::<OpRef>::new());
+        assert_eq!(sp.ops.len(), 1);
+        assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
+    }
+
+    #[test]
     fn test_rpython_short_preamble_builder_use_box_recurses_dependencies() {
         let produced = vec![
             (
@@ -2285,6 +2314,30 @@ mod tests {
     }
 
     #[test]
+    fn test_rpython_short_preamble_builder_skips_constant_used_boxes() {
+        let produced = vec![(
+            OpRef(10000),
+            ProducedShortOp {
+                kind: PreambleOpKind::Pure,
+                preamble_op: {
+                    let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef(0)]);
+                    op.pos = OpRef(30);
+                    op
+                },
+                invented_name: false,
+                same_as_source: None,
+            },
+        )];
+        let mut builder = ShortPreambleBuilder::new(&[OpRef(20)], &produced, &[OpRef(10)]);
+
+        assert!(builder.add_preamble_op(OpRef(10000)));
+        assert_eq!(builder.used_boxes(), &[] as &[OpRef]);
+        let sp = builder.build_short_preamble_struct();
+        assert_eq!(sp.used_boxes, Vec::<OpRef>::new());
+        assert_eq!(sp.jump_args, Vec::<OpRef>::new());
+    }
+
+    #[test]
     fn test_rpython_extended_builder_appends_label_and_jump_for_alias() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(30), OpRef(40), OpRef(41)]);
 
@@ -2326,6 +2379,40 @@ mod tests {
         assert_eq!(ext.extra_same_as().len(), 1);
         assert_eq!(ext.extra_same_as()[0].opcode, OpCode::SameAsI);
         assert_eq!(ext.extra_same_as()[0].pos, alias_result);
+    }
+
+    #[test]
+    fn test_rpython_extended_builder_skips_constant_used_boxes() {
+        let produced = vec![(
+            OpRef(10000),
+            ProducedShortOp {
+                kind: PreambleOpKind::Pure,
+                preamble_op: {
+                    let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef(30)]);
+                    op.pos = OpRef(31);
+                    op
+                },
+                invented_name: false,
+                same_as_source: None,
+            },
+        )];
+
+        let builder = ShortPreambleBuilder::new(&[OpRef(30)], &produced, &[OpRef(30)]);
+        let mut ext = ExtendedShortPreambleBuilder::new(7, &builder);
+        ext.setup(
+            &ShortPreamble {
+                ops: Vec::new(),
+                inputargs: vec![OpRef(30)],
+                used_boxes: vec![OpRef(30)],
+                jump_args: vec![OpRef(30)],
+                exported_state: None,
+            },
+            &[OpRef(30)],
+        );
+
+        assert!(ext.add_preamble_op(OpRef(10000)));
+        assert_eq!(ext.label_args(), &[OpRef(30)]);
+        assert_eq!(ext.jump_args(), &[OpRef(30)]);
     }
 
 }

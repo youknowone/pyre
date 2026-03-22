@@ -123,6 +123,11 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
     })
 }
 
+/// Create a FailDescr with explicit types and an explicit fail_index.
+pub fn make_fail_descr_typed_with_index(fail_index: u32, types: Vec<Type>) -> DescrRef {
+    Arc::new(MetaFailDescr { fail_index, types })
+}
+
 /// Create a ResumeGuardDescr — a FailDescr that carries resume data
 /// for reconstructing interpreter state on guard failure.
 ///
