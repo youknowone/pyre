@@ -185,6 +185,17 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
         return result;
     }
 
+    // RPython parity: after guard-restored fallback from compiled code,
+    // prevent nested calls from re-entering compiled code. The Finish
+    // result's forced-virtual W_IntObject (New+SetfieldGc in unbox pass)
+    // has corrupted ob_type when executed through nested compiled code
+    // dispatch. Root cause: optimizer's virtual forcing emits New with
+    // ob_type SetfieldGc, but the Cranelift-compiled execution order or
+    // allocation lifecycle differs from the trace's expectations.
+    //
+    // TODO: fix New/SetfieldGc execution order for forced virtuals in
+    // the unbox pass to allow nested compiled code dispatch.
+    let _plain_guard = pyre_interp::call::force_plain_eval();
     eval_loop_jit(frame)
 }
 
