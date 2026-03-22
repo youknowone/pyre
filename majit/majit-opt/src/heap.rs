@@ -93,6 +93,19 @@ impl CachedField {
         self.descrs.clear();
     }
 
+    /// heap.py:189-196: invalidate with PtrInfo cleanup.
+    /// RPython clears info._fields[descr.get_index()] for every registered info.
+    fn invalidate_with_ctx(&mut self, field_idx: u32, ctx: &mut crate::OptContext) {
+        for (&obj, _) in &self.entries {
+            let obj_resolved = ctx.get_replacement(obj);
+            if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
+                info.clear_field(field_idx);
+            }
+        }
+        self.entries.clear();
+        self.descrs.clear();
+    }
+
     /// Invalidate entries that may alias with a write to `obj`.
     /// Uses aliasing analysis sets to keep entries that cannot alias.
     fn invalidate_for_write(
@@ -454,11 +467,11 @@ impl OptHeap {
             }
             let final_value = op.arg(1);
             let descr = op.descr.clone();
-            // heap.py:129: self.invalidate(descr)
-            self.get_or_create_cached_field(field_idx).invalidate();
+            // heap.py:129: self.invalidate(descr) — clear all entries + PtrInfo
+            self.get_or_create_cached_field(field_idx).invalidate_with_ctx(field_idx, ctx);
             // emit_extra(op, emit=False): route through passes after heap.
             ctx.emit_through_passes_after(ctx.current_pass_idx, op);
-            // heap.py:142-143: put_field_back_to_info — restore cache
+            // heap.py:142-143: put_field_back_to_info — restore cache + PtrInfo
             self.cache_field(obj, field_idx, final_value, descr.as_ref());
             let obj_resolved = ctx.get_replacement(obj);
             if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
@@ -875,8 +888,8 @@ impl OptHeap {
         if cf.possible_aliasing(obj) {
             if let Some((lazy_obj, mut lazy_op)) = cf.lazy_set.take() {
                 // heap.py:122-143: force_lazy_set
-                // 1. invalidate all entries for this descr
-                cf.invalidate();
+                // 1. invalidate all entries for this descr + PtrInfo
+                cf.invalidate_with_ctx(field_idx, ctx);
                 // 2. emit the setfield
                 Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                 // 3. put_field_back_to_info — restore the forced entry
