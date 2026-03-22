@@ -7688,10 +7688,19 @@ fn inline_trace_and_execute(
             }
             InlineTraceStepAction::Trace(majit_meta::TraceAction::Continue) => {}
             InlineTraceStepAction::Trace(majit_meta::TraceAction::Finish {
-                finish_args, ..
+                finish_args,
+                finish_arg_types,
             }) => {
                 // PyPy finishframe(): pop frame, store result in parent
                 let result_opref = finish_args[0];
+                // Use the type from the Finish action, not from
+                // value_type_of — the return handler may have unboxed
+                // the value (DoneWithThisFrameDescrInt) so the PyreSym
+                // transient map does not know the result's type.
+                let finish_type = finish_arg_types
+                    .first()
+                    .copied()
+                    .unwrap_or(Type::Ref);
 
                 // Concrete execute the RETURN_VALUE
                 let top = framestack.last_mut().unwrap();
@@ -7713,7 +7722,7 @@ fn inline_trace_and_execute(
                     StepResult::Return(concrete_result) => {
                         // popframe()
                         let popped = framestack.pop().unwrap();
-                        let result_type = popped.sym.value_type_of(result_opref);
+                        let result_type = finish_type;
                         let concrete_result =
                             materialize_pending_inline_result(pending_inline_result_from_concrete(
                                 result_type,
