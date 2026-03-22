@@ -1,5 +1,6 @@
 use std::fmt;
 
+use pyre_object::excobject::EXCEPTION_TYPE;
 use pyre_object::pyobject::{
     BOOL_TYPE, FLOAT_TYPE, INT_TYPE, LONG_TYPE, NONE_TYPE, PyObjectRef, PyType, STR_TYPE,
 };
@@ -48,6 +49,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
             let name = w_func_get_name(obj);
             format!("<function {name}>")
+        } else if std::ptr::eq(tp, &EXCEPTION_TYPE as *const PyType) {
+            let msg = pyre_object::excobject::w_exception_get_message(obj);
+            msg.to_string()
         } else {
             format!("<{} object at {:?}>", (*tp).tp_name, obj)
         }

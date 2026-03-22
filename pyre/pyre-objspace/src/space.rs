@@ -1365,6 +1365,9 @@ pub fn py_str(obj: PyObjectRef) -> String {
             }
             return v.to_string();
         }
+        if is_exception(obj) {
+            return w_exception_get_message(obj).to_string();
+        }
     }
     "<object>".to_string()
 }
