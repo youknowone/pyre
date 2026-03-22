@@ -467,8 +467,10 @@ impl OptHeap {
             }
             let final_value = op.arg(1);
             let descr = op.descr.clone();
-            // heap.py:129: self.invalidate(descr) — clear all entries + PtrInfo
-            self.get_or_create_cached_field(field_idx).invalidate_with_ctx(field_idx, ctx);
+            // heap.py:129,189-191: invalidate(descr) — skip if is_always_pure
+            if !self.immutable_field_descrs.contains(&field_idx) {
+                self.get_or_create_cached_field(field_idx).invalidate_with_ctx(field_idx, ctx);
+            }
             // emit_extra(op, emit=False): route through passes after heap.
             ctx.emit_through_passes_after(ctx.current_pass_idx, op);
             // heap.py:142-143: put_field_back_to_info — restore cache + PtrInfo
@@ -776,14 +778,59 @@ impl OptHeap {
 
 
 
-        // heap.py:103-120: getfield_from_cache — check lazy_set then entries.
+        // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (obj, field_idx) = key;
+        let mut force_lazy = false;
         if let Some(cf) = self.field_cache.get(&field_idx) {
-            // Check lazy set first
-            if let Some(cached) = cf.get(obj) {
+            if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
+                if *lazy_obj == obj {
+                    // MUST_ALIAS: lazy_set targets the same struct
+                    let cached = lazy_op.arg(1);
+                    ctx.replace_op(op.pos, cached);
+                    return OptimizationResult::Remove;
+                }
+                // heap.py:108-111: possible_aliasing_two_infos
+                let cannot_alias = self.seen_allocation.contains(lazy_obj)
+                    || self.seen_allocation.contains(&obj)
+                    || self.known_distinct.contains(lazy_obj)
+                    || self.known_distinct.contains(&obj);
+                if !cannot_alias {
+                    // UNKNOWN_ALIAS → force_lazy_set, return None (cache miss)
+                    force_lazy = true;
+                }
+                // CANNOT_ALIAS: skip lazy_set, check entries below
+            } else if let Some(cached) = cf.entries.get(&obj).copied() {
+                let cached = ctx.get_replacement(cached);
                 ctx.replace_op(op.pos, cached);
                 return OptimizationResult::Remove;
             }
+        }
+        // heap.py:109-111: UNKNOWN_ALIAS → force lazy_set and return cache miss
+        if force_lazy {
+            if let Some(cf) = self.field_cache.get_mut(&field_idx) {
+                if let Some((lazy_obj, mut lazy_op)) = cf.lazy_set.take() {
+                    cf.invalidate_with_ctx(field_idx, ctx);
+                    if let Some(ref postponed) = self.postponed_op {
+                        let ppos = postponed.pos;
+                        if lazy_op.args.iter().any(|a| *a == ppos) {
+                            if let Some(p) = self.postponed_op.take() {
+                                ctx.emit(p);
+                            }
+                        }
+                    }
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                    // put_field_back_to_info
+                    let final_value = lazy_op.arg(1);
+                    let descr = lazy_op.descr.clone();
+                    let cf = self.get_or_create_cached_field(field_idx);
+                    cf.register(lazy_obj, final_value, descr.as_ref());
+                    let lazy_resolved = ctx.get_replacement(lazy_obj);
+                    if let Some(info) = ctx.get_ptr_info_mut(lazy_resolved) {
+                        info.set_field(field_idx, final_value);
+                    }
+                }
+            }
+            // Cache miss — fall through to emit the getfield
         }
 
         // Consume the imported short field: remove it so that if a later
@@ -869,36 +916,68 @@ impl OptHeap {
         self.unescaped.remove(&new_value);
 
         // heap.py:77-101: do_setfield — check write-after-write, aliasing, lazy set
-        let cf = self.get_or_create_cached_field(field_idx);
-
-        // Check if we already have this value cached (writing the same value again).
-        if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
-            if *lazy_obj == obj && lazy_op.arg(1) == new_value {
-                return OptimizationResult::Remove;
-            }
-        } else if let Some(&cached) = cf.entries.get(&obj) {
-            let cached_resolved = ctx.get_replacement(cached);
-            if cached_resolved == new_value {
-                return OptimizationResult::Remove;
+        // Check write-after-write first (before possible_aliasing).
+        {
+            let cf = self.get_or_create_cached_field(field_idx);
+            if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
+                if *lazy_obj == obj && lazy_op.arg(1) == new_value {
+                    return OptimizationResult::Remove;
+                }
+            } else if let Some(&cached) = cf.entries.get(&obj) {
+                let cached_resolved = ctx.get_replacement(cached);
+                if cached_resolved == new_value {
+                    return OptimizationResult::Remove;
+                }
             }
         }
 
         // heap.py:81-83: possible_aliasing → force_lazy_set
-        // If there's a lazy_set targeting a different struct, force it first.
-        if cf.possible_aliasing(obj) {
-            if let Some((lazy_obj, mut lazy_op)) = cf.lazy_set.take() {
+        let needs_force = self
+            .field_cache
+            .get(&field_idx)
+            .map_or(false, |cf| cf.possible_aliasing(obj));
+        if needs_force {
+            let lazy_data = self
+                .field_cache
+                .get_mut(&field_idx)
+                .and_then(|cf| cf.lazy_set.take());
+            if let Some((lazy_obj, mut lazy_op)) = lazy_data {
                 // heap.py:122-143: force_lazy_set
-                // 1. invalidate all entries for this descr + PtrInfo
-                cf.invalidate_with_ctx(field_idx, ctx);
-                // 2. emit the setfield
+                // 1. invalidate (skip pure)
+                if !self.immutable_field_descrs.contains(&field_idx) {
+                    self.get_or_create_cached_field(field_idx)
+                        .invalidate_with_ctx(field_idx, ctx);
+                }
+                // 2. emit postponed_op if referenced
+                if let Some(ref postponed) = self.postponed_op {
+                    let ppos = postponed.pos;
+                    if lazy_op.args.iter().any(|a| *a == ppos) {
+                        if let Some(p) = self.postponed_op.take() {
+                            ctx.emit(p);
+                        }
+                    }
+                }
+                // 3. emit the setfield
                 Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                // 3. put_field_back_to_info — restore the forced entry
+                // 4. put_field_back_to_info
                 let final_value = lazy_op.arg(1);
                 let descr = lazy_op.descr.clone();
-                cf.register(lazy_obj, final_value, descr.as_ref());
+                self.cache_field(lazy_obj, field_idx, final_value, descr.as_ref());
                 let lazy_obj_resolved = ctx.get_replacement(lazy_obj);
                 if let Some(info) = ctx.get_ptr_info_mut(lazy_obj_resolved) {
                     info.set_field(field_idx, final_value);
+                }
+            }
+        }
+
+        // heap.py:84-101: after force, recheck cached value
+        {
+            let cf = self.get_or_create_cached_field(field_idx);
+            if let Some(&cached) = cf.entries.get(&obj) {
+                let cached_resolved = ctx.get_replacement(cached);
+                if cached_resolved == new_value {
+                    cf.lazy_set = None;
+                    return OptimizationResult::Remove;
                 }
             }
         }
@@ -1944,16 +2023,18 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // RPython CachedField per-descr: setfield(p1) forces lazy_set(p0) →
-        // emits SETFIELD(p0). invalidate clears entries, put_field_back_to_info
-        // restores p0. But then invalidate_field_caches_for_write for p1
-        // removes p0's entry (input args can alias). So first GETFIELD(p0) =
-        // re-emitted, second GETFIELD(p1) = cached from lazy_set(p1).
-        // Result: SETFIELD(p0) + GETFIELD(p0) + Jump.
-        assert_eq!(result.len(), 3);
+        // RPython CachedField per-descr with aliasing analysis:
+        // - setfield(p1) forces lazy_set(p0) → emit SETFIELD(p0), put_back p0
+        // - invalidate_for_write(p1) removes p0 (input args can alias)
+        // - getfield(p0): lazy_set is p1, UNKNOWN_ALIAS → force lazy_set(p1)
+        //   → emit SETFIELD(p1), put_back p1. p0 entry gone → cache miss → emit GETFIELD(p0)
+        // - getfield(p1): entry p1=i2 from put_back → cache hit → remove
+        // Result: SETFIELD(p0) + SETFIELD(p1) + GETFIELD(p0) + Jump.
+        assert_eq!(result.len(), 4);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(result[1].opcode, OpCode::GetfieldGcI);
-        assert_eq!(result[2].opcode, OpCode::Jump);
+        assert_eq!(result[1].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[2].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[3].opcode, OpCode::Jump);
     }
 
     // ── Test 6: Array items: SETARRAYITEM then GETARRAYITEM → cached ──
