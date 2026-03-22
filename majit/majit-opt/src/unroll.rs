@@ -278,6 +278,9 @@ impl UnrollOptimizer {
                 gc,
                 p2_ni
             );
+            for (i, op) in p2_ops.iter().enumerate() {
+                eprintln!("[jit] p2[{i}]: {:?} pos={:?} args={:?}", op.opcode, op.pos, op.args);
+            }
         }
 
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──

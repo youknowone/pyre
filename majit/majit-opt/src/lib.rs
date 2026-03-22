@@ -318,6 +318,14 @@ impl OptContext {
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
         let pos_ref = op.pos;
+        // Clear any stale forwarding for this pos. Phase 2 import may set
+        // forwarding for heap cache entries whose source OpRef coincides with
+        // a trace op's pos. When the trace op is re-emitted in Phase 2, the
+        // new result must NOT be aliased to the imported value.
+        let idx = pos_ref.0 as usize;
+        if idx < self.forwarding.len() && !self.forwarding[idx].is_none() {
+            self.forwarding[idx] = OpRef::NONE;
+        }
         self.new_operations.push(op);
         pos_ref
     }
@@ -798,6 +806,11 @@ pub trait Optimization {
     /// Called after flush+drain to emit lazy_sets that were re-stored
     /// during drain. Virtual values should already be forced at this point.
     fn emit_remaining_lazy_directly(&mut self, _ctx: &mut OptContext) {}
+
+    /// Emit only virtualizable lazy SetfieldGc ops.
+    /// Called before JUMP in Phase 2 so compiled code writes virtualizable
+    /// fields (head/size) to memory for guard failure recovery.
+    fn flush_virtualizable(&mut self, _ctx: &mut OptContext) {}
 
     /// Mark this pass as Phase 2 (loop body). Phase 2 should not fully
     /// virtualize New() ops because guard recovery_layout is not yet
