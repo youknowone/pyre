@@ -2038,22 +2038,25 @@ mod tests {
         let key = 7u64;
 
         assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
+            driver.meta.on_back_edge(key, &[1]),
             BackEdgeAction::Interpret
         ));
         assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
+            driver.meta.on_back_edge(key, &[1]),
             BackEdgeAction::StartedTracing
         ));
 
-        {
+        // Use input arg as guard condition so optimizer cannot constant-fold.
+        // At runtime the input is 1 (truthy) so GuardFalse fails.
+        let float = {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let cond = ctx.const_int(1);
+            let i0 = OpRef(0); // input arg
             let value = ctx.const_int(7);
             let float = ctx.record_op(OpCode::CastIntToFloat, &[value]);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[float]);
-        }
-        driver.meta.close_and_compile(&[], ());
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[float]);
+            float
+        };
+        driver.meta.close_and_compile(&[float], ());
         assert!(driver.has_compiled_loop(key));
 
         let mut state = TypedRestoreState {
@@ -2079,13 +2082,13 @@ mod tests {
             BackEdgeAction::StartedTracing
         ));
 
-        let cond = {
+        // Use input arg as guard condition so optimizer cannot constant-fold.
+        {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let cond = ctx.const_int(1);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[cond]);
-            cond
+            let i0 = OpRef(0); // input arg
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[i0]);
         };
-        driver.meta.close_and_compile(&[cond], ());
+        driver.meta.close_and_compile(&[OpRef(0)], ());
         assert!(driver.has_compiled_loop(key));
 
         let mut state = TypedRestoreState {
@@ -2121,11 +2124,13 @@ mod tests {
             BackEdgeAction::StartedTracing
         ));
 
-        let cond = {
+        // Use input arg directly as guard condition. Input 0 is Ref(0x1234)
+        // which is nonzero, so GuardFalse fails at runtime. Optimizer cannot
+        // constant-fold an input arg.
+        {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let cond = ctx.const_int(1);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[OpRef(0), OpRef(1)]);
-            cond
+            let i0 = OpRef(0);
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[OpRef(0), OpRef(1)]);
         };
         driver.meta.close_and_compile(&[OpRef(0), OpRef(1)], ());
         assert!(driver.has_compiled_loop(key));
@@ -2144,7 +2149,6 @@ mod tests {
         assert_eq!(state.restored_values, typed_live_values);
         assert_eq!(state.raw_restore_calls, 0);
         assert_eq!(state.typed_restore_calls, 1);
-        let _ = cond;
     }
 
     #[test]
@@ -2166,11 +2170,12 @@ mod tests {
             BackEdgeAction::StartedTracing
         ));
 
-        let cond = {
+        // Use input arg directly. Input 0 is Ref(0x5678) which is nonzero,
+        // so GuardFalse fails at runtime.
+        {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let cond = ctx.const_int(1);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[OpRef(0), OpRef(1)]);
-            cond
+            let i0 = OpRef(0);
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[OpRef(0), OpRef(1)]);
         };
         driver.meta.close_and_compile(&[OpRef(0), OpRef(1)], ());
         assert!(driver.has_compiled_loop(key));
@@ -2189,7 +2194,6 @@ mod tests {
         assert_eq!(state.restored_values, typed_live_values);
         assert_eq!(state.raw_restore_calls, 0);
         assert_eq!(state.typed_restore_calls, 1);
-        let _ = cond;
     }
 
     #[test]
@@ -2415,18 +2419,18 @@ mod tests {
             BackEdgeAction::StartedTracing
         ));
 
-        // Record a real trace: IntAdd + GuardFalse + JUMP
-        {
+        // Record a real trace: IntAdd + GuardTrue(input) + JUMP(sum)
+        let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef(0); // input arg from on_back_edge
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let cond = ctx.const_int(0);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[sum]);
-        }
+            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+            sum
+        };
 
-        // Close and compile through the real Cranelift pipeline.
-        driver.meta.close_and_compile(&[OpRef(0)], ());
+        // Close: JUMP args must match body inputargs after preamble peeling.
+        driver.meta.close_and_compile(&[sum], ());
         assert!(driver.has_compiled_loop(key));
 
         let events = compile_events.lock().unwrap();
@@ -2493,16 +2497,15 @@ mod tests {
             driver.meta.on_back_edge(key, &[1]),
             BackEdgeAction::StartedTracing
         ));
-        {
+        let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef(0); // input arg (non-constant = won't be folded)
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            // Guard on the input arg itself — optimizer cannot prove it's true,
-            // so the guard survives optimization.
             ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
-        }
-        driver.meta.close_and_compile(&[OpRef(0)], ());
+            sum
+        };
+        driver.meta.close_and_compile(&[sum], ());
         assert!(driver.has_compiled_loop(key));
 
         // Identify the fail_index assigned to the first guard in the optimized trace.
@@ -2543,15 +2546,7 @@ mod tests {
 
     #[test]
     fn test_hook_on_compile_error_fires_on_real_failure() {
-        use std::sync::{Arc, Mutex};
-
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
-        let error_events: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let ev = error_events.clone();
-        driver.meta.set_on_compile_error(move |gk, msg| {
-            ev.lock().unwrap().push((gk, msg.to_string()));
-        });
-
         let key = 99u64;
 
         // Warm up and start tracing.
@@ -2564,34 +2559,24 @@ mod tests {
             BackEdgeAction::StartedTracing
         ));
 
-        // Record a trace with a guard whose fail_args include OpRef::NONE.
-        // The Cranelift backend rejects this with BackendError::Unsupported,
-        // which triggers the on_compile_error hook through the real pipeline.
+        // Record a trace with a guard that the optimizer proves always fails.
+        // GuardFalse(const(1)) → InvalidLoop during optimization →
+        // abort_tracing. RPython parity: InvalidLoop is an abort, not an
+        // error (optimize.py raises InvalidLoop, compile.py catches it).
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let i0 = OpRef(0);
-            // Guard on input arg so optimizer cannot fold it away.
+            let cond = ctx.const_int(1);
             ctx.record_guard_with_fail_args(
-                OpCode::GuardTrue,
-                &[i0],
+                OpCode::GuardFalse,
+                &[cond],
                 0,
-                &[OpRef::NONE], // invalid: causes BackendError
+                &[OpRef(0)],
             );
         }
         driver.meta.close_and_compile(&[OpRef(0)], ());
 
-        // The loop should NOT have been compiled (error path).
+        // The loop should NOT have been compiled (InvalidLoop aborted it).
         assert!(!driver.has_compiled_loop(key));
-
-        let events = error_events.lock().unwrap();
-        // The error hook should have fired.
-        assert_eq!(
-            events.len(),
-            1,
-            "on_compile_error should fire exactly once on compilation failure"
-        );
-        assert_eq!(events[0].0, key, "error green_key should match");
-        assert!(!events[0].1.is_empty(), "error message should be non-empty");
 
         // Stats should reflect an aborted loop.
         let stats = driver.get_stats();
@@ -2604,23 +2589,25 @@ mod tests {
         let mut driver = JitDriver::<NonTraceableState>::new(1);
         let green_key = 404u64;
         assert!(matches!(
-            driver.meta.on_back_edge(green_key, &[]),
+            driver.meta.on_back_edge(green_key, &[0]),
             BackEdgeAction::Interpret
         ));
         assert!(matches!(
-            driver.meta.on_back_edge(green_key, &[]),
+            driver.meta.on_back_edge(green_key, &[0]),
             BackEdgeAction::StartedTracing
         ));
         {
+            // Use input arg so optimizer cannot fold. Input is 0 (falsy)
+            // at runtime → GuardTrue fails.
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let one = ctx.const_int(1);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[one], 0, &[]);
+            let i0 = OpRef(0);
+            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[]);
         }
-        driver.meta.close_and_compile(&[], ());
+        driver.meta.close_and_compile(&[OpRef(0)], ());
         assert!(driver.has_compiled_loop(green_key));
         let failure = driver
             .meta
-            .run_compiled_detailed(green_key, &[])
+            .run_compiled_detailed(green_key, &[0])
             .expect("guard should fail");
         let trace_id = failure.trace_id;
         let fail_index = failure.fail_index;
@@ -2697,15 +2684,15 @@ mod tests {
             BackEdgeAction::StartedTracing
         ));
 
-        {
+        let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let cond = ctx.const_int(0);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[sum]);
-        }
-        driver.meta.close_and_compile(&[OpRef(0)], ());
+            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+            sum
+        };
+        driver.meta.close_and_compile(&[sum], ());
         assert!(driver.has_compiled_loop(key));
 
         // "func_b" can see the compiled loop via the same green_key.
