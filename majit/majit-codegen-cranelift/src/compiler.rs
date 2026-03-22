@@ -1850,13 +1850,15 @@ pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendEr
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
+    let mut current_inputs = inputs.to_vec();
+    loop {
     let (fail_index, outputs, handle, force_frame) = run_compiled_code(
         target.code_ptr,
         &target.fail_descrs,
         target.gc_runtime_id,
         target.num_ref_roots,
         target.max_output_slots,
-        inputs,
+        &current_inputs,
         target.needs_force_frame,
     );
 
@@ -1869,7 +1871,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             target.header_pc,
             target.source_guard,
             &target.inputarg_types,
-            inputs,
+            &current_inputs,
             target.caller_prefix_layout.as_ref(),
         );
     }
@@ -1880,8 +1882,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     if let Some(ref bridge) = *bridge_guard {
         release_force_token(handle);
         if bridge.loop_reentry {
-            // RPython parity: bridge JUMP → loop re-entry.
-            // Execute bridge, extract output values, re-enter parent loop.
             let bridge_frame = CraneliftBackend::execute_bridge(
                 bridge, &outputs, &fail_descr.fail_arg_types,
             );
@@ -1889,13 +1889,11 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                 .expect("bridge deadframe must have descriptor");
             if bridge_descr.is_finish() {
-                // Bridge's JUMP was lowered to Finish — extract outputs
-                // and re-enter the parent loop with those values.
                 let num_outputs = bridge_descr.fail_arg_types().len();
-                let reentry_inputs: Vec<i64> = (0..num_outputs)
+                current_inputs = (0..num_outputs)
                     .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
                     .collect();
-                return execute_registered_loop_target(target, &reentry_inputs);
+                continue; // re-enter loop
             }
             return bridge_frame;
         }
@@ -1932,7 +1930,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             exception_class,
             (!exception.is_null()).then_some(exception),
         )),
-    }
+    };
+    } // end loop
 }
 
 /// Stack-allocated output buffer size for the fast path.
@@ -7611,12 +7610,19 @@ fn collect_guards(
     let num_inputs = inputargs.len();
     let value_types = build_value_type_map(inputargs, ops);
 
+    // Collect Label descr indices to distinguish internal vs external JUMPs.
+    let label_descr_indices: HashSet<u32> = ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .filter_map(|op| op.descr.as_ref().map(|d| d.index()))
+        .collect();
+
     for (op_idx, op) in ops.iter().enumerate() {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
-        // External JUMP (bridge → loop body) is lowered to Finish exit.
+        // External JUMP: target not in this function's Labels.
         let is_external_jump = op.opcode == OpCode::Jump
-            && op.descr.as_ref().map_or(false, |d| d.index() > 0);
+            && op.descr.as_ref().map_or(false, |d| !label_descr_indices.contains(&d.index()));
 
         if !is_guard && !is_finish && !is_external_jump {
             continue;
@@ -7975,8 +7981,14 @@ impl majit_codegen::Backend for CraneliftBackend {
             gc_runtime_id: compiled.gc_runtime_id,
             // RPython parity: bridge ending with JUMP to loop body needs
             // re-entry dispatch instead of returning to interpreter.
-            loop_reentry: ops.last().map_or(false, |op| op.opcode == OpCode::Jump
-                && op.descr.as_ref().map_or(false, |d| d.index() > 0)),
+            loop_reentry: {
+                let has_label: HashSet<u32> = ops.iter()
+                    .filter(|o| o.opcode == OpCode::Label)
+                    .filter_map(|o| o.descr.as_ref().map(|d| d.index()))
+                    .collect();
+                ops.last().map_or(false, |op| op.opcode == OpCode::Jump
+                    && op.descr.as_ref().map_or(false, |d| !has_label.contains(&d.index())))
+            },
             num_inputs: compiled.num_inputs,
             num_ref_roots: compiled.num_ref_roots,
             max_output_slots: compiled.max_output_slots,

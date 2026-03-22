@@ -2811,7 +2811,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `green_key` identifies the parent loop.
     /// `trace_id` and `fail_index` identify the guard to attach the bridge to.
     /// `finish_args` are the symbolic values at the bridge end (loop header state).
-    pub fn close_bridge_with_finish(
+    pub fn close_bridge(
         &mut self,
         green_key: u64,
         trace_id: u64,
@@ -2863,7 +2863,7 @@ impl<M: Clone> MetaInterp<M> {
 
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] close_bridge_with_finish: key={}, trace_id={}, guard={}, ops={}",
+                "[jit] close_bridge: key={}, trace_id={}, guard={}, ops={}",
                 green_key,
                 trace_id,
                 fail_index,
@@ -2958,14 +2958,14 @@ impl<M: Clone> MetaInterp<M> {
         }
         let optimized_ops = if ends_with_jump {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let jump_args = optimized_ops
+                .last()
+                .unwrap()
+                .args
+                .to_vec();
             if compiled.front_target_tokens.len() > 1 {
                 // RPython optimize_bridge (unroll.py:201-212):
                 // flush + force_box_for_end_of_preamble + jump_to_existing_trace
-                let jump_args = optimized_ops
-                    .last()
-                    .unwrap()
-                    .args
-                    .to_vec();
                 // Use the optimizer's final context (carries forwarding,
                 // ptr_info, etc. from the optimization pass).
                 let mut jump_ctx = optimizer
@@ -3027,15 +3027,39 @@ impl<M: Clone> MetaInterp<M> {
                         }
                         result
                     } else {
-                        // RPython line 228: jump_to_preamble fallback
-                        if crate::majit_log_enabled() {
-                            eprintln!("[jit] bridge: jump_to_existing_trace failed, using Finish");
+                        // RPython line 228-229: jump_to_preamble fallback.
+                        // Redirect JUMP to target_tokens[0] (preamble).
+                        if let Some(preamble_token) = compiled.front_target_tokens.first() {
+                            let preamble_descr = preamble_token.as_jump_target_descr();
+                            let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+                            let mut jump = majit_ir::Op::new(majit_ir::OpCode::Jump, &jump_args);
+                            jump.descr = Some(preamble_descr);
+                            result.push(jump);
+                            if crate::majit_log_enabled() {
+                                eprintln!("[jit] bridge: jump_to_preamble (retrace limit)");
+                            }
+                            result
+                        } else {
+                            optimized_ops
                         }
-                        optimized_ops
                     }
                 }
             } else {
-                optimized_ops
+                // Only 1 target_token → jump_to_preamble directly
+                // RPython unroll.py:198-200
+                if let Some(preamble_token) = compiled.front_target_tokens.first() {
+                    let preamble_descr = preamble_token.as_jump_target_descr();
+                    let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+                    let mut jump = majit_ir::Op::new(majit_ir::OpCode::Jump, &jump_args);
+                    jump.descr = Some(preamble_descr);
+                    result.push(jump);
+                    if crate::majit_log_enabled() {
+                        eprintln!("[jit] bridge: jump_to_preamble (single token)");
+                    }
+                    result
+                } else {
+                    optimized_ops
+                }
             }
         } else {
             optimized_ops

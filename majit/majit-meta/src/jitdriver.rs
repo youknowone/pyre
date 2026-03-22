@@ -430,7 +430,7 @@ impl<S: JitState> JitDriver<S> {
                     self.trace_meta = None;
                     if let Some(sym) = sym {
                         let finish_args = S::collect_jump_args(&sym);
-                        self.meta.close_bridge_with_finish(
+                        self.meta.close_bridge(
                             bridge_key,
                             bridge_trace_id,
                             bridge_fail_index,
@@ -479,7 +479,7 @@ impl<S: JitState> JitDriver<S> {
                 {
                     self.sym = None;
                     self.trace_meta = None;
-                    self.meta.close_bridge_with_finish(
+                    self.meta.close_bridge(
                         bridge_key,
                         bridge_trace_id,
                         bridge_fail_index,
@@ -2606,7 +2606,7 @@ mod tests {
         // Step 2: Start bridge tracing via start_retrace (simulates guard failure path).
         assert!(driver.meta.start_retrace(key, fail_index, &[0]));
 
-        // Step 3: Record a bridge trace and compile it via close_bridge_with_finish.
+        // Step 3: Record a bridge trace and compile it via close_bridge.
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
             let i0 = OpRef(0); // bridge input from start_retrace
@@ -2616,7 +2616,7 @@ mod tests {
         let trace_id = 0u64; // will be normalized to root_trace_id
         let compiled = driver
             .meta
-            .close_bridge_with_finish(key, trace_id, fail_index, &[OpRef(0)]);
+            .close_bridge(key, trace_id, fail_index, &[OpRef(0)]);
         assert!(compiled, "bridge should compile successfully");
 
         let events = bridge_events.lock().unwrap();
