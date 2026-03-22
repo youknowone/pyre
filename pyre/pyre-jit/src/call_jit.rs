@@ -757,7 +757,7 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        match pyre_interp::eval::eval_loop_for_force(frame) {
+        match crate::eval::eval_with_jit(frame) {
             Ok(result) => result as i64,
             Err(err) => panic!("jit force self-recursive call boxed failed: {err}"),
         }
@@ -850,13 +850,9 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
-    // RPython parity: concrete execution during tracing must not re-enter
-    // the JIT portal. Use force_plain_eval to ensure nested calls use
-    // eval_frame_plain instead of eval_with_jit.
-    let _plain_guard = pyre_interp::call::force_plain_eval();
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
+        let bh_result = match crate::eval::eval_with_jit(frame) {
             Ok(result) => result,
             Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
         };
