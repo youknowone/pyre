@@ -665,7 +665,11 @@ impl OptHeap {
         // setfield/call invalidates cached_fields, the stale preamble value
         // cannot re-populate the cache on a subsequent getfield.
         if let Some(cached) = ctx.imported_short_fields.remove(&key) {
-            let cached = ctx.force_op_from_preamble(cached);
+            // Track preamble usage for short preamble builder.
+            ctx.force_op_from_preamble(cached);
+            // Use the imported value directly in cached_fields. Do NOT use
+            // the return value of force_op_from_preamble, which may return
+            // the Phase 1 source OpRef that collides with a Phase 2 body op pos.
             self.cached_fields.entry(key).or_insert(cached);
             if let Some(descr) = ctx.imported_short_field_descrs.remove(&key) {
                 self.cached_field_descrs.insert(key, descr);
@@ -743,9 +747,8 @@ impl OptHeap {
                 return OptimizationResult::Remove;
             }
         } else if let Some(&cached) = self.cached_fields.get(&key) {
-            let cached = ctx.get_replacement(cached);
-            if cached == new_value {
-                // Writing the same value already in the cache -> redundant.
+            let cached_resolved = ctx.get_replacement(cached);
+            if cached_resolved == new_value {
                 return OptimizationResult::Remove;
             }
         }
@@ -1347,6 +1350,32 @@ impl Optimization for OptHeap {
         self.force_all_lazy(ctx);
         if let Some(postponed) = self.postponed_op.take() {
             ctx.emit(postponed);
+        }
+    }
+
+    fn flush_virtualizable(&mut self, ctx: &mut OptContext) {
+        let vable_keys: Vec<FieldKey> = self
+            .lazy_setfields
+            .iter()
+            .filter(|(_, op)| op.descr.as_ref().map_or(false, |d| d.is_virtualizable()))
+            .map(|(&k, _)| k)
+            .collect();
+        for key in vable_keys {
+            if let Some(mut op) = self.lazy_setfields.remove(&key) {
+                let value_ref = ctx.get_replacement(op.arg(1));
+                if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
+                    if info.is_virtual() {
+                        info.force_to_ops_direct(value_ref, ctx);
+                    }
+                }
+                for arg in op.args.iter_mut() {
+                    *arg = ctx.get_replacement(*arg);
+                }
+                let final_value = op.arg(1);
+                self.remember_field_descr(key, &op);
+                ctx.emit(op);
+                self.cached_fields.insert(key, final_value);
+            }
         }
     }
 

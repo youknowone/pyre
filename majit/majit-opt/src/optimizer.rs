@@ -798,6 +798,18 @@ impl Optimizer {
         result
     }
 
+    /// Flush only virtualizable lazy SetfieldGc ops from the heap pass.
+    /// Called before JUMP in Phase 2 (skip_flush=true) so compiled code
+    /// writes head/size to memory for guard failure recovery.
+    fn flush_virtualizable_lazy_sets(&mut self, ctx: &mut OptContext) {
+        for pass in &mut self.passes {
+            if pass.name() == "heap" {
+                pass.flush_virtualizable(ctx);
+                break;
+            }
+        }
+    }
+
     /// optimizer.py: flush()
     /// Flush all passes' postponed state.
     pub fn flush(&mut self, ctx: &mut OptContext) {
@@ -1185,6 +1197,10 @@ impl Optimizer {
         let mut last_op = None;
         for op in ops {
             if self.skip_flush && op.opcode == OpCode::Jump {
+                // Phase 2: virtualizable lazy sets must be emitted before
+                // JUMP so the compiled code writes head/size to memory.
+                // RPython: flush(flush=False) still forces virtualizable fields.
+                self.flush_virtualizable_lazy_sets(&mut ctx);
                 last_op = Some(op.clone());
                 break;
             }
