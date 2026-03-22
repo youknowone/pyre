@@ -127,18 +127,12 @@ impl Drop for BlackholeEntryGuard {
 /// Bump the JIT call depth. Returns a guard that restores the
 /// depth when dropped.
 ///
-/// PyPy interp_jit.py parity: only bump depth when actively tracing.
-/// When NOT tracing, inner function calls run eval_loop_jit with
-/// depth==0, allowing their own loops to independently warm up and
-/// compile with separate green keys — matching PyPy's is_recursive
-/// JitDriver behavior where each (pycode, next_instr) gets its own
-/// compiled loop.
+/// RPython parity: track call depth unconditionally. jit_merge_point
+/// (which only runs at depth 0) is gated by is_tracing_key, so
+/// nested calls don't interfere with tracing. The depth prevents
+/// re-entrant jit_merge_point during concrete execution.
 #[inline]
 pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
-    // RPython parity: track call depth unconditionally so that
-    // jit_merge_point (which only runs at depth 0) is not entered
-    // for nested function calls. Only the outermost portal level
-    // should run the JIT dispatch loop.
     JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
     Some(JitCallDepthGuard)
 }
