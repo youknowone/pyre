@@ -7661,8 +7661,8 @@ impl Drop for CraneliftBackend {
         for trace_id in std::mem::take(&mut self.registered_call_assembler_bridge_traces) {
             unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(trace_id));
         }
-        CALL_ASSEMBLER_DEADFRAMES.with(|map| map.borrow_mut().clear());
-        NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.with(|cell| cell.set(1));
+        let _ = CALL_ASSEMBLER_DEADFRAMES.try_with(|map| map.borrow_mut().clear());
+        let _ = NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.try_with(|cell| cell.set(1));
         if let Some(runtime_id) = self.gc_runtime_id.take() {
             unregister_gc_runtime(runtime_id);
         }

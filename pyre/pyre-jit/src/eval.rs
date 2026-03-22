@@ -678,6 +678,10 @@ fn materialize_recovery_virtuals(
         }
         field_cursor += 2; // skip ob_type + intval
     }
+    // RPython resume.py parity: field values are stored separately from
+    // frame slots. Truncate consumed fields so restore_guard_failure_values
+    // does not count them as extra stack slots (inflating valuestackdepth).
+    typed.truncate(first_extra);
 }
 
 fn build_jit_state(
