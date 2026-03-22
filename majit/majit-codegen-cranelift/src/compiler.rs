@@ -3897,13 +3897,18 @@ impl CraneliftBackend {
     /// Shared by `execute_token` (after Value→i64 conversion) and
     /// `execute_token_ints` (direct pass-through).
     fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
+        // RPython parity: bridge JUMP → loop re-entry uses a loop instead
+        // of recursive calls, matching RPython's inline jmp within the same
+        // code buffer. Avoids stack growth on repeated bridge → re-enter cycles.
+        let mut current_inputs = inputs.to_vec();
+        loop {
         let (fail_index, outputs, handle, force_frame) = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
             compiled.gc_runtime_id,
             compiled.num_ref_roots,
             compiled.max_output_slots,
-            inputs,
+            &current_inputs,
             compiled.needs_force_frame,
         );
 
@@ -3916,7 +3921,7 @@ impl CraneliftBackend {
                 compiled.header_pc,
                 None,
                 &compiled.input_types,
-                inputs,
+                &current_inputs,
                 compiled.caller_prefix_layout.as_ref(),
             );
         }
@@ -3931,6 +3936,9 @@ impl CraneliftBackend {
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
             if bridge.loop_reentry {
+                // Bridge JUMP → loop re-entry: execute bridge, extract
+                // outputs, loop back to re-enter compiled code directly
+                // (like RPython's inline jmp to the loop header).
                 let bridge_frame = Self::execute_bridge(
                     bridge, &outputs, &fail_descr.fail_arg_types,
                 );
@@ -3939,11 +3947,10 @@ impl CraneliftBackend {
                     .expect("bridge deadframe must have descriptor");
                 if bridge_descr.is_finish() {
                     let num_outputs = bridge_descr.fail_arg_types().len();
-                    let reentry_inputs: Vec<i64> = (0..num_outputs)
+                    current_inputs = (0..num_outputs)
                         .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
                         .collect();
-                    // Re-enter the parent loop with bridge output values.
-                    return Self::execute_with_inputs(compiled, &reentry_inputs);
+                    continue; // re-enter loop
                 }
                 return bridge_frame;
             }
@@ -3961,7 +3968,7 @@ impl CraneliftBackend {
             release_force_token(handle);
         }
 
-        DeadFrame {
+        return DeadFrame {
             data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
                 fail_descr.clone(),
@@ -3970,7 +3977,8 @@ impl CraneliftBackend {
                 exception_class,
                 (!exception.is_null()).then_some(exception),
             )),
-        }
+        };
+        } // end loop
     }
 
     ///
