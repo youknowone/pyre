@@ -1293,9 +1293,26 @@ impl<M: Clone> MetaInterp<M> {
         // GUARD_NOT_INVALIDATED before the closing JUMP. fail_args = jump_args
         // so guard failure restores the same state as the JUMP target.
         {
-            let descr = crate::fail_descr::make_fail_descr(jump_args.len());
+            // Use the last guard's fail_args and types for GUARD_NOT_INVALIDATED.
+            // This ensures resume_pc and correct Ref types are preserved.
+            // RPython: GUARD_NOT_INVALIDATED shares resume state with nearby guards.
+            let (gni_fail_args, gni_types) = recorder
+                .ops()
+                .iter()
+                .rev()
+                .find_map(|op| {
+                    if !op.opcode.is_guard() {
+                        return None;
+                    }
+                    let descr = op.descr.as_ref()?;
+                    let fd = descr.as_fail_descr()?;
+                    let fa = op.fail_args.as_ref()?;
+                    Some((fa.to_vec(), fd.fail_arg_types().to_vec()))
+                })
+                .unwrap_or_else(|| (jump_args.to_vec(), vec![Type::Int; jump_args.len()]));
+            let descr = crate::fail_descr::make_fail_descr_typed(gni_types);
             recorder.record_guard_with_fail_args(
-                OpCode::GuardNotInvalidated, &[], descr, jump_args,
+                OpCode::GuardNotInvalidated, &[], descr, &gni_fail_args,
             );
         }
         recorder.close_loop(jump_args);

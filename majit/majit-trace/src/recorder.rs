@@ -254,6 +254,11 @@ impl Trace {
         self.ops.iter().filter(|op| op.opcode.is_guard()).count()
     }
 
+    /// Access the recorded operations.
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
     /// Get the last recorded operation, if any.
     pub fn last_op(&self) -> Option<&Op> {
         self.ops.last()
