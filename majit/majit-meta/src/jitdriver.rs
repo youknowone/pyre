@@ -1700,7 +1700,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-        on_guard_failure: impl Fn(&mut S, &S::Meta, &[i64], &crate::compile::CompiledExitLayout) -> Option<usize>,
+        on_guard_failure: impl FnOnce(&mut S, &S::Meta, &[i64], &crate::compile::CompiledExitLayout) -> Option<usize>,
     ) -> Option<usize> {
         if self.is_tracing() || !state.can_trace() {
             return None;
@@ -1796,37 +1796,6 @@ impl<S: JitState> JitDriver<S> {
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
                 );
                 return Some(resume_pc);
-            }
-            return None;
-        }
-
-        // Bridge-to-loop re-entry: when the guard failure comes from a bridge
-        // trace (not root), restore state and re-enter compiled code directly
-        // instead of returning to the interpreter. This eliminates the
-        // interpreter round-trip for bridge guard failures.
-        let root_trace_id = self.meta.get_root_trace_id(key_hash);
-        let is_bridge_guard = root_trace_id.is_some_and(|root| trace_id != root);
-        if is_bridge_guard {
-            if let Some(_resume_pc) = on_guard_failure(state, &result_meta, &raw_values, &exit_layout) {
-                self.sync_after(state, &result_meta, descriptor.as_ref());
-                // Re-enter compiled code if state is still compatible
-                if let Some(meta) = self.meta.get_compiled_meta(key_hash) {
-                    if state.is_compatible(meta) {
-                        let meta = meta.clone();
-                        let nd = self.driver_descriptor_for(state, &meta);
-                        if self.sync_before(state, &meta, nd.as_ref()) {
-                            let nl = state.extract_live_values(&meta);
-                            if Self::live_values_match_descriptor(nd.as_ref(), &nl) {
-                                if let Some(v) = self.extend_compiled_live_values(
-                                    key_hash, state, &meta, nd.as_ref(), nl) {
-                                    live_values = v;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-                return Some(target_pc);
             }
             return None;
         }
