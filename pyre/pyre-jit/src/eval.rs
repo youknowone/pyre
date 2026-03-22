@@ -284,9 +284,9 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 continue;
             }
         }
-        match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
-            StepResult::Continue => {}
-            StepResult::CloseLoop { loop_header_pc, .. } if is_portal => {
+        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+            Ok(StepResult::Continue) => {}
+            Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // Thin inline: counter tick only. Heavy logic in cold helper.
                 let green_key = make_green_key(frame.code, loop_header_pc);
@@ -300,9 +300,15 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     driver.meta_interp_mut().warm_state_mut().counter.reset(green_key);
                 }
             }
-            StepResult::CloseLoop { .. } => {}
-            StepResult::Return(result) => return Ok(result),
-            StepResult::Yield(result) => return Ok(result),
+            Ok(StepResult::CloseLoop { .. }) => {}
+            Ok(StepResult::Return(result)) => return Ok(result),
+            Ok(StepResult::Yield(result)) => return Ok(result),
+            Err(err) => {
+                if pyre_interp::eval::handle_exception(frame, &err) {
+                    continue;
+                }
+                return Err(err);
+            }
         }
     }
 }

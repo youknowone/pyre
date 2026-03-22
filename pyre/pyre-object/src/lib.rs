@@ -1,6 +1,7 @@
 pub mod boolobject;
 pub mod cellobject;
 pub mod dictobject;
+pub mod excobject;
 pub mod float_array;
 pub mod floatobject;
 pub mod int_array;
@@ -18,6 +19,7 @@ pub mod tupleobject;
 pub use boolobject::*;
 pub use cellobject::*;
 pub use dictobject::*;
+pub use excobject::*;
 pub use float_array::*;
 pub use floatobject::*;
 pub use int_array::*;
