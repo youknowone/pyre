@@ -1208,12 +1208,16 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         .unwrap_or_else(|| ctx.const_int(self.current_selected as i64));
                     let selected_ref = self.current_selected_ref
                         .unwrap_or(stack_ref);
-                    let fail_args = vec![stacksize, self.pool_ref, selected_val, selected_ref];
+                    // Include resume_pc (loop_header_pc) so restore_jit_guard_state
+                    // can return Some(resume_pc) → enables bridge compilation.
+                    let resume_pc = ctx.const_int(self.loop_header_pc as i64);
+                    let fail_args = vec![stacksize, self.pool_ref, selected_val, selected_ref, resume_pc];
                     let fail_types = vec![
                         majit_ir::Type::Int,
                         majit_ir::Type::Ref,
                         majit_ir::Type::Int,
                         majit_ir::Type::Ref,
+                        majit_ir::Type::Int,
                     ];
                     ctx.record_guard_typed_with_fail_args(
                         majit_ir::OpCode::GuardTrue,
