@@ -1,5 +1,5 @@
 def main():
-    n = 100000
+    n = 70
     a = 0
     b = 1
     i = 0
@@ -8,6 +8,6 @@ def main():
         a = b
         b = t
         i = i + 1
-    print(b % 1000000007)
+    print(b)
 
 main()

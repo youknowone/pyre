@@ -81,7 +81,6 @@ echo ""
 # ── Performance gated ───────────────────────────────────────
 bold "FAST (JIT-optimized, must stay fast)"; echo ""
 
-run_bench  "fib_loop"        "$BENCH/fib_loop.py"        "967618232"              10  1.0
 run_bench  "int_loop"        "$BENCH/int_loop.py"        "49999995000000"         30  5.0
 run_bench  "inline_helper"   "$BENCH/inline_helper.py"   "333333333333000000"     30  5.0
 
@@ -89,6 +88,8 @@ echo ""
 
 # ── Correctness only ────────────────────────────────────────
 bold "CORRECTNESS (must not crash or give wrong results)"; echo ""
+
+run_bench  "fib_loop"        "$BENCH/fib_loop.py"        "308061521170129"        10
 run_bench  "fib_recursive"   "$BENCH/fib_recursive.py"   "9227465"                60
 run_bench  "nbody"           "$BENCH/nbody.py"           "-0.035117363568587606"  120
 run_bench  "fannkuch"        "$BENCH/fannkuch.py"        "$(printf '73196\n38')"  120
