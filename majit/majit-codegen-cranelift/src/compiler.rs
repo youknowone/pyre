@@ -2862,6 +2862,21 @@ fn build_value_type_map(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, Type
                 result_type,
             );
         }
+        // Propagate optimizer-provided fail_arg_types to value_types.
+        // This ensures constant OpRefs typed as Ref by the optimizer
+        // (e.g., function pointers in GuardValue) are correctly typed
+        // in the backend's infer_fail_arg_types fallback.
+        if let Some(ref fat) = op.fail_arg_types {
+            if let Some(ref fa) = op.fail_args {
+                for (i, &opref) in fa.iter().enumerate() {
+                    if !opref.is_none() && !value_types.contains_key(&opref.0) {
+                        if let Some(&tp) = fat.get(i) {
+                            value_types.insert(opref.0, tp);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     value_types

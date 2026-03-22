@@ -1334,7 +1334,7 @@ impl<M: Clone> MetaInterp<M> {
         recorder.close_loop(jump_args);
         let trace = recorder.get_trace();
 
-        let mut constants = ctx.constants.into_inner();
+        let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = compile::fold_box_into_create_frame(
             trace.ops.clone(),
@@ -1367,6 +1367,7 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0);
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
+        unroll_opt.constant_types = constant_types;
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
@@ -1644,7 +1645,7 @@ impl<M: Clone> MetaInterp<M> {
         recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
         let trace = recorder.get_trace();
 
-        let mut constants = ctx.constants.into_inner();
+        let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = compile::fold_box_into_create_frame(
             trace.ops.clone(),
@@ -1659,6 +1660,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
+        optimizer.constant_types = constant_types;
         let optimized_ops = optimizer.optimize_with_constants_and_inputs(
             &trace_ops,
             &mut constants,

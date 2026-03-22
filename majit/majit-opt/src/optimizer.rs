@@ -46,6 +46,9 @@ pub struct Optimizer {
     /// In RPython this is `resume.ResumeDataLoopMemo`; here we use a simple
     /// HashMap since the full type lives in majit-meta (no circular dep).
     resumedata_memo_consts: std::collections::HashMap<i64, u32>,
+    /// Types of constant OpRefs from ConstantPool.constant_types.
+    /// Used to distinguish Ref constants from Int in guard fail_args.
+    pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython unroll.py: virtual structures found in JUMP args during preamble.
     /// Populated by OptVirtualize.export_virtual_for_preamble().
     pub exported_jump_virtuals: Vec<ExportedJumpVirtual>,
@@ -573,6 +576,7 @@ impl Optimizer {
             can_replace_guards: true,
             quasi_immutable_deps: std::collections::HashSet::new(),
             resumedata_memo_consts: std::collections::HashMap::new(),
+            constant_types: std::collections::HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             imported_virtuals: Vec::new(),
             exported_loop_state: None,
@@ -1789,6 +1793,38 @@ impl Optimizer {
             // encode_guard_virtuals records them as rd_virtuals metadata
             // for lazy reconstruction at guard failure time (resume.py).
             op = Self::encode_guard_virtuals(op, ctx);
+
+            // RPython parity: store fail_arg types using constant_types
+            // so the backend distinguishes Ref constants from Int.
+            if !self.constant_types.is_empty() {
+                if let Some(ref fa) = op.fail_args {
+                    let types: Vec<majit_ir::Type> = fa.iter().map(|opref| {
+                        if opref.is_none() {
+                            majit_ir::Type::Int
+                        } else if let Some(&tp) = self.constant_types.get(&opref.0) {
+                            tp
+                        } else if let Some(info) = ctx.get_ptr_info(*opref) {
+                            if matches!(info, crate::info::PtrInfo::NonNull | crate::info::PtrInfo::Instance(_)) {
+                                majit_ir::Type::Ref
+                            } else if info.is_virtual() {
+                                majit_ir::Type::Ref
+                            } else {
+                                // Check emitted ops for result type
+                                ctx.new_operations.iter()
+                                    .find(|o| o.pos == *opref)
+                                    .map(|o| o.result_type())
+                                    .unwrap_or(majit_ir::Type::Int)
+                            }
+                        } else {
+                            ctx.new_operations.iter()
+                                .find(|o| o.pos == *opref)
+                                .map(|o| o.result_type())
+                                .unwrap_or(majit_ir::Type::Int)
+                        }
+                    }).collect();
+                    op.fail_arg_types = Some(types);
+                }
+            }
 
             // optimizer.py:630-631: pendingfields → rd_pendingfields
             // resume.py:428-445: encode pending SetfieldGc/SetarrayitemGc

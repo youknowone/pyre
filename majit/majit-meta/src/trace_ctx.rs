@@ -206,6 +206,18 @@ impl TraceCtx {
         self.constants.get_or_insert(value)
     }
 
+    /// Get or create a Ref-typed constant OpRef.
+    /// RPython parity: Ref constants preserve their type so guard
+    /// fail_args are correctly typed during guard failure recovery.
+    pub fn const_ref(&mut self, value: i64) -> OpRef {
+        self.constants.get_or_insert_typed(value, majit_ir::Type::Ref)
+    }
+
+    /// Return the type of a constant OpRef, if recorded.
+    pub fn const_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
+        self.constants.constant_type(opref)
+    }
+
     /// Return the concrete value for a constant OpRef, if it is a pooled constant.
     pub fn const_value(&self, opref: OpRef) -> Option<i64> {
         self.constants.as_ref().get(&opref.0).copied()

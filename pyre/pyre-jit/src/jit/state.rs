@@ -1663,6 +1663,13 @@ impl TraceFrameState {
         self.record_guard(ctx, OpCode::GuardValue, &[value, expected]);
     }
 
+    /// Guard value == expected Ref constant (heap pointer).
+    /// Uses const_ref so guard fail_args preserve the Ref type.
+    pub(crate) fn guard_value_ref(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
+        let expected = ctx.const_ref(expected);
+        self.record_guard(ctx, OpCode::GuardValue, &[value, expected]);
+    }
+
     pub(crate) fn guard_nonnull(&mut self, ctx: &mut TraceCtx, value: OpRef) {
         self.record_guard(ctx, OpCode::GuardNonnull, &[value]);
     }
@@ -3044,7 +3051,7 @@ impl TraceFrameState {
                 let builtin_name = w_builtin_func_name(concrete_callable);
                 if args.len() == 1 {
                     self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64)
+                        this.guard_value_ref(ctx, callable, concrete_callable as i64)
                     });
                     if builtin_name == "type" {
                         return self.direct_type_value(callable, args[0]);
@@ -3057,22 +3064,22 @@ impl TraceFrameState {
                     }
                 } else if args.len() == 2 && builtin_name == "isinstance" {
                     self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64)
+                        this.guard_value_ref(ctx, callable, concrete_callable as i64)
                     });
                     return self.direct_isinstance_value(callable, args[0], args[1]);
                 } else if args.len() == 2 && builtin_name == "min" {
                     self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64)
+                        this.guard_value_ref(ctx, callable, concrete_callable as i64)
                     });
                     return self.direct_minmax_value(callable, args[0], args[1], false);
                 } else if args.len() == 2 && builtin_name == "max" {
                     self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64)
+                        this.guard_value_ref(ctx, callable, concrete_callable as i64)
                     });
                     return self.direct_minmax_value(callable, args[0], args[1], true);
                 }
                 return self.with_ctx(|this, ctx| {
-                    this.guard_value(ctx, callable, concrete_callable as i64);
+                    this.guard_value_ref(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
                     crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
                 });
@@ -3171,7 +3178,7 @@ impl TraceFrameState {
                 if callee_prefers_function_entry && !is_self_recursive {
                     let call_pc = self.fallthrough_pc.saturating_sub(1);
                     return self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64);
+                        this.guard_value_ref(ctx, callable, concrete_callable as i64);
                         let boxed_args = box_args_for_python_helper(this, ctx, args);
                         let result = crate::jit::helpers::emit_trace_call_known_function(
                             ctx,
@@ -3293,7 +3300,7 @@ impl TraceFrameState {
                     if nargs == 1 || crate::call_jit::callee_frame_helper(nargs).is_some() {
                         return self.with_ctx(|this, ctx| {
                             if !is_self_recursive {
-                                this.guard_value(ctx, callable, concrete_callable as i64);
+                                this.guard_value_ref(ctx, callable, concrete_callable as i64);
                             }
                             let self_recursive_raw_arg = if is_self_recursive
                                 && nargs == 1
@@ -3416,7 +3423,7 @@ impl TraceFrameState {
                         else {
                             let call_pc = self.fallthrough_pc.saturating_sub(1);
                             return self.with_ctx(|this, ctx| {
-                                this.guard_value(ctx, callable, concrete_callable as i64);
+                                this.guard_value_ref(ctx, callable, concrete_callable as i64);
                                 let result = crate::jit::helpers::emit_trace_call_known_function(
                                     ctx,
                                     this.frame(),
@@ -3446,7 +3453,7 @@ impl TraceFrameState {
                                 // Self-recursive: no callable guard needed (same function).
                                 // Non-self-recursive: guard on callable value.
                                 if !is_self_recursive {
-                                    this.guard_value(ctx, callable, concrete_callable as i64);
+                                    this.guard_value_ref(ctx, callable, concrete_callable as i64);
                                 }
                                 let callee_frame = if args.len() == 1 {
                                     let (helper, helper_arg_types) = one_arg_callee_frame_helper(
@@ -3557,7 +3564,7 @@ impl TraceFrameState {
 
                 let call_pc = self.fallthrough_pc.saturating_sub(1);
                 return self.with_ctx(|this, ctx| {
-                    this.guard_value(ctx, callable, concrete_callable as i64);
+                    this.guard_value_ref(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
                     let result = crate::jit::helpers::emit_trace_call_known_function(
                         ctx,
@@ -3586,7 +3593,7 @@ impl TraceFrameState {
         use pyre_interp::frame::PyFrame;
 
         self.with_ctx(|this, ctx| {
-            this.guard_value(ctx, callable, concrete_callable as i64);
+            this.guard_value_ref(ctx, callable, concrete_callable as i64);
         });
 
         let concrete_args: Vec<PyObjectRef> = (0..args.len())
@@ -3776,7 +3783,7 @@ impl TraceFrameState {
         let call_pc = self.fallthrough_pc.saturating_sub(1);
 
         let result = self.with_ctx(|this, ctx| {
-            this.guard_value(ctx, callable, concrete_callable as i64);
+            this.guard_value_ref(ctx, callable, concrete_callable as i64);
 
             if args.len() == 1 {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {

@@ -46,6 +46,8 @@ pub struct UnrollOptimizer {
     /// warmstate.py: max_retrace_guards parameter. If a compiled trace has
     /// more guards than this, retracing is permanently disabled.
     pub max_retrace_guards: u32,
+    /// Constant type hints from ConstantPool, propagated to inner Optimizer.
+    pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
 }
 
 impl UnrollOptimizer {
@@ -54,6 +56,7 @@ impl UnrollOptimizer {
             short_preamble: None,
             target_tokens: Vec::new(),
             retraced_count: 0,
+            constant_types: std::collections::HashMap::new(),
             retrace_limit: 5,
             max_retrace_guards: 15,
         }
@@ -170,6 +173,7 @@ impl UnrollOptimizer {
             Some(c) => crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone()),
             None => crate::optimizer::Optimizer::default_pipeline(),
         };
+        opt_p1.constant_types = self.constant_types.clone();
         // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
         // that only skips the final cleanup flush — JUMP-time force_all_lazy
         // still runs. In majit skip_flush also prevents JUMP lazy_set emit
@@ -224,6 +228,7 @@ impl UnrollOptimizer {
             Some(c) => crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone()),
             None => crate::optimizer::Optimizer::default_pipeline(),
         };
+        opt_p2.constant_types = self.constant_types.clone();
         opt_p2.imported_loop_state = Some(exported_state.clone());
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
