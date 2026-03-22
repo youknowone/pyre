@@ -17,6 +17,16 @@ use crate::resume::{
     ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary, ResumeLayoutSummary,
 };
 
+/// Resolve the type of an OpRef in guard fail_args.
+/// OpRef::NONE is a virtual slot placeholder (null GC ref).
+fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
+    if *opref == OpRef::NONE {
+        Type::Ref
+    } else {
+        value_types.get(&opref.0).copied().unwrap_or(Type::Int)
+    }
+}
+
 // ── Compilation result types (compile.py) ───────────────────────────────
 
 /// Static exit metadata for a compiled guard or finish point.
@@ -131,7 +141,7 @@ pub(crate) fn build_guard_metadata(
         } else if let Some(ref fail_args) = op.fail_args {
             fail_args
                 .iter()
-                .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                .map(|opref| fail_arg_type(opref, &value_types))
                 .collect()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
@@ -240,7 +250,7 @@ pub(crate) fn retag_fail_descrs_from_trace_types(
         } else if let Some(ref fail_args) = op.fail_args {
             fail_args
                 .iter()
-                .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                .map(|opref| fail_arg_type(opref, &value_types))
                 .collect()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
