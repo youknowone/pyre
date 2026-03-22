@@ -426,6 +426,17 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             || {},
             restore_guard_failure_for_loop,
         );
+        // RPython compile.py handle_fail parity: extract fail info
+        // before consuming outcome, for bridge compilation.
+        let guard_fail_info = match &outcome {
+            DetailedDriverRunOutcome::GuardFailure {
+                fail_index: Some(fi),
+                trace_id: Some(tid),
+                ..
+            } => Some((*fi, *tid)),
+            _ => None,
+        };
+
         {
             if majit_meta::majit_log_enabled() {
                 let kind = match &outcome {
@@ -466,10 +477,22 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 return Some(result);
             }
         }
+
+        // RPython compile.py:696 handle_fail parity: after guard-restored
+        // fallback, drain any pending bridge compile requests synchronously.
+        // RPython compiles bridges inside handle_fail before returning to
+        // the interpreter. In pyre, requests are queued by
+        // request_pending_bridge_compile in the Cranelift backend; drain
+        // them here so the bridge is ready before the next compiled entry.
+        if let Some((fail_index, trace_id)) = guard_fail_info {
+            let pending = majit_codegen_cranelift::take_pending_bridge_compile();
+            for (gk, tid, fi) in pending {
+                crate::call_jit::jit_bridge_compile_for_guard(gk, tid, fi);
+            }
+        }
+
         // After compiled code guard-restored fallback, re-establish the
-        // frame's array pointer. Compiled code may have read the ptr field
-        // but virtualizable sync does not write it; however fix_array_ptrs
-        // ensures inline-mode consistency for the interpreter.
+        // frame's array pointer.
         frame.fix_array_ptrs();
         return None;
     }

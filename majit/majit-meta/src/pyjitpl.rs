@@ -4155,6 +4155,10 @@ pub enum DetailedDriverRunOutcome {
     GuardFailure {
         restored: bool,
         via_blackhole: bool,
+        /// RPython compile.py handle_fail parity: fail_index and trace_id
+        /// for bridge compilation after guard failure.
+        fail_index: Option<u32>,
+        trace_id: Option<u64>,
     },
     Abort {
         restored: bool,
