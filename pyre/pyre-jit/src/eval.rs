@@ -94,7 +94,7 @@ pub(crate) fn has_finish_protocol_hint(green_key: u64) -> bool {
 
 /// RPython green_key = (pycode, next_instr).
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
-#[inline]
+#[inline(always)]
 pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> u64 {
     (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
@@ -194,14 +194,11 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     if let Some(result) = try_function_entry_jit(frame) {
         return result;
     }
-    // RPython portal_ptr(*args): the original interpreter function.
-    // At depth 0, eval_loop_jit adds jit_merge_point (PyPy interp_jit.py
-    // dispatch) and can_enter_jit (back-edge compilation).
-    // At depth > 0, use the plain interpreter directly — RPython's
-    // portal_ptr is the unmodified interpreter, not the JIT dispatch loop.
-    if JIT_CALL_DEPTH.with(|d| d.get()) > 0 {
-        return pyre_interp::eval::eval_loop_for_force(frame);
-    }
+    // RPython portal_ptr(*args): the interpreter with can_enter_jit
+    // at back-edges. jit_merge_point is guarded by depth==0 inside
+    // eval_loop_jit, so nested calls skip it automatically. Back-edge
+    // JIT (can_enter_jit / CloseLoop) works at any depth, matching
+    // RPython where portal_ptr always contains can_enter_jit.
     eval_loop_jit(frame)
 }
 
@@ -220,11 +217,19 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 ///
 /// Calls merge_point on EVERY iteration (PyPy line 85-87), not just
 /// when tracing. This matches PyPy's jit_merge_point placement.
+/// RPython interp_jit.py dispatch() parity.
+///
+/// The hot loop mirrors RPython's structure exactly:
+///   while True:
+///       jit_merge_point(...)      # thin inline check
+///       next_instr = handle_bytecode(...)
+///
+/// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     let code = unsafe { &*frame.code };
-
     let env = PyreEnv;
     let (driver, info) = driver_pair();
+    let is_portal: bool = &*code.obj_name != "<module>";
 
     loop {
         if frame.next_instr >= code.instructions.len() {
@@ -236,74 +241,40 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             return Ok(w_none());
         };
 
-        // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
-        //
-        // RPython interp_jit.py/warmspot.py: jit_merge_point runs at the
-        // dispatch-loop head, but can_enter_jit is rewritten to
-        // maybe_compile_and_run() and can also start tracing from a back-edge.
-        // Keep the loop-head merge point here, but let back-edges own their
-        // own tracing/compiled dispatch too.
-        // RPython parity: jit_merge_point is only in the portal function
-        // (interp_jit.py dispatch). Module-level code (<module>) does NOT
-        // have jit_merge_point — only user-defined functions do.
-        let is_portal: bool = {
-            let name: &str = &code.obj_name;
-            name != "<module>"
-        };
-        if is_portal && JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
-            let concrete_frame = frame as *mut PyFrame as usize;
-            let green_key = make_green_key(frame.code, pc);
-            let mut jit_state = build_jit_state(frame, info);
-            if let Some(outcome) = driver.jit_merge_point_keyed(
-                green_key,
-                pc,
-                &mut jit_state,
-                &env,
-                || {},
-                |ctx, sym| {
-                    JIT_TRACING.with(|t| t.set(true));
-                    let mut trace_frame = frame.snapshot_for_tracing();
-                    let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
-                    let _ = concrete_frame;
-                    trace_bytecode(ctx, sym, code, pc, trace_frame_ptr)
-                },
-            ) {
-                if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-                    return result;
-                }
-            }
-            if !driver.is_tracing() {
-                JIT_TRACING.with(|t| t.set(false));
+        // ── jit_merge_point (RPython interp_jit.py:85-87) ──
+        // RPython: jit_merge_point is in every dispatch() call.
+        // During concrete execution it's a no-op (JC_TRACING per-cell
+        // check). In pyre, trace_bytecode traces the entire loop in one
+        // call (unlike RPython's one-bytecode-at-a-time MetaInterp), so
+        // we gate on depth==0 to ensure single invocation per trace.
+        // is_tracing_key provides RPython's per-cell JC_TRACING check.
+        if is_portal
+            && JIT_CALL_DEPTH.with(|d| d.get()) == 0
+            && driver.is_tracing_key(make_green_key(frame.code, pc))
+        {
+            if let Some(result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+                return result;
             }
         }
 
-        // RPython perform_call()/finishframe() resumes the parent frame
-        // immediately after an inlined child returns. If tracing already
-        // concretely executed the CALL and advanced next_instr, do not replay
-        // or execute the original opcode again here.
-        if matches!(instruction, pyre_bytecode::bytecode::Instruction::Call { .. }) {
-            if frame.pending_inline_resume_pc == Some(pc) {
+        // ── inline replay (tracing bookkeeping) ──
+        if frame.pending_inline_resume_pc == Some(pc) {
+            if matches!(instruction, pyre_bytecode::bytecode::Instruction::Call { .. }) {
                 frame.pending_inline_resume_pc = None;
                 continue;
             }
         }
-
-        // RPython interp_jit.py places jit_merge_point at the dispatch-loop
-        // head, before any opcode-specific handoff. Keep replay-only CALL
-        // result delivery after jit_merge_point so loop headers at CALL sites
-        // still warm up under the same ownership as PyPy.
         if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
             if !frame.pending_inline_results.is_empty() {
                 frame.next_instr = pc + 1;
-                if pyre_interp::call::replay_pending_inline_call(
-                    frame,
-                    argc.get(op_arg) as usize,
-                ) {
+                if pyre_interp::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize) {
                     continue;
                 }
                 frame.next_instr = pc;
             }
         }
+
+        // ── handle_bytecode (RPython interp_jit.py:90) ──
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
         if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
@@ -314,70 +285,105 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
             StepResult::Continue => {}
             StepResult::CloseLoop { loop_header_pc, .. } if is_portal => {
-                let mut jit_state = build_jit_state(frame, info);
+                // ── can_enter_jit (RPython interp_jit.py:114) ──
+                // Thin inline: counter tick only. Heavy logic in cold helper.
                 let green_key = make_green_key(frame.code, loop_header_pc);
-                if majit_meta::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][root-backedge] enter key={} pc={} arg0={:?} has_compiled={}",
-                        green_key,
-                        loop_header_pc,
-                        debug_first_arg_int(frame),
-                        driver.has_compiled_loop(green_key)
-                    );
-                }
-                let outcome = if driver.has_compiled_loop(green_key) {
-                    Some(driver.run_compiled_detailed_with_bridge_keyed(
-                        green_key,
-                        loop_header_pc,
-                        &mut jit_state,
-                        &env,
-                        || {},
-                        restore_guard_failure_for_loop,
-                    ))
-                } else {
-                    driver.back_edge_or_run_compiled_keyed(
-                        green_key,
-                        loop_header_pc,
-                        &mut jit_state,
-                        &env,
-                        || {},
-                    )
-                };
-                if let Some(outcome) = outcome {
-                    if majit_meta::majit_log_enabled() {
-                        let kind = match &outcome {
-                            DetailedDriverRunOutcome::Finished { .. } => "finished",
-                            DetailedDriverRunOutcome::Jump { .. } => "jump",
-                            DetailedDriverRunOutcome::Abort { .. } => "abort",
-                            DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-                                "guard-restored"
-                            }
-                            DetailedDriverRunOutcome::GuardFailure {
-                                restored: false, ..
-                            } => "guard-unrestored",
-                        };
-                        eprintln!(
-                            "[jit][root-backedge] outcome key={} pc={} kind={}",
-                            green_key, loop_header_pc, kind
-                        );
-                    }
-                    if let Some(result) =
-                        handle_jit_outcome(outcome, &jit_state, frame, info, green_key)
-                    {
+                if driver.meta_interp_mut().warm_state_mut().counter.tick(green_key) && !driver.is_tracing() {
+                    if let Some(result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
                         return result;
                     }
                 }
-                if !driver.is_tracing() {
-                    JIT_TRACING.with(|t| t.set(false));
-                }
             }
-            StepResult::CloseLoop { .. } => {
-                // Non-portal (module-level) backedge — no JIT dispatch
-            }
+            StepResult::CloseLoop { .. } => {}
             StepResult::Return(result) => return Ok(result),
             StepResult::Yield(result) => return Ok(result),
         }
     }
+}
+
+/// RPython jit_merge_point slow path — only called when tracing is active.
+#[cold]
+#[inline(never)]
+fn jit_merge_point_hook(
+    frame: &mut PyFrame,
+    code: &pyre_bytecode::CodeObject,
+    pc: usize,
+    driver: &mut JitDriver<PyreJitState>,
+    info: &majit_meta::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
+) -> Option<PyResult> {
+    let concrete_frame = frame as *mut PyFrame as usize;
+    let green_key = make_green_key(frame.code, pc);
+    let mut jit_state = build_jit_state(frame, info);
+    if let Some(outcome) = driver.jit_merge_point_keyed(
+        green_key, pc, &mut jit_state, env, || {},
+        |ctx, sym| {
+            JIT_TRACING.with(|t| t.set(true));
+            let mut trace_frame = frame.snapshot_for_tracing();
+            let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
+            let _ = concrete_frame;
+            trace_bytecode(ctx, sym, code, pc, trace_frame_ptr)
+        },
+    ) {
+        if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+            return Some(result);
+        }
+    }
+    if !driver.is_tracing() {
+        JIT_TRACING.with(|t| t.set(false));
+    }
+    None
+}
+
+/// RPython can_enter_jit / maybe_compile_and_run slow path.
+/// Called only when counter threshold fires.
+#[cold]
+#[inline(never)]
+fn can_enter_jit_hook(
+    frame: &mut PyFrame,
+    green_key: u64,
+    loop_header_pc: usize,
+    driver: &mut JitDriver<PyreJitState>,
+    info: &majit_meta::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
+) -> Option<PyResult> {
+    let mut jit_state = build_jit_state(frame, info);
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][root-backedge] enter key={} pc={} arg0={:?} has_compiled={}",
+            green_key, loop_header_pc, debug_first_arg_int(frame),
+            driver.has_compiled_loop(green_key)
+        );
+    }
+    let outcome = if driver.has_compiled_loop(green_key) {
+        Some(driver.run_compiled_detailed_with_bridge_keyed(
+            green_key, loop_header_pc, &mut jit_state, env, || {},
+            restore_guard_failure_for_loop,
+        ))
+    } else {
+        driver.back_edge_or_run_compiled_keyed(
+            green_key, loop_header_pc, &mut jit_state, env, || {},
+        )
+    };
+    if let Some(outcome) = outcome {
+        if majit_meta::majit_log_enabled() {
+            let kind = match &outcome {
+                DetailedDriverRunOutcome::Finished { .. } => "finished",
+                DetailedDriverRunOutcome::Jump { .. } => "jump",
+                DetailedDriverRunOutcome::Abort { .. } => "abort",
+                DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => "guard-restored",
+                DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
+            };
+            eprintln!("[jit][root-backedge] outcome key={} pc={} kind={}", green_key, loop_header_pc, kind);
+        }
+        if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+            return Some(result);
+        }
+    }
+    if !driver.is_tracing() {
+        JIT_TRACING.with(|t| t.set(false));
+    }
+    None
 }
 
 /// RPython warmstate.py maybe_compile_and_run parity.

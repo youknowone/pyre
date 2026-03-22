@@ -207,8 +207,8 @@ pub struct JitStats {
 }
 
 pub struct WarmEnterState {
-    /// Global hot counter.
-    counter: JitCounter,
+    /// Global hot counter (RPython jitcounter timetable).
+    pub counter: JitCounter,
     /// Per-greenkey cells, keyed by the hash of the green key.
     cells: HashMap<u64, BaseJitCell>,
     /// Compilation threshold (copied from counter for easy access).

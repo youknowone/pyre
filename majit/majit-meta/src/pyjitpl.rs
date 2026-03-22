@@ -1250,6 +1250,16 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing.is_some()
     }
 
+    /// RPython JC_TRACING parity: check if we are currently tracing
+    /// this specific green key. Returns false for different green keys,
+    /// matching RPython's per-cell JC_TRACING flag.
+    #[inline]
+    pub fn is_tracing_key(&self, green_key: u64) -> bool {
+        self.tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.green_key == green_key || ctx.root_green_key() == green_key)
+    }
+
     /// Finish the current active trace without optimizing or compiling it.
     ///
     /// This is a semantic-seam helper for parity tests: it lets callers

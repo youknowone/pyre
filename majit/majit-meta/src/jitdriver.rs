@@ -334,6 +334,12 @@ impl<S: JitState> JitDriver<S> {
         self.meta.is_tracing()
     }
 
+    /// RPython JC_TRACING parity: true only when tracing this specific key.
+    #[inline]
+    pub fn is_tracing_key(&self, green_key: u64) -> bool {
+        self.meta.is_tracing_key(green_key)
+    }
+
     /// Whether the driver is currently tracing a bridge.
     #[inline]
     pub fn is_bridge_tracing(&self) -> bool {
@@ -622,7 +628,7 @@ impl<S: JitState> JitDriver<S> {
     /// and compiled-code entry belong to `can_enter_jit`/function-entry paths.
     pub fn jit_merge_point_keyed<F>(
         &mut self,
-        _green_key: u64,
+        green_key: u64,
         _target_pc: usize,
         _state: &mut S,
         _env: &S::Env,
@@ -632,7 +638,11 @@ impl<S: JitState> JitDriver<S> {
     where
         F: FnOnce(&mut TraceCtx, &mut S::Sym) -> TraceAction,
     {
-        if self.meta.is_tracing() {
+        // RPython JC_TRACING parity: only feed the trace when the
+        // green key matches the active trace. Nested calls with
+        // different green keys are ignored, matching RPython's
+        // per-cell JC_TRACING flag in maybe_compile_and_run.
+        if self.meta.is_tracing_key(green_key) {
             self.merge_point(trace_fn);
         }
         None
