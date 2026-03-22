@@ -1879,6 +1879,26 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     let bridge_guard = fail_descr.bridge.lock().unwrap();
     if let Some(ref bridge) = *bridge_guard {
         release_force_token(handle);
+        if bridge.loop_reentry {
+            // RPython parity: bridge JUMP → loop re-entry.
+            // Execute bridge, extract output values, re-enter parent loop.
+            let bridge_frame = CraneliftBackend::execute_bridge(
+                bridge, &outputs, &fail_descr.fail_arg_types,
+            );
+            drop(bridge_guard);
+            let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
+                .expect("bridge deadframe must have descriptor");
+            if bridge_descr.is_finish() {
+                // Bridge's JUMP was lowered to Finish — extract outputs
+                // and re-enter the parent loop with those values.
+                let num_outputs = bridge_descr.fail_arg_types().len();
+                let reentry_inputs: Vec<i64> = (0..num_outputs)
+                    .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
+                    .collect();
+                return execute_registered_loop_target(target, &reentry_inputs);
+            }
+            return bridge_frame;
+        }
         return CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
     }
     drop(bridge_guard);
@@ -3910,6 +3930,23 @@ impl CraneliftBackend {
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
+            if bridge.loop_reentry {
+                let bridge_frame = Self::execute_bridge(
+                    bridge, &outputs, &fail_descr.fail_arg_types,
+                );
+                drop(bridge_guard);
+                let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
+                    .expect("bridge deadframe must have descriptor");
+                if bridge_descr.is_finish() {
+                    let num_outputs = bridge_descr.fail_arg_types().len();
+                    let reentry_inputs: Vec<i64> = (0..num_outputs)
+                        .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
+                        .collect();
+                    // Re-enter the parent loop with bridge output values.
+                    return Self::execute_with_inputs(compiled, &reentry_inputs);
+                }
+                return bridge_frame;
+            }
             return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
         }
         drop(bridge_guard);
@@ -6582,9 +6619,18 @@ impl CraneliftBackend {
                     let target_block = op
                         .descr
                         .as_ref()
-                        .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied())
-                        .unwrap_or(loop_block);
-                    builder.ins().jump(target_block, &vals);
+                        .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied());
+                    if let Some(target_block) = target_block {
+                        // Internal JUMP — same function
+                        builder.ins().jump(target_block, &vals);
+                    } else {
+                        // External JUMP (bridge → loop body) — emit as
+                        // Finish exit. The dispatcher will re-enter the
+                        // target loop with these output values.
+                        let info = &guard_infos[guard_idx];
+                        guard_idx += 1;
+                        emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    }
                 }
 
                 OpCode::Finish => {
@@ -7560,14 +7606,17 @@ fn collect_guards(
     for (op_idx, op) in ops.iter().enumerate() {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
+        // External JUMP (bridge → loop body) is lowered to Finish exit.
+        let is_external_jump = op.opcode == OpCode::Jump
+            && op.descr.as_ref().map_or(false, |d| d.index() > 0);
 
-        if !is_guard && !is_finish {
+        if !is_guard && !is_finish && !is_external_jump {
             continue;
         }
 
         let fail_index = fail_descrs.len() as u32;
 
-        let (fail_arg_refs, fail_arg_types) = if is_finish {
+        let (fail_arg_refs, fail_arg_types) = if is_finish || is_external_jump {
             let refs: Vec<OpRef> = op.args.iter().copied().collect();
             // Use the descriptor's explicit types for FINISH args — these are
             // set by the tracer and represent the caller's view of the return
@@ -7695,7 +7744,7 @@ fn collect_guards(
             fail_index,
             trace_id,
             fail_arg_types,
-            is_finish,
+            is_finish || is_external_jump,
             force_token_slots,
             recovery_layout,
         );
@@ -7916,7 +7965,10 @@ impl majit_codegen::Backend for CraneliftBackend {
             fail_descrs: compiled.fail_descrs,
             terminal_exit_layouts: compiled.terminal_exit_layouts,
             gc_runtime_id: compiled.gc_runtime_id,
-            loop_reentry: false,
+            // RPython parity: bridge ending with JUMP to loop body needs
+            // re-entry dispatch instead of returning to interpreter.
+            loop_reentry: ops.last().map_or(false, |op| op.opcode == OpCode::Jump
+                && op.descr.as_ref().map_or(false, |d| d.index() > 0)),
             num_inputs: compiled.num_inputs,
             num_ref_roots: compiled.num_ref_roots,
             max_output_slots: compiled.max_output_slots,
