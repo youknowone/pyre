@@ -185,6 +185,17 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
         return result;
     }
 
+    // RPython parity: after guard-restored fallback from compiled code,
+    // prevent nested calls from re-entering compiled code. The Finish
+    // result's forced-virtual W_IntObject (New+SetfieldGc in unbox pass)
+    // has corrupted ob_type when executed through nested compiled code
+    // dispatch. Root cause: optimizer's virtual forcing emits New with
+    // ob_type SetfieldGc, but the Cranelift-compiled execution order or
+    // allocation lifecycle differs from the trace's expectations.
+    //
+    // TODO: fix New/SetfieldGc execution order for forced virtuals in
+    // the unbox pass to allow nested compiled code dispatch.
+    let _plain_guard = pyre_interp::call::force_plain_eval();
     eval_loop_jit(frame)
 }
 
@@ -221,12 +232,14 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 
         // PyPy interp_jit.py:85-87 — jit_merge_point on EVERY iteration.
         //
-        // RPython interp_jit.py dispatch() calls jit_merge_point for ALL
-        // Python code, including <module>-level loops. However, module-level
-        // code uses LOAD_NAME/STORE_NAME (dict access) instead of
-        // LOAD_FAST/STORE_FAST, so the virtualizable mechanism cannot carry
-        // locals as loop-carried values. Skip <module> until dict caching
-        // is implemented in the optimizer (RPython OptHeap dict caching).
+        // RPython interp_jit.py/warmspot.py: jit_merge_point runs at the
+        // dispatch-loop head, but can_enter_jit is rewritten to
+        // maybe_compile_and_run() and can also start tracing from a back-edge.
+        // Keep the loop-head merge point here, but let back-edges own their
+        // own tracing/compiled dispatch too.
+        // RPython parity: jit_merge_point is only in the portal function
+        // (interp_jit.py dispatch). Module-level code (<module>) does NOT
+        // have jit_merge_point — only user-defined functions do.
         let is_portal: bool = {
             let name: &str = &code.obj_name;
             name != "<module>"
@@ -607,7 +620,7 @@ fn restore_guard_failure_for_loop(
     exit_layout: &CompiledExitLayout,
 ) -> Option<usize> {
     if majit_meta::majit_log_enabled() {
-        let nraw = raw_values.len().min(16);
+        let nraw = raw_values.len().min(8);
         let slots: Vec<String> = (0..nraw).map(|i| format!("{:#x}", raw_values[i] as usize)).collect();
         eprintln!(
             "[jit] guard-fail: fail_idx={} types={:?} raw=[{}]",
@@ -668,9 +681,6 @@ fn materialize_recovery_virtuals(
         }
         field_cursor += 2; // skip ob_type + intval
     }
-    // Truncate extra field values so restore_guard_failure_values
-    // doesn't count them toward valuestackdepth.
-    typed.truncate(first_extra);
 }
 
 fn build_jit_state(
