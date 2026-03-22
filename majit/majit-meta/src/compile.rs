@@ -167,10 +167,35 @@ pub(crate) fn build_guard_metadata(
                     }).collect(),
                 }
             }).collect();
+            // Convert op.rd_pendingfields to ExitPendingFieldLayout
+            let pending_field_layouts = op.rd_pendingfields.as_ref().map(|entries| {
+                entries.iter().filter_map(|entry| {
+                    let fail_args = op.fail_args.as_ref()?;
+                    // Find target and value in fail_args
+                    let target_idx = fail_args.iter().position(|&a| a == entry.target)?;
+                    let value_idx = fail_args.iter().position(|&a| a == entry.value);
+                    let target = ExitValueSourceLayout::ExitValue(target_idx);
+                    let value = match value_idx {
+                        Some(idx) => ExitValueSourceLayout::ExitValue(idx),
+                        None => {
+                            // Value might be a constant
+                            ExitValueSourceLayout::Constant(entry.value.0 as i64)
+                        }
+                    };
+                    Some(majit_codegen::ExitPendingFieldLayout {
+                        descr_index: entry.descr_index,
+                        item_index: if entry.item_index >= 0 { Some(entry.item_index as usize) } else { None },
+                        is_array_item: entry.item_index >= 0,
+                        target,
+                        value,
+                    })
+                }).collect()
+            }).unwrap_or_default();
+
             ExitRecoveryLayout {
                 frames: vec![],
                 virtual_layouts,
-                pending_field_layouts: vec![],
+                pending_field_layouts,
             }
         });
 
