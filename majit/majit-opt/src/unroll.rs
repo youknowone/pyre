@@ -211,10 +211,9 @@ impl UnrollOptimizer {
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[jit] preamble peeling: {} virtual(s), phase1 end_args={} next_iter_args={}",
+                "[jit] preamble peeling: {} virtual(s), phase1 end_args={}",
                 jump_virtuals.len(),
                 exported_state.end_args.len(),
-                exported_state.next_iteration_args.len(),
             );
         }
 
@@ -1044,7 +1043,7 @@ impl OptUnroll {
             .unwrap_or_else(|| end_args.clone());
         let mut es = ExportedState::new(
             label_args.clone(),
-            next_iter_args,
+            end_args,
             virtual_state,
             infos,
             exported_short_ops,
