@@ -887,6 +887,11 @@ pub fn install_jit_call_bridge() {
         majit_codegen_cranelift::register_call_assembler_blackhole(
             jit_blackhole_resume_from_guard,
         );
+        // RPython compile.py:714: bridge compilation on guard failure threshold.
+        // TODO: enable when jit_bridge_compile_for_guard produces correct
+        // results (currently returns wrong values for fib base case).
+        // let (driver, _) = crate::eval::driver_pair();
+        // driver.set_bridge_threshold_hook(...);
     });
 }
 

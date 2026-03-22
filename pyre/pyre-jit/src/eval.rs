@@ -226,7 +226,14 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // maybe_compile_and_run() and can also start tracing from a back-edge.
         // Keep the loop-head merge point here, but let back-edges own their
         // own tracing/compiled dispatch too.
-        if JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
+        // RPython parity: jit_merge_point is only in the portal function
+        // (interp_jit.py dispatch). Module-level code (<module>) does NOT
+        // have jit_merge_point — only user-defined functions do.
+        let is_portal: bool = {
+            let name: &str = &code.obj_name;
+            name != "<module>"
+        };
+        if is_portal && JIT_CALL_DEPTH.with(|d| d.get()) == 0 {
             let concrete_frame = frame as *mut PyFrame as usize;
             let green_key = make_green_key(frame.code, pc);
             let mut jit_state = build_jit_state(frame, info);
@@ -287,16 +294,9 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 continue;
             }
         }
-        if matches!(instruction, pyre_bytecode::bytecode::Instruction::BinaryOp { .. }) {
-            let top1 = if frame.valuestackdepth > 0 { frame.locals_cells_stack_w[frame.valuestackdepth - 1] as usize } else { 0 };
-            let top2 = if frame.valuestackdepth > 1 { frame.locals_cells_stack_w[frame.valuestackdepth - 2] as usize } else { 0 };
-            let t1_int = top1 >= 0x1000 && unsafe { pyre_object::pyobject::is_int(top1 as pyre_object::PyObjectRef) };
-            let t2_int = top2 >= 0x1000 && unsafe { pyre_object::pyobject::is_int(top2 as pyre_object::PyObjectRef) };
-            eprintln!("[BINOP] pc={} vsd={} top={:#x}(int={}) second={:#x}(int={})", pc, frame.valuestackdepth, top1, t1_int, top2, t2_int);
-        }
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr)? {
             StepResult::Continue => {}
-            StepResult::CloseLoop { loop_header_pc, .. } => {
+            StepResult::CloseLoop { loop_header_pc, .. } if is_portal => {
                 let mut jit_state = build_jit_state(frame, info);
                 let green_key = make_green_key(frame.code, loop_header_pc);
                 if majit_meta::majit_log_enabled() {
@@ -353,6 +353,9 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 if !driver.is_tracing() {
                     JIT_TRACING.with(|t| t.set(false));
                 }
+            }
+            StepResult::CloseLoop { .. } => {
+                // Non-portal (module-level) backedge — no JIT dispatch
             }
             StepResult::Return(result) => return Ok(result),
             StepResult::Yield(result) => return Ok(result),
