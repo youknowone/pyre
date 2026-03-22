@@ -326,11 +326,14 @@ impl OptHeap {
                 continue;
             }
             // heap.py:614-616: virtualizable fields are deferred to
-            // rd_pendingfields instead of force-emitted, since the backend
-            // materializes them on guard failure.
-            // TODO: re-enable virtualizable deferral when guard exit pending
-            // stores don't cause icache pressure (shared trampoline needed).
-            // For now, force all lazy sets at guards (SetfieldGc emitted).
+            // rd_pendingfields instead of force-emitted. The Rust-side guard
+            // failure path (execute_pending_field_writes) replays them using
+            // the field layout metadata on ExitPendingFieldLayout.
+            let is_vable = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
+            if is_vable {
+                pendingfields.push(op);
+                continue;
+            }
             // heap.py:621: cf.force_lazy_set(self, descr) — emit
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
