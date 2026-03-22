@@ -607,7 +607,7 @@ fn restore_guard_failure_for_loop(
     exit_layout: &CompiledExitLayout,
 ) -> Option<usize> {
     if majit_meta::majit_log_enabled() {
-        let nraw = raw_values.len().min(8);
+        let nraw = raw_values.len().min(16);
         let slots: Vec<String> = (0..nraw).map(|i| format!("{:#x}", raw_values[i] as usize)).collect();
         eprintln!(
             "[jit] guard-fail: fail_idx={} types={:?} raw=[{}]",
@@ -668,6 +668,9 @@ fn materialize_recovery_virtuals(
         }
         field_cursor += 2; // skip ob_type + intval
     }
+    // Truncate extra field values so restore_guard_failure_values
+    // doesn't count them toward valuestackdepth.
+    typed.truncate(first_extra);
 }
 
 fn build_jit_state(
