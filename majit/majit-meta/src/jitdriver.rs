@@ -1,3 +1,39 @@
+use majit_codegen::ExitValueSourceLayout;
+
+/// RPython resume.py:993-1007: materialize deferred virtualizable SetfieldGc.
+fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i64]) {
+    let Some(ref recovery) = exit_layout.recovery_layout else { return };
+    for pf in &recovery.pending_field_layouts {
+        let struct_ptr = match &pf.target {
+            ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() =>
+                raw_values[*slot] as *mut u8,
+            ExitValueSourceLayout::Constant(c) => *c as *mut u8,
+            _ => std::ptr::null_mut(),
+        };
+        let value = match &pf.value {
+            ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() =>
+                raw_values[*slot],
+            ExitValueSourceLayout::Constant(c) => *c,
+            _ => 0,
+        };
+        if struct_ptr.is_null() { continue; }
+        // Virtualizable field offsets from descriptor index encoding:
+        // 0x8000_0003 = head (offset 0), 0x8000_0004 = size (offset 8)
+        let (offset, size) = match pf.descr_index {
+            idx if idx & 0x8000_0000 != 0 => match idx {
+                0x8000_0003 => (0, 8),
+                0x8000_0004 => (8, 8),
+                _ => continue,
+            },
+            idx => ((idx >> 2) as usize, 8),
+        };
+        unsafe {
+            let p = struct_ptr.add(offset);
+            match size { 8 => *(p as *mut i64) = value, 4 => *(p as *mut i32) = value as i32, _ => {} }
+        }
+    }
+}
+
 use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
@@ -1791,6 +1827,7 @@ impl<S: JitState> JitDriver<S> {
             .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
         if should_bridge {
             if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values, &exit_layout) {
+                materialize_pending_fields(&exit_layout, &raw_values);
                 self.sync_after(state, &result_meta, descriptor.as_ref());
                 self.start_bridge_tracing(
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
@@ -1802,6 +1839,7 @@ impl<S: JitState> JitDriver<S> {
 
         let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
         if resume_pc.is_some() {
+            materialize_pending_fields(&exit_layout, &raw_values);
             self.sync_after(state, &result_meta, descriptor.as_ref());
         }
         return resume_pc;

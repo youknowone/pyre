@@ -329,12 +329,17 @@ impl OptHeap {
                 pendingfields.push(op);
                 continue;
             }
-            // heap.py:614-616: virtualizable fields are deferred to
-            // rd_pendingfields instead of force-emitted, since the backend
-            // materializes them on guard failure.
-            // TODO: re-enable virtualizable deferral when guard exit pending
-            // stores don't cause icache pressure (shared trampoline needed).
-            // For now, force all lazy sets at guards (SetfieldGc emitted).
+            // RPython parity (heap.py:614-616): virtualizable fields deferred
+            // to rd_pendingfields. Materialized via materialize_pending_fields
+            // in jitdriver.rs on guard failure.
+            let is_vable = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
+            if is_vable {
+                for arg in op.args.iter_mut() {
+                    *arg = ctx.get_replacement(*arg);
+                }
+                pendingfields.push(op);
+                continue;
+            }
             // heap.py:621: cf.force_lazy_set(self, descr) — emit
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
