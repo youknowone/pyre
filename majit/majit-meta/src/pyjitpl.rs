@@ -2963,7 +2963,11 @@ impl<M: Clone> MetaInterp<M> {
                 .unwrap()
                 .args
                 .to_vec();
-            if compiled.front_target_tokens.len() > 1 {
+            // RPython compile.py:1035-1038: inline_short_preamble is false
+            // only for ResumeAtPositionDescr guards. We don't have that
+            // distinction yet, so default to true.
+            let inline_short_preamble = true;
+            if inline_short_preamble && compiled.front_target_tokens.len() > 1 {
                 // RPython optimize_bridge (unroll.py:201-212):
                 // flush + force_box_for_end_of_preamble + jump_to_existing_trace
                 // Use the optimizer's final context (carries forwarding,
