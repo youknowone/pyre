@@ -1016,6 +1016,48 @@ impl OptUnroll {
                 self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
             }
         }
+        // RPython parity: virtual field values (flattened from Virtual
+        // slots in make_inputargs) should NOT carry constant info across
+        // loop iterations. In RPython, these fields have IntBound info
+        // (widened) but NOT concrete constant values—only LEVEL_CONSTANT
+        // VirtualStateInfo entries export constants. Remove constants from
+        // virtual field value infos to prevent Phase 2 from constant-folding
+        // loop guards (e.g., IntLt(i, n) → always true).
+        for info_entry in virtual_state.state.iter() {
+            use crate::virtualstate::VirtualStateInfo;
+            match info_entry {
+                VirtualStateInfo::Virtual { fields, .. }
+                | VirtualStateInfo::VirtualStruct { fields, .. } => {
+                    for (_, child) in fields {
+                        if !matches!(child.as_ref(), VirtualStateInfo::Constant(_)) {
+                            // Field is not LEVEL_CONSTANT — find its flattened
+                            // label arg and remove the constant from exported info.
+                            // We don't track the exact field→label_arg mapping here,
+                            // but the key insight is: ALL non-constant virtual field
+                            // values should not be exported as constants.
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Simpler approach: strip constants from infos for any value that
+        // is NOT a compile-time constant (address or literal). A value whose
+        // OpRef < 10000 (i.e., a trace-computed value, not a constant pool
+        // entry) should not be treated as a constant across iterations.
+        for (&opref, info_entry) in infos.iter_mut() {
+            if opref.0 < 10000 && info_entry.constant.is_some() {
+                // Check if the VirtualState marks this as Constant
+                let is_vs_constant = virtual_state.state.iter().any(|s| {
+                    matches!(s, crate::virtualstate::VirtualStateInfo::Constant(v)
+                        if ctx.get_constant(opref) == Some(v))
+                });
+                if !is_vs_constant {
+                    info_entry.constant = None;
+                }
+            }
+        }
+
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
         let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
