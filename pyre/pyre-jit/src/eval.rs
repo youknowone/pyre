@@ -488,7 +488,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if !should_trace {
         return None;
     }
-
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
     driver

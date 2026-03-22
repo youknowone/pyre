@@ -1137,8 +1137,15 @@ impl TraceFrameState {
             let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
             fa.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, idx));
         }
+        let is_vable = self.sym().vable_array_base.is_some();
         for (stack_idx, slot) in stack_values.into_iter().enumerate() {
-            let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
+            // RPython parity: virtualizable slots need Ref for fail_args.
+            // Force Ref slot_type so materialize_fail_arg_slot boxes raw Ints.
+            let slot_type = if is_vable {
+                Type::Ref
+            } else {
+                stack_types.get(stack_idx).copied().unwrap_or(Type::Ref)
+            };
             fa.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, nlocals + stack_idx));
         }
         fa
@@ -1191,16 +1198,12 @@ impl TraceFrameState {
             s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
         }
         s.symbolic_stack[stack_idx] = value;
-        // RPython parity: virtualizable array slots (including stack) are
-        // always GCREF (Ref). The optimizer may track unboxed Int/Float
-        // internally, but the fail_args/guard descriptors must use Ref so
-        // that guard-failure restoration can correctly re-box values for
-        // the Python interpreter frame.
-        s.symbolic_stack_types[stack_idx] = if s.vable_array_base.is_some() {
-            Type::Ref
-        } else {
-            value_type
-        };
+        // Keep the trace-level value type. RPython's virtualizable GCREF
+        // constraint is enforced at guard-failure time (build_single_frame_
+        // fail_arg_types forces Ref for all virtualizable slots), not in
+        // the symbolic type tracking. The tracer needs accurate types to
+        // avoid redundant GetfieldGcPureI on already-unboxed Int values.
+        s.symbolic_stack_types[stack_idx] = value_type;
         s.valuestackdepth += 1;
     }
 
