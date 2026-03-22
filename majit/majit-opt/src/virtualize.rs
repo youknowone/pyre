@@ -498,15 +498,17 @@ impl OptVirtualize {
         vinfo: VirtualInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        // Mark as no longer virtual FIRST (avoids infinite recursion on nested virtuals)
-        let placeholder = if let Some(class_ptr) = vinfo.known_class {
-            PtrInfo::KnownClass {
-                class_ptr,
-                is_nonnull: true,
-            }
-        } else {
-            PtrInfo::NonNull
-        };
+        // Mark as no longer virtual FIRST (avoids infinite recursion on nested virtuals).
+        // RPython info.py: after force_box, the ptr_info becomes an Instance
+        // (non-virtual) that RETAINS the field values. This allows subsequent
+        // GetfieldGcPureI on the forced ref to still read the cached field
+        // values without emitting a load from memory.
+        let placeholder = PtrInfo::Instance(crate::info::InstancePtrInfo {
+            descr: Some(vinfo.descr.clone()),
+            known_class: vinfo.known_class,
+            fields: vinfo.fields.clone(),
+            field_descrs: vinfo.field_descrs.clone(),
+        });
         ctx.set_ptr_info(opref, placeholder);
 
         // Emit the NEW_WITH_VTABLE
