@@ -550,10 +550,8 @@ impl VirtualState {
                 let resolved = ctx.get_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (field_idx, field_state) in fields {
-                    let field_ref = ptr_info
-                        .and_then(|info| info.get_field(*field_idx))
-                        // Fallback: use pre_force_field_refs if virtual was forced.
-                        // Try both resolved and original opref (force may forward).
+                    let from_info = ptr_info.and_then(|info| info.get_field(*field_idx));
+                    let field_ref = from_info
                         .or_else(|| {
                             ctx.pre_force_field_refs
                                 .get(&resolved)
@@ -565,6 +563,11 @@ impl VirtualState {
                                 })
                         })
                         .unwrap_or(OpRef::NONE);
+                    if std::env::var_os("MAJIT_LOG").is_some() && field_ref.is_none() {
+                        eprintln!("[jit] enum_forced: opref={:?} resolved={:?} field_idx={} from_info={} pre_force_keys={:?}",
+                            opref, resolved, field_idx, from_info.is_some(),
+                            ctx.pre_force_field_refs.keys().collect::<Vec<_>>());
+                    }
                     Self::enum_forced_boxes_for_entry(
                         field_state,
                         field_ref,

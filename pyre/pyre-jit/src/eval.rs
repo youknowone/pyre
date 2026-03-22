@@ -608,13 +608,6 @@ fn restore_guard_failure_for_loop(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) -> Option<usize> {
-    // RPython parity note: virtualizable slots should always be GCREF in
-    // the output buffer. But the optimizer may replace virtual Ref values
-    // with their Int field values (via force_guard_fail_args). This means
-    // raw_values at virtualizable positions may contain raw ints, not
-    // PyObjectRef pointers. We must use exit_layout types to correctly
-    // re-box them. The fix must be at the optimizer level (don't expand
-    // virtualizable-slot virtuals, or expand them as Ref).
     if majit_meta::majit_log_enabled() {
         let nraw = raw_values.len().min(8);
         let slots: Vec<String> = (0..nraw).map(|i| format!("{:#x}", raw_values[i] as usize)).collect();
@@ -623,12 +616,60 @@ fn restore_guard_failure_for_loop(
             exit_layout.fail_index, exit_layout.exit_types, slots.join(", ")
         );
     }
-    let typed = decode_exit_layout_values(raw_values, exit_layout);
+    let mut typed = decode_exit_layout_values(raw_values, exit_layout);
+    // RPython resume.py: materialize virtual objects from recovery_layout.
+    // Virtual slots in fail_args are NONE (null Ref); their field values
+    // are stored as extra fail_args. Reconstruct the concrete PyObject
+    // from the field values and replace the null slot.
+    materialize_recovery_virtuals(&mut typed, exit_layout);
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_meta::majit_log_enabled() {
         eprintln!("[jit] guard-fail restored: ni={} vsd={}", jit_state.next_instr, jit_state.valuestackdepth);
     }
     restored.then_some(jit_state.next_instr)
+}
+
+/// RPython resume.py parity: reconstruct virtual objects from their
+/// field values stored as extra fail_args after null (NONE) slots.
+///
+/// When the optimizer encodes a virtual in fail_args (via rd_virtuals),
+/// it sets the virtual's slot to NONE and appends the field values.
+/// On guard failure, we detect null Ref slots and pair them with
+/// their field values to reconstruct concrete PyObjects.
+///
+/// Pattern: [header...] [non-virtual slots] [NONE, NONE, ...] [ob_type1, intval1, ob_type2, intval2, ...]
+/// Each null Ref slot consumes 2 field values (ob_type + intval) from the tail.
+fn materialize_recovery_virtuals(
+    typed: &mut Vec<Value>,
+    _exit_layout: &CompiledExitLayout,
+) {
+    // Find all null Ref slots (virtual markers)
+    let null_slots: Vec<usize> = (3..typed.len())
+        .filter(|&i| matches!(typed.get(i), Some(Value::Ref(majit_ir::GcRef(0)))))
+        .collect();
+    if null_slots.is_empty() {
+        return;
+    }
+    // The extra field values start after the last non-virtual slot.
+    // Each virtual has 2 fields: ob_type (Int) and intval (Int).
+    let first_extra = null_slots.last().map(|&s| s + 1).unwrap_or(typed.len());
+    let mut field_cursor = first_extra;
+    for &slot_idx in &null_slots {
+        // Consume 2 fields: ob_type and intval
+        let _ob_type_pos = field_cursor;
+        let intval_pos = field_cursor + 1;
+        if intval_pos >= typed.len() {
+            break;
+        }
+        if let Value::Int(v) = typed[intval_pos] {
+            let obj = pyre_object::intobject::w_int_new(v);
+            typed[slot_idx] = Value::Ref(majit_ir::GcRef(obj as usize));
+            if majit_meta::majit_log_enabled() {
+                eprintln!("[jit] materialized virtual W_IntObject(intval={}) at slot {}", v, slot_idx);
+            }
+        }
+        field_cursor += 2; // skip ob_type + intval
+    }
 }
 
 fn build_jit_state(

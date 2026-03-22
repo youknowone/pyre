@@ -1982,6 +1982,9 @@ impl Optimization for OptVirtualize {
             // JUMP (no virtualizable) / FINISH — export virtuals for preamble
             // peeling, then force escaping values.
             OpCode::Jump => {
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!("[jit] OptVirtualize: JUMP (non-vable path)");
+                }
                 let mut jump_op = op.clone();
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
                     let resolved = ctx.get_replacement(*arg);
