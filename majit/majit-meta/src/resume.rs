@@ -494,6 +494,10 @@ impl PendingFieldLayoutSummary {
             value: self
                 .value
                 .to_exit_source(fail_arg_positions, virtual_offset),
+            // Field layout resolved via pending_field_write_layout at replay time.
+            field_offset: 0,
+            field_size: 0,
+            field_type: majit_ir::Type::Int,
         }
     }
 }
@@ -3693,6 +3697,9 @@ mod tests {
                 is_array_item: false,
                 target: ExitValueSourceLayout::ExitValue(0),
                 value: ExitValueSourceLayout::Constant(1),
+                field_offset: 0,
+                field_size: 0,
+                field_type: majit_ir::Type::Int,
             }],
         };
 
@@ -3729,6 +3736,9 @@ mod tests {
                 is_array_item: true,
                 target: ExitValueSourceLayout::Virtual(1),
                 value: ExitValueSourceLayout::ExitValue(1),
+                field_offset: 0,
+                field_size: 0,
+                field_type: majit_ir::Type::Int,
             }
         );
     }

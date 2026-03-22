@@ -3442,48 +3442,18 @@ fn emit_indirect_call_from_parts(
     }
 }
 
-/// Emit a guard side-exit: execute pending field stores, then store fail args
-/// to outputs_ptr and return fail_index.
+/// Emit a guard side-exit: store fail args to outputs_ptr and return fail_index.
 ///
-/// rd_pendingfields: deferred SETFIELD_GC / SETARRAYITEM_GC where the value
-/// was virtual at optimization time.  On guard failure the virtual has been
-/// materialized into fail_args, so we write the field value to memory here
-/// — before the trampoline returns — making heap state consistent for the
-/// interpreter.
+/// rd_pendingfields (deferred heap writes) are NOT emitted inline here.
+/// They are executed in the Rust-side guard failure path using the
+/// ExitPendingFieldLayout metadata on the recovery layout. This avoids
+/// per-guard code bloat when many guards share the same pending stores.
 fn emit_guard_exit(
     builder: &mut FunctionBuilder,
     constants: &HashMap<u32, i64>,
     outputs_ptr: CValue,
     info: &GuardInfo,
 ) {
-    // rd_pendingfields: emit deferred stores before saving fail_args.
-    for ps in &info.pending_stores {
-        let struct_ptr = resolve_opref(builder, constants, ps.target_ref);
-        let value = resolve_opref(builder, constants, ps.value_ref);
-        let addr = builder.ins().iadd_imm(struct_ptr, ps.field_offset as i64);
-        match ps.field_type {
-            Type::Float => {
-                let fval = builder.ins().bitcast(cl_types::F64, MemFlags::new(), value);
-                builder.ins().store(MemFlags::trusted(), fval, addr, 0);
-            }
-            Type::Int | Type::Ref => {
-                let mem_ty = match ps.field_size {
-                    1 => cl_types::I8,
-                    2 => cl_types::I16,
-                    4 => cl_types::I32,
-                    _ => cl_types::I64,
-                };
-                let store_val = if mem_ty == cl_types::I64 {
-                    value
-                } else {
-                    builder.ins().ireduce(mem_ty, value)
-                };
-                builder.ins().store(MemFlags::trusted(), store_val, addr, 0);
-            }
-            Type::Void => {}
-        }
-    }
-
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
         let val = resolve_opref(builder, constants, arg_ref);
         let offset = (slot as i32) * 8;
@@ -3666,27 +3636,9 @@ fn run_compiled_code(
     (fail_index, outputs, handle, force_frame)
 }
 
-/// Deferred field store to emit in the guard exit block.
-/// resume.py: rd_pendingfields — materialized as native stores before
-/// the guard failure trampoline returns.
-struct GuardPendingStore {
-    /// OpRef of the struct/array pointer.
-    target_ref: OpRef,
-    /// OpRef of the value to store.
-    value_ref: OpRef,
-    /// Byte offset into the struct.
-    field_offset: usize,
-    /// Size of the field in bytes.
-    field_size: usize,
-    /// Type of the stored value.
-    field_type: Type,
-}
-
 struct GuardInfo {
     fail_index: u32,
     fail_arg_refs: Vec<OpRef>,
-    /// Deferred heap writes to execute in the guard exit block.
-    pending_stores: Vec<GuardPendingStore>,
 }
 
 fn identity_recovery_layout(
@@ -7737,6 +7689,9 @@ fn collect_guards(
                         is_array_item: entry.item_index >= 0,
                         target,
                         value,
+                        field_offset: entry.field_offset,
+                        field_size: entry.field_size,
+                        field_type: entry.field_type,
                     });
             }
         }
@@ -7753,28 +7708,9 @@ fn collect_guards(
         let descr = Arc::new(descr);
         fail_descrs.push(descr);
 
-        // rd_pendingfields: collect deferred heap writes for guard exit emission.
-        let pending_stores = op
-            .rd_pendingfields
-            .as_ref()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| GuardPendingStore {
-                        target_ref: entry.target,
-                        value_ref: entry.value,
-                        field_offset: entry.field_offset,
-                        field_size: entry.field_size,
-                        field_type: entry.field_type,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
         guard_infos.push(GuardInfo {
             fail_index,
             fail_arg_refs,
-            pending_stores,
         });
     }
 
@@ -9380,6 +9316,9 @@ mod tests {
                 is_array_item: true,
                 target: majit_codegen::ExitValueSourceLayout::Virtual(0),
                 value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                field_offset: 0,
+                field_size: 0,
+                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 190, 0, source_layout.clone()));
@@ -9551,6 +9490,9 @@ mod tests {
                 is_array_item: true,
                 target: majit_codegen::ExitValueSourceLayout::Virtual(0),
                 value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                field_offset: 0,
+                field_size: 0,
+                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout));
@@ -9621,6 +9563,9 @@ mod tests {
                 is_array_item: true,
                 target: majit_codegen::ExitValueSourceLayout::Virtual(0),
                 value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                field_offset: 0,
+                field_size: 0,
+                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(
@@ -12995,6 +12940,9 @@ mod tests {
                 is_array_item: true,
                 target: ExitValueSourceLayout::Virtual(0),
                 value: ExitValueSourceLayout::Constant(22),
+                field_offset: 0,
+                field_size: 0,
+                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(
@@ -13055,6 +13003,9 @@ mod tests {
                 is_array_item: true,
                 target: ExitValueSourceLayout::Virtual(0),
                 value: ExitValueSourceLayout::Constant(44),
+                field_offset: 0,
+                field_size: 0,
+                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(
@@ -13154,6 +13105,9 @@ mod tests {
                 is_array_item: true,
                 target: ExitValueSourceLayout::Virtual(1),
                 value: ExitValueSourceLayout::Constant(22),
+                field_offset: 0,
+                field_size: 0,
+                field_type: Type::Int,
             }
         );
     }

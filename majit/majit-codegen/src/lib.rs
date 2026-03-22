@@ -190,6 +190,12 @@ pub struct ExitPendingFieldLayout {
     pub is_array_item: bool,
     pub target: ExitValueSourceLayout,
     pub value: ExitValueSourceLayout,
+    /// Byte offset into the target struct (for direct write without descriptor lookup).
+    pub field_offset: usize,
+    /// Size in bytes of the field (1/2/4/8).
+    pub field_size: usize,
+    /// Type of the stored value.
+    pub field_type: majit_ir::Type,
 }
 
 impl ExitPendingFieldLayout {
@@ -200,6 +206,9 @@ impl ExitPendingFieldLayout {
             is_array_item: self.is_array_item,
             target: self.target.shifted_virtuals(virtual_offset),
             value: self.value.shifted_virtuals(virtual_offset),
+            field_offset: self.field_offset,
+            field_size: self.field_size,
+            field_type: self.field_type,
         }
     }
 }
