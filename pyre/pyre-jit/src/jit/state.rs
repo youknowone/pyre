@@ -784,6 +784,10 @@ fn boxed_slot_value_from_runtime_kind(value: &Value) -> PyObjectRef {
     }
 }
 
+fn is_unavailable_resume_value(value: &Value) -> bool {
+    matches!(value, Value::Ref(majit_ir::GcRef(0)))
+}
+
 fn fail_arg_opref_for_typed_value(ctx: &mut TraceCtx, value: Value) -> OpRef {
     match value {
         Value::Int(v) => ctx.const_int(v),
@@ -5329,10 +5333,16 @@ impl JitState for PyreJitState {
             .get(1)
             .map(value_to_usize)
             .unwrap_or(self.next_instr);
-        self.valuestackdepth = values
+        let encoded_valuestackdepth = values
             .get(2)
             .map(value_to_usize)
             .unwrap_or(self.valuestackdepth);
+        let effective_restored_slot_count = values[3..]
+            .iter()
+            .rposition(|value| !is_unavailable_resume_value(value))
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        self.valuestackdepth = encoded_valuestackdepth.max(effective_restored_slot_count);
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
@@ -5343,7 +5353,7 @@ impl JitState for PyreJitState {
                 // this slot was not modified by compiled code. The value is
                 // output as null (0x0). In this case, keep the frame's
                 // existing local value — RPython reads it from virtualizable.
-                let is_none_slot = matches!(value, Value::Ref(majit_ir::GcRef(0)));
+                let is_none_slot = is_unavailable_resume_value(value);
                 if !is_none_slot {
                     let boxed = boxed_slot_value_from_runtime_kind(value);
                     let _ = self.set_local_at(local_idx, boxed);
@@ -5353,7 +5363,7 @@ impl JitState for PyreJitState {
         }
         for stack_idx in 0..stack_only {
             if let Some(value) = values.get(idx) {
-                let is_none_slot = matches!(value, Value::Ref(majit_ir::GcRef(0)));
+                let is_none_slot = is_unavailable_resume_value(value);
                 if !is_none_slot {
                     let boxed = boxed_slot_value_from_runtime_kind(value);
                     let _ = self.set_stack_at(stack_idx, boxed);
@@ -6054,6 +6064,66 @@ mod tests {
         ));
 
         assert_eq!(state.next_instr, 9);
+        assert_eq!(state.valuestackdepth, 4);
+        let restored_i = state.local_at(3).expect("local i should be restored");
+        assert!(unsafe { is_int(restored_i) });
+        assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
+    }
+
+    #[test]
+    fn test_restore_guard_failure_ignores_trailing_unavailable_resume_slots() {
+        use majit_ir::GcRef;
+        use pyre_bytecode::{compile_exec, ConstantData};
+        use pyre_interp::frame::PyFrame;
+
+        let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
+            .expect("test code should compile");
+        let code = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } if code.obj_name.as_str() == "f" => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("test source should contain function code");
+
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut state = PyreJitState {
+            frame: frame_ptr,
+            next_instr: 0,
+            valuestackdepth: 4,
+        };
+        let meta = PyreMeta {
+            merge_pc: 0,
+            num_locals: 4,
+            ns_keys: Vec::new(),
+            valuestackdepth: 4,
+            has_virtualizable: true,
+            slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+        };
+        let values = vec![
+            Value::Ref(GcRef(frame_ptr)),
+            Value::Int(127),
+            Value::Int(4),
+            Value::Ref(GcRef(w_int_new(1) as usize)),
+            Value::Ref(GcRef(w_int_new(2) as usize)),
+            Value::Ref(GcRef(w_int_new(3) as usize)),
+            Value::Int(7),
+            Value::Ref(GcRef(0)),
+            Value::Ref(GcRef(0)),
+        ];
+
+        assert!(<PyreJitState as JitState>::restore_guard_failure_values(
+            &mut state,
+            &meta,
+            &values,
+            &majit_meta::blackhole::ExceptionState::default(),
+        ));
+
+        assert_eq!(state.next_instr, 127);
         assert_eq!(state.valuestackdepth, 4);
         let restored_i = state.local_at(3).expect("local i should be restored");
         assert!(unsafe { is_int(restored_i) });
