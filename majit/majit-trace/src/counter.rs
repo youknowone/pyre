@@ -50,31 +50,46 @@ impl JitCounter {
     }
 
     /// Increment the counter for the given hash. Returns true if threshold is reached.
+    /// RPython counter.py tick: always_inline for the fast path (slot 0 hit).
+    #[inline(always)]
     pub fn tick(&mut self, hash: u64) -> bool {
         let base = (hash as usize) & TABLE_MASK;
 
-        // 5-way associative lookup
-        for i in 0..ASSOCIATIVITY {
+        // RPython counter.py tick / _tick_slowpath parity:
+        // 5-way associative lookup with MRU swap to slot 0.
+        // Found at slot 0 (fast path):
+        if self.table[base].0 == hash {
+            self.table[base].1 += 1;
+            return self.table[base].1 >= self.threshold;
+        }
+        // Slowpath: check slots 1..ASSOCIATIVITY
+        // RPython counter.py _tick_slowpath + _swap parity.
+        for i in 1..ASSOCIATIVITY {
             let idx = (base + i) & TABLE_MASK;
             if self.table[idx].0 == hash {
                 self.table[idx].1 += 1;
-                return self.table[idx].1 >= self.threshold;
+                let fired = self.table[idx].1 >= self.threshold;
+                // RPython _swap(p_entry, n): swap with slot n only if
+                // slot n has a lower count (conditional promotion).
+                let prev_idx = (base + i - 1) & TABLE_MASK;
+                if self.table[prev_idx].1 <= self.table[idx].1 {
+                    self.table.swap(idx, prev_idx);
+                }
+                return fired;
             }
         }
 
-        // Not found — find the entry with the lowest count to evict
-        let mut min_idx = base;
-        let mut min_count = self.table[base].1;
-        for i in 1..ASSOCIATIVITY {
+        // Not found — RPython: find first empty slot (count == 0),
+        // or use the last slot (n=4). Existing entries are preserved.
+        let mut insert_idx = (base + ASSOCIATIVITY - 1) & TABLE_MASK;
+        for i in (0..ASSOCIATIVITY).rev() {
             let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].1 < min_count {
-                min_count = self.table[idx].1;
-                min_idx = idx;
+            if self.table[idx].1 == 0 {
+                insert_idx = idx;
+                break;
             }
         }
-
-        // Evict and insert
-        self.table[min_idx] = (hash, 1);
+        self.table[insert_idx] = (hash, 1);
         false
     }
 
