@@ -1722,10 +1722,24 @@ impl Optimizer {
             ctx.in_final_emission = false;
         }
         if op.opcode.is_guard() {
-            // optimizer.py: store_final_boxes_in_guard — encode virtual
-            // objects in fail_args as rd_virtuals instead of forcing them.
-            // This runs at the optimizer level (not per-pass) so ALL guards
-            // get virtual encoding regardless of which pass emits them.
+            // Force any remaining virtual fail_args before encoding.
+            // RPython's resume data can materialize virtuals at runtime,
+            // but Cranelift backend cannot. Force them to concrete refs
+            // (New + SetfieldGc) so guard failure recovery gets valid objects.
+            if let Some(ref mut fa) = op.fail_args {
+                for arg in fa.iter_mut() {
+                    let resolved = ctx.get_replacement(*arg);
+                    if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
+                        if info.is_virtual() && !matches!(info, crate::info::PtrInfo::Virtualizable(_)) {
+                            let mut info_mut = info;
+                            let forced = info_mut.force_to_ops_direct(resolved, ctx);
+                            *arg = ctx.get_replacement(forced);
+                            continue;
+                        }
+                    }
+                    *arg = resolved;
+                }
+            }
             op = Self::encode_guard_virtuals(op, ctx);
 
             // optimizer.py:630-631: pendingfields → rd_pendingfields
