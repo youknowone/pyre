@@ -188,9 +188,6 @@ pub(crate) fn build_guard_metadata(
                         is_array_item: entry.item_index >= 0,
                         target,
                         value,
-                        field_offset: entry.field_offset,
-                        field_size: entry.field_size,
-                        field_type: entry.field_type,
                     })
                 }).collect()
             }).unwrap_or_default();
