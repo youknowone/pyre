@@ -1858,7 +1858,15 @@ impl Optimizer {
                 PtrInfo::Virtual(vinfo) => {
                     let mut fields = Vec::with_capacity(vinfo.fields.len());
                     for &(field_idx, value_ref) in &vinfo.fields {
-                        let final_ref = ctx.get_replacement(value_ref);
+                        let mut final_ref = ctx.get_replacement(value_ref);
+                        // Nested virtual field values must be forced to concrete.
+                        if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
+                            if nested.is_virtual() {
+                                let mut nested_mut = nested;
+                                let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
+                                final_ref = ctx.get_replacement(forced);
+                            }
+                        }
                         let fa_index = extra_start + extra_fail_args.len();
                         extra_fail_args.push(final_ref);
                         let descr_idx = vinfo
@@ -1880,7 +1888,15 @@ impl Optimizer {
                 PtrInfo::VirtualStruct(vinfo) => {
                     let mut fields = Vec::with_capacity(vinfo.fields.len());
                     for &(field_idx, value_ref) in &vinfo.fields {
-                        let final_ref = ctx.get_replacement(value_ref);
+                        let mut final_ref = ctx.get_replacement(value_ref);
+                        // Nested virtual field values must be forced to concrete.
+                        if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
+                            if nested.is_virtual() {
+                                let mut nested_mut = nested;
+                                let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
+                                final_ref = ctx.get_replacement(forced);
+                            }
+                        }
                         let fa_index = extra_start + extra_fail_args.len();
                         extra_fail_args.push(final_ref);
                         let descr_idx = vinfo
