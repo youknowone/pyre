@@ -1457,6 +1457,8 @@ impl<M: Clone> MetaInterp<M> {
         let mut token = JitCellToken::new(token_num);
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
+        let mut optimized_ops = optimized_ops;
+        compile::retag_fail_descrs_from_trace_types(&inputargs, &mut optimized_ops);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -1716,6 +1718,8 @@ impl<M: Clone> MetaInterp<M> {
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
+        let mut optimized_ops = optimized_ops;
+        compile::retag_fail_descrs_from_trace_types(&inputargs, &mut optimized_ops);
 
         match self
             .backend
@@ -2949,6 +2953,8 @@ impl<M: Clone> MetaInterp<M> {
             optimized_ops
         };
         let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut optimized_ops = optimized_ops;
+        compile::retag_fail_descrs_from_trace_types(bridge_inputargs, &mut optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();

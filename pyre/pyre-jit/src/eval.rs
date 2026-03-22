@@ -320,9 +320,6 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     );
                 }
                 let outcome = if driver.has_compiled_loop(green_key) {
-                    if majit_meta::majit_log_enabled() {
-                        eprintln!("[jit] ENTERING run_compiled_with_bridge key={}", green_key);
-                    }
                     Some(driver.run_compiled_detailed_with_bridge_keyed(
                         green_key,
                         loop_header_pc,

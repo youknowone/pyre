@@ -1324,15 +1324,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
         let live_values = state.extract_live_values(&meta);
-        if crate::majit_log_enabled() {
-            let vals: Vec<String> = live_values.iter().enumerate()
-                .map(|(i, v)| format!("[{}]={:?}", i, v)).collect();
-            eprintln!("[jit] BRIDGE live_values: {}", vals.join(", "));
-        }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] BRIDGE abort: live_values mismatch");
-            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
