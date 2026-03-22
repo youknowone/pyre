@@ -2442,6 +2442,31 @@ fn assemble_peeled_trace(
             }
         }
     }
+    // RPython parity: SameAs aliases from short preamble (e.g., v29 = SameAsI(v26))
+    // must map to the same label arg as their source. Phase 2 body may reference the
+    // alias directly. Only add to input_remap if the alias is actually referenced
+    // by a Phase 2 body op (to avoid interfering with pyre's different alias patterns).
+    {
+        let p2_refs: std::collections::HashSet<OpRef> = p2_ops
+            .iter()
+            .flat_map(|op| {
+                op.args.iter().copied().chain(
+                    op.fail_args
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|fa| fa.iter().copied()),
+                )
+            })
+            .collect();
+        for alias in imported_short_aliases {
+            if !p2_refs.contains(&alias.result) {
+                continue; // not referenced by body — skip
+            }
+            if let Some(&source_la) = input_remap.get(&alias.same_as_source) {
+                input_remap.entry(alias.result).or_insert(source_la);
+            }
+        }
+    }
     for (idx, op) in p2_ops.iter().enumerate() {
         if op.pos.0 != u32::MAX {
             let fresh = OpRef(next_body_pos);

@@ -1374,6 +1374,7 @@ impl<M: Clone> MetaInterp<M> {
                         eprintln!("[jit] abort trace at key={} (InvalidLoop during optimize)", green_key);
                     }
                     self.warm_state.abort_tracing(green_key, false);
+                    self.stats.loops_aborted += 1;
                     return;
                 }
                 std::panic::resume_unwind(payload);
@@ -2859,14 +2860,29 @@ impl<M: Clone> MetaInterp<M> {
             Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
         };
 
-        self.compile_bridge(
+        let ok = self.compile_bridge(
             green_key,
             fail_index,
             &*fail_descr,
             &trace.ops,
             &trace.inputargs,
             constants,
-        )
+        );
+        // Mark bridge as loop-closing so execute_with_inputs can re-enter
+        // the parent loop directly on Finish.
+        if ok {
+            let source_trace_id = fail_descr.trace_id();
+            if let Some(compiled) = self.compiled_loops.get(&green_key) {
+                let tid = if source_trace_id == 0 {
+                    compiled.root_trace_id
+                } else {
+                    source_trace_id
+                };
+                self.backend
+                    .mark_bridge_loop_reentry(&compiled.token, tid, fail_index);
+            }
+        }
+        ok
     }
 }
 
@@ -4578,7 +4594,9 @@ mod tests {
         let ctx = meta.trace_ctx().unwrap();
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes[1], new_val);
-        assert_eq!(ctx.recorder.num_ops(), 5);
+        // Virtualizable field writes are deferred to rd_pendingfields
+        // (RPython heap.py:614-616), so only 4 ops are emitted instead of 5.
+        assert_eq!(ctx.recorder.num_ops(), 4);
     }
 
     #[test]
