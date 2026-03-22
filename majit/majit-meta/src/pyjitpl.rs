@@ -4332,20 +4332,20 @@ mod tests {
             );
         }
         let trace_info = meta.backend.compiled_trace_info(&token, trace_id);
-        MetaInterp::<()>::enrich_guard_resume_layouts_for_trace(
+        compile::enrich_guard_resume_layouts_for_trace(
             &mut resume_data,
             &mut exit_layouts,
             trace_id,
             inputargs,
             trace_info.as_ref(),
         );
-        MetaInterp::<()>::patch_backend_guard_recovery_layouts_for_trace(
+        compile::patch_backend_guard_recovery_layouts_for_trace(
             &mut meta.backend,
             &token,
             trace_id,
             &mut exit_layouts,
         );
-        MetaInterp::<()>::patch_backend_terminal_recovery_layouts_for_trace(
+        compile::patch_backend_terminal_recovery_layouts_for_trace(
             &mut meta.backend,
             &token,
             trace_id,
