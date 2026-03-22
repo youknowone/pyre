@@ -1303,26 +1303,32 @@ impl<M: Clone> MetaInterp<M> {
         // GUARD_NOT_INVALIDATED before the closing JUMP. fail_args = jump_args
         // so guard failure restores the same state as the JUMP target.
         {
-            // Use the last guard's fail_args and types for GUARD_NOT_INVALIDATED.
-            // This ensures resume_pc and correct Ref types are preserved.
-            // RPython: GUARD_NOT_INVALIDATED shares resume state with nearby guards.
-            let (gni_fail_args, gni_types) = recorder
-                .ops()
+            let inputarg_types = recorder.inputarg_types();
+            let num_inputargs = recorder.num_inputargs() as u32;
+            let guard_fail_arg_types = jump_args
                 .iter()
-                .rev()
-                .find_map(|op| {
-                    if !op.opcode.is_guard() {
-                        return None;
+                .map(|&arg| {
+                    if arg.0 < num_inputargs {
+                        inputarg_types[arg.0 as usize]
+                    } else {
+                        recorder
+                            .get_op_by_pos(arg)
+                            .map(|op| op.result_type())
+                            .unwrap_or(Type::Int)
                     }
-                    let descr = op.descr.as_ref()?;
-                    let fd = descr.as_fail_descr()?;
-                    let fa = op.fail_args.as_ref()?;
-                    Some((fa.to_vec(), fd.fail_arg_types().to_vec()))
                 })
-                .unwrap_or_else(|| (jump_args.to_vec(), vec![Type::Int; jump_args.len()]));
-            let descr = crate::fail_descr::make_fail_descr_typed(gni_types);
+                .collect();
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] close_and_compile GuardNotInvalidated types={:?} inputarg_types={:?} jump_args={:?}",
+                    guard_fail_arg_types,
+                    inputarg_types,
+                    jump_args,
+                );
+            }
+            let descr = crate::fail_descr::make_fail_descr_typed(guard_fail_arg_types);
             recorder.record_guard_with_fail_args(
-                OpCode::GuardNotInvalidated, &[], descr, &gni_fail_args,
+                OpCode::GuardNotInvalidated, &[], descr, jump_args,
             );
         }
         recorder.close_loop(jump_args);
@@ -1384,7 +1390,6 @@ impl<M: Clone> MetaInterp<M> {
                         eprintln!("[jit] abort trace at key={} (InvalidLoop during optimize)", green_key);
                     }
                     self.warm_state.abort_tracing(green_key, false);
-                    self.stats.loops_aborted += 1;
                     return;
                 }
                 std::panic::resume_unwind(payload);
@@ -1467,8 +1472,6 @@ impl<M: Clone> MetaInterp<M> {
         let mut token = JitCellToken::new(token_num);
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
-        let mut optimized_ops = optimized_ops;
-        compile::retag_fail_descrs_from_trace_types(&inputargs, &mut optimized_ops);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -1728,8 +1731,6 @@ impl<M: Clone> MetaInterp<M> {
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
-        let mut optimized_ops = optimized_ops;
-        compile::retag_fail_descrs_from_trace_types(&inputargs, &mut optimized_ops);
 
         match self
             .backend
@@ -2874,29 +2875,14 @@ impl<M: Clone> MetaInterp<M> {
             Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
         };
 
-        let ok = self.compile_bridge(
+        self.compile_bridge(
             green_key,
             fail_index,
             &*fail_descr,
             &trace.ops,
             &trace.inputargs,
             constants,
-        );
-        // Mark bridge as loop-closing so execute_with_inputs can re-enter
-        // the parent loop directly on Finish.
-        if ok {
-            let source_trace_id = fail_descr.trace_id();
-            if let Some(compiled) = self.compiled_loops.get(&green_key) {
-                let tid = if source_trace_id == 0 {
-                    compiled.root_trace_id
-                } else {
-                    source_trace_id
-                };
-                self.backend
-                    .mark_bridge_loop_reentry(&compiled.token, tid, fail_index);
-            }
-        }
-        ok
+        )
     }
 }
 
@@ -2963,8 +2949,6 @@ impl<M: Clone> MetaInterp<M> {
             optimized_ops
         };
         let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
-        let mut optimized_ops = optimized_ops;
-        compile::retag_fail_descrs_from_trace_types(bridge_inputargs, &mut optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
@@ -4364,20 +4348,20 @@ mod tests {
             );
         }
         let trace_info = meta.backend.compiled_trace_info(&token, trace_id);
-        compile::enrich_guard_resume_layouts_for_trace(
+        MetaInterp::<()>::enrich_guard_resume_layouts_for_trace(
             &mut resume_data,
             &mut exit_layouts,
             trace_id,
             inputargs,
             trace_info.as_ref(),
         );
-        compile::patch_backend_guard_recovery_layouts_for_trace(
+        MetaInterp::<()>::patch_backend_guard_recovery_layouts_for_trace(
             &mut meta.backend,
             &token,
             trace_id,
             &mut exit_layouts,
         );
-        compile::patch_backend_terminal_recovery_layouts_for_trace(
+        MetaInterp::<()>::patch_backend_terminal_recovery_layouts_for_trace(
             &mut meta.backend,
             &token,
             trace_id,
@@ -4610,9 +4594,7 @@ mod tests {
         let ctx = meta.trace_ctx().unwrap();
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes[1], new_val);
-        // Virtualizable field writes are deferred to rd_pendingfields
-        // (RPython heap.py:614-616), so only 4 ops are emitted instead of 5.
-        assert_eq!(ctx.recorder.num_ops(), 4);
+        assert_eq!(ctx.recorder.num_ops(), 5);
     }
 
     #[test]

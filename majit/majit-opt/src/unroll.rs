@@ -54,7 +54,7 @@ impl UnrollOptimizer {
             short_preamble: None,
             target_tokens: Vec::new(),
             retraced_count: 0,
-            retrace_limit: 0,
+            retrace_limit: 5,
             max_retrace_guards: 15,
         }
     }
@@ -234,13 +234,6 @@ impl UnrollOptimizer {
         opt_p2.skip_flush = true;
         // Phase 2: don't virtualize New() — guard recovery_layout not populated.
         opt_p2.set_phase2(true);
-        // heap.py:870: deserialize_optheap — import preamble heap cache.
-        // TODO: enabled once OpRef remapping for Phase 2 context is implemented.
-        // Currently causes performance regression (stale cache entries from
-        // Phase 1 OpRef namespace conflict with Phase 2 values).
-        // if !exported_state.preamble_heap_cache.is_empty() {
-        //     opt_p2.import_all_cached_fields(&exported_state.preamble_heap_cache);
-        // }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
@@ -382,19 +375,10 @@ impl UnrollOptimizer {
                             self.retraced_count, self.retrace_limit
                         );
                     }
-                    // RPython: retrace allowed → body self-loops to the new
-                    // target_token. Restore terminal Jump with body descr.
-                    jumped = true;
-                    if let Some(mut self_loop_jump) = body_terminal_op.clone() {
-                        if let Some(body_descr) = self
-                            .target_tokens
-                            .last()
-                            .map(|t| t.as_jump_target_descr())
-                        {
-                            self_loop_jump.descr = Some(body_descr);
-                        }
-                        redirected_tail_ops.push(self_loop_jump);
-                    }
+                    // RPython _jump_to_existing_trace() keeps the redirected
+                    // JUMP emitted by jump_ctx; it does not replace it with a
+                    // synthetic body self-loop.
+                    jumped = false;
                 } else {
                     // unroll.py:220-226: limit reached, try force_boxes=true
                     jump_ctx.clear_newoperations();
@@ -464,6 +448,12 @@ impl UnrollOptimizer {
         if !sp.is_empty() {
             self.short_preamble = Some(sp.clone());
         }
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[jit] assembly_contract: label_args={:?} used_boxes={:?} jump_args={:?}",
+                label_args, sp.used_boxes, sp.jump_args
+            );
+        }
 
         if !jump_to_self {
             // unroll.py:170-171: jump_to_preamble — body JUMP → preamble Label
@@ -496,7 +486,7 @@ impl UnrollOptimizer {
         }
 
         // ── Assembly (compile.py:310-338) ──
-        let combined = assemble_peeled_trace(
+        let combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &body_ops,
             &label_args,
@@ -506,6 +496,7 @@ impl UnrollOptimizer {
                 .unwrap_or(&[]),
             &exported_state.renamed_inputargs,
             &sp.used_boxes,
+            &sp.jump_args,
             p2_ni,
             jump_to_self,
             &imported_short_aliases,
@@ -1030,24 +1021,6 @@ impl OptUnroll {
         let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
         let exported_short_boxes = ctx.exported_short_boxes.clone();
 
-        // RPython: setinfo_from_preamble applies to short preamble sources
-        // too. Collect infos for short preamble source OpRefs so Phase 2
-        // can see constants (e.g. strategy==1 from GuardValue).
-        for entry in &exported_short_ops {
-            let source = match entry {
-                ExportedShortOp::Pure { source, .. }
-                | ExportedShortOp::HeapField { source, .. }
-                | ExportedShortOp::HeapArrayItem { source, .. } => *source,
-                _ => continue,
-            };
-            self.expand_info(source, ctx, exported_int_bounds, &mut infos);
-        }
-
-        // RPython: next_iteration_args are the pre-force JUMP args,
-        // NOT the forced end_args. VirtualState has one entry per
-        // next_iteration_arg, so their lengths must match.
-        let next_iter_args = ctx.pre_force_jump_args.clone()
-            .unwrap_or_else(|| end_args.clone());
         let mut es = ExportedState::new(
             label_args.clone(),
             end_args,
@@ -1405,88 +1378,7 @@ impl OptUnroll {
             }
         }
 
-        // Carry pre-force field refs from Phase 1 to Phase 2 ctx.
-        // Match pre_force_field_refs keys against pre_force_args (the JUMP
-        // args BEFORE forcing) to find which Phase 2 inputarg position
-        // corresponds to each key.
-        for (key, refs) in &exported_state.pre_force_field_refs {
-            // Match via pre_force_args (pre-force JUMP args) — these use
-            // the same OpRef namespace as the pre_force_field_refs keys.
-            for (i, pre_arg) in exported_state.pre_force_args.iter().enumerate() {
-                if *pre_arg == *key {
-                    let source = targetargs[i];
-                    // Store under all forwarding chain nodes
-                    let mut current = source;
-                    for _ in 0..10 {
-                        ctx.pre_force_field_refs.entry(current)
-                            .or_insert_with(Vec::new)
-                            .extend(refs.iter().cloned());
-                        let next = ctx.get_replacement(current);
-                        if next == current { break; }
-                        current = next;
-                    }
-                }
-            }
-            ctx.pre_force_field_refs.entry(*key)
-                .or_insert_with(Vec::new)
-                .extend(refs.iter().cloned());
-        }
-
-        // RPython setinfo_from_preamble: for virtual args, set PtrInfo::Virtual
-        // BEFORE make_inputargs so it can flatten field values.
-        // RPython reuses Phase 1's PtrInfo directly (source.set_forwarded(preamble_info));
-        // majit reconstructs the virtual with field values from pre_force_field_refs.
-        for (i, info) in exported_state.virtual_state.state.iter().enumerate() {
-            if let crate::virtualstate::VirtualStateInfo::Virtual { descr, known_class, fields, field_descrs } = info {
-                let opref = ctx.get_replacement(targetargs[i]);
-                let virtual_fields: Vec<(u32, OpRef)> = fields
-                    .iter()
-                    .filter_map(|(idx, child)| {
-                        match child.as_ref() {
-                            crate::virtualstate::VirtualStateInfo::Constant(val) => {
-                                let c = ctx.alloc_op_position();
-                                ctx.make_constant(c, val.clone());
-                                Some((*idx, c))
-                            }
-                            _ => {
-                                // Non-constant field: look up from pre_force_field_refs.
-                                // RPython's setinfo_from_preamble reuses Phase 1's
-                                // PtrInfo._fields directly; we reconstruct from the
-                                // saved field refs.
-                                ctx.pre_force_field_refs
-                                    .get(&opref)
-                                    .or_else(|| ctx.pre_force_field_refs.get(&targetargs[i]))
-                                    .and_then(|flds| {
-                                        flds.iter()
-                                            .find(|(fld_idx, _)| *fld_idx == *idx)
-                                            .map(|(_, r)| (*idx, *r))
-                                    })
-                            }
-                        }
-                    })
-                    .collect();
-                if !virtual_fields.is_empty() {
-                    ctx.set_ptr_info(
-                        opref,
-                        crate::info::PtrInfo::Virtual(crate::info::VirtualInfo {
-                            descr: descr.clone(),
-                            known_class: *known_class,
-                            fields: virtual_fields,
-                            field_descrs: field_descrs.clone(),
-                        }),
-                    );
-                }
-            }
-        }
-
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!("[jit] import_state: vs.state.len={} vs.states={:?}",
-                exported_state.virtual_state.state.len(),
-                exported_state.virtual_state.state.iter()
-                    .map(|s| format!("{}", if s.is_virtual() { "V" } else { "N" }))
-                    .collect::<Vec<_>>().join(","));
-        }
         let (label_args, virtuals) = exported_state
             .virtual_state
             .make_inputargs_and_virtuals(targetargs, ctx);
@@ -1494,25 +1386,23 @@ impl OptUnroll {
             .virtual_state
             .make_inputarg_source_slots(targetargs);
         let mut short_args = label_args.clone();
-        short_args.extend(virtuals.iter().copied());
-        // Store short_args in ctx for install_imported_virtuals to use.
-        // Virtual field values are at positions label_args.len()..
-        ctx.imported_virtual_args = Some((label_args.len(), short_args.clone()));
-        self.import_short_preamble_ops(&short_args, exported_state, ctx);
-        // RPython: setinfo_from_preamble applies to ALL exported values,
-        // including short preamble. Apply exported infos to imported
-        // short preamble sources so Phase 2 knows about constants.
-        for entry in &exported_state.exported_short_ops {
-            let source = match entry {
-                ExportedShortOp::Pure { source, .. }
-                | ExportedShortOp::HeapField { source, .. }
-                | ExportedShortOp::HeapArrayItem { source, .. } => *source,
-                _ => continue,
-            };
-            if let Some(info) = exported_state.exported_infos.get(&source) {
-                self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
+        short_args.extend(virtuals);
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            let label_consts: Vec<_> = label_args
+                .iter()
+                .filter_map(|&arg| ctx.get_constant(arg).cloned().map(|value| (arg, value)))
+                .collect();
+            let short_consts: Vec<_> = short_args
+                .iter()
+                .filter_map(|&arg| ctx.get_constant(arg).cloned().map(|value| (arg, value)))
+                .collect();
+            if !label_consts.is_empty() || !short_consts.is_empty() {
+                eprintln!(
+                    "[jit] import_state_consts: label={label_consts:?} short={short_consts:?}"
+                );
             }
         }
+        self.import_short_preamble_ops(&short_args, exported_state, ctx);
         if !ctx.initialize_imported_short_preamble_builder_from_exported_ops(
             &short_args,
             &exported_state.short_inputargs,
@@ -2222,13 +2112,56 @@ fn assemble_peeled_trace(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
+    assemble_peeled_trace_with_jump_args(
+        p1_ops,
+        p2_ops,
+        label_args,
+        label_source_slots,
+        start_label_args,
+        extra_label_args,
+        extra_label_args,
+        body_num_inputs,
+        jump_to_self,
+        imported_short_aliases,
+        imported_short_sources,
+        constants,
+        start_label_descr,
+        loop_label_descr,
+    )
+}
+
+fn assemble_peeled_trace_with_jump_args(
+    p1_ops: &[Op],
+    p2_ops: &[Op],
+    label_args: &[OpRef],
+    label_source_slots: &[OpRef],
+    start_label_args: &[OpRef],
+    extra_label_args: &[OpRef],
+    extra_jump_args: &[OpRef],
+    body_num_inputs: usize,
+    jump_to_self: bool,
+    imported_short_aliases: &[crate::ImportedShortAlias],
+    imported_short_sources: &[crate::ImportedShortSource],
+    constants: &std::collections::HashMap<u32, i64>,
+    start_label_descr: Option<DescrRef>,
+    loop_label_descr: Option<DescrRef>,
+) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
-    let filtered_extra_label_args: Vec<OpRef> = extra_label_args
-        .iter()
-        .copied()
-        .filter(|arg| !constants.contains_key(&arg.0))
-        .collect();
+    let mut filtered_extra_label_args = Vec::new();
+    let mut filtered_extra_jump_args = Vec::new();
+    let mut seen_extra_label_args = std::collections::HashSet::new();
+    for (idx, &label_arg) in extra_label_args.iter().enumerate() {
+        let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
+        if constants.contains_key(&label_arg.0)
+            || label_args.contains(&label_arg)
+            || !seen_extra_label_args.insert(label_arg)
+        {
+            continue;
+        }
+        filtered_extra_label_args.push(label_arg);
+        filtered_extra_jump_args.push(jump_arg);
+    }
 
     let mut next_free_pos = |mut next: u32| {
         next = next.max(body_num_inputs as u32);
@@ -2274,7 +2207,11 @@ fn assemble_peeled_trace(
 
     // Label position
     let label_pos = next_free_pos(max_pos);
-    let mut full_label_args = label_args.to_vec();
+    let mut full_label_args: Vec<OpRef> = label_args
+        .iter()
+        .copied()
+        .filter(|arg| !constants.contains_key(&arg.0))
+        .collect();
 
     // Collect preamble-defined OpRefs BEFORE adding extra label args,
     // so we can filter out virtual remnants (removed New ops).
@@ -2343,7 +2280,7 @@ fn assemble_peeled_trace(
         } else {
             (0..label_args.len()).map(|i| OpRef(i as u32)).collect()
         };
-    carried_source_slots.extend(filtered_extra_label_args.iter().copied());
+    carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     let mut label_set: std::collections::HashSet<OpRef> =
         full_label_args.iter().copied().collect();
     let mut seen_body_defs = std::collections::HashSet::new();
@@ -2400,18 +2337,11 @@ fn assemble_peeled_trace(
     label_op.descr = loop_label_descr;
     result.push(label_op);
 
-    // Body: 2-pass remap (inputarg refs → label_args, op positions → fresh boxes)
-    // Start body positions after all label arg positions (including SameAs
-    // aliases from short preamble) to prevent Cranelift variable collision
-    // where a body op result overwrites a label block parameter.
+    // Body: 2-pass remap (inputarg refs -> label args, body results -> fresh boxes)
     let max_label_arg_pos = full_label_args.iter().map(|a| a.0).max().unwrap_or(label_pos);
     let mut next_body_pos = next_free_pos(label_pos.max(max_label_arg_pos).saturating_add(1));
     let mut input_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
-    // RPython compile.py assembles `[start_label] + preamble + [label] + body`.
-    // After the loop label, only the loop-header contract (label args plus
-    // explicit invented-name aliases) is allowed to stay live. Other preamble
-    // temporaries must remap to the body copy, not leak past the Label.
     let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
         .iter()
         .copied()
@@ -2419,7 +2349,6 @@ fn assemble_peeled_trace(
         .chain(preamble_defs.iter().copied())
         .collect();
 
-    // Pass 1: collect all remappings
     if !label_source_slots.is_empty() && label_source_slots.len() == label_args.len() {
         for (&source_slot, &la) in label_source_slots.iter().zip(label_args.iter()) {
             if !source_slot.is_none() {
@@ -2433,14 +2362,6 @@ fn assemble_peeled_trace(
             }
         }
     }
-    // RPython unroll.py grows the loop header contract with sb.used_boxes.
-    // The body may still reference the original preamble result boxes for
-    // those carried values, even though the assembled label now uses the
-    // appended label args. Remap the original carried source refs to the
-    // appended label args so phase-2 body ops keep seeing the extended
-    // loop-header contract instead of dangling preamble positions.
-    // Use extra_label_start_idx (not label_args.len()) because
-    // body-use-before-def may insert entries between label_args and extras.
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if !source_slot.is_none() {
             if let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) {
@@ -2448,66 +2369,153 @@ fn assemble_peeled_trace(
             }
         }
     }
-    // RPython parity: SameAs aliases from short preamble (e.g., v29 = SameAsI(v26))
-    // must map to the same label arg as their source. Phase 2 body may reference the
-    // alias directly. Only add to input_remap if the alias is actually referenced
-    // by a Phase 2 body op (to avoid interfering with pyre's different alias patterns).
-    {
-        let p2_refs: std::collections::HashSet<OpRef> = p2_ops
-            .iter()
-            .flat_map(|op| {
-                op.args.iter().copied().chain(
-                    op.fail_args
-                        .as_ref()
-                        .into_iter()
-                        .flat_map(|fa| fa.iter().copied()),
-                )
-            })
-            .collect();
-        for alias in imported_short_aliases {
-            if !p2_refs.contains(&alias.result) {
-                continue; // not referenced by body — skip
-            }
-            if let Some(&source_la) = input_remap.get(&alias.same_as_source) {
-                input_remap.entry(alias.result).or_insert(source_la);
-            }
-        }
-    }
-    for (idx, op) in p2_ops.iter().enumerate() {
+    for op in p2_ops.iter() {
         if op.pos.0 != u32::MAX {
             let fresh = OpRef(next_body_pos);
             next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
             body_result_remap.insert(op.pos, fresh);
         }
     }
-    // Pass 2: apply
+
     let mut seen_body_defs = std::collections::HashSet::new();
-    for op in p2_ops.iter() {
+    let mut label_scope_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut current_inner_label_index: Option<usize> = None;
+    let mut defs_since_inner_label: std::collections::HashSet<OpRef> =
+        std::collections::HashSet::new();
+    for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = op.clone();
-        let original_args = op.args.clone();
+        let mut original_args = op.args.clone();
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
             new_op.pos = mapped_pos;
         }
-        let mut remap_body_arg = |arg: OpRef| -> OpRef {
-            // Phase 2 body may redefine an OpRef that was also defined in
-            // Phase 1 (e.g., GetfieldGcR result at the same pos).  When the
-            // body has re-defined the arg, body_result_remap takes precedence
-            // over input_remap, because the new definition shadows the import.
-            if let Some(&mapped) = body_result_remap.get(&arg) {
-                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
-                    return mapped;
+        let remap_body_arg = |arg: OpRef,
+                              label_scope_remap: &HashMap<OpRef, OpRef>,
+                              input_remap: &HashMap<OpRef, OpRef>,
+                              alias_remap: &HashMap<OpRef, OpRef>,
+                              short_source_map: &HashMap<OpRef, OpRef>,
+                              body_result_remap: &HashMap<OpRef, OpRef>,
+                              seen_body_defs: &std::collections::HashSet<OpRef>,
+                              visible_before_label: &std::collections::HashSet<OpRef>|
+         -> OpRef {
+            let mut current = arg;
+            for _ in 0..8 {
+                if let Some(&mapped) = label_scope_remap.get(&current) {
+                    if mapped != current {
+                        current = mapped;
+                        continue;
+                    }
                 }
+                if let Some(&mapped) = input_remap.get(&current) {
+                    if mapped != current {
+                        current = mapped;
+                        continue;
+                    }
+                }
+                if let Some(&mapped) = alias_remap.get(&current) {
+                    if mapped != current {
+                        current = mapped;
+                        continue;
+                    }
+                }
+                if let Some(&mapped) = short_source_map.get(&current) {
+                    if mapped != current {
+                        current = mapped;
+                        continue;
+                    }
+                }
+                if let Some(&mapped) = body_result_remap.get(&current) {
+                    if (seen_body_defs.contains(&current)
+                        || !visible_before_label.contains(&current))
+                        && mapped != current
+                    {
+                        current = mapped;
+                        continue;
+                    }
+                }
+                break;
             }
-            if let Some(&mapped) = input_remap.get(&arg) {
-                return mapped;
-            }
-            if let Some(&mapped) = alias_remap.get(&arg) {
-                return mapped;
-            }
-            arg
+            current
         };
         for arg in &mut new_op.args {
-            *arg = remap_body_arg(*arg);
+            *arg = remap_body_arg(
+                *arg,
+                &label_scope_remap,
+                &input_remap,
+                &alias_remap,
+                &short_source_map,
+                &body_result_remap,
+                &seen_body_defs,
+                &visible_before_label,
+            );
+        }
+        if new_op.opcode == OpCode::Label {
+            let mut seen_after_label_defs = std::collections::HashSet::new();
+            let mut extra_inner_sources = Vec::new();
+            let mut extra_inner_set = std::collections::HashSet::new();
+            let label_arg_set: std::collections::HashSet<OpRef> =
+                original_args.iter().copied().filter(|arg| !arg.is_none()).collect();
+            for later_op in p2_ops.iter().skip(op_idx + 1) {
+                for arg in later_op
+                    .args
+                    .iter()
+                    .copied()
+                    .chain(later_op.fail_args.iter().flatten().copied())
+                {
+                    if arg.is_none()
+                        || constants.contains_key(&arg.0)
+                        || label_arg_set.contains(&arg)
+                        || extra_inner_set.contains(&arg)
+                        || seen_after_label_defs.contains(&arg)
+                    {
+                        continue;
+                    }
+                    let available_before_label = visible_before_label.contains(&arg)
+                        || seen_body_defs.contains(&arg)
+                        || short_source_map.contains_key(&arg)
+                        || input_remap.contains_key(&arg)
+                        || alias_remap.contains_key(&arg);
+                    if available_before_label {
+                        extra_inner_set.insert(arg);
+                        extra_inner_sources.push(arg);
+                    }
+                }
+                if later_op.result_type() != Type::Void && !later_op.pos.is_none() {
+                    seen_after_label_defs.insert(later_op.pos);
+                }
+            }
+            for &source_arg in &extra_inner_sources {
+                let mapped_arg = remap_body_arg(
+                    source_arg,
+                    &label_scope_remap,
+                    &input_remap,
+                    &alias_remap,
+                    &short_source_map,
+                    &body_result_remap,
+                    &seen_body_defs,
+                    &visible_before_label,
+                );
+                if new_op.args.contains(&mapped_arg) {
+                    continue;
+                }
+                new_op.args.push(mapped_arg);
+                original_args.push(source_arg);
+            }
+            label_scope_remap.clear();
+            for (&source_arg, &mapped_arg) in original_args.iter().zip(new_op.args.iter()) {
+                if !source_arg.is_none() {
+                    label_scope_remap.insert(source_arg, mapped_arg);
+                    if let Some(imported_result) = imported_short_sources
+                        .iter()
+                        .find(|entry| entry.source == source_arg)
+                        .map(|entry| entry.result)
+                    {
+                        label_scope_remap.insert(imported_result, mapped_arg);
+                    }
+                    if let Some(&aliased_result) = alias_remap.get(&source_arg) {
+                        label_scope_remap.insert(aliased_result, mapped_arg);
+                    }
+                }
+            }
         }
         if new_op.opcode == OpCode::Jump {
             let mapped_base_args: Vec<OpRef> = if !jump_to_self {
@@ -2523,51 +2531,111 @@ fn assemble_peeled_trace(
             } else {
                 new_op.args.iter().copied().collect()
             };
+            let target_label_args: Vec<OpRef> = current_inner_label_index
+                .and_then(|label_idx| result.get(label_idx).map(|op| op.args.to_vec()))
+                .unwrap_or_else(|| full_label_args.clone());
+            let target_base_len = if current_inner_label_index.is_some() {
+                original_args.len()
+            } else {
+                label_args.len()
+            };
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[jit] assemble_jump: inner_label={:?} original_args={:?} mapped_base_args={:?} label_args={:?} label_source_slots={:?} filtered_extra_jump_args={:?}",
+                    current_inner_label_index,
+                    original_args,
+                    mapped_base_args,
+                    label_args,
+                    label_source_slots,
+                    filtered_extra_jump_args,
+                );
+            }
             let mut jump_args = mapped_base_args;
-            // When Jump targets the start label (jump_to_preamble), trim
-            // args to match the start label's contract and skip carried refs.
             if !jump_to_self {
                 jump_args.truncate(start_label_args.len());
             }
-            // RPython parity: carry preamble-defined values through the Jump
-            // only on the self-loop edge. jump_to_preamble keeps the start
-            // label contract and only swaps the descr.
-            if jump_to_self && jump_args.len() < full_label_args.len() {
-                // Pad extra args to match Label arity. For SameAs alias
-                // args, resolve to the source value which should already
-                // be present in jump_args from inline_short_preamble.
-                let alias_source: HashMap<OpRef, OpRef> = alias_remap
-                    .iter()
-                    .map(|(&from, &to)| (to, from))
-                    .collect();
-                while jump_args.len() < full_label_args.len() {
-                    let extra_label_arg = full_label_args[jump_args.len()];
-                    // If this label arg was created by a SameAs alias, find
-                    // the original source and look it up in existing jump_args.
-                    let resolved = if let Some(&source) = alias_source.get(&extra_label_arg) {
-                        // Source is in the original label args — find the
-                        // corresponding jump arg.
-                        full_label_args
-                            .iter()
-                            .position(|&la| la == source)
-                            .and_then(|pos| jump_args.get(pos).copied())
-                            .unwrap_or_else(|| remap_body_arg(extra_label_arg))
+            if jump_to_self {
+                jump_args.truncate(target_base_len);
+                while jump_args.len() < target_label_args.len() {
+                    let extra_idx = jump_args.len().saturating_sub(target_base_len);
+                    let extra_arg = if current_inner_label_index.is_some() {
+                        target_label_args[jump_args.len()]
                     } else {
-                        remap_body_arg(extra_label_arg)
+                        filtered_extra_jump_args
+                            .get(extra_idx)
+                            .copied()
+                            .unwrap_or(target_label_args[jump_args.len()])
                     };
-                    jump_args.push(resolved);
+                    let remapped = input_remap
+                        .get(&extra_arg)
+                        .copied()
+                        .or_else(|| alias_remap.get(&extra_arg).copied())
+                        .or_else(|| {
+                            body_result_remap.get(&extra_arg).copied().and_then(|mapped| {
+                                if seen_body_defs.contains(&extra_arg)
+                                    || !visible_before_label.contains(&extra_arg)
+                                {
+                                    Some(mapped)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or(extra_arg);
+                    jump_args.push(remapped);
                 }
             }
             new_op.args = jump_args.into();
         }
         if let Some(ref mut fa) = new_op.fail_args {
             for a in fa.iter_mut() {
-                *a = remap_body_arg(*a);
+                *a = remap_body_arg(
+                    *a,
+                    &label_scope_remap,
+                    &input_remap,
+                    &alias_remap,
+                    &short_source_map,
+                    &body_result_remap,
+                    &seen_body_defs,
+                    &visible_before_label,
+                );
+            }
+        }
+        if let Some(label_idx) = current_inner_label_index {
+            let mut extra_live_args = Vec::new();
+            let label_args = &result[label_idx].args;
+            for arg in new_op
+                .args
+                .iter()
+                .copied()
+                .chain(new_op.fail_args.iter().flatten().copied())
+            {
+                if arg.is_none()
+                    || constants.contains_key(&arg.0)
+                    || defs_since_inner_label.contains(&arg)
+                    || label_args.contains(&arg)
+                    || extra_live_args.contains(&arg)
+                {
+                    continue;
+                }
+                extra_live_args.push(arg);
+            }
+            if !extra_live_args.is_empty() {
+                let existing: std::collections::HashSet<OpRef> =
+                    result[label_idx].args.iter().copied().collect();
+                result[label_idx]
+                    .args
+                    .extend(extra_live_args.into_iter().filter(|arg| !existing.contains(arg)));
             }
         }
         result.push(new_op);
+        if op.opcode == OpCode::Label {
+            current_inner_label_index = Some(result.len() - 1);
+            defs_since_inner_label.clear();
+        }
         if op.result_type() != Type::Void && !op.pos.is_none() {
             seen_body_defs.insert(op.pos);
+            defs_since_inner_label.insert(result.last().unwrap().pos);
         }
     }
 
@@ -4234,7 +4302,7 @@ mod tests {
         let _ = optimizer.force_box(forced, &mut ctx2);
 
         let sp = ctx2.build_imported_short_preamble().unwrap();
-        assert_eq!(sp.used_boxes, vec![OpRef(30)]);
+        assert_eq!(sp.used_boxes, vec![imported_result]);
         assert_eq!(sp.jump_args, vec![imported_result]);
         assert_eq!(sp.ops.len(), 2);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAddOvf);
