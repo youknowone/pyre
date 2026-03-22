@@ -1311,13 +1311,17 @@ impl Optimization for OptHeap {
                 }
             }
 
-            // heap.py: optimize_QUASIIMMUT_FIELD
-            //
-            // Records the quasi-immutable dependency so that future
-            // GETFIELD_GC on this (obj, field) is treated as pure.
-            // Does NOT emit GUARD_NOT_INVALIDATED here — the trace
-            // already contains one where needed.
+            // Quasi-immutable field: treat as read + guard_not_invalidated.
+            // The QUASIIMMUT_FIELD op marks a field that rarely changes.
+            // The optimizer replaces the field read with the cached value and
+            // emits GUARD_NOT_INVALIDATED to ensure validity.
             OpCode::QuasiimmutField => {
+                if !self.seen_guard_not_invalidated {
+                    self.seen_guard_not_invalidated = true;
+                    let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
+                    self.force_all_lazy(ctx);
+                    ctx.emit(guard_op);
+                }
                 let obj = op.arg(0);
                 if let Some(descr) = &op.descr {
                     let field_idx = descr.index();
@@ -3629,18 +3633,13 @@ mod tests {
 
     #[test]
     fn test_quasiimmut_field_caches_value() {
-        // heap.py: QUASIIMMUT_FIELD records the dependency, does NOT emit
-        // GUARD_NOT_INVALIDATED. The trace itself already contains the guard.
-        //
         // quasiimmut_field(p0, descr=d0)
-        // guard_not_invalidated()             <- from the trace
         // i1 = getfield_gc_i(p0, descr=d0)   <- first read, cached as quasi-immut
         // call_n(some_func)                   <- would normally invalidate, but quasi-immut survives
         // i2 = getfield_gc_i(p0, descr=d0)   <- reuses cached value
         let d = descr(0);
         let mut ops = vec![
             Op::with_descr(OpCode::QuasiimmutField, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::GuardNotInvalidated, &[]),
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
             Op::new(OpCode::CallN, &[OpRef(200)]),
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
@@ -3663,7 +3662,7 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNotInvalidated)
             .count();
-        assert_eq!(gni_count, 1, "GUARD_NOT_INVALIDATED should survive");
+        assert_eq!(gni_count, 1, "GUARD_NOT_INVALIDATED should be emitted");
     }
 
     // ── Test 50: GC_LOAD forces lazy setfields ──
