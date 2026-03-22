@@ -612,6 +612,10 @@ pub struct ExportedState {
     pub preamble_heap_cache: Vec<(OpRef, u32, OpRef)>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::virtualstate::VirtualState,
+    /// Pre-force virtual field refs from Phase 1.
+    /// Needed by import_state to reconstruct PtrInfo::Virtual for
+    /// make_inputargs before virtual args are force-materialized.
+    pub pre_force_field_refs: HashMap<OpRef, Vec<(u32, OpRef)>>,
     /// unroll.py: exported_infos — optimizer knowledge from preamble.
     /// Maps OpRef → info for all args including virtual field contents.
     pub exported_infos: HashMap<OpRef, ExportedValueInfo>,
@@ -739,6 +743,7 @@ impl ExportedState {
             short_preamble: None,
             renamed_inputargs,
             short_inputargs,
+            pre_force_field_refs: HashMap::new(),
         }
     }
 
@@ -1026,11 +1031,7 @@ impl OptUnroll {
             self.expand_info(source, ctx, exported_int_bounds, &mut infos);
         }
 
-        ExportedState::new(
-            // RPython unroll.py exports:
-            //   ExportedState(label_args, end_args, ...)
-            // where `label_args` become end_args for the peeled preamble and
-            // `end_args` are the next_iteration_args used by import_state().
+        let mut es = ExportedState::new(
             label_args.clone(),
             end_args,
             virtual_state,
@@ -1039,7 +1040,11 @@ impl OptUnroll {
             exported_short_boxes,
             renamed_inputargs.to_vec(),
             short_args,
-        )
+        );
+        // Carry pre-force field refs so Phase 2 can reconstruct
+        // PtrInfo::Virtual for make_inputargs.
+        es.pre_force_field_refs = ctx.pre_force_field_refs.clone();
+        es
     }
 
     /// unroll.py:432-443: _expand_info
@@ -1378,6 +1383,23 @@ impl OptUnroll {
             if let Some(info) = exported_state.exported_infos.get(target) {
                 self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
             }
+        }
+
+        // Carry pre-force field refs from Phase 1 to Phase 2 ctx.
+        // make_inputargs uses these to get virtual field values.
+        for (key, refs) in &exported_state.pre_force_field_refs {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[jit] carry field_refs: key={:?} resolved={:?} refs={:?}",
+                    key, ctx.get_replacement(*key), refs);
+            }
+            // Store under both original and resolved keys.
+            let resolved = ctx.get_replacement(*key);
+            ctx.pre_force_field_refs.entry(resolved)
+                .or_insert_with(Vec::new)
+                .extend(refs.iter().cloned());
+            ctx.pre_force_field_refs.entry(*key)
+                .or_insert_with(Vec::new)
+                .extend(refs.iter().cloned());
         }
 
         // RPython setinfo_from_preamble: for virtual args, set PtrInfo::Virtual
