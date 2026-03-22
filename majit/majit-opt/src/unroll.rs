@@ -2452,16 +2452,20 @@ fn assemble_peeled_trace(
             new_op.pos = mapped_pos;
         }
         let mut remap_body_arg = |arg: OpRef| -> OpRef {
+            // Phase 2 body may redefine an OpRef that was also defined in
+            // Phase 1 (e.g., GetfieldGcR result at the same pos).  When the
+            // body has re-defined the arg, body_result_remap takes precedence
+            // over input_remap, because the new definition shadows the import.
+            if let Some(&mapped) = body_result_remap.get(&arg) {
+                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
+                    return mapped;
+                }
+            }
             if let Some(&mapped) = input_remap.get(&arg) {
                 return mapped;
             }
             if let Some(&mapped) = alias_remap.get(&arg) {
                 return mapped;
-            }
-            if let Some(&mapped) = body_result_remap.get(&arg) {
-                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
-                    return mapped;
-                }
             }
             arg
         };
@@ -2491,11 +2495,30 @@ fn assemble_peeled_trace(
             // RPython parity: carry preamble-defined values through the Jump
             // only on the self-loop edge. jump_to_preamble keeps the start
             // label contract and only swaps the descr.
-            if jump_to_self {
+            if jump_to_self && jump_args.len() < full_label_args.len() {
+                // Pad extra args to match Label arity. For SameAs alias
+                // args, resolve to the source value which should already
+                // be present in jump_args from inline_short_preamble.
+                let alias_source: HashMap<OpRef, OpRef> = alias_remap
+                    .iter()
+                    .map(|(&from, &to)| (to, from))
+                    .collect();
                 while jump_args.len() < full_label_args.len() {
-                    let extra_arg = full_label_args[jump_args.len()];
-                    let remapped = remap_body_arg(extra_arg);
-                    jump_args.push(remapped);
+                    let extra_label_arg = full_label_args[jump_args.len()];
+                    // If this label arg was created by a SameAs alias, find
+                    // the original source and look it up in existing jump_args.
+                    let resolved = if let Some(&source) = alias_source.get(&extra_label_arg) {
+                        // Source is in the original label args — find the
+                        // corresponding jump arg.
+                        full_label_args
+                            .iter()
+                            .position(|&la| la == source)
+                            .and_then(|pos| jump_args.get(pos).copied())
+                            .unwrap_or_else(|| remap_body_arg(extra_label_arg))
+                    } else {
+                        remap_body_arg(extra_label_arg)
+                    };
+                    jump_args.push(resolved);
                 }
             }
             new_op.args = jump_args.into();
