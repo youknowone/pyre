@@ -1321,13 +1321,37 @@ impl<S: JitState> JitDriver<S> {
         ) -> Option<usize>,
     ) -> DetailedDriverRunOutcome {
         let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit][run-compiled-abort] key={} reason=missing-compiled-meta target_pc={}",
+                    green_key, target_pc
+                );
+            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
+        if !state.is_compatible(&meta) {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit][run-compiled-abort] key={} reason=incompatible-state target_pc={}",
+                    green_key, target_pc
+                );
+            }
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        }
+        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit][run-compiled-abort] key={} reason=sync-before target_pc={}",
+                    green_key, target_pc
+                );
+            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -1341,7 +1365,12 @@ impl<S: JitState> JitDriver<S> {
         }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             if crate::majit_log_enabled() {
-                eprintln!("[jit] BRIDGE abort: live_values mismatch");
+                eprintln!(
+                    "[jit][run-compiled-abort] key={} reason=live-values-descriptor-mismatch target_pc={} nvals={}",
+                    green_key,
+                    target_pc,
+                    live_values.len()
+                );
             }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -1355,6 +1384,12 @@ impl<S: JitState> JitDriver<S> {
             descriptor.as_ref(),
             live_values,
         ) else {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit][run-compiled-abort] key={} reason=extend-live-values target_pc={}",
+                    green_key, target_pc
+                );
+            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -1365,6 +1400,12 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .run_compiled_detailed_with_values(green_key, &live_values)
         else {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit][run-compiled-abort] key={} reason=backend-run target_pc={}",
+                    green_key, target_pc
+                );
+            }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
