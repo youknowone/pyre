@@ -82,6 +82,9 @@ pub struct OptHeap {
     /// object's field via SETFIELD_GC / SETARRAYITEM_GC.
     /// Caches for unescaped objects survive calls (calls can't access them).
     unescaped: HashSet<OpRef>,
+    /// Objects loaded from distinct immutable fields. Like seen_allocation,
+    /// these cannot alias each other. RPython: _cannot_alias_via_content.
+    known_distinct: HashSet<OpRef>,
 
     // ── Nullity tracking ──
     /// Values known to be non-null: proven by guards (GuardNonnull, GuardClass,
@@ -126,6 +129,7 @@ impl OptHeap {
             postponed_op: None,
             immutable_field_descrs: HashSet::new(),
             seen_allocation: HashSet::new(),
+            known_distinct: HashSet::new(),
             unescaped: HashSet::new(),
             known_nonnull: HashSet::new(),
             loopinvariant_cache: HashMap::new(),
@@ -417,26 +421,25 @@ impl OptHeap {
     /// A write to an unknown-origin object invalidates all non-seen-allocation
     /// caches for that field.
     fn invalidate_field_caches_for_write(&mut self, obj: OpRef, field_idx: u32) {
-        let obj_is_seen_alloc = self.seen_allocation.contains(&obj);
+        let obj_is_distinct = self.seen_allocation.contains(&obj)
+            || self.known_distinct.contains(&obj);
 
         self.cached_fields.retain(|&(cached_obj, cached_field), _| {
             if cached_field != field_idx {
                 return true;
             }
-            // The exact same (obj, field) entry will be replaced after this,
-            // so removing it here is fine.
             if cached_obj == obj {
                 return false;
             }
-            if obj_is_seen_alloc {
-                // Writer is a seen allocation. It can't alias other seen allocations,
-                // so keep their caches. Only invalidate unknown-origin objects.
-                self.seen_allocation.contains(&cached_obj)
-            } else {
-                // Writer is unknown origin. It might alias other unknown-origin
-                // objects, but can't alias seen allocations.
-                self.seen_allocation.contains(&cached_obj)
+            // Two distinct objects cannot alias: keep the cache.
+            // RPython: _cannot_alias_via_content + seen_allocation.
+            let cached_is_distinct = self.seen_allocation.contains(&cached_obj)
+                || self.known_distinct.contains(&cached_obj);
+            if obj_is_distinct || cached_is_distinct {
+                return true;
             }
+            // Both are unknown-origin and not known_distinct — may alias.
+            false
         });
     }
 
@@ -719,6 +722,12 @@ impl OptHeap {
         // invalidation because the value never changes.
         if self.immutable_field_descrs.contains(&key.1) {
             self.immutable_cached_fields.insert(key, op.pos);
+            // Ref values loaded from immutable fields cannot alias each other
+            // or seen_allocation objects. This lets the aliasing analysis
+            // preserve their caches across writes to other objects.
+            if op.opcode == OpCode::GetfieldGcR {
+                self.known_distinct.insert(op.pos);
+            }
         }
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         // Record the field value in ptr_info so other passes can see it.
@@ -1375,6 +1384,7 @@ impl Optimization for OptHeap {
         self.immutable_field_descrs.clear();
         self.seen_allocation.clear();
         self.unescaped.clear();
+        self.known_distinct.clear();
         self.known_nonnull.clear();
         self.loopinvariant_cache.clear();
         self.last_call_did_not_raise = false;
