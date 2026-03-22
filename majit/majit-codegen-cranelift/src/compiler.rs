@@ -1883,13 +1883,9 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     }
     drop(bridge_guard);
 
-    // RPython compile.py:696 (handle_fail → must_compile): trigger bridge
-    // Bridge compilation is deferred: store a pending request that the
-    // MetaInterp layer can pick up after execute_token returns.
-    // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
+    // RPython compile.py:696 (handle_fail -> must_compile): trigger bridge
     if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-        // green_key from target's header_pc (may be 0 for function-entry traces)
-        let gk = target.header_pc; // use header_pc; caller provides real green_key
+        let gk = target.header_pc;
         request_pending_bridge_compile(gk, target.trace_id, fail_index);
     }
 
@@ -2387,6 +2383,28 @@ extern "C" fn call_assembler_shim(
         !outcome.is_null(),
         "call_assembler shim outcome buffer must be non-null"
     );
+
+    // RPython compile.py:compile_tmp_callback parity: pending target
+    // (code_ptr == null) → interpreter fallback via force_fn.
+    if target.code_ptr.is_null() {
+        if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
+            let callee_frame_ptr = input_slice[0];
+            if input_slice.len() > 3 {
+                PENDING_FORCE_LOCAL0.with(|c| c.set(Some(input_slice[3])));
+            }
+            let result = force_fn(callee_frame_ptr);
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return result as u64;
+        }
+        unsafe {
+            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+            *outcome.add(1) = 0;
+        }
+        return 0;
+    }
 
     // Use the full DeadFrame path which goes through run_compiled_code
     // with proper GC root + force frame registration. This matches
@@ -3516,6 +3534,10 @@ struct CompiledLoop {
     /// Whether any guard in this loop uses FORCE_TOKEN slots.
     /// When false, force frame registration can be skipped entirely.
     needs_force_frame: bool,
+    /// True when the trace closes with Jump (a looping trace).
+    /// When a bridge's Finish arity matches and this is true,
+    /// the bridge output can re-enter the loop directly.
+    is_loop: bool,
 }
 
 unsafe impl Send for CompiledLoop {}
@@ -3930,13 +3952,20 @@ impl CraneliftBackend {
     /// Shared by `execute_token` (after Value→i64 conversion) and
     /// `execute_token_ints` (direct pass-through).
     fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
+        // Bridge re-entry loop: when a bridge exits with Finish and matching
+        // arity, re-enter the compiled loop instead of returning to the
+        // interpreter. RPython send_bridge_to_backend parity.
+        let mut reentry_args: Option<Vec<i64>> = None;
+        loop {
+        let current_args: &[i64] = reentry_args.as_deref().unwrap_or(inputs);
+
         let (fail_index, outputs, handle, force_frame) = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
             compiled.gc_runtime_id,
             compiled.num_ref_roots,
             compiled.max_output_slots,
-            inputs,
+            current_args,
             compiled.needs_force_frame,
         );
 
@@ -3949,7 +3978,7 @@ impl CraneliftBackend {
                 compiled.header_pc,
                 None,
                 &compiled.input_types,
-                inputs,
+                current_args,
                 compiled.caller_prefix_layout.as_ref(),
             );
         }
@@ -3963,7 +3992,30 @@ impl CraneliftBackend {
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
-            return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            let frame = Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            let descr = frame
+                .data
+                .downcast_ref::<FrameData>()
+                .expect("bridge returned unexpected frame type");
+            // Bridge Finish with matching arity on a looping trace -> re-enter.
+            if compiled.is_loop
+                && descr.fail_descr.is_finish()
+                && descr.fail_descr.fail_arg_types().len() == compiled.num_inputs
+            {
+                let arity = descr.fail_descr.fail_arg_types().len();
+                let mut loop_inputs = Vec::with_capacity(arity);
+                for (i, &tp) in descr.fail_descr.fail_arg_types().iter().enumerate() {
+                    match tp {
+                        Type::Int => loop_inputs.push(descr.get_int(i)),
+                        Type::Ref => loop_inputs.push(descr.get_ref(i).as_usize() as i64),
+                        Type::Float => loop_inputs.push(descr.get_float(i).to_bits() as i64),
+                        Type::Void => loop_inputs.push(0),
+                    }
+                }
+                reentry_args = Some(loop_inputs);
+                continue;
+            }
+            return frame;
         }
         drop(bridge_guard);
 
@@ -3977,7 +4029,7 @@ impl CraneliftBackend {
             release_force_token(handle);
         }
 
-        DeadFrame {
+        return DeadFrame {
             data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
                 fail_descr.clone(),
@@ -3986,7 +4038,8 @@ impl CraneliftBackend {
                 exception_class,
                 (!exception.is_null()).then_some(exception),
             )),
-        }
+        };
+        } // end bridge re-entry loop
     }
 
     ///
@@ -7560,6 +7613,7 @@ impl CraneliftBackend {
         for descr in &fail_descrs {
             descr.set_trace_info(trace_info.clone());
         }
+        let is_loop = ops.iter().any(|op| op.opcode == OpCode::Jump);
         Ok(CompiledLoop {
             trace_id,
             input_types: trace_info.input_types.clone(),
@@ -7575,6 +7629,7 @@ impl CraneliftBackend {
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
             needs_force_frame,
+            is_loop,
         })
     }
 }
@@ -8062,13 +8117,19 @@ impl majit_codegen::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
+        // Bridge re-entry loop: when a bridge exits with Finish and matching
+        // arity, re-enter the compiled loop instead of returning.
+        let mut reentry_args: Option<Vec<i64>> = None;
+        loop {
+        let current_args: &[i64] = reentry_args.as_deref().unwrap_or(args);
+
         let (fail_index, mut outputs, handle, force_frame) = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
             compiled.gc_runtime_id,
             compiled.num_ref_roots,
             compiled.max_output_slots,
-            args,
+            current_args,
             compiled.needs_force_frame,
         );
 
@@ -8081,7 +8142,7 @@ impl majit_codegen::Backend for CraneliftBackend {
                 compiled.header_pc,
                 None,
                 &compiled.input_types,
-                args,
+                current_args,
                 compiled.caller_prefix_layout.as_ref(),
             );
             let descr = self.get_latest_descr(&frame);
@@ -8131,7 +8192,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         let fail_descr = &compiled.fail_descrs[fail_index as usize];
         fail_descr.increment_fail_count();
 
-        // If a bridge is attached, fall back to the full DeadFrame path.
+        // If a bridge is attached, execute it and check for loop re-entry.
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
@@ -8140,6 +8201,24 @@ impl majit_codegen::Backend for CraneliftBackend {
                 .data
                 .downcast_ref::<FrameData>()
                 .expect("bridge returned unexpected frame type");
+            // Bridge Finish with matching arity on a looping trace -> re-enter.
+            if compiled.is_loop
+                && descr.fail_descr.is_finish()
+                && descr.fail_descr.fail_arg_types().len() == compiled.num_inputs
+            {
+                let arity = descr.fail_descr.fail_arg_types().len();
+                let mut loop_inputs = Vec::with_capacity(arity);
+                for (i, &tp) in descr.fail_descr.fail_arg_types().iter().enumerate() {
+                    match tp {
+                        Type::Int => loop_inputs.push(descr.get_int(i)),
+                        Type::Ref => loop_inputs.push(descr.get_ref(i).as_usize() as i64),
+                        Type::Float => loop_inputs.push(descr.get_float(i).to_bits() as i64),
+                        Type::Void => loop_inputs.push(0),
+                    }
+                }
+                reentry_args = Some(loop_inputs);
+                continue;
+            }
             let arity = descr.fail_descr.fail_arg_types().len();
             let mut result = Vec::with_capacity(arity);
             let mut typed_result = Vec::with_capacity(arity);
@@ -8204,7 +8283,7 @@ impl majit_codegen::Backend for CraneliftBackend {
             }
         }
 
-        majit_codegen::RawExecResult {
+        return majit_codegen::RawExecResult {
             outputs,
             typed_outputs,
             exit_layout: Some(fail_descr.layout()),
@@ -8215,7 +8294,8 @@ impl majit_codegen::Backend for CraneliftBackend {
             fail_index,
             trace_id: fail_descr.trace_id(),
             is_finish: fail_descr.is_finish(),
-        }
+        };
+        } // end bridge re-entry loop
     }
 
     fn compiled_fail_descr_layouts(
