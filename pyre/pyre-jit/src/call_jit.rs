@@ -431,12 +431,12 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     // Re-establish array pointer after potential corruption
     frame.fix_array_ptrs();
 
-    // RPython bhimpl_recursive_call parity: the portal runner runs
-    // the interpreter WITHOUT re-entering compiled code. In RPython,
-    // blackhole's bhimpl_recursive_call calls portal_runner_adr which
-    // is the interpreter entry point, bypassing the JIT. We achieve
-    // this by temporarily forcing all nested calls to use eval_frame_plain.
-    let _plain_guard = pyre_interp::call::force_plain_eval();
+    // RPython parity: blackhole runs the CURRENT function without JIT
+    // (eval_loop_for_force), but nested calls from within blackhole go
+    // through portal_runner (eval_with_jit) which CAN re-enter compiled
+    // code. Removing force_plain_eval achieves this: eval_loop_for_force
+    // runs the current frame, but call_user_function dispatches nested
+    // calls through the EVAL_OVERRIDE (eval_with_jit).
 
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
@@ -808,10 +808,14 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
-    let _plain_guard = pyre_interp::call::force_plain_eval();
+    // RPython parity: current frame runs without JIT, nested calls
+    // go through portal_runner (eval_with_jit via EVAL_OVERRIDE).
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = resume_in_blackhole(frame);
+        let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
+            Ok(r) => r,
+            Err(err) => panic!("jit force recursive call raw failed: {err}"),
+        };
         match protocol {
             FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
                 w_int_get_value(bh_result)
@@ -850,10 +854,8 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
-    // RPython parity: concrete execution during tracing must not re-enter
-    // the JIT portal. Use force_plain_eval to ensure nested calls use
-    // eval_frame_plain instead of eval_with_jit.
-    let _plain_guard = pyre_interp::call::force_plain_eval();
+    // RPython parity: current frame runs without JIT, nested calls
+    // go through portal_runner (eval_with_jit via EVAL_OVERRIDE).
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
         let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
