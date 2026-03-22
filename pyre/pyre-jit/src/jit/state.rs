@@ -3131,10 +3131,22 @@ impl TraceFrameState {
                 // hit, then forces the residual/assembler path so the current
                 // trace can converge. Mirror that here instead of letting
                 // self-recursive trace-through run until trace-too-long.
+                let tracing_recursive_function_entry =
+                    is_self_recursive && root_trace_green_key == current_function_key;
                 let can_trace_through = callee_inline_eligible
                     && nargs <= 4
                     && if is_self_recursive {
-                        inline_decision == majit_meta::InlineDecision::Inline
+                        // RPython pyjitpl.py reached_loop_header(): when a
+                        // function-entry trace re-enters the same portal, the
+                        // recursive call is handed off with
+                        // do_recursive_call(..., assembler_call=True)
+                        // instead of tracing through the nested portal body as
+                        // an ordinary inline helper. Keep pyre on the same
+                        // side of that boundary: root function-entry traces do
+                        // not recursively trace-through "self"; they converge
+                        // to CALL_ASSEMBLER via the pending token path below.
+                        !tracing_recursive_function_entry
+                            && inline_decision == majit_meta::InlineDecision::Inline
                             && recursive_depth < max_unroll_recursion
                     } else {
                         !callee_prefers_function_entry && !callee_has_loop
