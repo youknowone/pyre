@@ -1357,14 +1357,25 @@ impl TraceFrameState {
         mut value: OpRef,
     ) -> Result<(), PyError> {
         let vtype = self.value_type(value);
-        let concrete_slot_type =
-            concrete_stack_value(self.concrete_frame, idx).map(concrete_virtualizable_slot_type);
+        // RPython parity: MIFrame registers are independent of the concrete
+        // Python frame. The symbolic value type determines whether unboxing
+        // is needed, not the concrete frame's slot state. In inline trace-
+        // through, the concrete frame may have raw Int from virtualizable
+        // writeback while the symbolic value is a fresh boxed Ref (New()).
+        // Using concrete_slot_type here would incorrectly unbox the New().
+        let concrete_slot_type = if vtype == Type::Ref {
+            // Symbolic value is already boxed — don't unbox based on stale
+            // concrete frame state. Only unbox if BOTH symbolic and concrete
+            // agree the value should be unboxed.
+            Some(Type::Ref)
+        } else {
+            concrete_stack_value(self.concrete_frame, idx).map(concrete_virtualizable_slot_type)
+        };
         match (concrete_slot_type, vtype) {
             (Some(Type::Int), Type::Ref) => {
                 value = self.trace_guarded_int_payload(ctx, value);
             }
             (Some(Type::Float), Type::Ref) => {
-                // Inline unbox with record_guard for correct fail_arg types.
                 let float_type_addr = &FLOAT_TYPE as *const _ as i64;
                 if value.0 < 10_000 {
                     let ob_type = trace_gc_object_int_field(
