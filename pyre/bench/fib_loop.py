@@ -8,6 +8,6 @@ def main():
         a = b
         b = t
         i = i + 1
-    print(b)
+    print(b % 1000000007)
 
 main()
