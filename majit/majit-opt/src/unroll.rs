@@ -211,9 +211,10 @@ impl UnrollOptimizer {
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[jit] preamble peeling: {} virtual(s), phase1 end_args={}",
+                "[jit] preamble peeling: {} virtual(s), phase1 end_args={} next_iter_args={}",
                 jump_virtuals.len(),
                 exported_state.end_args.len(),
+                exported_state.next_iteration_args.len(),
             );
         }
 
@@ -1036,9 +1037,14 @@ impl OptUnroll {
             self.expand_info(source, ctx, exported_int_bounds, &mut infos);
         }
 
+        // RPython: next_iteration_args are the pre-force JUMP args,
+        // NOT the forced end_args. VirtualState has one entry per
+        // next_iteration_arg, so their lengths must match.
+        let next_iter_args = ctx.pre_force_jump_args.clone()
+            .unwrap_or_else(|| end_args.clone());
         let mut es = ExportedState::new(
             label_args.clone(),
-            end_args,
+            next_iter_args,
             virtual_state,
             infos,
             exported_short_ops,
