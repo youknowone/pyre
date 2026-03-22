@@ -1338,7 +1338,6 @@ impl<S: JitState> JitDriver<S> {
         let resume_pc = on_guard_failure(state, &exit_meta, &raw_values, &exit_layout);
         let restored = resume_pc.is_some();
         if restored {
-            execute_pending_field_writes(&exit_layout, &raw_values);
             self.sync_after(state, &exit_meta, descriptor.as_ref());
             if should_bridge {
                 self.start_bridge_tracing(
@@ -1755,7 +1754,6 @@ impl<S: JitState> JitDriver<S> {
             .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
         if should_bridge {
             if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values, &exit_layout) {
-                execute_pending_field_writes(&exit_layout, &raw_values);
                 self.sync_after(state, &result_meta, descriptor.as_ref());
                 self.start_bridge_tracing(
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
@@ -1767,66 +1765,9 @@ impl<S: JitState> JitDriver<S> {
 
         let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
         if resume_pc.is_some() {
-            execute_pending_field_writes(&exit_layout, &raw_values);
             self.sync_after(state, &result_meta, descriptor.as_ref());
         }
         resume_pc
-    }
-}
-
-/// Execute deferred heap writes from a guard's recovery layout.
-///
-/// rd_pendingfields: when the optimizer defers SetfieldGc/SetarrayitemGc to
-/// the guard's resume data (e.g. virtualizable head/size fields), the Cranelift
-/// backend stores the layout in ExitPendingFieldLayout but does NOT emit inline
-/// stores in the guard exit block. Instead, this function replays them in Rust
-/// after the compiled code returns, using the raw exit values.
-pub fn execute_pending_field_writes(
-    exit_layout: &crate::compile::CompiledExitLayout,
-    raw_values: &[i64],
-) {
-    let Some(ref recovery) = exit_layout.recovery_layout else {
-        return;
-    };
-    for pf in &recovery.pending_field_layouts {
-        // Skip entries without valid field layout (field_size == 0 means
-        // the layout was constructed from resume summary without raw offsets).
-        if pf.field_size == 0 {
-            continue;
-        }
-        let target = resolve_exit_value_source(&pf.target, raw_values);
-        let value = resolve_exit_value_source(&pf.value, raw_values);
-        if target == 0 {
-            continue; // Null struct pointer
-        }
-        unsafe {
-            let ptr = (target as *mut u8).add(pf.field_offset);
-            match pf.field_type {
-                majit_ir::Type::Float => {
-                    (ptr as *mut f64).write(f64::from_bits(value as u64));
-                }
-                majit_ir::Type::Int | majit_ir::Type::Ref => match pf.field_size {
-                    1 => ptr.write(value as u8),
-                    2 => (ptr as *mut i16).write(value as i16),
-                    4 => (ptr as *mut i32).write(value as i32),
-                    _ => (ptr as *mut i64).write(value),
-                },
-                majit_ir::Type::Void => {}
-            }
-        }
-    }
-}
-
-fn resolve_exit_value_source(
-    source: &majit_codegen::ExitValueSourceLayout,
-    raw_values: &[i64],
-) -> i64 {
-    match source {
-        majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
-            raw_values.get(*idx).copied().unwrap_or(0)
-        }
-        majit_codegen::ExitValueSourceLayout::Constant(val) => *val,
-        _ => 0,
     }
 }
 
