@@ -337,6 +337,13 @@ impl OptHeap {
                 for arg in op.args.iter_mut() {
                     *arg = ctx.get_replacement(*arg);
                 }
+                // RPython heap.py:122-143 force_lazy_set(): after emitting,
+                // put_field_back_to_info() restores the cache. For
+                // virtualizable fields we don't emit, but we still need
+                // the cache to persist for subsequent getfields.
+                let final_value = op.arg(1);
+                self.cached_fields.insert(key, final_value);
+                self.remember_field_descr(key, &op);
                 pendingfields.push(op);
                 continue;
             }
