@@ -888,10 +888,11 @@ pub fn install_jit_call_bridge() {
             jit_blackhole_resume_from_guard,
         );
         // RPython compile.py:714: bridge compilation on guard failure threshold.
-        // TODO: enable when jit_bridge_compile_for_guard produces correct
-        // results (currently returns wrong values for fib base case).
-        // let (driver, _) = crate::eval::driver_pair();
-        // driver.set_bridge_threshold_hook(...);
+        // Bridge compilation works (guard=0 at count=200 triggers hook) but
+        // jit_bridge_compile_for_guard generates incorrect bridge ops that
+        // crash. Needs RPython-faithful bridge: new MetaInterp traces from
+        // guard failure point, not hardcoded ops.
+        // TODO: implement _trace_and_compile_from_bridge (compile.py:714)
     });
 }
 
