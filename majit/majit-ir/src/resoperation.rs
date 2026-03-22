@@ -74,6 +74,9 @@ pub struct Op {
     /// Mirrors rpython/jit/metainterp/resoperation.py getfailargs/setfailargs.
     /// If None, the backend falls back to storing input args.
     pub fail_args: Option<SmallVec<[OpRef; 3]>>,
+    /// Types of fail_args, set by the optimizer from constant_types.
+    /// When present, the backend uses these instead of inferring types.
+    pub fail_arg_types: Option<Vec<Type>>,
     /// Virtual objects in fail_args that should be reconstructed on guard
     /// failure instead of being materialized at compile time.
     ///
@@ -94,6 +97,7 @@ impl Op {
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
+            fail_arg_types: None,
             rd_virtuals: None,
             rd_pendingfields: None,
         }
@@ -106,6 +110,7 @@ impl Op {
             descr: Some(descr),
             pos: OpRef::NONE,
             fail_args: None,
+            fail_arg_types: None,
             rd_virtuals: None,
             rd_pendingfields: None,
         }
