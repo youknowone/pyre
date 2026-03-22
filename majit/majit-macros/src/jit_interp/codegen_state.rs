@@ -1036,6 +1036,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 linked_list_heads: std::collections::HashMap<usize, majit_ir::OpRef>,
                 // Keep symbolic stacks for fallback (non-linked-list storages)
                 stacks: std::collections::HashMap<usize, majit_meta::SymbolicStack>,
+                // Resume PC for internal guards (e.g. ensure_linked_list_head)
+                guard_resume_pc: Option<majit_ir::OpRef>,
             }
 
             #[allow(non_camel_case_types)]
@@ -1092,6 +1094,14 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 fn total_slots(&self) -> usize { 0 }
                 fn loop_header_pc(&self) -> usize { self.loop_header_pc }
                 fn header_selected(&self) -> usize { self.header_selected }
+
+                fn set_guard_resume_pc(&mut self, pc: majit_ir::OpRef) {
+                    self.guard_resume_pc = Some(pc);
+                }
+
+                fn guard_resume_pc(&self) -> Option<majit_ir::OpRef> {
+                    self.guard_resume_pc
+                }
 
                 fn ensure_stack(&mut self, selected: usize, _offset: usize, _len: usize) {
                     if !self.storage_layout.iter().any(|&(s, _)| s == selected) {
@@ -1208,13 +1218,19 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         .unwrap_or_else(|| ctx.const_int(self.current_selected as i64));
                     let selected_ref = self.current_selected_ref
                         .unwrap_or(stack_ref);
-                    let fail_args = vec![stacksize, self.pool_ref, selected_val, selected_ref];
-                    let fail_types = vec![
+                    let mut fail_args = vec![stacksize, self.pool_ref, selected_val, selected_ref];
+                    let mut fail_types = vec![
                         majit_ir::Type::Int,
                         majit_ir::Type::Ref,
                         majit_ir::Type::Int,
                         majit_ir::Type::Ref,
                     ];
+                    // Resume at the loop header so the interpreter can
+                    // re-evaluate stackok and take the appropriate branch
+                    // when the stack is empty.
+                    let resume_pc = ctx.const_int(self.loop_header_pc as i64);
+                    fail_args.push(resume_pc);
+                    fail_types.push(majit_ir::Type::Int);
                     ctx.record_guard_typed_with_fail_args(
                         majit_ir::OpCode::GuardTrue,
                         &[ge],
@@ -1368,6 +1384,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         linked_list_stack_refs: std::collections::HashMap::new(),
                         linked_list_heads: std::collections::HashMap::new(),
                         stacks: std::collections::HashMap::new(),
+                        guard_resume_pc: None,
                     }
                 }
 
