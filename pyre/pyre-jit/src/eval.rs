@@ -8,7 +8,7 @@
 //! from outside the interpreter.
 
 use crate::jit::state::{PyreEnv, PyreJitState};
-use crate::jit::trace::trace_one_op;
+use crate::jit::trace::trace_bytecode;
 use pyre_interp::frame::PyFrame;
 use pyre_object::w_none;
 use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
@@ -244,7 +244,7 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
         // RPython: jit_merge_point is in every dispatch() call.
         // During concrete execution it's a no-op (JC_TRACING per-cell
-        // check). In pyre, trace_one_op traces the entire loop in one
+        // check). In pyre, trace_bytecode traces the entire loop in one
         // call (unlike RPython's one-bytecode-at-a-time MetaInterp), so
         // we gate on depth==0 to ensure single invocation per trace.
         // is_tracing_key provides RPython's per-cell JC_TRACING check.
@@ -322,7 +322,7 @@ fn jit_merge_point_hook(
             let mut trace_frame = frame.snapshot_for_tracing();
             let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
             let _ = concrete_frame;
-            trace_one_op(ctx, sym, code, pc, trace_frame_ptr)
+            trace_bytecode(ctx, sym, code, pc, trace_frame_ptr)
         },
     ) {
         if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
@@ -848,16 +848,12 @@ r = fannkuch(6)";
 
     #[test]
     fn test_eval_recursive_fib_compiles_function_entry_trace() {
-        // RPython test_recursive.py: warmup with repeated calls so the
-        // trace compiles from a well-formed entry (function portal).
         let source = "\
 def fib(n):
     if n < 2:
         return n
     return fib(n - 1) + fib(n - 2)
 
-for i in range(15):
-    fib(i)
 result = fib(12)";
         let code = pyre_bytecode::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);

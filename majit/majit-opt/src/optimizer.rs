@@ -823,25 +823,6 @@ impl Optimizer {
         result
     }
 
-    /// heap.py: deserialize_optheap — import preamble heap cache into Phase 2.
-    pub fn import_all_cached_fields(&mut self, entries: &[(OpRef, u32, OpRef)]) {
-        for pass in &mut self.passes {
-            pass.import_cached_fields(entries);
-        }
-    }
-
-    /// Flush only virtualizable lazy SetfieldGc ops from the heap pass.
-    /// Called before JUMP in Phase 2 (skip_flush=true) so compiled code
-    /// writes head/size to memory for guard failure recovery.
-    fn flush_virtualizable_lazy_sets(&mut self, ctx: &mut OptContext) {
-        for pass in &mut self.passes {
-            if pass.name() == "heap" {
-                pass.flush_virtualizable(ctx);
-                break;
-            }
-        }
-    }
-
     /// optimizer.py: flush()
     /// Flush all passes' postponed state.
     pub fn flush(&mut self, ctx: &mut OptContext) {
@@ -1238,10 +1219,6 @@ impl Optimizer {
         let mut last_op = None;
         for op in ops {
             if self.skip_flush && op.opcode == OpCode::Jump {
-                // Phase 2: virtualizable lazy sets must be emitted before
-                // JUMP so the compiled code writes head/size to memory.
-                // RPython: flush(flush=False) still forces virtualizable fields.
-                self.flush_virtualizable_lazy_sets(&mut ctx);
                 last_op = Some(op.clone());
                 break;
             }
@@ -1783,10 +1760,9 @@ impl Optimizer {
             ctx.in_final_emission = false;
         }
         if op.opcode.is_guard() {
-            // optimizer.py: store_final_boxes_in_guard — encode virtual
-            // objects in fail_args as rd_virtuals instead of forcing them.
-            // This runs at the optimizer level (not per-pass) so ALL guards
-            // get virtual encoding regardless of which pass emits them.
+            // RPython parity: do NOT force virtuals in guard fail_args.
+            // encode_guard_virtuals records them as rd_virtuals metadata
+            // for lazy reconstruction at guard failure time (resume.py).
             op = Self::encode_guard_virtuals(op, ctx);
 
             // optimizer.py:630-631: pendingfields → rd_pendingfields
@@ -1921,9 +1897,8 @@ impl Optimizer {
                     for &(field_idx, value_ref) in &vinfo.fields {
                         let mut final_ref = ctx.get_replacement(value_ref);
                         // Nested virtual field values must be forced to concrete.
-                        // Cranelift backend does not support multi-level rd_virtuals.
                         if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
-                            if nested.is_virtual() && !matches!(nested, crate::info::PtrInfo::Virtualizable(_)) {
+                            if nested.is_virtual() {
                                 let mut nested_mut = nested;
                                 let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
                                 final_ref = ctx.get_replacement(forced);
@@ -1951,8 +1926,9 @@ impl Optimizer {
                     let mut fields = Vec::with_capacity(vinfo.fields.len());
                     for &(field_idx, value_ref) in &vinfo.fields {
                         let mut final_ref = ctx.get_replacement(value_ref);
+                        // Nested virtual field values must be forced to concrete.
                         if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
-                            if nested.is_virtual() && !matches!(nested, crate::info::PtrInfo::Virtualizable(_)) {
+                            if nested.is_virtual() {
                                 let mut nested_mut = nested;
                                 let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
                                 final_ref = ctx.get_replacement(forced);

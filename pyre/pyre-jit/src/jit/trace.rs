@@ -29,13 +29,7 @@ fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
     }
 }
 
-/// RPython pyjitpl.py MIFrame.run_one_step — single opcode.
-///
-/// Traces one bytecode symbolically: creates TraceFrameState, executes
-/// the opcode via trace_code_step, and retargets the green key on loop
-/// closure. Called from merge_point (= _interpret) on each dispatch
-/// iteration.
-pub fn trace_one_op(
+pub fn trace_bytecode(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
     code: &CodeObject,
