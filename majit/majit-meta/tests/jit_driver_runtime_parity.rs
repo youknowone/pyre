@@ -1862,7 +1862,7 @@ fn generic_back_edge_restores_and_syncs_virtualizable_state() {
             state,
             &(),
             || {},
-            |_state, _meta, _| None,
+            |_state, _meta, _, _| None,
         )
     };
 
