@@ -1849,14 +1849,103 @@ pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendEr
     ))
 }
 
+/// Result of running a bridge chain: either re-enter the parent loop
+/// or exit with a DeadFrame.
+enum BridgeChainResult {
+    /// Bridge Finish arity matches the loop input arity; re-enter
+    /// the parent loop with these values.
+    Reentry(Vec<i64>),
+    /// Bridge exited via a non-reenterable path.
+    Exit(DeadFrame),
+}
+
+/// Execute a bridge chain. If the final exit is a Finish whose output
+/// arity matches `loop_num_inputs`, return `Reentry` so the caller can
+/// feed the values back into the parent loop (bridge-to-loop re-entry).
+fn run_bridge_chain(
+    bridge: &BridgeData,
+    parent_outputs: &[i64],
+    parent_types: &[Type],
+    loop_num_inputs: usize,
+) -> BridgeChainResult {
+    let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
+    let bridge_inputs = &parent_outputs[..num_bridge_inputs];
+
+    let (fail_index, outputs, handle, force_frame) = run_compiled_code(
+        bridge.code_ptr,
+        &bridge.fail_descrs,
+        bridge.gc_runtime_id,
+        bridge.num_ref_roots,
+        bridge.max_output_slots,
+        bridge_inputs,
+        bridge.needs_force_frame,
+    );
+
+    if let Some(frame) =
+        maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
+    {
+        return BridgeChainResult::Exit(wrap_call_assembler_deadframe_with_caller_prefix(
+            frame,
+            bridge.trace_id,
+            bridge.header_pc,
+            Some(bridge.source_guard),
+            &bridge.input_types,
+            bridge_inputs,
+            bridge.caller_prefix_layout.as_ref(),
+        ));
+    }
+
+    let fail_descr = &bridge.fail_descrs[fail_index as usize];
+    fail_descr.increment_fail_count();
+
+    // Bridge Finish with matching arity -> loop re-entry.
+    if fail_descr.is_finish && fail_descr.fail_arg_types.len() == loop_num_inputs {
+        release_force_token(handle);
+        return BridgeChainResult::Reentry(outputs[..loop_num_inputs].to_vec());
+    }
+
+    // Check for chained bridges.
+    let bridge_guard = fail_descr.bridge.lock().unwrap();
+    if let Some(ref next_bridge) = *bridge_guard {
+        release_force_token(handle);
+        return run_bridge_chain(next_bridge, &outputs, &fail_descr.fail_arg_types, loop_num_inputs);
+    }
+    drop(bridge_guard);
+
+    let saved_data = if let Some(ref ff) = force_frame {
+        take_force_frame_saved_data(ff)
+    } else {
+        None
+    };
+    let (exception_class, exception) = take_pending_jit_exception_state();
+    if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
+        release_force_token(handle);
+    }
+
+    BridgeChainResult::Exit(DeadFrame {
+        data: Box::new(FrameData::new_with_savedata_and_exception(
+            outputs,
+            fail_descr.clone(),
+            bridge.gc_runtime_id,
+            saved_data,
+            exception_class,
+            (!exception.is_null()).then_some(exception),
+        )),
+    })
+}
+
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
+    let loop_num_inputs = target.num_inputs;
+    let mut reentry_buf = inputs.to_vec();
+
+    loop {
     let (fail_index, outputs, handle, force_frame) = run_compiled_code(
         target.code_ptr,
         &target.fail_descrs,
         target.gc_runtime_id,
         target.num_ref_roots,
         target.max_output_slots,
-        inputs,
+        &reentry_buf,
         target.needs_force_frame,
     );
 
@@ -1869,27 +1958,38 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             target.header_pc,
             target.source_guard,
             &target.inputarg_types,
-            inputs,
+            &reentry_buf,
             target.caller_prefix_layout.as_ref(),
         );
     }
 
     let fail_descr = &target.fail_descrs[fail_index as usize];
     let fail_count = fail_descr.increment_fail_count();
-    let bridge_guard = fail_descr.bridge.lock().unwrap();
-    if let Some(ref bridge) = *bridge_guard {
-        release_force_token(handle);
-        return CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
-    }
-    drop(bridge_guard);
 
-    // RPython compile.py:696 (handle_fail → must_compile): trigger bridge
+    // Bridge-to-loop re-entry: when bridge Finish arity matches loop inputs,
+    // feed bridge outputs back as loop inputs without interpreter round-trip.
+    let bridge_ptr = fail_descr.bridge_code_ptr();
+    if !bridge_ptr.is_null() {
+        release_force_token(handle);
+        let bridge_guard = fail_descr.bridge.lock().unwrap();
+        if let Some(ref bridge) = *bridge_guard {
+            match run_bridge_chain(bridge, &outputs, &fail_descr.fail_arg_types, loop_num_inputs) {
+                BridgeChainResult::Reentry(new_inputs) => {
+                    reentry_buf = new_inputs;
+                    continue;
+                }
+                BridgeChainResult::Exit(frame) => return frame,
+            }
+        }
+        drop(bridge_guard);
+    }
+
+    // RPython compile.py:696 (handle_fail -> must_compile): trigger bridge
     // Bridge compilation is deferred: store a pending request that the
     // MetaInterp layer can pick up after execute_token returns.
     // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
     if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-        // green_key from target's header_pc (may be 0 for function-entry traces)
-        let gk = target.header_pc; // use header_pc; caller provides real green_key
+        let gk = target.header_pc;
         request_pending_bridge_compile(gk, target.trace_id, fail_index);
     }
 
@@ -1903,7 +2003,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         release_force_token(handle);
     }
 
-    DeadFrame {
+    return DeadFrame {
         data: Box::new(FrameData::new_with_savedata_and_exception(
             outputs,
             fail_descr.clone(),
@@ -1912,7 +2012,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             exception_class,
             (!exception.is_null()).then_some(exception),
         )),
-    }
+    };
+    } // end loop (bridge-to-loop re-entry)
 }
 
 /// Stack-allocated output buffer size for the fast path.
@@ -3929,14 +4030,24 @@ impl CraneliftBackend {
     ///
     /// Shared by `execute_token` (after Value→i64 conversion) and
     /// `execute_token_ints` (direct pass-through).
+    ///
+    /// Bridge-to-loop re-entry: when a guard fails and the attached bridge
+    /// exits with a Finish whose output arity matches the loop's input arity,
+    /// the bridge outputs are fed back as loop inputs without returning to the
+    /// interpreter. This eliminates the per-guard-failure interpreter
+    /// round-trip (RPython: bridge code jumps directly to loop header).
     fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
+        let loop_num_inputs = compiled.num_inputs;
+        let mut reentry_buf = inputs.to_vec();
+
+        loop {
         let (fail_index, outputs, handle, force_frame) = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
             compiled.gc_runtime_id,
             compiled.num_ref_roots,
             compiled.max_output_slots,
-            inputs,
+            &reentry_buf,
             compiled.needs_force_frame,
         );
 
@@ -3949,7 +4060,7 @@ impl CraneliftBackend {
                 compiled.header_pc,
                 None,
                 &compiled.input_types,
-                inputs,
+                &reentry_buf,
                 compiled.caller_prefix_layout.as_ref(),
             );
         }
@@ -3959,13 +4070,24 @@ impl CraneliftBackend {
         // Increment guard failure count.
         fail_descr.increment_fail_count();
 
-        // If a bridge is attached to this guard, execute it.
-        let bridge_guard = fail_descr.bridge.lock().unwrap();
-        if let Some(ref bridge) = *bridge_guard {
+        // If a bridge is attached to this guard, execute the bridge chain.
+        // When the chain exits with a Finish whose arity matches the loop
+        // inputs, re-enter the loop directly (bridge-to-loop re-entry).
+        let bridge_ptr = fail_descr.bridge_code_ptr();
+        if !bridge_ptr.is_null() {
             release_force_token(handle);
-            return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            let bridge_guard = fail_descr.bridge.lock().unwrap();
+            if let Some(ref bridge) = *bridge_guard {
+                match run_bridge_chain(bridge, &outputs, &fail_descr.fail_arg_types, loop_num_inputs) {
+                    BridgeChainResult::Reentry(new_inputs) => {
+                        reentry_buf = new_inputs;
+                        continue;
+                    }
+                    BridgeChainResult::Exit(frame) => return frame,
+                }
+            }
+            drop(bridge_guard);
         }
-        drop(bridge_guard);
 
         let saved_data = if let Some(ref ff) = force_frame {
             take_force_frame_saved_data(ff)
@@ -3977,7 +4099,7 @@ impl CraneliftBackend {
             release_force_token(handle);
         }
 
-        DeadFrame {
+        return DeadFrame {
             data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
                 fail_descr.clone(),
@@ -3986,75 +4108,24 @@ impl CraneliftBackend {
                 exception_class,
                 (!exception.is_null()).then_some(exception),
             )),
-        }
+        };
+        } // end loop (bridge-to-loop re-entry)
     }
 
+    /// Execute a bridge chain and return a DeadFrame.
     ///
     /// If the bridge itself hits a guard that has another bridge attached,
     /// this chains through until a final exit is reached.
+    /// This is the non-reentry path used by callers that cannot loop back.
     fn execute_bridge(
         bridge: &BridgeData,
         parent_outputs: &[i64],
         parent_types: &[Type],
     ) -> DeadFrame {
-        // The bridge's inputs are the parent guard's fail args.
-        let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
-        let bridge_inputs = &parent_outputs[..num_bridge_inputs];
-
-        let (fail_index, outputs, handle, force_frame) = run_compiled_code(
-            bridge.code_ptr,
-            &bridge.fail_descrs,
-            bridge.gc_runtime_id,
-            bridge.num_ref_roots,
-            bridge.max_output_slots,
-            bridge_inputs,
-            bridge.needs_force_frame,
-        );
-
-        if let Some(frame) =
-            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
-        {
-            return wrap_call_assembler_deadframe_with_caller_prefix(
-                frame,
-                bridge.trace_id,
-                bridge.header_pc,
-                Some(bridge.source_guard),
-                &bridge.input_types,
-                bridge_inputs,
-                bridge.caller_prefix_layout.as_ref(),
-            );
-        }
-
-        let fail_descr = &bridge.fail_descrs[fail_index as usize];
-        fail_descr.increment_fail_count();
-
-        // Check for chained bridges.
-        let bridge_guard = fail_descr.bridge.lock().unwrap();
-        if let Some(ref next_bridge) = *bridge_guard {
-            release_force_token(handle);
-            return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
-        }
-        drop(bridge_guard);
-
-        let saved_data = if let Some(ref ff) = force_frame {
-            take_force_frame_saved_data(ff)
-        } else {
-            None
-        };
-        let (exception_class, exception) = take_pending_jit_exception_state();
-        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-            release_force_token(handle);
-        }
-
-        DeadFrame {
-            data: Box::new(FrameData::new_with_savedata_and_exception(
-                outputs,
-                fail_descr.clone(),
-                bridge.gc_runtime_id,
-                saved_data,
-                exception_class,
-                (!exception.is_null()).then_some(exception),
-            )),
+        // Use run_bridge_chain with loop_num_inputs=0 to disable re-entry.
+        match run_bridge_chain(bridge, parent_outputs, parent_types, 0) {
+            BridgeChainResult::Reentry(_) => unreachable!("reentry disabled with loop_num_inputs=0"),
+            BridgeChainResult::Exit(frame) => frame,
         }
     }
 
@@ -8062,13 +8133,17 @@ impl majit_codegen::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
+        let loop_num_inputs = compiled.num_inputs;
+        let mut reentry_buf = args.to_vec();
+
+        loop {
         let (fail_index, mut outputs, handle, force_frame) = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
             compiled.gc_runtime_id,
             compiled.num_ref_roots,
             compiled.max_output_slots,
-            args,
+            &reentry_buf,
             compiled.needs_force_frame,
         );
 
@@ -8081,7 +8156,7 @@ impl majit_codegen::Backend for CraneliftBackend {
                 compiled.header_pc,
                 None,
                 &compiled.input_types,
-                args,
+                &reentry_buf,
                 compiled.caller_prefix_layout.as_ref(),
             );
             let descr = self.get_latest_descr(&frame);
@@ -8131,55 +8206,67 @@ impl majit_codegen::Backend for CraneliftBackend {
         let fail_descr = &compiled.fail_descrs[fail_index as usize];
         fail_descr.increment_fail_count();
 
-        // If a bridge is attached, fall back to the full DeadFrame path.
-        let bridge_guard = fail_descr.bridge.lock().unwrap();
-        if let Some(ref bridge) = *bridge_guard {
+        // Bridge-to-loop re-entry: if a bridge is attached and exits with
+        // a Finish whose arity matches the loop inputs, re-enter the loop
+        // directly without returning to the interpreter.
+        let bridge_ptr = fail_descr.bridge_code_ptr();
+        if !bridge_ptr.is_null() {
             release_force_token(handle);
-            let frame = Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
-            let descr = frame
-                .data
-                .downcast_ref::<FrameData>()
-                .expect("bridge returned unexpected frame type");
-            let arity = descr.fail_descr.fail_arg_types().len();
-            let mut result = Vec::with_capacity(arity);
-            let mut typed_result = Vec::with_capacity(arity);
-            for (i, &tp) in descr.fail_descr.fail_arg_types().iter().enumerate() {
-                match tp {
-                    Type::Int => {
-                        let value = descr.get_int(i);
-                        result.push(value);
-                        typed_result.push(Value::Int(value));
+            let bridge_guard = fail_descr.bridge.lock().unwrap();
+            if let Some(ref bridge) = *bridge_guard {
+                match run_bridge_chain(bridge, &outputs, &fail_descr.fail_arg_types, loop_num_inputs) {
+                    BridgeChainResult::Reentry(new_inputs) => {
+                        reentry_buf = new_inputs;
+                        continue;
                     }
-                    Type::Ref => {
-                        let value = descr.get_ref(i);
-                        result.push(value.as_usize() as i64);
-                        typed_result.push(Value::Ref(value));
-                    }
-                    Type::Float => {
-                        let value = descr.get_float(i);
-                        result.push(value.to_bits() as i64);
-                        typed_result.push(Value::Float(value));
-                    }
-                    Type::Void => {
-                        result.push(0);
-                        typed_result.push(Value::Void);
+                    BridgeChainResult::Exit(frame) => {
+                        let descr = frame
+                            .data
+                            .downcast_ref::<FrameData>()
+                            .expect("bridge returned unexpected frame type");
+                        let arity = descr.fail_descr.fail_arg_types().len();
+                        let mut result = Vec::with_capacity(arity);
+                        let mut typed_result = Vec::with_capacity(arity);
+                        for (i, &tp) in descr.fail_descr.fail_arg_types().iter().enumerate() {
+                            match tp {
+                                Type::Int => {
+                                    let value = descr.get_int(i);
+                                    result.push(value);
+                                    typed_result.push(Value::Int(value));
+                                }
+                                Type::Ref => {
+                                    let value = descr.get_ref(i);
+                                    result.push(value.as_usize() as i64);
+                                    typed_result.push(Value::Ref(value));
+                                }
+                                Type::Float => {
+                                    let value = descr.get_float(i);
+                                    result.push(value.to_bits() as i64);
+                                    typed_result.push(Value::Float(value));
+                                }
+                                Type::Void => {
+                                    result.push(0);
+                                    typed_result.push(Value::Void);
+                                }
+                            }
+                        }
+                        return majit_codegen::RawExecResult {
+                            outputs: result,
+                            typed_outputs: typed_result,
+                            exit_layout: Some(descr.fail_descr.layout()),
+                            force_token_slots: descr.fail_descr.force_token_slots().to_vec(),
+                            savedata: descr.try_get_savedata_ref(),
+                            exception_class: descr.get_exception_class(),
+                            exception_value: descr.get_exception_ref(),
+                            fail_index: descr.fail_descr.fail_index(),
+                            trace_id: descr.fail_descr.trace_id(),
+                            is_finish: descr.fail_descr.is_finish(),
+                        };
                     }
                 }
             }
-            return majit_codegen::RawExecResult {
-                outputs: result,
-                typed_outputs: typed_result,
-                exit_layout: Some(descr.fail_descr.layout()),
-                force_token_slots: descr.fail_descr.force_token_slots().to_vec(),
-                savedata: descr.try_get_savedata_ref(),
-                exception_class: descr.get_exception_class(),
-                exception_value: descr.get_exception_ref(),
-                fail_index: descr.fail_descr.fail_index(),
-                trace_id: descr.fail_descr.trace_id(),
-                is_finish: descr.fail_descr.is_finish(),
-            };
+            drop(bridge_guard);
         }
-        drop(bridge_guard);
 
         // No bridge — skip DeadFrame, return outputs directly.
         let savedata = if let Some(ref ff) = force_frame {
@@ -8204,7 +8291,7 @@ impl majit_codegen::Backend for CraneliftBackend {
             }
         }
 
-        majit_codegen::RawExecResult {
+        return majit_codegen::RawExecResult {
             outputs,
             typed_outputs,
             exit_layout: Some(fail_descr.layout()),
@@ -8215,7 +8302,8 @@ impl majit_codegen::Backend for CraneliftBackend {
             fail_index,
             trace_id: fail_descr.trace_id(),
             is_finish: fail_descr.is_finish(),
-        }
+        };
+        } // end loop (bridge-to-loop re-entry)
     }
 
     fn compiled_fail_descr_layouts(
