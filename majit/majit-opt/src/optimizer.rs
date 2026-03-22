@@ -1642,6 +1642,110 @@ impl Optimizer {
         ops
     }
 
+    /// unroll.py:183-236: optimize_bridge()
+    ///
+    /// Optimizes a bridge trace and redirects its terminal JUMP to the
+    /// appropriate loop body target token, falling back to the preamble
+    /// when no match is found.
+    ///
+    /// Returns the final optimized ops with JUMP redirected.
+    pub fn optimize_bridge(
+        &mut self,
+        ops: &[Op],
+        constants: &mut std::collections::HashMap<u32, i64>,
+        num_inputs: usize,
+        front_target_tokens: &mut Vec<crate::unroll::TargetToken>,
+        inline_short_preamble: bool,
+        // runtime_boxes: Option<&[Value]>,  // B4 TODO
+        // resumestorage: Option<...>,        // B3 TODO
+    ) -> Vec<Op> {
+        // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
+        let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
+
+        // Check if trace ends with JUMP
+        let ends_with_jump = optimized_ops
+            .last()
+            .map_or(false, |op| op.opcode == OpCode::Jump);
+
+        if !ends_with_jump {
+            return optimized_ops;
+        }
+
+        let jump_args = optimized_ops.last().unwrap().args.to_vec();
+
+        // unroll.py:198-200: not inline_short_preamble or single target → jump_to_preamble
+        if !inline_short_preamble || front_target_tokens.len() <= 1 {
+            if let Some(preamble_token) = front_target_tokens.first() {
+                return crate::unroll::UnrollOptimizer::jump_to_preamble(&optimized_ops, preamble_token);
+            }
+            return optimized_ops;
+        }
+
+        // unroll.py:203: self.flush()
+        let mut ctx = self
+            .final_ctx
+            .take()
+            .unwrap_or_else(|| {
+                let ni = self.final_num_inputs();
+                OptContext::with_num_inputs(32, ni)
+            });
+        self.flush(&mut ctx);
+
+        // unroll.py:204-205: force_box_for_end_of_preamble for each jump arg
+        for &arg in &jump_args {
+            let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
+        }
+
+        // Resolve JUMP args after forcing
+        let jump_args: Vec<_> = jump_args
+            .iter()
+            .map(|&a| ctx.get_replacement(a))
+            .collect();
+
+        // unroll.py:207-208: jump_to_existing_trace(jump_op, None, runtime_boxes, force_boxes=False)
+        let opt_unroll = crate::unroll::OptUnroll::new();
+        let vs = opt_unroll.jump_to_existing_trace(
+            &jump_args,
+            None,
+            front_target_tokens,
+            self,
+            &mut ctx,
+            false,
+        );
+
+        if vs.is_none() {
+            // unroll.py:212-213: matched → return ops with redirected JUMP
+            let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+            result.extend(ctx.new_operations.drain(..));
+            return result;
+        }
+
+        // unroll.py:214-218: retrace logic (B7 TODO — for now skip retrace, go to force)
+        // Try force_boxes=true (unroll.py:221-223)
+        ctx.clear_newoperations();
+        let vs2 = opt_unroll.jump_to_existing_trace(
+            &jump_args,
+            None,
+            front_target_tokens,
+            self,
+            &mut ctx,
+            true, // force_boxes
+        );
+
+        if vs2.is_none() {
+            let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+            result.extend(ctx.new_operations.drain(..));
+            return result;
+        }
+
+        // unroll.py:228-229: jump_to_preamble fallback
+        if let Some(preamble_token) = front_target_tokens.first() {
+            return crate::unroll::UnrollOptimizer::jump_to_preamble(&optimized_ops, preamble_token);
+        }
+
+        optimized_ops
+    }
+
     fn collect_exported_int_bounds(
         &self,
         args: &[OpRef],
