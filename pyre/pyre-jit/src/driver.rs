@@ -35,19 +35,22 @@ mod tests {
 
     #[test]
     fn test_traceable_opcodes() {
-        assert!(is_traceable("UnboxIntBinop"));
-        assert!(is_traceable("LocalRead"));
-        assert!(is_traceable("FunctionCall"));
+        // majit-analyze classifies opcodes based on static analysis.
+        // VableArrayRead/Write are the primary classified patterns for
+        // locals/cells access (LoadFast → VableArrayRead etc.).
+        assert!(is_traceable("VableArrayRead"));
+        assert!(is_traceable("VableArrayWrite"));
         assert!(!is_traceable("NonExistent"));
     }
 
     #[test]
     fn test_classification_lookup() {
+        // LoadDeref reads from the virtualizable cells array.
         let cls = CANONICAL_TRACE_PATTERNS
             .iter()
-            .find(|(pat, _)| *pat == "Instruction::BinaryOp")
+            .find(|(pat, _)| *pat == "Instruction::LoadDeref")
             .map(|(_, cls)| *cls);
         assert!(cls.is_some());
-        assert_eq!(cls.unwrap(), "UnboxIntBinop");
+        assert_eq!(cls.unwrap(), "VableArrayRead");
     }
 }

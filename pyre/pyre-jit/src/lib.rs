@@ -42,21 +42,22 @@ mod tests {
             CANONICAL_TRACE_PATTERNS.len()
         );
 
-        // Check key patterns exist
-        let has_binary = CANONICAL_TRACE_PATTERNS
+        // Check key patterns exist — majit-analyze classifies opcodes
+        // based on virtualizable array access patterns (RPython parity).
+        let has_vable_read = CANONICAL_TRACE_PATTERNS
             .iter()
-            .any(|(_, p)| *p == "UnboxIntBinop");
-        assert!(has_binary, "missing UnboxIntBinop pattern");
+            .any(|(_, p)| *p == "VableArrayRead");
+        assert!(has_vable_read, "missing VableArrayRead pattern");
 
-        let has_local_read = CANONICAL_TRACE_PATTERNS
+        let has_vable_write = CANONICAL_TRACE_PATTERNS
             .iter()
-            .any(|(_, p)| *p == "LocalRead");
-        assert!(has_local_read, "missing LocalRead pattern");
+            .any(|(_, p)| *p == "VableArrayWrite");
+        assert!(has_vable_write, "missing VableArrayWrite pattern");
 
-        let has_call = CANONICAL_TRACE_PATTERNS
+        let has_vable_field = CANONICAL_TRACE_PATTERNS
             .iter()
-            .any(|(_, p)| *p == "FunctionCall");
-        assert!(has_call, "missing FunctionCall pattern");
+            .any(|(_, p)| *p == "VableFieldWrite");
+        assert!(has_vable_field, "missing VableFieldWrite pattern");
 
         eprintln!(
             "Auto-generated {} canonical trace patterns",
