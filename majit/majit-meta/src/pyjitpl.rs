@@ -1838,6 +1838,11 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|e| e.num_inputs)
     }
 
+    /// Get the root trace_id for a compiled loop.
+    pub fn get_root_trace_id(&self, green_key: u64) -> Option<u64> {
+        self.compiled_loops.get(&green_key).map(|e| e.root_trace_id)
+    }
+
     /// Run the compiled loop for the given green key.
     ///
     /// `live_values` must have the same length and order as the values
