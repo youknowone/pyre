@@ -135,12 +135,12 @@ impl Drop for BlackholeEntryGuard {
 /// compiled loop.
 #[inline]
 pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
-    if JIT_TRACING.with(|t| t.get()) {
-        JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
-        Some(JitCallDepthGuard)
-    } else {
-        None
-    }
+    // RPython parity: track call depth unconditionally so that
+    // jit_merge_point (which only runs at depth 0) is not entered
+    // for nested function calls. Only the outermost portal level
+    // should run the JIT dispatch loop.
+    JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
+    Some(JitCallDepthGuard)
 }
 
 #[inline]
@@ -181,21 +181,27 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     crate::call_jit::install_jit_call_bridge();
     frame.fix_array_ptrs();
 
+    // RPython warmspot.py ll_portal_runner:
+    //   maybe_compile_and_run(increment_threshold, *args)
+    //   return portal_ptr(*args)
+    //
+    // maybe_compile_and_run = try_function_entry_jit: checks for compiled
+    // code (dispatch) or threshold (start tracing). Internally guards on
+    // JC_TRACING (driver.is_tracing()) to avoid re-entry during tracing.
+    //
+    // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
+    // can_enter_jit back-edge), plain interpreter at depth > 0.
     if let Some(result) = try_function_entry_jit(frame) {
         return result;
     }
-
-    // RPython parity: after guard-restored fallback from compiled code,
-    // prevent nested calls from re-entering compiled code. The Finish
-    // result's forced-virtual W_IntObject (New+SetfieldGc in unbox pass)
-    // has corrupted ob_type when executed through nested compiled code
-    // dispatch. Root cause: optimizer's virtual forcing emits New with
-    // ob_type SetfieldGc, but the Cranelift-compiled execution order or
-    // allocation lifecycle differs from the trace's expectations.
-    //
-    // TODO: fix New/SetfieldGc execution order for forced virtuals in
-    // the unbox pass to allow nested compiled code dispatch.
-    let _plain_guard = pyre_interp::call::force_plain_eval();
+    // RPython portal_ptr(*args): the original interpreter function.
+    // At depth 0, eval_loop_jit adds jit_merge_point (PyPy interp_jit.py
+    // dispatch) and can_enter_jit (back-edge compilation).
+    // At depth > 0, use the plain interpreter directly — RPython's
+    // portal_ptr is the unmodified interpreter, not the JIT dispatch loop.
+    if JIT_CALL_DEPTH.with(|d| d.get()) > 0 {
+        return pyre_interp::eval::eval_loop_for_force(frame);
+    }
     eval_loop_jit(frame)
 }
 
@@ -374,18 +380,25 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     }
 }
 
-/// Try running compiled code or entering the recursive function-entry path.
+/// RPython warmstate.py maybe_compile_and_run parity.
+///
+/// Called at every portal entry (function call). Must be fast for the
+/// common case (no compiled code, not tracing, threshold not reached).
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
-    // RPython parity: blackhole's bhimpl_recursive_call calls portal_runner
-    // which CAN enter JIT for callee frames. Only the force callback's OWN
-    // frame runs as interpreter (eval_loop_for_force); nested calls freely
-    // enter compiled code. No in_blackhole_entry() check needed here.
     let green_key = make_green_key(frame.code, frame.next_instr);
-
-    // Process deferred bridge compile requests from call_assembler
-    // guard failures. Must be done BEFORE driver_pair() to avoid
-    // double mutable borrow (jit_bridge_compile_for_guard also borrows).
     let (driver, info) = driver_pair();
+
+    // RPython warmstate.py maybe_compile_and_run fast path:
+    // if no compiled loop and not tracing, just tick the counter.
+    if !driver.has_compiled_loop(green_key) && !driver.is_tracing() {
+        let should_trace = driver
+            .meta_interp_mut()
+            .warm_state_mut()
+            .should_trace_function_entry(green_key);
+        if !should_trace {
+            return None;
+        }
+    }
 
     if driver.has_compiled_loop(green_key) {
         if majit_meta::majit_log_enabled() {
