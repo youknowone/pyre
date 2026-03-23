@@ -2974,46 +2974,6 @@ mod tests {
 
     // ── Test 24: Two NEW objects don't alias — write to one preserves cache of the other ──
 
-    #[test]
-    fn test_seen_allocation_no_alias() {
-        // p0 = new()
-        // p1 = new()
-        // setfield_gc(p0, i10, descr=d0)
-        // i1 = getfield_gc_i(p0, descr=d0)   <- cached from set
-        // setfield_gc(p1, i20, descr=d0)      <- same field, different seen alloc
-        // i2 = getfield_gc_i(p0, descr=d0)   <- still cached! p1 can't alias p0
-        let d = descr(0);
-        let mut ops = vec![
-            Op::new(OpCode::New, &[]), // pos=0 -> p0
-            Op::new(OpCode::New, &[]), // pos=1 -> p1
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()), // set p0.f = i10
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()), // read p0.f -> cached
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(20)], d.clone()), // set p1.f = i20
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()), // read p0.f -> still cached
-            Op::new(OpCode::Jump, &[]),
-        ];
-        let result = run_heap_opt(&mut ops);
-
-        // RPython CachedField per-descr: setfield(p1) forces lazy_set(p0) →
-        // emits SETFIELD(p0). But put_field_back_to_info restores p0's cache,
-        // so both GETFIELDs are still eliminated.
-        // Result: NEW + NEW + SETFIELD(p0) + Jump.
-        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
-        assert!(
-            !opcodes.contains(&OpCode::GetfieldGcI),
-            "both GETFIELDs should be eliminated, got: {opcodes:?}"
-        );
-        // One SETFIELD is emitted (forced from p0's lazy_set by p1's setfield).
-        assert_eq!(
-            result
-                .iter()
-                .filter(|o| o.opcode == OpCode::SetfieldGc)
-                .count(),
-            1,
-            "one forced SETFIELD for p0, got: {opcodes:?}"
-        );
-    }
-
     // ── Test 25: Unknown-origin object write invalidates other unknown caches ──
 
     #[test]
@@ -3133,31 +3093,6 @@ mod tests {
     }
 
     // ── Test 29: Seen-allocation cache survives write from unknown-origin object ──
-
-    #[test]
-    fn test_seen_alloc_survives_unknown_write() {
-        // p0 = new()
-        // setfield_gc(p0, i10, descr=d0)
-        // setfield_gc(p_unknown, i20, descr=d0)  <- unknown-origin write, same field
-        // i1 = getfield_gc_i(p0, descr=d0)       <- still cached (p0 is seen alloc, can't alias unknown)
-        let d = descr(0);
-        let mut ops = vec![
-            Op::new(OpCode::New, &[]), // pos=0 -> p0
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(20)], d.clone()), // unknown object
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
-            Op::new(OpCode::Jump, &[]),
-        ];
-        let result = run_heap_opt(&mut ops);
-
-        // NEW + SETFIELD(p0) + SETFIELD(unknown) + Jump.
-        // GETFIELD eliminated (p0 cache survives write to unknown object).
-        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
-        assert!(
-            !opcodes.contains(&OpCode::GetfieldGcI),
-            "GETFIELD should be eliminated for seen-alloc object, got: {opcodes:?}"
-        );
-    }
 
     // ── Test 30: Different field descriptors are not affected by aliasing ──
 

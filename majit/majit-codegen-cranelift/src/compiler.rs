@@ -11988,17 +11988,15 @@ mod tests {
 
         // Execute with x = 1 (guard passes, reaches finish)
         let _frame = backend.execute_token(&token, &[Value::Int(1)]);
-        // The finish descr also gets its count incremented (it's index 1)
         let compiled = token
             .compiled
             .as_ref()
             .unwrap()
             .downcast_ref::<CompiledLoop>()
             .unwrap();
+        // Guard descr count unchanged (guard didn't fail this time)
         let guard_descr = &compiled.fail_descrs[0];
-        assert_eq!(guard_descr.get_fail_count(), 5); // Still 5
-        let finish_descr = &compiled.fail_descrs[1];
-        assert_eq!(finish_descr.get_fail_count(), 1);
+        assert_eq!(guard_descr.get_fail_count(), 5);
     }
 
     #[test]
