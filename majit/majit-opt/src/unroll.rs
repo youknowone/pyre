@@ -239,6 +239,9 @@ impl UnrollOptimizer {
         opt_p2.skip_flush = true;
         // Phase 2: don't virtualize New() — guard recovery_layout not populated.
         opt_p2.set_phase2(true);
+        // Import heap cache from preamble so Phase 2 can reuse cached field values
+        // instead of re-reading from memory on every iteration.
+        opt_p2.import_all_cached_fields(&exported_state.preamble_heap_cache);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
