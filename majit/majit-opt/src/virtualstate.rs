@@ -861,17 +861,26 @@ impl VirtualState {
         self.is_compatible(other)
     }
 
-    /// Generate guards to bridge from `other` state to `self` state.
+    /// virtualstate.py: generate_guards(other, boxes, runtime_boxes, optimizer)
     ///
+    /// Generate guards to bridge from `other` state to `self` state.
     /// Returns a list of guard operations that need to be emitted to ensure
     /// the incoming values satisfy the requirements of the optimized loop.
     ///
-    /// In RPython, this is done during `VirtualState.generate_guards()`.
-    pub fn generate_guards(&self, other: &VirtualState) -> Vec<GuardRequirement> {
+    /// `runtime_boxes`: live OpRefs at the jump point. When provided,
+    /// per-entry guard generation can peek at the runtime value to decide
+    /// whether emitting a GUARD_VALUE is profitable (e.g. when the
+    /// runtime value already equals the expected constant).
+    pub fn generate_guards(
+        &self,
+        other: &VirtualState,
+        runtime_boxes: Option<&[OpRef]>,
+    ) -> Vec<GuardRequirement> {
         let mut guards = Vec::new();
 
         for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
-            Self::generate_guards_for_entry(i, expected, incoming, &mut guards);
+            let runtime_box = runtime_boxes.and_then(|rb| rb.get(i).copied());
+            Self::generate_guards_for_entry(i, expected, incoming, runtime_box, &mut guards);
         }
 
         guards
@@ -881,6 +890,7 @@ impl VirtualState {
         arg_idx: usize,
         expected: &VirtualStateInfo,
         incoming: &VirtualStateInfo,
+        _runtime_box: Option<OpRef>,
         guards: &mut Vec<GuardRequirement>,
     ) {
         match (expected, incoming) {
@@ -992,38 +1002,66 @@ impl VirtualState {
     /// Full guard generation with GenerateGuardState context.
     /// For each state entry, generate guards that make the runtime values
     /// match the expected virtual state shape.
+    ///
+    /// `runtime_boxes`: live OpRefs at the jump point. Used by per-entry
+    /// guard generation to decide whether emitting a GUARD_VALUE is
+    /// profitable (e.g. runtime value already equals the expected constant).
     pub fn generate_guards_with_state<'a>(
         &self,
         other: &VirtualState,
         boxes: &[OpRef],
+        runtime_boxes: Option<&[OpRef]>,
         ctx: &'a OptContext,
     ) -> GenerateGuardState<'a> {
         let mut state = GenerateGuardState::new(ctx);
         let len = self.state.len().min(other.state.len()).min(boxes.len());
         for i in 0..len {
-            self.generate_guard_for_entry(i, &self.state[i], &other.state[i], boxes[i], &mut state);
+            let runtime_box = runtime_boxes.and_then(|rb| rb.get(i).copied());
+            self.generate_guard_for_entry(
+                i,
+                &self.state[i],
+                &other.state[i],
+                boxes[i],
+                runtime_box,
+                &mut state,
+            );
         }
         state
     }
 
     /// Per-entry guard generation (virtualstate.py: AbstractVirtualStateInfo.generate_guards)
+    ///
+    /// `runtime_box`: the live OpRef for this entry at the jump point.
+    /// For LEVEL_CONSTANT targets, if the runtime_box is available we emit
+    /// GUARD_VALUE instead of marking the entry as bad — matching RPython's
+    /// `NotVirtualStateInfo._generate_guards` (line 400).
     fn generate_guard_for_entry(
         &self,
         idx: usize,
         expected: &VirtualStateInfo,
         incoming: &VirtualStateInfo,
-        _box_opref: OpRef,
+        box_opref: OpRef,
+        runtime_box: Option<OpRef>,
         state: &mut GenerateGuardState,
     ) {
         match (expected, incoming) {
-            // Constant vs non-constant → need GUARD_VALUE
-            (VirtualStateInfo::Constant(val), _) => {
-                if let VirtualStateInfo::Constant(other_val) = incoming {
-                    if val == other_val {
-                        return; // same constant, no guard needed
-                    }
+            // Constant vs same constant → no guard needed
+            (VirtualStateInfo::Constant(val), VirtualStateInfo::Constant(other_val)) => {
+                if val != other_val {
+                    state.mark_bad(idx, "constant mismatch");
                 }
-                state.mark_bad(idx, "constant mismatch");
+            }
+            // Constant vs non-constant: emit GUARD_VALUE if runtime_box available,
+            // otherwise mark as bad. (virtualstate.py line 400)
+            (VirtualStateInfo::Constant(val), _) => {
+                if runtime_box.is_some() {
+                    let val_const = OpRef(10_000 + idx as u32);
+                    let mut op = Op::new(OpCode::GuardValue, &[box_opref, val_const]);
+                    op.fail_args = Some(Default::default());
+                    state.add_guard(op);
+                } else {
+                    state.mark_bad(idx, "constant mismatch");
+                }
             }
             // KnownClass vs unknown → GUARD_CLASS
             (VirtualStateInfo::KnownClass { .. }, VirtualStateInfo::Unknown) => {
@@ -1691,7 +1729,7 @@ mod tests {
         ]);
         let s2 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::Unknown]);
 
-        let guards = s1.generate_guards(&s2);
+        let guards = s1.generate_guards(&s2, None);
         assert_eq!(guards.len(), 2);
         assert!(matches!(
             &guards[0],
