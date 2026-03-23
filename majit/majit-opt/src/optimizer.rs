@@ -1593,11 +1593,16 @@ impl Optimizer {
             }
         }
 
-        // Resolve forwarding BEFORE remap so that all refs point to concrete
-        // positions that remap can then reassign.
+        // Resolve forwarding BEFORE remap.
+        // RPython Box identity: import_boxes provides 1-hop forwarding.
         {
             let fwd = ctx.forwarding.clone();
+            let boxes = ctx.import_boxes.clone();
             let resolve = |opref: OpRef| -> OpRef {
+                // Check import_boxes first (RPython Box identity)
+                if let Some(&target) = boxes.get(&opref) {
+                    return target;
+                }
                 let mut cur = opref;
                 loop {
                     let idx = cur.0 as usize;
@@ -1631,10 +1636,10 @@ impl Optimizer {
             .retain(|op| !Self::is_constant_placeholder_op(op, &ctx.constants));
 
         // Drop ops whose args reference undefined OpRefs (un-forced virtual
-        // remnants). Include imported OpRefs (from import_state forwarding and
-        // short preamble) in the defined set — RPython doesn't have this
-        // cleanup at all, but we keep it to catch genuinely dangling refs.
-        {
+        // remnants). RPython doesn't have this cleanup — skip in Phase 2
+        // (skip_flush) where forwarding-resolved virtual field refs may
+        // appear undefined but are valid at runtime.
+        if !self.skip_flush {
             let defined: std::collections::HashSet<u32> = {
                 let mut s: std::collections::HashSet<u32> =
                     (0..self.final_num_inputs as u32).collect();
@@ -1648,8 +1653,6 @@ impl Optimizer {
                         s.insert(k as u32);
                     }
                 }
-                // Include all OpRefs reachable via forwarding (import_state
-                // maps original input args to preamble OpRefs through forwarding).
                 for (i, &fwd) in ctx.forwarding.iter().enumerate() {
                     if !fwd.is_none() && fwd != OpRef(i as u32) {
                         s.insert(fwd.0);
@@ -1668,11 +1671,14 @@ impl Optimizer {
         self.drain_extra_operations_from(0, &mut ctx);
         // Extra operations can introduce new forwarding (for example Heap/Pure
         // forwarding a recently-emitted boxed-field read to its raw payload).
-        // Resolve forwarding again before the second undefined-ref filter so
-        // late-emitted users don't keep stale producer OpRefs.
+        // Resolve forwarding again. RPython Box identity via import_boxes.
         {
             let fwd = ctx.forwarding.clone();
+            let boxes = ctx.import_boxes.clone();
             let resolve = |opref: OpRef| -> OpRef {
+                if let Some(&target) = boxes.get(&opref) {
+                    return target;
+                }
                 let mut cur = opref;
                 loop {
                     let idx = cur.0 as usize;
@@ -1697,7 +1703,7 @@ impl Optimizer {
                 }
             }
         }
-        {
+        if !self.skip_flush {
             let defined: std::collections::HashSet<u32> = {
                 let mut s: std::collections::HashSet<u32> =
                     (0..self.final_num_inputs as u32).collect();
@@ -1818,6 +1824,66 @@ impl Optimizer {
                         ctx.constants.resize(target_idx + 1, None);
                     }
                     ctx.constants[target_idx] = Some(v);
+                }
+            }
+
+            // Remap exported_loop_state OpRefs so Phase 2 sees post-remap
+            // positions. Without this, Phase 2's import_boxes maps to
+            // pre-remap positions that no longer exist in the constants map.
+            if let Some(ref mut state) = self.exported_loop_state {
+                let remap_opref = |opref: &mut OpRef| {
+                    if let Some(&new_pos) = remap.get(&opref.0) {
+                        *opref = OpRef(new_pos);
+                    }
+                };
+                for arg in &mut state.next_iteration_args {
+                    remap_opref(arg);
+                }
+                for arg in &mut state.end_args {
+                    remap_opref(arg);
+                }
+                for arg in &mut state.renamed_inputargs {
+                    remap_opref(arg);
+                }
+                for arg in &mut state.short_inputargs {
+                    remap_opref(arg);
+                }
+                for arg in &mut state.pre_force_args {
+                    remap_opref(arg);
+                }
+                // Remap exported_infos keys
+                let old_infos = std::mem::take(&mut state.exported_infos);
+                for (key, value) in old_infos {
+                    let new_key = remap.get(&key.0).map(|&p| OpRef(p)).unwrap_or(key);
+                    state.exported_infos.insert(new_key, value);
+                }
+                // Remap pre_force_field_refs keys and values
+                let old_refs = std::mem::take(&mut state.pre_force_field_refs);
+                for (key, fields) in old_refs {
+                    let new_key = remap.get(&key.0).map(|&p| OpRef(p)).unwrap_or(key);
+                    let new_fields: Vec<(u32, OpRef)> = fields
+                        .into_iter()
+                        .map(|(idx, val)| {
+                            let new_val = remap.get(&val.0).map(|&p| OpRef(p)).unwrap_or(val);
+                            (idx, new_val)
+                        })
+                        .collect();
+                    state.pre_force_field_refs.insert(new_key, new_fields);
+                }
+                // Remap exported short boxes
+                for entry in &mut state.exported_short_boxes {
+                    remap_opref(&mut entry.op.pos);
+                    for arg in &mut entry.op.args {
+                        remap_opref(arg);
+                    }
+                    if let Some(ref mut fa) = entry.op.fail_args {
+                        for arg in fa.iter_mut() {
+                            remap_opref(arg);
+                        }
+                    }
+                    if let Some(ref mut src) = entry.same_as_source {
+                        remap_opref(src);
+                    }
                 }
             }
         }

@@ -957,21 +957,20 @@ pub fn take_pending_frame_restore() -> Option<FrameRestore> {
 /// Only requests at the current depth are taken; deeper requests
 /// are left for their own call level to process.
 thread_local! {
-    static PENDING_BRIDGE_COMPILE: std::cell::RefCell<Vec<(u32, u64, u64, u32, usize)>> =
+    static PENDING_BRIDGE_COMPILE: std::cell::RefCell<Vec<(u32, u64, u64, u32)>> =
         std::cell::RefCell::new(Vec::new());
     static BRIDGE_COMPILE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-fn request_pending_bridge_compile(
-    green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
-    resume_pc: usize,
-) {
+fn request_pending_bridge_compile(green_key: u64, trace_id: u64, fail_index: u32) {
     let depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
+    eprintln!(
+        "[pending-bridge] push depth={} gk={} trace={} fail={}",
+        depth, green_key, trace_id, fail_index
+    );
     PENDING_BRIDGE_COMPILE.with(|cell| {
         cell.borrow_mut()
-            .push((depth, green_key, trace_id, fail_index, resume_pc));
+            .push((depth, green_key, trace_id, fail_index));
     });
 }
 
@@ -994,17 +993,18 @@ impl Drop for BridgeDepthGuard {
 }
 
 /// Take pending bridge compile requests at or above the current depth.
-pub fn take_pending_bridge_compile() -> Vec<(u64, u64, u32, usize)> {
+pub fn take_pending_bridge_compile() -> Vec<(u64, u64, u32)> {
     let current_depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
+    eprintln!("[take-bridge] current_depth={}", current_depth);
     PENDING_BRIDGE_COMPILE.with(|cell| {
         let mut pending = cell.borrow_mut();
         let mut result = Vec::new();
-        pending.retain(|&(depth, gk, tid, fi, rpc)| {
+        pending.retain(|&(depth, gk, tid, fi)| {
             if depth >= current_depth {
-                result.push((gk, tid, fi, rpc));
+                result.push((gk, tid, fi));
                 false
             } else {
-                true
+                true // keep for outer depth
             }
         });
         result
@@ -1908,8 +1908,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
             // green_key from target's header_pc (may be 0 for function-entry traces)
             let gk = target.header_pc; // use header_pc; caller provides real green_key
-            let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
-            request_pending_bridge_compile(gk, target.trace_id, fail_index, resume_pc);
+            request_pending_bridge_compile(gk, target.trace_id, fail_index);
         }
 
         let saved_data = if let Some(ref ff) = force_frame {
@@ -3980,14 +3979,6 @@ impl CraneliftBackend {
             }
             drop(bridge_guard);
 
-            // RPython compile.py:696 handle_fail: trigger bridge compilation.
-            let fail_count = fail_descr.get_fail_count();
-            if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-                let gk = compiled.header_pc;
-                let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
-                request_pending_bridge_compile(gk, compiled.trace_id, fail_index, resume_pc);
-            }
-
             let saved_data = if let Some(ref ff) = force_frame {
                 take_force_frame_saved_data(ff)
             } else {
@@ -4331,22 +4322,16 @@ impl CraneliftBackend {
             label_blocks.push((label_idx, block));
         }
 
-        // RPython backend: Label ops define loop blocks.
-        // Linear traces (no Label, no Jump) stay in the entry block.
-        let has_jump = ops.iter().any(|op| op.opcode == OpCode::Jump);
-        let loop_block = if !label_blocks.is_empty() {
-            label_blocks.last().map(|(_, block)| *block).unwrap()
-        } else if has_jump {
-            // Legacy no-Label trace with Jump: need a loop block
-            let block = builder.create_block();
-            for _ in 0..loop_param_count {
-                builder.append_block_param(block, cl_types::I64);
-            }
-            block
-        } else {
-            // Linear trace: no loop block needed, stay in entry_block
-            entry_block
-        };
+        let loop_block = label_blocks
+            .last()
+            .map(|(_, block)| *block)
+            .unwrap_or_else(|| {
+                let block = builder.create_block();
+                for _ in 0..loop_param_count {
+                    builder.append_block_param(block, cl_types::I64);
+                }
+                block
+            });
 
         let mut guard_idx: usize = 0;
         let mut last_ovf_flag: Option<CValue> = None;
@@ -4369,13 +4354,15 @@ impl CraneliftBackend {
                     builder.def_var(var(arg_ref.0), param);
                 }
             }
-        } else if has_jump {
+        } else {
             let zero = builder.ins().iconst(cl_types::I64, 0);
             let vals: Vec<CValue> = (0..loop_param_count)
                 .map(|i| {
                     if i < num_inputs {
                         builder.use_var(var(i as u32))
                     } else {
+                        // Extra params from depth growth: initialize to 0.
+                        // First iteration will set them via the loop body.
                         zero
                     }
                 })
@@ -4387,7 +4374,6 @@ impl CraneliftBackend {
                 builder.def_var(var(i as u32), param);
             }
         }
-        // else: linear trace — already in entry_block with vars defined
 
         for op_idx in 0..ops.len() {
             if let Some((_, label_block)) = label_blocks

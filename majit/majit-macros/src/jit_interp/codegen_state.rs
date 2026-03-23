@@ -990,77 +990,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             quote! {}
         };
 
-    // ── Queue (FIFO) support ──
-    let queue_indices = &storage.linked_list_queue_indices;
-    let linked_list_queue_methods =
-        if let Some(tail_offset) = &storage.linked_list_queue_tail_offset {
-            quote! {
-                fn is_queue_storage(&self, selected: usize) -> bool {
-                    false #( || selected == #queue_indices )*
-                }
-
-                fn linked_list_queue_tail_descr(&self) -> Option<majit_ir::DescrRef> {
-                    Some(std::sync::Arc::new(
-                        majit_ir::descr::SimpleFieldDescr::new(
-                            0x8000_0005, // unique tag for queue tail field
-                            #tail_offset,
-                            8,
-                            majit_ir::Type::Ref,
-                            false,
-                        ),
-                    ))
-                }
-
-                fn linked_list_tail(&self, selected: usize) -> Option<majit_ir::OpRef> {
-                    self.linked_list_tails.get(&selected).copied()
-                }
-
-                fn set_linked_list_tail(&mut self, selected: usize, tail: majit_ir::OpRef) {
-                    self.linked_list_tails.insert(selected, tail);
-                }
-
-                fn linked_list_writeback_tail(
-                    &mut self,
-                    ctx: &mut majit_meta::TraceCtx,
-                    selected: usize,
-                    new_tail: majit_ir::OpRef,
-                ) {
-                    let Some(stack_ref) = self.ensure_linked_list_stack_ref(ctx, selected) else {
-                        return;
-                    };
-                    let Some(tail_descr) = self.linked_list_queue_tail_descr() else {
-                        return;
-                    };
-                    ctx.record_op_with_descr(
-                        majit_ir::OpCode::SetfieldGc,
-                        &[stack_ref, new_tail],
-                        tail_descr,
-                    );
-                }
-
-                fn ensure_linked_list_tail(
-                    &mut self,
-                    ctx: &mut majit_meta::TraceCtx,
-                    selected: usize,
-                ) -> Option<majit_ir::OpRef> {
-                    if let Some(&tail) = self.linked_list_tails.get(&selected) {
-                        return Some(tail);
-                    }
-                    let stack_ref = self.ensure_linked_list_stack_ref(ctx, selected)?;
-                    let tail_descr = self.linked_list_queue_tail_descr()?;
-                    let tail = ctx.record_op_with_descr(
-                        majit_ir::OpCode::GetfieldGcR,
-                        &[stack_ref],
-                        tail_descr,
-                    );
-                    self.linked_list_tails.insert(selected, tail);
-                    Some(tail)
-                }
-            }
-        } else {
-            quote! {}
-        };
-
     // ── Linked list mode ──
     // RPython parity: live state carries stacksize + storage ref + selected.
     // Stack heads and sizes live on GC-managed shadow stack objects.
@@ -1106,7 +1035,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 meta_storage_count: usize,
                 linked_list_stack_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
                 linked_list_heads: std::collections::HashMap<usize, majit_ir::OpRef>,
-                linked_list_tails: std::collections::HashMap<usize, majit_ir::OpRef>,
                 // Keep symbolic stacks for fallback (non-linked-list storages)
                 stacks: std::collections::HashMap<usize, majit_meta::SymbolicStack>,
             }
@@ -1385,7 +1313,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 #linked_list_descr_methods
-                #linked_list_queue_methods
             }
 
             impl majit_meta::JitState for #state_type {
@@ -1445,7 +1372,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         meta_storage_count: meta.storage_layout.len(),
                         linked_list_stack_refs: std::collections::HashMap::new(),
                         linked_list_heads: std::collections::HashMap::new(),
-                        linked_list_tails: std::collections::HashMap::new(),
                         stacks: std::collections::HashMap::new(),
                     }
                 }

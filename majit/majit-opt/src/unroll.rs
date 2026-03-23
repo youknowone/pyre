@@ -1032,48 +1032,6 @@ impl OptUnroll {
                 self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
             }
         }
-        // RPython parity: virtual field values (flattened from Virtual
-        // slots in make_inputargs) should NOT carry constant info across
-        // loop iterations. In RPython, these fields have IntBound info
-        // (widened) but NOT concrete constant values—only LEVEL_CONSTANT
-        // VirtualStateInfo entries export constants. Remove constants from
-        // virtual field value infos to prevent Phase 2 from constant-folding
-        // loop guards (e.g., IntLt(i, n) → always true).
-        for info_entry in virtual_state.state.iter() {
-            use crate::virtualstate::VirtualStateInfo;
-            match info_entry {
-                VirtualStateInfo::Virtual { fields, .. }
-                | VirtualStateInfo::VirtualStruct { fields, .. } => {
-                    for (_, child) in fields {
-                        if !matches!(child.as_ref(), VirtualStateInfo::Constant(_)) {
-                            // Field is not LEVEL_CONSTANT — find its flattened
-                            // label arg and remove the constant from exported info.
-                            // We don't track the exact field→label_arg mapping here,
-                            // but the key insight is: ALL non-constant virtual field
-                            // values should not be exported as constants.
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Simpler approach: strip constants from infos for any value that
-        // is NOT a compile-time constant (address or literal). A value whose
-        // OpRef < 10000 (i.e., a trace-computed value, not a constant pool
-        // entry) should not be treated as a constant across iterations.
-        for (&opref, info_entry) in infos.iter_mut() {
-            if opref.0 < 10000 && info_entry.constant.is_some() {
-                // Check if the VirtualState marks this as Constant
-                let is_vs_constant = virtual_state.state.iter().any(|s| {
-                    matches!(s, crate::virtualstate::VirtualStateInfo::Constant(v)
-                        if ctx.get_constant(opref) == Some(v))
-                });
-                if !is_vs_constant {
-                    info_entry.constant = None;
-                }
-            }
-        }
-
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
         let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
@@ -1108,11 +1066,22 @@ impl OptUnroll {
     ) {
         let resolved = ctx.get_replacement(arg);
         if infos.contains_key(&resolved) {
+            // Also store under the original key so import_state can
+            // find the info using the unresolved next_iteration_args key.
+            if arg != resolved {
+                if let Some(info) = infos.get(&resolved).cloned() {
+                    infos.insert(arg, info);
+                }
+            }
             return;
         }
         let info = self.collect_exported_info(resolved, ctx, exported_int_bounds);
         let is_virtual = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual());
-        infos.insert(resolved, info);
+        infos.insert(resolved, info.clone());
+        // Also store under the original (unresolved) key.
+        if arg != resolved {
+            infos.insert(arg, info);
+        }
         if is_virtual {
             self.expand_infos_from_virtual(resolved, ctx, exported_int_bounds, infos);
         }
@@ -1435,35 +1404,19 @@ impl OptUnroll {
             "import_state: next_iteration_args mismatch"
         );
 
-        // unroll.py:483-490: source.set_forwarded(target); setinfo_from_preamble
+        // unroll.py:483-490: source.set_forwarded(target)
         //
-        // RPython Box identity parity: set_forwarded(target) only affects
-        // the source Box. In majit's flat forwarding table, setting
-        // forwarding[4]=OpRef(5) then forwarding[5]=OpRef(20) creates a
-        // chain 4→5→20. RPython avoids this because v5_box never has
-        // set_forwarded called on it — only targetargs[4] does.
-        //
-        // Fix: mark targetarg positions as "import-frozen". When
-        // get_replacement encounters a frozen position, it returns the
-        // DIRECT forwarding target (1-hop) without further chain following.
-        // This emulates RPython's Box identity where each source has
-        // independent forwarding.
-        // RPython import_state (unroll.py:483-490):
-        // 1) source.set_forwarded(target)
-        // 2) setinfo_from_preamble(source, info) → target.set_forwarded(info)
-        // After step 2, get_box_replacement(source) stops at target (because
-        // target._forwarded = info, which is terminal).
-        //
-        // In majit: apply info to target FIRST, then set forwarding.
-        // This ensures get_replacement stops at target (ptr_info is set).
-        for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
-            if let Some(info) = exported_state.exported_infos.get(target) {
-                self.apply_exported_info(*target, info, &exported_state.exported_infos, ctx);
-            }
-        }
+        // RPython Box identity: import_boxes maps source → target with
+        // per-value forwarding (not the flat table). get_replacement
+        // checks import_boxes first and returns target directly —
+        // target's own forwarding is NOT followed, matching RPython
+        // where v5_box has no _forwarded set.
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
-            ctx.replace_op(source, *target);
+            ctx.set_import_box(source, *target);
+            if let Some(info) = exported_state.exported_infos.get(target) {
+                self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
+            }
         }
 
         // Remap pre_force_field_refs keys from Phase 1 OpRefs to Phase 2
@@ -1618,9 +1571,9 @@ impl OptUnroll {
             return;
         }
         if let Some(value) = &info.constant {
-            ctx.make_constant_direct(opref, value.clone());
+            ctx.make_constant(opref, value.clone());
             if let Value::Ref(ptr) = value {
-                ctx.set_ptr_info_direct(opref, crate::info::PtrInfo::Constant(*ptr));
+                ctx.set_ptr_info(opref, crate::info::PtrInfo::Constant(*ptr));
             }
         }
         if let Some(ptr_info) = info.ptr_info.clone() {
@@ -1635,7 +1588,7 @@ impl OptUnroll {
                 }
                 ExportedPtrKind::Struct => {
                     if let Some(descr) = info.ptr_descr.clone() {
-                        ctx.set_ptr_info_direct(opref, crate::info::PtrInfo::struct_ptr(descr));
+                        ctx.set_ptr_info(opref, crate::info::PtrInfo::struct_ptr(descr));
                     }
                 }
                 ExportedPtrKind::Array => {
@@ -1644,15 +1597,12 @@ impl OptUnroll {
                             .array_lenbound
                             .clone()
                             .unwrap_or_else(crate::intutils::IntBound::nonnegative);
-                        ctx.set_ptr_info_direct(
-                            opref,
-                            crate::info::PtrInfo::array(descr, lenbound),
-                        );
+                        ctx.set_ptr_info(opref, crate::info::PtrInfo::array(descr, lenbound));
                     }
                 }
                 ExportedPtrKind::None => {
                     if let Some(class_ptr) = info.known_class {
-                        ctx.set_ptr_info_direct(
+                        ctx.set_ptr_info(
                             opref,
                             crate::info::PtrInfo::KnownClass {
                                 class_ptr,
@@ -1660,7 +1610,7 @@ impl OptUnroll {
                             },
                         );
                     } else if info.nonnull {
-                        ctx.set_ptr_info_direct(opref, crate::info::PtrInfo::NonNull);
+                        ctx.set_ptr_info(opref, crate::info::PtrInfo::NonNull);
                     }
                 }
             }
@@ -1689,7 +1639,7 @@ impl OptUnroll {
 
         match ptr_info {
             PtrInfo::Virtual(info) => {
-                ctx.set_ptr_info_direct(opref, PtrInfo::Virtual(info.clone()));
+                ctx.set_ptr_info(opref, PtrInfo::Virtual(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.apply_exported_info_recursive(
@@ -1703,7 +1653,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualStruct(info) => {
-                ctx.set_ptr_info_direct(opref, PtrInfo::VirtualStruct(info.clone()));
+                ctx.set_ptr_info(opref, PtrInfo::VirtualStruct(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.apply_exported_info_recursive(
@@ -1717,7 +1667,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualArray(info) => {
-                ctx.set_ptr_info_direct(opref, PtrInfo::VirtualArray(info.clone()));
+                ctx.set_ptr_info(opref, PtrInfo::VirtualArray(info.clone()));
                 for &item_ref in &info.items {
                     if let Some(item_info) = exported_infos.get(&item_ref) {
                         self.apply_exported_info_recursive(
@@ -1731,7 +1681,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualArrayStruct(info) => {
-                ctx.set_ptr_info_direct(opref, PtrInfo::VirtualArrayStruct(info.clone()));
+                ctx.set_ptr_info(opref, PtrInfo::VirtualArrayStruct(info.clone()));
                 for fields in &info.element_fields {
                     for &(_, field_ref) in fields {
                         if let Some(field_info) = exported_infos.get(&field_ref) {
@@ -1747,7 +1697,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualRawBuffer(info) => {
-                ctx.set_ptr_info_direct(opref, PtrInfo::VirtualRawBuffer(info.clone()));
+                ctx.set_ptr_info(opref, PtrInfo::VirtualRawBuffer(info.clone()));
                 for &(_, _, entry_ref) in &info.entries {
                     if let Some(entry_info) = exported_infos.get(&entry_ref) {
                         self.apply_exported_info_recursive(
@@ -1761,7 +1711,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::Instance(info) => {
-                ctx.set_ptr_info_direct(opref, PtrInfo::Instance(info.clone()));
+                ctx.set_ptr_info(opref, PtrInfo::Instance(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.apply_exported_info_recursive(
@@ -1775,7 +1725,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::Struct(info) => {
-                ctx.set_ptr_info_direct(opref, PtrInfo::Struct(info.clone()));
+                ctx.set_ptr_info(opref, PtrInfo::Struct(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.apply_exported_info_recursive(
@@ -1789,7 +1739,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::Array(info) => {
-                ctx.set_ptr_info_direct(opref, PtrInfo::Array(info.clone()));
+                ctx.set_ptr_info(opref, PtrInfo::Array(info.clone()));
                 for &item_ref in &info.items {
                     if let Some(item_info) = exported_infos.get(&item_ref) {
                         self.apply_exported_info_recursive(
@@ -1806,7 +1756,7 @@ impl OptUnroll {
                 class_ptr,
                 is_nonnull,
             } => {
-                ctx.set_ptr_info_direct(
+                ctx.set_ptr_info(
                     opref,
                     PtrInfo::KnownClass {
                         class_ptr,
@@ -2009,7 +1959,7 @@ impl OptUnroll {
                                 .copied()
                                 .map(crate::ImportedShortPureArg::OpRef),
                             ExportedShortArg::Const { source, value } => {
-                                ctx.make_constant_direct(*source, value.clone());
+                                ctx.make_constant(*source, value.clone());
                                 Some(crate::ImportedShortPureArg::Const(*value))
                             }
                             ExportedShortArg::Produced(index) => produced_results
@@ -2362,16 +2312,18 @@ fn assemble_peeled_trace_with_jump_args(
         .iter()
         .map(|s| (s.result, s.source))
         .collect();
-    // RPython compile.py:327: extra_same_as ops are placed sequentially
-    // in the flat operations array between preamble and label. Position =
-    // array index, so a single sequential counter prevents collision.
+    // Use a separate position counter for extra SameAs ops, starting after
+    // label_pos to avoid colliding with it or with imported_short_aliases.
+    // Do NOT modify max_pos — it's used by body-use-before-def below and
+    // changing it breaks int loops where no extra SameAs is generated.
+    let mut extra_pos = next_free_pos(label_pos.saturating_add(1));
     for &arg in &filtered_extra_label_args {
         let mapped = alias_remap.get(&arg).copied().unwrap_or(arg);
         if !preamble_defs.contains(&mapped) {
             if let Some(&source) = short_source_map.get(&arg) {
                 if preamble_defs.contains(&source) {
-                    let pos = OpRef(max_pos);
-                    max_pos = next_free_pos(max_pos.saturating_add(1));
+                    let pos = OpRef(extra_pos);
+                    extra_pos = next_free_pos(extra_pos.saturating_add(1));
                     let mut op = Op::new(OpCode::SameAsI, &[source]);
                     op.pos = pos;
                     alias_remap.insert(arg, pos);
@@ -2715,7 +2667,11 @@ fn assemble_peeled_trace_with_jump_args(
                 jump_args.truncate(start_label_args.len());
             }
             if jump_to_self {
-                jump_args.truncate(target_base_len);
+                // RPython parity: don't truncate to label_args.len() because
+                // label_args only has non-virtual entries. The redirected
+                // JUMP from jump_to_existing_trace already has the correct
+                // flattened args including virtual field values.
+                // Only pad if JUMP is shorter than the target label.
                 while jump_args.len() < target_label_args.len() {
                     let extra_idx = jump_args.len().saturating_sub(target_base_len);
                     let extra_arg = if current_inner_label_index.is_some() {

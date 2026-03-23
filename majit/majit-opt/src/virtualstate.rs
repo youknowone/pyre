@@ -1347,9 +1347,18 @@ fn export_single_value(
     }
     visited.insert(opref, ());
 
-    // Check for known constant
+    // Check for known constant.
+    // RPython parity: only export LEVEL_CONSTANT for truly invariant values
+    // (constant pool entries with OpRef >= 10000). Trace-computed values
+    // may have been constant-folded during Phase 1 but change across
+    // iterations. RPython's setinfo_from_preamble_list calls
+    // item.set_forwarded(None) — info is completely cleared for ALL types.
     if let Some(value) = ctx.get_constant(opref) {
-        return VirtualStateInfo::Constant(value.clone());
+        if opref.0 >= 10000 {
+            return VirtualStateInfo::Constant(value.clone());
+        }
+        // Trace-computed constant (OpRef < 10000): export as Unknown.
+        return VirtualStateInfo::Unknown;
     }
 
     // Check PtrInfo

@@ -105,7 +105,13 @@ pub struct OptContext {
     pub constants: Vec<Option<Value>>,
     /// Forwarding chain: maps old OpRef to replacement OpRef.
     pub forwarding: Vec<OpRef>,
-    // (import_frozen removed: get_replacement now stops at ptr_info terminals)
+    /// RPython Box identity: per-value forwarding for import_state positions.
+    /// Maps source OpRef → target OpRef WITHOUT using the flat forwarding
+    /// table. get_replacement checks this map FIRST. This prevents chains:
+    /// import_boxes[4]=OpRef(5) does NOT chain through forwarding[5]=OpRef(20)
+    /// because OpRef(5) is looked up in import_boxes (not found → no chain)
+    /// rather than in forwarding.
+    import_boxes: HashMap<OpRef, OpRef>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -258,7 +264,7 @@ impl OptContext {
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
-            // (import_frozen removed)
+            import_boxes: HashMap::new(),
         }
     }
 
@@ -300,7 +306,7 @@ impl OptContext {
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
-            // (import_frozen removed)
+            import_boxes: HashMap::new(),
         }
     }
 
@@ -673,11 +679,22 @@ impl OptContext {
         self.forwarding[idx] = new;
     }
 
+    /// RPython Box identity: set per-value forwarding for import_state.
+    /// This does NOT use the flat forwarding table, preventing chains.
+    pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
+        self.import_boxes.insert(source, target);
+    }
+
     /// Follow the forwarding chain to get the current replacement for `opref`.
-    /// RPython: get_box_replacement(op) — follows _forwarded chain, stops
-    /// when _forwarded is Info (not another Box). In our model, we stop
-    /// when the NEXT position has ptr_info set (it's a terminal like Info).
+    /// Import boxes are checked FIRST — they provide 1-hop forwarding
+    /// that doesn't chain through the flat table.
     pub fn get_replacement(&self, mut opref: OpRef) -> OpRef {
+        // RPython Box identity: import_state's per-value forwarding.
+        // Returns target directly (target's own forwarding is NOT followed
+        // because target is like RPython's v5_box with no _forwarded).
+        if let Some(&target) = self.import_boxes.get(&opref) {
+            return target;
+        }
         loop {
             let idx = opref.0 as usize;
             if idx >= self.forwarding.len() {
@@ -687,29 +704,12 @@ impl OptContext {
             if next.is_none() {
                 return opref;
             }
-            // RPython: stop if NEXT has Info attached (terminal).
-            // get_box_replacement returns the Box whose _forwarded is Info.
-            let next_idx = next.0 as usize;
-            if next_idx < self.ptr_info.len() && self.ptr_info[next_idx].is_some() {
-                return next;
-            }
             opref = next;
         }
     }
 
-    /// RPython parity: resolves forwarding first, storing on the canonical Box.
+    /// Record that an operation produces a known constant value.
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
-        let resolved = self.get_replacement(opref);
-        let idx = resolved.0 as usize;
-        if idx >= self.constants.len() {
-            self.constants.resize(idx + 1, None);
-        }
-        self.constants[idx] = Some(value);
-    }
-
-    /// Store constant WITHOUT resolving forwarding.
-    /// Used by import_state where the target is a fresh Phase 1 opref.
-    pub fn make_constant_direct(&mut self, opref: OpRef, value: Value) {
         let idx = opref.0 as usize;
         if idx >= self.constants.len() {
             self.constants.resize(idx + 1, None);
@@ -843,21 +843,7 @@ impl OptContext {
         }
     }
 
-    /// RPython parity: resolves forwarding first, storing info on the
-    /// canonical (resolved) Box.
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
-        let resolved = self.get_replacement(opref);
-        let idx = resolved.0 as usize;
-        if idx >= self.ptr_info.len() {
-            self.ptr_info.resize(idx + 1, None);
-        }
-        self.ptr_info[idx] = Some(info);
-    }
-
-    /// Store info WITHOUT resolving forwarding. Used exclusively by
-    /// import_state where the target opref is a fresh Phase 1 Box that
-    /// must receive info directly (RPython: target.set_forwarded(info)).
-    pub fn set_ptr_info_direct(&mut self, opref: OpRef, info: PtrInfo) {
         let idx = opref.0 as usize;
         if idx >= self.ptr_info.len() {
             self.ptr_info.resize(idx + 1, None);
