@@ -484,12 +484,12 @@ impl<S: JitState> JitDriver<S> {
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                loop_header_pc: _loop_header_pc,
+                loop_header_pc,
             } => {
                 // RPython parity: the active trace green key is already
                 // retargeted by the tracer when it reaches the loop header.
-                // `loop_header_pc` is the bytecode merge point, not a hashed
-                // green key, so do not overwrite the tracing key here.
+                // Pass loop_header_pc to close_and_compile so the compiled
+                // loop's is_compatible check uses the actual loop header PC.
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
