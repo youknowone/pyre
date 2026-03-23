@@ -1782,10 +1782,10 @@ impl TraceFrameState {
         // virtualizable frame state at the merge point. If symbolic stack
         // accounting drifted during tracing, resync depth/shape from the
         // concrete frame before materializing JUMP args.
+        // MIFrame Box tracking: use PyreSym's tracked values, not snapshot.
         let concrete_frame = self.concrete_frame;
-        let concrete_nlocals = concrete_nlocals(concrete_frame).unwrap_or(self.sym().nlocals);
-        let concrete_vsd = concrete_stack_depth(concrete_frame)
-            .unwrap_or_else(|| self.sym().valuestackdepth.max(concrete_nlocals));
+        let concrete_nlocals = self.sym().nlocals;
+        let concrete_vsd = self.sym().valuestackdepth.max(concrete_nlocals);
         {
             let s = self.sym_mut();
             s.nlocals = concrete_nlocals;
@@ -1951,8 +1951,7 @@ impl TraceFrameState {
         }
 
         self.flush_to_frame(ctx);
-        let concrete_next_instr =
-            unsafe { (*(self.concrete_frame as *const pyre_interp::frame::PyFrame)).next_instr };
+        let concrete_next_instr = self.sym().pending_next_instr.unwrap_or(self.fallthrough_pc);
         let (
             frame,
             next_instr,
