@@ -1460,6 +1460,11 @@ impl<M: Clone> MetaInterp<M> {
             return;
         }
 
+        // Note: Phase 2 body guards may have OpRef::NONE in fail_args for
+        // virtual slots. These are handled at runtime by materialize_recovery_virtuals.
+        // If materialization fails (null Ref remains), the compiled code is
+        // invalidated at guard-fail time. No compile-time rejection needed.
+
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
 
