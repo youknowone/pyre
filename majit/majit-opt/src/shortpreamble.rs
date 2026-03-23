@@ -531,22 +531,14 @@ impl ShortBoxes {
     /// shortpreamble.py: sb.add_pure_op(op)
     pub fn add_pure_op(&mut self, op: Op) {
         let result = op.pos;
-        self.add_potential_op(
-            self.lookup_label_arg(result),
-            op,
-            PreambleOpKind::Pure,
-        );
+        self.add_potential_op(self.lookup_label_arg(result), op, PreambleOpKind::Pure);
     }
 
     /// Add a heap read as a short-box candidate.
     /// shortpreamble.py: sb.add_heap_op(op, getfield_op)
     pub fn add_heap_op(&mut self, op: Op) {
         let result = op.pos;
-        self.add_potential_op(
-            self.lookup_label_arg(result),
-            op,
-            PreambleOpKind::Heap,
-        );
+        self.add_potential_op(self.lookup_label_arg(result), op, PreambleOpKind::Heap);
     }
 
     /// Add a loop-invariant call as a short-box candidate.
@@ -2354,5 +2346,4 @@ mod tests {
         assert_eq!(ext.extra_same_as()[0].opcode, OpCode::SameAsI);
         assert_eq!(ext.extra_same_as()[0].pos, alias_result);
     }
-
 }

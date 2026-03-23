@@ -7,8 +7,8 @@
 /// If a virtual escapes (e.g., passed to a call or stored in a non-virtual),
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 
 use majit_ir::{
     Descr, DescrRef, FieldDescr, GuardVirtualEntry, OopSpecIndex, Op, OpCode, OpRef, Type, Value,
@@ -121,7 +121,11 @@ impl OptVirtualize {
                 class_ptr: existing,
                 is_nonnull,
             }) => PtrInfo::KnownClass {
-                class_ptr: if existing.is_null() { class_ptr } else { existing },
+                class_ptr: if existing.is_null() {
+                    class_ptr
+                } else {
+                    existing
+                },
                 is_nonnull: is_nonnull || !class_ptr.is_null(),
             },
             Some(PtrInfo::NonNull)
@@ -521,7 +525,12 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
         if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!("[virt] force_virtual_instance: opref={:?} alloc_ref={:?} replaced={}", opref, alloc_ref, opref != alloc_ref);
+            eprintln!(
+                "[virt] force_virtual_instance: opref={:?} alloc_ref={:?} replaced={}",
+                opref,
+                alloc_ref,
+                opref != alloc_ref
+            );
         }
 
         // Emit SETFIELD_GC for each tracked field
@@ -1167,7 +1176,9 @@ impl OptVirtualize {
                     return OptimizationResult::Remove;
                 }
                 PtrInfo::KnownClass { class_ptr, .. } => {
-                    if expected_class.is_none_or(|expected| *class_ptr == expected || class_ptr.is_null()) {
+                    if expected_class
+                        .is_none_or(|expected| *class_ptr == expected || class_ptr.is_null())
+                    {
                         return OptimizationResult::Remove;
                     }
                 }
@@ -1450,7 +1461,9 @@ impl OptVirtualize {
                     class_ptr,
                     is_nonnull: true,
                 } => {
-                    if expected_class.is_none_or(|expected| *class_ptr == expected || class_ptr.is_null()) {
+                    if expected_class
+                        .is_none_or(|expected| *class_ptr == expected || class_ptr.is_null())
+                    {
                         return OptimizationResult::Remove;
                     }
                 }
@@ -3795,10 +3808,7 @@ mod tests {
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         // Virtual-value lazy SetfieldGc is dropped at JUMP (RPython parity).
-        let new_count = result
-            .iter()
-            .filter(|op| op.opcode == OpCode::New)
-            .count();
+        let new_count = result.iter().filter(|op| op.opcode == OpCode::New).count();
         assert_eq!(
             new_count, 0,
             "virtual New should NOT be materialized at Jump; got {result:?}"

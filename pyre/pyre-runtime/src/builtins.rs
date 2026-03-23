@@ -20,22 +20,52 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
 
     // Exception type constructors — callable for `raise ValueError("msg")`
     // and identifiable by name for CHECK_EXC_MATCH.
-    namespace.get_or_insert_with("BaseException", || w_builtin_func_new("BaseException", exc_base_exception));
-    namespace.get_or_insert_with("Exception", || w_builtin_func_new("Exception", exc_exception));
-    namespace.get_or_insert_with("ArithmeticError", || w_builtin_func_new("ArithmeticError", exc_arithmetic_error));
-    namespace.get_or_insert_with("ZeroDivisionError", || w_builtin_func_new("ZeroDivisionError", exc_zero_division));
-    namespace.get_or_insert_with("TypeError", || w_builtin_func_new("TypeError", exc_type_error));
-    namespace.get_or_insert_with("ValueError", || w_builtin_func_new("ValueError", exc_value_error));
+    namespace.get_or_insert_with("BaseException", || {
+        w_builtin_func_new("BaseException", exc_base_exception)
+    });
+    namespace.get_or_insert_with("Exception", || {
+        w_builtin_func_new("Exception", exc_exception)
+    });
+    namespace.get_or_insert_with("ArithmeticError", || {
+        w_builtin_func_new("ArithmeticError", exc_arithmetic_error)
+    });
+    namespace.get_or_insert_with("ZeroDivisionError", || {
+        w_builtin_func_new("ZeroDivisionError", exc_zero_division)
+    });
+    namespace.get_or_insert_with("TypeError", || {
+        w_builtin_func_new("TypeError", exc_type_error)
+    });
+    namespace.get_or_insert_with("ValueError", || {
+        w_builtin_func_new("ValueError", exc_value_error)
+    });
     namespace.get_or_insert_with("KeyError", || w_builtin_func_new("KeyError", exc_key_error));
-    namespace.get_or_insert_with("IndexError", || w_builtin_func_new("IndexError", exc_index_error));
-    namespace.get_or_insert_with("AttributeError", || w_builtin_func_new("AttributeError", exc_attribute_error));
-    namespace.get_or_insert_with("NameError", || w_builtin_func_new("NameError", exc_name_error));
-    namespace.get_or_insert_with("RuntimeError", || w_builtin_func_new("RuntimeError", exc_runtime_error));
-    namespace.get_or_insert_with("StopIteration", || w_builtin_func_new("StopIteration", exc_stop_iteration));
-    namespace.get_or_insert_with("OverflowError", || w_builtin_func_new("OverflowError", exc_overflow_error));
-    namespace.get_or_insert_with("ImportError", || w_builtin_func_new("ImportError", exc_import_error));
-    namespace.get_or_insert_with("NotImplementedError", || w_builtin_func_new("NotImplementedError", exc_not_implemented_error));
-    namespace.get_or_insert_with("AssertionError", || w_builtin_func_new("AssertionError", exc_assertion_error));
+    namespace.get_or_insert_with("IndexError", || {
+        w_builtin_func_new("IndexError", exc_index_error)
+    });
+    namespace.get_or_insert_with("AttributeError", || {
+        w_builtin_func_new("AttributeError", exc_attribute_error)
+    });
+    namespace.get_or_insert_with("NameError", || {
+        w_builtin_func_new("NameError", exc_name_error)
+    });
+    namespace.get_or_insert_with("RuntimeError", || {
+        w_builtin_func_new("RuntimeError", exc_runtime_error)
+    });
+    namespace.get_or_insert_with("StopIteration", || {
+        w_builtin_func_new("StopIteration", exc_stop_iteration)
+    });
+    namespace.get_or_insert_with("OverflowError", || {
+        w_builtin_func_new("OverflowError", exc_overflow_error)
+    });
+    namespace.get_or_insert_with("ImportError", || {
+        w_builtin_func_new("ImportError", exc_import_error)
+    });
+    namespace.get_or_insert_with("NotImplementedError", || {
+        w_builtin_func_new("NotImplementedError", exc_not_implemented_error)
+    });
+    namespace.get_or_insert_with("AssertionError", || {
+        w_builtin_func_new("AssertionError", exc_assertion_error)
+    });
 }
 
 /// Create a fresh namespace seeded with the default builtins.
@@ -230,22 +260,52 @@ macro_rules! exc_constructor {
     };
 }
 
-exc_constructor!(exc_base_exception, pyre_object::excobject::ExcKind::BaseException);
+exc_constructor!(
+    exc_base_exception,
+    pyre_object::excobject::ExcKind::BaseException
+);
 exc_constructor!(exc_exception, pyre_object::excobject::ExcKind::Exception);
-exc_constructor!(exc_arithmetic_error, pyre_object::excobject::ExcKind::ArithmeticError);
-exc_constructor!(exc_zero_division, pyre_object::excobject::ExcKind::ZeroDivisionError);
+exc_constructor!(
+    exc_arithmetic_error,
+    pyre_object::excobject::ExcKind::ArithmeticError
+);
+exc_constructor!(
+    exc_zero_division,
+    pyre_object::excobject::ExcKind::ZeroDivisionError
+);
 exc_constructor!(exc_type_error, pyre_object::excobject::ExcKind::TypeError);
 exc_constructor!(exc_value_error, pyre_object::excobject::ExcKind::ValueError);
 exc_constructor!(exc_key_error, pyre_object::excobject::ExcKind::KeyError);
 exc_constructor!(exc_index_error, pyre_object::excobject::ExcKind::IndexError);
-exc_constructor!(exc_attribute_error, pyre_object::excobject::ExcKind::AttributeError);
+exc_constructor!(
+    exc_attribute_error,
+    pyre_object::excobject::ExcKind::AttributeError
+);
 exc_constructor!(exc_name_error, pyre_object::excobject::ExcKind::NameError);
-exc_constructor!(exc_runtime_error, pyre_object::excobject::ExcKind::RuntimeError);
-exc_constructor!(exc_stop_iteration, pyre_object::excobject::ExcKind::StopIteration);
-exc_constructor!(exc_overflow_error, pyre_object::excobject::ExcKind::OverflowError);
-exc_constructor!(exc_import_error, pyre_object::excobject::ExcKind::ImportError);
-exc_constructor!(exc_not_implemented_error, pyre_object::excobject::ExcKind::NotImplementedError);
-exc_constructor!(exc_assertion_error, pyre_object::excobject::ExcKind::AssertionError);
+exc_constructor!(
+    exc_runtime_error,
+    pyre_object::excobject::ExcKind::RuntimeError
+);
+exc_constructor!(
+    exc_stop_iteration,
+    pyre_object::excobject::ExcKind::StopIteration
+);
+exc_constructor!(
+    exc_overflow_error,
+    pyre_object::excobject::ExcKind::OverflowError
+);
+exc_constructor!(
+    exc_import_error,
+    pyre_object::excobject::ExcKind::ImportError
+);
+exc_constructor!(
+    exc_not_implemented_error,
+    pyre_object::excobject::ExcKind::NotImplementedError
+);
+exc_constructor!(
+    exc_assertion_error,
+    pyre_object::excobject::ExcKind::AssertionError
+);
 
 /// `__build_class__(body, name, *bases)` — stub for class creation.
 /// Phase 1: returns None (class bodies not yet executed).

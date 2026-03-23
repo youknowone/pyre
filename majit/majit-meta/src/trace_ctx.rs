@@ -210,7 +210,8 @@ impl TraceCtx {
     /// RPython parity: Ref constants preserve their type so guard
     /// fail_args are correctly typed during guard failure recovery.
     pub fn const_ref(&mut self, value: i64) -> OpRef {
-        self.constants.get_or_insert_typed(value, majit_ir::Type::Ref)
+        self.constants
+            .get_or_insert_typed(value, majit_ir::Type::Ref)
     }
 
     /// Return the type of a constant OpRef, if recorded.

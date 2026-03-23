@@ -880,9 +880,7 @@ pub fn install_jit_call_bridge() {
         register_jit_function_caller(jit_call_user_function_from_frame);
         majit_codegen_cranelift::register_call_assembler_force(jit_force_callee_frame);
         majit_codegen_cranelift::register_call_assembler_bridge(jit_bridge_compile_callee);
-        majit_codegen_cranelift::register_call_assembler_blackhole(
-            jit_blackhole_resume_from_guard,
-        );
+        majit_codegen_cranelift::register_call_assembler_blackhole(jit_blackhole_resume_from_guard);
         // compile.py:714: bridge compilation on guard failure threshold.
         // jit_bridge_compile_for_guard traces from guard failure point
         // using MetaInterp tracing (start_bridge_tracing + trace loop).
@@ -907,8 +905,7 @@ fn jit_blackhole_resume_from_guard(
     if fail_values_ptr.is_null() || num_fail_values == 0 {
         return None;
     }
-    let fail_values =
-        unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
+    let fail_values = unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
     // The green_key from the target may be 0 for function-entry traces.
     // Recover the real green_key from the callee frame's code pointer.
     let actual_green_key = if green_key == 0 && num_fail_values >= 1 {
@@ -927,7 +924,10 @@ fn jit_blackhole_resume_from_guard(
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[blackhole-resume] gk={} trace={} fail_idx={} nvals={}",
-            actual_green_key, trace_id, fail_index, fail_values.len(),
+            actual_green_key,
+            trace_id,
+            fail_index,
+            fail_values.len(),
         );
     }
     // RPython _run_forever parity: blackhole may return Jump (loop back)
@@ -936,7 +936,11 @@ fn jit_blackhole_resume_from_guard(
     let mut current_values = fail_values.to_vec();
     loop {
         let bh_opt = driver.blackhole_guard_failure(
-            actual_green_key, trace_id, current_fail_index, &current_values, exception.clone(),
+            actual_green_key,
+            trace_id,
+            current_fail_index,
+            &current_values,
+            exception.clone(),
         );
         let (bh_result, _bh_exc) = bh_opt?;
         match bh_result {
@@ -952,9 +956,7 @@ fn jit_blackhole_resume_from_guard(
                 // re-entry support in the blackhole yet.
                 return None;
             }
-            majit_meta::blackhole::BlackholeResult::GuardFailed {
-                fail_values, ..
-            } => {
+            majit_meta::blackhole::BlackholeResult::GuardFailed { fail_values, .. } => {
                 // Nested guard failure inside blackhole. Fall back.
                 return None;
             }
@@ -982,9 +984,9 @@ pub fn jit_bridge_compile_for_guard(
     fail_index: u32,
     frame: &mut PyFrame,
 ) {
+    use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
     use crate::jit::trace::trace_bytecode;
-    use crate::eval::build_jit_state;
 
     let (driver, info) = crate::eval::driver_pair();
 
@@ -1041,9 +1043,7 @@ pub fn jit_bridge_compile_for_guard(
             &mut jit_state,
             &env,
             || {},
-            |ctx, sym| {
-                trace_bytecode(ctx, sym, code, pc, trace_frame_ptr)
-            },
+            |ctx, sym| trace_bytecode(ctx, sym, code, pc, trace_frame_ptr),
         );
 
         // merge_point handles Finish/CloseLoop via bridge_info.
@@ -1264,12 +1264,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
                 unsafe {
                     std::ptr::write(
                         ptr,
-                        PyFrame::new_for_call(
-                            func_code,
-                            &[boxed_arg],
-                            globals,
-                            execution_context,
-                        ),
+                        PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
                     );
                     (&mut *ptr).fix_array_ptrs();
                 }
@@ -1278,12 +1273,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
             unsafe {
                 std::ptr::write(
                     ptr,
-                    PyFrame::new_for_call(
-                        func_code,
-                        &[boxed_arg],
-                        globals,
-                        execution_context,
-                    ),
+                    PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
                 );
                 (&mut *ptr).fix_array_ptrs();
             }

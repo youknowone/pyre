@@ -62,11 +62,7 @@ mod tests {
         let ops = get_ops(ctx);
         assert_eq!(
             ops,
-            vec![
-                OpCode::GetfieldGcI,
-                OpCode::GuardClass,
-                OpCode::GetfieldGcI,
-            ]
+            vec![OpCode::GetfieldGcI, OpCode::GuardClass, OpCode::GetfieldGcI,]
         );
         eprintln!("✓ trace_unbox_int: {:?}", ops);
     }
@@ -139,11 +135,7 @@ mod tests {
         let ops = get_ops(ctx);
         assert_eq!(
             ops,
-            vec![
-                OpCode::GetfieldGcI,
-                OpCode::GuardClass,
-                OpCode::GetfieldGcF,
-            ]
+            vec![OpCode::GetfieldGcI, OpCode::GuardClass, OpCode::GetfieldGcF,]
         );
         eprintln!("✓ trace_unbox_float: {:?}", ops);
     }

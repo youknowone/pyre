@@ -780,11 +780,8 @@ impl<M: Clone> MetaInterp<M> {
                 // target so call_assembler can resolve the pending token at
                 // runtime. call_assembler_fast_path detects null code_ptr and
                 // falls back to force_fn.
-                self.backend.register_pending_target(
-                    pending_num,
-                    input_types,
-                    num_inputs,
-                );
+                self.backend
+                    .register_pending_target(pending_num, input_types, num_inputs);
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
                 }
@@ -814,9 +811,13 @@ impl<M: Clone> MetaInterp<M> {
 
         match self.warm_state.force_start_tracing(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing(recorder) => {
-                self.setup_tracing(green_key, green_key_values, driver_descriptor, live_values, recorder)
-            }
+            HotResult::StartTracing(recorder) => self.setup_tracing(
+                green_key,
+                green_key_values,
+                driver_descriptor,
+                live_values,
+                recorder,
+            ),
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
         }
@@ -835,9 +836,13 @@ impl<M: Clone> MetaInterp<M> {
 
         match self.warm_state.maybe_compile(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing(recorder) => {
-                self.setup_tracing(green_key, green_key_values, driver_descriptor, live_values, recorder)
-            }
+            HotResult::StartTracing(recorder) => self.setup_tracing(
+                green_key,
+                green_key_values,
+                driver_descriptor,
+                live_values,
+                recorder,
+            ),
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }
@@ -880,12 +885,7 @@ impl<M: Clone> MetaInterp<M> {
             if total_vable > 0 && live_values.len() >= 1 + total_vable {
                 let vable_oprefs: Vec<OpRef> =
                     (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
-                ctx.init_virtualizable_boxes(
-                    info,
-                    OpRef(0),
-                    &vable_oprefs,
-                    &array_lengths,
-                );
+                ctx.init_virtualizable_boxes(info, OpRef(0), &vable_oprefs, &array_lengths);
             }
         }
 
@@ -1357,14 +1357,15 @@ impl<M: Clone> MetaInterp<M> {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] close_and_compile GuardNotInvalidated types={:?} inputarg_types={:?} jump_args={:?}",
-                    guard_fail_arg_types,
-                    inputarg_types,
-                    jump_args,
+                    guard_fail_arg_types, inputarg_types, jump_args,
                 );
             }
             let descr = crate::fail_descr::make_fail_descr_typed(guard_fail_arg_types);
             recorder.record_guard_with_fail_args(
-                OpCode::GuardNotInvalidated, &[], descr, jump_args,
+                OpCode::GuardNotInvalidated,
+                &[],
+                descr,
+                jump_args,
             );
         }
         recorder.close_loop(jump_args);
@@ -1424,7 +1425,10 @@ impl<M: Clone> MetaInterp<M> {
                     .is_some()
                 {
                     if crate::majit_log_enabled() {
-                        eprintln!("[jit] abort trace at key={} (InvalidLoop during optimize)", green_key);
+                        eprintln!(
+                            "[jit] abort trace at key={} (InvalidLoop during optimize)",
+                            green_key
+                        );
                     }
                     self.warm_state.abort_tracing(green_key, false);
                     return;
@@ -1438,19 +1442,21 @@ impl<M: Clone> MetaInterp<M> {
         // loop inputargs. Simple loops synthesize a LABEL from that contract;
         // they do not grow inputargs to match a rewritten JUMP arity.
         let root_inputargs = root_loop_inputargs_from_optimizer(&trace.inputargs, final_num_inputs);
-        let (inputargs, optimized_ops) =
-            match normalize_root_loop_entry_contract(root_inputargs, optimized_ops) {
-                Ok(normalized) => normalized,
-                Err((expected, actual)) => {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] abort compile: root loop entry/jump arity mismatch input={} jump={}",
-                            expected, actual,
-                        );
-                    }
-                    return;
+        let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
+            root_inputargs,
+            optimized_ops,
+        ) {
+            Ok(normalized) => normalized,
+            Err((expected, actual)) => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] abort compile: root loop entry/jump arity mismatch input={} jump={}",
+                        expected, actual,
+                    );
                 }
-            };
+                return;
+            }
+        };
 
         // RPython virtualizable parity: standard virtualizable fields and
         // arrays stay in the trace as first-class virtualizable boxes.
@@ -1469,7 +1475,8 @@ impl<M: Clone> MetaInterp<M> {
             for op in &optimized_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
                     if let Some(ref fa) = op.fail_args {
-                        let raw: Vec<String> = fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
+                        let raw: Vec<String> =
+                            fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
                         eprintln!("[jit] FINAL GuardNotInv fail_args=[{}]", raw.join(", "));
                     }
                 }
@@ -1848,7 +1855,9 @@ impl<M: Clone> MetaInterp<M> {
                             result.insert(fi, knowledge.clone());
                         }
                     }
-                    let end_knowledge = optimizer.final_ctx.as_ref()
+                    let end_knowledge = optimizer
+                        .final_ctx
+                        .as_ref()
                         .map(|c| optimizer.serialize_optimizer_knowledge(c))
                         .unwrap_or_default();
                     for (_, k) in result.iter_mut() {
@@ -1880,10 +1889,16 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 {
                     let mut previous_tokens: Vec<JitCellToken> = Vec::new();
-                    let ft = self.compiled_loops.get(&green_key)
-                        .map(|c| c.front_target_tokens.clone()).unwrap_or_default();
-                    let rc = self.compiled_loops.get(&green_key)
-                        .map(|c| c.retraced_count).unwrap_or(0);
+                    let ft = self
+                        .compiled_loops
+                        .get(&green_key)
+                        .map(|c| c.front_target_tokens.clone())
+                        .unwrap_or_default();
+                    let rc = self
+                        .compiled_loops
+                        .get(&green_key)
+                        .map(|c| c.retraced_count)
+                        .unwrap_or(0);
                     if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                         previous_tokens.push(old_entry.token);
                         previous_tokens.extend(old_entry.previous_tokens);
@@ -2483,10 +2498,7 @@ impl<M: Clone> MetaInterp<M> {
             // RPython compile.py:697-706 (must_compile → _trace_and_compile_from_bridge):
             // When guard fails >= trace_eagerness times, trigger bridge hook.
             // The hook (set by pyre) compiles a bridge for the alternative path.
-            if fail_count >= self.trace_eagerness
-                && self.trace_eagerness > 0
-                && !bridge_compiled
-            {
+            if fail_count >= self.trace_eagerness && self.trace_eagerness > 0 && !bridge_compiled {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] bridge threshold reached: key={} trace={} guard={} count={}",
@@ -3029,7 +3041,10 @@ impl<M: Clone> MetaInterp<M> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] finish_bridge: key={}, trace_id={}, guard={}, ops={}",
-                green_key, trace_id, fail_index, trace.ops.len()
+                green_key,
+                trace_id,
+                fail_index,
+                trace.ops.len()
             );
             eprintln!("--- bridge trace (finish, before opt) ---");
             eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
@@ -3112,7 +3127,11 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_knowledge: Option<OptimizerKnowledge> = {
             let source_trace_id = {
                 let tid = fail_descr.trace_id();
-                if tid == 0 { compiled.root_trace_id } else { tid }
+                if tid == 0 {
+                    compiled.root_trace_id
+                } else {
+                    tid
+                }
             };
             compiled.traces.get(&source_trace_id).and_then(|trace| {
                 let knowledge = trace.optimizer_knowledge.get(&fail_index)?;
@@ -3138,7 +3157,11 @@ impl<M: Clone> MetaInterp<M> {
                     remap.entry(opref).or_insert(opref);
                 }
                 let remapped = knowledge.remap(&remap);
-                if remapped.is_empty() { None } else { Some(remapped) }
+                if remapped.is_empty() {
+                    None
+                } else {
+                    Some(remapped)
+                }
             })
         };
         let (optimized_ops, retrace_requested) = optimizer.optimize_bridge(
@@ -4444,7 +4467,11 @@ mod tests {
 
     #[test]
     fn test_normalize_root_loop_entry_contract_inserts_label_from_inputargs() {
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1), InputArg::new_int(2)];
+        let inputargs = vec![
+            InputArg::new_int(0),
+            InputArg::new_int(1),
+            InputArg::new_int(2),
+        ];
         let ops = vec![
             mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 3),
             mk_op(OpCode::Jump, &[OpRef(3), OpRef(2), OpRef(1)], OpRef::NONE.0),
@@ -4464,7 +4491,11 @@ mod tests {
 
     #[test]
     fn test_normalize_root_loop_entry_contract_uses_simple_loop_jump_contract() {
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1), InputArg::new_int(2)];
+        let inputargs = vec![
+            InputArg::new_int(0),
+            InputArg::new_int(1),
+            InputArg::new_int(2),
+        ];
         let ops = vec![mk_op(OpCode::Jump, &[OpRef(0), OpRef(1)], OpRef::NONE.0)];
 
         let (normalized_inputargs, normalized_ops) =
@@ -8030,12 +8061,7 @@ mod raw_int_postprocess_tests {
 
     #[test]
     fn unbox_finish_result_rewrites_new_setfield_chain_even_if_new_is_last() {
-        let new_op = mk_op_with_descr(
-            OpCode::New,
-            &[],
-            25,
-            majit_ir::descr::make_size_descr(16),
-        );
+        let new_op = mk_op_with_descr(OpCode::New, &[], 25, majit_ir::descr::make_size_descr(16));
         let set_type = mk_op_with_descr(
             OpCode::SetfieldGc,
             &[OpRef(25), OpRef(99)],
@@ -8055,8 +8081,11 @@ mod raw_int_postprocess_tests {
             crate::make_fail_descr_typed(vec![Type::Ref]),
         );
 
-        let (ops, changed) =
-            unbox_finish_result(vec![set_type, set_payload, new_op, finish], &HashMap::new(), &HashSet::new());
+        let (ops, changed) = unbox_finish_result(
+            vec![set_type, set_payload, new_op, finish],
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert!(changed);
         assert_eq!(ops.len(), 1);

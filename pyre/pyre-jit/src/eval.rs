@@ -230,13 +230,16 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             if tracing_depth != 0 {
                 let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
                 if current_depth == tracing_depth {
-                    if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+                    if let Some(loop_result) =
+                        jit_merge_point_hook(frame, code, pc, driver, info, &env)
+                    {
                         return loop_result;
                     }
                 }
             } else if driver.is_tracing() {
                 // First merge_point after trace start — depth not yet set.
-                if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+                if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env)
+                {
                     return loop_result;
                 }
             }
@@ -244,7 +247,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 
         // ── inline replay (tracing bookkeeping) ──
         if frame.pending_inline_resume_pc == Some(pc) {
-            if matches!(instruction, pyre_bytecode::bytecode::Instruction::Call { .. }) {
+            if matches!(
+                instruction,
+                pyre_bytecode::bytecode::Instruction::Call { .. }
+            ) {
                 frame.pending_inline_resume_pc = None;
                 continue;
             }
@@ -273,11 +279,23 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // Thin inline: counter tick only. Heavy logic in cold helper.
                 let green_key = make_green_key(frame.code, loop_header_pc);
-                if driver.meta_interp_mut().warm_state_mut().counter.tick(green_key) && !driver.is_tracing() {
-                    if let Some(loop_result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
+                if driver
+                    .meta_interp_mut()
+                    .warm_state_mut()
+                    .counter
+                    .tick(green_key)
+                    && !driver.is_tracing()
+                {
+                    if let Some(loop_result) =
+                        can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env)
+                    {
                         return loop_result;
                     }
-                    driver.meta_interp_mut().warm_state_mut().counter.reset(green_key);
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_mut()
+                        .counter
+                        .reset(green_key);
                 }
             }
             Ok(StepResult::CloseLoop { .. }) => {}
@@ -309,7 +327,11 @@ fn jit_merge_point_hook(
     let mut jit_state = build_jit_state(frame, info);
     let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
     if let Some(outcome) = driver.jit_merge_point_keyed(
-        green_key, pc, &mut jit_state, env, || {},
+        green_key,
+        pc,
+        &mut jit_state,
+        env,
+        || {},
         |ctx, sym| {
             JIT_TRACING_DEPTH.with(|t| t.set(current_depth));
             let mut trace_frame = frame.snapshot_for_tracing();
@@ -346,7 +368,10 @@ fn can_enter_jit_hook(
     // Early exit for blacklisted keys: avoid build_jit_state + build_meta overhead.
     let has_compiled = driver.has_compiled_loop(green_key);
     if !has_compiled
-        && !driver.meta_interp().warm_state_ref().counter_would_fire(green_key)
+        && !driver
+            .meta_interp()
+            .warm_state_ref()
+            .counter_would_fire(green_key)
     {
         return None;
     }
@@ -354,7 +379,9 @@ fn can_enter_jit_hook(
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit][root-backedge] enter key={} pc={} arg0={:?} has_compiled={}",
-            green_key, loop_header_pc, debug_first_arg_int(frame),
+            green_key,
+            loop_header_pc,
+            debug_first_arg_int(frame),
             has_compiled
         );
     }
@@ -362,7 +389,11 @@ fn can_enter_jit_hook(
     // from jit_merge_point via the eval_loop_jit dispatch path.
     let outcome = if driver.has_compiled_loop(green_key) {
         Some(driver.run_compiled_detailed_with_bridge_keyed(
-            green_key, loop_header_pc, &mut jit_state, env, || {},
+            green_key,
+            loop_header_pc,
+            &mut jit_state,
+            env,
+            || {},
             restore_guard_failure_for_loop,
         ))
     } else if !driver.is_tracing() {
@@ -370,7 +401,11 @@ fn can_enter_jit_hook(
             return None;
         }
         driver.back_edge_or_run_compiled_keyed(
-            green_key, loop_header_pc, &mut jit_state, env, || {},
+            green_key,
+            loop_header_pc,
+            &mut jit_state,
+            env,
+            || {},
         )
     } else {
         None
@@ -384,7 +419,10 @@ fn can_enter_jit_hook(
                 DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => "guard-restored",
                 DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
             };
-            eprintln!("[jit][root-backedge] outcome key={} pc={} kind={}", green_key, loop_header_pc, kind);
+            eprintln!(
+                "[jit][root-backedge] outcome key={} pc={} kind={}",
+                green_key, loop_header_pc, kind
+            );
         }
         match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
             JitAction::Return(result) => return Some(LoopResult::Done(result)),
@@ -471,7 +509,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 JitAction::Return(result) => {
                     if majit_meta::majit_log_enabled() {
                         let rendered = result.as_ref().ok().and_then(|value| {
-                            if value.is_null() || !unsafe { pyre_object::pyobject::is_int(*value) } {
+                            if value.is_null() || !unsafe { pyre_object::pyobject::is_int(*value) }
+                            {
                                 return None;
                             }
                             Some(unsafe { pyre_object::intobject::w_int_get_value(*value) })
@@ -527,7 +566,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         .meta_interp_mut()
         .warm_state_mut()
         .should_trace_function_entry(green_key);
-    let count = driver.meta_interp().warm_state_ref().function_entry_count(green_key);
+    let count = driver
+        .meta_interp()
+        .warm_state_ref()
+        .function_entry_count(green_key);
     let function_threshold = driver.meta_interp().warm_state_ref().function_threshold();
     let boosted = driver.is_function_boosted(green_key);
     if majit_meta::majit_log_enabled() {
@@ -576,8 +618,7 @@ fn handle_jit_outcome(
             ..
         } => {
             let (driver, _) = driver_pair();
-            let raw_int_result = raw_int_result
-                || driver.has_raw_int_finish(green_key);
+            let raw_int_result = raw_int_result || driver.has_raw_int_finish(green_key);
             if majit_meta::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
@@ -634,10 +675,7 @@ fn handle_jit_outcome(
     }
 }
 
-fn decode_exit_layout_values(
-    raw_values: &[i64],
-    layout: &CompiledExitLayout,
-) -> Vec<Value> {
+fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
     layout
         .exit_types
         .iter()
@@ -662,10 +700,14 @@ fn restore_guard_failure_for_loop(
 ) -> Option<usize> {
     if majit_meta::majit_log_enabled() {
         let nraw = raw_values.len().min(8);
-        let slots: Vec<String> = (0..nraw).map(|i| format!("{:#x}", raw_values[i] as usize)).collect();
+        let slots: Vec<String> = (0..nraw)
+            .map(|i| format!("{:#x}", raw_values[i] as usize))
+            .collect();
         eprintln!(
             "[jit] guard-fail: fail_idx={} types={:?} raw=[{}]",
-            exit_layout.fail_index, exit_layout.exit_types, slots.join(", ")
+            exit_layout.fail_index,
+            exit_layout.exit_types,
+            slots.join(", ")
         );
     }
     let mut typed = decode_exit_layout_values(raw_values, exit_layout);
@@ -678,7 +720,10 @@ fn restore_guard_failure_for_loop(
     // the frame state is unsafe for the interpreter. Return None
     // (= not restored) so the interpreter ignores the guard result
     // and continues from scratch rather than dereferencing null.
-    let has_null_ref = typed.iter().skip(3).any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
+    let has_null_ref = typed
+        .iter()
+        .skip(3)
+        .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
     if has_null_ref {
         if majit_meta::majit_log_enabled() {
             eprintln!("[jit] guard-fail: null Ref in restored values, invalidating compiled code");
@@ -688,15 +733,24 @@ fn restore_guard_failure_for_loop(
         let (driver, _) = driver_pair();
         let keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
         for key in keys {
-            driver.meta_interp_mut().warm_state_mut().abort_tracing(key, true);
-            driver.meta_interp_mut().warm_state_mut().clear_loop_token(key);
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .abort_tracing(key, true);
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .clear_loop_token(key);
         }
         driver.invalidate_all_compiled();
         return None;
     }
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_meta::majit_log_enabled() {
-        eprintln!("[jit] guard-fail restored: ni={} vsd={}", jit_state.next_instr, jit_state.valuestackdepth);
+        eprintln!(
+            "[jit] guard-fail restored: ni={} vsd={}",
+            jit_state.next_instr, jit_state.valuestackdepth
+        );
     }
     restored.then_some(jit_state.next_instr)
 }
@@ -712,10 +766,7 @@ fn restore_guard_failure_for_loop(
 /// Pattern: [..., NONE, NONE] [ob_type1, intval1, ob_type2, intval2]
 /// Only apply when trailing fields are available (2 Int per null slot).
 /// Otherwise, replace remaining null Refs with w_none() for safety.
-fn materialize_recovery_virtuals(
-    typed: &mut Vec<Value>,
-    _exit_layout: &CompiledExitLayout,
-) {
+fn materialize_recovery_virtuals(typed: &mut Vec<Value>, _exit_layout: &CompiledExitLayout) {
     // Find all null Ref slots (virtual markers) after the header (frame/ni/vsd)
     let null_slots: Vec<usize> = (3..typed.len())
         .filter(|&i| matches!(typed.get(i), Some(Value::Ref(majit_ir::GcRef(0)))))
@@ -738,11 +789,18 @@ fn materialize_recovery_virtuals(
         let mut valid = true;
         let mut check_cursor = trailing_start;
         for _ in &null_slots {
-            if check_cursor + 1 >= typed.len() { valid = false; break; }
+            if check_cursor + 1 >= typed.len() {
+                valid = false;
+                break;
+            }
             if let Value::Int(ob_type) = typed[check_cursor] {
-                if ob_type as usize != w_int_type_id { valid = false; break; }
+                if ob_type as usize != w_int_type_id {
+                    valid = false;
+                    break;
+                }
             } else {
-                valid = false; break;
+                valid = false;
+                break;
             }
             check_cursor += 2;
         }
@@ -763,7 +821,10 @@ fn materialize_recovery_virtuals(
                 let obj = pyre_object::intobject::w_int_new(v);
                 typed[slot_idx] = Value::Ref(majit_ir::GcRef(obj as usize));
                 if majit_meta::majit_log_enabled() {
-                    eprintln!("[jit] materialized virtual W_IntObject(intval={}) at slot {}", v, slot_idx);
+                    eprintln!(
+                        "[jit] materialized virtual W_IntObject(intval={}) at slot {}",
+                        v, slot_idx
+                    );
                 }
             }
             field_cursor += 2;

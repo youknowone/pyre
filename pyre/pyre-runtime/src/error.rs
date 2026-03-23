@@ -1,5 +1,5 @@
-use pyre_object::excobject::{ExcKind, exc_kind_name, w_exception_new};
 use pyre_object::PyObjectRef;
+use pyre_object::excobject::{ExcKind, exc_kind_name, w_exception_new};
 
 /// Result type for Python operations.
 pub type PyResult = Result<PyObjectRef, PyError>;

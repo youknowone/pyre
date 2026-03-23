@@ -167,40 +167,59 @@ pub(crate) fn build_guard_metadata(
         // resume.py: store_final_boxes stores VirtualInfo blueprints in the
         // guard descriptor so guard failure can materialize virtual objects.
         let recovery_layout = op.rd_virtuals.as_ref().map(|entries| {
-            use majit_codegen::{ExitRecoveryLayout, ExitVirtualLayout, ExitValueSourceLayout};
-            let virtual_layouts: Vec<ExitVirtualLayout> = entries.iter().map(|entry| {
-                ExitVirtualLayout::Struct {
+            use majit_codegen::{ExitRecoveryLayout, ExitValueSourceLayout, ExitVirtualLayout};
+            let virtual_layouts: Vec<ExitVirtualLayout> = entries
+                .iter()
+                .map(|entry| ExitVirtualLayout::Struct {
                     type_id: entry.known_class.map_or(0, |gc| gc.as_usize() as u32),
                     descr_index: entry.descr.index(),
-                    fields: entry.fields.iter().map(|(field_descr_idx, fail_arg_idx)| {
-                        (*field_descr_idx, ExitValueSourceLayout::ExitValue(*fail_arg_idx))
-                    }).collect(),
-                }
-            }).collect();
+                    fields: entry
+                        .fields
+                        .iter()
+                        .map(|(field_descr_idx, fail_arg_idx)| {
+                            (
+                                *field_descr_idx,
+                                ExitValueSourceLayout::ExitValue(*fail_arg_idx),
+                            )
+                        })
+                        .collect(),
+                })
+                .collect();
             // Convert op.rd_pendingfields to ExitPendingFieldLayout
-            let pending_field_layouts = op.rd_pendingfields.as_ref().map(|entries| {
-                entries.iter().filter_map(|entry| {
-                    let fail_args = op.fail_args.as_ref()?;
-                    // Find target and value in fail_args
-                    let target_idx = fail_args.iter().position(|&a| a == entry.target)?;
-                    let value_idx = fail_args.iter().position(|&a| a == entry.value);
-                    let target = ExitValueSourceLayout::ExitValue(target_idx);
-                    let value = match value_idx {
-                        Some(idx) => ExitValueSourceLayout::ExitValue(idx),
-                        None => {
-                            // Value might be a constant
-                            ExitValueSourceLayout::Constant(entry.value.0 as i64)
-                        }
-                    };
-                    Some(majit_codegen::ExitPendingFieldLayout {
-                        descr_index: entry.descr_index,
-                        item_index: if entry.item_index >= 0 { Some(entry.item_index as usize) } else { None },
-                        is_array_item: entry.item_index >= 0,
-                        target,
-                        value,
-                    })
-                }).collect()
-            }).unwrap_or_default();
+            let pending_field_layouts = op
+                .rd_pendingfields
+                .as_ref()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let fail_args = op.fail_args.as_ref()?;
+                            // Find target and value in fail_args
+                            let target_idx = fail_args.iter().position(|&a| a == entry.target)?;
+                            let value_idx = fail_args.iter().position(|&a| a == entry.value);
+                            let target = ExitValueSourceLayout::ExitValue(target_idx);
+                            let value = match value_idx {
+                                Some(idx) => ExitValueSourceLayout::ExitValue(idx),
+                                None => {
+                                    // Value might be a constant
+                                    ExitValueSourceLayout::Constant(entry.value.0 as i64)
+                                }
+                            };
+                            Some(majit_codegen::ExitPendingFieldLayout {
+                                descr_index: entry.descr_index,
+                                item_index: if entry.item_index >= 0 {
+                                    Some(entry.item_index as usize)
+                                } else {
+                                    None
+                                },
+                                is_array_item: entry.item_index >= 0,
+                                target,
+                                value,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             ExitRecoveryLayout {
                 frames: vec![],
@@ -231,10 +250,7 @@ pub(crate) fn build_guard_metadata(
     (result, guard_op_indices, exit_layouts)
 }
 
-pub(crate) fn retag_fail_descrs_from_trace_types(
-    inputargs: &[InputArg],
-    ops: &mut [majit_ir::Op],
-) {
+pub(crate) fn retag_fail_descrs_from_trace_types(inputargs: &[InputArg], ops: &mut [majit_ir::Op]) {
     let (value_types, _) = build_trace_value_maps(inputargs, ops);
     let mut next_fail_index = 0u32;
     for op in ops.iter_mut() {
@@ -1352,11 +1368,23 @@ mod tests {
         assert_eq!(find_fail_index_for_exit_op(&ops, 1), Some(0));
         assert_eq!(find_fail_index_for_exit_op(&ops, 2), Some(1));
         assert_eq!(
-            ops[1].descr.as_ref().unwrap().as_fail_descr().unwrap().fail_arg_types(),
+            ops[1]
+                .descr
+                .as_ref()
+                .unwrap()
+                .as_fail_descr()
+                .unwrap()
+                .fail_arg_types(),
             &[Type::Ref, Type::Int]
         );
         assert_eq!(
-            ops[2].descr.as_ref().unwrap().as_fail_descr().unwrap().fail_arg_types(),
+            ops[2]
+                .descr
+                .as_ref()
+                .unwrap()
+                .as_fail_descr()
+                .unwrap()
+                .fail_arg_types(),
             &[Type::Ref, Type::Int]
         );
     }

@@ -177,8 +177,7 @@ fn run_repl(quiet: bool) {
         match try_compile_single(&buffer) {
             CompileResult::Complete(code) => {
                 let code_ptr = Box::into_raw(Box::new(code));
-                let mut frame =
-                    PyFrame::new_with_namespace(code_ptr, ctx_ptr, namespace);
+                let mut frame = PyFrame::new_with_namespace(code_ptr, ctx_ptr, namespace);
                 match eval_with_jit(&mut frame) {
                     Ok(result) => {
                         if !result.is_null() && !unsafe { pyre_object::is_none(result) } {

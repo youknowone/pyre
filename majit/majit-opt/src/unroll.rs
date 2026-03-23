@@ -266,8 +266,13 @@ impl UnrollOptimizer {
             for op in &p2_ops {
                 if op.opcode.is_guard() {
                     if let Some(ref fa) = op.fail_args {
-                        let fa_raw: Vec<String> = fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
-                        eprintln!("[jit] p2 guard {:?} fail_args_raw=[{}]", op.opcode, fa_raw.join(", "));
+                        let fa_raw: Vec<String> =
+                            fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
+                        eprintln!(
+                            "[jit] p2 guard {:?} fail_args_raw=[{}]",
+                            op.opcode,
+                            fa_raw.join(", ")
+                        );
                     }
                 }
             }
@@ -284,7 +289,10 @@ impl UnrollOptimizer {
                 p2_ni
             );
             for (i, op) in p2_ops.iter().enumerate() {
-                eprintln!("[jit] p2[{i}]: {:?} pos={:?} args={:?}", op.opcode, op.pos, op.args);
+                eprintln!(
+                    "[jit] p2[{i}]: {:?} pos={:?} args={:?}",
+                    op.opcode, op.pos, op.args
+                );
             }
         }
 
@@ -405,9 +413,7 @@ impl UnrollOptimizer {
                     if !jumped {
                         // unroll.py:228: "Retrace count reached, jumping to preamble"
                         if std::env::var_os("MAJIT_LOG").is_some() {
-                            eprintln!(
-                                "[jit] Retrace count reached, jumping to preamble"
-                            );
+                            eprintln!("[jit] Retrace count reached, jumping to preamble");
                         }
                         // jumped stays false → jump_to_preamble below
                     }
@@ -500,10 +506,7 @@ impl UnrollOptimizer {
             &p1_ops,
             &body_ops,
             &label_args,
-            opt_p2
-                .imported_label_source_slots
-                .as_deref()
-                .unwrap_or(&[]),
+            opt_p2.imported_label_source_slots.as_deref().unwrap_or(&[]),
             &exported_state.renamed_inputargs,
             &sp.used_boxes,
             &sp.jump_args,
@@ -522,7 +525,10 @@ impl UnrollOptimizer {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("--- peeled trace (assembled) ---");
             eprint!("{}", majit_ir::format_trace(&combined, &consts_p2));
-            eprintln!("[jit] consts_p2 keys: {:?}", consts_p2.keys().collect::<Vec<_>>());
+            eprintln!(
+                "[jit] consts_p2 keys: {:?}",
+                consts_p2.keys().collect::<Vec<_>>()
+            );
         }
         *constants = consts_p2;
         (combined, p2_ni)
@@ -1253,7 +1259,8 @@ impl OptUnroll {
                 Err(()) => {
                     if force_boxes {
                         args = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
-                        virtual_state = crate::virtualstate::export_state(&args, ctx, &ctx.ptr_info);
+                        virtual_state =
+                            crate::virtualstate::export_state(&args, ctx, &ctx.ptr_info);
                     }
                     continue;
                 }
@@ -1471,15 +1478,21 @@ impl OptUnroll {
                     if let Some(&phase2_opref) = targetargs.get(phase1_idx) {
                         // Also remap field value OpRefs using next_iteration_args mapping:
                         // Phase 1 field value → Phase 2 equivalent via pre_force_args index.
-                        let remapped_fields: Vec<(u32, OpRef)> = fields.iter().map(|&(idx, val)| {
-                            // Find val in pre_force_args or next_iteration_args
-                            let remapped_val = exported_state.pre_force_args.iter()
-                                .position(|&a| a == val)
-                                .and_then(|pos| targetargs.get(pos).copied())
-                                .unwrap_or(val);
-                            (idx, remapped_val)
-                        }).collect();
-                        ctx.pre_force_field_refs.insert(phase2_opref, remapped_fields);
+                        let remapped_fields: Vec<(u32, OpRef)> = fields
+                            .iter()
+                            .map(|&(idx, val)| {
+                                // Find val in pre_force_args or next_iteration_args
+                                let remapped_val = exported_state
+                                    .pre_force_args
+                                    .iter()
+                                    .position(|&a| a == val)
+                                    .and_then(|pos| targetargs.get(pos).copied())
+                                    .unwrap_or(val);
+                                (idx, remapped_val)
+                            })
+                            .collect();
+                        ctx.pre_force_field_refs
+                            .insert(phase2_opref, remapped_fields);
                     }
                 }
             }
@@ -1850,9 +1863,9 @@ impl OptUnroll {
                                         .map(ExportedShortArg::Produced)
                                 })
                                 .or_else(|| {
-                                    ctx.get_constant(arg).cloned().map(|value| {
-                                        ExportedShortArg::Const { source: arg, value }
-                                    })
+                                    ctx.get_constant(arg)
+                                        .cloned()
+                                        .map(|value| ExportedShortArg::Const { source: arg, value })
                                 })
                         })
                         .collect::<Option<Vec<_>>>();
@@ -2165,7 +2178,9 @@ pub(crate) fn import_state(
     exported_state: &ExportedState,
     ctx: &mut OptContext,
 ) -> Vec<OpRef> {
-    OptUnroll::new().import_state(targetargs, exported_state, ctx).0
+    OptUnroll::new()
+        .import_state(targetargs, exported_state, ctx)
+        .0
 }
 
 pub(crate) fn import_state_with_source_slots(
@@ -2321,9 +2336,8 @@ fn assemble_peeled_trace_with_jump_args(
     // Collect preamble-defined OpRefs BEFORE adding extra label args,
     // so we can filter out virtual remnants (removed New ops).
     let preamble_defs: std::collections::HashSet<OpRef> = {
-        let mut s: std::collections::HashSet<OpRef> = (0..body_num_inputs)
-            .map(|i| OpRef(i as u32))
-            .collect();
+        let mut s: std::collections::HashSet<OpRef> =
+            (0..body_num_inputs).map(|i| OpRef(i as u32)).collect();
         for op in &result {
             if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
                 s.insert(op.pos);
@@ -2384,13 +2398,13 @@ fn assemble_peeled_trace_with_jump_args(
             (0..label_args.len()).map(|i| OpRef(i as u32)).collect()
         };
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
-    let mut label_set: std::collections::HashSet<OpRef> =
-        full_label_args.iter().copied().collect();
+    let mut label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
     let mut seen_body_defs = std::collections::HashSet::new();
     for op in p2_ops {
-        let all_refs = op.args.iter().chain(
-            op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()),
-        );
+        let all_refs = op
+            .args
+            .iter()
+            .chain(op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()));
         for &arg in all_refs {
             if arg.is_none() || arg.0 >= 10_000 {
                 continue; // skip NONE and constants
@@ -2476,7 +2490,11 @@ fn assemble_peeled_trace_with_jump_args(
     result.push(label_op);
 
     // Body: 2-pass remap (inputarg refs -> label args, body results -> fresh boxes)
-    let max_label_arg_pos = full_label_args.iter().map(|a| a.0).max().unwrap_or(label_pos);
+    let max_label_arg_pos = full_label_args
+        .iter()
+        .map(|a| a.0)
+        .max()
+        .unwrap_or(label_pos);
     let mut next_body_pos = next_free_pos(label_pos.max(max_label_arg_pos).saturating_add(1));
     let mut input_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
@@ -2590,8 +2608,11 @@ fn assemble_peeled_trace_with_jump_args(
             let mut seen_after_label_defs = std::collections::HashSet::new();
             let mut extra_inner_sources = Vec::new();
             let mut extra_inner_set = std::collections::HashSet::new();
-            let label_arg_set: std::collections::HashSet<OpRef> =
-                original_args.iter().copied().filter(|arg| !arg.is_none()).collect();
+            let label_arg_set: std::collections::HashSet<OpRef> = original_args
+                .iter()
+                .copied()
+                .filter(|arg| !arg.is_none())
+                .collect();
             for later_op in p2_ops.iter().skip(op_idx + 1) {
                 for arg in later_op
                     .args
@@ -2709,15 +2730,18 @@ fn assemble_peeled_trace_with_jump_args(
                         .copied()
                         .or_else(|| alias_remap.get(&extra_arg).copied())
                         .or_else(|| {
-                            body_result_remap.get(&extra_arg).copied().and_then(|mapped| {
-                                if seen_body_defs.contains(&extra_arg)
-                                    || !visible_before_label.contains(&extra_arg)
-                                {
-                                    Some(mapped)
-                                } else {
-                                    None
-                                }
-                            })
+                            body_result_remap
+                                .get(&extra_arg)
+                                .copied()
+                                .and_then(|mapped| {
+                                    if seen_body_defs.contains(&extra_arg)
+                                        || !visible_before_label.contains(&extra_arg)
+                                    {
+                                        Some(mapped)
+                                    } else {
+                                        None
+                                    }
+                                })
                         })
                         .unwrap_or(extra_arg);
                     jump_args.push(remapped);
@@ -2761,9 +2785,11 @@ fn assemble_peeled_trace_with_jump_args(
             if !extra_live_args.is_empty() {
                 let existing: std::collections::HashSet<OpRef> =
                     result[label_idx].args.iter().copied().collect();
-                result[label_idx]
-                    .args
-                    .extend(extra_live_args.into_iter().filter(|arg| !existing.contains(arg)));
+                result[label_idx].args.extend(
+                    extra_live_args
+                        .into_iter()
+                        .filter(|arg| !existing.contains(arg)),
+                );
             }
         }
         result.push(new_op);
@@ -3432,7 +3458,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptUnroll::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         // Expect: peeled_add, peeled_guard, Label, body_add, body_guard, Jump = 6
         assert_eq!(result.len(), 6);
@@ -4943,7 +4973,11 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[1].args.as_slice(), &[OpRef(10)]);
         assert_eq!(
-            combined[2].fail_args.as_ref().expect("guard fail args").as_slice(),
+            combined[2]
+                .fail_args
+                .as_ref()
+                .expect("guard fail args")
+                .as_slice(),
             &[OpRef(10), OpRef(50)]
         );
     }
@@ -4986,7 +5020,11 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
         assert_eq!(combined[1].args.as_slice(), &[OpRef(64)]);
         assert_eq!(
-            combined[1].fail_args.as_ref().expect("guard fail args").as_slice(),
+            combined[1]
+                .fail_args
+                .as_ref()
+                .expect("guard fail args")
+                .as_slice(),
             &[OpRef(64)]
         );
         assert_eq!(combined[2].opcode, OpCode::IntAdd);

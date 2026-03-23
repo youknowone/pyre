@@ -860,7 +860,11 @@ mod tests {
         assign_positions(&mut ops, 100);
 
         let mut opt = Optimizer::default_pipeline();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         let guard_count = result
             .iter()
@@ -911,7 +915,11 @@ mod tests {
         assign_positions(&mut ops, 100);
 
         let mut opt = Optimizer::default_pipeline();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
         let guard_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNoOverflow)

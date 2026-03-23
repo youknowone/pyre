@@ -564,9 +564,14 @@ impl VirtualState {
                         })
                         .unwrap_or(OpRef::NONE);
                     if std::env::var_os("MAJIT_LOG").is_some() && field_ref.is_none() {
-                        eprintln!("[jit] enum_forced: opref={:?} resolved={:?} field_idx={} from_info={} pre_force_keys={:?}",
-                            opref, resolved, field_idx, from_info.is_some(),
-                            ctx.pre_force_field_refs.keys().collect::<Vec<_>>());
+                        eprintln!(
+                            "[jit] enum_forced: opref={:?} resolved={:?} field_idx={} from_info={} pre_force_keys={:?}",
+                            opref,
+                            resolved,
+                            field_idx,
+                            from_info.is_some(),
+                            ctx.pre_force_field_refs.keys().collect::<Vec<_>>()
+                        );
                     }
                     Self::enum_forced_boxes_for_entry(
                         field_state,
@@ -887,7 +892,12 @@ impl VirtualState {
             let box_opref = boxes.get(i).copied().unwrap_or(OpRef::NONE);
             let runtime_box = runtime_boxes.and_then(|rb| rb.get(i).copied());
             Self::generate_guards_for_entry(
-                i, expected, incoming, box_opref, runtime_box, &mut guards,
+                i,
+                expected,
+                incoming,
+                box_opref,
+                runtime_box,
+                &mut guards,
             );
         }
 
@@ -1184,10 +1194,7 @@ pub enum GuardRequirement {
         expected_class: GcRef,
     },
     /// Emit GUARD_NONNULL on the arg at this index.
-    GuardNonnull {
-        arg_index: usize,
-        box_opref: OpRef,
-    },
+    GuardNonnull { arg_index: usize, box_opref: OpRef },
     /// Emit GUARD_VALUE on the arg at this index.
     GuardValue {
         arg_index: usize,
@@ -2029,14 +2036,16 @@ mod tests {
         );
         let mut optimizer = crate::optimizer::Optimizer::new();
 
-        assert!(state
-            .make_inputargs_and_virtuals_with_optimizer(
-                &[virtual_ref],
-                &mut optimizer,
-                &mut ctx,
-                false,
-            )
-            .is_err());
+        assert!(
+            state
+                .make_inputargs_and_virtuals_with_optimizer(
+                    &[virtual_ref],
+                    &mut optimizer,
+                    &mut ctx,
+                    false,
+                )
+                .is_err()
+        );
 
         let (inputargs, virtuals) = state
             .make_inputargs_and_virtuals_with_optimizer(

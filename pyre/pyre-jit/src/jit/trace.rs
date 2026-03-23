@@ -76,8 +76,7 @@ pub fn trace_bytecode(
                     ..
                 } = action
                 {
-                    let key =
-                        crate::eval::make_green_key(code as *const CodeObject, target_pc);
+                    let key = crate::eval::make_green_key(code as *const CodeObject, target_pc);
                     ctx.set_green_key(key);
                 } else if matches!(action, TraceAction::CloseLoop) {
                     let key = crate::eval::make_green_key(code as *const CodeObject, pc);
@@ -94,8 +93,8 @@ pub fn trace_bytecode(
 #[cfg(test)]
 mod tests {
     use super::semantic_fallthrough_pc;
-    use pyre_bytecode::compile_exec;
     use pyre_bytecode::bytecode::Instruction;
+    use pyre_bytecode::compile_exec;
     use pyre_runtime::decode_instruction_at;
 
     #[test]

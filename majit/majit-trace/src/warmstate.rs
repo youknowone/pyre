@@ -779,7 +779,10 @@ impl WarmEnterState {
                 }
             }
         }
-        let count = self.function_entry_counts.entry(green_key_hash).or_insert(0);
+        let count = self
+            .function_entry_counts
+            .entry(green_key_hash)
+            .or_insert(0);
         *count += 1;
         *count >= self.function_threshold
     }

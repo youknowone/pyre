@@ -29,10 +29,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
     let pc = frame.next_instr.saturating_sub(1) as u32;
 
     // Python 3.11+ exception table dispatch
-    if let Some(entry) = pyre_bytecode::bytecode::find_exception_handler(
-        &code.exceptiontable,
-        pc,
-    ) {
+    if let Some(entry) = pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc) {
         // Unwind stack to handler's expected depth
         let target_depth = frame.nlocals() + frame.ncells() + entry.depth as usize;
         while frame.valuestackdepth > target_depth {
@@ -460,7 +457,9 @@ impl OpcodeStepExecutor for PyFrame {
                     if pyre_object::is_exception(exc) {
                         Err(PyError::from_exc_object(exc))
                     } else {
-                        Err(PyError::runtime_error("exceptions must derive from BaseException"))
+                        Err(PyError::runtime_error(
+                            "exceptions must derive from BaseException",
+                        ))
                     }
                 }
             }
