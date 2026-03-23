@@ -210,7 +210,12 @@ pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate
     } else {
         truth
     };
-    emit_trace_call_ref_typed(ctx, jit_bool_value_from_truth as *const (), &[truth], &[Type::Int])
+    emit_trace_call_ref_typed(
+        ctx,
+        jit_bool_value_from_truth as *const (),
+        &[truth],
+        &[Type::Int],
+    )
 }
 
 pub fn emit_trace_binary_value(

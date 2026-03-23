@@ -380,7 +380,8 @@ impl OptContext {
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
         let pos_ref = op.pos;
-        self.extra_operations_after.push_back((after_pass_idx + 1, op));
+        self.extra_operations_after
+            .push_back((after_pass_idx + 1, op));
         pos_ref
     }
 
@@ -464,13 +465,16 @@ impl OptContext {
                     for arg in args {
                         let resolved = match arg {
                             ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
-                            ExportedShortArg::Produced(index) => produced_results.get(*index).copied(),
+                            ExportedShortArg::Produced(index) => {
+                                produced_results.get(*index).copied()
+                            }
                             ExportedShortArg::Const { source, value } => {
-                                let opref = imported_constants.entry(*source).or_insert_with(|| {
-                                    let opref = self.alloc_op_position();
-                                    self.make_constant(opref, value.clone());
-                                    opref
-                                });
+                                let opref =
+                                    imported_constants.entry(*source).or_insert_with(|| {
+                                        let opref = self.alloc_op_position();
+                                        self.make_constant(opref, value.clone());
+                                        opref
+                                    });
                                 Some(*opref)
                             }
                         };
@@ -536,8 +540,11 @@ impl OptContext {
             }
         }
 
-        self.imported_short_preamble_builder =
-            Some(ShortPreambleBuilder::new(short_args, &produced, short_inputargs));
+        self.imported_short_preamble_builder = Some(ShortPreambleBuilder::new(
+            short_args,
+            &produced,
+            short_inputargs,
+        ));
         self.imported_short_preamble_used.clear();
         true
     }

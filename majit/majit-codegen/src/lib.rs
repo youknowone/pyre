@@ -519,7 +519,8 @@ pub trait Backend: Send {
         _token_number: u64,
         _input_types: Vec<Type>,
         _num_inputs: usize,
-    ) {}
+    ) {
+    }
 
     /// Compile a bridge (side exit path) and attach it to the loop.
     fn compile_bridge(

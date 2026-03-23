@@ -111,6 +111,13 @@ bold "pyre pre-merge check"; echo ""
 echo "binary: $PYRE"
 echo ""
 
+# Warm up: cold run to prime disk/CPU caches (results discarded)
+printf "  %-20s" "(warmup)"
+python3 "$BENCH/int_loop.py" >/dev/null 2>&1 || true
+pypy3 "$BENCH/int_loop.py" >/dev/null 2>&1 || true
+"$PYRE" "$BENCH/int_loop.py" >/dev/null 2>&1 || true
+printf "$(dim done)\n"
+
 #                NAME             SCRIPT                         EXPECTED                     TIMEOUT  MAX_SEC  BEAT_CPYTHON
 run_bench       "int_loop"       "$BENCH/int_loop.py"           "49999995000000"              30       ""       1
 run_bench       "fib_loop"       "$BENCH/fib_loop.py"           "967618232"                   30       ""       1

@@ -2,21 +2,25 @@ use majit_codegen::ExitValueSourceLayout;
 
 /// RPython resume.py:993-1007: materialize deferred virtualizable SetfieldGc.
 fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i64]) {
-    let Some(ref recovery) = exit_layout.recovery_layout else { return };
+    let Some(ref recovery) = exit_layout.recovery_layout else {
+        return;
+    };
     for pf in &recovery.pending_field_layouts {
         let struct_ptr = match &pf.target {
-            ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() =>
-                raw_values[*slot] as *mut u8,
+            ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() => {
+                raw_values[*slot] as *mut u8
+            }
             ExitValueSourceLayout::Constant(c) => *c as *mut u8,
             _ => std::ptr::null_mut(),
         };
         let value = match &pf.value {
-            ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() =>
-                raw_values[*slot],
+            ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() => raw_values[*slot],
             ExitValueSourceLayout::Constant(c) => *c,
             _ => 0,
         };
-        if struct_ptr.is_null() { continue; }
+        if struct_ptr.is_null() {
+            continue;
+        }
         // Virtualizable field offsets from descriptor index encoding:
         // 0x8000_0003 = head (offset 0), 0x8000_0004 = size (offset 8)
         let (offset, size) = match pf.descr_index {
@@ -29,7 +33,11 @@ fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i6
         };
         unsafe {
             let p = struct_ptr.add(offset);
-            match size { 8 => *(p as *mut i64) = value, 4 => *(p as *mut i32) = value as i32, _ => {} }
+            match size {
+                8 => *(p as *mut i64) = value,
+                4 => *(p as *mut i32) = value as i32,
+                _ => {}
+            }
         }
     }
 }
@@ -210,19 +218,20 @@ impl<S: JitState> JitDriver<S> {
         if let Some(info) = S::__build_virtualizable_info() {
             meta.set_virtualizable_info(info);
         }
-        let epoch_qmut = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::quasiimmut::QuasiImmut::new(),
-        ));
+        let epoch_qmut =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::quasiimmut::QuasiImmut::new()));
         // Background thread: periodically invalidate all registered loops.
         // RPython uses GC/signal-triggered invalidation; we use a timer as
         // a portable equivalent. Period matches PyPy's checkinterval (~10ms).
         let invalidation_thread = {
             let qmut = epoch_qmut.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                if let Ok(mut qmut) = qmut.lock() {
-                    if qmut.has_watchers() {
-                        qmut.invalidate();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if let Ok(mut qmut) = qmut.lock() {
+                        if qmut.has_watchers() {
+                            qmut.invalidate();
+                        }
                     }
                 }
             })
@@ -276,8 +285,12 @@ impl<S: JitState> JitDriver<S> {
         fail_index: u32,
         fail_values: &[i64],
         exception: crate::blackhole::ExceptionState,
-    ) -> Option<(crate::blackhole::BlackholeResult, crate::blackhole::ExceptionState)> {
-        self.meta.blackhole_guard_failure(green_key, trace_id, fail_index, fail_values, exception)
+    ) -> Option<(
+        crate::blackhole::BlackholeResult,
+        crate::blackhole::ExceptionState,
+    )> {
+        self.meta
+            .blackhole_guard_failure(green_key, trace_id, fail_index, fail_values, exception)
     }
 
     /// Register an interpreter boxing helper for the raw-int finish protocol.
@@ -831,13 +844,7 @@ impl<S: JitState> JitDriver<S> {
     /// Called when the counter threshold has ALREADY fired (from eval_loop_jit).
     /// Bypasses counter.tick() inside maybe_compile, allowing decay_counters()
     /// to be called before tracing starts.
-    pub fn bound_reached(
-        &mut self,
-        green_key: u64,
-        target_pc: usize,
-        state: &mut S,
-        env: &S::Env,
-    ) {
+    pub fn bound_reached(&mut self, green_key: u64, target_pc: usize, state: &mut S, env: &S::Env) {
         if self.meta.is_tracing() {
             return;
         }
@@ -851,12 +858,10 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        match self.meta.bound_reached(
-            green_key,
-            None,
-            descriptor,
-            &live_values,
-        ) {
+        match self
+            .meta
+            .bound_reached(green_key, None, descriptor, &live_values)
+        {
             BackEdgeAction::StartedTracing => {
                 self.sym = Some(S::create_sym(&meta, target_pc));
                 self.trace_meta = Some(meta);
@@ -1315,8 +1320,11 @@ impl<S: JitState> JitDriver<S> {
         }
         let live_values = state.extract_live_values(&meta);
         if crate::majit_log_enabled() {
-            let vals: Vec<String> = live_values.iter().enumerate()
-                .map(|(i, v)| format!("[{}]={:?}", i, v)).collect();
+            let vals: Vec<String> = live_values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("[{}]={:?}", i, v))
+                .collect();
             eprintln!("[jit] run_bridge live_values: {}", vals.join(", "));
         }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
@@ -1425,8 +1433,11 @@ impl<S: JitState> JitDriver<S> {
         }
         let live_values = state.extract_live_values(&meta);
         if crate::majit_log_enabled() {
-            let vals: Vec<String> = live_values.iter().enumerate()
-                .map(|(i, v)| format!("[{}]={:?}", i, v)).collect();
+            let vals: Vec<String> = live_values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("[{}]={:?}", i, v))
+                .collect();
             eprintln!("[jit] BRIDGE live_values: {}", vals.join(", "));
         }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
@@ -1867,7 +1878,12 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-        on_guard_failure: impl FnOnce(&mut S, &S::Meta, &[i64], &crate::compile::CompiledExitLayout) -> Option<usize>,
+        on_guard_failure: impl FnOnce(
+            &mut S,
+            &S::Meta,
+            &[i64],
+            &crate::compile::CompiledExitLayout,
+        ) -> Option<usize>,
     ) -> Option<usize> {
         if self.is_tracing() || !state.can_trace() {
             return None;
@@ -1919,61 +1935,68 @@ impl<S: JitState> JitDriver<S> {
 
         let mut live_values = live_values;
         loop {
-        let result = self
-            .meta
-            .run_compiled_raw_detailed_with_values(key_hash, &live_values)?;
-        let is_finish = result.is_finish;
-        let fail_index = result.fail_index;
-        let trace_id = result.trace_id;
-        let result_meta = result.meta.clone();
-        let typed_values = result.typed_values;
-        let raw_values = result.values;
-        let exit_layout = result.exit_layout;
+            let result = self
+                .meta
+                .run_compiled_raw_detailed_with_values(key_hash, &live_values)?;
+            let is_finish = result.is_finish;
+            let fail_index = result.fail_index;
+            let trace_id = result.trace_id;
+            let result_meta = result.meta.clone();
+            let typed_values = result.typed_values;
+            let raw_values = result.values;
+            let exit_layout = result.exit_layout;
 
-        if is_finish || fail_index == u32::MAX {
-            state.restore_values(&result_meta, &typed_values);
-            self.sync_after(state, &result_meta, descriptor.as_ref());
-            // Re-enter compiled code if state is still compatible
-            if let Some(meta) = self.meta.get_compiled_meta(key_hash) {
-                if state.is_compatible(meta) {
-                    let meta = meta.clone();
-                    let nd = self.driver_descriptor_for(state, &meta);
-                    if self.sync_before(state, &meta, nd.as_ref()) {
-                        let nl = state.extract_live_values(&meta);
-                        if Self::live_values_match_descriptor(nd.as_ref(), &nl) {
-                            if let Some(v) = self.extend_compiled_live_values(
-                                key_hash, state, &meta, nd.as_ref(), nl) {
-                                live_values = v;
-                                continue;
+            if is_finish || fail_index == u32::MAX {
+                state.restore_values(&result_meta, &typed_values);
+                self.sync_after(state, &result_meta, descriptor.as_ref());
+                // Re-enter compiled code if state is still compatible
+                if let Some(meta) = self.meta.get_compiled_meta(key_hash) {
+                    if state.is_compatible(meta) {
+                        let meta = meta.clone();
+                        let nd = self.driver_descriptor_for(state, &meta);
+                        if self.sync_before(state, &meta, nd.as_ref()) {
+                            let nl = state.extract_live_values(&meta);
+                            if Self::live_values_match_descriptor(nd.as_ref(), &nl) {
+                                if let Some(v) = self.extend_compiled_live_values(
+                                    key_hash,
+                                    state,
+                                    &meta,
+                                    nd.as_ref(),
+                                    nl,
+                                ) {
+                                    live_values = v;
+                                    continue;
+                                }
                             }
                         }
                     }
                 }
+                return Some(target_pc);
             }
-            return Some(target_pc);
-        }
 
-        let should_bridge = self
-            .meta
-            .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
-        if should_bridge {
-            if let Some(resume_pc) = on_guard_failure(state, &result_meta, &raw_values, &exit_layout) {
+            let should_bridge = self
+                .meta
+                .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
+            if should_bridge {
+                if let Some(resume_pc) =
+                    on_guard_failure(state, &result_meta, &raw_values, &exit_layout)
+                {
+                    materialize_pending_fields(&exit_layout, &raw_values);
+                    self.sync_after(state, &result_meta, descriptor.as_ref());
+                    self.start_bridge_tracing(
+                        key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
+                    );
+                    return Some(resume_pc);
+                }
+                return None;
+            }
+
+            let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
+            if resume_pc.is_some() {
                 materialize_pending_fields(&exit_layout, &raw_values);
                 self.sync_after(state, &result_meta, descriptor.as_ref());
-                self.start_bridge_tracing(
-                    key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
-                );
-                return Some(resume_pc);
             }
-            return None;
-        }
-
-        let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
-        if resume_pc.is_some() {
-            materialize_pending_fields(&exit_layout, &raw_values);
-            self.sync_after(state, &result_meta, descriptor.as_ref());
-        }
-        return resume_pc;
+            return resume_pc;
         } // end loop { run_compiled ... }
     }
 }
@@ -2198,7 +2221,10 @@ mod tests {
                 .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
                 .is_none()
         );
-        assert!(driver.is_tracing(), "back-edge should start tracing once hot");
+        assert!(
+            driver.is_tracing(),
+            "back-edge should start tracing once hot"
+        );
     }
 
     #[test]
@@ -2735,12 +2761,7 @@ mod tests {
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let cond = ctx.const_int(1);
-            ctx.record_guard_with_fail_args(
-                OpCode::GuardFalse,
-                &[cond],
-                0,
-                &[OpRef(0)],
-            );
+            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[OpRef(0)]);
         }
         driver.meta.close_and_compile(&[OpRef(0)], ());
 

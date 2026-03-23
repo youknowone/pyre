@@ -998,17 +998,18 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             pool_ref_field.expect("linked_list mode requires storage.pool_ref as a GcRef field");
         let selected_ref_field = selected_ref_field
             .expect("linked_list mode requires storage.selected_ref as a GcRef field");
-        let stacksize_field =
-            stacksize_field.expect("linked_list mode requires storage.stacksize");
+        let stacksize_field = stacksize_field.expect("linked_list mode requires storage.stacksize");
         let storage_offset = storage.linked_list_storage_offset.as_ref().expect(
             "linked_list mode requires linked_list_storage_offset (shadow storage pools offset)",
         );
-        let stack_head_offset = storage.linked_list_stack_head_offset.as_ref().expect(
-            "linked_list mode requires linked_list_stack_head_offset",
-        );
-        let stack_size_offset = storage.linked_list_stack_size_offset.as_ref().expect(
-            "linked_list mode requires linked_list_stack_size_offset",
-        );
+        let stack_head_offset = storage
+            .linked_list_stack_head_offset
+            .as_ref()
+            .expect("linked_list mode requires linked_list_stack_head_offset");
+        let stack_size_offset = storage
+            .linked_list_stack_size_offset
+            .as_ref()
+            .expect("linked_list mode requires linked_list_stack_size_offset");
         let pool_live_raw = quote! { self.#pool_ref_field.as_usize() as i64 };
         let selected_ref_live_raw = quote! { self.#selected_ref_field.as_usize() as i64 };
 

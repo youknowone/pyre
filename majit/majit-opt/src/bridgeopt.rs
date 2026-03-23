@@ -505,7 +505,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert!(
             result.is_empty(),
@@ -520,7 +524,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert_eq!(
             result.len(),
@@ -539,7 +547,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert!(
             result.is_empty(),
@@ -615,7 +627,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert_eq!(result.len(), 1, "GuardTrue should be removed");
         assert_eq!(result[0].opcode, OpCode::IntGe);
@@ -638,7 +654,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert_eq!(result.len(), 1, "GuardTrue should be removed");
         assert_eq!(result[0].opcode, OpCode::IntLe);
@@ -661,7 +681,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert_eq!(result.len(), 1, "GuardTrue should be removed");
         assert_eq!(result[0].opcode, OpCode::IntGt);
@@ -684,7 +708,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert_eq!(result.len(), 1, "GuardFalse should be removed");
         assert_eq!(result[0].opcode, OpCode::IntLt);
@@ -707,7 +735,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert_eq!(result.len(), 2, "GuardFalse should NOT be removed");
     }
@@ -753,7 +785,11 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptBridgeOpt::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
 
         assert_eq!(
             result.len(),

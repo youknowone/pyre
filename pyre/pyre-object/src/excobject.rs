@@ -163,10 +163,19 @@ mod tests {
 
     #[test]
     fn test_exc_kind_matches_hierarchy() {
-        assert!(exc_kind_matches(ExcKind::ZeroDivisionError, "ZeroDivisionError"));
-        assert!(exc_kind_matches(ExcKind::ZeroDivisionError, "ArithmeticError"));
+        assert!(exc_kind_matches(
+            ExcKind::ZeroDivisionError,
+            "ZeroDivisionError"
+        ));
+        assert!(exc_kind_matches(
+            ExcKind::ZeroDivisionError,
+            "ArithmeticError"
+        ));
         assert!(exc_kind_matches(ExcKind::ZeroDivisionError, "Exception"));
-        assert!(exc_kind_matches(ExcKind::ZeroDivisionError, "BaseException"));
+        assert!(exc_kind_matches(
+            ExcKind::ZeroDivisionError,
+            "BaseException"
+        ));
         assert!(!exc_kind_matches(ExcKind::ZeroDivisionError, "ValueError"));
     }
 

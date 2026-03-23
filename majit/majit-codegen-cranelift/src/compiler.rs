@@ -902,14 +902,11 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// Args: (green_key, trace_id, fail_index, fail_values_ptr, num_fail_values) → result i64.
 /// This reads the guard's resume data, restores state from fail_values (deadframe),
 /// and executes the remaining IR ops from the guard point to Finish.
-static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
-    fn(u64, u64, u32, *const i64, usize) -> Option<i64>,
-> = OnceLock::new();
+static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize) -> Option<i64>> =
+    OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
-pub fn register_call_assembler_blackhole(
-    f: fn(u64, u64, u32, *const i64, usize) -> Option<i64>,
-) {
+pub fn register_call_assembler_blackhole(f: fn(u64, u64, u32, *const i64, usize) -> Option<i64>) {
     let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
 }
 
@@ -967,9 +964,13 @@ thread_local! {
 
 fn request_pending_bridge_compile(green_key: u64, trace_id: u64, fail_index: u32) {
     let depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
-    eprintln!("[pending-bridge] push depth={} gk={} trace={} fail={}", depth, green_key, trace_id, fail_index);
+    eprintln!(
+        "[pending-bridge] push depth={} gk={} trace={} fail={}",
+        depth, green_key, trace_id, fail_index
+    );
     PENDING_BRIDGE_COMPILE.with(|cell| {
-        cell.borrow_mut().push((depth, green_key, trace_id, fail_index));
+        cell.borrow_mut()
+            .push((depth, green_key, trace_id, fail_index));
     });
 }
 
@@ -1852,85 +1853,84 @@ pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendEr
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
     let mut current_inputs = inputs.to_vec();
     loop {
-    let (fail_index, outputs, handle, force_frame) = run_compiled_code(
-        target.code_ptr,
-        &target.fail_descrs,
-        target.gc_runtime_id,
-        target.num_ref_roots,
-        target.max_output_slots,
-        &current_inputs,
-        target.needs_force_frame,
-    );
-
-    if let Some(frame) =
-        maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
-    {
-        return wrap_call_assembler_deadframe_with_caller_prefix(
-            frame,
-            target.trace_id,
-            target.header_pc,
-            target.source_guard,
-            &target.inputarg_types,
-            &current_inputs,
-            target.caller_prefix_layout.as_ref(),
-        );
-    }
-
-    let fail_descr = &target.fail_descrs[fail_index as usize];
-    let fail_count = fail_descr.increment_fail_count();
-    let bridge_guard = fail_descr.bridge.lock().unwrap();
-    if let Some(ref bridge) = *bridge_guard {
-        release_force_token(handle);
-        if bridge.loop_reentry {
-            let bridge_frame = CraneliftBackend::execute_bridge(
-                bridge, &outputs, &fail_descr.fail_arg_types,
-            );
-            drop(bridge_guard);
-            let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
-                .expect("bridge deadframe must have descriptor");
-            if bridge_descr.is_finish() {
-                let num_outputs = bridge_descr.fail_arg_types().len();
-                current_inputs = (0..num_outputs)
-                    .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
-                    .collect();
-                continue; // re-enter loop
-            }
-            return bridge_frame;
-        }
-        return CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
-    }
-    drop(bridge_guard);
-
-    // RPython compile.py:696 (handle_fail → must_compile): trigger bridge
-    // Bridge compilation is deferred: store a pending request that the
-    // MetaInterp layer can pick up after execute_token returns.
-    // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
-    if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-        // green_key from target's header_pc (may be 0 for function-entry traces)
-        let gk = target.header_pc; // use header_pc; caller provides real green_key
-        request_pending_bridge_compile(gk, target.trace_id, fail_index);
-    }
-
-    let saved_data = if let Some(ref ff) = force_frame {
-        take_force_frame_saved_data(ff)
-    } else {
-        None
-    };
-    let (exception_class, exception) = take_pending_jit_exception_state();
-    if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-        release_force_token(handle);
-    }
-
-    DeadFrame {
-        data: Box::new(FrameData::new_with_savedata_and_exception(
-            outputs,
-            fail_descr.clone(),
+        let (fail_index, outputs, handle, force_frame) = run_compiled_code(
+            target.code_ptr,
+            &target.fail_descrs,
             target.gc_runtime_id,
-            saved_data,
-            exception_class,
-            (!exception.is_null()).then_some(exception),
-        )),
-    };
+            target.num_ref_roots,
+            target.max_output_slots,
+            &current_inputs,
+            target.needs_force_frame,
+        );
+
+        if let Some(frame) =
+            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
+        {
+            return wrap_call_assembler_deadframe_with_caller_prefix(
+                frame,
+                target.trace_id,
+                target.header_pc,
+                target.source_guard,
+                &target.inputarg_types,
+                &current_inputs,
+                target.caller_prefix_layout.as_ref(),
+            );
+        }
+
+        let fail_descr = &target.fail_descrs[fail_index as usize];
+        let fail_count = fail_descr.increment_fail_count();
+        let bridge_guard = fail_descr.bridge.lock().unwrap();
+        if let Some(ref bridge) = *bridge_guard {
+            release_force_token(handle);
+            if bridge.loop_reentry {
+                let bridge_frame =
+                    CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+                drop(bridge_guard);
+                let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
+                    .expect("bridge deadframe must have descriptor");
+                if bridge_descr.is_finish() {
+                    let num_outputs = bridge_descr.fail_arg_types().len();
+                    current_inputs = (0..num_outputs)
+                        .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
+                        .collect();
+                    continue; // re-enter loop
+                }
+                return bridge_frame;
+            }
+            return CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+        }
+        drop(bridge_guard);
+
+        // RPython compile.py:696 (handle_fail → must_compile): trigger bridge
+        // Bridge compilation is deferred: store a pending request that the
+        // MetaInterp layer can pick up after execute_token returns.
+        // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
+        if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
+            // green_key from target's header_pc (may be 0 for function-entry traces)
+            let gk = target.header_pc; // use header_pc; caller provides real green_key
+            request_pending_bridge_compile(gk, target.trace_id, fail_index);
+        }
+
+        let saved_data = if let Some(ref ff) = force_frame {
+            take_force_frame_saved_data(ff)
+        } else {
+            None
+        };
+        let (exception_class, exception) = take_pending_jit_exception_state();
+        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
+            release_force_token(handle);
+        }
+
+        DeadFrame {
+            data: Box::new(FrameData::new_with_savedata_and_exception(
+                outputs,
+                fail_descr.clone(),
+                target.gc_runtime_id,
+                saved_data,
+                exception_class,
+                (!exception.is_null()).then_some(exception),
+            )),
+        };
     } // end loop
 }
 
@@ -1974,7 +1974,11 @@ extern "C" fn call_assembler_guard_failure(
         let mut bridge_outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
         let mut bridge_roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
         let bridge_fail_index = unsafe {
-            func(inputs.as_ptr(), bridge_outputs.as_mut_ptr(), bridge_roots.as_mut_ptr() as *mut i64)
+            func(
+                inputs.as_ptr(),
+                bridge_outputs.as_mut_ptr(),
+                bridge_roots.as_mut_ptr() as *mut i64,
+            )
         };
         // Simple bridge: Finish at index 0 or 1
         let _ = bridge_fail_index;
@@ -2008,10 +2012,7 @@ extern "C" fn call_assembler_guard_failure(
 /// handle_fail → _trace_and_compile_from_bridge pattern.
 ///
 /// This does NOT use MetaInterp — bridge ops are trivial and need no optimizer.
-fn compile_base_case_bridge(
-    target: &RegisteredLoopTarget,
-    fail_index: u32,
-) -> bool {
+fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> bool {
     use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 
     let fail_descr = match target.fail_descrs.get(fail_index as usize) {
@@ -2431,8 +2432,11 @@ extern "C" fn call_assembler_shim(
         .collect();
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         if let Some(result) = bh_fn(
-            target.header_pc, target.trace_id,
-            fail_index, fail_values.as_ptr(), fail_values.len(),
+            target.header_pc,
+            target.trace_id,
+            fail_index,
+            fail_values.as_ptr(),
+            fail_values.len(),
         ) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -2719,7 +2723,8 @@ fn resolve_call_assembler_target(
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[codegen] call-assembler type mismatch: target={:?} descr={:?}",
-                target.inputarg_types, call_descr.arg_types()
+                target.inputarg_types,
+                call_descr.arg_types()
             );
         }
         return Err(unsupported_semantics(
@@ -3916,82 +3921,84 @@ impl CraneliftBackend {
         // code buffer. Avoids stack growth on repeated bridge → re-enter cycles.
         let mut current_inputs = inputs.to_vec();
         loop {
-        let (fail_index, outputs, handle, force_frame) = run_compiled_code(
-            compiled.code_ptr,
-            &compiled.fail_descrs,
-            compiled.gc_runtime_id,
-            compiled.num_ref_roots,
-            compiled.max_output_slots,
-            &current_inputs,
-            compiled.needs_force_frame,
-        );
-
-        if let Some(frame) =
-            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
-        {
-            return wrap_call_assembler_deadframe_with_caller_prefix(
-                frame,
-                compiled.trace_id,
-                compiled.header_pc,
-                None,
-                &compiled.input_types,
-                &current_inputs,
-                compiled.caller_prefix_layout.as_ref(),
-            );
-        }
-
-        let fail_descr = &compiled.fail_descrs[fail_index as usize];
-
-        // Increment guard failure count.
-        fail_descr.increment_fail_count();
-
-        // If a bridge is attached to this guard, execute it.
-        let bridge_guard = fail_descr.bridge.lock().unwrap();
-        if let Some(ref bridge) = *bridge_guard {
-            release_force_token(handle);
-            if bridge.loop_reentry {
-                // Bridge JUMP → loop re-entry: execute bridge, extract
-                // outputs, loop back to re-enter compiled code directly
-                // (like RPython's inline jmp to the loop header).
-                let bridge_frame = Self::execute_bridge(
-                    bridge, &outputs, &fail_descr.fail_arg_types,
-                );
-                drop(bridge_guard);
-                let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
-                    .expect("bridge deadframe must have descriptor");
-                if bridge_descr.is_finish() {
-                    let num_outputs = bridge_descr.fail_arg_types().len();
-                    current_inputs = (0..num_outputs)
-                        .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
-                        .collect();
-                    continue; // re-enter loop
-                }
-                return bridge_frame;
-            }
-            return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
-        }
-        drop(bridge_guard);
-
-        let saved_data = if let Some(ref ff) = force_frame {
-            take_force_frame_saved_data(ff)
-        } else {
-            None
-        };
-        let (exception_class, exception) = take_pending_jit_exception_state();
-        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-            release_force_token(handle);
-        }
-
-        return DeadFrame {
-            data: Box::new(FrameData::new_with_savedata_and_exception(
-                outputs,
-                fail_descr.clone(),
+            let (fail_index, outputs, handle, force_frame) = run_compiled_code(
+                compiled.code_ptr,
+                &compiled.fail_descrs,
                 compiled.gc_runtime_id,
-                saved_data,
-                exception_class,
-                (!exception.is_null()).then_some(exception),
-            )),
-        };
+                compiled.num_ref_roots,
+                compiled.max_output_slots,
+                &current_inputs,
+                compiled.needs_force_frame,
+            );
+
+            if let Some(frame) = maybe_take_call_assembler_deadframe(
+                fail_index,
+                &outputs,
+                handle,
+                force_frame.as_ref(),
+            ) {
+                return wrap_call_assembler_deadframe_with_caller_prefix(
+                    frame,
+                    compiled.trace_id,
+                    compiled.header_pc,
+                    None,
+                    &compiled.input_types,
+                    &current_inputs,
+                    compiled.caller_prefix_layout.as_ref(),
+                );
+            }
+
+            let fail_descr = &compiled.fail_descrs[fail_index as usize];
+
+            // Increment guard failure count.
+            fail_descr.increment_fail_count();
+
+            // If a bridge is attached to this guard, execute it.
+            let bridge_guard = fail_descr.bridge.lock().unwrap();
+            if let Some(ref bridge) = *bridge_guard {
+                release_force_token(handle);
+                if bridge.loop_reentry {
+                    // Bridge JUMP → loop re-entry: execute bridge, extract
+                    // outputs, loop back to re-enter compiled code directly
+                    // (like RPython's inline jmp to the loop header).
+                    let bridge_frame =
+                        Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+                    drop(bridge_guard);
+                    let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
+                        .expect("bridge deadframe must have descriptor");
+                    if bridge_descr.is_finish() {
+                        let num_outputs = bridge_descr.fail_arg_types().len();
+                        current_inputs = (0..num_outputs)
+                            .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
+                            .collect();
+                        continue; // re-enter loop
+                    }
+                    return bridge_frame;
+                }
+                return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            }
+            drop(bridge_guard);
+
+            let saved_data = if let Some(ref ff) = force_frame {
+                take_force_frame_saved_data(ff)
+            } else {
+                None
+            };
+            let (exception_class, exception) = take_pending_jit_exception_state();
+            if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
+                release_force_token(handle);
+            }
+
+            return DeadFrame {
+                data: Box::new(FrameData::new_with_savedata_and_exception(
+                    outputs,
+                    fail_descr.clone(),
+                    compiled.gc_runtime_id,
+                    saved_data,
+                    exception_class,
+                    (!exception.is_null()).then_some(exception),
+                )),
+            };
         } // end loop
     }
 
@@ -4225,10 +4232,7 @@ impl CraneliftBackend {
                     {
                         declared_vars.insert(arg.0);
                         if debug_declares {
-                            eprintln!(
-                                "[jit][declare] fail-arg var{} owner={:?}",
-                                arg.0, op.opcode
-                            );
+                            eprintln!("[jit][declare] fail-arg var{} owner={:?}", arg.0, op.opcode);
                         }
                         builder.declare_var(var(arg.0), cl_types::I64);
                     }
@@ -4318,16 +4322,22 @@ impl CraneliftBackend {
             label_blocks.push((label_idx, block));
         }
 
-        let loop_block = label_blocks
-            .last()
-            .map(|(_, block)| *block)
-            .unwrap_or_else(|| {
-                let block = builder.create_block();
-                for _ in 0..loop_param_count {
-                    builder.append_block_param(block, cl_types::I64);
-                }
-                block
-            });
+        // RPython backend: Label ops define loop blocks.
+        // Linear traces (no Label, no Jump) stay in the entry block.
+        let has_jump = ops.iter().any(|op| op.opcode == OpCode::Jump);
+        let loop_block = if !label_blocks.is_empty() {
+            label_blocks.last().map(|(_, block)| *block).unwrap()
+        } else if has_jump {
+            // Legacy no-Label trace with Jump: need a loop block
+            let block = builder.create_block();
+            for _ in 0..loop_param_count {
+                builder.append_block_param(block, cl_types::I64);
+            }
+            block
+        } else {
+            // Linear trace: no loop block needed, stay in entry_block
+            entry_block
+        };
 
         let mut guard_idx: usize = 0;
         let mut last_ovf_flag: Option<CValue> = None;
@@ -4350,15 +4360,13 @@ impl CraneliftBackend {
                     builder.def_var(var(arg_ref.0), param);
                 }
             }
-        } else {
+        } else if has_jump {
             let zero = builder.ins().iconst(cl_types::I64, 0);
             let vals: Vec<CValue> = (0..loop_param_count)
                 .map(|i| {
                     if i < num_inputs {
                         builder.use_var(var(i as u32))
                     } else {
-                        // Extra params from depth growth: initialize to 0.
-                        // First iteration will set them via the loop body.
                         zero
                     }
                 })
@@ -4370,6 +4378,7 @@ impl CraneliftBackend {
                 builder.def_var(var(i as u32), param);
             }
         }
+        // else: linear trace — already in entry_block with vars defined
 
         for op_idx in 0..ops.len() {
             if let Some((_, label_block)) = label_blocks
@@ -4750,10 +4759,7 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(class_check_block);
                     builder.seal_block(class_check_block);
-                    let actual_class =
-                        builder
-                            .ins()
-                            .load(ptr_type, MemFlags::trusted(), obj, 0);
+                    let actual_class = builder.ins().load(ptr_type, MemFlags::trusted(), obj, 0);
                     let neq = builder
                         .ins()
                         .icmp(IntCC::NotEqual, actual_class, expected_class);
@@ -5447,12 +5453,10 @@ impl CraneliftBackend {
                             builder.switch_to_block(direct_force_block);
                             builder.seal_block(direct_force_block);
                             // RPython assembler_call_helper: bridge check + force_fn.
-                            let frame_ptr = builder.ins().load(
-                                cl_types::I64,
-                                MemFlags::trusted(),
-                                args_ptr,
-                                0,
-                            );
+                            let frame_ptr =
+                                builder
+                                    .ins()
+                                    .load(cl_types::I64, MemFlags::trusted(), args_ptr, 0);
                             let force_result = emit_host_call(
                                 &mut builder,
                                 ptr_type,
@@ -7309,14 +7313,15 @@ impl CraneliftBackend {
                         builder.def_var(var(vi), result);
                     } else {
                         // No GC runtime: plain malloc fallback for non-GC languages.
-                        let alloc_fn = builder.ins().iconst(
-                            ptr_type,
-                            plain_malloc_zeroed_shim as *const () as i64,
-                        );
+                        let alloc_fn = builder
+                            .ins()
+                            .iconst(ptr_type, plain_malloc_zeroed_shim as *const () as i64);
                         let sig = {
                             let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
-                            sig.params.push(cranelift_codegen::ir::AbiParam::new(cl_types::I64));
-                            sig.returns.push(cranelift_codegen::ir::AbiParam::new(cl_types::I64));
+                            sig.params
+                                .push(cranelift_codegen::ir::AbiParam::new(cl_types::I64));
+                            sig.returns
+                                .push(cranelift_codegen::ir::AbiParam::new(cl_types::I64));
                             builder.import_signature(sig)
                         };
                         let call = builder.ins().call_indirect(sig, alloc_fn, &[size_val]);
@@ -7636,7 +7641,10 @@ fn collect_guards(
         let is_finish = op.opcode == OpCode::Finish;
         // External JUMP: target not in this function's Labels.
         let is_external_jump = op.opcode == OpCode::Jump
-            && op.descr.as_ref().map_or(false, |d| !label_descr_indices.contains(&d.index()));
+            && op
+                .descr
+                .as_ref()
+                .map_or(false, |d| !label_descr_indices.contains(&d.index()));
 
         if !is_guard && !is_finish && !is_external_jump {
             continue;
@@ -7996,12 +8004,18 @@ impl majit_codegen::Backend for CraneliftBackend {
             // RPython parity: bridge ending with JUMP to loop body needs
             // re-entry dispatch instead of returning to interpreter.
             loop_reentry: {
-                let has_label: HashSet<u32> = ops.iter()
+                let has_label: HashSet<u32> = ops
+                    .iter()
                     .filter(|o| o.opcode == OpCode::Label)
                     .filter_map(|o| o.descr.as_ref().map(|d| d.index()))
                     .collect();
-                ops.last().map_or(false, |op| op.opcode == OpCode::Jump
-                    && op.descr.as_ref().map_or(false, |d| !has_label.contains(&d.index())))
+                ops.last().map_or(false, |op| {
+                    op.opcode == OpCode::Jump
+                        && op
+                            .descr
+                            .as_ref()
+                            .map_or(false, |d| !has_label.contains(&d.index()))
+                })
             },
             num_inputs: compiled.num_inputs,
             num_ref_roots: compiled.num_ref_roots,
@@ -11136,9 +11150,19 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            mk_op_with_descr(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0, start_descr),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef(0), OpRef(1)],
+                OpRef::NONE.0,
+                start_descr,
+            ),
             mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
-            mk_op_with_descr(OpCode::Label, &[OpRef(0), OpRef(2)], OpRef::NONE.0, loop_descr),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef(0), OpRef(2)],
+                OpRef::NONE.0,
+                loop_descr,
+            ),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
@@ -11156,7 +11180,11 @@ mod tests {
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::GuardNonnullClass, &[OpRef(0), OpRef(100)], OpRef::NONE.0),
+            mk_op(
+                OpCode::GuardNonnullClass,
+                &[OpRef(0), OpRef(100)],
+                OpRef::NONE.0,
+            ),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
@@ -13946,11 +13974,25 @@ mod tests {
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.0),
             mk_op(OpCode::CallMallocNursery, &[OpRef(16)], 0),
-            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], OpRef::NONE.0, fd.clone()),
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(0), OpRef(100)],
+                OpRef::NONE.0,
+                fd.clone(),
+            ),
             mk_op(OpCode::CallMallocNursery, &[OpRef(32)], 1),
-            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(101)], OpRef::NONE.0, fd),
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(1), OpRef(101)],
+                OpRef::NONE.0,
+                fd,
+            ),
             mk_op(OpCode::CallMallocNursery, &[OpRef(24)], 2),
-            mk_op(OpCode::Finish, &[OpRef(0), OpRef(1), OpRef(2)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+                OpRef::NONE.0,
+            ),
         ];
 
         let mut token = JitCellToken::new(1505_1);
@@ -13987,7 +14029,10 @@ mod tests {
         }
         gc.collect_nursery();
         gc.remove_root(&mut root as *mut GcRef);
-        assert!(!gc.is_in_nursery(root.0), "root must be old before JIT runs");
+        assert!(
+            !gc.is_in_nursery(root.0),
+            "root must be old before JIT runs"
+        );
 
         let filler = gc.alloc_with_type(young_node_tid, 16);
         assert!(gc.is_in_nursery(filler.0));
@@ -13999,8 +14044,18 @@ mod tests {
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::CallMallocNursery, &[OpRef(16)], 1),
-            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(100)], OpRef::NONE.0, int_fd),
-            mk_op_with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], OpRef::NONE.0, ref_fd),
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(1), OpRef(100)],
+                OpRef::NONE.0,
+                int_fd,
+            ),
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(0), OpRef(1)],
+                OpRef::NONE.0,
+                ref_fd,
+            ),
             mk_op(OpCode::CallMallocNursery, &[OpRef(24)], 2),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
@@ -14017,7 +14072,10 @@ mod tests {
         assert!(!moved_root.is_null());
 
         let child = GcRef(unsafe { *(moved_root.0 as *const usize) });
-        assert!(!child.is_null(), "old root lost its young child across collection");
+        assert!(
+            !child.is_null(),
+            "old root lost its young child across collection"
+        );
         assert_eq!(unsafe { *(child.0 as *const i64) }, 777);
     }
 

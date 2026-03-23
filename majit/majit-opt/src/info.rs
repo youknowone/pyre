@@ -389,7 +389,12 @@ impl PtrInfo {
         self.force_to_ops_impl(opref, ctx, true)
     }
 
-    fn force_to_ops_impl(&mut self, opref: OpRef, ctx: &mut crate::OptContext, direct: bool) -> OpRef {
+    fn force_to_ops_impl(
+        &mut self,
+        opref: OpRef,
+        ctx: &mut crate::OptContext,
+        direct: bool,
+    ) -> OpRef {
         use majit_ir::{Op, OpCode};
 
         fn force_child(value_ref: OpRef, ctx: &mut crate::OptContext, direct: bool) -> OpRef {
@@ -422,7 +427,9 @@ impl PtrInfo {
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx, direct);
-                    let descr = vinfo.field_descrs.iter()
+                    let descr = vinfo
+                        .field_descrs
+                        .iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
                     let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
@@ -442,7 +449,9 @@ impl PtrInfo {
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx, direct);
-                    let descr = vinfo.field_descrs.iter()
+                    let descr = vinfo
+                        .field_descrs
+                        .iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
                     let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
@@ -817,9 +826,14 @@ impl PtrInfo {
         if let PtrInfo::Virtual(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    if let Some((_, descr)) = v.field_descrs.iter().find(|(idx, _)| *idx == field_idx)
+                    if let Some((_, descr)) =
+                        v.field_descrs.iter().find(|(idx, _)| *idx == field_idx)
                     {
-                        result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr.clone()));
+                        result.push(Op::with_descr(
+                            OpCode::GetfieldGcI,
+                            &[structbox],
+                            descr.clone(),
+                        ));
                     }
                 }
             }
@@ -827,9 +841,14 @@ impl PtrInfo {
         if let PtrInfo::VirtualStruct(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    if let Some((_, descr)) = v.field_descrs.iter().find(|(idx, _)| *idx == field_idx)
+                    if let Some((_, descr)) =
+                        v.field_descrs.iter().find(|(idx, _)| *idx == field_idx)
                     {
-                        result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr.clone()));
+                        result.push(Op::with_descr(
+                            OpCode::GetfieldGcI,
+                            &[structbox],
+                            descr.clone(),
+                        ));
                     }
                 }
             }

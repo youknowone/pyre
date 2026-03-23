@@ -1707,8 +1707,14 @@ where
                         .get(const_idx)
                         .expect("jitcode const index out of bounds") as usize
                 };
-                if sym.ensure_linked_list_stack_ref(ctx, new_selected).is_some() {
-                    if self.linked_list_select_storage(ctx, sym, new_selected).is_err() {
+                if sym
+                    .ensure_linked_list_stack_ref(ctx, new_selected)
+                    .is_some()
+                {
+                    if self
+                        .linked_list_select_storage(ctx, sym, new_selected)
+                        .is_err()
+                    {
                         return TraceAction::Abort;
                     }
                 } else if sym.current_selected_ref().is_some() {

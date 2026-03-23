@@ -2492,9 +2492,7 @@ mod tests {
             pass.propagate_forward(&ops[1], &mut ctx)
         }))
         .expect_err("guard_true(0) should abort as InvalidLoop");
-        assert!(err
-            .downcast_ref::<crate::optimize::InvalidLoop>()
-            .is_some());
+        assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
     }
 
     #[test]
@@ -2544,9 +2542,7 @@ mod tests {
             pass.propagate_forward(&ops[1], &mut ctx)
         }))
         .expect_err("guard_false(1) should abort as InvalidLoop");
-        assert!(err
-            .downcast_ref::<crate::optimize::InvalidLoop>()
-            .is_some());
+        assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
     }
 
     #[test]
@@ -2672,9 +2668,7 @@ mod tests {
             }
         }))
         .expect_err("guard_true(0) should abort the optimized trace");
-        assert!(err
-            .downcast_ref::<crate::optimize::InvalidLoop>()
-            .is_some());
+        assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
     }
 
     // ── Wrapping arithmetic tests ──
