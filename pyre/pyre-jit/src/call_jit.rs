@@ -251,9 +251,9 @@ pub fn maybe_handle_inline_concrete_call(
     let _suspend_inline_override = pyre_interp::call::suspend_inline_call_override();
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
     let _jit_depth = crate::eval::jit_call_depth_bump();
-    // RPython parity: concrete execution during tracing must not re-enter
-    // the JIT portal (eval_with_jit). Nested calls use eval_frame_plain.
-    let _plain_guard = pyre_interp::call::force_plain_eval();
+    // RPython blackhole.py:1095: bhimpl_recursive_call → portal_runner
+    // CAN enter JIT. JIT_TRACING_DEPTH prevents re-entrant tracing,
+    // so nested calls safely enter compiled code without force_plain_eval.
     let forced = if code_ptr == frame.code as *const () {
         jit_force_self_recursive_call_raw_1(frame as *const PyFrame as i64, raw_arg)
     } else {
