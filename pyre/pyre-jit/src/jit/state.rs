@@ -4839,6 +4839,16 @@ impl SharedOpcodeHandler for TraceFrameState {
     }
 
     fn build_map(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: build concrete dict
+        let s = self.sym();
+        let vsd = s.valuestackdepth;
+        let concrete_items: Vec<PyObjectRef> = (0..items.len())
+            .map(|i| s.concrete_value_at(vsd + i).to_pyobj())
+            .collect();
+        if concrete_items.iter().all(|v| !v.is_null()) {
+            let dict = pyre_runtime::build_map_from_refs(&concrete_items);
+            self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(dict));
+        }
         self.trace_build_map(items)
     }
 
