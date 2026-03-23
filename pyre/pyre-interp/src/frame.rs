@@ -123,6 +123,30 @@ fn ncells(code: &CodeObject) -> usize {
 }
 
 impl PyFrame {
+    /// Create a minimal frame stub for passing to call dispatch.
+    /// Used by MIFrame Box tracking when concrete_frame is unavailable.
+    pub fn new_minimal(
+        code: *const CodeObject,
+        namespace: *mut pyre_runtime::PyNamespace,
+        execution_context: *const PyExecutionContext,
+    ) -> Self {
+        let nlocals = unsafe { (&*code).varnames.len() };
+        let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
+        let size = nlocals + ncells + 16; // small stack
+        PyFrame {
+            execution_context,
+            code,
+            locals_cells_stack_w: pyre_runtime::PyObjectArray::from_vec(vec![pyre_object::PY_NULL; size]),
+            valuestackdepth: nlocals + ncells,
+            next_instr: 0,
+            namespace,
+            vable_token: 0,
+            block_stack: Vec::new(),
+            pending_inline_results: std::collections::VecDeque::new(),
+            pending_inline_resume_pc: None,
+        }
+    }
+
     /// Create a new frame for executing a code object with a fresh execution context.
     pub fn new(code: CodeObject) -> Self {
         Self::new_with_context(code, Rc::new(PyExecutionContext::default()))

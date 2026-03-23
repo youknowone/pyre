@@ -277,8 +277,12 @@ pub struct PyreSym {
     /// Concrete value to be consumed by the next push_value() call.
     pub(crate) pending_concrete_push: Option<ConcreteValue>,
     /// Frame metadata extracted at trace start — avoids stale snapshot reads.
+    /// RPython MIFrame.jitcode parity.
     pub(crate) concrete_code: *const pyre_bytecode::CodeObject,
+    /// Namespace for global lookups.
     pub(crate) concrete_namespace: *mut pyre_runtime::PyNamespace,
+    /// Execution context pointer (for creating callee frames).
+    pub(crate) concrete_execution_context: *const pyre_runtime::PyExecutionContext,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1083,6 +1087,7 @@ impl PyreSym {
             // concrete_code and concrete_namespace initialized below
             concrete_code: std::ptr::null(),
             concrete_namespace: std::ptr::null_mut(),
+            concrete_execution_context: std::ptr::null(),
         }
     }
 
@@ -1153,6 +1158,7 @@ impl PyreSym {
             let frame = unsafe { &*(concrete_frame as *const pyre_interp::frame::PyFrame) };
             self.concrete_code = frame.code;
             self.concrete_namespace = frame.namespace;
+            self.concrete_execution_context = frame.execution_context;
         }
         self.symbolic_initialized = true;
     }
@@ -3402,10 +3408,8 @@ impl TraceFrameState {
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
                 let root_trace_green_key = root_trace_green_key(self);
-                let current_function_key = unsafe {
-                    let cf = &*(self.concrete_frame as *const pyre_interp::frame::PyFrame);
-                    crate::eval::make_green_key(cf.code, 0)
-                };
+                let current_function_key =
+                    crate::eval::make_green_key(self.sym().concrete_code, 0);
                 let is_self_recursive = callee_key == current_function_key;
                 let inline_decision = driver.should_inline(callee_key);
                 let inline_framestack_active = self.parent_fail_args.is_some();
@@ -3902,11 +3906,14 @@ impl TraceFrameState {
             }
         }
 
+        let caller_code = self.sym().concrete_code;
+        // Read execution_context and namespace from concrete_frame (the caller).
+        // PyreSym's values may belong to a nested callee in inline trace-through.
         let caller = unsafe { &*(self.concrete_frame as *const PyFrame) };
         let code_ptr = unsafe { w_func_get_code_ptr(concrete_callable) } as *const CodeObject;
         let globals = unsafe { w_func_get_globals(concrete_callable) };
         let closure = unsafe { pyre_runtime::w_func_get_closure(concrete_callable) };
-        let is_self_recursive = crate::eval::make_green_key(caller.code, 0) == callee_key;
+        let is_self_recursive = crate::eval::make_green_key(caller_code, 0) == callee_key;
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             code_ptr,
             &concrete_args,
