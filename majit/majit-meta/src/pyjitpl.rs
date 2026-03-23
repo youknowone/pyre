@@ -159,7 +159,18 @@ fn normalize_root_loop_entry_contract(
         let mut label_op = Op::new(OpCode::Label, &label_args);
         label_op.pos = OpRef::NONE;
         optimized_ops.insert(0, label_op);
-    } else if jump_targets_current_loop && label_arg_count != jump_arg_count {
+    } else if jump_targets_current_loop && jump_arg_count > label_arg_count {
+        // RPython compile.py: JUMP may carry extra short-preamble args
+        // beyond the LABEL arity. The backend only uses LABEL-arity args;
+        // truncate the excess.
+        if let Some(jump) = optimized_ops
+            .iter_mut()
+            .rev()
+            .find(|op| op.opcode == OpCode::Jump)
+        {
+            jump.args.truncate(label_arg_count);
+        }
+    } else if jump_targets_current_loop && label_arg_count > jump_arg_count {
         return Err((label_arg_count, jump_arg_count));
     }
 
