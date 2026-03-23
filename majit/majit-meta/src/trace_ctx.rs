@@ -53,9 +53,25 @@ pub struct TraceCtx {
     /// Pending OpRef replacements from inline callee returns.
     /// Applied when the trace is finalized (close_loop/compile).
     replacements: Vec<(OpRef, OpRef)>,
+    /// RPython pyjitpl.py:3030 current_merge_points — green keys of
+    /// loop headers visited during tracing. First visit records the key;
+    /// second visit closes the loop (inner loop unrolled once).
+    current_merge_points: Vec<u64>,
 }
 
 impl TraceCtx {
+    /// RPython pyjitpl.py:2991 — check if a loop header was already visited.
+    pub fn has_merge_point(&self, key: u64) -> bool {
+        self.current_merge_points.contains(&key)
+    }
+
+    /// RPython pyjitpl.py:3030 — record a loop header visit.
+    pub fn add_merge_point(&mut self, key: u64) {
+        if !self.current_merge_points.contains(&key) {
+            self.current_merge_points.push(key);
+        }
+    }
+
     /// Create a standalone TraceCtx for testing or external use.
     pub fn for_test(num_inputs: usize) -> Self {
         let mut recorder = Trace::new();
@@ -84,6 +100,7 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             replacements: Vec::new(),
+            current_merge_points: vec![green_key],
         }
     }
 
@@ -106,6 +123,7 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             replacements: Vec::new(),
+            current_merge_points: vec![green_key],
         }
     }
 
