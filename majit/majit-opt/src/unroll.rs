@@ -1102,11 +1102,22 @@ impl OptUnroll {
     ) {
         let resolved = ctx.get_replacement(arg);
         if infos.contains_key(&resolved) {
+            // Also store under the original key so import_state can
+            // find the info using the unresolved next_iteration_args key.
+            if arg != resolved {
+                if let Some(info) = infos.get(&resolved).cloned() {
+                    infos.insert(arg, info);
+                }
+            }
             return;
         }
         let info = self.collect_exported_info(resolved, ctx, exported_int_bounds);
         let is_virtual = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual());
-        infos.insert(resolved, info);
+        infos.insert(resolved, info.clone());
+        // Also store under the original (unresolved) key.
+        if arg != resolved {
+            infos.insert(arg, info);
+        }
         if is_virtual {
             self.expand_infos_from_virtual(resolved, ctx, exported_int_bounds, infos);
         }
