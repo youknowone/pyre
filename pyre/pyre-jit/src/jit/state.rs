@@ -4492,6 +4492,13 @@ impl SharedOpcodeHandler for TraceFrameState {
     }
 
     fn peek_at(&mut self, depth: usize) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: set pending concrete from peeked stack position
+        let s = self.sym();
+        let stack_idx = s.valuestackdepth.checked_sub(s.nlocals + depth + 1);
+        if let Some(idx) = stack_idx {
+            let concrete = s.concrete_stack.get(idx).copied().unwrap_or(PY_NULL);
+            self.sym_mut().pending_concrete_push = Some(concrete);
+        }
         self.with_ctx(|this, ctx| TraceFrameState::peek_value(this, ctx, depth))
     }
 
