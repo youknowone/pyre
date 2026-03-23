@@ -1007,7 +1007,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                             8,
                             majit_ir::Type::Ref,
                             false,
-                        ).with_virtualizable(true),
+                        ),
                     ))
                 }
 

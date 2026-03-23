@@ -15,10 +15,6 @@ use majit_ir::{
     Value,
 };
 use majit_opt::intdiv::magic_numbers;
-use majit_opt::optimizer::Optimizer;
-use majit_opt::pure::OptPure;
-use majit_opt::rewrite::OptRewrite;
-use majit_opt::simplify::OptSimplify;
 use majit_trace::recorder::Trace;
 
 // ---------------------------------------------------------------------------
@@ -53,13 +49,9 @@ fn make_descr(index: u32) -> DescrRef {
     Arc::new(TestFailDescr { index })
 }
 
-fn new_optimizer() -> Optimizer {
-    let mut opt = Optimizer::new();
-    opt.add_pass(Box::new(OptRewrite::new()));
-    opt.add_pass(Box::new(OptPure::new()));
-    opt.add_pass(Box::new(OptSimplify::new()));
-    opt
-}
+// RPython runner_test.py parity: backend tests compile traces directly
+// without running through the optimizer. The optimizer has its own tests
+// in majit-opt.
 
 // ---------------------------------------------------------------------------
 // Test 1: Simple arithmetic (trace -> optimize -> compile -> execute)
@@ -79,11 +71,7 @@ fn test_simple_arithmetic() {
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
-    // Optimize
-    let mut opt = new_optimizer();
-    let optimized = opt.optimize(&trace.ops);
-
-    // Compile
+    // Compile directly without optimizer (RPython test_compile_linear_loop parity)
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
     constants.insert(1000, 1i64);
@@ -91,7 +79,7 @@ fn test_simple_arithmetic() {
 
     let mut token = JitCellToken::new(0);
     backend
-        .compile_loop(&trace.inputargs, &optimized, &mut token)
+        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // Execute

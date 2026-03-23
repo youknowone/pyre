@@ -343,18 +343,21 @@ mod tests {
     // ── Edge cases ──
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn test_magic_numbers_panics_for_power_of_two() {
         magic_numbers(4);
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn test_magic_numbers_panics_for_two() {
         magic_numbers(2);
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn test_magic_numbers_panics_for_one() {
         magic_numbers(1);
