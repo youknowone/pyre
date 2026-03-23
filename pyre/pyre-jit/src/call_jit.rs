@@ -884,12 +884,9 @@ pub fn install_jit_call_bridge() {
         majit_codegen_cranelift::register_call_assembler_blackhole(
             jit_blackhole_resume_from_guard,
         );
-        // RPython compile.py:714: bridge compilation on guard failure threshold.
-        // Bridge compilation works (guard=0 at count=200 triggers hook) but
-        // jit_bridge_compile_for_guard generates incorrect bridge ops that
-        // crash. Needs RPython-faithful bridge: new MetaInterp traces from
-        // guard failure point, not hardcoded ops.
-        // TODO: implement _trace_and_compile_from_bridge (compile.py:714)
+        // compile.py:714: bridge compilation on guard failure threshold.
+        // jit_bridge_compile_for_guard traces from guard failure point
+        // using MetaInterp tracing (start_bridge_tracing + trace loop).
     });
 }
 
@@ -967,102 +964,128 @@ fn jit_blackhole_resume_from_guard(
     }
 }
 
-/// RPython compile.py:714 (_trace_and_compile_from_bridge):
+/// compile.py:714 (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
-/// Compiles a bridge for the alternative path.
+/// Traces the alternative path from the guard failure point and compiles
+/// a bridge.
 ///
-/// For fib's Guard(n>=2) failure: the bridge handles n<2 → return n.
-/// Bridge ops: GetfieldGcI(n_boxed, intval) → Finish(unboxed_n)
-pub fn jit_bridge_compile_for_guard(green_key: u64, trace_id: u64, fail_index: u32) {
-    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
-    use std::collections::HashMap;
+/// pyjitpl.py:2884 handle_guard_failure:
+///   initialize_state_from_guard_failure(resumedescr, deadframe)
+///   prepare_resume_from_failure(deadframe, inputargs, resumedescr, excdata)
+///   self.interpret()
+///
+/// The tracing loop mirrors pyjitpl.py interpret(): execute bytecodes
+/// from the guard failure PC until a Finish (return) or CloseLoop
+/// (back-edge to loop header) is reached.
+pub fn jit_bridge_compile_for_guard(
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    frame: &mut PyFrame,
+) {
+    use crate::jit::state::PyreEnv;
+    use crate::jit::trace::trace_bytecode;
+    use crate::eval::build_jit_state;
 
-    let driver = crate::eval::driver_pair();
-    let meta = driver.0.meta_interp_mut();
+    let (driver, info) = crate::eval::driver_pair();
 
-    let Some(fail_descr) = meta.get_fail_descr_for_bridge(green_key, trace_id, fail_index) else {
-        {
-            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("[bridge-compile] FAILED get_fail_descr: key={} trace={} fail={}", green_key, trace_id, fail_index);
-            }
-        }
-        return;
-    };
-
-    let fail_arg_types = fail_descr.fail_arg_types().to_vec();
-
-    // RPython compile.py:1039 — bridge inputargs match guard's fail_arg_types
-    let bridge_inputargs: Vec<InputArg> = fail_arg_types
-        .iter()
-        .enumerate()
-        .map(|(i, tp)| InputArg::from_type(*tp, i as u32))
-        .collect();
-
-    // RPython pyjitpl.py:2841 (interpret) → traces the alternative path.
-    // For fib base case: fail_args = [frame(Ref), ni(Int), vsd(Int), n(Ref)]
-    // The n<2 path just returns n. Bridge: unbox n → Finish(raw_n).
-    //
-    // For RawInt protocol: GetfieldGcI(inputarg_3, intval_descr) → Finish
-    let protocol = finish_protocol(green_key);
-    let mut bridge_ops = Vec::new();
-    let constants: HashMap<u32, i64> = HashMap::new();
-
-    // Find first Ref inputarg after the virtualizable header (idx >= 3)
-    // This is typically the first local variable.
-    let first_ref_idx = fail_arg_types
-        .iter()
-        .enumerate()
-        .position(|(i, tp)| i >= 3 && *tp == Type::Ref);
-
-    if let Some(ref_idx) = first_ref_idx {
-        if matches!(protocol, FinishProtocol::RawInt) {
-            // Unbox: GetfieldGcI(n_boxed, intval_descr) → raw int
-            let n_boxed = OpRef(ref_idx as u32);
-            let intval_descr = crate::jit::descr::int_intval_descr();
-            let unboxed = OpRef(bridge_inputargs.len() as u32);
-            let mut getfield = Op::with_descr(OpCode::GetfieldGcI, &[n_boxed], intval_descr);
-            getfield.pos = unboxed;
-            bridge_ops.push(getfield);
-
-            let finish_descr = majit_meta::make_fail_descr_typed(vec![Type::Int]);
-            let mut finish_op = Op::with_descr(OpCode::Finish, &[unboxed], finish_descr);
-            finish_op.pos = OpRef(unboxed.0 + 1);
-            bridge_ops.push(finish_op);
-        } else {
-            // Boxed: return the Ref directly
-            let n_boxed = OpRef(ref_idx as u32);
-            let finish_descr = majit_meta::make_fail_descr_typed(vec![Type::Ref]);
-            let mut finish_op = Op::with_descr(OpCode::Finish, &[n_boxed], finish_descr);
-            finish_op.pos = OpRef(bridge_inputargs.len() as u32);
-            bridge_ops.push(finish_op);
-        }
-    } else {
-        // No Ref locals — can't synthesize bridge
-        return;
-    }
+    // pyjitpl.py:2884: initialize_state_from_guard_failure.
+    // The frame has already been restored by restore_guard_failure_for_loop.
+    let resume_pc = frame.next_instr;
+    let code = unsafe { &*frame.code };
+    let env = PyreEnv;
+    let mut jit_state = build_jit_state(frame, info);
+    let loop_header_pc = 0; // not used by start_bridge_tracing
 
     if majit_meta::majit_log_enabled() {
         eprintln!(
-            "[jit][bridge] compiling bridge for guard key={} trace={} fail={}",
-            green_key, trace_id, fail_index
+            "[jit][bridge-trace] start key={} trace={} fail={} resume_pc={}",
+            green_key, trace_id, fail_index, resume_pc
         );
     }
 
-    // RPython compile.py:792 (compile_and_attach) → send_bridge_to_backend
-    let ok = meta.compile_bridge(
+    // compile.py:714: start_retrace_from_guard + set bridge_info.
+    if !driver.start_bridge_tracing(
         green_key,
+        trace_id,
         fail_index,
-        fail_descr.as_ref(),
-        &bridge_ops,
-        &bridge_inputargs,
-        constants,
-    );
-    {
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("[bridge-compile] result={} key={} trace={} fail={}", ok, green_key, trace_id, fail_index);
+        &mut jit_state,
+        &env,
+        resume_pc,
+        loop_header_pc,
+    ) {
+        if majit_meta::majit_log_enabled() {
+            eprintln!(
+                "[jit][bridge-trace] start_bridge_tracing failed key={} trace={} fail={}",
+                green_key, trace_id, fail_index
+            );
         }
+        return;
+    }
+
+    // pyjitpl.py:2841 interpret(): trace bytecodes from guard failure PC
+    // until the bridge path terminates (Finish or CloseLoop).
+    let mut trace_frame = frame.snapshot_for_tracing();
+    let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
+    let max_bridge_ops = 200;
+
+    for step in 0..max_bridge_ops {
+        let pc = trace_frame.next_instr;
+        if pc >= code.instructions.len() {
+            break;
+        }
+
+        // Feed one bytecode to the active trace via merge_point.
+        let outcome = driver.jit_merge_point_keyed(
+            green_key,
+            pc,
+            &mut jit_state,
+            &env,
+            || {},
+            |ctx, sym| {
+                trace_bytecode(ctx, sym, code, pc, trace_frame_ptr)
+            },
+        );
+
+        // merge_point handles Finish/CloseLoop via bridge_info.
+        // If it returns an outcome, the bridge was compiled.
+        if outcome.is_some() {
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-trace] compiled at step={} pc={} key={}",
+                    step, pc, green_key
+                );
+            }
+            return;
+        }
+
+        // If the driver is no longer tracing, the bridge was compiled
+        // (or aborted) inside merge_point.
+        if !driver.is_tracing() {
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-trace] trace ended at step={} pc={} key={}",
+                    step, pc, green_key
+                );
+            }
+            return;
+        }
+
+        // Advance the trace frame's PC for the next instruction.
+        // execute_opcode_step on TraceFrameState updates symbolic state
+        // but not the concrete frame's next_instr. Advance manually.
+        trace_frame.next_instr = pc + 1;
+    }
+
+    // Trace didn't converge — abort.
+    if driver.is_tracing() {
+        if majit_meta::majit_log_enabled() {
+            eprintln!(
+                "[jit][bridge-trace] abort: too many ops key={} trace={} fail={}",
+                green_key, trace_id, fail_index
+            );
+        }
+        driver.meta_interp_mut().abort_trace(false);
     }
 }
 

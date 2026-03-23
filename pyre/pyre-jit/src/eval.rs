@@ -525,7 +525,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         if let Some((fail_index, trace_id)) = guard_fail_info {
             let pending = majit_codegen_cranelift::take_pending_bridge_compile();
             for (gk, tid, fi) in pending {
-                crate::call_jit::jit_bridge_compile_for_guard(gk, tid, fi);
+                crate::call_jit::jit_bridge_compile_for_guard(gk, tid, fi, frame);
             }
         }
 
@@ -819,7 +819,7 @@ fn materialize_recovery_virtuals(
     }
 }
 
-fn build_jit_state(
+pub(crate) fn build_jit_state(
     frame: &PyFrame,
     virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
 ) -> PyreJitState {

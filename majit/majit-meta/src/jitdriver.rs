@@ -517,6 +517,22 @@ impl<S: JitState> JitDriver<S> {
                 finish_args,
                 finish_arg_types,
             } => {
+                // compile.py:714: bridge tracing that exits via return
+                // closes as a bridge with Finish, not a standalone loop.
+                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
+                    self.bridge_info.take()
+                {
+                    self.sym = None;
+                    self.trace_meta = None;
+                    self.meta.finish_bridge(
+                        bridge_key,
+                        bridge_trace_id,
+                        bridge_fail_index,
+                        &finish_args,
+                        finish_arg_types,
+                    );
+                    return;
+                }
                 let meta = self.trace_meta.take().unwrap();
                 self.meta
                     .finish_and_compile(&finish_args, finish_arg_types, meta);

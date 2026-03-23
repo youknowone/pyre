@@ -2957,6 +2957,63 @@ impl<M: Clone> MetaInterp<M> {
             constants,
         )
     }
+
+    /// compile.py:714 _trace_and_compile_from_bridge — Finish variant.
+    ///
+    /// Close the current bridge trace with an explicit Finish op (e.g. when
+    /// the bridge path returns a value instead of jumping back to the loop
+    /// header). The Finish op is appended to the recorded ops before
+    /// optimization and compilation.
+    pub fn finish_bridge(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        finish_args: &[OpRef],
+        finish_arg_types: Vec<Type>,
+    ) -> bool {
+        self.forced_virtualizable = None;
+        let ctx = match self.tracing.take() {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+
+        let mut recorder = ctx.recorder;
+        recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
+        let trace = recorder.get_trace();
+
+        let constants = ctx.constants.into_inner();
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] finish_bridge: key={}, trace_id={}, guard={}, ops={}",
+                green_key, trace_id, fail_index, trace.ops.len()
+            );
+            eprintln!("--- bridge trace (finish, before opt) ---");
+            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
+        }
+
+        let fail_descr = {
+            let compiled = match self.compiled_loops.get(&green_key) {
+                Some(c) => c,
+                None => return false,
+            };
+            let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
+                Some(descr) => descr,
+                None => return false,
+            };
+            Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
+        };
+
+        self.compile_bridge(
+            green_key,
+            fail_index,
+            &*fail_descr,
+            &trace.ops,
+            &trace.inputargs,
+            constants,
+        )
+    }
 }
 
 impl<M: Clone> MetaInterp<M> {
