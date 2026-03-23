@@ -1849,6 +1849,11 @@ impl<S: JitState> JitDriver<S> {
         self.sym = Some(S::create_sym(&trace_meta, resume_pc));
         self.trace_meta = Some(trace_meta);
         self.bridge_info = Some((green_key, trace_id, fail_index));
+        // RPython pyjitpl.py:2908 — bridge traces start with empty
+        // current_merge_points (no loop header to match against).
+        if let Some(ref mut ctx) = self.meta.tracing {
+            ctx.clear_merge_points();
+        }
         true
     }
 
