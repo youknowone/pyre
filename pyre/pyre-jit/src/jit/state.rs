@@ -25,6 +25,83 @@ use pyre_object::{
     w_str_get_value, w_tuple_len,
 };
 use pyre_objspace::truth_value as objspace_truth_value;
+
+/// Typed concrete value — RPython `FrontendOp._resint/_resref/_resfloat` parity.
+///
+/// Python bytecode uses untyped locals, so we use a tagged enum instead of
+/// RPython's separate `registers_i/r/f` arrays. Each variant corresponds to
+/// one of RPython's Box types: `BoxInt`, `BoxPtr`, `BoxFloat`.
+#[derive(Clone, Copy, Debug)]
+pub enum ConcreteValue {
+    Int(i64),
+    Float(f64),
+    Ref(PyObjectRef),
+    Null,
+}
+
+impl ConcreteValue {
+    /// Convert from PyObjectRef (unbox if possible).
+    pub fn from_pyobj(obj: PyObjectRef) -> Self {
+        if obj.is_null() {
+            return ConcreteValue::Null;
+        }
+        unsafe {
+            if is_int(obj) {
+                ConcreteValue::Int(w_int_get_value(obj))
+            } else if is_float(obj) {
+                ConcreteValue::Float(w_float_get_value(obj))
+            } else {
+                ConcreteValue::Ref(obj)
+            }
+        }
+    }
+
+    /// Convert to PyObjectRef (box if needed).
+    pub fn to_pyobj(self) -> PyObjectRef {
+        match self {
+            ConcreteValue::Int(v) => w_int_new(v),
+            ConcreteValue::Float(v) => pyre_object::w_float_new(v),
+            ConcreteValue::Ref(obj) => obj,
+            ConcreteValue::Null => PY_NULL,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, ConcreteValue::Null)
+    }
+
+    /// RPython box.getint() parity.
+    pub fn getint(&self) -> Option<i64> {
+        match self {
+            ConcreteValue::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// RPython box.getfloatstorage() parity.
+    pub fn getfloat(&self) -> Option<f64> {
+        match self {
+            ConcreteValue::Float(v) => Some(*v),
+            ConcreteValue::Int(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    /// RPython box.getref_base() parity.
+    pub fn getref(&self) -> PyObjectRef {
+        self.to_pyobj()
+    }
+
+    /// Truth value (RPython box.getint() != 0 for goto_if_not).
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            ConcreteValue::Int(v) => *v != 0,
+            ConcreteValue::Float(v) => *v != 0.0,
+            ConcreteValue::Ref(obj) => objspace_truth_value(*obj),
+            ConcreteValue::Null => false,
+        }
+    }
+}
 use pyre_runtime::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
@@ -141,10 +218,10 @@ pub struct PyreSym {
     // updates these alongside the symbolic OpRefs so that guard decisions,
     // branch directions, and call results use internally tracked values
     // instead of reading from an external PyFrame snapshot.
-    pub(crate) concrete_locals: Vec<PyObjectRef>,
-    pub(crate) concrete_stack: Vec<PyObjectRef>,
+    pub(crate) concrete_locals: Vec<ConcreteValue>,
+    pub(crate) concrete_stack: Vec<ConcreteValue>,
     /// Concrete value to be consumed by the next push_value() call.
-    pub(crate) pending_concrete_push: Option<PyObjectRef>,
+    pub(crate) pending_concrete_push: Option<ConcreteValue>,
     /// Frame metadata extracted at trace start — avoids stale snapshot reads.
     pub(crate) concrete_code: *const pyre_bytecode::CodeObject,
     pub(crate) concrete_namespace: *mut pyre_runtime::PyNamespace,
@@ -945,6 +1022,7 @@ impl PyreSym {
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
             pending_concrete_push: None,
+            // concrete_code and concrete_namespace initialized below
             concrete_code: std::ptr::null(),
             concrete_namespace: std::ptr::null_mut(),
         }
@@ -999,10 +1077,10 @@ impl PyreSym {
         // MIFrame concrete Box tracking: populate concrete value arrays
         // from the concrete frame snapshot (RPython MIFrame.setup_call parity).
         self.concrete_locals = (0..nlocals)
-            .map(|i| concrete_stack_value(concrete_frame, i).unwrap_or(PY_NULL))
+            .map(|i| ConcreteValue::from_pyobj(concrete_stack_value(concrete_frame, i).unwrap_or(PY_NULL)))
             .collect();
         self.concrete_stack = (0..stack_only_depth)
-            .map(|i| concrete_stack_value(concrete_frame, nlocals + i).unwrap_or(PY_NULL))
+            .map(|i| ConcreteValue::from_pyobj(concrete_stack_value(concrete_frame, nlocals + i).unwrap_or(PY_NULL)))
             .collect();
         // Extract frame metadata pointers for use without concrete_frame
         if concrete_frame != 0 {
