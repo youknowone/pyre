@@ -48,12 +48,8 @@ pub enum StepAction {
 /// Each frame in the MetaInterp's framestack tracks both symbolic
 /// (PyreSym) and concrete (ConcreteValue arrays) state.
 pub struct PyreMetaFrame {
-    /// Symbolic IR tracking state.
+    /// Symbolic + concrete state (PyreSym owns concrete_locals/concrete_stack).
     pub sym: PyreSym,
-    /// Concrete local variable values (RPython registers_i/r/f unified).
-    pub concrete_locals: Vec<ConcreteValue>,
-    /// Concrete operand stack values.
-    pub concrete_stack: Vec<ConcreteValue>,
     /// Code object being traced (RPython MIFrame.jitcode).
     pub jitcode: *const CodeObject,
     /// Program counter (RPython MIFrame.pc).
@@ -125,20 +121,20 @@ impl PyreMetaInterp {
         let nlocals = code.varnames.len();
 
         // RPython MIFrame.setup_call: distribute args to registers
-        let mut concrete_locals = vec![ConcreteValue::Null; nlocals];
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.concrete_locals = vec![ConcreteValue::Null; nlocals];
+        sym.concrete_stack = Vec::new();
+        sym.symbolic_locals = vec![OpRef::NONE; nlocals];
+        sym.nlocals = nlocals;
         for (i, arg) in args.iter().enumerate() {
             if i < nlocals {
-                concrete_locals[i] = arg.concrete;
+                sym.concrete_locals[i] = arg.concrete;
+                sym.symbolic_locals[i] = arg.opref;
             }
         }
 
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        // TODO: initialize sym from args
-
         let frame = PyreMetaFrame {
             sym,
-            concrete_locals,
-            concrete_stack: Vec::new(),
             jitcode: callee_code,
             pc: 0,
             greenkey,
@@ -162,7 +158,7 @@ impl PyreMetaInterp {
         } else {
             // RPython make_result_of_lastop: store in parent
             let parent = self.framestack.last_mut().unwrap();
-            parent.concrete_stack.push(result.concrete);
+            parent.sym.concrete_stack.push(result.concrete);
             parent.sym.symbolic_stack.push(result.opref);
             StepAction::ChangeFrame
         }
@@ -205,20 +201,20 @@ impl PyreMetaFrame {
     /// Push a FrontendOp onto the operand stack.
     fn push(&mut self, op: FrontendOp) {
         self.sym.symbolic_stack.push(op.opref);
-        self.concrete_stack.push(op.concrete);
+        self.sym.concrete_stack.push(op.concrete);
     }
 
     /// Pop a FrontendOp from the operand stack.
     fn pop(&mut self) -> FrontendOp {
         let opref = self.sym.symbolic_stack.pop().unwrap_or(OpRef::NONE);
-        let concrete = self.concrete_stack.pop().unwrap_or(ConcreteValue::Null);
+        let concrete = self.sym.concrete_stack.pop().unwrap_or(ConcreteValue::Null);
         FrontendOp::new(opref, concrete)
     }
 
     /// Peek at the top of the operand stack without popping.
     fn peek(&self) -> FrontendOp {
         let opref = self.sym.symbolic_stack.last().copied().unwrap_or(OpRef::NONE);
-        let concrete = self.concrete_stack.last().copied().unwrap_or(ConcreteValue::Null);
+        let concrete = self.sym.concrete_stack.last().copied().unwrap_or(ConcreteValue::Null);
         FrontendOp::new(opref, concrete)
     }
 
@@ -252,10 +248,14 @@ impl PyreMetaFrame {
         FrontendOp::new(result_opref, concrete_result)
     }
 
-    /// RPython MIFrame.run_one_step() parity.
+    /// RPython MIFrame.run_one_step() parity — concrete dispatch.
     ///
-    /// Decode and execute one bytecode instruction, recording IR and
-    /// computing concrete results simultaneously.
+    /// Computes concrete results for each opcode. Symbolic IR recording
+    /// is delegated to TraceFrameState::trace_code_step via the
+    /// trace_bytecode loop.
+    ///
+    /// When this is used as the primary dispatch (replacing TraceFrameState),
+    /// execute_and_record handles both concrete + symbolic in one call.
     pub fn run_one_step(
         &mut self,
         ctx: &mut TraceCtx,
@@ -304,7 +304,7 @@ impl PyreMetaFrame {
             // RPython: registers[idx] already holds the box
             Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                 let idx = var_num.get(op_arg).as_usize();
-                let concrete = self.concrete_locals.get(idx).copied()
+                let concrete = self.sym.concrete_locals.get(idx).copied()
                     .unwrap_or(ConcreteValue::Null);
                 // RPython: box is already in registers[idx]
                 let opref = self.sym.symbolic_locals.get(idx).copied()
@@ -315,8 +315,8 @@ impl PyreMetaFrame {
             Instruction::StoreFast { var_num } => {
                 let idx = var_num.get(op_arg).as_usize();
                 let val = self.pop();
-                if idx < self.concrete_locals.len() {
-                    self.concrete_locals[idx] = val.concrete;
+                if idx < self.sym.concrete_locals.len() {
+                    self.sym.concrete_locals[idx] = val.concrete;
                 }
                 if idx < self.sym.symbolic_locals.len() {
                     self.sym.symbolic_locals[idx] = val.opref;
@@ -522,17 +522,17 @@ impl PyreMetaFrame {
             // ── Stack manipulation ──
             Instruction::Copy { i } => {
                 let depth = i.get(op_arg) as usize;
-                let idx = self.concrete_stack.len().saturating_sub(depth);
-                let concrete = self.concrete_stack.get(idx).copied().unwrap_or(ConcreteValue::Null);
+                let idx = self.sym.concrete_stack.len().saturating_sub(depth);
+                let concrete = self.sym.concrete_stack.get(idx).copied().unwrap_or(ConcreteValue::Null);
                 let opref = self.sym.symbolic_stack.get(idx).copied().unwrap_or(OpRef::NONE);
                 self.push(FrontendOp::new(opref, concrete));
                 Ok(StepAction::Continue)
             }
             Instruction::Swap { i } => {
                 let depth = i.get(op_arg) as usize;
-                let top = self.concrete_stack.len() - 1;
-                let other = self.concrete_stack.len() - depth;
-                self.concrete_stack.swap(top, other);
+                let top = self.sym.concrete_stack.len() - 1;
+                let other = self.sym.concrete_stack.len() - depth;
+                self.sym.concrete_stack.swap(top, other);
                 self.sym.symbolic_stack.swap(top, other);
                 Ok(StepAction::Continue)
             }
@@ -723,8 +723,8 @@ impl PyreMetaFrame {
                 let pair = var_nums.get(op_arg);
                 let idx1 = u32::from(pair.idx_1()) as usize;
                 let idx2 = u32::from(pair.idx_2()) as usize;
-                let c1 = self.concrete_locals.get(idx1).copied().unwrap_or(ConcreteValue::Null);
-                let c2 = self.concrete_locals.get(idx2).copied().unwrap_or(ConcreteValue::Null);
+                let c1 = self.sym.concrete_locals.get(idx1).copied().unwrap_or(ConcreteValue::Null);
+                let c2 = self.sym.concrete_locals.get(idx2).copied().unwrap_or(ConcreteValue::Null);
                 self.push(FrontendOp::new(OpRef::NONE, c1));
                 self.push(FrontendOp::new(OpRef::NONE, c2));
                 Ok(StepAction::Continue)
@@ -734,10 +734,10 @@ impl PyreMetaFrame {
                 let store_idx = u32::from(pair.idx_1()) as usize;
                 let load_idx = u32::from(pair.idx_2()) as usize;
                 let val = self.pop();
-                if store_idx < self.concrete_locals.len() {
-                    self.concrete_locals[store_idx] = val.concrete;
+                if store_idx < self.sym.concrete_locals.len() {
+                    self.sym.concrete_locals[store_idx] = val.concrete;
                 }
-                let c = self.concrete_locals.get(load_idx).copied().unwrap_or(ConcreteValue::Null);
+                let c = self.sym.concrete_locals.get(load_idx).copied().unwrap_or(ConcreteValue::Null);
                 self.push(FrontendOp::new(OpRef::NONE, c));
                 Ok(StepAction::Continue)
             }
