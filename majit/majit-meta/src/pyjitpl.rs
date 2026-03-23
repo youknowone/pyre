@@ -664,10 +664,25 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn make_optimizer(&self) -> Optimizer {
-        if let Some(config) = self.current_virtualizable_optimizer_config() {
-            return Optimizer::default_pipeline_with_virtualizable(config);
-        }
-        Optimizer::default_pipeline()
+        let mut opt = if let Some(config) = self.current_virtualizable_optimizer_config() {
+            Optimizer::default_pipeline_with_virtualizable(config)
+        } else {
+            Optimizer::default_pipeline()
+        };
+        // optimizer.py:787-789: constant_fold — allocate immutable objects
+        // at compile time. Uses Box::leak for permanent allocation (immutable
+        // objects are never freed, matching RPython's prebuilt constants).
+        opt.constant_fold_alloc = Some(Box::new(|size_bytes: usize| {
+            let layout = std::alloc::Layout::from_size_align(size_bytes, 8)
+                .unwrap_or(std::alloc::Layout::new::<u8>());
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            if ptr.is_null() {
+                majit_ir::GcRef::NULL
+            } else {
+                majit_ir::GcRef(ptr as usize)
+            }
+        }));
+        opt
     }
 
     /// Set a callback for loop compilation events.
