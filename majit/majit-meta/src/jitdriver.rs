@@ -1343,6 +1343,10 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
+            // Invalidate this compiled loop so we don't keep re-entering
+            // only to abort. The warm state entry is left as-is so the
+            // interpreter runs without repeated compile attempts.
+            self.meta.compiled_loops.remove(&green_key);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
