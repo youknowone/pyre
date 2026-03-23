@@ -225,6 +225,7 @@ pub struct PyreMeta {
 /// (locals, stack, valuestackdepth, next_instr) persists across instructions.
 /// Locals and stack are virtualized (carried through JUMP args);
 /// only next_instr and valuestackdepth are synced before guards / loop close.
+#[derive(Clone)]
 pub struct PyreSym {
     /// OpRef for the owning PyFrame pointer.
     pub frame: OpRef,
@@ -1228,7 +1229,8 @@ impl TraceFrameState {
                 return Some(v.to_pyobj());
             }
         }
-        None
+        // Fallback: read from concrete frame snapshot
+        concrete_return_value(self.concrete_frame)
     }
 
     fn next_instruction_consumes_comparison_truth(&self) -> bool {
@@ -1404,6 +1406,11 @@ impl TraceFrameState {
         }
         s.symbolic_stack[stack_idx] = value;
         s.symbolic_stack_types[stack_idx] = value_type;
+        // Persist type for value_type_of lookups after stack pop
+        // (e.g., inline callee return → pop → value_type_of on result).
+        if !value.is_none() {
+            s.transient_value_types.insert(value, value_type);
+        }
         // MIFrame Box tracking: store concrete value alongside symbolic
         let concrete = s
             .pending_concrete_push

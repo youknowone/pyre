@@ -1410,10 +1410,9 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
-            // Invalidate this compiled loop and blacklist the key.
-            self.meta.compiled_loops.remove(&green_key);
-            self.meta.warm_state.abort_tracing(green_key, true);
-            self.meta.warm_state.clear_loop_token(green_key);
+            // Don't invalidate: the compiled code may be entered from a
+            // compatible state later (e.g., function-entry trace created
+            // merge_pc mismatch, but direct back-edge entry matches).
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
