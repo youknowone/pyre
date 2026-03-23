@@ -4244,8 +4244,7 @@ impl CraneliftBackend {
                 continue;
             }
             for &arg in &op.args {
-                if arg.is_none() || constants.contains_key(&arg.0) || declared_vars.contains(&arg.0)
-                {
+                if arg.is_none() || declared_vars.contains(&arg.0) {
                     continue;
                 }
                 declared_vars.insert(arg.0);
@@ -4347,7 +4346,7 @@ impl CraneliftBackend {
             builder.switch_to_block(entry_label_block);
             for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
                 let param = builder.block_params(entry_label_block)[i];
-                if !arg_ref.is_none() && !constants.contains_key(&arg_ref.0) {
+                if !arg_ref.is_none() {
                     builder.def_var(var(arg_ref.0), param);
                 }
             }

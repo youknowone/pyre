@@ -2404,9 +2404,10 @@ fn assemble_peeled_trace_with_jump_args(
             {
                 continue;
             }
-            if preamble_defs.contains(&arg) {
-                continue;
-            }
+            // preamble_defs values are available in the fall-through from
+            // preamble to the first iteration. BUT after the Label (loop
+            // body back-edge), only Label args are available — preamble defs
+            // are not carried across the back-edge. So do NOT skip them.
             // Body-use-before-def: a value used in the body before its
             // defining op is encountered. Carry it through the label so
             // the assembled body has it available.
