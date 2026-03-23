@@ -48,6 +48,10 @@ pub struct UnrollOptimizer {
     pub max_retrace_guards: u32,
     /// Constant type hints from ConstantPool, propagated to inner Optimizer.
     pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    /// compile.py:362: pre-imported ExportedState for compile_retrace.
+    /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
+    /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
+    pub imported_state: Option<ExportedState>,
 }
 
 impl UnrollOptimizer {
@@ -59,6 +63,7 @@ impl UnrollOptimizer {
             constant_types: std::collections::HashMap::new(),
             retrace_limit: 5,
             max_retrace_guards: 15,
+            imported_state: None,
         }
     }
 
@@ -166,46 +171,59 @@ impl UnrollOptimizer {
         num_inputs: usize,
         vable_config: Option<crate::virtualize::VirtualizableConfig>,
     ) -> (Vec<Op>, usize) {
-        // ── Phase 1: PreambleCompileData.optimize() ──
-        // ── Phase 1: optimize_preamble (compile.py:275-276) ──
-        let mut consts_p1 = constants.clone();
-        let mut opt_p1 = match vable_config.as_ref() {
-            Some(c) => crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone()),
-            None => crate::optimizer::Optimizer::default_pipeline(),
-        };
-        opt_p1.constant_types = self.constant_types.clone();
-        // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
-        // that only skips the final cleanup flush — JUMP-time force_all_lazy
-        // still runs. In majit skip_flush also prevents JUMP lazy_set emit
-        // which breaks force_virtual.
-        let p1_ops = opt_p1.optimize_with_constants_and_inputs(ops, &mut consts_p1, num_inputs);
-        let p1_ni = opt_p1.final_num_inputs();
-        let jump_virtuals = std::mem::take(&mut opt_p1.exported_jump_virtuals);
+        // compile.py:362: if imported_state is pre-set (compile_retrace path),
+        // skip Phase 1 and go directly to Phase 2 with the imported state.
+        let (mut exported_state, consts_p1, jump_virtuals, p1_ops) = if let Some(pre_imported) =
+            self.imported_state.take()
+        {
+            // Retrace path: Phase 1 already done; preamble ops are in
+            // the caller's partial_trace, not produced here.
+            (pre_imported, constants.clone(), Vec::new(), Vec::new())
+        } else {
+            // ── Phase 1: PreambleCompileData.optimize() ──
+            // ── Phase 1: optimize_preamble (compile.py:275-276) ──
+            let mut consts_p1 = constants.clone();
+            let mut opt_p1 = match vable_config.as_ref() {
+                Some(c) => {
+                    crate::optimizer::Optimizer::default_pipeline_with_virtualizable(c.clone())
+                }
+                None => crate::optimizer::Optimizer::default_pipeline(),
+            };
+            opt_p1.constant_types = self.constant_types.clone();
+            // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
+            // that only skips the final cleanup flush — JUMP-time force_all_lazy
+            // still runs. In majit skip_flush also prevents JUMP lazy_set emit
+            // which breaks force_virtual.
+            let p1_ops = opt_p1.optimize_with_constants_and_inputs(ops, &mut consts_p1, num_inputs);
+            let p1_ni = opt_p1.final_num_inputs();
+            let jv = std::mem::take(&mut opt_p1.exported_jump_virtuals);
 
-        let mut exported_state = match opt_p1.exported_loop_state.clone() {
-            Some(state) => state,
-            None => {
-                *constants = consts_p1;
-                let loop_arity = closing_loop_contract_arity(&p1_ops, p1_ni);
-                return (p1_ops, loop_arity);
+            match opt_p1.exported_loop_state.clone() {
+                Some(mut state) => {
+                    // Determine types of end_args from Phase 1's output ops.
+                    {
+                        let op_types: HashMap<OpRef, Type> = p1_ops
+                            .iter()
+                            .filter(|op| !op.pos.is_none())
+                            .map(|op| (op.pos, op.opcode.result_type()))
+                            .collect();
+                        state.end_arg_types = state
+                            .end_args
+                            .iter()
+                            .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
+                            .collect();
+                    }
+                    // Export Phase 1's heap cache for Phase 2.
+                    state.preamble_heap_cache = opt_p1.export_all_cached_fields();
+                    (state, consts_p1, jv, p1_ops)
+                }
+                None => {
+                    *constants = consts_p1;
+                    let loop_arity = closing_loop_contract_arity(&p1_ops, p1_ni);
+                    return (p1_ops, loop_arity);
+                }
             }
         };
-        // Determine types of end_args from Phase 1's output ops.
-        // This enables Phase 2 to skip unboxing for Int/Float-typed args.
-        {
-            let op_types: HashMap<OpRef, Type> = p1_ops
-                .iter()
-                .filter(|op| !op.pos.is_none())
-                .map(|op| (op.pos, op.opcode.result_type()))
-                .collect();
-            exported_state.end_arg_types = exported_state
-                .end_args
-                .iter()
-                .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
-                .collect();
-        }
-        // Export Phase 1's heap cache for Phase 2.
-        exported_state.preamble_heap_cache = opt_p1.export_all_cached_fields();
         self.ensure_preamble_target_token();
         // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
         // RPython import_state: phase 2 starts from the original trace input

@@ -203,6 +203,20 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) previous_tokens: Vec<JitCellToken>,
 }
 
+/// pyjitpl.py: partial trace saved from a failed bridge compilation.
+///
+/// When `compile_trace` (bridge path) fails to close the loop and sets
+/// `retrace_needed`, this struct stores the intermediate compilation result
+/// so that `compile_retrace` can append new body ops to it.
+pub(crate) struct PartialTrace {
+    /// Optimized ops from the first (incomplete) compilation attempt.
+    pub(crate) ops: Vec<Op>,
+    /// Inputargs from the partial trace.
+    pub(crate) inputargs: Vec<InputArg>,
+    /// Constants from the partial trace.
+    pub(crate) constants: HashMap<u32, i64>,
+}
+
 /// The meta-tracing JIT engine.
 ///
 /// Manages the full JIT lifecycle: warm counting → tracing → optimization
@@ -261,6 +275,21 @@ pub struct MetaInterp<M: Clone> {
     /// for a green key so the loop should finish early instead of repeatedly
     /// aborting once it nears the trace limit.
     pub(crate) force_finish_trace: bool,
+    /// pyjitpl.py:2389: partial trace from a failed bridge compilation attempt.
+    /// When bridge optimization returns "not final" (retrace needed), the
+    /// partial optimized ops are saved here so compile_retrace can append
+    /// the new body and compile the complete loop.
+    pub(crate) partial_trace: Option<PartialTrace>,
+    /// pyjitpl.py:2390: green key where the retrace should resume.
+    /// On the next close_and_compile for this key, compile_retrace is used
+    /// instead of compile_loop.
+    pub(crate) retracing_from: Option<u64>,
+    /// pyjitpl.py:2374: optimizer state snapshot from the failed bridge attempt.
+    /// compile_retrace imports this to resume optimization from where the
+    /// first attempt left off.
+    pub(crate) exported_state: Option<majit_opt::unroll::ExportedState>,
+    /// pyjitpl.py:2373: number of cancelled compilation attempts.
+    pub(crate) cancel_count: u32,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -549,6 +578,10 @@ impl<M: Clone> MetaInterp<M> {
             create_frame_raw_map: HashMap::new(),
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
+            partial_trace: None,
+            retracing_from: None,
+            exported_state: None,
+            cancel_count: 0,
         }
     }
 
@@ -1339,6 +1372,49 @@ impl<M: Clone> MetaInterp<M> {
     /// in the same order as the InputArgs registered during `on_back_edge`.
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
     pub fn close_and_compile(&mut self, jump_args: &[OpRef], meta: M) {
+        // pyjitpl.py:2993-3007: if partial_trace is set, the previous
+        // compilation attempt requested a retrace. Verify the green_key
+        // matches and dispatch to compile_retrace.
+        if self.partial_trace.is_some() {
+            let current_key = self.tracing.as_ref().map(|ctx| ctx.green_key);
+            if let Some(retrace_key) = self.retracing_from {
+                if current_key == Some(retrace_key) {
+                    let ok = self.compile_retrace(jump_args, meta.clone());
+                    if ok {
+                        // Successful retrace compilation.
+                        self.cancel_count = 0;
+                        self.warm_state.reset_function_counts();
+                        return;
+                    }
+                    // Cancelled — check if too many attempts.
+                    self.cancel_count += 1;
+                    if self.cancel_count > 5 {
+                        if crate::majit_log_enabled() {
+                            eprintln!("[jit] retrace cancelled too many times");
+                        }
+                        self.partial_trace = None;
+                        self.retracing_from = None;
+                        self.exported_state = None;
+                        self.cancel_count = 0;
+                        if let Some(ctx) = self.tracing.take() {
+                            self.warm_state.abort_tracing(ctx.green_key, false);
+                        }
+                        self.warm_state.reset_function_counts();
+                        return;
+                    }
+                    // Not too many — fall through to normal compile_loop path.
+                    if crate::majit_log_enabled() {
+                        eprintln!("[jit] retrace cancelled, trying normal compilation");
+                    }
+                } else {
+                    // Green key mismatch — clear retrace state.
+                    self.partial_trace = None;
+                    self.retracing_from = None;
+                    self.exported_state = None;
+                }
+            }
+        }
+
         let vable_config = self.current_virtualizable_optimizer_config();
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
@@ -1662,6 +1738,296 @@ impl<M: Clone> MetaInterp<M> {
         }
         // Reset per-trace function call counts.
         self.warm_state.reset_function_counts();
+    }
+
+    /// pyjitpl.py:2408-2412: retrace_needed — save state from a failed
+    /// bridge compilation for a subsequent compile_retrace attempt.
+    ///
+    /// Called when the optimizer returns "not final" (no existing target token
+    /// matched). The partial trace and exported state are saved so the next
+    /// close_and_compile for this green_key can use compile_retrace.
+    pub fn retrace_needed(
+        &mut self,
+        green_key: u64,
+        ops: Vec<Op>,
+        inputargs: Vec<InputArg>,
+        constants: HashMap<u32, i64>,
+        exported_state: majit_opt::unroll::ExportedState,
+    ) {
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] retrace_needed: key={}, partial_ops={}",
+                green_key,
+                ops.len()
+            );
+        }
+        self.partial_trace = Some(PartialTrace {
+            ops,
+            inputargs,
+            constants,
+        });
+        self.retracing_from = Some(green_key);
+        self.exported_state = Some(exported_state);
+    }
+
+    /// pyjitpl.py:3171-3177 / compile.py:341-394: compile_retrace — compile
+    /// a new loop specialization by appending new body ops to a partial trace.
+    ///
+    /// Uses the saved exported_state to import optimizer knowledge from the
+    /// first (failed) attempt, then optimizes the new trace body and
+    /// concatenates with partial_trace ops.
+    ///
+    /// Returns true if compilation succeeded.
+    pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
+        let partial = match self.partial_trace.take() {
+            Some(p) => p,
+            None => return false,
+        };
+        let start_state = match self.exported_state.take() {
+            Some(s) => s,
+            None => return false,
+        };
+        let green_key = match self.retracing_from.take() {
+            Some(k) => k,
+            None => return false,
+        };
+
+        let vable_config = self.current_virtualizable_optimizer_config();
+        self.forced_virtualizable = None;
+        self.force_finish_trace = false;
+        let mut ctx = match self.tracing.take() {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+        ctx.apply_replacements();
+
+        let mut recorder = ctx.recorder;
+        recorder.close_loop(jump_args);
+        let trace = recorder.get_trace();
+
+        let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
+
+        let trace_ops = compile::fold_box_into_create_frame(
+            trace.ops.clone(),
+            &mut constants,
+            &self.raw_int_box_helpers,
+            &self.create_frame_raw_map,
+        );
+
+        if crate::majit_log_enabled() {
+            eprintln!("--- retrace body (before opt) ---");
+            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+        }
+
+        // compile.py:362-367: optimize using UnrolledLoopData with start_state.
+        let prior_front_target_tokens = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| compiled.front_target_tokens.clone())
+            .unwrap_or_default();
+        let mut unroll_opt = majit_opt::unroll::UnrollOptimizer::new();
+        unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        unroll_opt.retraced_count = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| compiled.retraced_count)
+            .unwrap_or(0);
+        unroll_opt.retrace_limit = self.warm_state.retrace_limit();
+        unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
+        unroll_opt.constant_types = constant_types;
+        // Import the exported state from the first (failed) attempt so the
+        // optimizer can continue from where it left off.
+        unroll_opt.imported_state = Some(start_state);
+
+        let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unroll_opt.optimize_trace_with_constants_and_inputs_vable(
+                &trace_ops,
+                &mut constants,
+                trace.inputargs.len(),
+                vable_config,
+            )
+        }));
+        let (body_ops, final_num_inputs) = match optimize_result {
+            Ok(result) => result,
+            Err(payload) => {
+                if payload
+                    .downcast_ref::<majit_opt::optimize::InvalidLoop>()
+                    .is_some()
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!("[jit] compile_retrace: InvalidLoop at key={}", green_key);
+                    }
+                    return false;
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
+
+        // compile.py:379-382: concatenate partial_trace ops with new body.
+        let mut combined_ops = partial.ops;
+        combined_ops.extend(body_ops);
+        // Merge constants from partial trace with new constants.
+        for (k, v) in partial.constants {
+            constants.entry(k).or_insert(v);
+        }
+
+        let root_inputargs =
+            root_loop_inputargs_from_optimizer(&partial.inputargs, final_num_inputs);
+        let (inputargs, combined_ops) =
+            match normalize_root_loop_entry_contract(root_inputargs, combined_ops) {
+                Ok(normalized) => normalized,
+                Err((expected, actual)) => {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_retrace: entry/jump arity mismatch input={} jump={}",
+                            expected, actual,
+                        );
+                    }
+                    return false;
+                }
+            };
+
+        let combined_ops = compile::unbox_call_assembler_results(combined_ops);
+        let combined_ops =
+            compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
+
+        if crate::majit_log_enabled() {
+            eprintln!("--- retrace combined (after opt) ---");
+            eprint!("{}", majit_ir::format_trace(&combined_ops, &constants));
+        }
+
+        let num_combined_ops = combined_ops.len();
+        let has_guard = combined_ops.iter().any(|op| op.opcode.is_guard());
+        if !has_guard {
+            if crate::majit_log_enabled() {
+                eprintln!("[jit] compile_retrace: guardless loop");
+            }
+            return false;
+        }
+
+        let compiled_constants = constants.clone();
+        self.backend.set_constants(constants);
+
+        let token_num = self.warm_state.alloc_token_number();
+        let mut token = JitCellToken::new(token_num);
+        let trace_id = self.alloc_trace_id();
+        self.backend.set_next_trace_id(trace_id);
+
+        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.backend
+                .compile_loop(&inputargs, &combined_ops, &mut token)
+        }));
+        let compile_result = match compile_result {
+            Ok(r) => r,
+            Err(_) => {
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit] compile_retrace panicked at key={green_key}");
+                }
+                self.warm_state.abort_tracing(green_key, false);
+                return false;
+            }
+        };
+        match compile_result {
+            Ok(_) => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compiled retrace at key={}, num_inputs={}",
+                        green_key,
+                        inputargs.len()
+                    );
+                }
+                let (resume_data, guard_op_indices, mut exit_layouts) =
+                    compile::build_guard_metadata(&inputargs, &combined_ops, green_key);
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
+                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
+                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                }
+                if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
+                    compile::merge_backend_terminal_exit_layouts(
+                        &mut terminal_exit_layouts,
+                        &backend_layouts,
+                    );
+                }
+                let trace_info = self.backend.compiled_trace_info(&token, trace_id);
+                let mut resume_data = resume_data;
+                compile::enrich_guard_resume_layouts_for_trace(
+                    &mut resume_data,
+                    &mut exit_layouts,
+                    trace_id,
+                    &inputargs,
+                    trace_info.as_ref(),
+                );
+                compile::patch_backend_guard_recovery_layouts_for_trace(
+                    &mut self.backend,
+                    &token,
+                    trace_id,
+                    &mut exit_layouts,
+                );
+                compile::patch_backend_terminal_recovery_layouts_for_trace(
+                    &mut self.backend,
+                    &token,
+                    trace_id,
+                    &mut terminal_exit_layouts,
+                );
+                let mut traces = HashMap::new();
+                traces.insert(
+                    trace_id,
+                    CompiledTrace {
+                        inputargs: inputargs.clone(),
+                        resume_data,
+                        ops: combined_ops,
+                        constants: compiled_constants,
+                        guard_op_indices,
+                        exit_layouts,
+                        terminal_exit_layouts,
+                        optimizer_knowledge: HashMap::new(),
+                    },
+                );
+
+                let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                    previous_tokens.push(old_entry.token);
+                    previous_tokens.extend(old_entry.previous_tokens);
+                }
+                self.compiled_loops.insert(
+                    green_key,
+                    CompiledEntry {
+                        token,
+                        num_inputs: inputargs.len(),
+                        meta,
+                        front_target_tokens: if unroll_opt.target_tokens.is_empty() {
+                            prior_front_target_tokens
+                        } else {
+                            unroll_opt.target_tokens.clone()
+                        },
+                        retraced_count: unroll_opt.retraced_count,
+                        root_trace_id: trace_id,
+                        guard_failures: HashMap::new(),
+                        traces,
+                        previous_tokens,
+                    },
+                );
+                let install_num = self.warm_state.alloc_token_number();
+                let install_token = JitCellToken::new(install_num);
+                self.warm_state
+                    .attach_procedure_to_interp(green_key, install_token);
+                self.stats.loops_compiled += 1;
+
+                if let Some(ref hook) = self.hooks.on_compile_loop {
+                    hook(green_key, 0, num_combined_ops);
+                }
+                true
+            }
+            Err(e) => {
+                self.stats.loops_aborted += 1;
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit] compile_retrace failed: {e}");
+                }
+                self.warm_state.abort_tracing(green_key, false);
+                false
+            }
+        }
     }
 
     /// Abort the current trace.
