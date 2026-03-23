@@ -258,6 +258,15 @@ impl Trace {
         self.op_count = pos.op_count;
     }
 
+    /// Reset finalized flag so cut() can be called after close_loop().
+    ///
+    /// compile_trace records a tentative JUMP (close_loop), snapshots ops,
+    /// then needs to undo the JUMP via cut(). close_loop sets finalized=true,
+    /// so this must be called before cut() in that sequence.
+    pub fn unfinalize(&mut self) {
+        self.finalized = false;
+    }
+
     /// Number of operations recorded so far (not counting input args).
     pub fn num_ops(&self) -> usize {
         self.ops.len()

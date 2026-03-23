@@ -307,6 +307,10 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) exported_state: Option<majit_opt::unroll::ExportedState>,
     /// pyjitpl.py:2373: number of cancelled compilation attempts.
     pub(crate) cancel_count: u32,
+    /// pyjitpl.py:3182: trace position saved before compile_trace records
+    /// a tentative JUMP. If compile_trace triggers retrace_needed, this
+    /// becomes the retracing_from position.
+    pub(crate) potential_retrace_position: Option<majit_trace::recorder::TracePosition>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -599,6 +603,7 @@ impl<M: Clone> MetaInterp<M> {
             retracing_from: None,
             exported_state: None,
             cancel_count: 0,
+            potential_retrace_position: None,
         }
     }
 
@@ -1777,6 +1782,88 @@ impl<M: Clone> MetaInterp<M> {
         self.retracing_from = None;
         self.exported_state = None;
         self.cancel_count = 0;
+    }
+
+    /// compile.py: has_compiled_targets — check if a green key has
+    /// compiled target tokens that a bridge can jump to.
+    pub fn has_compiled_targets(&self, green_key: u64) -> bool {
+        self.compiled_loops
+            .get(&green_key)
+            .map_or(false, |c| !c.front_target_tokens.is_empty())
+    }
+
+    /// pyjitpl.py:3179-3190: compile_trace — try to compile the current
+    /// trace as a bridge to an existing compiled loop.
+    ///
+    /// Called during tracing when a loop header is reached and that loop
+    /// already has compiled code. Records a tentative JUMP, takes a
+    /// snapshot of the trace ops, then cuts the JUMP back off.
+    /// The snapshot is optimized as a bridge; on success the bridge is
+    /// compiled and installed, on failure retrace_needed may be set.
+    ///
+    /// Returns `CompileOutcome::Compiled` if the bridge was successfully
+    /// compiled and installed. The caller should switch to compiled code.
+    /// Returns `CompileOutcome::Cancelled` if the bridge couldn't close
+    /// (retrace_needed was set, or optimization failed).
+    pub fn compile_trace(&mut self, green_key: u64, jump_args: &[OpRef]) -> CompileOutcome {
+        let ctx = match self.tracing.as_mut() {
+            Some(ctx) => ctx,
+            None => return CompileOutcome::Cancelled,
+        };
+
+        // pyjitpl.py:3181: save position before recording JUMP
+        let cut_at = ctx.get_trace_position();
+        self.potential_retrace_position = Some(cut_at);
+
+        // pyjitpl.py:3183-3184: record tentative JUMP to compiled loop
+        ctx.recorder.close_loop(jump_args);
+
+        // Snapshot the trace ops (including JUMP) for bridge compilation.
+        let bridge_ops = ctx.recorder.ops().to_vec();
+        let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
+            .recorder
+            .inputarg_types()
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
+            .collect();
+        let constants = ctx.constants.as_ref().clone();
+
+        // pyjitpl.py:3189: always cut — pop the tentative JUMP.
+        // close_loop sets finalized=true, so we must unset it before cut.
+        ctx.recorder.unfinalize();
+        ctx.recorder.cut(cut_at);
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] compile_trace: key={}, bridge_ops={}, inputargs={}",
+                green_key,
+                bridge_ops.len(),
+                bridge_inputargs.len(),
+            );
+        }
+
+        // Try to compile as a bridge to the existing compiled loop.
+        let fail_descr_types: Vec<Type> = bridge_inputargs.iter().map(|a| a.tp).collect();
+        let fail_descr_ref = crate::fail_descr::make_fail_descr_typed(fail_descr_types);
+        let fail_descr: &dyn majit_ir::FailDescr = fail_descr_ref.as_fail_descr().unwrap();
+        let success = self.compile_bridge(
+            green_key,
+            0, // fail_index: 0 for entry bridge
+            fail_descr,
+            &bridge_ops,
+            &bridge_inputargs,
+            constants,
+        );
+
+        if success {
+            CompileOutcome::Compiled
+        } else {
+            // Bridge optimization failed. If the optimizer set
+            // retrace_requested, retrace_needed has been called by
+            // compile_bridge internally (new target token added).
+            CompileOutcome::Cancelled
+        }
     }
 
     /// pyjitpl.py:2408-2412: retrace_needed — save state from a failed
