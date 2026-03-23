@@ -4559,15 +4559,18 @@ impl SharedOpcodeHandler for TraceFrameState {
 
 impl LocalOpcodeHandler for TraceFrameState {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: set pending concrete from concrete_locals
+        let concrete = self.sym().concrete_locals.get(idx).copied().unwrap_or(PY_NULL);
+        self.sym_mut().pending_concrete_push = Some(concrete);
         self.with_ctx(|this, ctx| TraceFrameState::load_local_value(this, ctx, idx))
     }
 
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
         let _ = name;
+        // MIFrame Box tracking: set pending concrete from concrete_locals
+        let concrete = self.sym().concrete_locals.get(idx).copied().unwrap_or(PY_NULL);
+        self.sym_mut().pending_concrete_push = Some(concrete);
         let value = self.with_ctx(|this, ctx| TraceFrameState::load_local_value(this, ctx, idx))?;
-        // RPython MIFrame keeps int/ref/float registers in separate typed arrays.
-        // Only ref-typed locals can be null/unbound at load time; raw int/float
-        // locals must not pick up a spurious GuardNonnull.
         if self.value_type(value) == Type::Ref {
             self.with_ctx(|this, ctx| {
                 TraceFrameState::guard_nonnull(this, ctx, value);
@@ -4577,6 +4580,11 @@ impl LocalOpcodeHandler for TraceFrameState {
     }
 
     fn store_local_value(&mut self, idx: usize, value: Self::Value) -> Result<(), PyError> {
+        // MIFrame Box tracking: update concrete_locals from last popped value
+        let concrete = self.sym().last_popped_concrete_value.unwrap_or(PY_NULL);
+        if idx < self.sym().concrete_locals.len() {
+            self.sym_mut().concrete_locals[idx] = concrete;
+        }
         self.with_ctx(|this, ctx| TraceFrameState::store_local_value(this, ctx, idx, value))
     }
 }
@@ -4746,6 +4754,28 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
         b: Self::Value,
         op: BinaryOperator,
     ) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete result for int binary ops
+        if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
+            let result = match op {
+                BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.wrapping_add(rhs),
+                BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => lhs.wrapping_sub(rhs),
+                BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => lhs.wrapping_mul(rhs),
+                BinaryOperator::Remainder | BinaryOperator::InplaceRemainder if rhs != 0 => {
+                    ((lhs % rhs) + rhs) % rhs // Python modulo semantics
+                }
+                BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide if rhs != 0 => {
+                    let d = lhs.wrapping_div(rhs);
+                    if (lhs ^ rhs) < 0 && d * rhs != lhs { d - 1 } else { d }
+                }
+                BinaryOperator::And | BinaryOperator::InplaceAnd => lhs & rhs,
+                BinaryOperator::Or | BinaryOperator::InplaceOr => lhs | rhs,
+                BinaryOperator::Xor | BinaryOperator::InplaceXor => lhs ^ rhs,
+                BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lhs.wrapping_shl(rhs as u32),
+                BinaryOperator::Rshift | BinaryOperator::InplaceRshift => lhs.wrapping_shr(rhs as u32),
+                _ => 0, // fallback
+            };
+            self.sym_mut().pending_concrete_push = Some(pyre_object::w_int_new(result));
+        }
         if matches!(op, BinaryOperator::Subscr) {
             self.binary_subscr_value(a, b)
         } else if self.concrete_binary_float_operands()
@@ -4764,6 +4794,18 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
         b: Self::Value,
         op: ComparisonOperator,
     ) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete comparison result
+        if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
+            let result = match op {
+                ComparisonOperator::Less => lhs < rhs,
+                ComparisonOperator::LessOrEqual => lhs <= rhs,
+                ComparisonOperator::Greater => lhs > rhs,
+                ComparisonOperator::GreaterOrEqual => lhs >= rhs,
+                ComparisonOperator::Equal => lhs == rhs,
+                ComparisonOperator::NotEqual => lhs != rhs,
+            };
+            self.sym_mut().pending_concrete_push = Some(pyre_object::w_bool_from(result));
+        }
         self.compare_value_direct(a, b, op)
     }
 
@@ -4778,30 +4820,37 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
 
 impl ConstantOpcodeHandler for TraceFrameState {
     fn int_constant(&mut self, value: i64) -> Result<Self::Value, PyError> {
+        self.sym_mut().pending_concrete_push = Some(pyre_object::w_int_new(value));
         self.trace_int_constant(value)
     }
 
     fn bigint_constant(&mut self, value: &PyBigInt) -> Result<Self::Value, PyError> {
+        self.sym_mut().pending_concrete_push = Some(pyre_object::w_long_new(value.clone()));
         self.trace_bigint_constant(value)
     }
 
     fn float_constant(&mut self, value: f64) -> Result<Self::Value, PyError> {
+        self.sym_mut().pending_concrete_push = Some(pyre_object::w_float_new(value));
         self.trace_float_constant(value)
     }
 
     fn bool_constant(&mut self, value: bool) -> Result<Self::Value, PyError> {
+        self.sym_mut().pending_concrete_push = Some(pyre_object::w_bool_from(value));
         self.trace_bool_constant(value)
     }
 
     fn str_constant(&mut self, value: &str) -> Result<Self::Value, PyError> {
+        self.sym_mut().pending_concrete_push = Some(pyre_object::w_str_new(value));
         self.trace_str_constant(value)
     }
 
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError> {
+        // Code objects don't have a simple concrete repr; use PY_NULL
         self.trace_code_constant(code)
     }
 
     fn none_constant(&mut self) -> Result<Self::Value, PyError> {
+        self.sym_mut().pending_concrete_push = Some(pyre_object::w_none());
         self.trace_none_constant()
     }
 }
