@@ -417,12 +417,22 @@ impl PtrInfo {
 
         match self {
             PtrInfo::VirtualStruct(vinfo) => {
-                ctx.set_ptr_info(opref, PtrInfo::NonNull);
+                // RPython info.py: _is_virtual = False, _fields retained.
+                let preserved = PtrInfo::Struct(StructPtrInfo {
+                    descr: vinfo.descr.clone(),
+                    fields: vinfo
+                        .fields
+                        .iter()
+                        .map(|&(idx, val)| (idx, ctx.get_replacement(val)))
+                        .collect(),
+                    field_descrs: vinfo.field_descrs.clone(),
+                });
                 let mut new_op = Op::new(OpCode::New, &[]);
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
+                // Store preserved info on alloc_ref (canonical after force).
+                ctx.set_ptr_info_direct(alloc_ref, preserved);
                 if opref != alloc_ref {
-                    ctx.set_ptr_info(alloc_ref, PtrInfo::NonNull);
                     ctx.replace_op(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
@@ -439,12 +449,22 @@ impl PtrInfo {
                 alloc_ref
             }
             PtrInfo::Virtual(vinfo) => {
-                ctx.set_ptr_info(opref, PtrInfo::NonNull);
+                // RPython info.py: _is_virtual = False, _fields retained.
+                let preserved = PtrInfo::Instance(InstancePtrInfo {
+                    descr: Some(vinfo.descr.clone()),
+                    known_class: vinfo.known_class,
+                    fields: vinfo
+                        .fields
+                        .iter()
+                        .map(|&(idx, val)| (idx, ctx.get_replacement(val)))
+                        .collect(),
+                    field_descrs: vinfo.field_descrs.clone(),
+                });
                 let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
+                ctx.set_ptr_info_direct(alloc_ref, preserved);
                 if opref != alloc_ref {
-                    ctx.set_ptr_info(alloc_ref, PtrInfo::NonNull);
                     ctx.replace_op(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
