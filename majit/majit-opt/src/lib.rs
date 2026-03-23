@@ -101,6 +101,50 @@ pub struct TrackedPreambleUse {
 /// allocated memory. The optimizer writes field values directly.
 pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
 
+// --- Phase A: new forwarding types (additive, not yet wired) ---
+
+/// Unified forwarding slot. RPython stores forwarded as one of:
+/// - another op (Op), a PtrInfo (Info), or a Const (Constant).
+/// This replaces the separate `forwarding`, `ptr_info`, `constants` vecs
+/// once migration is complete.
+#[derive(Clone)]
+pub enum Forwarded {
+    None,
+    Op(OpRef),
+    Info(InfoRef),
+    Constant(Value),
+}
+
+/// Handle into `InfoArena`. Lightweight copy type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InfoRef(pub u32);
+
+/// Arena allocator for `PtrInfo` objects. Provides stable `InfoRef` handles
+/// that do not move when the arena grows.
+pub struct InfoArena {
+    infos: Vec<PtrInfo>,
+}
+
+impl InfoArena {
+    pub fn new() -> Self {
+        Self { infos: Vec::new() }
+    }
+
+    pub fn alloc(&mut self, info: PtrInfo) -> InfoRef {
+        let idx = self.infos.len();
+        self.infos.push(info);
+        InfoRef(idx as u32)
+    }
+
+    pub fn get(&self, r: InfoRef) -> &PtrInfo {
+        &self.infos[r.0 as usize]
+    }
+
+    pub fn get_mut(&mut self, r: InfoRef) -> &mut PtrInfo {
+        &mut self.infos[r.0 as usize]
+    }
+}
+
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.
@@ -233,6 +277,10 @@ pub struct OptContext {
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
     pub in_final_emission: bool,
+    /// Phase A: unified forwarding table (additive, not yet wired).
+    pub forwarded: Vec<Forwarded>,
+    /// Phase A: arena for PtrInfo objects (additive, not yet wired).
+    pub info_arena: InfoArena,
 }
 
 impl OptContext {
@@ -276,6 +324,8 @@ impl OptContext {
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             import_boxes: HashMap::new(),
+            forwarded: Vec::new(),
+            info_arena: InfoArena::new(),
         }
     }
 
@@ -319,6 +369,8 @@ impl OptContext {
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             import_boxes: HashMap::new(),
+            forwarded: Vec::new(),
+            info_arena: InfoArena::new(),
         }
     }
 
@@ -682,28 +734,37 @@ impl OptContext {
     /// Record that `old` should be replaced by `new` wherever it appears.
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new {
-            return; // avoid self-referencing forwarding loop
+            return;
         }
         let idx = old.0 as usize;
         if idx >= self.forwarding.len() {
             self.forwarding.resize(idx + 1, OpRef::NONE);
         }
         self.forwarding[idx] = new;
+        // Sync to forwarded table.
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
+        }
+        self.forwarded[idx] = Forwarded::Op(new);
     }
 
     /// RPython Box identity: set per-value forwarding for import_state.
     /// This does NOT use the flat forwarding table, preventing chains.
     pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
         self.import_boxes.insert(source, target);
+        // Sync: import_boxes → forwarded Op.
+        let idx = source.0 as usize;
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
+        }
+        self.forwarded[idx] = Forwarded::Op(target);
     }
 
-    /// Follow the forwarding chain to get the current replacement for `opref`.
-    /// Import boxes are checked FIRST — they provide 1-hop forwarding
-    /// that doesn't chain through the flat table.
+    /// RPython get_box_replacement: follow forwarding chain, stop when the
+    /// NEXT position has ptr_info set (it's a terminal, like RPython's
+    /// get_box_replacement stopping at _forwarded=Info).
     pub fn get_replacement(&self, mut opref: OpRef) -> OpRef {
-        // RPython Box identity: import_state's per-value forwarding.
-        // Returns target directly (target's own forwarding is NOT followed
-        // because target is like RPython's v5_box with no _forwarded).
+        // RPython Box identity: import_boxes checked first.
         if let Some(&target) = self.import_boxes.get(&opref) {
             return target;
         }
@@ -715,6 +776,13 @@ impl OptContext {
             let next = self.forwarding[idx];
             if next.is_none() {
                 return opref;
+            }
+            // RPython: stop if NEXT has Info (ptr_info set → terminal).
+            let next_idx = next.0 as usize;
+            if next_idx < self.ptr_info.len() {
+                if self.ptr_info[next_idx].is_some() {
+                    return next;
+                }
             }
             opref = next;
         }
