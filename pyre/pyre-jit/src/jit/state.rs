@@ -4018,22 +4018,9 @@ impl TraceFrameState {
         // track results via pending_concrete_push instead of frame stack ops.
         self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(concrete_result));
 
-        // Update caller_frame only if its stack is in sync (single-step mode).
-        let caller_frame =
-            unsafe { &mut *(self.concrete_frame as *mut pyre_interp::frame::PyFrame) };
-        let call_pc = self.fallthrough_pc.saturating_sub(1);
-        let snapshot_depth = caller_frame.valuestackdepth;
-        let expected_pop = args.len() + 2; // args + null_or_self + callable
-        if snapshot_depth >= caller_frame.nlocals() + caller_frame.ncells() + expected_pop {
-            for _ in 0..args.len() {
-                let _ = caller_frame.pop();
-            }
-            let _ = caller_frame.pop(); // null_or_self
-            let _ = caller_frame.pop(); // callable
-            caller_frame.push(concrete_result);
-            caller_frame.next_instr = self.fallthrough_pc;
-            caller_frame.pending_inline_resume_pc = Some(call_pc);
-        }
+        // RPython finishframe parity: result is stored via pending_concrete_push.
+        // No concrete_frame stack manipulation needed — MIFrame Box tracking
+        // handles all concrete state internally.
 
         Ok(result_opref)
     }
