@@ -1301,10 +1301,13 @@ impl OptHeap {
         };
 
         let (array, descr_idx, const_index) = key;
+        let array = ctx.get_replacement(array);
         let new_value = op.arg(2);
 
-        // Check if writing the same value (lazy_set or cached entry).
-        if let Some(cai) = self.array_cache.get(&(descr_idx, const_index)) {
+        // heap.py:77-101: do_setfield (shared by CachedField AND ArrayCachedItem)
+        // Write-after-write check.
+        {
+            let cai = self.get_or_create_cached_arrayitem(descr_idx, const_index);
             if let Some((lazy_obj, lazy_op)) = &cai.lazy_set {
                 if *lazy_obj == array && lazy_op.arg(2) == new_value {
                     return OptimizationResult::Remove;
@@ -1317,10 +1320,51 @@ impl OptHeap {
             }
         }
 
-        // Store as lazy set.
+        // heap.py:81-83: possible_aliasing → force_lazy_set
+        let needs_force = self
+            .array_cache
+            .get(&(descr_idx, const_index))
+            .map_or(false, |cai| cai.possible_aliasing(array));
+        if needs_force {
+            let lazy_data = self
+                .array_cache
+                .get_mut(&(descr_idx, const_index))
+                .and_then(|cai| cai.lazy_set.take());
+            if let Some((lazy_obj, mut lazy_op)) = lazy_data {
+                let cai = self.get_or_create_cached_arrayitem(descr_idx, const_index);
+                cai.invalidate();
+                if let Some(ref postponed) = self.postponed_op {
+                    let ppos = postponed.pos;
+                    if lazy_op.args.iter().any(|a| *a == ppos) {
+                        if let Some(p) = self.postponed_op.take() {
+                            ctx.emit(p);
+                        }
+                    }
+                }
+                Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                // put_field_back_to_info
+                let final_value = lazy_op.arg(2);
+                let descr = lazy_op.descr.clone();
+                self.cache_arrayitem(lazy_obj, descr_idx, const_index, final_value, descr.as_ref());
+            }
+        }
+
+        // heap.py:84-101: recheck after force
+        {
+            let cai = self.get_or_create_cached_arrayitem(descr_idx, const_index);
+            if let Some(cached) = cai.get_entry(array) {
+                let cached = ctx.get_replacement(cached);
+                if cached == new_value {
+                    cai.lazy_set = None;
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
+
+        // Store as lazy set. heap.py:89-90
         let cai = self.get_or_create_cached_arrayitem(descr_idx, const_index);
         cai.lazy_set = Some((array, op.clone()));
-        // Remove stale entry for this array (will be re-cached on next get).
+        // Remove stale entry
         let idx = cai.cached_arrays.iter().position(|a| *a == array);
         if let Some(idx) = idx {
             cai.cached_arrays.swap_remove(idx);
