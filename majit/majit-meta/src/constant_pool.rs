@@ -75,6 +75,13 @@ impl ConstantPool {
     pub fn as_ref(&self) -> &HashMap<u32, i64> {
         &self.constants
     }
+
+    /// Clone the constants map without consuming the pool.
+    /// Used by compile_trace which needs a copy for compilation
+    /// while keeping the pool alive for potential continued tracing.
+    pub fn snapshot(&self) -> HashMap<u32, i64> {
+        self.constants.clone()
+    }
 }
 
 impl Default for ConstantPool {

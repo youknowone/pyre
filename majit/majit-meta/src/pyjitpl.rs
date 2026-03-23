@@ -3496,6 +3496,15 @@ impl<M: Clone> MetaInterp<M> {
             .map_or(false, |c| !c.token.is_invalidated())
     }
 
+    /// pyjitpl.py:3892 has_compiled_targets(): check whether a green key
+    /// has a compiled loop with target tokens (preamble peeling entries).
+    #[inline]
+    pub fn has_compiled_targets(&self, green_key: u64) -> bool {
+        self.compiled_loops.get(&green_key).map_or(false, |c| {
+            !c.token.is_invalidated() && !c.front_target_tokens.is_empty()
+        })
+    }
+
     /// Remove all compiled loops. Used when guard-fail recovery is
     /// unrecoverable (null Ref in resume data).
     pub fn clear_compiled_loops(&mut self) {
@@ -3573,6 +3582,212 @@ impl<M: Clone> MetaInterp<M> {
             force_token_slots: exit_layout.force_token_slots.clone(),
             is_finish: exit_layout.is_finish,
         })
+    }
+
+    // ── compile_trace (pyjitpl.py:3179) ──────────────────────────
+
+    /// pyjitpl.py:3179-3190 compile_trace(): when tracing reaches a loop
+    /// header that has existing compiled code, compile the current trace
+    /// as a bridge to that compiled code.
+    ///
+    /// Records a temporary JUMP to the target loop token, compiles the
+    /// trace using optimize_bridge, then cuts the JUMP from history.
+    /// Returns true if compilation succeeded.
+    pub fn compile_trace(&mut self, target_green_key: u64, jump_args: &[OpRef]) -> bool {
+        if !self.has_compiled_targets(target_green_key) {
+            return false;
+        }
+        let ctx = match self.tracing.as_mut() {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+
+        // history.py get_trace_position() — save position for cut
+        let cut_at = ctx.recorder.get_trace_position();
+
+        // Record JUMP to existing compiled loop (pyjitpl.py:3183)
+        ctx.recorder.close_loop(jump_args);
+
+        // Get trace snapshot for compilation (recorder is not consumed)
+        let trace = ctx.recorder.get_trace_snapshot();
+        let constants = ctx.constants.snapshot();
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] compile_trace: target_key={}, ops={}",
+                target_green_key,
+                trace.ops.len()
+            );
+            eprintln!("--- compile_trace (before opt) ---");
+            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
+        }
+
+        // compile.py:1023 compile_trace with ends_with_jump=True:
+        // Use optimize_bridge with the target loop's target_tokens.
+        let mut optimizer = self.make_optimizer();
+        let mut constants = constants;
+        let compiled = match self.compiled_loops.get_mut(&target_green_key) {
+            Some(c) => c,
+            None => {
+                // Cut the JUMP (finally block)
+                if let Some(ctx) = self.tracing.as_mut() {
+                    ctx.recorder.cut(cut_at);
+                }
+                return false;
+            }
+        };
+
+        let inline_short_preamble = true;
+        let retraced_count = compiled.retraced_count;
+        let retrace_limit = 0u32;
+        let (optimized_ops, retrace_requested) = optimizer.optimize_bridge(
+            &trace.ops,
+            &mut constants,
+            trace.inputargs.len(),
+            &mut compiled.front_target_tokens,
+            inline_short_preamble,
+            retraced_count,
+            retrace_limit,
+            None, // no bridge knowledge for compile_trace
+        );
+
+        if retrace_requested {
+            compiled.retraced_count += 1;
+            if let Some(exported) = optimizer.exported_loop_state.take() {
+                let mut new_token = majit_opt::unroll::TargetToken::new_preamble(
+                    compiled.front_target_tokens.len() as u64,
+                );
+                new_token.virtual_state = Some(exported.virtual_state);
+                compiled.front_target_tokens.push(new_token);
+            }
+        }
+
+        // compile.py:1070 — if info.final(), compile and attach
+        let has_label = optimized_ops.iter().any(|op| op.opcode == OpCode::Label);
+        let has_jump = optimized_ops
+            .last()
+            .is_some_and(|op| op.opcode == OpCode::Jump);
+        let success = has_label && has_jump;
+
+        if success {
+            let optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
+            let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+
+            if crate::majit_log_enabled() {
+                eprintln!("--- compile_trace (after opt) ---");
+                eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
+            }
+
+            // Compile as a new loop — the JUMP target is the existing
+            // compiled code's Label, so execution will transfer there.
+            let compiled_constants = constants.clone();
+            self.backend.set_constants(constants);
+
+            let token_num = self.warm_state.alloc_token_number();
+            let mut token = JitCellToken::new(token_num);
+            let trace_id = self.alloc_trace_id();
+            self.backend.set_next_trace_id(trace_id);
+
+            let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.backend
+                    .compile_loop(&trace.inputargs, &optimized_ops, &mut token)
+            }));
+
+            match compile_result {
+                Ok(Ok(_)) => {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_trace success: target_key={}",
+                            target_green_key
+                        );
+                    }
+                    // Store as compiled loop for the tracing green key
+                    let tracing_green_key = self
+                        .tracing
+                        .as_ref()
+                        .map(|ctx| ctx.green_key)
+                        .unwrap_or(target_green_key);
+
+                    let (resume_data, guard_op_indices, exit_layouts) =
+                        compile::build_guard_metadata(
+                            &trace.inputargs,
+                            &optimized_ops,
+                            tracing_green_key,
+                        );
+                    let terminal_exit_layouts =
+                        compile::build_terminal_exit_layouts(&trace.inputargs, &optimized_ops);
+
+                    let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                    if let Some(old_entry) = self.compiled_loops.remove(&tracing_green_key) {
+                        previous_tokens.push(old_entry.token);
+                        previous_tokens.extend(old_entry.previous_tokens);
+                    }
+                    let meta = self
+                        .compiled_loops
+                        .get(&target_green_key)
+                        .map(|c| c.meta.clone())
+                        .unwrap_or_else(|| {
+                            // Should not happen — target_green_key was just verified
+                            panic!("compile_trace: target loop disappeared")
+                        });
+                    self.compiled_loops.insert(
+                        tracing_green_key,
+                        CompiledEntry {
+                            token: {
+                                let install_num = self.warm_state.alloc_token_number();
+                                let install_token = JitCellToken::new(install_num);
+                                self.warm_state
+                                    .attach_procedure_to_interp(tracing_green_key, install_token);
+                                token
+                            },
+                            num_inputs: trace.inputargs.len(),
+                            meta,
+                            front_target_tokens: Vec::new(),
+                            retraced_count: 0,
+                            root_trace_id: trace_id,
+                            guard_failures: HashMap::new(),
+                            traces: {
+                                let mut traces = HashMap::new();
+                                traces.insert(
+                                    trace_id,
+                                    CompiledTrace {
+                                        inputargs: trace.inputargs.clone(),
+                                        resume_data,
+                                        ops: optimized_ops,
+                                        constants: compiled_constants,
+                                        guard_op_indices,
+                                        exit_layouts,
+                                        terminal_exit_layouts,
+                                        optimizer_knowledge: HashMap::new(),
+                                    },
+                                );
+                                traces
+                            },
+                            previous_tokens,
+                        },
+                    );
+                    self.stats.loops_compiled += 1;
+                }
+                _ => {
+                    if crate::majit_log_enabled() {
+                        eprintln!("[jit] compile_trace: compilation failed");
+                    }
+                }
+            }
+        }
+
+        // history.py cut(): always remove the JUMP (finally block)
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.recorder.cut(cut_at);
+        }
+
+        // If successful, take the tracing context (trace is done)
+        if success {
+            self.tracing.take();
+            self.forced_virtualizable = None;
+        }
+
+        success
     }
 
     // ── Bridge Compilation ──────────────────────────────────────

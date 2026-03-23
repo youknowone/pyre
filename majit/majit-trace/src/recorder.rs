@@ -326,6 +326,29 @@ impl Trace {
             }
         }
     }
+
+    /// history.py get_trace_position(): save current trace position for
+    /// later cut(). Returns (ops_len, op_count, finalized).
+    pub fn get_trace_position(&self) -> (usize, u32, bool) {
+        (self.ops.len(), self.op_count, self.finalized)
+    }
+
+    /// history.py cut(): truncate trace back to a saved position.
+    /// Used by compile_trace to temporarily record a JUMP, compile,
+    /// then remove the JUMP.
+    pub fn cut(&mut self, position: (usize, u32, bool)) {
+        let (ops_len, op_count, finalized) = position;
+        self.ops.truncate(ops_len);
+        self.op_count = op_count;
+        self.finalized = finalized;
+    }
+
+    /// Get a snapshot of the trace for compilation without consuming
+    /// the recorder. Used by compile_trace which needs to compile
+    /// the trace and then cut back.
+    pub fn get_trace_snapshot(&self) -> TreeLoop {
+        TreeLoop::new(self.inputargs.clone(), self.ops.clone())
+    }
 }
 
 impl Default for Trace {
