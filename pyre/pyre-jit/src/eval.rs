@@ -240,12 +240,19 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         };
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
-        // Fast path: driver.is_tracing() is false most of the time.
-        // Only access TLS depth when actually tracing.
-        if is_portal && driver.is_tracing() {
+        // Fast path: check TLS tracing_depth first (cheap, L1 cache).
+        // driver.is_tracing() is checked only when depth==0 and trace just started.
+        if is_portal {
             let tracing_depth = JIT_TRACING_DEPTH.with(|t| t.get());
-            let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
-            if tracing_depth == 0 || current_depth == tracing_depth {
+            if tracing_depth != 0 {
+                let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
+                if current_depth == tracing_depth {
+                    if let Some(result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+                        return result;
+                    }
+                }
+            } else if driver.is_tracing() {
+                // First merge_point after trace start — depth not yet set.
                 if let Some(result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
                     return result;
                 }
