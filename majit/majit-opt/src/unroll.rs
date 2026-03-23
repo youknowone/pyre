@@ -1207,7 +1207,11 @@ impl OptUnroll {
             }
             let extra_guards = target_vs.generate_guards(&virtual_state, &args, runtime_boxes);
             for guard_req in &extra_guards {
-                if let Some(guard_op) = guard_req.to_op(&args) {
+                if let Some(mut guard_op) = guard_req.to_op(&args) {
+                    // unroll.py:336-337: copy resume position from patchguardop
+                    if let Some(ref patch) = ctx.patchguardop {
+                        guard_op.descr = patch.descr.clone();
+                    }
                     optimizer.send_extra_operation(&guard_op, ctx);
                 }
             }
@@ -1355,6 +1359,13 @@ impl OptUnroll {
                         if let Some(&mapped) = mapping.get(arg) {
                             *arg = mapped;
                         }
+                    }
+                }
+                // unroll.py:405-409: guards in short preamble inherit
+                // resume position from patchguardop
+                if new_op.opcode.is_guard() {
+                    if let Some(ref patch) = ctx.patchguardop {
+                        new_op.descr = patch.descr.clone();
                     }
                 }
                 let new_ref = ctx.alloc_op_position();
