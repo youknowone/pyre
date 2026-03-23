@@ -4677,6 +4677,12 @@ impl SharedOpcodeHandler for TraceFrameState {
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete getattr
+        if let Some(concrete_obj) = self.concrete_popped_value() {
+            if let Ok(result) = pyre_objspace::space::py_getattr(concrete_obj, name) {
+                self.sym_mut().pending_concrete_push = Some(result);
+            }
+        }
         self.trace_load_attr(obj, name)
     }
 
@@ -4811,6 +4817,11 @@ impl TruthOpcodeHandler for TraceFrameState {
         truth: Self::Truth,
         negate: bool,
     ) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete bool from truth
+        if let Some(concrete_truth) = self.sym().last_comparison_concrete_truth {
+            let result = if negate { !concrete_truth } else { concrete_truth };
+            self.sym_mut().pending_concrete_push = Some(pyre_object::w_bool_from(result));
+        }
         self.trace_bool_value_from_truth(truth, negate)
     }
 }
