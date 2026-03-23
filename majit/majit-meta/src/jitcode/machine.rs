@@ -798,6 +798,10 @@ where
         sym.linked_list_writeback_head(ctx, selected, next);
         let _ = self.linked_list_adjust_size(ctx, sym, selected, -1)?;
 
+        // RPython frees popped nodes via minimark nursery collection (bulk).
+        // Interpreter pop() calls free_node() directly; compiled code relies
+        // on the interpreter free list being populated on guard exits.
+
         let concrete = self
             .runtime_stack_mut(selected, runtime)
             .pop()
