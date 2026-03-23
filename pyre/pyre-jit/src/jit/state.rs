@@ -1033,6 +1033,17 @@ impl PyreSym {
         }
         Type::Ref
     }
+
+    /// Read a concrete value from the Box arrays using an absolute
+    /// unified-array index (0..nlocals = locals, nlocals.. = stack).
+    pub(crate) fn concrete_value_at(&self, abs_idx: usize) -> PyObjectRef {
+        if abs_idx < self.nlocals {
+            self.concrete_locals.get(abs_idx).copied().unwrap_or(PY_NULL)
+        } else {
+            let stack_idx = abs_idx - self.nlocals;
+            self.concrete_stack.get(stack_idx).copied().unwrap_or(PY_NULL)
+        }
+    }
 }
 
 impl TraceFrameState {
@@ -1122,7 +1133,7 @@ impl TraceFrameState {
         if !slot.is_none() {
             return slot;
         }
-        let concrete_value = concrete_stack_value(self.concrete_frame, abs_idx).unwrap_or(PY_NULL);
+        let concrete_value = self.concrete_at_or_frame(abs_idx).unwrap_or(PY_NULL);
         let typed_value = extract_concrete_typed_value(slot_type, concrete_value);
         fail_arg_opref_for_typed_value(ctx, typed_value)
     }
@@ -1376,7 +1387,7 @@ impl TraceFrameState {
     ) -> Result<(), PyError> {
         let vtype = self.value_type(value);
         let concrete_slot_type =
-            concrete_stack_value(self.concrete_frame, idx).map(concrete_virtualizable_slot_type);
+            self.concrete_at_or_frame(idx).map(concrete_virtualizable_slot_type);
         match (concrete_slot_type, vtype) {
             (Some(Type::Int), Type::Ref) => {
                 value = self.trace_guarded_int_payload(ctx, value);
@@ -1795,23 +1806,32 @@ impl TraceFrameState {
     fn concrete_popped_value(&self) -> Option<PyObjectRef> {
         self.sym()
             .last_popped_concrete_value
-            .or_else(|| concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth))
+            .or_else(|| self.concrete_at_or_frame(self.sym().valuestackdepth))
+    }
+
+    /// Read a concrete value from Box arrays first, falling back to concrete_frame.
+    fn concrete_at_or_frame(&self, abs_idx: usize) -> Option<PyObjectRef> {
+        let v = self.sym().concrete_value_at(abs_idx);
+        if !v.is_null() {
+            return Some(v);
+        }
+        concrete_stack_value(self.concrete_frame, abs_idx)
     }
 
     fn concrete_binary_operands(&self) -> Option<(PyObjectRef, PyObjectRef)> {
         let vsd = self.sym().valuestackdepth;
         Some((
-            concrete_stack_value(self.concrete_frame, vsd)?,
-            concrete_stack_value(self.concrete_frame, vsd.checked_add(1)?)?,
+            self.concrete_at_or_frame(vsd)?,
+            self.concrete_at_or_frame(vsd + 1)?,
         ))
     }
 
     fn concrete_store_subscr_operands(&self) -> Option<(PyObjectRef, PyObjectRef, PyObjectRef)> {
         let vsd = self.sym().valuestackdepth;
         Some((
-            concrete_stack_value(self.concrete_frame, vsd)?,
-            concrete_stack_value(self.concrete_frame, vsd.checked_add(1)?)?,
-            concrete_stack_value(self.concrete_frame, vsd.checked_add(2)?)?,
+            self.concrete_at_or_frame(vsd)?,
+            self.concrete_at_or_frame(vsd + 1)?,
+            self.concrete_at_or_frame(vsd + 2)?,
         ))
     }
 
@@ -2830,21 +2850,17 @@ impl TraceFrameState {
     }
 
     pub(crate) fn concrete_iter_continues(&self) -> Result<bool, PyError> {
-        let concrete_iter =
-            concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth - 1)
-                .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
+        let concrete_iter = self.concrete_at_or_frame(self.sym().valuestackdepth - 1)
+            .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
         range_iter_continues(concrete_iter)
     }
 
     fn concrete_callable_after_pops(&self) -> Option<PyObjectRef> {
-        concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth)
+        self.concrete_at_or_frame(self.sym().valuestackdepth)
     }
 
     fn concrete_call_arg_after_pops(&self, arg_idx: usize) -> Option<PyObjectRef> {
-        concrete_stack_value(
-            self.concrete_frame,
-            self.sym().valuestackdepth + 2 + arg_idx,
-        )
+        self.concrete_at_or_frame(self.sym().valuestackdepth + 2 + arg_idx)
     }
 
     fn trace_known_builtin_call(
@@ -3959,7 +3975,7 @@ impl TraceFrameState {
 
     pub(crate) fn iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
         let concrete_iter =
-            concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth - 1)
+            self.concrete_at_or_frame(self.sym().valuestackdepth - 1)
                 .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step =
@@ -4015,7 +4031,7 @@ impl TraceFrameState {
         let concrete_val = self
             .sym_mut()
             .last_popped_concrete_value
-            .or_else(|| concrete_stack_value(self.concrete_frame, self.sym().valuestackdepth))
+            .or_else(|| self.concrete_at_or_frame(self.sym().valuestackdepth))
             .ok_or_else(|| PyError::type_error("missing concrete branch value during trace"))?;
         Ok(objspace_truth_value(concrete_val))
     }
