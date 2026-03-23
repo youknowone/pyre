@@ -61,10 +61,10 @@ pub(crate) struct CompiledTrace {
     pub(crate) exit_layouts: HashMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
     pub(crate) terminal_exit_layouts: HashMap<usize, StoredExitLayout>,
-    /// bridgeopt.py: serialized optimizer knowledge per guard.
-    /// Heap cache, known classes, and loopinvariant results known at guard time.
+    /// bridgeopt.py: serialized optimizer knowledge per guard, keyed by fail_index.
+    /// Each guard gets the optimizer knowledge state at its point in the trace.
     /// Used by deserialize_optimizer_knowledge when compiling a bridge.
-    pub(crate) optimizer_knowledge: OptimizerKnowledge,
+    pub(crate) optimizer_knowledge: HashMap<u32, OptimizerKnowledge>,
 }
 
 pub(crate) struct StoredResumeData {
@@ -1552,7 +1552,7 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
-                        optimizer_knowledge: OptimizerKnowledge::new(), // TODO: serialize from optimizer
+                        optimizer_knowledge: HashMap::new(), // TODO: serialize from optimizer
                     },
                 );
 
@@ -1806,6 +1806,21 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
+                let per_guard_knowledge = {
+                    let knowledge = optimizer.final_ctx.as_ref()
+                        .map(|c| optimizer.serialize_optimizer_knowledge(c))
+                        .unwrap_or_default();
+                    if knowledge.is_empty() {
+                        HashMap::new()
+                    } else {
+                        // Store the same end-of-trace knowledge for each guard.
+                        // This is conservative: early guards may get less
+                        // knowledge than optimal, but never wrong knowledge.
+                        guard_op_indices.keys()
+                            .map(|&fi| (fi, knowledge.clone()))
+                            .collect()
+                    }
+                };
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -1817,12 +1832,7 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
-                        optimizer_knowledge: {
-                            let ctx = optimizer.final_ctx.as_ref()
-                                .map(|c| optimizer.serialize_optimizer_knowledge(c))
-                                .unwrap_or_default();
-                            ctx
-                        },
+                        optimizer_knowledge: per_guard_knowledge,
                     },
                 );
                 {
@@ -3006,7 +3016,8 @@ impl<M: Clone> MetaInterp<M> {
                 if tid == 0 { compiled.root_trace_id } else { tid }
             };
             compiled.traces.get(&source_trace_id).and_then(|trace| {
-                if trace.optimizer_knowledge.is_empty() {
+                let knowledge = trace.optimizer_knowledge.get(&fail_index)?;
+                if knowledge.is_empty() {
                     return None;
                 }
                 // Build mapping: source_trace_opref -> bridge_inputarg_index.
@@ -3027,7 +3038,7 @@ impl<M: Clone> MetaInterp<M> {
                     let opref = majit_ir::OpRef(idx);
                     remap.entry(opref).or_insert(opref);
                 }
-                let remapped = trace.optimizer_knowledge.remap(&remap);
+                let remapped = knowledge.remap(&remap);
                 if remapped.is_empty() { None } else { Some(remapped) }
             })
         };
@@ -3183,7 +3194,7 @@ impl<M: Clone> MetaInterp<M> {
                             guard_op_indices,
                             exit_layouts,
                             terminal_exit_layouts,
-                            optimizer_knowledge: OptimizerKnowledge::new(),
+                            optimizer_knowledge: HashMap::new(),
                         },
                     );
                 }
@@ -4512,7 +4523,7 @@ mod tests {
                 guard_op_indices,
                 exit_layouts,
                 terminal_exit_layouts,
-                optimizer_knowledge: OptimizerKnowledge::new(),
+                optimizer_knowledge: HashMap::new(),
             },
         );
 
@@ -4975,7 +4986,7 @@ mod tests {
                 guard_op_indices: HashMap::new(),
                 exit_layouts: HashMap::new(),
                 terminal_exit_layouts: HashMap::new(),
-                optimizer_knowledge: OptimizerKnowledge::new(),
+                optimizer_knowledge: HashMap::new(),
             },
         );
 
@@ -5078,7 +5089,7 @@ mod tests {
                 guard_op_indices: HashMap::new(),
                 exit_layouts,
                 terminal_exit_layouts: HashMap::new(),
-                optimizer_knowledge: OptimizerKnowledge::new(),
+                optimizer_knowledge: HashMap::new(),
             },
         );
         meta.compiled_loops.insert(
@@ -5367,7 +5378,7 @@ mod tests {
                 guard_op_indices: HashMap::new(),
                 exit_layouts: HashMap::new(),
                 terminal_exit_layouts: HashMap::new(),
-                optimizer_knowledge: OptimizerKnowledge::new(),
+                optimizer_knowledge: HashMap::new(),
             },
         );
         meta.compiled_loops.insert(
@@ -6459,7 +6470,7 @@ mod tests {
                 guard_op_indices: HashMap::new(),
                 exit_layouts,
                 terminal_exit_layouts,
-                optimizer_knowledge: OptimizerKnowledge::new(),
+                optimizer_knowledge: HashMap::new(),
             },
         );
         meta.compiled_loops.insert(
