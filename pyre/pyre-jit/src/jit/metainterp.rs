@@ -170,6 +170,56 @@ impl PyreMetaInterp {
 }
 
 impl PyreMetaFrame {
+    /// Push a FrontendOp onto the operand stack.
+    fn push(&mut self, op: FrontendOp) {
+        self.sym.symbolic_stack.push(op.opref);
+        self.concrete_stack.push(op.concrete);
+    }
+
+    /// Pop a FrontendOp from the operand stack.
+    fn pop(&mut self) -> FrontendOp {
+        let opref = self.sym.symbolic_stack.pop().unwrap_or(OpRef::NONE);
+        let concrete = self.concrete_stack.pop().unwrap_or(ConcreteValue::Null);
+        FrontendOp::new(opref, concrete)
+    }
+
+    /// Peek at the top of the operand stack without popping.
+    fn peek(&self) -> FrontendOp {
+        let opref = self.sym.symbolic_stack.last().copied().unwrap_or(OpRef::NONE);
+        let concrete = self.concrete_stack.last().copied().unwrap_or(ConcreteValue::Null);
+        FrontendOp::new(opref, concrete)
+    }
+
+    /// RPython MetaInterp.execute_and_record() parity.
+    ///
+    /// Step 1: executor.execute() — compute concrete result
+    /// Step 2: Check constant fold
+    /// Step 3: history.record() — record IR operation
+    fn execute_and_record(
+        &self,
+        ctx: &mut TraceCtx,
+        opcode: majit_ir::OpCode,
+        args: &[FrontendOp],
+        descr: Option<majit_ir::DescrRef>,
+    ) -> FrontendOp {
+        // Step 1: Concrete execution (RPython executor.execute)
+        let concrete_args: Vec<ConcreteValue> = args.iter().map(|a| a.concrete).collect();
+        let concrete_result = super::executor::execute_opcode(opcode, &concrete_args);
+
+        // Step 2: Constant fold (RPython: if pure and all_const → wrap_constant)
+        // TODO: implement constant folding check
+
+        // Step 3: Record IR (RPython history.record)
+        let arg_oprefs: Vec<OpRef> = args.iter().map(|a| a.opref).collect();
+        let result_opref = if let Some(d) = descr {
+            ctx.record_op_with_descr(opcode, &arg_oprefs, d)
+        } else {
+            ctx.record_op(opcode, &arg_oprefs)
+        };
+
+        FrontendOp::new(result_opref, concrete_result)
+    }
+
     /// RPython MIFrame.run_one_step() parity.
     ///
     /// Decode and execute one bytecode instruction, recording IR and
@@ -192,8 +242,11 @@ impl PyreMetaFrame {
         };
         self.pc += 1;
 
-        // TODO: dispatch_opcode — Phase 2 will implement all handlers
-        // For now, return Continue to satisfy the type system
+        // TODO: dispatch_opcode — implement all opcode handlers
+        // Each handler follows the RPython pattern:
+        //   let args = [self.pop(), self.pop()];     // pop operands
+        //   let result = self.execute_and_record(ctx, opcode, &args, descr);
+        //   self.push(result);                        // push result
         Ok(StepAction::Continue)
     }
 }
