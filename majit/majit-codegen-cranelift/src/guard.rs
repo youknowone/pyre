@@ -39,6 +39,8 @@ pub struct BridgeData {
     /// GC runtime used by the compiled bridge, if any.
     pub gc_runtime_id: Option<u64>,
     /// Number of input arguments the bridge expects.
+    /// Set to parent guard's fail_arg count (not optimizer-reduced count)
+    /// so execute_bridge passes all parent outputs and indices align.
     pub num_inputs: usize,
     /// Number of shadow-root slots the bridge expects.
     pub num_ref_roots: usize,

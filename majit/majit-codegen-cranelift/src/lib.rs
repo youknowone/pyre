@@ -10,8 +10,8 @@ pub use compiler::{
     enter_bridge_compile_depth, execute_call_assembler_direct, force_token_to_dead_frame,
     get_float_from_deadframe, get_int_from_deadframe, get_latest_descr_from_deadframe,
     get_ref_from_deadframe, get_savedata_ref_from_deadframe, grab_savedata_ref_from_deadframe,
-    jit_exc_is_pending, jit_exc_raise, register_call_assembler_blackhole,
-    register_call_assembler_bridge, register_call_assembler_force,
-    register_pending_call_assembler_target, set_gil_hooks, set_savedata_ref_on_deadframe,
-    take_pending_bridge_compile, take_pending_force_local0, take_pending_frame_restore,
+    jit_exc_is_pending, jit_exc_raise, register_bridge_threshold_callback,
+    register_call_assembler_blackhole, register_call_assembler_bridge,
+    register_call_assembler_force, register_pending_call_assembler_target, set_gil_hooks,
+    set_savedata_ref_on_deadframe, take_pending_force_local0, take_pending_frame_restore,
 };

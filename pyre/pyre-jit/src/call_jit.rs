@@ -880,10 +880,32 @@ pub fn install_jit_call_bridge() {
         majit_codegen_cranelift::register_call_assembler_force(jit_force_callee_frame);
         majit_codegen_cranelift::register_call_assembler_bridge(jit_bridge_compile_callee);
         majit_codegen_cranelift::register_call_assembler_blackhole(jit_blackhole_resume_from_guard);
-        // compile.py:714: bridge compilation on guard failure threshold.
-        // jit_bridge_compile_for_guard traces from guard failure point
-        // using MetaInterp tracing (start_bridge_tracing + trace loop).
+        // RPython compile.py:696 handle_fail parity: bridge compilation
+        // callback invoked synchronously when guard fail count reaches
+        // threshold. Replaces the deferred pending queue.
+        majit_codegen_cranelift::register_bridge_threshold_callback(on_bridge_threshold_reached);
     });
+}
+
+/// RPython handle_fail → _trace_and_compile_from_bridge parity.
+/// Called synchronously from Cranelift's execute_with_inputs when guard
+/// fail count reaches the bridge threshold. The frame state is still
+/// valid at this point (not yet reset by force_fn).
+fn on_bridge_threshold_reached(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize) {
+    // Store the bridge request for synchronous processing in
+    // restore_guard_failure_for_loop, which has access to the
+    // restored frame state.
+    PENDING_BRIDGE_REQUEST.with(|c| {
+        c.set(Some((green_key, trace_id, fail_index, resume_pc)));
+    });
+}
+
+thread_local! {
+    /// Single pending bridge request set by on_bridge_threshold_reached,
+    /// consumed by restore_guard_failure_for_loop. At most one request
+    /// per guard failure, matching RPython's handle_fail pattern.
+    pub(crate) static PENDING_BRIDGE_REQUEST: std::cell::Cell<Option<(u64, u64, u32, usize)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// RPython resume_in_blackhole parity: resume execution from the guard
@@ -990,13 +1012,18 @@ pub fn jit_bridge_compile_for_guard(
 
     let (driver, info) = crate::eval::driver_pair();
 
-    // TODO: Bridge compilation from function-entry traces needs proper
-    // frame state reconstruction (RPython resume_in_blackhole parity).
-    let _ = resume_pc_hint;
-    let resume_pc = frame.next_instr;
+    // RPython resume_in_blackhole parity: use resume_pc from guard's
+    // resume data (via LAST_GUARD_RESUME_PC or recovery_layout), not
+    // frame.next_instr which may have been reset by force_fn.
+    let resume_pc = if resume_pc_hint > 0 {
+        resume_pc_hint
+    } else {
+        frame.next_instr
+    };
     if resume_pc == 0 {
         return;
     }
+    frame.next_instr = resume_pc;
     let code = unsafe { &*frame.code };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);

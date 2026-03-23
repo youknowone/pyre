@@ -955,60 +955,35 @@ pub fn take_pending_frame_restore() -> Option<FrameRestore> {
 /// Stack-based to handle nested call_assembler dispatch (self-recursion).
 /// Deferred bridge compile requests with depth tracking.
 /// Only requests at the current depth are taken; deeper requests
-/// are left for their own call level to process.
-thread_local! {
-    static PENDING_BRIDGE_COMPILE: std::cell::RefCell<Vec<(u32, u64, u64, u32, usize)>> =
-        std::cell::RefCell::new(Vec::new());
-    static BRIDGE_COMPILE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+/// RPython handle_fail parity: when a guard failure reaches the bridge
+/// compilation threshold, invoke the registered callback directly instead
+/// of deferring via a pending queue. The callback is registered by
+/// pyre-jit (install_jit_call_bridge) and performs synchronous bridge
+/// compilation matching RPython's _trace_and_compile_from_bridge.
+type BridgeThresholdFn = fn(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize);
+
+static BRIDGE_THRESHOLD_FN: std::sync::OnceLock<BridgeThresholdFn> = std::sync::OnceLock::new();
+
+/// Register the bridge threshold callback.
+pub fn register_bridge_threshold_callback(f: BridgeThresholdFn) {
+    let _ = BRIDGE_THRESHOLD_FN.set(f);
 }
 
-fn request_pending_bridge_compile(
-    green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
-    resume_pc: usize,
-) {
-    let depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
-    PENDING_BRIDGE_COMPILE.with(|cell| {
-        cell.borrow_mut()
-            .push((depth, green_key, trace_id, fail_index, resume_pc));
-    });
-}
-
-/// Enter a new bridge compile depth level. Returns a guard that
-/// restores the previous depth on drop.
-pub fn enter_bridge_compile_depth() -> BridgeDepthGuard {
-    let prev = BRIDGE_COMPILE_DEPTH.with(|d| {
-        let v = d.get();
-        d.set(v + 1);
-        v
-    });
-    BridgeDepthGuard(prev)
-}
-
-pub struct BridgeDepthGuard(u32);
-impl Drop for BridgeDepthGuard {
-    fn drop(&mut self) {
-        BRIDGE_COMPILE_DEPTH.with(|d| d.set(self.0));
+fn notify_bridge_threshold(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize) {
+    if let Some(f) = BRIDGE_THRESHOLD_FN.get() {
+        f(green_key, trace_id, fail_index, resume_pc);
     }
 }
 
-/// Take pending bridge compile requests at or above the current depth.
-pub fn take_pending_bridge_compile() -> Vec<(u64, u64, u32, usize)> {
-    let current_depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
-    PENDING_BRIDGE_COMPILE.with(|cell| {
-        let mut pending = cell.borrow_mut();
-        let mut result = Vec::new();
-        pending.retain(|&(depth, gk, tid, fi, rpc)| {
-            if depth >= current_depth {
-                result.push((gk, tid, fi, rpc));
-                false
-            } else {
-                true
-            }
-        });
-        result
-    })
+/// Enter a new bridge compile depth level (kept for compatibility with
+/// existing call sites that manage nesting).
+pub fn enter_bridge_compile_depth() -> BridgeDepthGuard {
+    BridgeDepthGuard
+}
+
+pub struct BridgeDepthGuard;
+impl Drop for BridgeDepthGuard {
+    fn drop(&mut self) {}
 }
 
 // ── Call-assembler dispatch table ──
@@ -1907,9 +1882,18 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
         if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
             // green_key from target's header_pc (may be 0 for function-entry traces)
-            let gk = target.header_pc; // use header_pc; caller provides real green_key
-            let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
-            request_pending_bridge_compile(gk, target.trace_id, fail_index, resume_pc);
+            let gk = target.header_pc;
+            // RPython resumedescr parity: extract resume_pc from
+            // recovery_layout (compile-time resume data), not outputs.
+            let resume_pc = fail_descr
+                .recovery_layout
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|r| r.frames.first())
+                .map(|f| f.pc as usize)
+                .unwrap_or(0);
+            notify_bridge_threshold(gk, target.trace_id, fail_index, resume_pc);
         }
 
         let saved_data = if let Some(ref ff) = force_frame {
@@ -2020,6 +2004,11 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
         Some(d) => d,
         None => return false,
     };
+    // Don't overwrite a bridge compiled by MetaInterp (compile_bridge in
+    // pyjitpl.rs). The MetaInterp bridge has correct inputarg mapping.
+    if fail_descr.has_bridge() {
+        return true;
+    }
     let fail_arg_types = fail_descr.fail_arg_types();
 
     // Find the value to return in the bridge.
@@ -3951,6 +3940,29 @@ impl CraneliftBackend {
 
             let fail_descr = &compiled.fail_descrs[fail_index as usize];
 
+            // Finish exits return directly — no bridge dispatch.
+            if fail_descr.is_finish {
+                let saved_data = if let Some(ref ff) = force_frame {
+                    take_force_frame_saved_data(ff)
+                } else {
+                    None
+                };
+                let (exception_class, exception) = take_pending_jit_exception_state();
+                if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
+                    release_force_token(handle);
+                }
+                return DeadFrame {
+                    data: Box::new(FrameData::new_with_savedata_and_exception(
+                        outputs,
+                        fail_descr.clone(),
+                        compiled.gc_runtime_id,
+                        saved_data,
+                        exception_class,
+                        (!exception.is_null()).then_some(exception),
+                    )),
+                };
+            }
+
             // Increment guard failure count.
             fail_descr.increment_fail_count();
 
@@ -3984,8 +3996,15 @@ impl CraneliftBackend {
             let fail_count = fail_descr.get_fail_count();
             if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
                 let gk = compiled.header_pc;
-                let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
-                request_pending_bridge_compile(gk, compiled.trace_id, fail_index, resume_pc);
+                let resume_pc = fail_descr
+                    .recovery_layout
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|r| r.frames.first())
+                    .map(|f| f.pc as usize)
+                    .unwrap_or(0);
+                notify_bridge_threshold(gk, compiled.trace_id, fail_index, resume_pc);
             }
 
             let saved_data = if let Some(ref ff) = force_frame {
@@ -8009,6 +8028,10 @@ impl majit_codegen::Backend for CraneliftBackend {
                 unregister_bridge_call_assembler_expectations(bridge);
             }
         }
+        // RPython parity: bridge num_inputs = parent guard's fail_arg count.
+        // start_retrace_from_guard registers all fail_args as inputargs,
+        // so compiled.num_inputs already equals fail_arg_types.len().
+        let bridge_num_inputs = compiled.num_inputs;
         source_descr.attach_bridge(BridgeData {
             trace_id: compiled.trace_id,
             input_types: compiled.input_types.clone(),
@@ -8035,7 +8058,7 @@ impl majit_codegen::Backend for CraneliftBackend {
                             .map_or(false, |d| !has_label.contains(&d.index()))
                 })
             },
-            num_inputs: compiled.num_inputs,
+            num_inputs: bridge_num_inputs,
             num_ref_roots: compiled.num_ref_roots,
             max_output_slots: compiled.max_output_slots,
             needs_force_frame: compiled.needs_force_frame,
