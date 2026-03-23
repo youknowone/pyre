@@ -105,6 +105,20 @@ impl JitCounter {
         }
     }
 
+    /// Evict the counter entry for the given hash.
+    /// Sets hash and count to 0, so the key must re-accumulate from zero
+    /// in a (possibly different) slot.
+    pub fn evict(&mut self, hash: u64) {
+        let base = (hash as usize) & TABLE_MASK;
+        for i in 0..ASSOCIATIVITY {
+            let idx = (base + i) & TABLE_MASK;
+            if self.table[idx].0 == hash {
+                self.table[idx] = (0, 0);
+                return;
+            }
+        }
+    }
+
     /// Decay all counters by the given factor (0.0 = clear, 1.0 = keep).
     /// counter.py: decay_all_counters with configurable decay factor.
     /// For backwards compatibility, the default halves all counters.

@@ -395,6 +395,13 @@ impl WarmEnterState {
     /// Called by the interpreter at loop back-edges and function entries.
     /// Returns a `HotResult` telling the interpreter what to do next.
     /// Mark a green key as DONT_TRACE_HERE permanently.
+    /// Clear the loop token for a cell, so is_compiled() returns false.
+    pub fn clear_loop_token(&mut self, green_key_hash: u64) {
+        if let Some(cell) = self.cells.get_mut(&green_key_hash) {
+            cell.loop_token = None;
+        }
+    }
+
     pub fn mark_dont_trace(&mut self, green_key_hash: u64) {
         self.disable_noninlinable_function(green_key_hash);
     }
@@ -405,7 +412,10 @@ impl WarmEnterState {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+                return false;
+            }
+            if cell.state == BaseJitCellState::DontTraceHere {
                 return false;
             }
         }
