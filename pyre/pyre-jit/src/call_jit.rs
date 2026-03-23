@@ -807,10 +807,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     // RPython parity: nested calls CAN enter JIT (blackhole.py:1095)
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
-            Ok(r) => r,
-            Err(err) => panic!("jit force recursive call raw failed: {err}"),
-        };
+        let bh_result = resume_in_blackhole(frame);
         match protocol {
             FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
                 w_int_get_value(bh_result)

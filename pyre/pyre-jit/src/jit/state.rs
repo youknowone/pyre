@@ -3408,8 +3408,7 @@ impl TraceFrameState {
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
                 let root_trace_green_key = root_trace_green_key(self);
-                let current_function_key =
-                    crate::eval::make_green_key(self.sym().concrete_code, 0);
+                let current_function_key = crate::eval::make_green_key(self.sym().concrete_code, 0);
                 let is_self_recursive = callee_key == current_function_key;
                 let inline_decision = driver.should_inline(callee_key);
                 let inline_framestack_active = self.parent_fail_args.is_some();

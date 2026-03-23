@@ -155,13 +155,7 @@ pub struct OptContext {
     pub constants: Vec<Option<Value>>,
     /// Forwarding chain: maps old OpRef to replacement OpRef.
     pub forwarding: Vec<OpRef>,
-    /// RPython Box identity: per-value forwarding for import_state positions.
-    /// Maps source OpRef → target OpRef WITHOUT using the flat forwarding
-    /// table. get_replacement checks this map FIRST. This prevents chains:
-    /// import_boxes[4]=OpRef(5) does NOT chain through forwarding[5]=OpRef(20)
-    /// because OpRef(5) is looked up in import_boxes (not found → no chain)
-    /// rather than in forwarding.
-    import_boxes: HashMap<OpRef, OpRef>,
+    // (import_boxes removed: ptr_info stop in get_replacement replaces it)
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -323,7 +317,7 @@ impl OptContext {
             in_final_emission: false,
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
-            import_boxes: HashMap::new(),
+            // (import_boxes removed)
             forwarded: Vec::new(),
             info_arena: InfoArena::new(),
         }
@@ -368,7 +362,7 @@ impl OptContext {
             in_final_emission: false,
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
-            import_boxes: HashMap::new(),
+            // (import_boxes removed)
             forwarded: Vec::new(),
             info_arena: InfoArena::new(),
         }

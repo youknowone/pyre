@@ -19,7 +19,7 @@ use majit_meta::TraceCtx;
 use pyre_bytecode::CodeObject;
 use pyre_object::PyObjectRef;
 
-use super::state::{ConcreteValue, TracedBox as FrontendOp, PyreSym};
+use super::state::{ConcreteValue, PyreSym, TracedBox as FrontendOp};
 
 /// RPython ChangeFrame / DoneWithThisFrame* parity.
 ///
