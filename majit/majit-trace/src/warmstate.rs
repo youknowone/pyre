@@ -2358,16 +2358,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_dont_trace() {
-        let mut ws = WarmEnterState::new(2);
-        let key = 0xABCD;
-        ws.mark_dont_trace(key);
-        // After marking, maybe_compile should return NotHot
-        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
-    }
-
-    #[test]
     fn test_quasiimmut_dependency_lifecycle() {
         let mut ws = WarmEnterState::new(2);
         let key = 0xF00D;

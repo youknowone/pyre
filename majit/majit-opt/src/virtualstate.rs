@@ -1822,8 +1822,9 @@ mod tests {
 
     #[test]
     fn test_export_constant() {
+        // RPython parity: only constant pool entries (>= 10000) export as Constant.
         let mut ctx = OptContext::new(10);
-        let opref = ctx.emit(Op::new(OpCode::SameAsI, &[OpRef::NONE]));
+        let opref = OpRef(10042);
         ctx.make_constant(opref, Value::Int(42));
 
         let ptr_info: Vec<Option<PtrInfo>> = Vec::new();
@@ -1869,22 +1870,22 @@ mod tests {
 
     #[test]
     fn test_export_import_roundtrip() {
-        // Export a state, then import it and verify the optimizer has the right info
+        // RPython parity: only constant pool entries (OpRef >= 10000) survive
+        // export/import. Trace-computed constants are cleared (setinfo_from_preamble).
         let mut ctx = OptContext::new(10);
-        let opref = ctx.emit(Op::new(OpCode::SameAsI, &[OpRef::NONE]));
-        ctx.make_constant(opref, Value::Int(42));
+        let const_ref = OpRef(10042); // constant pool entry
+        ctx.make_constant(const_ref, Value::Int(42));
 
         let ptr_info_in: Vec<Option<PtrInfo>> = Vec::new();
-        let state = export_state(&[opref], &ctx, &ptr_info_in);
+        let state = export_state(&[const_ref], &ctx, &ptr_info_in);
 
         // Now import into a fresh context
         let mut ctx2 = OptContext::new(10);
-        let target = ctx2.emit(Op::new(OpCode::SameAsI, &[OpRef::NONE]));
+        let target = OpRef(10042);
         let mut ptr_info_out: Vec<Option<PtrInfo>> = Vec::new();
 
         import_state(&state, &[target], &mut ctx2, &mut ptr_info_out);
 
-        // The target should now be a known constant
         assert_eq!(ctx2.get_constant_int(target), Some(42));
     }
 
