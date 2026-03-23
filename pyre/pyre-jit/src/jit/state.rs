@@ -5344,10 +5344,18 @@ impl JitState for PyreJitState {
             .get(1)
             .map(value_to_usize)
             .unwrap_or(self.next_instr);
+        // RPython parity: blackhole creates a fresh frame from resumedata.
+        // In pyre we reuse the same frame, so clamp valuestackdepth to
+        // frame array capacity — extra fail_args from virtual materialization
+        // can inflate the count beyond bounds.
+        let arr_cap = self.locals_cells_stack_array()
+            .map(|a| unsafe { (*a).len() })
+            .unwrap_or(usize::MAX);
         self.valuestackdepth = values
             .get(2)
             .map(value_to_usize)
-            .unwrap_or(self.valuestackdepth);
+            .unwrap_or(self.valuestackdepth)
+            .min(arr_cap);
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
@@ -5368,6 +5376,14 @@ impl JitState for PyreJitState {
                 let _ = self.set_stack_at(stack_idx, boxed);
             }
             idx += 1;
+        }
+
+        // Clear stale slots beyond valuestackdepth (blackhole fresh frame parity).
+        let vsd = self.valuestackdepth;
+        if let Some(arr) = self.locals_cells_stack_array_mut() {
+            for i in vsd..arr.len() {
+                arr[i] = pyre_object::PY_NULL;
+            }
         }
 
         self.sync_scalar_fields_to_frame()
