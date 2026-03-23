@@ -534,6 +534,174 @@ impl PyreMetaFrame {
                 Err(pyre_runtime::PyError::runtime_error("raise during tracing"))
             }
 
+            // ── Iterator ──
+            Instruction::GetIter => {
+                // TOS is iterable, convert to iterator concrete
+                // For now pass through — concrete value stays
+                Ok(StepAction::Continue)
+            }
+            Instruction::ForIter { delta } => {
+                let iter = self.peek();
+                let continues = match iter.concrete {
+                    ConcreteValue::Ref(obj) if !obj.is_null() => {
+                        pyre_runtime::range_iter_continues(obj).unwrap_or(false)
+                    }
+                    _ => false,
+                };
+                if continues {
+                    let next_val = match iter.concrete {
+                        ConcreteValue::Ref(obj) => {
+                            let v = pyre_runtime::range_iter_next_or_null(obj).unwrap_or(pyre_object::PY_NULL);
+                            if v.is_null() { ConcreteValue::Null } else { ConcreteValue::from_pyobj(v) }
+                        }
+                        _ => ConcreteValue::Null,
+                    };
+                    self.push(FrontendOp::new(OpRef::NONE, next_val));
+                } else {
+                    self.pop(); // pop exhausted iterator
+                    let target = self.pc + u32::from(delta.get(op_arg)) as usize;
+                    self.pc = target;
+                }
+                Ok(StepAction::Continue)
+            }
+
+            // ── Unpack sequence ──
+            Instruction::UnpackSequence { count } => {
+                let n = count.get(op_arg) as usize;
+                let seq = self.pop();
+                // Push items in reverse order (Python semantics)
+                let obj = seq.concrete.to_pyobj();
+                // Concrete unpack: extract items from tuple/list
+                let items = pyre_runtime::unpack_sequence_exact(obj, n);
+                match items {
+                    Ok(items) => {
+                        for item in items.into_iter().rev() {
+                            self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::from_pyobj(item)));
+                        }
+                    }
+                    Err(_) => {
+                        for _ in 0..n {
+                            self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Null));
+                        }
+                    }
+                }
+                Ok(StepAction::Continue)
+            }
+
+            // ── String / Format ──
+            Instruction::BuildString { count } => {
+                let n = count.get(op_arg) as usize;
+                let mut parts = Vec::with_capacity(n);
+                for _ in 0..n {
+                    parts.push(self.pop());
+                }
+                parts.reverse();
+                // Concrete: concatenate string representations
+                let mut result = String::new();
+                for part in &parts {
+                    let obj = part.concrete.to_pyobj();
+                    if !obj.is_null() {
+                        result.push_str(&pyre_objspace::space::py_str(obj));
+                    }
+                }
+                let str_obj = pyre_object::w_str_new(&result);
+                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Ref(str_obj)));
+                Ok(StepAction::Continue)
+            }
+            Instruction::FormatSimple => {
+                let val = self.pop();
+                let s = pyre_objspace::space::py_str(val.concrete.to_pyobj());
+                self.push(FrontendOp::new(
+                    OpRef::NONE,
+                    ConcreteValue::Ref(pyre_object::w_str_new(&s)),
+                ));
+                Ok(StepAction::Continue)
+            }
+
+            // ── Boolean ──
+            Instruction::ToBool => {
+                let val = self.pop();
+                let truth = val.concrete.is_truthy();
+                self.push(FrontendOp::new(
+                    OpRef::NONE,
+                    ConcreteValue::Int(truth as i64),
+                ));
+                Ok(StepAction::Continue)
+            }
+
+            // ── None checks ──
+            Instruction::PopJumpIfNone { delta } => {
+                let val = self.pop();
+                let is_none = matches!(val.concrete, ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
+                    || matches!(val.concrete, ConcreteValue::Null);
+                if is_none {
+                    let target = self.pc + u32::from(delta.get(op_arg)) as usize;
+                    self.pc = target;
+                }
+                Ok(StepAction::Continue)
+            }
+            Instruction::PopJumpIfNotNone { delta } => {
+                let val = self.pop();
+                let is_none = matches!(val.concrete, ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
+                    || matches!(val.concrete, ConcreteValue::Null);
+                if !is_none {
+                    let target = self.pc + u32::from(delta.get(op_arg)) as usize;
+                    self.pc = target;
+                }
+                Ok(StepAction::Continue)
+            }
+
+            // ── Contains / Is ──
+            Instruction::ContainsOp { invert } => {
+                let haystack = self.pop();
+                let needle = self.pop();
+                let result = pyre_objspace::space::py_contains(
+                    haystack.concrete.to_pyobj(),
+                    needle.concrete.to_pyobj(),
+                ).unwrap_or(false);
+                let inverted = match invert.get(op_arg) {
+                    pyre_bytecode::bytecode::Invert::No => result,
+                    pyre_bytecode::bytecode::Invert::Yes => !result,
+                };
+                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Int(inverted as i64)));
+                Ok(StepAction::Continue)
+            }
+            Instruction::IsOp { invert } => {
+                let b = self.pop();
+                let a = self.pop();
+                let same = std::ptr::eq(a.concrete.to_pyobj(), b.concrete.to_pyobj());
+                let result = match invert.get(op_arg) {
+                    pyre_bytecode::bytecode::Invert::No => same,
+                    pyre_bytecode::bytecode::Invert::Yes => !same,
+                };
+                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Int(result as i64)));
+                Ok(StepAction::Continue)
+            }
+
+            // ── LoadFast pairs ──
+            Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
+                let pair = var_nums.get(op_arg);
+                let idx1 = u32::from(pair.idx_1()) as usize;
+                let idx2 = u32::from(pair.idx_2()) as usize;
+                let c1 = self.concrete_locals.get(idx1).copied().unwrap_or(ConcreteValue::Null);
+                let c2 = self.concrete_locals.get(idx2).copied().unwrap_or(ConcreteValue::Null);
+                self.push(FrontendOp::new(OpRef::NONE, c1));
+                self.push(FrontendOp::new(OpRef::NONE, c2));
+                Ok(StepAction::Continue)
+            }
+            Instruction::StoreFastLoadFast { var_nums } => {
+                let pair = var_nums.get(op_arg);
+                let store_idx = u32::from(pair.idx_1()) as usize;
+                let load_idx = u32::from(pair.idx_2()) as usize;
+                let val = self.pop();
+                if store_idx < self.concrete_locals.len() {
+                    self.concrete_locals[store_idx] = val.concrete;
+                }
+                let c = self.concrete_locals.get(load_idx).copied().unwrap_or(ConcreteValue::Null);
+                self.push(FrontendOp::new(OpRef::NONE, c));
+                Ok(StepAction::Continue)
+            }
+
             // ── Unsupported (abort trace) ──
             _ => {
                 if majit_meta::majit_log_enabled() {
