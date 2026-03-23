@@ -72,6 +72,11 @@ impl TraceCtx {
         }
     }
 
+    /// RPython pyjitpl.py:2908 — bridge traces start with empty merge points.
+    pub fn clear_merge_points(&mut self) {
+        self.current_merge_points.clear();
+    }
+
     /// Create a standalone TraceCtx for testing or external use.
     pub fn for_test(num_inputs: usize) -> Self {
         let mut recorder = Trace::new();
