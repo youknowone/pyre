@@ -1443,6 +1443,11 @@ impl Optimization for OptRewrite {
                 }
                 OptimizationResult::PassOn
             }
+            // rewrite.py: optimize_GUARD_FUTURE_CONDITION
+            OpCode::GuardFutureCondition => {
+                ctx.patchguardop = Some(op.clone());
+                OptimizationResult::Remove
+            }
 
             // ── rewrite.py: INT_SIGNEXT(x, n) where bounds already fit ──
             // If x is already known to fit in n bytes, the signext is a no-op.
@@ -2942,6 +2947,22 @@ mod tests {
         // Process GuardNoException -> should NOT be removed
         let result2 = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result2, OptimizationResult::PassOn));
+    }
+
+    #[test]
+    fn test_guard_future_condition_records_and_removes() {
+        // rewrite.py: GUARD_FUTURE_CONDITION → record in patchguardop + remove
+        let mut op = Op::new(OpCode::GuardFutureCondition, &[]);
+        op.pos = OpRef(0);
+        let mut ctx = OptContext::new(1);
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        assert!(ctx.patchguardop.is_some());
+        assert_eq!(
+            ctx.patchguardop.unwrap().opcode,
+            OpCode::GuardFutureCondition
+        );
     }
 
     #[test]
