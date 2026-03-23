@@ -2202,7 +2202,8 @@ mod tests {
     fn test_strgetitem_bounds() {
         // STRGETITEM result should be bounded to [0, 255].
         let mut opt = OptIntBounds::new();
-        let op = Op::new(OpCode::Strgetitem, &[OpRef(100), OpRef(101)]);
+        let mut op = Op::new(OpCode::Strgetitem, &[OpRef(100), OpRef(101)]);
+        op.pos = OpRef(102);
         let mut ctx = OptContext::new(10);
         let result = opt.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
