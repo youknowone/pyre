@@ -871,16 +871,24 @@ impl VirtualState {
     /// per-entry guard generation can peek at the runtime value to decide
     /// whether emitting a GUARD_VALUE is profitable (e.g. when the
     /// runtime value already equals the expected constant).
+    /// virtualstate.py:646: generate_guards(self, other, boxes, runtime_boxes, optimizer)
+    ///
+    /// `boxes`: the actual OpRefs at each position (used as the guard's
+    /// first argument in GUARD_VALUE etc.).
     pub fn generate_guards(
         &self,
         other: &VirtualState,
+        boxes: &[OpRef],
         runtime_boxes: Option<&[OpRef]>,
     ) -> Vec<GuardRequirement> {
         let mut guards = Vec::new();
 
         for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
+            let box_opref = boxes.get(i).copied().unwrap_or(OpRef::NONE);
             let runtime_box = runtime_boxes.and_then(|rb| rb.get(i).copied());
-            Self::generate_guards_for_entry(i, expected, incoming, runtime_box, &mut guards);
+            Self::generate_guards_for_entry(
+                i, expected, incoming, box_opref, runtime_box, &mut guards,
+            );
         }
 
         guards
@@ -890,6 +898,7 @@ impl VirtualState {
         arg_idx: usize,
         expected: &VirtualStateInfo,
         incoming: &VirtualStateInfo,
+        box_opref: OpRef,
         _runtime_box: Option<OpRef>,
         guards: &mut Vec<GuardRequirement>,
     ) {
@@ -898,19 +907,24 @@ impl VirtualState {
             (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::Unknown) => {
                 guards.push(GuardRequirement::GuardClass {
                     arg_index: arg_idx,
+                    box_opref,
                     expected_class: *class_ptr,
                 });
             }
 
             // If expected is nonnull but incoming is unknown, need a guard_nonnull
             (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown) => {
-                guards.push(GuardRequirement::GuardNonnull { arg_index: arg_idx });
+                guards.push(GuardRequirement::GuardNonnull {
+                    arg_index: arg_idx,
+                    box_opref,
+                });
             }
 
             // If expected has bounds but incoming doesn't
             (VirtualStateInfo::IntBounded(bounds), VirtualStateInfo::Unknown) => {
                 guards.push(GuardRequirement::GuardBounds {
                     arg_index: arg_idx,
+                    box_opref,
                     bounds: bounds.clone(),
                 });
             }
@@ -919,6 +933,7 @@ impl VirtualState {
             (VirtualStateInfo::Constant(val), VirtualStateInfo::Unknown) => {
                 guards.push(GuardRequirement::GuardValue {
                     arg_index: arg_idx,
+                    box_opref,
                     expected_value: val.clone(),
                 });
             }
@@ -936,6 +951,7 @@ impl VirtualState {
                 let expected_len = expected_items.len() as i64;
                 guards.push(GuardRequirement::GuardValue {
                     arg_index: arg_idx,
+                    box_opref,
                     expected_value: Value::Int(expected_len),
                 });
             }
@@ -1053,7 +1069,7 @@ impl VirtualState {
             }
             // Constant vs non-constant: emit GUARD_VALUE if runtime_box available,
             // otherwise mark as bad. (virtualstate.py line 400)
-            (VirtualStateInfo::Constant(val), _) => {
+            (VirtualStateInfo::Constant(_val), _) => {
                 if runtime_box.is_some() {
                     let val_const = OpRef(10_000 + idx as u32);
                     let mut op = Op::new(OpCode::GuardValue, &[box_opref, val_const]);
@@ -1155,56 +1171,91 @@ impl VirtualState {
 }
 
 /// A guard that must be emitted to make an incoming state compatible.
+///
+/// virtualstate.py:646: boxes parameter provides the actual OpRef at each
+/// position. `box_opref` is the concrete OpRef used as the guard's first
+/// argument; `arg_index` is the position in the state vector.
 #[derive(Clone, Debug)]
 pub enum GuardRequirement {
     /// Emit GUARD_CLASS on the arg at this index.
     GuardClass {
         arg_index: usize,
+        box_opref: OpRef,
         expected_class: GcRef,
     },
     /// Emit GUARD_NONNULL on the arg at this index.
-    GuardNonnull { arg_index: usize },
+    GuardNonnull {
+        arg_index: usize,
+        box_opref: OpRef,
+    },
     /// Emit GUARD_VALUE on the arg at this index.
     GuardValue {
         arg_index: usize,
+        box_opref: OpRef,
         expected_value: Value,
     },
     /// Emit integer bounds guards on the arg at this index.
-    GuardBounds { arg_index: usize, bounds: IntBound },
+    GuardBounds {
+        arg_index: usize,
+        box_opref: OpRef,
+        bounds: IntBound,
+    },
 }
 
 impl GuardRequirement {
     /// Convert this guard requirement into a concrete Op, given the
-    /// concrete args vector. Returns None if the arg_index is out of bounds.
+    /// concrete args vector. Uses box_opref as the guard's first argument
+    /// (virtualstate.py:646 boxes parameter), falling back to args[arg_index].
     pub fn to_op(&self, args: &[OpRef]) -> Option<Op> {
         match self {
             GuardRequirement::GuardClass {
                 arg_index,
-                expected_class,
+                box_opref,
+                expected_class: _,
             } => {
-                let arg = *args.get(*arg_index)?;
+                let arg = if !box_opref.is_none() {
+                    *box_opref
+                } else {
+                    *args.get(*arg_index)?
+                };
                 let class_const = OpRef(10_000 + *arg_index as u32); // placeholder
                 let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
                 op.fail_args = Some(Default::default());
                 Some(op)
             }
-            GuardRequirement::GuardNonnull { arg_index } => {
-                let arg = *args.get(*arg_index)?;
+            GuardRequirement::GuardNonnull {
+                arg_index,
+                box_opref,
+            } => {
+                let arg = if !box_opref.is_none() {
+                    *box_opref
+                } else {
+                    *args.get(*arg_index)?
+                };
                 let mut op = Op::new(OpCode::GuardNonnull, &[arg]);
                 op.fail_args = Some(Default::default());
                 Some(op)
             }
             GuardRequirement::GuardValue {
                 arg_index,
-                expected_value,
+                box_opref,
+                expected_value: _,
             } => {
-                let arg = *args.get(*arg_index)?;
+                let arg = if !box_opref.is_none() {
+                    *box_opref
+                } else {
+                    *args.get(*arg_index)?
+                };
                 let val_const = OpRef(10_000 + *arg_index as u32); // placeholder
                 let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
                 op.fail_args = Some(Default::default());
                 Some(op)
             }
-            GuardRequirement::GuardBounds { arg_index, bounds } => {
+            GuardRequirement::GuardBounds {
+                arg_index: _,
+                box_opref: _,
+                bounds: _,
+            } => {
                 // IntBound guards are emitted as int_ge/int_le pairs
                 // For now, skip — intbounds pass handles these
                 None
@@ -1738,15 +1789,16 @@ mod tests {
         ]);
         let s2 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::Unknown]);
 
-        let guards = s1.generate_guards(&s2, None);
+        let boxes = vec![OpRef(100), OpRef(101)];
+        let guards = s1.generate_guards(&s2, &boxes, None);
         assert_eq!(guards.len(), 2);
         assert!(matches!(
             &guards[0],
-            GuardRequirement::GuardClass { arg_index: 0, .. }
+            GuardRequirement::GuardClass { arg_index: 0, box_opref, .. } if *box_opref == OpRef(100)
         ));
         assert!(matches!(
             &guards[1],
-            GuardRequirement::GuardNonnull { arg_index: 1 }
+            GuardRequirement::GuardNonnull { arg_index: 1, box_opref } if *box_opref == OpRef(101)
         ));
     }
 
