@@ -1238,7 +1238,7 @@ impl OptUnroll {
             if !target_vs.generalization_of(&virtual_state) {
                 continue;
             }
-            let extra_guards = target_vs.generate_guards(&virtual_state, runtime_boxes);
+            let extra_guards = target_vs.generate_guards(&virtual_state, &args, runtime_boxes);
             for guard_req in &extra_guards {
                 if let Some(guard_op) = guard_req.to_op(&args) {
                     optimizer.send_extra_operation(&guard_op, ctx);

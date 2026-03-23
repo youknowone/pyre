@@ -739,6 +739,44 @@ impl OptHeap {
         }
     }
 
+    /// heap.py:206-226: _cannot_alias_via_content
+    ///
+    /// If both PtrInfos have fields and any shared field index has different
+    /// constant values, the two objects cannot be the same struct at runtime.
+    fn cannot_alias_via_content(
+        opref1: OpRef,
+        opref2: OpRef,
+        ctx: &OptContext,
+    ) -> bool {
+        let (Some(info1), Some(info2)) = (ctx.get_ptr_info(opref1), ctx.get_ptr_info(opref2))
+        else {
+            return false;
+        };
+        let f1 = info1.all_items();
+        let f2 = info2.all_items();
+        if f1.is_empty() || f2.is_empty() {
+            return false;
+        }
+        // heap.py:217: for index in range(min(len(content1), len(content2)))
+        // RPython iterates by position. Our fields are (idx, val) pairs —
+        // match by field_idx which is equivalent when both objects share
+        // the same descriptor layout.
+        for &(idx1, v1) in f1 {
+            for &(idx2, v2) in f2 {
+                if idx1 != idx2 {
+                    continue;
+                }
+                let v1r = ctx.get_replacement(v1);
+                let v2r = ctx.get_replacement(v2);
+                // heap.py:222-224: both constant and different → CANNOT_ALIAS
+                if ctx.is_constant(v1r) && ctx.is_constant(v2r) && v1r != v2r {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Invalidate only array cache entries affected by an ARRAYCOPY/ARRAYMOVE.
     ///
     /// Instead of clearing all array caches, only remove entries for the
@@ -985,11 +1023,15 @@ impl OptHeap {
                 let cannot_alias_via_class = matches!(
                     (class1, class2), (Some(c1), Some(c2)) if c1 != c2
                 );
-                let cannot_alias = cannot_alias_via_class
+                let mut cannot_alias = cannot_alias_via_class
                     || self.seen_allocation.contains(lazy_obj)
                     || self.seen_allocation.contains(&obj)
                     || self.known_distinct.contains(lazy_obj)
                     || self.known_distinct.contains(&obj);
+                if !cannot_alias {
+                    let lazy_obj_resolved = ctx.get_replacement(*lazy_obj);
+                    cannot_alias = Self::cannot_alias_via_content(lazy_obj_resolved, obj, ctx);
+                }
                 if !cannot_alias {
                     // UNKNOWN_ALIAS → force_lazy_set, return None (cache miss)
                     force_lazy = true;
@@ -1033,9 +1075,19 @@ impl OptHeap {
             // Cache miss — fall through to emit the getfield
         }
 
+        // Virtualizable fields (linked list head/size) are loop-variant.
+        // Do not use cached/imported values — they become stale after the
+        // first compiled iteration. Fall through to emit a real memory read.
+        let is_vable_field = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
+        if is_vable_field {
+            ctx.imported_short_fields.remove(&key);
+            ctx.imported_short_field_descrs.remove(&key);
+        }
+
         // Consume the imported short field: remove it so that if a later
         // setfield/call invalidates cache, the stale preamble value
         // cannot re-populate the cache on a subsequent getfield.
+        if !is_vable_field {
         if let Some(cached) = ctx.imported_short_fields.remove(&key) {
             ctx.force_op_from_preamble(cached);
             let cf = self.get_or_create_cached_field(field_idx);
@@ -1044,6 +1096,7 @@ impl OptHeap {
                 cf.register(obj, cached, d.as_ref());
             }
         }
+        } // !is_vable_field
 
         // Check immutable field cache first — these survive all invalidation.
         if let Some(&cached) = self.immutable_cached_fields.get(&key) {
@@ -1081,7 +1134,10 @@ impl OptHeap {
         // heap.py line 652: make_nonnull(op.getarg(0))
         let struct_ref = ctx.get_replacement(op.arg(0));
         self.known_nonnull.insert(struct_ref);
-        self.cache_field(obj, field_idx, op.pos, op.descr.as_ref());
+        // Virtualizable fields are loop-variant; skip caching.
+        if !is_vable_field {
+            self.cache_field(obj, field_idx, op.pos, op.descr.as_ref());
+        }
         // Save immutable fields in the permanent cache — they survive all
         // invalidation because the value never changes.
         if self.immutable_field_descrs.contains(&key.1) {
@@ -1095,8 +1151,25 @@ impl OptHeap {
         }
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         // Record the field value in ptr_info so other passes can see it.
-        if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
-            info.set_field(key.1, op.pos);
+        if !is_vable_field {
+            if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
+                info.set_field(key.1, op.pos);
+            }
+        }
+        // Virtualizable Ref fields (linked list head) need a null guard:
+        // compiled traces may unroll multiple pops and follow null next ptrs.
+        let is_vable_ref = is_vable_field
+            && matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR);
+        if is_vable_ref {
+            ctx.emit(op.clone());
+            let zero_ref = ctx.make_constant_int(0);
+            let cmp_pos = ctx.alloc_op_position();
+            let mut cmp_op = Op::new(OpCode::IntNe, &[op.pos, zero_ref]);
+            cmp_op.pos = cmp_pos;
+            ctx.emit(cmp_op);
+            let guard_op = Op::new(OpCode::GuardTrue, &[cmp_pos]);
+            ctx.emit(guard_op);
+            return OptimizationResult::Remove;
         }
         OptimizationResult::Emit(op.clone())
     }
@@ -1133,8 +1206,10 @@ impl OptHeap {
         }
 
         // heap.py:81-83: possible_aliasing → force_lazy_set
-        // _cannot_alias_via_classes_or_lengths (heap.py:198-204):
-        // if both objects have known classes and they differ, skip the force.
+        // heap.py:67-75: possible_aliasing_two_infos checks:
+        //   1. same_info → MUST_ALIAS (handled by OpRef equality above)
+        //   2. _cannot_alias_via_classes_or_lengths (198-204)
+        //   3. _cannot_alias_via_content (206-226)
         let needs_force = self
             .field_cache
             .get(&field_idx)
@@ -1143,12 +1218,18 @@ impl OptHeap {
                     return false;
                 }
                 let lazy_obj = cf.lazy_set.as_ref().unwrap().0;
+                // _cannot_alias_via_classes_or_lengths
                 let class1 = ctx.get_ptr_info(lazy_obj).and_then(|i| i.get_known_class());
                 let class2 = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class());
-                let cannot_alias_via_class = matches!(
-                    (class1, class2), (Some(c1), Some(c2)) if c1 != c2
-                );
-                !cannot_alias_via_class
+                if matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2) {
+                    return false;
+                }
+                // _cannot_alias_via_content
+                let lazy_resolved = ctx.get_replacement(lazy_obj);
+                if Self::cannot_alias_via_content(lazy_resolved, obj, ctx) {
+                    return false;
+                }
+                true // UNKNOWN_ALIAS → needs force
             });
         if needs_force {
             let lazy_data = self
@@ -1199,6 +1280,17 @@ impl OptHeap {
         // Aliasing-aware invalidation: only invalidate caches that might
         // be affected by this write.
         self.invalidate_field_caches_for_write(obj, field_idx);
+
+        // Virtualizable fields (linked list head/size) must be emitted
+        // immediately so compiled code always writes to memory. Lazy
+        // deferral loses the write when force_lazy_sets_for_guard drains
+        // into rd_pendingfields but the normal loop path never emits.
+        let is_vable = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
+        if is_vable {
+            let cf = self.get_or_create_cached_field(field_idx);
+            cf.lazy_set = None; // drop any previous lazy set
+            return OptimizationResult::Emit(op.clone());
+        }
 
         // Store as lazy set. heap.py:89-90: self._lazy_set = op
         // obj is already resolved through get_replacement above.

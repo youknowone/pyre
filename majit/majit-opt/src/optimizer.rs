@@ -157,6 +157,11 @@ pub struct Optimizer {
     /// bridgeopt.py: pending bridge knowledge to apply after setup().
     /// Stored here so it survives the setup() clear in optimize_with_constants_and_inputs.
     pending_bridge_knowledge: Option<OptimizerKnowledge>,
+    /// Per-guard optimizer knowledge snapshots, captured at each guard emit
+    /// during optimization. Keyed by guard op position (OpRef).
+    /// RPython: resume.py:570-574 _add_optimizer_sections serializes the
+    /// optimizer state AT EACH GUARD, not just at end-of-trace.
+    pub per_guard_knowledge: Vec<(OpRef, OptimizerKnowledge)>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -660,6 +665,7 @@ impl Optimizer {
             terminal_op: None,
             final_ctx: None,
             pending_bridge_knowledge: None,
+            per_guard_knowledge: Vec::new(),
         }
     }
 
@@ -2071,9 +2077,32 @@ impl Optimizer {
             ctx.in_final_emission = false;
         }
         if op.opcode.is_guard() {
+            // RPython resume.py:570-574: _add_optimizer_sections captures the
+            // optimizer's knowledge AT THIS GUARD POINT. Snapshot heap fields
+            // (the part that changes during optimization) per-guard. Known
+            // classes and loopinvariant are stable across the trace.
+            {
+                let mut heap_fields = Vec::new();
+                for pass in &self.passes {
+                    let fields = pass.export_cached_fields();
+                    if !fields.is_empty() {
+                        heap_fields = fields;
+                        break; // only one pass (heap) exports fields
+                    }
+                }
+                if !heap_fields.is_empty() {
+                    self.per_guard_knowledge.push((
+                        op.pos,
+                        OptimizerKnowledge {
+                            heap_fields,
+                            known_classes: Vec::new(),
+                            loopinvariant_results: Vec::new(),
+                        },
+                    ));
+                }
+            }
+
             // RPython parity: do NOT force virtuals in guard fail_args.
-            // encode_guard_virtuals records them as rd_virtuals metadata
-            // for lazy reconstruction at guard failure time (resume.py).
             op = Self::encode_guard_virtuals(op, ctx);
 
             // RPython parity: store fail_arg types using constant_types

@@ -714,6 +714,11 @@ impl OptContext {
         self.constants.get(idx).and_then(|v| v.as_ref())
     }
 
+    /// Whether `opref` has a known constant value.
+    pub fn is_constant(&self, opref: OpRef) -> bool {
+        self.get_constant(opref).is_some()
+    }
+
     /// Get constant integer value, if known.
     pub fn get_constant_int(&self, opref: OpRef) -> Option<i64> {
         self.get_constant(opref).and_then(|v| match v {
@@ -816,6 +821,18 @@ impl OptContext {
     }
 
     /// info.py: op.set_forwarded(info) — set PtrInfo for an OpRef.
+    /// Ensure a PtrInfo exists for the given OpRef. Creates an empty
+    /// Instance if none exists, so that set_field can store values.
+    pub fn ensure_ptr_info(&mut self, opref: OpRef) {
+        let idx = opref.0 as usize;
+        if idx >= self.ptr_info.len() {
+            self.ptr_info.resize(idx + 1, None);
+        }
+        if self.ptr_info[idx].is_none() {
+            self.ptr_info[idx] = Some(PtrInfo::instance(None, None));
+        }
+    }
+
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
         let idx = opref.0 as usize;
         if idx >= self.ptr_info.len() {

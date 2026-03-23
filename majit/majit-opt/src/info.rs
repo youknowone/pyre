@@ -611,6 +611,18 @@ impl PtrInfo {
         }
     }
 
+    /// info.py: all_items() — return all cached field entries.
+    /// heap.py:211,214: opinfo.all_items() used by _cannot_alias_via_content.
+    pub fn all_items(&self) -> &[(u32, OpRef)] {
+        match self {
+            PtrInfo::Instance(v) => &v.fields,
+            PtrInfo::Struct(v) => &v.fields,
+            PtrInfo::Virtual(v) => &v.fields,
+            PtrInfo::VirtualStruct(v) => &v.fields,
+            _ => &[],
+        }
+    }
+
     /// info.py: getfield(field_descr) — get a field from a virtual object.
     pub fn get_field(&self, field_idx: u32) -> Option<OpRef> {
         match self {
