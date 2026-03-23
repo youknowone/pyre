@@ -1543,6 +1543,21 @@ impl Optimization for OptRewrite {
     fn name(&self) -> &'static str {
         "rewrite"
     }
+
+    /// rewrite.py: serialize_optrewrite — export loopinvariant results.
+    fn export_loopinvariant_results(&self) -> Vec<(i64, OpRef)> {
+        self.loop_invariant_results
+            .iter()
+            .map(|(&func_ptr, &result)| (func_ptr, result))
+            .collect()
+    }
+
+    /// rewrite.py: deserialize_optrewrite — import loopinvariant results.
+    fn import_loopinvariant_results(&mut self, entries: &[(i64, OpRef)]) {
+        for &(func_ptr, result) in entries {
+            self.loop_invariant_results.insert(func_ptr, result);
+        }
+    }
 }
 
 impl Default for OptRewrite {

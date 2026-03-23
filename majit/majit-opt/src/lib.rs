@@ -890,6 +890,14 @@ pub trait Optimization {
     /// heap.py: deserialize_optheap — import cached fields into this pass.
     fn import_cached_fields(&mut self, _entries: &[(OpRef, u32, OpRef)]) {}
 
+    /// bridgeopt.py:113-122: serialize_optrewrite — export loopinvariant results.
+    fn export_loopinvariant_results(&self) -> Vec<(i64, OpRef)> {
+        Vec::new()
+    }
+
+    /// bridgeopt.py:173-185: deserialize_optrewrite — import loopinvariant results.
+    fn import_loopinvariant_results(&mut self, _entries: &[(i64, OpRef)]) {}
+
     /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
     fn export_arg_int_bounds(
         &self,

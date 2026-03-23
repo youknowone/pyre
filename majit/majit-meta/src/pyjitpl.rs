@@ -6,7 +6,7 @@ use majit_codegen::{
 };
 use majit_codegen_cranelift::CraneliftBackend;
 use majit_ir::{GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
-use majit_opt::optimizer::Optimizer;
+use majit_opt::optimizer::{Optimizer, OptimizerKnowledge};
 use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
 
@@ -62,9 +62,9 @@ pub(crate) struct CompiledTrace {
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
     pub(crate) terminal_exit_layouts: HashMap<usize, StoredExitLayout>,
     /// bridgeopt.py: serialized optimizer knowledge per guard.
-    /// Heap cache (struct, field_idx, value) triples known at guard time.
+    /// Heap cache, known classes, and loopinvariant results known at guard time.
     /// Used by deserialize_optimizer_knowledge when compiling a bridge.
-    pub(crate) optimizer_knowledge: Vec<(majit_ir::OpRef, u32, majit_ir::OpRef)>,
+    pub(crate) optimizer_knowledge: OptimizerKnowledge,
 }
 
 pub(crate) struct StoredResumeData {
@@ -1552,7 +1552,7 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
-                        optimizer_knowledge: Vec::new(), // TODO: serialize from optimizer
+                        optimizer_knowledge: OptimizerKnowledge::new(), // TODO: serialize from optimizer
                     },
                 );
 
@@ -1817,7 +1817,12 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
-                        optimizer_knowledge: optimizer.serialize_optimizer_knowledge(),
+                        optimizer_knowledge: {
+                            let ctx = optimizer.final_ctx.as_ref()
+                                .map(|c| optimizer.serialize_optimizer_knowledge(c))
+                                .unwrap_or_default();
+                            ctx
+                        },
                     },
                 );
                 {
@@ -2994,8 +2999,8 @@ impl<M: Clone> MetaInterp<M> {
         // bridgeopt.py: retrieve optimizer knowledge from the source trace
         // and remap OpRefs from the source trace's numbering to the bridge's
         // inputarg numbering. The bridge inputargs correspond to the guard's
-        // fail_args in order, so source_opref → bridge_inputarg_index.
-        let bridge_knowledge: Option<Vec<(majit_ir::OpRef, u32, majit_ir::OpRef)>> = {
+        // fail_args in order, so source_opref -> bridge_inputarg_index.
+        let bridge_knowledge: Option<OptimizerKnowledge> = {
             let source_trace_id = {
                 let tid = fail_descr.trace_id();
                 if tid == 0 { compiled.root_trace_id } else { tid }
@@ -3004,7 +3009,7 @@ impl<M: Clone> MetaInterp<M> {
                 if trace.optimizer_knowledge.is_empty() {
                     return None;
                 }
-                // Build mapping: source_trace_opref → bridge_inputarg_index.
+                // Build mapping: source_trace_opref -> bridge_inputarg_index.
                 // The guard's fail_args list which source-trace OpRefs are
                 // saved; the bridge's inputargs are OpRef(0..n) in that order.
                 let guard_op_idx = trace.guard_op_indices.get(&fail_index)?;
@@ -3022,15 +3027,7 @@ impl<M: Clone> MetaInterp<M> {
                     let opref = majit_ir::OpRef(idx);
                     remap.entry(opref).or_insert(opref);
                 }
-                let remapped: Vec<_> = trace
-                    .optimizer_knowledge
-                    .iter()
-                    .filter_map(|&(obj, field_idx, val)| {
-                        let new_obj = remap.get(&obj)?;
-                        let new_val = remap.get(&val)?;
-                        Some((*new_obj, field_idx, *new_val))
-                    })
-                    .collect();
+                let remapped = trace.optimizer_knowledge.remap(&remap);
                 if remapped.is_empty() { None } else { Some(remapped) }
             })
         };
@@ -3042,7 +3039,7 @@ impl<M: Clone> MetaInterp<M> {
             inline_short_preamble,
             retraced_count,
             retrace_limit,
-            bridge_knowledge.as_deref(),
+            bridge_knowledge.as_ref(),
         );
         if retrace_requested {
             // unroll.py:217: cell_token.retraced_count += 1
@@ -3186,7 +3183,7 @@ impl<M: Clone> MetaInterp<M> {
                             guard_op_indices,
                             exit_layouts,
                             terminal_exit_layouts,
-                            optimizer_knowledge: Vec::new(),
+                            optimizer_knowledge: OptimizerKnowledge::new(),
                         },
                     );
                 }
@@ -4515,6 +4512,7 @@ mod tests {
                 guard_op_indices,
                 exit_layouts,
                 terminal_exit_layouts,
+                optimizer_knowledge: OptimizerKnowledge::new(),
             },
         );
 
@@ -4977,6 +4975,7 @@ mod tests {
                 guard_op_indices: HashMap::new(),
                 exit_layouts: HashMap::new(),
                 terminal_exit_layouts: HashMap::new(),
+                optimizer_knowledge: OptimizerKnowledge::new(),
             },
         );
 
@@ -5079,6 +5078,7 @@ mod tests {
                 guard_op_indices: HashMap::new(),
                 exit_layouts,
                 terminal_exit_layouts: HashMap::new(),
+                optimizer_knowledge: OptimizerKnowledge::new(),
             },
         );
         meta.compiled_loops.insert(
@@ -5367,6 +5367,7 @@ mod tests {
                 guard_op_indices: HashMap::new(),
                 exit_layouts: HashMap::new(),
                 terminal_exit_layouts: HashMap::new(),
+                optimizer_knowledge: OptimizerKnowledge::new(),
             },
         );
         meta.compiled_loops.insert(
@@ -6458,6 +6459,7 @@ mod tests {
                 guard_op_indices: HashMap::new(),
                 exit_layouts,
                 terminal_exit_layouts,
+                optimizer_knowledge: OptimizerKnowledge::new(),
             },
         );
         meta.compiled_loops.insert(

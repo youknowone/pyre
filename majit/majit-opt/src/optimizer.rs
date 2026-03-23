@@ -13,7 +13,72 @@ use crate::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{GuardVirtualEntry, Op, OpCode, OpRef, Type};
+use majit_ir::{GcRef, GuardVirtualEntry, Op, OpCode, OpRef, Type};
+
+use crate::info::PtrInfo;
+
+/// bridgeopt.py: serialized optimizer knowledge for guard resume data.
+///
+/// Captures the optimizer's knowledge at each guard point so that bridges
+/// compiled from guard failures can inherit heap cache, known class, and
+/// loopinvariant call result information.
+#[derive(Clone, Debug, Default)]
+pub struct OptimizerKnowledge {
+    /// Heap cache: (object, field_descr_index, value) triples.
+    pub heap_fields: Vec<(OpRef, u32, OpRef)>,
+    /// Known classes: (box, class_ptr) pairs.
+    /// bridgeopt.py:74-88: serialize known class bitfield.
+    pub known_classes: Vec<(OpRef, GcRef)>,
+    /// Loop-invariant call results: (func_ptr, result) pairs.
+    /// bridgeopt.py:113-122: serialize_optrewrite.
+    pub loopinvariant_results: Vec<(i64, OpRef)>,
+}
+
+impl OptimizerKnowledge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.heap_fields.is_empty()
+            && self.known_classes.is_empty()
+            && self.loopinvariant_results.is_empty()
+    }
+
+    /// Remap OpRefs from source-trace numbering to bridge inputarg numbering.
+    pub fn remap(&self, remap: &std::collections::HashMap<OpRef, OpRef>) -> Self {
+        let heap_fields = self
+            .heap_fields
+            .iter()
+            .filter_map(|&(obj, field_idx, val)| {
+                let new_obj = remap.get(&obj)?;
+                let new_val = remap.get(&val)?;
+                Some((*new_obj, field_idx, *new_val))
+            })
+            .collect();
+        let known_classes = self
+            .known_classes
+            .iter()
+            .filter_map(|&(opref, class_ptr)| {
+                let new_opref = remap.get(&opref)?;
+                Some((*new_opref, class_ptr))
+            })
+            .collect();
+        let loopinvariant_results = self
+            .loopinvariant_results
+            .iter()
+            .filter_map(|&(func_ptr, result)| {
+                let new_result = remap.get(&result)?;
+                Some((func_ptr, *new_result))
+            })
+            .collect();
+        OptimizerKnowledge {
+            heap_fields,
+            known_classes,
+            loopinvariant_results,
+        }
+    }
+}
 
 /// The optimizer: chains passes and runs them over a trace.
 ///
@@ -91,7 +156,7 @@ pub struct Optimizer {
     pub final_ctx: Option<OptContext>,
     /// bridgeopt.py: pending bridge knowledge to apply after setup().
     /// Stored here so it survives the setup() clear in optimize_with_constants_and_inputs.
-    pending_bridge_knowledge: Option<Vec<(OpRef, u32, OpRef)>>,
+    pending_bridge_knowledge: Option<OptimizerKnowledge>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -610,25 +675,62 @@ impl Optimizer {
     }
 
     /// bridgeopt.py:63-122: serialize_optimizer_knowledge
-    /// Export the optimizer's heap cache knowledge for storage in guard resume data.
-    /// Called after optimization to capture what the optimizer knows at each guard.
-    pub fn serialize_optimizer_knowledge(&self) -> Vec<(OpRef, u32, OpRef)> {
-        let mut result = Vec::new();
+    /// Export the optimizer's heap cache, known class, and loopinvariant knowledge
+    /// for storage in guard resume data. Called after optimization.
+    pub fn serialize_optimizer_knowledge(&self, ctx: &OptContext) -> OptimizerKnowledge {
+        let mut knowledge = OptimizerKnowledge::new();
+
+        // Heap fields: exported from OptHeap pass
         for pass in &self.passes {
-            result.extend(pass.export_cached_fields());
+            knowledge.heap_fields.extend(pass.export_cached_fields());
         }
-        result
+
+        // bridgeopt.py:74-88: known classes from ptr_info
+        for (idx, info_opt) in ctx.ptr_info.iter().enumerate() {
+            if let Some(info) = info_opt {
+                if let Some(class_ptr) = info.get_known_class() {
+                    knowledge
+                        .known_classes
+                        .push((OpRef(idx as u32), *class_ptr));
+                }
+            }
+        }
+
+        // bridgeopt.py:113-122: loopinvariant results from OptRewrite
+        for pass in &self.passes {
+            knowledge
+                .loopinvariant_results
+                .extend(pass.export_loopinvariant_results());
+        }
+
+        knowledge
     }
 
     /// bridgeopt.py:124-185: deserialize_optimizer_knowledge
     /// Import optimizer knowledge from the guard's resume data into this optimizer.
-    /// Called before bridge optimization to pre-populate the heap cache.
-    pub fn deserialize_optimizer_knowledge(&mut self, entries: &[(OpRef, u32, OpRef)]) {
-        if entries.is_empty() {
-            return;
+    /// Called before bridge optimization to pre-populate caches.
+    pub fn deserialize_optimizer_knowledge(
+        &mut self,
+        knowledge: &OptimizerKnowledge,
+        ctx: &mut OptContext,
+    ) {
+        // Heap fields -> OptHeap
+        if !knowledge.heap_fields.is_empty() {
+            for pass in &mut self.passes {
+                pass.import_cached_fields(&knowledge.heap_fields);
+            }
         }
-        for pass in &mut self.passes {
-            pass.import_cached_fields(entries);
+
+        // bridgeopt.py:133-146: known classes -> PtrInfo::KnownClass
+        for &(opref, class_ptr) in &knowledge.known_classes {
+            Self::make_constant_class(ctx, opref, class_ptr.0 as i64);
+        }
+
+        // bridgeopt.py:173-185: loopinvariant results -> OptRewrite
+        if !knowledge.loopinvariant_results.is_empty() {
+            for pass in &mut self.passes {
+                pass.import_loopinvariant_results(&knowledge.loopinvariant_results);
+            }
         }
     }
 
@@ -1107,10 +1209,8 @@ impl Optimizer {
     /// Record that an OpRef has a known class (type pointer).
     /// This is used by GUARD_CLASS to propagate class info.
     pub fn make_constant_class(ctx: &mut OptContext, opref: OpRef, class_value: i64) {
-        // In RPython this creates an InstancePtrInfo with _known_class.
-        // In majit we record it as a fact the guard pass can use.
-        // The class value is stored so downstream passes can check it.
-        let _ = (ctx, opref, class_value);
+        let class_ptr = GcRef(class_value as usize);
+        ctx.set_ptr_info(opref, PtrInfo::known_class(class_ptr, true));
     }
 
     /// optimizer.py: is_raw_ptr(op)
@@ -1210,8 +1310,8 @@ impl Optimizer {
         if let Some(knowledge) = self.pending_bridge_knowledge.take() {
             // heap.py:870-894: deserialize_optheap — import into passes AND
             // set PtrInfo fields so other passes see the cached values.
-            self.deserialize_optimizer_knowledge(&knowledge);
-            for &(obj, field_idx, val) in &knowledge {
+            self.deserialize_optimizer_knowledge(&knowledge, &mut ctx);
+            for &(obj, field_idx, val) in &knowledge.heap_fields {
                 if !obj.is_none() && !val.is_none() {
                     if let Some(info) = ctx.get_ptr_info_mut(obj) {
                         info.set_field(field_idx, val);
@@ -1708,13 +1808,13 @@ impl Optimizer {
         inline_short_preamble: bool,
         retraced_count: u32,
         retrace_limit: u32,
-        bridge_knowledge: Option<&[(OpRef, u32, OpRef)]>,
+        bridge_knowledge: Option<&OptimizerKnowledge>,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
         // clears pass state, so we apply AFTER setup.
         if let Some(knowledge) = bridge_knowledge {
-            self.pending_bridge_knowledge = Some(knowledge.to_vec());
+            self.pending_bridge_knowledge = Some(knowledge.clone());
         }
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
         let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
