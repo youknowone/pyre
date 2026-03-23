@@ -68,6 +68,10 @@ impl CachedField {
     /// heap.py:59-65: possible_aliasing — check if the lazy_set targets a
     /// different struct than `struct_opref`. If so, the lazy_set must be
     /// forced before this struct can be accessed.
+    ///
+    /// Both `lazy_obj` and `struct_opref` must be pre-resolved through
+    /// `ctx.get_replacement` so that two different OpRefs forwarding to the
+    /// same object are treated as identical (PtrInfo identity semantics).
     fn possible_aliasing(&self, struct_opref: OpRef) -> bool {
         if let Some((lazy_obj, _)) = &self.lazy_set {
             *lazy_obj != struct_opref
@@ -183,6 +187,9 @@ impl CachedArrayItem {
 
     /// heap.py:59-65: possible_aliasing -- check if the lazy_set targets a
     /// different array than `array_opref`.
+    ///
+    /// Both `lazy_obj` and `array_opref` must be pre-resolved through
+    /// `ctx.get_replacement` (PtrInfo identity semantics).
     fn possible_aliasing(&self, array_opref: OpRef) -> bool {
         if let Some((lazy_obj, _)) = &self.lazy_set {
             *lazy_obj != array_opref
@@ -884,7 +891,9 @@ impl OptHeap {
 
 
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
-        let (obj, field_idx) = key;
+        let (raw_obj, field_idx) = key;
+        // Resolve forwarding (PtrInfo identity semantics, heap.py same_info).
+        let obj = ctx.get_replacement(raw_obj);
         let mut force_lazy = false;
         if let Some(cf) = self.field_cache.get(&field_idx) {
             if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
@@ -1014,7 +1023,10 @@ impl OptHeap {
             None => return OptimizationResult::Emit(op.clone()),
         };
 
-        let (obj, field_idx) = key;
+        let (raw_obj, field_idx) = key;
+        // Resolve forwarding so that two OpRefs pointing to the same object
+        // compare equal (PtrInfo identity semantics, heap.py same_info).
+        let obj = ctx.get_replacement(raw_obj);
         let new_value = op.arg(1);
 
         // The stored value escapes (it becomes reachable via the heap).
@@ -1092,11 +1104,11 @@ impl OptHeap {
         self.invalidate_field_caches_for_write(obj, field_idx);
 
         // Store as lazy set. heap.py:89-90: self._lazy_set = op
+        // obj is already resolved through get_replacement above.
         let cf = self.get_or_create_cached_field(field_idx);
         cf.lazy_set = Some((obj, op.clone()));
 
         // heap.py: cf.do_setfield updates info as well
-        let obj = ctx.get_replacement(obj);
         if let Some(info) = ctx.get_ptr_info_mut(obj) {
             info.set_field(field_idx, new_value);
         }
@@ -1583,7 +1595,7 @@ impl Optimization for OptHeap {
                     if pending_op.opcode == OpCode::SetarrayitemGc {
                         let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
                         if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
-                            let array = pending_op.arg(0);
+                            let array = ctx.get_replacement(pending_op.arg(0));
                             let cai = self.get_or_create_cached_arrayitem(descr_idx, index);
                             cai.lazy_set = Some((array, pending_op));
                         } else {
@@ -1591,7 +1603,7 @@ impl Optimization for OptHeap {
                         }
                     } else {
                         let field_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
-                        let obj = pending_op.arg(0);
+                        let obj = ctx.get_replacement(pending_op.arg(0));
                         let cf = self.get_or_create_cached_field(field_idx);
                         cf.lazy_set = Some((obj, pending_op));
                     }
