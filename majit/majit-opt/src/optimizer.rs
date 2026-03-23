@@ -1399,16 +1399,16 @@ impl Optimizer {
             self.propagate_one(op, &mut ctx);
         }
 
-        // RPython: JUMP goes through all passes BEFORE flush.
-        // OptVirtualize captures pre_force_virtual_state during JUMP.
-        // Flush destroys virtuals, so JUMP must run first.
+        // RPython optimizer.py:553-556: flush=True sends JUMP through
+        // passes after flush; flush=False (Phase 2) stores it directly.
         if let Some(mut terminal_op) = last_op {
-            for arg in &mut terminal_op.args {
-                *arg = ctx.get_replacement(*arg);
-            }
             if self.skip_flush {
+                // Phase 2: JUMP is NOT sent through passes (RPython parity).
                 self.terminal_op = Some(terminal_op);
             } else {
+                for arg in &mut terminal_op.args {
+                    *arg = ctx.get_replacement(*arg);
+                }
                 self.propagate_one(&terminal_op, &mut ctx);
             }
         }
