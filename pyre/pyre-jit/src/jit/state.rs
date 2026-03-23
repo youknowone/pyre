@@ -4662,10 +4662,27 @@ impl SharedOpcodeHandler for TraceFrameState {
         key: Self::Value,
         value: Self::Value,
     ) -> Result<(), PyError> {
+        // MIFrame Box tracking: mutate concrete list/dict
+        if let Some((c_obj, c_key, c_val)) = self.concrete_store_subscr_operands() {
+            let _ = pyre_objspace::space::py_setitem(c_obj, c_key, c_val);
+        }
         self.store_subscr_value(obj, key, value)
     }
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
+        // MIFrame Box tracking: mutate concrete list
+        // list and value are already popped from symbolic stack; their concrete
+        // counterparts are in the positions just above current valuestackdepth.
+        let s = self.sym();
+        let c_list = s.concrete_value_at(s.valuestackdepth);
+        let c_value = s.concrete_value_at(s.valuestackdepth + 1);
+        if !c_list.is_null() && !c_value.is_null() {
+            unsafe {
+                if pyre_object::is_list(c_list) {
+                    pyre_object::w_list_append(c_list, c_value);
+                }
+            }
+        }
         self.list_append_value(list, value)
     }
 
@@ -4678,6 +4695,12 @@ impl SharedOpcodeHandler for TraceFrameState {
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete getattr
+        if let Some(concrete_obj) = self.concrete_popped_value() {
+            if let Ok(result) = pyre_objspace::space::py_getattr(concrete_obj, name) {
+                self.sym_mut().pending_concrete_push = Some(result);
+            }
+        }
         self.trace_load_attr(obj, name)
     }
 
@@ -4822,6 +4845,15 @@ impl TruthOpcodeHandler for TraceFrameState {
         truth: Self::Truth,
         negate: bool,
     ) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete bool from truth
+        if let Some(concrete_truth) = self.sym().last_comparison_concrete_truth {
+            let result = if negate {
+                !concrete_truth
+            } else {
+                concrete_truth
+            };
+            self.sym_mut().pending_concrete_push = Some(pyre_object::w_bool_from(result));
+        }
         self.trace_bool_value_from_truth(truth, negate)
     }
 }
@@ -4903,7 +4935,60 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
         b: Self::Value,
         op: BinaryOperator,
     ) -> Result<Self::Value, PyError> {
-        // MIFrame Box tracking: compute concrete result for int binary ops
+        // MIFrame Box tracking: compute concrete result for binary ops
+        // Float path
+        if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
+            unsafe {
+                let is_float_op = is_float(lhs_obj) || is_float(rhs_obj);
+                if is_float_op {
+                    let lhs_f = if is_float(lhs_obj) {
+                        w_float_get_value(lhs_obj)
+                    } else if is_int(lhs_obj) {
+                        w_int_get_value(lhs_obj) as f64
+                    } else {
+                        0.0
+                    };
+                    let rhs_f = if is_float(rhs_obj) {
+                        w_float_get_value(rhs_obj)
+                    } else if is_int(rhs_obj) {
+                        w_int_get_value(rhs_obj) as f64
+                    } else {
+                        0.0
+                    };
+                    let result = match op {
+                        BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs_f + rhs_f,
+                        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => lhs_f - rhs_f,
+                        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => lhs_f * rhs_f,
+                        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide
+                            if rhs_f != 0.0 =>
+                        {
+                            lhs_f / rhs_f
+                        }
+                        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide
+                            if rhs_f != 0.0 =>
+                        {
+                            (lhs_f / rhs_f).floor()
+                        }
+                        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder
+                            if rhs_f != 0.0 =>
+                        {
+                            lhs_f % rhs_f
+                        }
+                        _ => f64::NAN,
+                    };
+                    if !result.is_nan()
+                        || matches!(
+                            op,
+                            BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide
+                        )
+                    {
+                        self.sym_mut().pending_concrete_push =
+                            Some(pyre_object::w_float_new(result));
+                    }
+                }
+            }
+        }
+        // Int path
         if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
             let result = match op {
                 BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.wrapping_add(rhs),
@@ -4952,6 +5037,35 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
         op: ComparisonOperator,
     ) -> Result<Self::Value, PyError> {
         // MIFrame Box tracking: compute concrete comparison result
+        if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
+            unsafe {
+                if is_float(lhs_obj) || is_float(rhs_obj) {
+                    let lhs_f = if is_float(lhs_obj) {
+                        w_float_get_value(lhs_obj)
+                    } else if is_int(lhs_obj) {
+                        w_int_get_value(lhs_obj) as f64
+                    } else {
+                        0.0
+                    };
+                    let rhs_f = if is_float(rhs_obj) {
+                        w_float_get_value(rhs_obj)
+                    } else if is_int(rhs_obj) {
+                        w_int_get_value(rhs_obj) as f64
+                    } else {
+                        0.0
+                    };
+                    let result = match op {
+                        ComparisonOperator::Less => lhs_f < rhs_f,
+                        ComparisonOperator::LessOrEqual => lhs_f <= rhs_f,
+                        ComparisonOperator::Greater => lhs_f > rhs_f,
+                        ComparisonOperator::GreaterOrEqual => lhs_f >= rhs_f,
+                        ComparisonOperator::Equal => lhs_f == rhs_f,
+                        ComparisonOperator::NotEqual => lhs_f != rhs_f,
+                    };
+                    self.sym_mut().pending_concrete_push = Some(pyre_object::w_bool_from(result));
+                }
+            }
+        }
         if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
             let result = match op {
                 ComparisonOperator::Less => lhs < rhs,
@@ -4967,10 +5081,18 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
     }
 
     fn unary_negative_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete negation
+        if let Some(v) = self.concrete_unary_int_operand() {
+            self.sym_mut().pending_concrete_push = Some(pyre_object::w_int_new(v.wrapping_neg()));
+        }
         self.unary_int_value(value, OpCode::IntNeg)
     }
 
     fn unary_invert_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete bitwise invert
+        if let Some(v) = self.concrete_unary_int_operand() {
+            self.sym_mut().pending_concrete_push = Some(pyre_object::w_int_new(!v));
+        }
         self.unary_int_value(value, OpCode::IntInvert)
     }
 }

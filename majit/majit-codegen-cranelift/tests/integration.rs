@@ -58,7 +58,6 @@ fn make_descr(index: u32) -> DescrRef {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_simple_arithmetic() {
     // Record: input(i) -> result = i + CONST_1 -> finish(result)
     // Execute with i=41, expect 42.
@@ -93,7 +92,6 @@ fn test_simple_arithmetic() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_sum_loop() {
     // Record a loop: input(i, sum) -> sum2 = sum + i -> i2 = i - 1
     //   -> cmp = i2 > 0 -> guard_true(cmp) -> jump(i2, sum2)
@@ -174,7 +172,6 @@ fn test_sum_loop() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_identity_operations() {
     // Record: input(x) -> y = x + 0 -> z = y * 1 -> finish(z)
     // The optimizer's OptRewrite pass can eliminate identity operations
@@ -228,7 +225,6 @@ fn test_identity_operations() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_guard_failure_path() {
     // Record: input(x) -> cmp = x > 0 -> guard_true(cmp)
     //   -> result = x * 2 -> finish(result)
@@ -287,7 +283,6 @@ fn test_guard_failure_path() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_multiple_optimization_passes() {
     // Record a trace with redundant operations:
     //   input(a, b)
@@ -349,7 +344,6 @@ fn test_multiple_optimization_passes() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_bridge_end_to_end() {
     // Main trace: sum loop counting down from N.
     //   input(i, sum) -> sum2 = sum + i -> i2 = i - 1
@@ -1306,7 +1300,6 @@ fn test_stress_virtual_guard_constfold() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_stress_intdiv_intbounds_interaction() {
     // === Part A: Optimizer-level verification ===
     // Build a trace with a redundant guard to verify IntBounds eliminates it.
@@ -1438,7 +1431,6 @@ fn test_stress_intdiv_intbounds_interaction() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_stress_loop_multi_pass() {
     let mut rec = Trace::new();
     let i = rec.record_input_arg(Type::Int);
@@ -1562,7 +1554,6 @@ fn test_stress_loop_multi_pass() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_stress_heap_cache_greenfield() {
     let immut_fd = immutable_field_descr(0);
     let mut_fd = field_descr(1);
@@ -1760,7 +1751,6 @@ fn test_stress_string_virtualization() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_stress_loop_intbounds_guard_cse() {
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
@@ -1884,7 +1874,6 @@ fn test_stress_loop_intbounds_guard_cse() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_stress_cse_chain() {
     let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
@@ -2811,7 +2800,6 @@ fn test_ffi_call_exception_propagation() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     // Trace: input(x) -> result = x + 5 -> cmp = result < 100
     //        -> guard_true(cmp) -> finish(result)
@@ -2886,7 +2874,6 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_compiled_trace_multi_guard_frame_stacks_query() {
     // Trace: input(x) -> cmp1 = x > 0 -> guard_true(cmp1)
     //        -> result = x + 1 -> cmp2 = result < 1000
@@ -2963,7 +2950,6 @@ fn test_compiled_trace_multi_guard_frame_stacks_query() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_compiled_bridge_guard_failure_has_frame_stack() {
     // Main loop: input(i, sum) -> sum2 = sum + i -> i2 = i - 1
     //            -> cmp = i2 > 0 -> guard_true(cmp) -> jump(i2, sum2)
@@ -3167,7 +3153,6 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // compile_loop Cranelift verifier error (invalid block reference)
 fn test_frame_stack_slot_types_match_fail_arg_types() {
     // Trace with mixed Int and Float fail args:
     //   input(x_int, x_float) -> cmp = x_int > 0 -> guard_true(cmp, fail_args=[x_int, x_float])

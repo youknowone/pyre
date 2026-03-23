@@ -248,6 +248,45 @@ pub trait JitCodeSym {
     ) {
     }
 
+    // -- Queue (FIFO) support -----
+    //
+    // Queue uses the same head/size fields as Stack (pop from head),
+    // but push appends to tail. The tail pointer is at a separate offset.
+
+    /// Whether the given storage index is a Queue (FIFO) storage.
+    /// Queue push appends to tail instead of prepending to head.
+    fn is_queue_storage(&self, _selected: usize) -> bool {
+        false
+    }
+
+    /// Descriptor for the tail pointer field on the queue object.
+    fn linked_list_queue_tail_descr(&self) -> Option<majit_ir::DescrRef> {
+        None
+    }
+
+    /// Current tail OpRef for the given queue storage.
+    fn linked_list_tail(&self, _selected: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Update the tail OpRef for the given queue storage.
+    fn set_linked_list_tail(&mut self, _selected: usize, _tail: OpRef) {}
+
+    /// Write the tail pointer back to the queue object in memory.
+    fn linked_list_writeback_tail(
+        &mut self,
+        _ctx: &mut TraceCtx,
+        _selected: usize,
+        _new_tail: OpRef,
+    ) {
+    }
+
+    /// Ensure the tail pointer is loaded for the given queue storage.
+    /// Returns the OpRef of the tail pointer, or None if not a queue.
+    fn ensure_linked_list_tail(&mut self, _ctx: &mut TraceCtx, _selected: usize) -> Option<OpRef> {
+        None
+    }
+
     // -- State field support (register/tape machines) -----
     //
     // When state_fields is configured, scalar and array fields on the
@@ -610,6 +649,13 @@ where
         sym.set_current_selected_value(selected, selected_value);
         sym.set_current_selected_ref(selected, stack_ref);
         sym.set_current_stacksize_value(stacksize);
+        // For Queue storages, also load the tail pointer.
+        if sym.is_queue_storage(selected) {
+            if let Some(tail_descr) = sym.linked_list_queue_tail_descr() {
+                let tail = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], tail_descr);
+                sym.set_linked_list_tail(selected, tail);
+            }
+        }
         Ok(())
     }
 
@@ -689,6 +735,42 @@ where
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[node, old_head], next_descr);
         sym.set_linked_list_head(selected, node);
         sym.linked_list_writeback_head(ctx, selected, node);
+        let _ = self.linked_list_adjust_size(ctx, sym, selected, 1)?;
+
+        self.runtime_stack_mut(selected, runtime).push(concrete);
+        Ok(())
+    }
+
+    /// Emit IR for Queue push: write value to tail, allocate new sentinel,
+    /// set tail.next = new, update queue.tail = new.
+    /// RPython parity: rpaheui Queue._put_value / push (append to tail).
+    fn linked_list_queue_push(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        selected: usize,
+        value: OpRef,
+        concrete: i64,
+    ) -> Result<(), TraceAction> {
+        let size_descr = sym.node_size_descr().ok_or(TraceAction::Abort)?;
+        let value_descr = sym.node_value_descr().ok_or(TraceAction::Abort)?;
+        let next_descr = sym.node_next_descr().ok_or(TraceAction::Abort)?;
+
+        let tail = sym
+            .ensure_linked_list_tail(ctx, selected)
+            .ok_or(TraceAction::Abort)?;
+
+        // tail.value = value (write to current sentinel's value slot)
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[tail, value], value_descr);
+        // new_node = New(Node)
+        let new_node = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+        // tail.next = new_node
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[tail, new_node], next_descr);
+        // queue.tail = new_node
+        sym.set_linked_list_tail(selected, new_node);
+        sym.linked_list_writeback_tail(ctx, selected, new_node);
+        // size += 1
         let _ = self.linked_list_adjust_size(ctx, sym, selected, 1)?;
 
         self.runtime_stack_mut(selected, runtime).push(concrete);
@@ -953,11 +1035,13 @@ where
                 let selected = sym.current_selected();
                 let (value, concrete) = self.read_int_reg(src);
                 if sym.ensure_linked_list_head(ctx, selected).is_some() {
-                    // Linked list mode: emit New + SetfieldGc (OptVirtualize target)
-                    if self
-                        .linked_list_push(ctx, sym, runtime, selected, value, concrete)
-                        .is_err()
-                    {
+                    // Linked list mode: Queue appends to tail, Stack prepends to head.
+                    let result = if sym.is_queue_storage(selected) {
+                        self.linked_list_queue_push(ctx, sym, runtime, selected, value, concrete)
+                    } else {
+                        self.linked_list_push(ctx, sym, runtime, selected, value, concrete)
+                    };
+                    if result.is_err() {
                         return TraceAction::Abort;
                     }
                 } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
@@ -1743,10 +1827,12 @@ where
                 };
                 let (value, concrete) = self.read_int_reg(src_idx);
                 if sym.ensure_linked_list_head(ctx, target).is_some() {
-                    if self
-                        .linked_list_push(ctx, sym, runtime, target, value, concrete)
-                        .is_err()
-                    {
+                    let result = if sym.is_queue_storage(target) {
+                        self.linked_list_queue_push(ctx, sym, runtime, target, value, concrete)
+                    } else {
+                        self.linked_list_push(ctx, sym, runtime, target, value, concrete)
+                    };
+                    if result.is_err() {
                         return TraceAction::Abort;
                     }
                 } else if sym.current_selected_ref().is_some() {
