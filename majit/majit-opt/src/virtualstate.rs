@@ -1841,7 +1841,7 @@ mod tests {
     fn test_export_virtual() {
         let mut ctx = OptContext::new(10);
         let opref = ctx.emit(Op::new(OpCode::NewWithVtable, &[]));
-        let field_ref = ctx.emit(Op::new(OpCode::SameAsI, &[OpRef::NONE]));
+        let field_ref = OpRef(10099); // constant pool entry
         ctx.make_constant(field_ref, Value::Int(99));
 
         let descr = test_descr(1);

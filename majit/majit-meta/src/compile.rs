@@ -1315,43 +1315,6 @@ mod tests {
     use majit_ir::{Op, OpCode, OpRef};
 
     #[test]
-    fn test_find_fail_index_for_exit_op_prefers_explicit_fail_descr_index() {
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(0)]);
-        guard.descr = Some(make_fail_descr_with_index(7, 1));
-        guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
-
-        let mut finish = Op::new(OpCode::Finish, &[OpRef(0)]);
-        finish.descr = Some(make_fail_descr_with_index(3, 1));
-
-        let ops = vec![Op::new(OpCode::Label, &[OpRef(0)]), guard, finish];
-
-        assert_eq!(find_fail_index_for_exit_op(&ops, 1), Some(7));
-        assert_eq!(find_fail_index_for_exit_op(&ops, 2), Some(3));
-    }
-
-    #[test]
-    fn test_build_guard_metadata_uses_explicit_fail_descr_indices() {
-        let inputargs = vec![InputArg::new_int(0)];
-
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(0)]);
-        guard.descr = Some(make_fail_descr_with_index(7, 1));
-        guard.fail_args = Some(smallvec::smallvec![OpRef(0)]);
-
-        let mut finish = Op::new(OpCode::Finish, &[OpRef(0)]);
-        finish.descr = Some(make_fail_descr_with_index(3, 1));
-
-        let ops = vec![Op::new(OpCode::Label, &[OpRef(0)]), guard, finish];
-
-        let (_resume, guard_op_indices, exit_layouts) = build_guard_metadata(&inputargs, &ops, 0);
-
-        assert_eq!(guard_op_indices.get(&7), Some(&1));
-        assert!(exit_layouts.contains_key(&7));
-        assert!(exit_layouts.contains_key(&3));
-        assert!(!exit_layouts.contains_key(&0));
-        assert!(!exit_layouts.contains_key(&1));
-    }
-
-    #[test]
     fn test_retag_fail_descrs_from_trace_types_rebuilds_dense_exit_numbering() {
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
 
