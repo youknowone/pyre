@@ -638,11 +638,14 @@ impl<S: JitState> JitDriver<S> {
     where
         F: FnOnce(&mut TraceCtx, &mut S::Sym) -> TraceAction,
     {
-        // RPython JC_TRACING parity: only feed the trace when the
-        // green key matches the active trace. Nested calls with
-        // different green keys are ignored, matching RPython's
-        // per-cell JC_TRACING flag in maybe_compile_and_run.
-        if self.meta.is_tracing_key(green_key) {
+        // RPython JC_TRACING parity: in RPython, MetaInterp._interpret()
+        // runs all bytecodes within the same portal call. In pyre,
+        // eval_loop_jit calls jit_merge_point at each bytecode, so the
+        // green_key changes per bytecode (includes pc). Use is_tracing()
+        // (not is_tracing_key) to accept all bytecodes from the tracing
+        // portal. Nested function calls are prevented by JIT_TRACING
+        // flag in eval_loop_jit.
+        if self.meta.is_tracing() {
             self.merge_point(trace_fn);
         }
         None
@@ -1530,6 +1533,13 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.meta.has_compiled_loop(green_key)
+    }
+
+    /// Remove all compiled code. Used when guard-fail recovery detects
+    /// unrecoverable state (e.g., null Ref slots from incomplete
+    /// resume data), preventing repeated entry→guard-fail loops.
+    pub fn invalidate_all_compiled(&mut self) {
+        self.meta.clear_compiled_loops();
     }
 
     /// Whether the compiled finish for this loop exits with a raw int.

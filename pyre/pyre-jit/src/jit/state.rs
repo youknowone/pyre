@@ -666,12 +666,11 @@ fn concrete_value_type(value: PyObjectRef) -> Type {
 
 /// RPython parity: virtualizable array slots are always GCREF (Ref).
 /// Even W_IntObject values are Ref — the trace unboxes via GetfieldGcPureI.
-fn concrete_virtualizable_slot_type(value: PyObjectRef) -> Type {
-    if value.is_null() || looks_like_heap_ref(value) {
-        Type::Ref
-    } else {
-        Type::Int
-    }
+fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
+    // RPython virtualizable.py: all virtualizable_boxes entries are Box
+    // (GCREF). The optimizer recovers unboxed values via GetfieldGcPureI
+    // during preamble peeling. Unconditionally return Ref here.
+    Type::Ref
 }
 
 fn looks_like_heap_ref(value: PyObjectRef) -> bool {

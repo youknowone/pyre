@@ -1450,6 +1450,30 @@ impl OptUnroll {
             }
         }
 
+        // Remap pre_force_field_refs keys from Phase 1 OpRefs to Phase 2
+        // targetarg OpRefs. Phase 1 pre_force_args[i] is the pre-force
+        // JUMP arg for position i, targetargs[i] is the Phase 2 inputarg
+        // for the same position.
+        if !exported_state.pre_force_field_refs.is_empty() {
+            for (phase1_idx, phase1_opref) in exported_state.pre_force_args.iter().enumerate() {
+                if let Some(fields) = exported_state.pre_force_field_refs.get(phase1_opref) {
+                    if let Some(&phase2_opref) = targetargs.get(phase1_idx) {
+                        // Also remap field value OpRefs using next_iteration_args mapping:
+                        // Phase 1 field value → Phase 2 equivalent via pre_force_args index.
+                        let remapped_fields: Vec<(u32, OpRef)> = fields.iter().map(|&(idx, val)| {
+                            // Find val in pre_force_args or next_iteration_args
+                            let remapped_val = exported_state.pre_force_args.iter()
+                                .position(|&a| a == val)
+                                .and_then(|pos| targetargs.get(pos).copied())
+                                .unwrap_or(val);
+                            (idx, remapped_val)
+                        }).collect();
+                        ctx.pre_force_field_refs.insert(phase2_opref, remapped_fields);
+                    }
+                }
+            }
+        }
+
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
         let (label_args, virtuals) = exported_state
             .virtual_state
