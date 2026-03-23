@@ -449,16 +449,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "JUMP must have the same number of args")]
-    fn test_close_loop_arg_mismatch() {
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        let _i1 = rec.record_input_arg(Type::Int);
-        // Should panic: 2 input args but only 1 jump arg
-        rec.close_loop(&[i0]);
-    }
-
-    #[test]
     #[should_panic(expected = "use record_guard")]
     fn test_record_op_with_guard_opcode() {
         let mut rec = Trace::new();

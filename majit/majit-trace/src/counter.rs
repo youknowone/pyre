@@ -299,12 +299,13 @@ mod tests {
         for _ in 0..8 {
             counter.tick(42);
         }
+        // count=8, decay by 0.96 → floor(8*0.96)=7
         counter.decay_all_counters();
-        // Count should be halved (8 -> 4), so need 6 more to reach 10
-        for _ in 0..5 {
-            assert!(!counter.tick(42));
-        }
-        assert!(counter.tick(42)); // 4 + 6 = 10
+        assert_eq!(counter.get(42), 7);
+        // Need 3 more to reach 10
+        assert!(!counter.tick(42)); // 8
+        assert!(!counter.tick(42)); // 9
+        assert!(counter.tick(42)); // 10
     }
 }
 

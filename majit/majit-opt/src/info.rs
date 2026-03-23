@@ -4,7 +4,7 @@ use crate::intutils::IntBound;
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, Value};
 
 /// Information about an operation's result, attached during optimization.
 ///
@@ -415,9 +415,18 @@ impl PtrInfo {
             }
         };
 
+        // RPython info.py:140-145: immutable virtual filled with constants
+        // → constant fold to a compile-time constant pointer.
+        if self.is_immutable_and_filled_with_constants(ctx) {
+            // All fields are constants and descr is immutable → can fold
+            // to a constant. For now, we don't have constant_fold infrastructure,
+            // so fall through to the normal force path. This matches RPython's
+            // behavior when constant_fold is not available.
+        }
+
         match self {
             PtrInfo::VirtualStruct(vinfo) => {
-                // RPython info.py: _is_virtual = False, _fields retained.
+                // RPython info.py:147-156: _is_virtual = False, _fields retained.
                 let preserved = PtrInfo::Struct(StructPtrInfo {
                     descr: vinfo.descr.clone(),
                     fields: vinfo
@@ -431,7 +440,7 @@ impl PtrInfo {
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 // Store preserved info on alloc_ref (canonical after force).
-                ctx.set_ptr_info_direct(alloc_ref, preserved);
+                ctx.set_ptr_info(alloc_ref, preserved);
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
                 }
@@ -463,7 +472,7 @@ impl PtrInfo {
                 let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
-                ctx.set_ptr_info_direct(alloc_ref, preserved);
+                ctx.set_ptr_info(alloc_ref, preserved);
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
                 }
@@ -626,6 +635,33 @@ impl PtrInfo {
             }
             _ => {}
         }
+    }
+
+    /// info.py:273-303: _is_immutable_and_filled_with_constants
+    /// Check if this virtual is immutable and all fields are constants.
+    /// Used by force_box to determine if the virtual can be constant-folded.
+    pub fn is_immutable_and_filled_with_constants(&self, ctx: &crate::OptContext) -> bool {
+        let (fields, descr) = match self {
+            PtrInfo::Virtual(v) => (&v.fields, &v.descr),
+            PtrInfo::VirtualStruct(v) => (&v.fields, &v.descr),
+            _ => return false,
+        };
+        if !descr.is_always_pure() {
+            return false;
+        }
+        for &(_, val) in fields {
+            let resolved = ctx.get_replacement(val);
+            if !ctx.is_constant(resolved) {
+                // Check if it's a virtual that is also immutable+constant
+                if let Some(info) = ctx.get_ptr_info(resolved) {
+                    if info.is_virtual() && info.is_immutable_and_filled_with_constants(ctx) {
+                        continue;
+                    }
+                }
+                return false;
+            }
+        }
+        true
     }
 
     /// heap.py:194: opinfo._fields[descr.get_index()] = None
