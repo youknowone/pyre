@@ -2,7 +2,7 @@
 //! (RPython splits this across MetaInterp.history, compile.py, and Trace).
 
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type};
-use majit_trace::recorder::Trace;
+use majit_trace::recorder::{Trace, TracePosition};
 
 use majit_codegen::JitCellToken;
 
@@ -53,28 +53,64 @@ pub struct TraceCtx {
     /// Pending OpRef replacements from inline callee returns.
     /// Applied when the trace is finalized (close_loop/compile).
     replacements: Vec<(OpRef, OpRef)>,
-    /// RPython pyjitpl.py:3030 current_merge_points — green keys of
-    /// loop headers visited during tracing. First visit records the key;
-    /// second visit closes the loop (inner loop unrolled once).
-    current_merge_points: Vec<u64>,
+    /// pyjitpl.py:3030 current_merge_points — loop headers visited during
+    /// tracing with their trace positions. First visit records the key +
+    /// position; second visit closes the loop.
+    current_merge_points: Vec<MergePoint>,
+}
+
+/// pyjitpl.py:2989 — a visited loop header with its trace position.
+///
+/// RPython stores `(original_boxes, start)` where start is a 5-tuple
+/// trace position. In majit, boxes are implicit (inputargs) and position
+/// is a `TracePosition`.
+#[derive(Clone, Debug)]
+pub struct MergePoint {
+    /// Green key of the loop header.
+    pub green_key: u64,
+    /// Trace position when this loop header was first visited.
+    pub position: TracePosition,
 }
 
 impl TraceCtx {
-    /// RPython pyjitpl.py:2991 — check if a loop header was already visited.
+    /// pyjitpl.py:2991 — check if a loop header was already visited.
     pub fn has_merge_point(&self, key: u64) -> bool {
-        self.current_merge_points.contains(&key)
+        self.current_merge_points
+            .iter()
+            .any(|mp| mp.green_key == key)
     }
 
-    /// RPython pyjitpl.py:3030 — record a loop header visit.
+    /// pyjitpl.py:3029-3030 — record a loop header visit with position.
     pub fn add_merge_point(&mut self, key: u64) {
-        if !self.current_merge_points.contains(&key) {
-            self.current_merge_points.push(key);
+        if !self.has_merge_point(key) {
+            let position = self.recorder.get_position();
+            self.current_merge_points.push(MergePoint {
+                green_key: key,
+                position,
+            });
         }
     }
 
-    /// RPython pyjitpl.py:2908 — bridge traces start with empty merge points.
+    /// pyjitpl.py:2908 — bridge traces start with empty merge points.
     pub fn clear_merge_points(&mut self) {
         self.current_merge_points.clear();
+    }
+
+    /// Get the merge point for a given green key, if it exists.
+    pub fn get_merge_point(&self, key: u64) -> Option<&MergePoint> {
+        self.current_merge_points
+            .iter()
+            .find(|mp| mp.green_key == key)
+    }
+
+    /// history.py: get_trace_position — current recorder position.
+    pub fn get_trace_position(&self) -> TracePosition {
+        self.recorder.get_position()
+    }
+
+    /// history.py: cut — restore recorder to a saved position.
+    pub fn cut_trace(&mut self, pos: TracePosition) {
+        self.recorder.cut(pos);
     }
 
     /// Create a standalone TraceCtx for testing or external use.
@@ -92,6 +128,7 @@ impl TraceCtx {
     }
 
     pub(crate) fn new(recorder: Trace, green_key: u64) -> Self {
+        let initial_position = recorder.get_position();
         TraceCtx {
             recorder,
             green_key,
@@ -105,7 +142,10 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             replacements: Vec::new(),
-            current_merge_points: vec![green_key],
+            current_merge_points: vec![MergePoint {
+                green_key,
+                position: initial_position,
+            }],
         }
     }
 
@@ -115,6 +155,7 @@ impl TraceCtx {
         green_key: u64,
         green_key_values: GreenKey,
     ) -> Self {
+        let initial_position = recorder.get_position();
         TraceCtx {
             recorder,
             green_key,
@@ -128,7 +169,10 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             replacements: Vec::new(),
-            current_merge_points: vec![green_key],
+            current_merge_points: vec![MergePoint {
+                green_key,
+                position: initial_position,
+            }],
         }
     }
 
