@@ -826,6 +826,45 @@ impl<S: JitState> JitDriver<S> {
 
     #[cold]
     #[inline(never)]
+    /// RPython warmstate.py:425 bound_reached parity.
+    ///
+    /// Called when the counter threshold has ALREADY fired (from eval_loop_jit).
+    /// Bypasses counter.tick() inside maybe_compile, allowing decay_counters()
+    /// to be called before tracing starts.
+    pub fn bound_reached(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) {
+        if self.meta.is_tracing() {
+            return;
+        }
+        let meta = state.build_meta(target_pc, env);
+        let descriptor = self.driver_descriptor_for(state, &meta);
+        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+            return;
+        }
+        let live_values = state.extract_live_values(&meta);
+        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            return;
+        }
+
+        match self.meta.bound_reached(
+            green_key,
+            None,
+            descriptor,
+            &live_values,
+        ) {
+            BackEdgeAction::StartedTracing => {
+                self.sym = Some(S::create_sym(&meta, target_pc));
+                self.trace_meta = Some(meta);
+            }
+            _ => {}
+        }
+    }
+
     fn maybe_start_tracing(
         &mut self,
         green_key: u64,

@@ -795,6 +795,33 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// RPython warmstate.py:425 bound_reached parity.
+    ///
+    /// Like `on_back_edge_typed` but bypasses the counter tick — the
+    /// caller (can_enter_jit_hook) already verified the counter fired.
+    /// This allows decay_counters() to be called before tracing starts
+    /// without the internal tick check blocking the trace.
+    pub fn bound_reached(
+        &mut self,
+        green_key: u64,
+        green_key_values: Option<majit_ir::GreenKey>,
+        driver_descriptor: Option<JitDriverStaticData>,
+        live_values: &[Value],
+    ) -> BackEdgeAction {
+        if self.tracing.is_some() {
+            return BackEdgeAction::AlreadyTracing;
+        }
+
+        match self.warm_state.force_start_tracing(green_key) {
+            HotResult::NotHot => BackEdgeAction::Interpret,
+            HotResult::StartTracing(recorder) => {
+                self.setup_tracing(green_key, green_key_values, driver_descriptor, live_values, recorder)
+            }
+            HotResult::RunCompiled => BackEdgeAction::RunCompiled,
+            HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
+        }
+    }
+
     pub fn on_back_edge_typed(
         &mut self,
         green_key: u64,
@@ -808,70 +835,69 @@ impl<M: Clone> MetaInterp<M> {
 
         match self.warm_state.maybe_compile(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing(mut recorder) => {
-                for value in live_values {
-                    recorder.record_input_arg(value.get_type());
-                }
-
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] start tracing at key={}, num_inputs={}",
-                        green_key,
-                        live_values.len()
-                    );
-                }
-
-                let mut ctx = if let Some(values) = green_key_values {
-                    TraceCtx::with_green_key(recorder, green_key, values)
-                } else {
-                    TraceCtx::new(recorder, green_key)
-                };
-                if let Some(descriptor) = driver_descriptor {
-                    ctx.set_driver_descriptor(descriptor);
-                }
-                // Initialize standard virtualizable boxes if VirtualizableInfo is set.
-                //
-                // RPython equivalent: MetaInterp._init_virtualizable_state()
-                //
-                // The inputargs are laid out as: [frame_ref, field0, field1, ...,
-                // array0_elem0, ..., array0_elemN, ...]. We extract the OpRef
-                // indices corresponding to static fields + array elements and
-                // pass them to init_virtualizable_boxes so that subsequent
-                // vable_getfield/setfield calls use boxes instead of heap ops.
-                if let Some(ref info) = self.virtualizable_info {
-                    let array_lengths = self.trace_entry_vable_lengths(info);
-                    let num_static = info.num_static_extra_boxes;
-                    let num_array_elems: usize = array_lengths.iter().sum();
-                    let total_vable = num_static + num_array_elems;
-
-                    if total_vable > 0 && live_values.len() >= 1 + total_vable {
-                        let vable_oprefs: Vec<OpRef> =
-                            (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
-                        ctx.init_virtualizable_boxes(
-                            info,
-                            OpRef(0), // frame ref = first inputarg
-                            &vable_oprefs,
-                            &array_lengths,
-                        );
-                    }
-                }
-
-                self.forced_virtualizable = None;
-                self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
-                self.tracing = Some(ctx);
-                // Pre-allocate a token number for this trace so that
-                // self-recursive calls can emit call_assembler targeting
-                // this token before the trace is compiled.
-                let pending_num = self.warm_state.alloc_token_number();
-                self.pending_token = Some((green_key, pending_num));
-                if let Some(ref hook) = self.hooks.on_trace_start {
-                    hook(green_key);
-                }
-                BackEdgeAction::StartedTracing
+            HotResult::StartTracing(recorder) => {
+                self.setup_tracing(green_key, green_key_values, driver_descriptor, live_values, recorder)
             }
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }
+    }
+
+    fn setup_tracing(
+        &mut self,
+        green_key: u64,
+        green_key_values: Option<majit_ir::GreenKey>,
+        driver_descriptor: Option<JitDriverStaticData>,
+        live_values: &[Value],
+        mut recorder: majit_trace::recorder::Trace,
+    ) -> BackEdgeAction {
+        for value in live_values {
+            recorder.record_input_arg(value.get_type());
+        }
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] start tracing at key={}, num_inputs={}",
+                green_key,
+                live_values.len()
+            );
+        }
+
+        let mut ctx = if let Some(values) = green_key_values {
+            TraceCtx::with_green_key(recorder, green_key, values)
+        } else {
+            TraceCtx::new(recorder, green_key)
+        };
+        if let Some(descriptor) = driver_descriptor {
+            ctx.set_driver_descriptor(descriptor);
+        }
+        if let Some(ref info) = self.virtualizable_info {
+            let array_lengths = self.trace_entry_vable_lengths(info);
+            let num_static = info.num_static_extra_boxes;
+            let num_array_elems: usize = array_lengths.iter().sum();
+            let total_vable = num_static + num_array_elems;
+
+            if total_vable > 0 && live_values.len() >= 1 + total_vable {
+                let vable_oprefs: Vec<OpRef> =
+                    (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
+                ctx.init_virtualizable_boxes(
+                    info,
+                    OpRef(0),
+                    &vable_oprefs,
+                    &array_lengths,
+                );
+            }
+        }
+
+        self.forced_virtualizable = None;
+        self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
+        self.tracing = Some(ctx);
+        let pending_num = self.warm_state.alloc_token_number();
+        self.pending_token = Some((green_key, pending_num));
+        if let Some(ref hook) = self.hooks.on_trace_start {
+            hook(green_key);
+        }
+        BackEdgeAction::StartedTracing
     }
 
     /// Access the active TraceCtx (if currently tracing).
