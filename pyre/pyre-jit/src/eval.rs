@@ -224,8 +224,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         };
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
-        // Fast path: check TLS tracing_depth first (cheap, L1 cache).
-        // driver.is_tracing() is checked only when depth==0 and trace just started.
+        // RPython MetaInterp._interpret() takes over execution entirely.
+        // In pyre, full-loop tracing runs inside trace_bytecode, but
+        // jit_merge_point_hook must still fire at the correct call depth
+        // to start the trace. JIT_TRACING_DEPTH ensures nested concrete
+        // calls (call_user_function_plain) don't trigger merge_point.
         if is_portal {
             let tracing_depth = JIT_TRACING_DEPTH.with(|t| t.get());
             if tracing_depth != 0 {
