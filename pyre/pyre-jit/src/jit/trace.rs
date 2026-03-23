@@ -46,6 +46,9 @@ pub fn trace_bytecode(
     start_pc: usize,
     concrete_frame: usize,
 ) -> TraceAction {
+    // RPython MetaInterp mode: PyreMetaFrame handles concrete dispatch
+    // while TraceFrameState handles symbolic IR recording.
+    // Both share PyreSym's concrete_locals/concrete_stack.
     let mut pc = start_pc;
 
     loop {
