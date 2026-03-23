@@ -90,6 +90,28 @@ pub fn trace_bytecode(
     }
 }
 
+/// Test PyreMetaInterp on a code object — for validation only.
+/// Returns concrete result if the interpret loop completes.
+#[allow(dead_code)]
+pub fn test_metainterp_trace(
+    code: &CodeObject,
+    namespace: *mut pyre_runtime::PyNamespace,
+    args: &[super::state::ConcreteValue],
+) -> Option<super::state::ConcreteValue> {
+    use super::metainterp::{PyreMetaInterp, StepAction};
+
+    let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, namespace);
+    let frontend_args: Vec<super::state::TracedBox> = args
+        .iter()
+        .map(|c| super::state::TracedBox::new(majit_ir::OpRef::NONE, *c))
+        .collect();
+    metainterp.perform_call(code as *const CodeObject, frontend_args, None);
+
+    // Dummy TraceCtx — we only test concrete execution here
+    // TODO: proper TraceCtx integration
+    None // Cannot create TraceCtx without recorder
+}
+
 #[cfg(test)]
 mod tests {
     use super::semantic_fallthrough_pc;
