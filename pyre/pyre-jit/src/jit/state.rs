@@ -26,6 +26,27 @@ use pyre_object::{
 };
 use pyre_objspace::truth_value as objspace_truth_value;
 
+/// Traced value — RPython `FrontendOp(position, _resint/_resref/_resfloat)` parity.
+///
+/// Carries both the symbolic IR reference (OpRef) and the concrete
+/// execution value (ConcreteValue). Created by opcode handlers that
+/// compute concrete results alongside IR recording.
+#[derive(Clone, Copy, Debug)]
+pub struct TracedBox {
+    pub opref: OpRef,
+    pub concrete: ConcreteValue,
+}
+
+impl TracedBox {
+    pub fn new(opref: OpRef, concrete: ConcreteValue) -> Self {
+        Self { opref, concrete }
+    }
+
+    pub fn opref_only(opref: OpRef) -> Self {
+        Self { opref, concrete: ConcreteValue::Null }
+    }
+}
+
 /// Typed concrete value — RPython `FrontendOp._resint/_resref/_resfloat` parity.
 ///
 /// Python bytecode uses untyped locals, so we use a tagged enum instead of
@@ -90,6 +111,16 @@ impl ConcreteValue {
     /// RPython box.getref_base() parity.
     pub fn getref(&self) -> PyObjectRef {
         self.to_pyobj()
+    }
+
+    /// Convert to majit IR Type.
+    pub fn ir_type(&self) -> Type {
+        match self {
+            ConcreteValue::Int(_) => Type::Int,
+            ConcreteValue::Float(_) => Type::Float,
+            ConcreteValue::Ref(_) => Type::Ref,
+            ConcreteValue::Null => Type::Ref,
+        }
     }
 
     /// Truth value (RPython box.getint() != 0 for goto_if_not).
@@ -1333,6 +1364,27 @@ impl TraceFrameState {
             s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
         }
         s.concrete_stack[stack_idx] = concrete;
+        s.valuestackdepth += 1;
+    }
+
+    /// Push a TracedBox (RPython execute_and_record return value parity).
+    /// Bypasses pending_concrete_push — concrete value is directly provided.
+    fn push_traced_box(&mut self, _ctx: &mut TraceCtx, traced: TracedBox) {
+        let value_type = self.value_type(traced.opref);
+        let s = self.sym_mut();
+        let stack_idx = s.stack_only_depth();
+        if stack_idx >= s.symbolic_stack.len() {
+            s.symbolic_stack.resize(stack_idx + 1, OpRef::NONE);
+        }
+        if stack_idx >= s.symbolic_stack_types.len() {
+            s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
+        }
+        s.symbolic_stack[stack_idx] = traced.opref;
+        s.symbolic_stack_types[stack_idx] = value_type;
+        if stack_idx >= s.concrete_stack.len() {
+            s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
+        }
+        s.concrete_stack[stack_idx] = traced.concrete;
         s.valuestackdepth += 1;
     }
 
