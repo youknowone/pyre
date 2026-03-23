@@ -974,6 +974,16 @@ impl Optimizer {
         result
     }
 
+    /// Import cached field entries from preamble into all optimizer passes.
+    pub fn import_all_cached_fields(&mut self, entries: &[(OpRef, u32, OpRef)]) {
+        if entries.is_empty() {
+            return;
+        }
+        for pass in &mut self.passes {
+            pass.import_cached_fields(entries);
+        }
+    }
+
     /// optimizer.py: flush()
     /// Flush all passes' postponed state.
     pub fn flush(&mut self, ctx: &mut OptContext) {
