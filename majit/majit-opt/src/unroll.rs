@@ -2007,20 +2007,18 @@ impl OptUnroll {
                     let Some(args) = args else {
                         continue;
                     };
-                    // RPython import_state() replays short boxes via
-                    // produced_op.produce_op(); it does not preload OVF
-                    // operations into OptPure's CSE table. Reusing an
-                    // imported INT_*_OVF result without replaying the paired
-                    // GUARD_NO_OVERFLOW leaves a stray guard in phase 2.
-                    if !opcode.is_ovf() {
-                        ctx.imported_short_pure_ops
-                            .push(crate::ImportedShortPureOp {
-                                opcode,
-                                descr: descr.clone(),
-                                args,
-                                result: result_opref,
-                            });
-                    }
+                    // RPython PureOp.produce_op() preloads all pure ops
+                    // (including OVF) into OptPure's CSE table. OptPure
+                    // postpones OVF ops and only resolves them when the
+                    // paired GuardNoOverflow arrives, so guard pairing
+                    // is maintained even for imported OVF operations.
+                    ctx.imported_short_pure_ops
+                        .push(crate::ImportedShortPureOp {
+                            opcode,
+                            descr: descr.clone(),
+                            args,
+                            result: result_opref,
+                        });
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: result_opref,
                         source,
