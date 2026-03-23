@@ -162,6 +162,8 @@ pub struct Optimizer {
     /// RPython: resume.py:570-574 _add_optimizer_sections serializes the
     /// optimizer state AT EACH GUARD, not just at end-of-trace.
     pub per_guard_knowledge: Vec<(OpRef, OptimizerKnowledge)>,
+    /// optimizer.py:787: constant_fold allocator for compile-time object creation.
+    pub constant_fold_alloc: Option<crate::ConstantFoldAllocFn>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -674,6 +676,7 @@ impl Optimizer {
             final_ctx: None,
             pending_bridge_knowledge: None,
             per_guard_knowledge: Vec::new(),
+            constant_fold_alloc: None,
         }
     }
 
@@ -1326,6 +1329,7 @@ impl Optimizer {
         let effective_inputs = num_inputs.max((max_pos + 1) as usize);
         let mut ctx = OptContext::with_num_inputs(ops.len(), effective_inputs);
         ctx.skip_flush_mode = self.skip_flush;
+        ctx.constant_fold_alloc = self.constant_fold_alloc.take();
 
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {
