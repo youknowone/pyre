@@ -2669,11 +2669,13 @@ fn assemble_peeled_trace_with_jump_args(
                 jump_args.truncate(start_label_args.len());
             }
             if jump_to_self {
-                // RPython parity: don't truncate to label_args.len() because
-                // label_args only has non-virtual entries. The redirected
-                // JUMP from jump_to_existing_trace already has the correct
-                // flattened args including virtual field values.
-                // Only pad if JUMP is shorter than the target label.
+                // RPython compile.py:334: assert jump.numargs() == label.numargs().
+                // Truncate excess JUMP args (from forced virtuals in
+                // jump_to_existing_trace) to match the LABEL arity.
+                if jump_args.len() > target_label_args.len() {
+                    jump_args.truncate(target_label_args.len());
+                }
+                // Pad if JUMP is shorter than the target label.
                 while jump_args.len() < target_label_args.len() {
                     let extra_idx = jump_args.len().saturating_sub(target_base_len);
                     let extra_arg = if current_inner_label_index.is_some() {
