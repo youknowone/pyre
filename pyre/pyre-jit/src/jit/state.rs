@@ -1254,9 +1254,15 @@ impl TraceFrameState {
             .unwrap_or(Type::Ref);
         // MIFrame Box tracking: pop concrete value from concrete_stack
         let concrete_popped = s.concrete_stack.get(stack_idx).copied().unwrap_or(PY_NULL);
-        // Fall back to concrete_frame if concrete_stack has PY_NULL
+        // Fall back to concrete_frame only if within snapshot's depth
         let concrete_popped = if concrete_popped.is_null() {
-            concrete_stack_value(concrete_frame, s.valuestackdepth.saturating_sub(1))
+            let snapshot_depth = concrete_stack_depth(concrete_frame).unwrap_or(0);
+            let abs_idx = s.valuestackdepth.saturating_sub(1);
+            if abs_idx < snapshot_depth {
+                concrete_stack_value(concrete_frame, abs_idx)
+            } else {
+                None
+            }
         } else {
             Some(concrete_popped)
         };
@@ -1809,13 +1815,23 @@ impl TraceFrameState {
             .or_else(|| self.concrete_at_or_frame(self.sym().valuestackdepth))
     }
 
-    /// Read a concrete value from Box arrays first, falling back to concrete_frame.
+    /// Read a concrete value from Box arrays, with safe fallback to concrete_frame.
+    /// In full-loop tracing, the concrete_frame snapshot may be stale (its stack
+    /// depth doesn't advance), so we only fall back for indices within the
+    /// snapshot's actual depth.
     fn concrete_at_or_frame(&self, abs_idx: usize) -> Option<PyObjectRef> {
         let v = self.sym().concrete_value_at(abs_idx);
         if !v.is_null() {
             return Some(v);
         }
-        concrete_stack_value(self.concrete_frame, abs_idx)
+        // Safe fallback: only read from concrete_frame if the index is within
+        // the snapshot's actual stack depth (avoids underflow/OOB).
+        let snapshot_depth = concrete_stack_depth(self.concrete_frame).unwrap_or(0);
+        if abs_idx < snapshot_depth {
+            concrete_stack_value(self.concrete_frame, abs_idx)
+        } else {
+            None
+        }
     }
 
     fn concrete_binary_operands(&self) -> Option<(PyObjectRef, PyObjectRef)> {
