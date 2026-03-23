@@ -68,7 +68,12 @@ thread_local! {
         UnsafeCell::new(HashSet::new());
 
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
-    static JIT_TRACING: Cell<bool> = Cell::new(false);
+    /// JIT call depth at which tracing is active. 0 = not tracing.
+    /// When non-zero, only the eval_loop_jit at the same call depth
+    /// feeds trace steps via jit_merge_point. Nested function calls
+    /// (deeper depth) and parent calls (shallower depth) skip
+    /// merge_point, matching RPython's per-cell JC_TRACING behavior.
+    static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
     static RECURSIVE_FORCE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
     static BLACKHOLE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
 }
@@ -236,18 +241,15 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         };
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
-        // RPython: jit_merge_point is in every dispatch() call.
-        // During concrete execution it's a no-op (JC_TRACING per-cell
-        // check). In pyre, trace_bytecode traces the entire loop in one
-        // call (unlike RPython's one-bytecode-at-a-time MetaInterp), so
-        // we gate on depth==0 to ensure single invocation per trace.
-        // is_tracing_key provides RPython's per-cell JC_TRACING check.
-        if is_portal
-            && JIT_CALL_DEPTH.with(|d| d.get()) == 0
-            && driver.is_tracing_key(make_green_key(frame.code, pc))
-        {
-            if let Some(result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
-                return result;
+        // Fast path: driver.is_tracing() is false most of the time.
+        // Only access TLS depth when actually tracing.
+        if is_portal && driver.is_tracing() {
+            let tracing_depth = JIT_TRACING_DEPTH.with(|t| t.get());
+            let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
+            if tracing_depth == 0 || current_depth == tracing_depth {
+                if let Some(result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+                    return result;
+                }
             }
         }
 
@@ -309,10 +311,11 @@ fn jit_merge_point_hook(
     let concrete_frame = frame as *mut PyFrame as usize;
     let green_key = make_green_key(frame.code, pc);
     let mut jit_state = build_jit_state(frame, info);
+    let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
     if let Some(outcome) = driver.jit_merge_point_keyed(
         green_key, pc, &mut jit_state, env, || {},
         |ctx, sym| {
-            JIT_TRACING.with(|t| t.set(true));
+            JIT_TRACING_DEPTH.with(|t| t.set(current_depth));
             let mut trace_frame = frame.snapshot_for_tracing();
             let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
             let _ = concrete_frame;
@@ -323,8 +326,9 @@ fn jit_merge_point_hook(
             return Some(result);
         }
     }
+    // Trace completed or aborted — clear tracing depth if it was us.
     if !driver.is_tracing() {
-        JIT_TRACING.with(|t| t.set(false));
+        JIT_TRACING_DEPTH.with(|t| t.set(0));
     }
     None
 }
@@ -374,9 +378,7 @@ fn can_enter_jit_hook(
             return Some(result);
         }
     }
-    if !driver.is_tracing() {
-        JIT_TRACING.with(|t| t.set(false));
-    }
+    JIT_TRACING_DEPTH.with(|t| t.set(0));
     None
 }
 
@@ -666,6 +668,25 @@ fn restore_guard_failure_for_loop(
     // are stored as extra fail_args. Reconstruct the concrete PyObject
     // from the field values and replace the null slot.
     materialize_recovery_virtuals(&mut typed, exit_layout);
+    // Safety: if any null Ref slots remain after materialization,
+    // the frame state is unsafe for the interpreter. Return None
+    // (= not restored) so the interpreter ignores the guard result
+    // and continues from scratch rather than dereferencing null.
+    let has_null_ref = typed.iter().skip(3).any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
+    if has_null_ref {
+        if majit_meta::majit_log_enabled() {
+            eprintln!("[jit] guard-fail: null Ref in restored values, invalidating compiled code");
+        }
+        // Blacklist all compiled keys and invalidate compiled code to prevent
+        // repeated compile→fail cycles. Blacklist first, then clear.
+        let (driver, _) = driver_pair();
+        let keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
+        for key in keys {
+            driver.meta_interp_mut().warm_state_mut().abort_tracing(key, true);
+        }
+        driver.invalidate_all_compiled();
+        return None;
+    }
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_meta::majit_log_enabled() {
         eprintln!("[jit] guard-fail restored: ni={} vsd={}", jit_state.next_instr, jit_state.valuestackdepth);
@@ -673,51 +694,82 @@ fn restore_guard_failure_for_loop(
     restored.then_some(jit_state.next_instr)
 }
 
-/// RPython resume.py parity: reconstruct virtual objects from their
+/// Guard failure recovery: reconstruct virtual objects from their
 /// field values stored as extra fail_args after null (NONE) slots.
 ///
-/// When the optimizer encodes a virtual in fail_args (via rd_virtuals),
-/// it sets the virtual's slot to NONE and appends the field values.
-/// On guard failure, we detect null Ref slots and pair them with
-/// their field values to reconstruct concrete PyObjects.
+/// When the optimizer places a virtual in fail_args, it sets the
+/// virtual's slot to NONE and appends field values (ob_type, intval).
+/// On guard failure, we detect contiguous null Ref slots at the end
+/// of the locals/stack region and pair them with trailing Int fields.
 ///
-/// Pattern: [header...] [non-virtual slots] [NONE, NONE, ...] [ob_type1, intval1, ob_type2, intval2, ...]
-/// Each null Ref slot consumes 2 field values (ob_type + intval) from the tail.
+/// Pattern: [..., NONE, NONE] [ob_type1, intval1, ob_type2, intval2]
+/// Only apply when trailing fields are available (2 Int per null slot).
+/// Otherwise, replace remaining null Refs with w_none() for safety.
 fn materialize_recovery_virtuals(
     typed: &mut Vec<Value>,
     _exit_layout: &CompiledExitLayout,
 ) {
-    // Find all null Ref slots (virtual markers)
+    // Find all null Ref slots (virtual markers) after the header (frame/ni/vsd)
     let null_slots: Vec<usize> = (3..typed.len())
         .filter(|&i| matches!(typed.get(i), Some(Value::Ref(majit_ir::GcRef(0)))))
         .collect();
     if null_slots.is_empty() {
         return;
     }
-    // The extra field values start after the last non-virtual slot.
-    // Each virtual has 2 fields: ob_type (Int) and intval (Int).
-    let first_extra = null_slots.last().map(|&s| s + 1).unwrap_or(typed.len());
-    let mut field_cursor = first_extra;
-    for &slot_idx in &null_slots {
-        // Consume 2 fields: ob_type and intval
-        let _ob_type_pos = field_cursor;
-        let intval_pos = field_cursor + 1;
-        if intval_pos >= typed.len() {
-            break;
-        }
-        if let Value::Int(v) = typed[intval_pos] {
-            let obj = pyre_object::intobject::w_int_new(v);
-            typed[slot_idx] = Value::Ref(majit_ir::GcRef(obj as usize));
-            if majit_meta::majit_log_enabled() {
-                eprintln!("[jit] materialized virtual W_IntObject(intval={}) at slot {}", v, slot_idx);
+
+    // Check if trailing values after the LAST null slot contain enough
+    // Int pairs to reconstruct all null slots as virtuals.
+    let last_null = *null_slots.last().unwrap();
+    let trailing_start = last_null + 1;
+    let trailing_count = typed.len() - trailing_start;
+    let needed_fields = null_slots.len() * 2;
+
+    if trailing_count >= needed_fields {
+        // Validate: first field of each pair should be a W_IntObject type id.
+        // If not, the trailing data is not virtual field data.
+        let w_int_type_id = pyre_object::intobject::w_int_type_id();
+        let mut valid = true;
+        let mut check_cursor = trailing_start;
+        for _ in &null_slots {
+            if check_cursor + 1 >= typed.len() { valid = false; break; }
+            if let Value::Int(ob_type) = typed[check_cursor] {
+                if ob_type as usize != w_int_type_id { valid = false; break; }
+            } else {
+                valid = false; break;
             }
+            check_cursor += 2;
         }
-        field_cursor += 2; // skip ob_type + intval
+        if !valid {
+            // Not virtual field data — leave null Refs as-is.
+            // The caller's has_null_ref check will detect this and
+            // skip the restore entirely.
+            return;
+        }
+        // Enough trailing fields: reconstruct virtuals
+        let mut field_cursor = trailing_start;
+        for &slot_idx in &null_slots {
+            let intval_pos = field_cursor + 1;
+            if intval_pos >= typed.len() {
+                break;
+            }
+            if let Value::Int(v) = typed[intval_pos] {
+                let obj = pyre_object::intobject::w_int_new(v);
+                typed[slot_idx] = Value::Ref(majit_ir::GcRef(obj as usize));
+                if majit_meta::majit_log_enabled() {
+                    eprintln!("[jit] materialized virtual W_IntObject(intval={}) at slot {}", v, slot_idx);
+                }
+            }
+            field_cursor += 2;
+        }
+        // Truncate consumed field values
+        typed.truncate(trailing_start);
+    } else {
+        // Not enough trailing fields — null slots are dead/unused.
+        // Replace with w_none() to prevent SIGSEGV.
+        for &slot_idx in &null_slots {
+            typed[slot_idx] = Value::Ref(majit_ir::GcRef(w_none() as usize));
+        }
     }
-    // RPython resume.py parity: field values are stored separately from
-    // frame slots. Truncate consumed fields so restore_guard_failure_values
-    // does not count them as extra stack slots (inflating valuestackdepth).
-    typed.truncate(first_extra);
 }
 
 fn build_jit_state(

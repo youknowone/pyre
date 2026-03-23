@@ -2743,6 +2743,17 @@ impl<M: Clone> MetaInterp<M> {
             .map_or(false, |c| !c.token.is_invalidated())
     }
 
+    /// Remove all compiled loops. Used when guard-fail recovery is
+    /// unrecoverable (null Ref in resume data).
+    pub fn clear_compiled_loops(&mut self) {
+        self.compiled_loops.clear();
+    }
+
+    /// Return all green keys that have compiled loops.
+    pub fn all_compiled_keys(&self) -> Vec<u64> {
+        self.compiled_loops.keys().copied().collect()
+    }
+
     /// Whether the compiled Finish for this green_key returns a raw int.
     pub fn has_raw_int_finish(&self, green_key: u64) -> bool {
         self.raw_int_finish_keys.contains(&green_key)

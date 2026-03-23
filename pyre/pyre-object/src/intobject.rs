@@ -62,6 +62,12 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
     }
 }
 
+/// Return the address of INT_TYPE for JIT type-id validation.
+#[inline]
+pub fn w_int_type_id() -> usize {
+    &INT_TYPE as *const PyType as usize
+}
+
 /// Extract the i64 value from a known W_IntObject pointer.
 ///
 /// # Safety
