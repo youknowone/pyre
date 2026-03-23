@@ -872,7 +872,9 @@ impl OptHeap {
                 }
             }
             if ei.check_write_descr_field(field_idx) {
-                // Call writes this field → force lazy set AND invalidate cache
+                // heap.py:137-145: force_lazy_set(can_cache=False)
+                // Call writes this field → force lazy set AND invalidate cache.
+                // No put_field_back_to_info: the call overwrites the value.
                 if let Some(cf) = self.field_cache.get_mut(&field_idx) {
                     if let Some((_, mut lazy_op)) = cf.lazy_set.take() {
                         Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
@@ -977,7 +979,14 @@ impl OptHeap {
                     return OptimizationResult::Remove;
                 }
                 // heap.py:108-111: possible_aliasing_two_infos
-                let cannot_alias = self.seen_allocation.contains(lazy_obj)
+                // _cannot_alias_via_classes_or_lengths (heap.py:198-204)
+                let class1 = ctx.get_ptr_info(*lazy_obj).and_then(|i| i.get_known_class());
+                let class2 = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class());
+                let cannot_alias_via_class = matches!(
+                    (class1, class2), (Some(c1), Some(c2)) if c1 != c2
+                );
+                let cannot_alias = cannot_alias_via_class
+                    || self.seen_allocation.contains(lazy_obj)
                     || self.seen_allocation.contains(&obj)
                     || self.known_distinct.contains(lazy_obj)
                     || self.known_distinct.contains(&obj);
@@ -993,6 +1002,10 @@ impl OptHeap {
             }
         }
         // heap.py:109-111: UNKNOWN_ALIAS → force lazy_set and return cache miss
+        // heap.py:122: force_lazy_set(can_cache=True) — reads don't destroy cache,
+        // so put_field_back_to_info restores the lazy value into the cache.
+        // (Contrast with write-descr force in force_from_effectinfo which uses
+        // can_cache=False and does NOT restore the value.)
         if force_lazy {
             if let Some(cf) = self.field_cache.get_mut(&field_idx) {
                 if let Some((lazy_obj, mut lazy_op)) = cf.lazy_set.take() {
@@ -1006,7 +1019,7 @@ impl OptHeap {
                         }
                     }
                     Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                    // put_field_back_to_info
+                    // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(1);
                     let descr = lazy_op.descr.clone();
                     let cf = self.get_or_create_cached_field(field_idx);
@@ -1120,10 +1133,23 @@ impl OptHeap {
         }
 
         // heap.py:81-83: possible_aliasing → force_lazy_set
+        // _cannot_alias_via_classes_or_lengths (heap.py:198-204):
+        // if both objects have known classes and they differ, skip the force.
         let needs_force = self
             .field_cache
             .get(&field_idx)
-            .map_or(false, |cf| cf.possible_aliasing(obj));
+            .map_or(false, |cf| {
+                if !cf.possible_aliasing(obj) {
+                    return false;
+                }
+                let lazy_obj = cf.lazy_set.as_ref().unwrap().0;
+                let class1 = ctx.get_ptr_info(lazy_obj).and_then(|i| i.get_known_class());
+                let class2 = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class());
+                let cannot_alias_via_class = matches!(
+                    (class1, class2), (Some(c1), Some(c2)) if c1 != c2
+                );
+                !cannot_alias_via_class
+            });
         if needs_force {
             let lazy_data = self
                 .field_cache
@@ -1974,6 +2000,10 @@ impl Optimization for OptHeap {
     fn export_cached_fields(&self) -> Vec<(OpRef, u32, OpRef)> {
         let mut result = Vec::new();
         for (&field_idx, cf) in &self.field_cache {
+            // heap.py:830-831: skip if lazy_set active
+            if cf.lazy_set.is_some() {
+                continue;
+            }
             for i in 0..cf.cached_structs.len() {
                 let obj = cf.cached_structs[i];
                 let val = cf.cached_values[i];
