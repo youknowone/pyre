@@ -371,6 +371,169 @@ impl PyreMetaFrame {
                 Ok(StepAction::DoneWithThisFrame(result))
             }
 
+            // ── Globals ──
+            Instruction::LoadGlobal { namei } => {
+                // RPython: residual GETFIELD on namespace
+                let name_idx = (namei.get(op_arg) >> 1) as usize;
+                let name = code.names.get(name_idx).map(|s| s.as_ref()).unwrap_or("");
+                let _push_null = (namei.get(op_arg) & 1) != 0;
+                // Push NULL for PUSH_NULL semantics
+                if _push_null {
+                    self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Null));
+                }
+                // Concrete: read from namespace
+                let concrete = unsafe {
+                    let ns = (*self.jitcode).varnames.as_ptr(); // placeholder
+                    ConcreteValue::Null // TODO: actual namespace lookup
+                };
+                self.push(FrontendOp::new(OpRef::NONE, concrete));
+                Ok(StepAction::Continue)
+            }
+
+            // ── Call ──
+            Instruction::Call { argc } => {
+                let nargs = argc.get(op_arg) as usize;
+                let mut args = Vec::with_capacity(nargs);
+                for _ in 0..nargs {
+                    args.push(self.pop());
+                }
+                args.reverse();
+                let _null_or_self = self.pop();
+                let callable = self.pop();
+
+                // RPython: execute_varargs for residual call concrete result
+                let concrete_result = match callable.concrete {
+                    ConcreteValue::Ref(obj) if !obj.is_null() => {
+                        unsafe {
+                            if pyre_runtime::is_builtin_func(obj) {
+                                let func = pyre_runtime::w_builtin_func_get(obj);
+                                let concrete_args: Vec<PyObjectRef> =
+                                    args.iter().map(|a| a.concrete.to_pyobj()).collect();
+                                ConcreteValue::from_pyobj(func(&concrete_args))
+                            } else {
+                                ConcreteValue::Null
+                            }
+                        }
+                    }
+                    _ => ConcreteValue::Null,
+                };
+                // TODO: proper IR recording for call
+                self.push(FrontendOp::new(OpRef::NONE, concrete_result));
+                Ok(StepAction::Continue)
+            }
+
+            // ── Collections ──
+            Instruction::BuildList { count } => {
+                let n = count.get(op_arg) as usize;
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.pop());
+                }
+                items.reverse();
+                let concrete_items: Vec<PyObjectRef> =
+                    items.iter().map(|i| i.concrete.to_pyobj()).collect();
+                let list = pyre_runtime::build_list_from_refs(&concrete_items);
+                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::from_pyobj(list)));
+                Ok(StepAction::Continue)
+            }
+            Instruction::BuildTuple { count } => {
+                let n = count.get(op_arg) as usize;
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.pop());
+                }
+                items.reverse();
+                let concrete_items: Vec<PyObjectRef> =
+                    items.iter().map(|i| i.concrete.to_pyobj()).collect();
+                let tuple = pyre_runtime::build_tuple_from_refs(&concrete_items);
+                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::from_pyobj(tuple)));
+                Ok(StepAction::Continue)
+            }
+
+            // ── Subscript ──
+            Instruction::StoreSubscr => {
+                let key = self.pop();
+                let obj = self.pop();
+                let value = self.pop();
+                let _ = pyre_objspace::space::py_setitem(
+                    obj.concrete.to_pyobj(),
+                    key.concrete.to_pyobj(),
+                    value.concrete.to_pyobj(),
+                );
+                Ok(StepAction::Continue)
+            }
+
+            // ── Attribute ──
+            Instruction::LoadAttr { namei } => {
+                let name_idx = u32::from(namei.get(op_arg)) as usize;
+                let name = code.names.get(name_idx >> 1).map(|s| s.as_ref()).unwrap_or("");
+                let obj = self.pop();
+                let concrete = match pyre_objspace::space::py_getattr(
+                    obj.concrete.to_pyobj(),
+                    name,
+                ) {
+                    Ok(v) => ConcreteValue::from_pyobj(v),
+                    Err(_) => ConcreteValue::Null,
+                };
+                self.push(FrontendOp::new(OpRef::NONE, concrete));
+                Ok(StepAction::Continue)
+            }
+
+            // ── Stack manipulation ──
+            Instruction::Copy { i } => {
+                let depth = i.get(op_arg) as usize;
+                let idx = self.concrete_stack.len().saturating_sub(depth);
+                let concrete = self.concrete_stack.get(idx).copied().unwrap_or(ConcreteValue::Null);
+                let opref = self.sym.symbolic_stack.get(idx).copied().unwrap_or(OpRef::NONE);
+                self.push(FrontendOp::new(opref, concrete));
+                Ok(StepAction::Continue)
+            }
+            Instruction::Swap { i } => {
+                let depth = i.get(op_arg) as usize;
+                let top = self.concrete_stack.len() - 1;
+                let other = self.concrete_stack.len() - depth;
+                self.concrete_stack.swap(top, other);
+                self.sym.symbolic_stack.swap(top, other);
+                Ok(StepAction::Continue)
+            }
+
+            // ── Misc ──
+            Instruction::PushNull => {
+                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Null));
+                Ok(StepAction::Continue)
+            }
+            Instruction::JumpBackwardNoInterrupt { delta } => {
+                let target = self.pc - u32::from(delta.get(op_arg)) as usize;
+                self.pc = target;
+                Ok(StepAction::Continue)
+            }
+
+            // ── Exception handling ──
+            Instruction::PushExcInfo => {
+                let exc = self.pop();
+                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Null)); // prev exc
+                self.push(exc);
+                Ok(StepAction::Continue)
+            }
+            Instruction::PopExcept => {
+                self.pop(); // prev exc
+                Ok(StepAction::Continue)
+            }
+            Instruction::CheckExcMatch => {
+                let exc_type = self.pop();
+                let _exc_value = self.peek();
+                // TODO: proper type matching
+                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Int(1))); // always match
+                Ok(StepAction::Continue)
+            }
+            Instruction::RaiseVarargs { argc } => {
+                let n = argc.get(op_arg) as usize;
+                for _ in 0..n {
+                    self.pop();
+                }
+                Err(pyre_runtime::PyError::runtime_error("raise during tracing"))
+            }
+
             // ── Unsupported (abort trace) ──
             _ => {
                 if majit_meta::majit_log_enabled() {
