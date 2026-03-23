@@ -83,9 +83,15 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 }
 
 thread_local! {
-    static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
     /// Call depth at which the current trace started.
     static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
+}
+
+/// Read the call depth from pyre-interp's CALL_DEPTH TLS.
+/// Replaces the separate JIT_CALL_DEPTH — single source of truth.
+#[inline(always)]
+fn call_depth() -> u32 {
+    pyre_interp::call::call_depth()
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -95,44 +101,20 @@ pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> 
     (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 
-/// RAII guard that decrements `JIT_CALL_DEPTH` on drop.
-pub struct JitCallDepthGuard;
-
-impl Drop for JitCallDepthGuard {
-    fn drop(&mut self) {
-        JIT_CALL_DEPTH.with(|d| d.set(d.get() - 1));
-    }
-}
-
-/// Bump the JIT call depth. Returns a guard that restores the
-/// depth when dropped.
-///
-/// RPython parity: track call depth unconditionally. jit_merge_point
-/// (which only runs at depth 0) is gated by is_tracing_key, so
-/// nested calls don't interfere with tracing. The depth prevents
-/// re-entrant jit_merge_point during concrete execution.
-#[inline]
-pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
-    JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
-    Some(JitCallDepthGuard)
-}
+// JIT_CALL_DEPTH removed — pyre-interp::call::CALL_DEPTH is the single
+// source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
 
 /// RPython rstack.stack_almost_full() parity.
 #[inline]
 fn stack_almost_full() -> bool {
-    JIT_CALL_DEPTH.with(|d| d.get()) > 20
+    call_depth() > 20
 }
 
 /// Evaluate a Python frame with JIT compilation.
 ///
 /// This is the main entry point for pyre-jit.
-fn depth_bump_callback() -> Option<Box<dyn std::any::Any>> {
-    jit_call_depth_bump().map(|g| Box::new(g) as Box<dyn std::any::Any>)
-}
-
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     pyre_interp::call::register_eval_override(eval_with_jit);
-    pyre_interp::call::register_depth_bump(depth_bump_callback);
     pyre_interp::call::register_inline_call_override(
         crate::call_jit::maybe_handle_inline_concrete_call,
     );
@@ -230,7 +212,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         if is_portal {
             let tracing_depth = JIT_TRACING_DEPTH.with(|t| t.get());
             if tracing_depth != 0 {
-                let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
+                let current_depth = call_depth();
                 if current_depth == tracing_depth {
                     if let Some(loop_result) =
                         jit_merge_point_hook(frame, code, pc, driver, info, &env)
@@ -327,7 +309,7 @@ fn jit_merge_point_hook(
     let concrete_frame = frame as *mut PyFrame as usize;
     let green_key = make_green_key(frame.code, pc);
     let mut jit_state = build_jit_state(frame, info);
-    let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
+    let current_depth = call_depth();
     if let Some(outcome) = driver.jit_merge_point_keyed(
         green_key,
         pc,
@@ -410,7 +392,7 @@ fn can_enter_jit_hook(
             || {},
         );
         if !was_tracing && driver.is_tracing() {
-            JIT_TRACING_DEPTH.with(|d| d.set(JIT_CALL_DEPTH.with(|c| c.get())));
+            JIT_TRACING_DEPTH.with(|d| d.set(call_depth()));
         }
         result
     } else {
@@ -466,7 +448,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
                 green_key,
                 debug_first_arg_int(frame),
-                JIT_CALL_DEPTH.with(|d| d.get()),
+                call_depth(),
                 driver.has_raw_int_finish(green_key)
             );
         }

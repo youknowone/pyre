@@ -60,6 +60,25 @@ static INLINE_CALL_OVERRIDE: OnceLock<InlineCallOverrideFn> = OnceLock::new();
 
 thread_local! {
     static INLINE_CALL_OVERRIDE_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Call depth counter — incremented on every user function call,
+    /// decremented on return. Replaces the Box<dyn Any> depth bump
+    /// callback with a zero-allocation TLS increment.
+    static CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Get current call depth. Used by pyre-jit for JIT_CALL_DEPTH parity.
+#[inline(always)]
+pub fn call_depth() -> u32 {
+    CALL_DEPTH.with(|d| d.get())
+}
+
+/// RAII guard that decrements CALL_DEPTH on drop.
+struct CallDepthGuard;
+impl Drop for CallDepthGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        CALL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 /// Register the JIT-aware eval function. Called by pyre-jit at startup.
@@ -205,7 +224,9 @@ pub fn call_user_function(
         return result;
     }
 
-    let _guard = DEPTH_BUMP_OVERRIDE.get().and_then(|f| f());
+    // Direct TLS increment — no Box allocation. Replaces DEPTH_BUMP_OVERRIDE callback.
+    CALL_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth_guard = CallDepthGuard;
     let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
     let eval_fn = if plain_mode {
         eval_frame_plain
