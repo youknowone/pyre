@@ -20,6 +20,20 @@ use majit_ir::Value;
 use majit_meta::blackhole::ExceptionState;
 use majit_meta::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 
+/// RPython jitexc.py:53 ContinueRunningNormally parity.
+enum LoopResult {
+    Done(PyResult),
+    ContinueRunningNormally,
+}
+
+/// Action from handle_jit_outcome for eval_loop_jit dispatch.
+enum JitAction {
+    Return(PyResult),
+    Continue,
+    /// RPython jitexc.py:53: guard-restored → restart portal.
+    ContinueRunningNormally,
+}
+
 use crate::jit::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
 use crate::jit::frame_layout::build_pyframe_virtualizable_info;
 use majit_gc::collector::MiniMarkGC;
@@ -70,13 +84,13 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 
 thread_local! {
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
-    /// JIT call depth at which tracing is active. 0 = not tracing.
+    /// Call depth at which the current trace started.
+    /// jit_merge_point_hook only fires at this depth.
     static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
     /// Last green_key that started a back-edge trace. Used to blacklist
     /// the originating key when compiled code from a redirected trace fails.
     static LAST_TRACE_START_KEY: Cell<u64> = Cell::new(0);
     static RECURSIVE_FORCE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
-    static BLACKHOLE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -95,22 +109,6 @@ impl Drop for JitCallDepthGuard {
     }
 }
 
-pub(crate) struct RecursiveForceEntryGuard;
-
-impl Drop for RecursiveForceEntryGuard {
-    fn drop(&mut self) {
-        RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.set(d.get() - 1));
-    }
-}
-
-pub(crate) struct BlackholeEntryGuard;
-
-impl Drop for BlackholeEntryGuard {
-    fn drop(&mut self) {
-        BLACKHOLE_ENTRY_DEPTH.with(|d| d.set(d.get() - 1));
-    }
-}
-
 /// Bump the JIT call depth. Returns a guard that restores the
 /// depth when dropped.
 ///
@@ -124,26 +122,24 @@ pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
     Some(JitCallDepthGuard)
 }
 
+pub(crate) struct RecursiveForceEntryGuard;
+
+impl Drop for RecursiveForceEntryGuard {
+    fn drop(&mut self) {
+        RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
 #[inline]
 pub(crate) fn recursive_force_entry_bump() -> RecursiveForceEntryGuard {
     RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.set(d.get() + 1));
     RecursiveForceEntryGuard
 }
 
+/// RPython rstack.stack_almost_full() parity.
 #[inline]
-pub(crate) fn in_recursive_force_entry() -> bool {
-    RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.get() > 0)
-}
-
-#[inline]
-pub(crate) fn blackhole_entry_bump() -> BlackholeEntryGuard {
-    BLACKHOLE_ENTRY_DEPTH.with(|d| d.set(d.get() + 1));
-    BlackholeEntryGuard
-}
-
-#[inline]
-pub(crate) fn in_blackhole_entry() -> bool {
-    BLACKHOLE_ENTRY_DEPTH.with(|d| d.get() > 0)
+fn stack_almost_full() -> bool {
+    JIT_CALL_DEPTH.with(|d| d.get()) > 20
 }
 
 /// Evaluate a Python frame with JIT compilation.
@@ -175,12 +171,21 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     if let Some(result) = try_function_entry_jit(frame) {
         return result;
     }
-    // RPython portal_ptr(*args): the interpreter with can_enter_jit
-    // at back-edges. jit_merge_point is guarded by depth==0 inside
-    // eval_loop_jit, so nested calls skip it automatically. Back-edge
-    // JIT (can_enter_jit / CloseLoop) works at any depth, matching
-    // RPython where portal_ptr always contains can_enter_jit.
-    eval_loop_jit(frame)
+    handle_jitexception(frame)
+}
+
+/// RPython warmspot.py:961-1007 handle_jitexception parity.
+#[inline(always)]
+fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
+    loop {
+        match eval_loop_jit(frame) {
+            LoopResult::Done(result) => return result,
+            LoopResult::ContinueRunningNormally => {
+                frame.fix_array_ptrs();
+                continue;
+            }
+        }
+    }
 }
 
 fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
@@ -206,7 +211,7 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 ///       next_instr = handle_bytecode(...)
 ///
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
-pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
+fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*frame.code };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
@@ -214,12 +219,12 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 
     loop {
         if frame.next_instr >= code.instructions.len() {
-            return Ok(w_none());
+            return LoopResult::Done(Ok(w_none()));
         }
 
         let pc = frame.next_instr;
         let Some((instruction, op_arg)) = pyre_runtime::decode_instruction_at(code, pc) else {
-            return Ok(w_none());
+            return LoopResult::Done(Ok(w_none()));
         };
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
@@ -230,14 +235,14 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             if tracing_depth != 0 {
                 let current_depth = JIT_CALL_DEPTH.with(|d| d.get());
                 if current_depth == tracing_depth {
-                    if let Some(result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
-                        return result;
+                    if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+                        return loop_result;
                     }
                 }
             } else if driver.is_tracing() {
                 // First merge_point after trace start — depth not yet set.
-                if let Some(result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
-                    return result;
+                if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+                    return loop_result;
                 }
             }
         }
@@ -274,8 +279,8 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // Thin inline: counter tick only. Heavy logic in cold helper.
                 let green_key = make_green_key(frame.code, loop_header_pc);
                 if driver.meta_interp_mut().warm_state_mut().counter.tick(green_key) && !driver.is_tracing() {
-                    if let Some(result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
-                        return result;
+                    if let Some(loop_result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
+                        return loop_result;
                     }
                     // Hook returned None without starting a trace: reset counter
                     // to prevent repeated tick fires. If tracing just started,
@@ -284,13 +289,13 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 }
             }
             Ok(StepResult::CloseLoop { .. }) => {}
-            Ok(StepResult::Return(result)) => return Ok(result),
-            Ok(StepResult::Yield(result)) => return Ok(result),
+            Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
+            Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
             Err(err) => {
                 if pyre_interp::eval::handle_exception(frame, &err) {
                     continue;
                 }
-                return Err(err);
+                return LoopResult::Done(Err(err));
             }
         }
     }
@@ -306,7 +311,7 @@ fn jit_merge_point_hook(
     driver: &mut JitDriver<PyreJitState>,
     info: &majit_meta::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
-) -> Option<PyResult> {
+) -> Option<LoopResult> {
     let concrete_frame = frame as *mut PyFrame as usize;
     let green_key = make_green_key(frame.code, pc);
     let mut jit_state = build_jit_state(frame, info);
@@ -321,8 +326,10 @@ fn jit_merge_point_hook(
             trace_bytecode(ctx, sym, code, pc, trace_frame_ptr)
         },
     ) {
-        if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-            return Some(result);
+        match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+            JitAction::Return(result) => return Some(LoopResult::Done(result)),
+            JitAction::ContinueRunningNormally => return Some(LoopResult::ContinueRunningNormally),
+            JitAction::Continue => {}
         }
     }
     // Trace completed or aborted — clear tracing depth if it was us.
@@ -343,7 +350,7 @@ fn can_enter_jit_hook(
     driver: &mut JitDriver<PyreJitState>,
     info: &majit_meta::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
-) -> Option<PyResult> {
+) -> Option<LoopResult> {
     // Early exit for blacklisted keys: avoid build_jit_state + build_meta overhead.
     let has_compiled = driver.has_compiled_loop(green_key);
     if !has_compiled
@@ -388,9 +395,6 @@ fn can_enter_jit_hook(
         }
         match &outcome {
             DetailedDriverRunOutcome::Abort { .. } => {
-                // Compiled code aborted (incompatible-state etc.).
-                // Blacklist the originating back-edge key so it doesn't
-                // retrigger tracing → compile → abort cycles.
                 let origin_key = LAST_TRACE_START_KEY.with(|k| k.get());
                 if origin_key != 0 && origin_key != green_key {
                     driver.meta_interp_mut().warm_state_mut().abort_tracing(origin_key, true);
@@ -399,8 +403,10 @@ fn can_enter_jit_hook(
             }
             _ => {}
         }
-        if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-            return Some(result);
+        match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+            JitAction::Return(result) => return Some(LoopResult::Done(result)),
+            JitAction::ContinueRunningNormally => return Some(LoopResult::ContinueRunningNormally),
+            JitAction::Continue => {}
         }
     }
     JIT_TRACING_DEPTH.with(|t| t.set(0));
@@ -478,24 +484,25 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     kind
                 );
             }
-            if let Some(result) =
-                handle_jit_outcome(outcome, &jit_state, frame, info, green_key)
-            {
-                if majit_meta::majit_log_enabled() {
-                    let rendered = result.as_ref().ok().and_then(|value| {
-                        if value.is_null() || !unsafe { pyre_object::pyobject::is_int(*value) } {
-                            return None;
-                        }
-                        Some(unsafe { pyre_object::intobject::w_int_get_value(*value) })
-                    });
-                    eprintln!(
-                        "[jit][func-entry] compiled return key={} arg0={:?} result={:?}",
-                        green_key,
-                        debug_first_arg_int(frame),
-                        rendered
-                    );
+            match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+                JitAction::Return(result) => {
+                    if majit_meta::majit_log_enabled() {
+                        let rendered = result.as_ref().ok().and_then(|value| {
+                            if value.is_null() || !unsafe { pyre_object::pyobject::is_int(*value) } {
+                                return None;
+                            }
+                            Some(unsafe { pyre_object::intobject::w_int_get_value(*value) })
+                        });
+                        eprintln!(
+                            "[jit][func-entry] compiled return key={} arg0={:?} result={:?}",
+                            green_key,
+                            debug_first_arg_int(frame),
+                            rendered
+                        );
+                    }
+                    return Some(result);
                 }
-                return Some(result);
+                JitAction::ContinueRunningNormally | JitAction::Continue => {}
             }
         }
 
@@ -520,12 +527,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
 
     if majit_meta::majit_log_enabled() {
         eprintln!(
-            "[jit][func-entry] probe key={} arg0={:?} tracing={} recursive_entry={} self_recursive_candidate={}",
+            "[jit][func-entry] probe key={} arg0={:?} tracing={}",
             green_key,
             debug_first_arg_int(frame),
             driver.is_tracing(),
-            in_recursive_force_entry(),
-            crate::call_jit::self_recursive_function_entry_candidate(frame),
         );
     }
 
@@ -587,7 +592,7 @@ fn handle_jit_outcome(
     frame: &mut PyFrame,
     _info: &majit_meta::virtualizable::VirtualizableInfo,
     green_key: u64,
-) -> Option<PyResult> {
+) -> JitAction {
     match outcome {
         DetailedDriverRunOutcome::Finished {
             typed_values,
@@ -604,7 +609,7 @@ fn handle_jit_outcome(
                 );
             }
             let [value] = typed_values.as_slice() else {
-                return Some(Err(pyre_runtime::PyError::type_error(
+                return JitAction::Return(Err(pyre_runtime::PyError::type_error(
                     "compiled finish did not produce a single object return value",
                 )));
             };
@@ -625,30 +630,27 @@ fn handle_jit_outcome(
                     pyre_object::floatobject::w_float_new(*f)
                 }
                 majit_ir::Value::Void => {
-                    return Some(Err(pyre_runtime::PyError::type_error(
+                    return JitAction::Return(Err(pyre_runtime::PyError::type_error(
                         "compiled finish produced a void return value",
                     )));
                 }
             };
-            Some(Ok(value))
+            JitAction::Return(Ok(value))
         }
         DetailedDriverRunOutcome::Jump { .. } => {
-            // RPython run_compiled path already restored the loop-header state
-            // into the virtualizable before returning a Jump outcome.
-            // Do not perform an extra interpreter-side writeback here.
             let _ = frame;
-            None
+            JitAction::Continue
         }
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            // Guard-recovery paths already rebuild the restored frame state
-            // before returning to the interpreter. Avoid a second writeback.
+            // Guard-recovery paths rebuild the restored frame state before
+            // returning. The interpreter continues from the restored PC.
             let _ = frame;
-            None
+            JitAction::Continue
         }
         DetailedDriverRunOutcome::GuardFailure {
             restored: false, ..
         }
-        | DetailedDriverRunOutcome::Abort { .. } => None,
+        | DetailedDriverRunOutcome::Abort { .. } => JitAction::Continue,
     }
 }
 
