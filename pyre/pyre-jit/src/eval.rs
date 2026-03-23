@@ -69,11 +69,10 @@ thread_local! {
 
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
     /// JIT call depth at which tracing is active. 0 = not tracing.
-    /// When non-zero, only the eval_loop_jit at the same call depth
-    /// feeds trace steps via jit_merge_point. Nested function calls
-    /// (deeper depth) and parent calls (shallower depth) skip
-    /// merge_point, matching RPython's per-cell JC_TRACING behavior.
     static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
+    /// Last green_key that started a back-edge trace. Used to blacklist
+    /// the originating key when compiled code from a redirected trace fails.
+    static LAST_TRACE_START_KEY: Cell<u64> = Cell::new(0);
     static RECURSIVE_FORCE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
     static BLACKHOLE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
 }
@@ -282,11 +281,23 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             StepResult::Continue => {}
             StepResult::CloseLoop { loop_header_pc, .. } if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
-                // Thin inline: counter tick only. Heavy logic in cold helper.
+                // Fast path: check for compiled code first, then counter.
                 let green_key = make_green_key(frame.code, loop_header_pc);
-                if driver.meta_interp_mut().warm_state_mut().counter.tick(green_key) && !driver.is_tracing() {
+                if driver.has_compiled_loop(green_key) {
                     if let Some(result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
                         return result;
+                    }
+                } else if !driver.is_tracing()
+                    && driver.meta_interp_mut().warm_state_mut().counter.tick(green_key)
+                    && driver.meta_interp().warm_state_ref().counter_would_fire(green_key) {
+                    if let Some(result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
+                        return result;
+                    }
+                    // Hook returned None: if tracing just started, don't touch
+                    // anything. Otherwise mark as DontTraceHere so the
+                    // counter_would_fire early exit prevents repeated hook entry.
+                    if !driver.is_tracing() {
+                        driver.meta_interp_mut().warm_state_mut().mark_dont_trace(green_key);
                     }
                 }
             }
@@ -345,23 +356,36 @@ fn can_enter_jit_hook(
     info: &majit_meta::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<PyResult> {
+    // Early exit for blacklisted keys: avoid build_jit_state + build_meta overhead.
+    let has_compiled = driver.has_compiled_loop(green_key);
+    if !has_compiled
+        && !driver.meta_interp().warm_state_ref().counter_would_fire(green_key)
+    {
+        return None;
+    }
     let mut jit_state = build_jit_state(frame, info);
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit][root-backedge] enter key={} pc={} arg0={:?} has_compiled={}",
             green_key, loop_header_pc, debug_first_arg_int(frame),
-            driver.has_compiled_loop(green_key)
+            has_compiled
         );
     }
+    // RPython can_enter_jit only runs compiled code — tracing starts
+    // from jit_merge_point via the eval_loop_jit dispatch path.
     let outcome = if driver.has_compiled_loop(green_key) {
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key, loop_header_pc, &mut jit_state, env, || {},
             restore_guard_failure_for_loop,
         ))
-    } else {
+    } else if !driver.is_tracing() {
+        // No compiled code, not tracing: try starting a trace.
+        LAST_TRACE_START_KEY.with(|k| k.set(green_key));
         driver.back_edge_or_run_compiled_keyed(
             green_key, loop_header_pc, &mut jit_state, env, || {},
         )
+    } else {
+        None
     };
     if let Some(outcome) = outcome {
         if majit_meta::majit_log_enabled() {
@@ -373,6 +397,19 @@ fn can_enter_jit_hook(
                 DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
             };
             eprintln!("[jit][root-backedge] outcome key={} pc={} kind={}", green_key, loop_header_pc, kind);
+        }
+        match &outcome {
+            DetailedDriverRunOutcome::Abort { .. } => {
+                // Compiled code aborted (incompatible-state etc.).
+                // Blacklist the originating back-edge key so it doesn't
+                // retrigger tracing → compile → abort cycles.
+                let origin_key = LAST_TRACE_START_KEY.with(|k| k.get());
+                if origin_key != 0 && origin_key != green_key {
+                    driver.meta_interp_mut().warm_state_mut().abort_tracing(origin_key, true);
+                    driver.meta_interp_mut().warm_state_mut().clear_loop_token(origin_key);
+                }
+            }
+            _ => {}
         }
         if let Some(result) = handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
             return Some(result);
@@ -677,12 +714,17 @@ fn restore_guard_failure_for_loop(
         if majit_meta::majit_log_enabled() {
             eprintln!("[jit] guard-fail: null Ref in restored values, invalidating compiled code");
         }
-        // Blacklist all compiled keys and invalidate compiled code to prevent
-        // repeated compile→fail cycles. Blacklist first, then clear.
+        // Blacklist all compiled keys AND the originating trace key.
+        // Clear loop_tokens so counter_would_fire returns false.
         let (driver, _) = driver_pair();
-        let keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
+        let mut keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
+        let origin_key = LAST_TRACE_START_KEY.with(|k| k.get());
+        if origin_key != 0 {
+            keys.push(origin_key);
+        }
         for key in keys {
             driver.meta_interp_mut().warm_state_mut().abort_tracing(key, true);
+            driver.meta_interp_mut().warm_state_mut().clear_loop_token(key);
         }
         driver.invalidate_all_compiled();
         return None;
