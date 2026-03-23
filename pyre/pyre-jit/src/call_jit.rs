@@ -250,7 +250,7 @@ pub fn maybe_handle_inline_concrete_call(
     // symbolic frame and corrupt concrete stack reads.
     let _suspend_inline_override = pyre_interp::call::suspend_inline_call_override();
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
-    let _jit_depth = crate::eval::jit_call_depth_bump();
+    // Depth tracked by pyre_interp::call::CALL_DEPTH (call_user_function path).
     // RPython blackhole.py:1095: bhimpl_recursive_call → portal_runner
     // CAN enter JIT. JIT_TRACING_DEPTH prevents re-entrant tracing,
     // so nested calls safely enter compiled code without force_plain_eval.
@@ -395,7 +395,7 @@ extern "C" fn jit_call_user_function_from_frame(
     let args =
         unsafe { std::slice::from_raw_parts(args_ptr as *const PyObjectRef, nargs as usize) };
     let _suspend_inline_override = pyre_interp::call::suspend_inline_call_override();
-    let _jit_depth = crate::eval::jit_call_depth_bump();
+    // Depth tracked by pyre_interp::call::CALL_DEPTH (call_user_function path).
     match pyre_interp::call::call_user_function(frame, callable as PyObjectRef, args) {
         Ok(result) => result as i64,
         Err(err) => panic!("jit user-function call failed: {err}"),
