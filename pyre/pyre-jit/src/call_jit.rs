@@ -738,7 +738,6 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
 /// the callee frame is created directly from the caller's code/globals.
 pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
-    let _force_guard = crate::eval::recursive_force_entry_bump();
     let boxed_arg_ref = boxed_arg as PyObjectRef;
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let green_key = crate::eval::make_green_key(caller.code, 0);
@@ -797,7 +796,6 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     raw_int_arg: i64,
 ) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
-    let _force_guard = crate::eval::recursive_force_entry_bump();
     let callable_ref = callable as PyObjectRef;
     let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
@@ -839,7 +837,6 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// calls re-enter compiled code through the normal portal runner path.
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
-    let _force_guard = crate::eval::recursive_force_entry_bump();
     if majit_meta::majit_log_enabled() && raw_int_arg <= 4 {
         eprintln!("[jit][force-self-recursive] enter arg={}", raw_int_arg);
     }

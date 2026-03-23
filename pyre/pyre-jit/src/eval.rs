@@ -87,10 +87,6 @@ thread_local! {
     /// Call depth at which the current trace started.
     /// jit_merge_point_hook only fires at this depth.
     static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
-    /// Last green_key that started a back-edge trace. Used to blacklist
-    /// the originating key when compiled code from a redirected trace fails.
-    static LAST_TRACE_START_KEY: Cell<u64> = Cell::new(0);
-    static RECURSIVE_FORCE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -120,20 +116,6 @@ impl Drop for JitCallDepthGuard {
 pub fn jit_call_depth_bump() -> Option<JitCallDepthGuard> {
     JIT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
     Some(JitCallDepthGuard)
-}
-
-pub(crate) struct RecursiveForceEntryGuard;
-
-impl Drop for RecursiveForceEntryGuard {
-    fn drop(&mut self) {
-        RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.set(d.get() - 1));
-    }
-}
-
-#[inline]
-pub(crate) fn recursive_force_entry_bump() -> RecursiveForceEntryGuard {
-    RECURSIVE_FORCE_ENTRY_DEPTH.with(|d| d.set(d.get() + 1));
-    RecursiveForceEntryGuard
 }
 
 /// RPython rstack.stack_almost_full() parity.
@@ -282,9 +264,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     if let Some(loop_result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
                         return loop_result;
                     }
-                    // Hook returned None without starting a trace: reset counter
-                    // to prevent repeated tick fires. If tracing just started,
-                    // is_tracing() is true so we don't reach here.
+                    // Reset counter after hook returns None without tracing.
+                    // Prevents repeated tick fires that cause overhead.
                     driver.meta_interp_mut().warm_state_mut().counter.reset(green_key);
                 }
             }
@@ -374,8 +355,6 @@ fn can_enter_jit_hook(
             restore_guard_failure_for_loop,
         ))
     } else if !driver.is_tracing() {
-        // No compiled code, not tracing: try starting a trace.
-        LAST_TRACE_START_KEY.with(|k| k.set(green_key));
         driver.back_edge_or_run_compiled_keyed(
             green_key, loop_header_pc, &mut jit_state, env, || {},
         )
@@ -392,16 +371,6 @@ fn can_enter_jit_hook(
                 DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
             };
             eprintln!("[jit][root-backedge] outcome key={} pc={} kind={}", green_key, loop_header_pc, kind);
-        }
-        match &outcome {
-            DetailedDriverRunOutcome::Abort { .. } => {
-                let origin_key = LAST_TRACE_START_KEY.with(|k| k.get());
-                if origin_key != 0 && origin_key != green_key {
-                    driver.meta_interp_mut().warm_state_mut().abort_tracing(origin_key, true);
-                    driver.meta_interp_mut().warm_state_mut().clear_loop_token(origin_key);
-                }
-            }
-            _ => {}
         }
         match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
             JitAction::Return(result) => return Some(LoopResult::Done(result)),
@@ -538,15 +507,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
 
-    let self_recursive_candidate = crate::call_jit::self_recursive_function_entry_candidate(frame);
-    if !driver.is_function_boosted(green_key) && self_recursive_candidate {
-        // WarmState boosts are "trace the next entry quickly", not "trace the
-        // current entry immediately". Mirror that RPython behavior here so
-        // the first outermost recursive call only seeds the counter and the
-        // next recursive portal entry starts the separate function trace.
-        driver.boost_function_entry(green_key);
-        return None;
-    }
+    // RPython warmstate.py:446 maybe_compile_and_run: standard counter
+    // threshold for ALL functions. No self-recursive boosting.
     let should_trace = driver
         .meta_interp_mut()
         .warm_state_mut()
@@ -706,11 +668,7 @@ fn restore_guard_failure_for_loop(
         // Blacklist all compiled keys AND the originating trace key.
         // Clear loop_tokens so counter_would_fire returns false.
         let (driver, _) = driver_pair();
-        let mut keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
-        let origin_key = LAST_TRACE_START_KEY.with(|k| k.get());
-        if origin_key != 0 {
-            keys.push(origin_key);
-        }
+        let keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
         for key in keys {
             driver.meta_interp_mut().warm_state_mut().abort_tracing(key, true);
             driver.meta_interp_mut().warm_state_mut().clear_loop_token(key);
