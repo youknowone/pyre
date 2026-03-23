@@ -437,7 +437,8 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
 
-    let result = match crate::eval::portal_runner_for_force(frame) {
+    // RPython bhimpl_recursive_call → portal_runner parity.
+    let result = match crate::eval::eval_with_jit(frame) {
         Ok(r) => r,
         Err(_) => pyre_object::PY_NULL,
     };
@@ -633,17 +634,15 @@ extern "C" fn jit_force_callee_frame_interp_nocache(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
 
-    // RPython warmspot.py:941 portal_runner parity
-    let result = match crate::eval::portal_runner_for_force(frame) {
-        Ok(r) => r,
-        Err(_) => pyre_object::PY_NULL,
-    };
-    match protocol {
-        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-            w_int_get_value(result)
+    match crate::eval::eval_with_jit(frame) {
+        Ok(result) => match protocol {
+            FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
+                w_int_get_value(result)
+            },
+            FinishProtocol::RawInt => result as i64,
+            FinishProtocol::Boxed => result as i64,
         },
-        FinishProtocol::RawInt => result as i64,
-        FinishProtocol::Boxed => result as i64,
+        Err(_) => 0i64,
     }
 }
 
@@ -755,7 +754,7 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     // RPython warmspot.py:941 portal_runner parity
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        match crate::eval::portal_runner_for_force(frame) {
+        match crate::eval::eval_with_jit(frame) {
             Ok(r) => r as i64,
             Err(_) => 0i64,
         }
@@ -852,7 +851,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     // RPython warmspot.py:941 portal_runner parity
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let pr_result = match crate::eval::portal_runner_for_force(frame) {
+        let pr_result = match crate::eval::eval_with_jit(frame) {
             Ok(r) => r,
             Err(_) => pyre_object::PY_NULL,
         };
@@ -983,6 +982,7 @@ pub fn jit_bridge_compile_for_guard(
     trace_id: u64,
     fail_index: u32,
     frame: &mut PyFrame,
+    resume_pc_hint: usize,
 ) {
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
@@ -990,9 +990,13 @@ pub fn jit_bridge_compile_for_guard(
 
     let (driver, info) = crate::eval::driver_pair();
 
-    // pyjitpl.py:2884: initialize_state_from_guard_failure.
-    // The frame has already been restored by restore_guard_failure_for_loop.
+    // TODO: Bridge compilation from function-entry traces needs proper
+    // frame state reconstruction (RPython resume_in_blackhole parity).
+    let _ = resume_pc_hint;
     let resume_pc = frame.next_instr;
+    if resume_pc == 0 {
+        return;
+    }
     let code = unsafe { &*frame.code };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
@@ -1110,17 +1114,15 @@ extern "C" fn jit_bridge_compile_callee(
         green_key
     };
     let protocol = finish_protocol(green_key);
-    // RPython warmspot.py:941 portal_runner parity
-    let pr_result = match crate::eval::portal_runner_for_force(frame) {
-        Ok(r) => r,
-        Err(_) => pyre_object::PY_NULL,
-    };
-    let result = match protocol {
-        FinishProtocol::RawInt if !pr_result.is_null() && unsafe { is_int(pr_result) } => unsafe {
-            w_int_get_value(pr_result)
+    let result = match crate::eval::eval_with_jit(frame) {
+        Ok(r) => match protocol {
+            FinishProtocol::RawInt if !r.is_null() && unsafe { is_int(r) } => unsafe {
+                w_int_get_value(r)
+            },
+            FinishProtocol::RawInt => r as i64,
+            FinishProtocol::Boxed => r as i64,
         },
-        FinishProtocol::RawInt => pr_result as i64,
-        FinishProtocol::Boxed => pr_result as i64,
+        Err(_) => 0i64,
     };
 
     let bridge_inputargs = vec![InputArg::from_type(Type::Int, 0)];

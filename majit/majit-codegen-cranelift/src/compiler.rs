@@ -957,20 +957,21 @@ pub fn take_pending_frame_restore() -> Option<FrameRestore> {
 /// Only requests at the current depth are taken; deeper requests
 /// are left for their own call level to process.
 thread_local! {
-    static PENDING_BRIDGE_COMPILE: std::cell::RefCell<Vec<(u32, u64, u64, u32)>> =
+    static PENDING_BRIDGE_COMPILE: std::cell::RefCell<Vec<(u32, u64, u64, u32, usize)>> =
         std::cell::RefCell::new(Vec::new());
     static BRIDGE_COMPILE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-fn request_pending_bridge_compile(green_key: u64, trace_id: u64, fail_index: u32) {
+fn request_pending_bridge_compile(
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    resume_pc: usize,
+) {
     let depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
-    eprintln!(
-        "[pending-bridge] push depth={} gk={} trace={} fail={}",
-        depth, green_key, trace_id, fail_index
-    );
     PENDING_BRIDGE_COMPILE.with(|cell| {
         cell.borrow_mut()
-            .push((depth, green_key, trace_id, fail_index));
+            .push((depth, green_key, trace_id, fail_index, resume_pc));
     });
 }
 
@@ -993,18 +994,17 @@ impl Drop for BridgeDepthGuard {
 }
 
 /// Take pending bridge compile requests at or above the current depth.
-pub fn take_pending_bridge_compile() -> Vec<(u64, u64, u32)> {
+pub fn take_pending_bridge_compile() -> Vec<(u64, u64, u32, usize)> {
     let current_depth = BRIDGE_COMPILE_DEPTH.with(|d| d.get());
-    eprintln!("[take-bridge] current_depth={}", current_depth);
     PENDING_BRIDGE_COMPILE.with(|cell| {
         let mut pending = cell.borrow_mut();
         let mut result = Vec::new();
-        pending.retain(|&(depth, gk, tid, fi)| {
+        pending.retain(|&(depth, gk, tid, fi, rpc)| {
             if depth >= current_depth {
-                result.push((gk, tid, fi));
+                result.push((gk, tid, fi, rpc));
                 false
             } else {
-                true // keep for outer depth
+                true
             }
         });
         result
@@ -1908,7 +1908,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
             // green_key from target's header_pc (may be 0 for function-entry traces)
             let gk = target.header_pc; // use header_pc; caller provides real green_key
-            request_pending_bridge_compile(gk, target.trace_id, fail_index);
+            let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
+            request_pending_bridge_compile(gk, target.trace_id, fail_index, resume_pc);
         }
 
         let saved_data = if let Some(ref ff) = force_frame {
@@ -3978,6 +3979,14 @@ impl CraneliftBackend {
                 return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
             }
             drop(bridge_guard);
+
+            // RPython compile.py:696 handle_fail: trigger bridge compilation.
+            let fail_count = fail_descr.get_fail_count();
+            if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
+                let gk = compiled.header_pc;
+                let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
+                request_pending_bridge_compile(gk, compiled.trace_id, fail_index, resume_pc);
+            }
 
             let saved_data = if let Some(ref ff) = force_frame {
                 take_force_frame_saved_data(ff)
