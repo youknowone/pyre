@@ -1620,9 +1620,9 @@ impl OptUnroll {
             return;
         }
         if let Some(value) = &info.constant {
-            ctx.make_constant(opref, value.clone());
+            ctx.make_constant_direct(opref, value.clone());
             if let Value::Ref(ptr) = value {
-                ctx.set_ptr_info(opref, crate::info::PtrInfo::Constant(*ptr));
+                ctx.set_ptr_info_direct(opref, crate::info::PtrInfo::Constant(*ptr));
             }
         }
         if let Some(ptr_info) = info.ptr_info.clone() {
@@ -1637,7 +1637,7 @@ impl OptUnroll {
                 }
                 ExportedPtrKind::Struct => {
                     if let Some(descr) = info.ptr_descr.clone() {
-                        ctx.set_ptr_info(opref, crate::info::PtrInfo::struct_ptr(descr));
+                        ctx.set_ptr_info_direct(opref, crate::info::PtrInfo::struct_ptr(descr));
                     }
                 }
                 ExportedPtrKind::Array => {
@@ -1646,12 +1646,12 @@ impl OptUnroll {
                             .array_lenbound
                             .clone()
                             .unwrap_or_else(crate::intutils::IntBound::nonnegative);
-                        ctx.set_ptr_info(opref, crate::info::PtrInfo::array(descr, lenbound));
+                        ctx.set_ptr_info_direct(opref, crate::info::PtrInfo::array(descr, lenbound));
                     }
                 }
                 ExportedPtrKind::None => {
                     if let Some(class_ptr) = info.known_class {
-                        ctx.set_ptr_info(
+                        ctx.set_ptr_info_direct(
                             opref,
                             crate::info::PtrInfo::KnownClass {
                                 class_ptr,
@@ -1659,7 +1659,7 @@ impl OptUnroll {
                             },
                         );
                     } else if info.nonnull {
-                        ctx.set_ptr_info(opref, crate::info::PtrInfo::NonNull);
+                        ctx.set_ptr_info_direct(opref, crate::info::PtrInfo::NonNull);
                     }
                 }
             }
@@ -1688,7 +1688,7 @@ impl OptUnroll {
 
         match ptr_info {
             PtrInfo::Virtual(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::Virtual(info.clone()));
+                ctx.set_ptr_info_direct(opref, PtrInfo::Virtual(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.apply_exported_info_recursive(
@@ -1702,7 +1702,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualStruct(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::VirtualStruct(info.clone()));
+                ctx.set_ptr_info_direct(opref, PtrInfo::VirtualStruct(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.apply_exported_info_recursive(
@@ -1716,7 +1716,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualArray(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::VirtualArray(info.clone()));
+                ctx.set_ptr_info_direct(opref, PtrInfo::VirtualArray(info.clone()));
                 for &item_ref in &info.items {
                     if let Some(item_info) = exported_infos.get(&item_ref) {
                         self.apply_exported_info_recursive(
@@ -1730,7 +1730,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualArrayStruct(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::VirtualArrayStruct(info.clone()));
+                ctx.set_ptr_info_direct(opref, PtrInfo::VirtualArrayStruct(info.clone()));
                 for fields in &info.element_fields {
                     for &(_, field_ref) in fields {
                         if let Some(field_info) = exported_infos.get(&field_ref) {
@@ -1746,7 +1746,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualRawBuffer(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::VirtualRawBuffer(info.clone()));
+                ctx.set_ptr_info_direct(opref, PtrInfo::VirtualRawBuffer(info.clone()));
                 for &(_, _, entry_ref) in &info.entries {
                     if let Some(entry_info) = exported_infos.get(&entry_ref) {
                         self.apply_exported_info_recursive(
@@ -1760,7 +1760,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::Instance(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::Instance(info.clone()));
+                ctx.set_ptr_info_direct(opref, PtrInfo::Instance(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.apply_exported_info_recursive(
@@ -1774,7 +1774,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::Struct(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::Struct(info.clone()));
+                ctx.set_ptr_info_direct(opref, PtrInfo::Struct(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.apply_exported_info_recursive(
@@ -1788,7 +1788,7 @@ impl OptUnroll {
                 }
             }
             PtrInfo::Array(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::Array(info.clone()));
+                ctx.set_ptr_info_direct(opref, PtrInfo::Array(info.clone()));
                 for &item_ref in &info.items {
                     if let Some(item_info) = exported_infos.get(&item_ref) {
                         self.apply_exported_info_recursive(
@@ -1805,7 +1805,7 @@ impl OptUnroll {
                 class_ptr,
                 is_nonnull,
             } => {
-                ctx.set_ptr_info(
+                ctx.set_ptr_info_direct(
                     opref,
                     PtrInfo::KnownClass {
                         class_ptr,
@@ -2008,7 +2008,7 @@ impl OptUnroll {
                                 .copied()
                                 .map(crate::ImportedShortPureArg::OpRef),
                             ExportedShortArg::Const { source, value } => {
-                                ctx.make_constant(*source, value.clone());
+                                ctx.make_constant_direct(*source, value.clone());
                                 Some(crate::ImportedShortPureArg::Const(*value))
                             }
                             ExportedShortArg::Produced(index) => produced_results

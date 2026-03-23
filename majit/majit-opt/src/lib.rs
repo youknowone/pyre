@@ -705,8 +705,19 @@ impl OptContext {
         }
     }
 
-    /// Record that an operation produces a known constant value.
+    /// RPython parity: resolves forwarding first, storing on the canonical Box.
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
+        let resolved = self.get_replacement(opref);
+        let idx = resolved.0 as usize;
+        if idx >= self.constants.len() {
+            self.constants.resize(idx + 1, None);
+        }
+        self.constants[idx] = Some(value);
+    }
+
+    /// Store constant WITHOUT resolving forwarding.
+    /// Used by import_state where the target is a fresh Phase 1 opref.
+    pub fn make_constant_direct(&mut self, opref: OpRef, value: Value) {
         let idx = opref.0 as usize;
         if idx >= self.constants.len() {
             self.constants.resize(idx + 1, None);
@@ -840,7 +851,21 @@ impl OptContext {
         }
     }
 
+    /// RPython parity: resolves forwarding first, storing info on the
+    /// canonical (resolved) Box.
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
+        let resolved = self.get_replacement(opref);
+        let idx = resolved.0 as usize;
+        if idx >= self.ptr_info.len() {
+            self.ptr_info.resize(idx + 1, None);
+        }
+        self.ptr_info[idx] = Some(info);
+    }
+
+    /// Store info WITHOUT resolving forwarding. Used exclusively by
+    /// import_state where the target opref is a fresh Phase 1 Box that
+    /// must receive info directly (RPython: target.set_forwarded(info)).
+    pub fn set_ptr_info_direct(&mut self, opref: OpRef, info: PtrInfo) {
         let idx = opref.0 as usize;
         if idx >= self.ptr_info.len() {
             self.ptr_info.resize(idx + 1, None);
