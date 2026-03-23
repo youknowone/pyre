@@ -4644,10 +4644,27 @@ impl SharedOpcodeHandler for TraceFrameState {
         key: Self::Value,
         value: Self::Value,
     ) -> Result<(), PyError> {
+        // MIFrame Box tracking: mutate concrete list/dict
+        if let Some((c_obj, c_key, c_val)) = self.concrete_store_subscr_operands() {
+            let _ = pyre_objspace::space::py_setitem(c_obj, c_key, c_val);
+        }
         self.store_subscr_value(obj, key, value)
     }
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
+        // MIFrame Box tracking: mutate concrete list
+        // list and value are already popped from symbolic stack; their concrete
+        // counterparts are in the positions just above current valuestackdepth.
+        let s = self.sym();
+        let c_list = s.concrete_value_at(s.valuestackdepth);
+        let c_value = s.concrete_value_at(s.valuestackdepth + 1);
+        if !c_list.is_null() && !c_value.is_null() {
+            unsafe {
+                if pyre_object::is_list(c_list) {
+                    pyre_object::w_list_append(c_list, c_value);
+                }
+            }
+        }
         self.list_append_value(list, value)
     }
 
