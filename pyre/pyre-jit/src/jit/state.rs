@@ -4534,9 +4534,9 @@ impl SharedOpcodeHandler for TraceFrameState {
         callable: Self::Value,
         args: &[Self::Value],
     ) -> Result<Self::Value, PyError> {
-        // MIFrame Box tracking: compute concrete call result from concrete args
-        // This mirrors RPython executor.execute_varargs() which runs the real
-        // function and captures the concrete result.
+        // MIFrame Box tracking: compute concrete call result from concrete args.
+        // RPython executor.execute_varargs() runs the real function and captures
+        // the concrete result. We do the same for both builtins and user functions.
         if let Some(concrete_callable) = self.concrete_callable_after_pops() {
             let concrete_args: Vec<PyObjectRef> = (0..args.len())
                 .filter_map(|i| self.concrete_call_arg_after_pops(i))
@@ -4547,6 +4547,29 @@ impl SharedOpcodeHandler for TraceFrameState {
                         let func = pyre_runtime::w_builtin_func_get(concrete_callable);
                         let result = func(&concrete_args);
                         self.sym_mut().pending_concrete_push = Some(result);
+                    } else if pyre_runtime::is_func(concrete_callable) {
+                        // User-defined function: call via plain interpreter
+                        // to get concrete result without JIT re-entry.
+                        // Guard against stack overflow from deep concrete calls
+                        // during tracing (inline_helper pattern).
+                        use std::cell::Cell;
+                        thread_local! {
+                            static CONCRETE_CALL_DEPTH: Cell<u32> = Cell::new(0);
+                        }
+                        let depth = CONCRETE_CALL_DEPTH.with(|d| d.get());
+                        if depth < 3 {
+                            CONCRETE_CALL_DEPTH.with(|d| d.set(depth + 1));
+                            let frame_ptr = self.concrete_frame as *const pyre_interp::frame::PyFrame;
+                            let result = pyre_interp::call::call_user_function_plain(
+                                unsafe { &*frame_ptr },
+                                concrete_callable,
+                                &concrete_args,
+                            );
+                            CONCRETE_CALL_DEPTH.with(|d| d.set(depth));
+                            if let Ok(result) = result {
+                                self.sym_mut().pending_concrete_push = Some(result);
+                            }
+                        }
                     }
                 }
             }

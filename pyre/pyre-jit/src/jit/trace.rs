@@ -1,7 +1,10 @@
 //! Public trace entrypoint for `pyre`'s JIT portal.
 //!
-//! This stays as the stable entry surface used by the interpreter loop while
-//! trace recording executes directly through `TraceFrameState`.
+//! RPython MetaInterp._interpret() parity: trace_bytecode loops over
+//! all bytecodes in the loop body, recording IR while tracking concrete
+//! values internally via PyreSym's concrete Box arrays. No external
+//! frame execution is needed — each opcode handler computes concrete
+//! results alongside symbolic IR recording.
 
 use majit_meta::{TraceAction, TraceCtx};
 use pyre_bytecode::CodeObject;
@@ -29,44 +32,63 @@ fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
     }
 }
 
+/// Trace an entire loop body starting at `start_pc`.
+///
+/// RPython MetaInterp._interpret() parity: loops over bytecodes,
+/// recording IR via TraceFrameState. Concrete values are tracked
+/// internally in PyreSym's concrete_locals/concrete_stack arrays —
+/// no external frame execution is needed. Stops when a back-edge
+/// (CloseLoop) is reached or on error/abort.
 pub fn trace_bytecode(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
     code: &CodeObject,
-    pc: usize,
+    start_pc: usize,
     concrete_frame: usize,
 ) -> TraceAction {
-    // RPython pyjitpl/blackhole pass the semantic fallthrough pc to
-    // goto_if_not guards, not the raw bytecode successor. pyre bytecode keeps
-    // EXTENDED_ARG/NOT_TAKEN/CACHE as separate units, so skip them here.
-    let mut frame_state =
-        TraceFrameState::from_sym(ctx, sym, concrete_frame, semantic_fallthrough_pc(code, pc));
+    let mut pc = start_pc;
 
-    // PyPy interp_jit.py:89 — promote(valuestackdepth).
-    // hint(self.valuestackdepth, promote=True) forces valuestackdepth
-    // to be a compile-time constant, enabling constant-folding of
-    // stack offset calculations.
-    frame_state.promote_valuestackdepth(concrete_frame);
+    loop {
+        if pc >= code.instructions.len() {
+            return TraceAction::Abort;
+        }
 
-    let action = frame_state.trace_code_step(code, pc);
+        // ── Symbolic + concrete trace step ──
+        // Each opcode handler records IR AND updates concrete Box values
+        // in PyreSym (via pending_concrete_push / concrete_locals).
+        let mut frame_state =
+            TraceFrameState::from_sym(ctx, sym, concrete_frame, semantic_fallthrough_pc(code, pc));
+        frame_state.promote_valuestackdepth(concrete_frame);
 
-    // RPython pyjitpl.py reached_loop_header(): a loop-closing back-edge
-    // carries its merge-point explicitly. Retarget the trace green key from
-    // that loop-header PC instead of trying to infer it from jump args or
-    // virtualizable state later.
-    if let TraceAction::CloseLoopWithArgs {
-        loop_header_pc: Some(target_pc),
-        ..
-    } = action
-    {
-        let back_edge_key = crate::eval::make_green_key(code as *const CodeObject, target_pc);
-        ctx.set_green_key(back_edge_key);
-    } else if matches!(action, TraceAction::CloseLoop) {
-        let back_edge_key = crate::eval::make_green_key(code as *const CodeObject, pc);
-        ctx.set_green_key(back_edge_key);
+        let action = frame_state.trace_code_step(code, pc);
+
+        match action {
+            TraceAction::Continue => {
+                // Get next PC from symbolic state
+                let next_pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                pc = next_pc;
+            }
+
+            TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
+                // Retarget trace green key to loop header
+                if let TraceAction::CloseLoopWithArgs {
+                    loop_header_pc: Some(target_pc),
+                    ..
+                } = action
+                {
+                    let key =
+                        crate::eval::make_green_key(code as *const CodeObject, target_pc);
+                    ctx.set_green_key(key);
+                } else if matches!(action, TraceAction::CloseLoop) {
+                    let key = crate::eval::make_green_key(code as *const CodeObject, pc);
+                    ctx.set_green_key(key);
+                }
+                return action;
+            }
+
+            other => return other,
+        }
     }
-
-    action
 }
 
 #[cfg(test)]
