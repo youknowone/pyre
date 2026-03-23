@@ -13,6 +13,19 @@ use crate::history::TreeLoop;
 /// Mirrors the configurable warmstate `trace_limit` parameter.
 pub const DEFAULT_TRACE_LIMIT: usize = 6000;
 
+/// opencoder.py: cut_point() — snapshot of trace recorder position.
+///
+/// In RPython this is a 5-tuple `(_pos, _count, _index, snapshot_len, array_len)`.
+/// majit's structured IR ops make byte-level tracking and snapshot buffers
+/// unnecessary, so position reduces to op_count + ops.len().
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TracePosition {
+    /// Next OpRef index at this position (Trace.op_count).
+    pub op_count: u32,
+    /// Number of ops in the ops vec at this position.
+    pub ops_len: usize,
+}
+
 /// The trace recorder: accumulates operations during tracing.
 pub struct Trace {
     /// Recorded operations.
@@ -222,6 +235,27 @@ impl Trace {
         self.aborted = true;
         self.ops.clear();
         self.inputargs.clear();
+    }
+
+    /// opencoder.py: cut_point() — snapshot the current recorder position.
+    ///
+    /// Used by compile_trace to save position before recording a JUMP,
+    /// and by reached_loop_header to record merge points.
+    pub fn get_position(&self) -> TracePosition {
+        TracePosition {
+            op_count: self.op_count,
+            ops_len: self.ops.len(),
+        }
+    }
+
+    /// opencoder.py: cut_at() — restore the recorder to a previously saved position.
+    ///
+    /// Discards all operations recorded after `pos`. Used to undo a
+    /// tentative JUMP after compile_trace succeeds or fails.
+    pub fn cut(&mut self, pos: TracePosition) {
+        assert!(!self.finalized, "cannot cut a finalized trace");
+        self.ops.truncate(pos.ops_len);
+        self.op_count = pos.op_count;
     }
 
     /// Number of operations recorded so far (not counting input args).
@@ -1382,5 +1416,36 @@ mod tests {
         assert_eq!(new_rec.num_inputargs(), input_count);
         assert!(!new_rec.is_too_long());
         assert_eq!(new_rec.num_ops(), 0);
+    }
+
+    #[test]
+    fn test_get_position_and_cut() {
+        let mut rec = Trace::with_num_inputs(2);
+        let pos0 = rec.get_position();
+        assert_eq!(pos0.ops_len, 0);
+        assert_eq!(pos0.op_count, 2); // 2 inputargs
+
+        let _a = rec.record_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        let pos1 = rec.get_position();
+        assert_eq!(pos1.ops_len, 1);
+        assert_eq!(pos1.op_count, 3);
+
+        let _b = rec.record_op(OpCode::IntSub, &[OpRef(0), OpRef(1)]);
+        let _c = rec.record_op(OpCode::IntMul, &[OpRef(0), OpRef(1)]);
+        assert_eq!(rec.num_ops(), 3);
+
+        // Cut back to pos1 — should discard IntSub and IntMul
+        rec.cut(pos1);
+        assert_eq!(rec.num_ops(), 1);
+        assert_eq!(rec.get_position(), pos1);
+
+        // Can record more ops after cut
+        let d = rec.record_op(OpCode::IntNeg, &[OpRef(0)]);
+        assert_eq!(d, OpRef(3)); // continues from pos1.op_count
+        assert_eq!(rec.num_ops(), 2);
+
+        // Cut back to pos0 — should discard everything
+        rec.cut(pos0);
+        assert_eq!(rec.num_ops(), 0);
     }
 }

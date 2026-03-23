@@ -61,7 +61,7 @@ pub use pyjitpl::{
 };
 pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;
-pub use trace_ctx::TraceCtx;
+pub use trace_ctx::{MergePoint, TraceCtx};
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 pub fn majit_log_enabled() -> bool {
