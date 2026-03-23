@@ -1342,6 +1342,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn linked_list_stack_head_descr(&self) -> Option<majit_ir::DescrRef> {
+                    // RPython: Stack.head is a plain mutable field (no _virtualizable_).
+                    // virtualizable=true here is a workaround for heap cache not properly
+                    // exporting/importing field state across JUMP→Label transitions.
+                    // TODO: fix heap cache export for linked list fields, then remove this.
                     Some(std::sync::Arc::new(
                         majit_ir::descr::SimpleFieldDescr::new(
                             0x8000_0003,
@@ -1354,6 +1358,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn linked_list_stack_size_descr(&self) -> Option<majit_ir::DescrRef> {
+                    // Same workaround as head — see comment above.
                     Some(std::sync::Arc::new(
                         majit_ir::descr::SimpleFieldDescr::new(
                             0x8000_0004,
