@@ -5748,26 +5748,10 @@ impl JitState for PyreJitState {
         // RPython warmstate.py: only green key matching + token validity.
         // Concrete slot types are NOT checked — preamble guards catch
         // type mismatches at runtime.
-        let pc_ok = self.next_instr == meta.merge_pc;
-        let locals_ok = self.local_count() == meta.num_locals;
-        let ns_ok = self.namespace_len() == meta.ns_keys.len();
-        let vsd_ok = self.valuestackdepth == meta.valuestackdepth;
-        if !(pc_ok && locals_ok && ns_ok && vsd_ok) {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[compat] FAIL pc={}=={} locals={}=={} ns={}=={} vsd={}=={}",
-                    self.next_instr,
-                    meta.merge_pc,
-                    self.local_count(),
-                    meta.num_locals,
-                    self.namespace_len(),
-                    meta.ns_keys.len(),
-                    self.valuestackdepth,
-                    meta.valuestackdepth,
-                );
-            }
-        }
-        pc_ok && locals_ok && ns_ok && vsd_ok
+        self.next_instr == meta.merge_pc
+            && self.local_count() == meta.num_locals
+            && self.namespace_len() == meta.ns_keys.len()
+            && self.valuestackdepth == meta.valuestackdepth
     }
 
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
