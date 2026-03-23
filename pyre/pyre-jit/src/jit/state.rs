@@ -1197,7 +1197,7 @@ impl PyreSym {
 impl TraceFrameState {
     /// Get the concrete return value from the frame's stack top.
     fn concrete_stack_value_at_return(&self) -> Option<PyObjectRef> {
-        // MIFrame Box tracking: read from concrete_stack instead of concrete_frame
+        // MIFrame Box tracking: read from concrete_stack
         let s = self.sym();
         if s.valuestackdepth > 0 {
             let v = s.concrete_value_at(s.valuestackdepth - 1);
@@ -1205,7 +1205,7 @@ impl TraceFrameState {
                 return Some(v.to_pyobj());
             }
         }
-        concrete_return_value(self.concrete_frame)
+        None
     }
 
     fn next_instruction_consumes_comparison_truth(&self) -> bool {
