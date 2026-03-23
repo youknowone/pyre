@@ -156,6 +156,19 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     handle_jitexception(frame)
 }
 
+/// RPython warmspot.py:941 portal_runner for force callbacks.
+///
+/// Unlike eval_with_jit, this does NOT register callbacks (already done)
+/// and is safe to call from force helpers during compiled code execution.
+/// RPython: bhimpl_recursive_call → portal_runner → CAN enter JIT.
+pub(crate) fn portal_runner_for_force(frame: &mut PyFrame) -> PyResult {
+    frame.fix_array_ptrs();
+    if let Some(result) = try_function_entry_jit(frame) {
+        return result;
+    }
+    handle_jitexception(frame)
+}
+
 /// RPython warmspot.py:961-1007 handle_jitexception parity.
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {

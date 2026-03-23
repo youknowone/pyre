@@ -431,16 +431,15 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     // Re-establish array pointer after potential corruption
     frame.fix_array_ptrs();
 
-    // RPython blackhole.py:1095 bhimpl_recursive_call parity:
-    // nested calls go through portal_runner which CAN enter JIT.
-    // Current frame runs as interpreter (eval_loop_for_force).
+    // RPython warmspot.py:941 portal_runner parity:
+    // bhimpl_recursive_call → portal_runner → CAN enter JIT.
 
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
 
-    let result = match pyre_interp::eval::eval_loop_for_force(frame) {
+    let result = match crate::eval::portal_runner_for_force(frame) {
         Ok(r) => r,
-        Err(err) => panic!("jit force callee frame failed: {err}"),
+        Err(_) => pyre_object::PY_NULL,
     };
 
     // Process deferred bridge compile requests. force_fn is called
@@ -634,15 +633,17 @@ extern "C" fn jit_force_callee_frame_interp_nocache(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
 
-    match pyre_interp::eval::eval_loop_for_force(frame) {
-        Ok(result) => match protocol {
-            FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-                w_int_get_value(result)
-            },
-            FinishProtocol::RawInt => result as i64,
-            FinishProtocol::Boxed => result as i64,
+    // RPython warmspot.py:941 portal_runner parity
+    let result = match crate::eval::portal_runner_for_force(frame) {
+        Ok(r) => r,
+        Err(_) => pyre_object::PY_NULL,
+    };
+    match protocol {
+        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
+            w_int_get_value(result)
         },
-        Err(err) => panic!("jit force callee frame (interp, nocache) failed: {err}"),
+        FinishProtocol::RawInt => result as i64,
+        FinishProtocol::Boxed => result as i64,
     }
 }
 
@@ -751,11 +752,12 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     }
 
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
+    // RPython warmspot.py:941 portal_runner parity
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        match pyre_interp::eval::eval_loop_for_force(frame) {
-            Ok(result) => result as i64,
-            Err(err) => panic!("jit force self-recursive call boxed failed: {err}"),
+        match crate::eval::portal_runner_for_force(frame) {
+            Ok(r) => r as i64,
+            Err(_) => 0i64,
         }
     };
     jit_drop_callee_frame(frame_ptr);
@@ -847,19 +849,19 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
-    // RPython parity (blackhole.py:1095): nested calls CAN enter JIT
+    // RPython warmspot.py:941 portal_runner parity
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = match pyre_interp::eval::eval_loop_for_force(frame) {
-            Ok(result) => result,
-            Err(err) => panic!("jit force self-recursive call raw failed: {err}"),
+        let pr_result = match crate::eval::portal_runner_for_force(frame) {
+            Ok(r) => r,
+            Err(_) => pyre_object::PY_NULL,
         };
         match protocol {
-            FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
-                w_int_get_value(bh_result)
+            FinishProtocol::RawInt if !pr_result.is_null() && unsafe { is_int(pr_result) } => unsafe {
+                w_int_get_value(pr_result)
             },
-            FinishProtocol::RawInt => bh_result as i64,
-            FinishProtocol::Boxed => bh_result as i64,
+            FinishProtocol::RawInt => pr_result as i64,
+            FinishProtocol::Boxed => pr_result as i64,
         }
     };
     jit_drop_callee_frame(frame_ptr);
@@ -1108,15 +1110,17 @@ extern "C" fn jit_bridge_compile_callee(
         green_key
     };
     let protocol = finish_protocol(green_key);
-    let result = match pyre_interp::eval::eval_loop_for_force(frame) {
-        Ok(r) => match protocol {
-            FinishProtocol::RawInt if !r.is_null() && unsafe { is_int(r) } => unsafe {
-                w_int_get_value(r)
-            },
-            FinishProtocol::RawInt => r as i64,
-            FinishProtocol::Boxed => r as i64,
+    // RPython warmspot.py:941 portal_runner parity
+    let pr_result = match crate::eval::portal_runner_for_force(frame) {
+        Ok(r) => r,
+        Err(_) => pyre_object::PY_NULL,
+    };
+    let result = match protocol {
+        FinishProtocol::RawInt if !pr_result.is_null() && unsafe { is_int(pr_result) } => unsafe {
+            w_int_get_value(pr_result)
         },
-        Err(e) => panic!("bridge force failed: {e}"),
+        FinishProtocol::RawInt => pr_result as i64,
+        FinishProtocol::Boxed => pr_result as i64,
     };
 
     let bridge_inputargs = vec![InputArg::from_type(Type::Int, 0)];
