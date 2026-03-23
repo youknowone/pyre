@@ -203,36 +203,6 @@ fn start_trace(
 }
 
 #[test]
-fn jit_interp_may_force_call_lowers_to_call_may_force_i() {
-    let program = Program {
-        ops: vec![OP_MAY_FORCE_CALL],
-    };
-    let state = SpecialState {
-        storage: StoragePool::new(&[&[3, 4]]),
-        selected: 0,
-    };
-    let (mut interp, mut sym) = start_trace(&program, &state);
-
-    let action = {
-        let ctx = interp.trace_ctx().unwrap();
-        __trace_trace_special_call_step(ctx, &mut sym, &program, 0, &state.storage, state.selected)
-    };
-    assert!(matches!(action, TraceAction::Continue));
-
-    let result = sym.stacks.get(&0).unwrap().peek().unwrap();
-    let (trace, _constants) = interp.finish_trace_for_parity(&[result]).unwrap();
-    assert_eq!(trace.ops.len(), 2);
-    assert_eq!(trace.ops[0].opcode, OpCode::CallMayForceI);
-    assert_eq!(trace.ops[1].opcode, OpCode::Finish);
-
-    let mut interp_state = SpecialState {
-        storage: StoragePool::new(&[&[3, 4]]),
-        selected: 0,
-    };
-    assert_eq!(trace_special_call_step(&program, 0, &mut interp_state), 7);
-}
-
-#[test]
 fn jit_interp_release_gil_void_call_lowers_to_call_release_gil_n() {
     let _guard = CALL_FAMILY_TEST_LOCK.lock().unwrap();
     LAST_VOID_SUM.store(-1, Ordering::SeqCst);

@@ -13,7 +13,7 @@ def compute(x):
 def main():
     s = 0
     i = 0
-    while i < 1000000:
+    while i < 3000000:
         s = add(s, compute(i))
         i = add(i, 1)
     print(s)

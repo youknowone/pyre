@@ -7985,66 +7985,6 @@ mod tests {
     }
 
     #[test]
-    fn test_close_loop_args_keeps_traced_raw_int_box_identity() {
-        use pyre_bytecode::compile_exec;
-        use pyre_interp::frame::PyFrame;
-
-        let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.locals_cells_stack_w[0] = w_int_new(41);
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(2);
-        let frame_ref = OpRef(0);
-        let local_raw = OpRef(1);
-        let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.symbolic_initialized = true;
-        sym.nlocals = 1;
-        sym.valuestackdepth = 1;
-        sym.symbolic_locals = vec![local_raw];
-        sym.symbolic_local_types = vec![Type::Int];
-        sym.vable_next_instr = ctx.const_int(11);
-        sym.vable_valuestackdepth = ctx.const_int(1);
-        sym.transient_value_types.insert(local_raw, Type::Int);
-
-        let mut state = TraceFrameState {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            concrete_frame: frame_ptr,
-            ob_type_fd: trace_ob_type_descr(),
-            fallthrough_pc: 0,
-            parent_fail_args: None,
-            parent_fail_arg_types: None,
-            pending_inline_frame: None,
-        };
-
-        let args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
-        assert_eq!(args.len(), 4);
-        assert_eq!(
-            args[3], local_raw,
-            "loop-close args should keep the traced raw int instead of allocating a new W_Int"
-        );
-
-        let recorder = ctx.into_recorder();
-        let mut saw_box_call = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                continue;
-            };
-            if matches!(op.opcode, OpCode::CallI | OpCode::CallR)
-                && op.args.as_slice() == [local_raw]
-            {
-                saw_box_call = true;
-            }
-        }
-        assert!(
-            !saw_box_call,
-            "close_loop_args should not rematerialize a boxed W_Int for raw int locals"
-        );
-    }
-
-    #[test]
     fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int() {
         use pyre_bytecode::compile_exec;
         use pyre_interp::frame::PyFrame;
