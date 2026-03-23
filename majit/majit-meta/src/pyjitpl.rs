@@ -160,9 +160,16 @@ fn normalize_root_loop_entry_contract(
         label_op.pos = OpRef::NONE;
         optimized_ops.insert(0, label_op);
     } else if jump_targets_current_loop && jump_arg_count > label_arg_count {
-        // RPython compile.py: JUMP may carry extra short-preamble args
-        // beyond the LABEL arity. The backend only uses LABEL-arity args;
-        // truncate the excess.
+        // RPython compile.py:334 asserts jump.numargs() == label.numargs().
+        // This mismatch indicates a bug in the assembly step's extra
+        // label/jump args calculation. Truncate as a workaround but log
+        // a warning — this should not happen with correct assembly.
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] WARNING: JUMP args ({}) > LABEL args ({}), truncating",
+                jump_arg_count, label_arg_count
+            );
+        }
         if let Some(jump) = optimized_ops
             .iter_mut()
             .rev()
