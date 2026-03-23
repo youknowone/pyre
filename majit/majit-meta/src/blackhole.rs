@@ -1892,72 +1892,47 @@ mod tests {
         }
     }
 
-    // ── Integer arithmetic correctness ──
+    // ── Integer arithmetic & comparison (consolidated) ──
 
     #[test]
-    fn test_executor_int_add() {
+    fn test_executor_int_arithmetic() {
+        // ADD
         assert_eq!(exec_binop(OpCode::IntAdd, 3, 4), 7);
         assert_eq!(exec_binop(OpCode::IntAdd, -1, 1), 0);
         assert_eq!(exec_binop(OpCode::IntAdd, 0, 0), 0);
-    }
-
-    #[test]
-    fn test_executor_int_sub() {
+        // SUB
         assert_eq!(exec_binop(OpCode::IntSub, 10, 3), 7);
         assert_eq!(exec_binop(OpCode::IntSub, 0, 5), -5);
-    }
-
-    #[test]
-    fn test_executor_int_mul() {
+        // MUL
         assert_eq!(exec_binop(OpCode::IntMul, 6, 7), 42);
         assert_eq!(exec_binop(OpCode::IntMul, -3, 4), -12);
         assert_eq!(exec_binop(OpCode::IntMul, 0, 999), 0);
-    }
-
-    #[test]
-    fn test_executor_int_floordiv() {
+        // FLOORDIV
         assert_eq!(exec_binop(OpCode::IntFloorDiv, 17, 5), 3);
         assert_eq!(exec_binop(OpCode::IntFloorDiv, -17, 5), -3);
         assert_eq!(exec_binop(OpCode::IntFloorDiv, 100, 1), 100);
-    }
-
-    #[test]
-    fn test_executor_int_mod() {
+        // MOD
         assert_eq!(exec_binop(OpCode::IntMod, 17, 5), 2);
         assert_eq!(exec_binop(OpCode::IntMod, 10, 3), 1);
         assert_eq!(exec_binop(OpCode::IntMod, 6, 3), 0);
     }
 
-    // ── Integer comparisons ──
-
     #[test]
-    fn test_executor_int_lt() {
+    fn test_executor_int_comparisons() {
+        // LT
         assert_eq!(exec_binop(OpCode::IntLt, 3, 4), 1);
         assert_eq!(exec_binop(OpCode::IntLt, 4, 4), 0);
         assert_eq!(exec_binop(OpCode::IntLt, 5, 4), 0);
-    }
-
-    #[test]
-    fn test_executor_int_ge() {
+        // GE
         assert_eq!(exec_binop(OpCode::IntGe, 4, 4), 1);
         assert_eq!(exec_binop(OpCode::IntGe, 5, 4), 1);
         assert_eq!(exec_binop(OpCode::IntGe, 3, 4), 0);
-    }
-
-    #[test]
-    fn test_executor_int_eq() {
+        // EQ / NE
         assert_eq!(exec_binop(OpCode::IntEq, 5, 5), 1);
         assert_eq!(exec_binop(OpCode::IntEq, 5, 6), 0);
-    }
-
-    #[test]
-    fn test_executor_int_ne() {
-        assert_eq!(exec_binop(OpCode::IntNe, 5, 6), 1);
         assert_eq!(exec_binop(OpCode::IntNe, 5, 5), 0);
-    }
-
-    #[test]
-    fn test_executor_int_le_gt() {
+        assert_eq!(exec_binop(OpCode::IntNe, 5, 6), 1);
+        // LE / GT
         assert_eq!(exec_binop(OpCode::IntLe, 3, 4), 1);
         assert_eq!(exec_binop(OpCode::IntLe, 4, 4), 1);
         assert_eq!(exec_binop(OpCode::IntLe, 5, 4), 0);
@@ -1965,90 +1940,54 @@ mod tests {
         assert_eq!(exec_binop(OpCode::IntGt, 4, 4), 0);
     }
 
-    // ── Float arithmetic ──
-
     #[test]
-    fn test_executor_float_add() {
-        let a = f64::to_bits(1.5) as i64;
-        let b = f64::to_bits(2.5) as i64;
-        let result = exec_binop(OpCode::FloatAdd, a, b);
-        assert_eq!(f64::from_bits(result as u64), 4.0);
+    fn test_executor_int_bitwise() {
+        assert_eq!(exec_binop(OpCode::IntAnd, 0xFF, 0x0F), 0x0F);
+        assert_eq!(exec_binop(OpCode::IntOr, 0xF0, 0x0F), 0xFF);
+        assert_eq!(exec_binop(OpCode::IntXor, 0xFF, 0x0F), 0xF0);
+        assert_eq!(exec_binop(OpCode::IntLshift, 1, 4), 16);
+        assert_eq!(exec_binop(OpCode::IntRshift, 16, 4), 1);
     }
 
     #[test]
-    fn test_executor_float_mul() {
-        let a = f64::to_bits(3.0) as i64;
-        let b = f64::to_bits(2.0) as i64;
-        let result = exec_binop(OpCode::FloatMul, a, b);
-        assert_eq!(f64::from_bits(result as u64), 6.0);
-    }
-
-    #[test]
-    fn test_executor_float_sub() {
-        let a = f64::to_bits(10.5) as i64;
-        let b = f64::to_bits(3.5) as i64;
-        let result = exec_binop(OpCode::FloatSub, a, b);
-        assert_eq!(f64::from_bits(result as u64), 7.0);
-    }
-
-    #[test]
-    fn test_executor_float_truediv() {
-        let a = f64::to_bits(7.0) as i64;
-        let b = f64::to_bits(2.0) as i64;
-        let result = exec_binop(OpCode::FloatTrueDiv, a, b);
-        assert_eq!(f64::from_bits(result as u64), 3.5);
-    }
-
-    // ── Unary ops ──
-
-    #[test]
-    fn test_executor_int_neg() {
-        assert_eq!(exec_unop(OpCode::IntNeg, 5), -5);
-        assert_eq!(exec_unop(OpCode::IntNeg, -3), 3);
-        assert_eq!(exec_unop(OpCode::IntNeg, 0), 0);
-    }
-
-    #[test]
-    fn test_executor_int_invert() {
+    fn test_executor_int_unary() {
+        assert_eq!(exec_unop(OpCode::IntNeg, 42), -42);
+        assert_eq!(exec_unop(OpCode::IntNeg, -1), 1);
         assert_eq!(exec_unop(OpCode::IntInvert, 0), -1);
         assert_eq!(exec_unop(OpCode::IntInvert, -1), 0);
-        assert_eq!(exec_unop(OpCode::IntInvert, 1), -2);
     }
 
     #[test]
-    fn test_executor_float_neg() {
-        let a = f64::to_bits(3.0) as i64;
-        let result = exec_unop(OpCode::FloatNeg, a);
-        assert_eq!(f64::from_bits(result as u64), -3.0);
+    fn test_executor_float_arithmetic() {
+        let fb = |v: f64| f64::to_bits(v) as i64;
+        let fr = |r: i64| f64::from_bits(r as u64);
+        assert_eq!(fr(exec_binop(OpCode::FloatAdd, fb(1.5), fb(2.5))), 4.0);
+        assert_eq!(fr(exec_binop(OpCode::FloatMul, fb(3.0), fb(4.0))), 12.0);
+        assert_eq!(fr(exec_binop(OpCode::FloatSub, fb(10.0), fb(3.5))), 6.5);
+        assert_eq!(fr(exec_binop(OpCode::FloatTrueDiv, fb(10.0), fb(4.0))), 2.5);
     }
 
     #[test]
-    fn test_executor_float_abs() {
-        let a = f64::to_bits(-5.5) as i64;
-        let result = exec_unop(OpCode::FloatAbs, a);
-        assert_eq!(f64::from_bits(result as u64), 5.5);
-    }
-
-    // ── Casts ──
-
-    #[test]
-    fn test_executor_cast_int_to_float() {
-        let result = exec_unop(OpCode::CastIntToFloat, 42);
-        assert_eq!(f64::from_bits(result as u64), 42.0);
+    fn test_executor_float_unary() {
+        let fb = |v: f64| f64::to_bits(v) as i64;
+        let fr = |r: i64| f64::from_bits(r as u64);
+        assert_eq!(fr(exec_unop(OpCode::FloatNeg, fb(3.14))), -3.14);
+        assert_eq!(fr(exec_unop(OpCode::FloatAbs, fb(-2.5))), 2.5);
+        assert_eq!(fr(exec_unop(OpCode::FloatAbs, fb(2.5))), 2.5);
     }
 
     #[test]
-    fn test_executor_cast_float_to_int() {
-        let a = f64::to_bits(3.7) as i64;
-        let result = exec_unop(OpCode::CastFloatToInt, a);
-        assert_eq!(result, 3);
-    }
-
-    #[test]
-    fn test_executor_cast_float_to_int_negative() {
-        let a = f64::to_bits(-2.9) as i64;
-        let result = exec_unop(OpCode::CastFloatToInt, a);
-        assert_eq!(result, -2);
+    fn test_executor_cast_int_float() {
+        let fr = |r: i64| f64::from_bits(r as u64);
+        assert_eq!(fr(exec_unop(OpCode::CastIntToFloat, 42)), 42.0);
+        assert_eq!(
+            exec_unop(OpCode::CastFloatToInt, f64::to_bits(3.7) as i64),
+            3
+        );
+        assert_eq!(
+            exec_unop(OpCode::CastFloatToInt, f64::to_bits(-2.9) as i64),
+            -2
+        );
     }
 
     // ── Overflow arithmetic ──
