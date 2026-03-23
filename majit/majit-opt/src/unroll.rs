@@ -2497,11 +2497,16 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
             new_op.pos = mapped_pos;
         }
+        // RPython parity: short_source_map is NOT part of the runtime arg
+        // remap chain. It's only for body-use-before-def detection (which
+        // adds extra Label args and SameAs ops in the preamble). The
+        // input_remap already maps body args to label args including any
+        // extra args added from the short preamble.
         let remap_body_arg = |arg: OpRef,
                               label_scope_remap: &HashMap<OpRef, OpRef>,
                               input_remap: &HashMap<OpRef, OpRef>,
                               alias_remap: &HashMap<OpRef, OpRef>,
-                              short_source_map: &HashMap<OpRef, OpRef>,
+                              _short_source_map: &HashMap<OpRef, OpRef>,
                               body_result_remap: &HashMap<OpRef, OpRef>,
                               seen_body_defs: &std::collections::HashSet<OpRef>,
                               visible_before_label: &std::collections::HashSet<OpRef>|
@@ -2521,12 +2526,6 @@ fn assemble_peeled_trace_with_jump_args(
                     }
                 }
                 if let Some(&mapped) = alias_remap.get(&current) {
-                    if mapped != current {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                if let Some(&mapped) = short_source_map.get(&current) {
                     if mapped != current {
                         current = mapped;
                         continue;
