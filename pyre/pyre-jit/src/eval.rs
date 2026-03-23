@@ -370,7 +370,15 @@ fn can_enter_jit_hook(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     let has_compiled = driver.has_compiled_loop(green_key);
+    // RPython parity: jit_merge_point is at the loop header, so the
+    // frame's PC equals the merge_pc. In pyre, can_enter_jit fires at
+    // the back-edge instruction, so frame.next_instr is AFTER the jump.
+    // Restore the PC to the loop header before building the jit state.
+    frame.next_instr = loop_header_pc;
     let mut jit_state = build_jit_state(frame, info);
+    // Ensure the jit state PC matches the loop header, even if
+    // sync_from_virtualizable read a stale value from raw memory.
+    jit_state.next_instr = loop_header_pc;
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit][root-backedge] enter key={} pc={} arg0={:?} has_compiled={}",
