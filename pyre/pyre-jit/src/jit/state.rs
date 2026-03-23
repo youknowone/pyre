@@ -135,6 +135,17 @@ pub struct PyreSym {
     /// the pre-pop stack shape, matching RPython's goto_if_not(box).
     pub(crate) pending_branch_value: Option<OpRef>,
     pub(crate) transient_value_types: std::collections::HashMap<OpRef, Type>,
+    // ── MIFrame concrete Box tracking (RPython registers_i/r/f parity) ──
+    // Concrete Python object values for locals and stack, tracked in
+    // parallel with symbolic_locals/symbolic_stack. Each opcode handler
+    // updates these alongside the symbolic OpRefs so that guard decisions,
+    // branch directions, and call results use internally tracked values
+    // instead of reading from an external PyFrame snapshot.
+    pub(crate) concrete_locals: Vec<PyObjectRef>,
+    pub(crate) concrete_stack: Vec<PyObjectRef>,
+    /// Concrete value to be consumed by the next push_value() call.
+    /// Set by opcode handlers before pushing a result.
+    pub(crate) pending_concrete_push: Option<PyObjectRef>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -927,6 +938,9 @@ impl PyreSym {
             last_popped_concrete_value: None,
             pending_branch_value: None,
             transient_value_types: std::collections::HashMap::new(),
+            concrete_locals: Vec::new(),
+            concrete_stack: Vec::new(),
+            pending_concrete_push: None,
         }
     }
 
@@ -975,6 +989,14 @@ impl PyreSym {
         }
         self.pending_next_instr = None;
         self.valuestackdepth = valuestackdepth;
+        // MIFrame concrete Box tracking: populate concrete value arrays
+        // from the concrete frame snapshot (RPython MIFrame.setup_call parity).
+        self.concrete_locals = (0..nlocals)
+            .map(|i| concrete_stack_value(concrete_frame, i).unwrap_or(PY_NULL))
+            .collect();
+        self.concrete_stack = (0..stack_only_depth)
+            .map(|i| concrete_stack_value(concrete_frame, nlocals + i).unwrap_or(PY_NULL))
+            .collect();
         self.symbolic_initialized = true;
     }
 
