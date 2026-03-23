@@ -5101,10 +5101,25 @@ impl ControlFlowOpcodeHandler for TraceFrameState {
 
     fn close_loop_args(&mut self, target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
         self.with_ctx(|this, ctx| {
-            // RPython reached_loop_header(): the loop-close state must carry
-            // the explicit backward-jump target, i.e. the real loop header
-            // merge-point. Reassert it here instead of trusting whatever
-            // fallthrough pc happened to be materialized earlier in the step.
+            // RPython reached_loop_header (pyjitpl.py:2988-3030):
+            // Check current_merge_points for same_greenkey. If this is
+            // an inner loop's first visit, record and continue (unroll).
+            let code_ptr =
+                unsafe { &*(this.concrete_frame as *const pyre_interp::frame::PyFrame) }.code;
+            let back_edge_key = crate::eval::make_green_key(code_ptr, target);
+            if !ctx.has_merge_point(back_edge_key) {
+                // First visit: record merge point and continue tracing.
+                ctx.add_merge_point(back_edge_key);
+                TraceFrameState::set_next_instr(this, ctx, target);
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][reached_loop_header] first visit, unroll: key={} pc={}",
+                        back_edge_key, target
+                    );
+                }
+                return Ok(None); // Continue — inner loop unrolled
+            }
+            // Same green key seen → close the loop.
             TraceFrameState::set_next_instr(this, ctx, target);
             Ok(Some(TraceFrameState::close_loop_args(this, ctx)))
         })
