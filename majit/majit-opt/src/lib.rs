@@ -40,6 +40,22 @@ pub(crate) fn majit_log_enabled() -> bool {
     std::env::var_os("MAJIT_LOG").is_some()
 }
 
+/// compile.py: ResumeAtPositionDescr — type tag for guards created during
+/// loop unrolling / short preamble inlining.
+#[derive(Debug)]
+struct OptResumeAtPositionDescr;
+
+impl majit_ir::Descr for OptResumeAtPositionDescr {
+    fn is_resume_at_position(&self) -> bool {
+        true
+    }
+}
+
+/// Create a ResumeAtPositionDescr for optimizer-generated guards.
+pub fn make_resume_at_position_descr() -> DescrRef {
+    std::sync::Arc::new(OptResumeAtPositionDescr)
+}
+
 /// Result of an optimization pass processing an operation.
 #[derive(Debug)]
 pub enum OptimizationResult {

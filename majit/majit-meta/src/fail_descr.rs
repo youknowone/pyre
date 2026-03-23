@@ -157,6 +157,46 @@ pub fn make_resume_guard_descr_with_index(
     })
 }
 
+/// compile.py: ResumeAtPositionDescr — type tag for guards created during
+/// loop unrolling / short preamble inlining. Carries no extra data.
+///
+/// When compile_trace encounters a bridge starting from this descriptor,
+/// it sets inline_short_preamble = false.
+#[derive(Debug)]
+pub struct ResumeAtPositionDescr {
+    fail_index: u32,
+    types: Vec<Type>,
+}
+
+impl majit_ir::Descr for ResumeAtPositionDescr {
+    fn index(&self) -> u32 {
+        self.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn is_resume_at_position(&self) -> bool {
+        true
+    }
+}
+
+impl FailDescr for ResumeAtPositionDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.types
+    }
+}
+
+/// Create a ResumeAtPositionDescr with auto-assigned fail_index.
+pub fn make_resume_at_position_descr() -> DescrRef {
+    Arc::new(ResumeAtPositionDescr {
+        fail_index: alloc_fail_index(),
+        types: Vec::new(),
+    })
+}
+
 /// Extract resume data from a guard's FailDescr + MetaInterp's resume_data map.
 ///
 /// The recommended pattern for resume data lookup:

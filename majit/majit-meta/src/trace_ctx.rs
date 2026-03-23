@@ -61,15 +61,19 @@ pub struct TraceCtx {
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
 ///
-/// RPython stores `(original_boxes, start)` where start is a 5-tuple
-/// trace position. In majit, boxes are implicit (inputargs) and position
-/// is a `TracePosition`.
+/// RPython stores `(original_boxes, start)` where `original_boxes` is the
+/// full list of green+red args at the first visit, and `start` is a 5-tuple
+/// trace position. majit stores the equivalent as OpRef vectors + TracePosition.
 #[derive(Clone, Debug)]
 pub struct MergePoint {
     /// Green key of the loop header.
     pub green_key: u64,
     /// Trace position when this loop header was first visited.
     pub position: TracePosition,
+    /// pyjitpl.py:2989: original_boxes — live variable OpRefs at the first
+    /// visit to this loop header. Used by compile_loop/compile_retrace as
+    /// the inputargs for trace cutting.
+    pub original_boxes: Vec<OpRef>,
 }
 
 impl TraceCtx {
@@ -80,13 +84,15 @@ impl TraceCtx {
             .any(|mp| mp.green_key == key)
     }
 
-    /// pyjitpl.py:3029-3030 — record a loop header visit with position.
-    pub fn add_merge_point(&mut self, key: u64) {
+    /// pyjitpl.py:3029-3030 — record a loop header visit with position
+    /// and live variable snapshot.
+    pub fn add_merge_point(&mut self, key: u64, live_args: Vec<OpRef>) {
         if !self.has_merge_point(key) {
             let position = self.recorder.get_position();
             self.current_merge_points.push(MergePoint {
                 green_key: key,
                 position,
+                original_boxes: live_args,
             });
         }
     }
@@ -129,6 +135,9 @@ impl TraceCtx {
 
     pub(crate) fn new(recorder: Trace, green_key: u64) -> Self {
         let initial_position = recorder.get_position();
+        let initial_boxes: Vec<OpRef> = (0..recorder.num_inputargs())
+            .map(|i| OpRef(i as u32))
+            .collect();
         TraceCtx {
             recorder,
             green_key,
@@ -145,6 +154,7 @@ impl TraceCtx {
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
+                original_boxes: initial_boxes.clone(),
             }],
         }
     }
@@ -156,6 +166,9 @@ impl TraceCtx {
         green_key_values: GreenKey,
     ) -> Self {
         let initial_position = recorder.get_position();
+        let initial_boxes: Vec<OpRef> = (0..recorder.num_inputargs())
+            .map(|i| OpRef(i as u32))
+            .collect();
         TraceCtx {
             recorder,
             green_key,
@@ -172,6 +185,7 @@ impl TraceCtx {
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
+                original_boxes: initial_boxes.clone(),
             }],
         }
     }
