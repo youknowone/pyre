@@ -264,8 +264,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     if let Some(loop_result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
                         return loop_result;
                     }
-                    // Reset counter after hook returns None without tracing.
-                    // Prevents repeated tick fires that cause overhead.
                     driver.meta_interp_mut().warm_state_mut().counter.reset(green_key);
                 }
             }
@@ -355,6 +353,9 @@ fn can_enter_jit_hook(
             restore_guard_failure_for_loop,
         ))
     } else if !driver.is_tracing() {
+        if stack_almost_full() {
+            return None;
+        }
         driver.back_edge_or_run_compiled_keyed(
             green_key, loop_header_pc, &mut jit_state, env, || {},
         )
@@ -604,8 +605,12 @@ fn handle_jit_outcome(
             JitAction::Continue
         }
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            // Guard-recovery paths rebuild the restored frame state before
-            // returning. The interpreter continues from the restored PC.
+            // RPython: guard failure → resume_in_blackhole → interprets
+            // from guard PC to loop header → ContinueRunningNormally.
+            // pyre skips the blackhole step: frame is already restored,
+            // eval_loop_jit continues from the restored PC with JIT hooks.
+            // This is equivalent because the next back-edge will trigger
+            // can_enter_jit normally.
             let _ = frame;
             JitAction::Continue
         }
