@@ -54,9 +54,10 @@ pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
 pub use majit_codegen::CompiledTraceInfo;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
-    BackEdgeAction, BlackholeRunResult, CompiledExitLayout, CompiledTerminalExitLayout,
-    CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, DriverRunOutcome,
-    GuardRecoveryAction, InlineDecision, JitHooks, JitStats, MetaInterp, RawCompileResult,
+    BackEdgeAction, BlackholeRunResult, CompileOutcome, CompiledExitLayout,
+    CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome,
+    DriverRunOutcome, GuardRecoveryAction, InlineDecision, JitHooks, JitStats, MetaInterp,
+    RawCompileResult,
 };
 pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;

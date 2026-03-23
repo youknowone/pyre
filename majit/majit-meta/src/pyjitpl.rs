@@ -38,6 +38,23 @@ pub enum BackEdgeAction {
     RunCompiled,
 }
 
+/// pyjitpl.py: result of close_and_compile / compile_loop.
+///
+/// RPython uses exceptions (raise ContinueRunningNormally on success,
+/// raise SwitchToBlackhole on fatal failure) and None returns for
+/// cancellation. majit uses this enum instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileOutcome {
+    /// Compilation succeeded — compiled loop is installed and ready to run.
+    Compiled,
+    /// Compilation was cancelled (e.g. InvalidLoop, virtual state mismatch).
+    /// The caller may retry or continue tracing.
+    Cancelled,
+    /// Too many cancellations — abort and fall back to interpreter.
+    /// Equivalent to RPython's SwitchToBlackhole(ABORT_BAD_LOOP).
+    Aborted,
+}
+
 /// Per-guard failure tracking for bridge compilation decisions.
 pub(crate) struct GuardFailureInfo {
     /// Number of times this guard has failed.
@@ -1371,7 +1388,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
     /// in the same order as the InputArgs registered during `on_back_edge`.
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
-    pub fn close_and_compile(&mut self, jump_args: &[OpRef], meta: M) {
+    pub fn close_and_compile(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
@@ -1381,36 +1398,37 @@ impl<M: Clone> MetaInterp<M> {
                 if current_key == Some(retrace_key) {
                     let ok = self.compile_retrace(jump_args, meta.clone());
                     if ok {
-                        // Successful retrace compilation.
                         self.cancel_count = 0;
                         self.warm_state.reset_function_counts();
-                        return;
+                        return CompileOutcome::Compiled;
                     }
-                    // Cancelled — check if too many attempts.
+                    // pyjitpl.py:3004: creation of the loop was cancelled!
                     self.cancel_count += 1;
-                    if self.cancel_count > 5 {
+                    if self.cancelled_too_many_times() {
                         if crate::majit_log_enabled() {
                             eprintln!("[jit] retrace cancelled too many times");
                         }
-                        self.partial_trace = None;
-                        self.retracing_from = None;
-                        self.exported_state = None;
-                        self.cancel_count = 0;
+                        self.clear_retrace_state();
                         if let Some(ctx) = self.tracing.take() {
                             self.warm_state.abort_tracing(ctx.green_key, false);
                         }
                         self.warm_state.reset_function_counts();
-                        return;
+                        return CompileOutcome::Aborted;
                     }
-                    // Not too many — fall through to normal compile_loop path.
+                    // Not too many — clear retrace state and fall through
+                    // to normal compile_loop path.
+                    self.exported_state = None;
                     if crate::majit_log_enabled() {
                         eprintln!("[jit] retrace cancelled, trying normal compilation");
                     }
                 } else {
-                    // Green key mismatch — clear retrace state.
-                    self.partial_trace = None;
-                    self.retracing_from = None;
-                    self.exported_state = None;
+                    // pyjitpl.py:2994-2995: green key mismatch — abort.
+                    self.clear_retrace_state();
+                    if let Some(ctx) = self.tracing.take() {
+                        self.warm_state.abort_tracing(ctx.green_key, false);
+                    }
+                    self.warm_state.reset_function_counts();
+                    return CompileOutcome::Aborted;
                 }
             }
         }
@@ -1523,7 +1541,8 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                     self.warm_state.abort_tracing(green_key, false);
-                    return;
+                    self.warm_state.reset_function_counts();
+                    return CompileOutcome::Cancelled;
                 }
                 std::panic::resume_unwind(payload);
             }
@@ -1546,7 +1565,8 @@ impl<M: Clone> MetaInterp<M> {
                         expected, actual,
                     );
                 }
-                return;
+                self.warm_state.reset_function_counts();
+                return CompileOutcome::Cancelled;
             }
         };
 
@@ -1588,7 +1608,8 @@ impl<M: Clone> MetaInterp<M> {
                 eprintln!("[jit] abort: guardless loop (no interrupt support)");
             }
             self.warm_state.abort_tracing(green_key, true);
-            return;
+            self.warm_state.reset_function_counts();
+            return CompileOutcome::Cancelled;
         }
 
         // Note: guards with NONE in fail_args may have sufficient trailing
@@ -1625,7 +1646,8 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // RPython: backend failure is non-permanent — allow retry.
                 self.warm_state.abort_tracing(green_key, false);
-                return;
+                self.warm_state.reset_function_counts();
+                return CompileOutcome::Cancelled;
             }
         };
         match compile_result {
@@ -1722,6 +1744,8 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
                 }
+                self.warm_state.reset_function_counts();
+                return CompileOutcome::Compiled;
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
@@ -1734,10 +1758,25 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // RPython: backend compilation failure is non-permanent.
                 self.warm_state.abort_tracing(green_key, false);
+                self.warm_state.reset_function_counts();
+                return CompileOutcome::Cancelled;
             }
         }
-        // Reset per-trace function call counts.
-        self.warm_state.reset_function_counts();
+    }
+
+    /// pyjitpl.py:2936-2942: cancelled_too_many_times — check if
+    /// cancel_count exceeds max_unroll_loops.
+    fn cancelled_too_many_times(&self) -> bool {
+        let limit = self.warm_state.max_unroll_loops();
+        self.cancel_count > limit
+    }
+
+    /// Clear retrace state (partial_trace, retracing_from, exported_state).
+    fn clear_retrace_state(&mut self) {
+        self.partial_trace = None;
+        self.retracing_from = None;
+        self.exported_state = None;
+        self.cancel_count = 0;
     }
 
     /// pyjitpl.py:2408-2412: retrace_needed — save state from a failed
@@ -2036,6 +2075,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn abort_trace(&mut self, permanent: bool) {
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
+        self.clear_retrace_state();
         if let Some(ctx) = self.tracing.take() {
             self.stats.loops_aborted += 1;
             let green_key = ctx.green_key;
