@@ -4518,6 +4518,23 @@ impl SharedOpcodeHandler for TraceFrameState {
         callable: Self::Value,
         args: &[Self::Value],
     ) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: compute concrete call result from concrete args
+        // This mirrors RPython executor.execute_varargs() which runs the real
+        // function and captures the concrete result.
+        if let Some(concrete_callable) = self.concrete_callable_after_pops() {
+            let concrete_args: Vec<PyObjectRef> = (0..args.len())
+                .filter_map(|i| self.concrete_call_arg_after_pops(i))
+                .collect();
+            if concrete_args.len() == args.len() {
+                unsafe {
+                    if pyre_runtime::is_builtin_func(concrete_callable) {
+                        let func = pyre_runtime::w_builtin_func_get(concrete_callable);
+                        let result = func(&concrete_args);
+                        self.sym_mut().pending_concrete_push = Some(result);
+                    }
+                }
+            }
+        }
         self.call_callable_value(callable, args)
     }
 
