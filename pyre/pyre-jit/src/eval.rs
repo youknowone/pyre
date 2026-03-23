@@ -86,8 +86,6 @@ thread_local! {
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
     /// Call depth at which the current trace started.
     static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
-    /// Resume PC from the most recent guard failure restoration.
-    static LAST_GUARD_RESUME_PC: Cell<usize> = Cell::new(0);
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -515,23 +513,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
             match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
                 JitAction::Return(result) => {
-                    // Drain pending bridge requests before returning.
-                    let pending = majit_codegen_cranelift::take_pending_bridge_compile();
-                    for (gk, tid, fi, resume_pc) in pending {
-                        let effective_gk = if gk == 0 { green_key } else { gk };
-                        let effective_rpc = if resume_pc == 0 {
-                            LAST_GUARD_RESUME_PC.with(|c| c.get())
-                        } else {
-                            resume_pc
-                        };
-                        crate::call_jit::jit_bridge_compile_for_guard(
-                            effective_gk,
-                            tid,
-                            fi,
-                            frame,
-                            effective_rpc,
-                        );
-                    }
+                    // Bridge requests are drained synchronously inside
+                    // restore_guard_failure_for_loop (RPython handle_fail
+                    // parity). No need to drain here.
                     return Some(result);
                 }
                 JitAction::ContinueRunningNormally | JitAction::Continue => {}
@@ -748,16 +732,49 @@ fn restore_guard_failure_for_loop(
         return None;
     }
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
-    // Store resume PC for bridge compilation. Guard failures inside
-    // CallAssemblerI force callbacks lose the frame state, so we save
-    // the restored next_instr here for later use.
-    LAST_GUARD_RESUME_PC.with(|c| c.set(jit_state.next_instr));
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit] guard-fail restored: ni={} vsd={}",
             jit_state.next_instr, jit_state.valuestackdepth
         );
     }
+
+    // RPython compile.py:696 handle_fail parity: compile bridge
+    // SYNCHRONOUSLY while the frame state is still valid.
+    // The bridge threshold callback (on_bridge_threshold_reached)
+    // stores a single request in PENDING_BRIDGE_REQUEST TLS.
+    // Consume it here where the frame is fully restored.
+    if restored {
+        if let Some((gk, tid, fi, resume_pc)) =
+            crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take())
+        {
+            let frame = unsafe { &mut *(jit_state.frame as *mut pyre_interp::frame::PyFrame) };
+            frame.next_instr = jit_state.next_instr;
+            frame.valuestackdepth = jit_state.valuestackdepth;
+
+            let effective_gk = if gk == 0 {
+                make_green_key(frame.code, 0)
+            } else {
+                gk
+            };
+            let effective_rpc = if resume_pc == 0 {
+                jit_state.next_instr
+            } else {
+                resume_pc
+            };
+            crate::call_jit::jit_bridge_compile_for_guard(
+                effective_gk,
+                tid,
+                fi,
+                frame,
+                effective_rpc,
+            );
+
+            frame.next_instr = jit_state.next_instr;
+            frame.valuestackdepth = jit_state.valuestackdepth;
+        }
+    }
+
     restored.then_some(jit_state.next_instr)
 }
 
