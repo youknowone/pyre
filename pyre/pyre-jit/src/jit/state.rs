@@ -136,7 +136,6 @@ impl ConcreteValue {
         }
     }
 }
-use pyre_interp::frame::PendingInlineResult;
 use pyre_runtime::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
@@ -4783,14 +4782,14 @@ impl SharedOpcodeHandler for TraceFrameState {
                     } else if pyre_runtime::is_func(concrete_callable) {
                         // User-defined function: call via plain interpreter
                         // to get concrete result without JIT re-entry.
-                        // Guard against stack overflow from deep concrete calls
-                        // during tracing (inline_helper pattern).
+                        // Concrete call execution — RPython executor.execute_varargs parity.
+                        // Depth limit prevents stack overflow on deeply nested calls.
                         use std::cell::Cell;
                         thread_local! {
                             static CONCRETE_CALL_DEPTH: Cell<u32> = Cell::new(0);
                         }
                         let depth = CONCRETE_CALL_DEPTH.with(|d| d.get());
-                        if depth < 3 {
+                        if depth < 32 {
                             CONCRETE_CALL_DEPTH.with(|d| d.set(depth + 1));
                             let frame_ptr =
                                 self.concrete_frame as *const pyre_interp::frame::PyFrame;
