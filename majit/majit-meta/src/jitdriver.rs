@@ -679,6 +679,21 @@ impl<S: JitState> JitDriver<S> {
         // portal. Nested function calls are prevented by JIT_TRACING
         // flag in eval_loop_jit.
         if self.meta.is_tracing() {
+            // pyjitpl.py:2973-2977 compile_trace: if the current green_key
+            // has compiled code with target tokens, compile the current
+            // trace as a bridge to that existing compiled code.
+            if self.meta.has_compiled_targets(green_key) {
+                if let Some(sym) = self.sym.as_ref() {
+                    let jump_args = S::collect_jump_args(sym);
+                    if self.meta.compile_trace(green_key, &jump_args) {
+                        self.sym = None;
+                        self.trace_meta = None;
+                        return Some(DetailedDriverRunOutcome::Jump {
+                            via_blackhole: false,
+                        });
+                    }
+                }
+            }
             self.merge_point(trace_fn);
         }
         None
