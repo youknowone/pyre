@@ -85,9 +85,8 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 thread_local! {
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
     /// Call depth at which the current trace started.
+    /// jit_merge_point_hook only fires at this depth.
     static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
-    /// Resume PC from the most recent guard failure restoration.
-    static LAST_GUARD_RESUME_PC: Cell<usize> = Cell::new(0);
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -366,7 +365,16 @@ fn can_enter_jit_hook(
     info: &majit_meta::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
+    // Early exit for blacklisted keys: avoid build_jit_state + build_meta overhead.
     let has_compiled = driver.has_compiled_loop(green_key);
+    if !has_compiled
+        && !driver
+            .meta_interp()
+            .warm_state_ref()
+            .counter_would_fire(green_key)
+    {
+        return None;
+    }
     let mut jit_state = build_jit_state(frame, info);
     if majit_meta::majit_log_enabled() {
         eprintln!(
@@ -392,18 +400,13 @@ fn can_enter_jit_hook(
         if stack_almost_full() {
             return None;
         }
-        let was_tracing = driver.is_tracing();
-        let result = driver.back_edge_or_run_compiled_keyed(
+        driver.back_edge_or_run_compiled_keyed(
             green_key,
             loop_header_pc,
             &mut jit_state,
             env,
             || {},
-        );
-        if !was_tracing && driver.is_tracing() {
-            JIT_TRACING_DEPTH.with(|d| d.set(JIT_CALL_DEPTH.with(|c| c.get())));
-        }
-        result
+        )
     } else {
         None
     };
@@ -504,26 +507,37 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
             match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
                 JitAction::Return(result) => {
-                    // Drain pending bridge requests before returning.
-                    let pending = majit_codegen_cranelift::take_pending_bridge_compile();
-                    for (gk, tid, fi, resume_pc) in pending {
-                        let effective_gk = if gk == 0 { green_key } else { gk };
-                        let effective_rpc = if resume_pc == 0 {
-                            LAST_GUARD_RESUME_PC.with(|c| c.get())
-                        } else {
-                            resume_pc
-                        };
-                        crate::call_jit::jit_bridge_compile_for_guard(
-                            effective_gk,
-                            tid,
-                            fi,
-                            frame,
-                            effective_rpc,
+                    if majit_meta::majit_log_enabled() {
+                        let rendered = result.as_ref().ok().and_then(|value| {
+                            if value.is_null() || !unsafe { pyre_object::pyobject::is_int(*value) }
+                            {
+                                return None;
+                            }
+                            Some(unsafe { pyre_object::intobject::w_int_get_value(*value) })
+                        });
+                        eprintln!(
+                            "[jit][func-entry] compiled return key={} arg0={:?} result={:?}",
+                            green_key,
+                            debug_first_arg_int(frame),
+                            rendered
                         );
                     }
                     return Some(result);
                 }
                 JitAction::ContinueRunningNormally | JitAction::Continue => {}
+            }
+        }
+
+        // RPython compile.py:696 handle_fail parity: after guard-restored
+        // fallback, drain any pending bridge compile requests synchronously.
+        // RPython compiles bridges inside handle_fail before returning to
+        // the interpreter. In pyre, requests are queued by
+        // request_pending_bridge_compile in the Cranelift backend; drain
+        // them here so the bridge is ready before the next compiled entry.
+        if let Some((fail_index, trace_id)) = guard_fail_info {
+            let pending = majit_codegen_cranelift::take_pending_bridge_compile();
+            for (gk, tid, fi) in pending {
+                crate::call_jit::jit_bridge_compile_for_guard(gk, tid, fi, frame);
             }
         }
 
@@ -587,11 +601,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         );
     }
     driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
-    if driver.is_tracing() {
-        // RPython warmstate.py:429 decay_all_counters:
-        // called once after tracing starts to prevent burst compilation.
-        driver.meta_interp_mut().warm_state_mut().decay_counters();
-    }
     None
 }
 
@@ -737,10 +746,6 @@ fn restore_guard_failure_for_loop(
         return None;
     }
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
-    // Store resume PC for bridge compilation. Guard failures inside
-    // CallAssemblerI force callbacks lose the frame state, so we save
-    // the restored next_instr here for later use.
-    LAST_GUARD_RESUME_PC.with(|c| c.set(jit_state.next_instr));
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit] guard-fail restored: ni={} vsd={}",

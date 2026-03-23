@@ -223,11 +223,6 @@ pub struct StorageConfig {
     pub linked_list_stack_head_offset: Option<Expr>,
     /// Byte offset of the size field on the shadow stack object.
     pub linked_list_stack_size_offset: Option<Expr>,
-    /// Byte offset of the tail pointer on Queue objects (FIFO push).
-    /// When set, enables Queue tracing support.
-    pub linked_list_queue_tail_offset: Option<Expr>,
-    /// Storage indices that are Queue (FIFO) storages.
-    pub linked_list_queue_indices: Vec<Expr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -415,8 +410,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut linked_list_storage_offset = None;
     let mut linked_list_stack_head_offset = None;
     let mut linked_list_stack_size_offset = None;
-    let mut linked_list_queue_tail_offset = None;
-    let mut linked_list_queue_indices: Vec<Expr> = Vec::new();
     let mut compact_encode = None;
     let mut compact_decode = None;
     let mut compact_min = None;
@@ -502,16 +495,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             "linked_list_stack_size_offset" => {
                 linked_list_stack_size_offset = Some(content.parse::<Expr>()?);
             }
-            "linked_list_queue_tail_offset" => {
-                linked_list_queue_tail_offset = Some(content.parse::<Expr>()?);
-            }
-            "linked_list_queue_indices" => {
-                let inner;
-                bracketed!(inner in content);
-                let exprs: Punctuated<Expr, Token![,]> =
-                    inner.parse_terminated(Expr::parse, Token![,])?;
-                linked_list_queue_indices = exprs.into_iter().collect();
-            }
             "virtualizable" => {
                 let _: LitBool = content.parse()?;
                 return Err(syn::Error::new(
@@ -563,8 +546,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         linked_list_storage_offset,
         linked_list_stack_head_offset,
         linked_list_stack_size_offset,
-        linked_list_queue_tail_offset,
-        linked_list_queue_indices,
     })
 }
 

@@ -120,11 +120,10 @@ impl JitCounter {
     }
 
     /// Decay all counters by the given factor (0.0 = clear, 1.0 = keep).
-    /// counter.py:266 decay_all_counters.
-    /// RPython default decay=40, so decay_by_mult = 1.0 - 40*0.001 = 0.96.
-    /// Each call reduces all counters by 4%.
+    /// counter.py: decay_all_counters with configurable decay factor.
+    /// For backwards compatibility, the default halves all counters.
     pub fn decay_all_counters(&mut self) {
-        self.decay_all_counters_by(0.96);
+        self.decay_all_counters_by(0.5);
     }
 
     /// Decay all counters by a multiplicative factor.

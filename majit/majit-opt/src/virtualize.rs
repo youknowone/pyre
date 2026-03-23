@@ -812,16 +812,9 @@ impl OptVirtualize {
         let field_idx = descr_index(&op.descr);
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
 
-        // RPython import_state parity: imported virtual heads already have
-        // their fields set from inputargs. The original trace's SetfieldGc
-        // carries preamble-time concrete values — skip them for imported virtuals.
-        if ctx
-            .imported_virtual_heads
-            .iter()
-            .any(|&(_, vh)| vh == struct_ref)
-        {
-            return OptimizationResult::Remove;
-        }
+        // RPython virtualize.py:200-202: virtual SetfieldGc always updates
+        // the field, even for imported virtual heads. Body computation must
+        // be able to update virtual fields (e.g., i.intval = i + step).
 
         if is_raw_op && self.is_standard_virtualizable_ref(struct_ref, ctx) {
             return OptimizationResult::PassOn;
