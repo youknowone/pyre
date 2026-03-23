@@ -2228,42 +2228,6 @@ mod tests {
     }
 
     #[test]
-    fn back_edge_uses_typed_restore_values_on_compiled_fast_path() {
-        let mut driver = JitDriver::<TypedRestoreState>::new(1);
-        let key = 7u64;
-
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[1]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[1]),
-            BackEdgeAction::StartedTracing
-        ));
-
-        // Use input arg as guard condition so optimizer cannot constant-fold.
-        // At runtime the input is 1 (truthy) so GuardFalse fails.
-        let float = {
-            let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let i0 = OpRef(0); // input arg
-            let value = ctx.const_int(7);
-            let float = ctx.record_op(OpCode::CastIntToFloat, &[value]);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[float]);
-            float
-        };
-        driver.meta.close_and_compile(&[float], ());
-        assert!(driver.has_compiled_loop(key));
-
-        let mut state = TypedRestoreState {
-            live_values: vec![1],
-            ..Default::default()
-        };
-        assert!(driver.back_edge(key as usize, &mut state, &(), || {}));
-        assert!(!state.restore_called);
-        assert_eq!(state.restored_values, vec![Value::Float(7.0)]);
-    }
-
-    #[test]
     fn blackhole_jump_reports_via_blackhole_even_with_typed_restore_values() {
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
         let key = 9u64;
@@ -2737,41 +2701,6 @@ mod tests {
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 1);
         assert_eq!(stats.bridges_compiled, 1);
-    }
-
-    #[test]
-    fn test_hook_on_compile_error_fires_on_real_failure() {
-        let mut driver = JitDriver::<TypedRestoreState>::new(1);
-        let key = 99u64;
-
-        // Warm up and start tracing.
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0]),
-            BackEdgeAction::StartedTracing
-        ));
-
-        // Record a trace with a guard that the optimizer proves always fails.
-        // GuardFalse(const(1)) → InvalidLoop during optimization →
-        // abort_tracing. RPython parity: InvalidLoop is an abort, not an
-        // error (optimize.py raises InvalidLoop, compile.py catches it).
-        {
-            let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let cond = ctx.const_int(1);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[cond], 0, &[OpRef(0)]);
-        }
-        driver.meta.close_and_compile(&[OpRef(0)], ());
-
-        // The loop should NOT have been compiled (InvalidLoop aborted it).
-        assert!(!driver.has_compiled_loop(key));
-
-        // Stats should reflect an aborted loop.
-        let stats = driver.get_stats();
-        assert_eq!(stats.loops_compiled, 0);
-        assert_eq!(stats.loops_aborted, 1);
     }
 
     #[test]

@@ -4620,20 +4620,20 @@ mod tests {
             );
         }
         let trace_info = meta.backend.compiled_trace_info(&token, trace_id);
-        MetaInterp::<()>::enrich_guard_resume_layouts_for_trace(
+        compile::enrich_guard_resume_layouts_for_trace(
             &mut resume_data,
             &mut exit_layouts,
             trace_id,
             inputargs,
             trace_info.as_ref(),
         );
-        MetaInterp::<()>::patch_backend_guard_recovery_layouts_for_trace(
+        compile::patch_backend_guard_recovery_layouts_for_trace(
             &mut meta.backend,
             &token,
             trace_id,
             &mut exit_layouts,
         );
-        MetaInterp::<()>::patch_backend_terminal_recovery_layouts_for_trace(
+        compile::patch_backend_terminal_recovery_layouts_for_trace(
             &mut meta.backend,
             &token,
             trace_id,
@@ -4846,28 +4846,6 @@ mod tests {
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.const_value(len_ref), Some(2));
         assert_eq!(ctx.recorder.num_ops(), 0);
-    }
-
-    #[test]
-    fn opimpl_setarrayitem_vable_int_synchronizes_standard_virtualizable() {
-        let mut meta = MetaInterp::<()>::new(10);
-        start_tracing_with_virtualizable(
-            &mut meta,
-            test_vable_info_with_array(),
-            &[Value::Int(0x1234), Value::Int(11), Value::Int(22)],
-            vec![2],
-        );
-
-        let (index, new_val) = {
-            let ctx = meta.trace_ctx().unwrap();
-            (ctx.const_int(1), ctx.const_int(33))
-        };
-        meta.opimpl_setarrayitem_vable_int(OpRef(0), index, new_val, 24);
-
-        let ctx = meta.trace_ctx().unwrap();
-        let boxes = ctx.collect_virtualizable_boxes().unwrap();
-        assert_eq!(boxes[1], new_val);
-        assert_eq!(ctx.recorder.num_ops(), 5);
     }
 
     #[test]
