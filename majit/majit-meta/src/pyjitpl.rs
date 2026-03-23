@@ -1460,10 +1460,9 @@ impl<M: Clone> MetaInterp<M> {
             return;
         }
 
-        // Note: Phase 2 body guards may have OpRef::NONE in fail_args for
-        // virtual slots. These are handled at runtime by materialize_recovery_virtuals.
-        // If materialization fails (null Ref remains), the compiled code is
-        // invalidated at guard-fail time. No compile-time rejection needed.
+        // Note: guards with NONE in fail_args may have sufficient trailing
+        // fields for virtual materialization. Runtime guard-fail recovery
+        // handles this. If materialization fails, compiled code is invalidated.
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
@@ -1687,6 +1686,30 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
             eprintln!("--- finish trace (after opt, before unbox) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
+        }
+
+        // Skip compilation if any guard has unrecoverable NONE in fail_args.
+        {
+            let has_unrecoverable_none = optimized_ops.iter().any(|op| {
+                if op.opcode.is_guard() {
+                    if let Some(ref fa) = op.fail_args {
+                        let none_count = fa.iter().skip(3).filter(|a| **a == OpRef::NONE).count();
+                        if none_count > 0 {
+                            let last_none = fa.iter().rposition(|a| *a == OpRef::NONE).unwrap();
+                            let trailing = fa.len() - last_none - 1;
+                            return trailing < none_count * 2;
+                        }
+                    }
+                }
+                false
+            });
+            if has_unrecoverable_none {
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit] abort finish: guard NONE without sufficient trailing fields");
+                }
+                self.warm_state.abort_tracing(green_key, true);
+                return;
+            }
         }
 
         // Re-enable raw-int terminal finishes when the trace ends in an
