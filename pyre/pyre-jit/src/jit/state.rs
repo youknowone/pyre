@@ -1206,10 +1206,13 @@ impl TraceFrameState {
             s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
         }
         s.symbolic_stack[stack_idx] = value;
-        // Keep trace-level stack types precise. Guard/fail-arg lowering is
-        // responsible for re-boxing virtualizable slots when the interpreter
-        // frame contract requires Ref values.
         s.symbolic_stack_types[stack_idx] = value_type;
+        // MIFrame Box tracking: store concrete value alongside symbolic
+        let concrete = s.pending_concrete_push.take().unwrap_or(PY_NULL);
+        if stack_idx >= s.concrete_stack.len() {
+            s.concrete_stack.resize(stack_idx + 1, PY_NULL);
+        }
+        s.concrete_stack[stack_idx] = concrete;
         s.valuestackdepth += 1;
     }
 
@@ -1219,10 +1222,7 @@ impl TraceFrameState {
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
-        let concrete_popped = concrete_stack_value(
-            self.concrete_frame,
-            self.sym().valuestackdepth.saturating_sub(1),
-        );
+        let concrete_frame = self.concrete_frame;
         let s = self.sym_mut();
         let nlocals = s.nlocals;
         let stack_idx = s
@@ -1241,6 +1241,14 @@ impl TraceFrameState {
             .get(stack_idx)
             .copied()
             .unwrap_or(Type::Ref);
+        // MIFrame Box tracking: pop concrete value from concrete_stack
+        let concrete_popped = s.concrete_stack.get(stack_idx).copied().unwrap_or(PY_NULL);
+        // Fall back to concrete_frame if concrete_stack has PY_NULL
+        let concrete_popped = if concrete_popped.is_null() {
+            concrete_stack_value(concrete_frame, s.valuestackdepth.saturating_sub(1))
+        } else {
+            Some(concrete_popped)
+        };
         s.valuestackdepth -= 1;
         s.last_popped_concrete_value = concrete_popped;
         s.transient_value_types.insert(value, value_type);
