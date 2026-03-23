@@ -54,6 +54,11 @@ thread_local! {
         );
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
+        // warmspot.py:449 — portal function returns a Python object (int).
+        // pyre's portal always returns PyObjectRef, but the JIT unboxes
+        // int results to raw i64 via unbox_finish_result, so the static
+        // result_type is Int.
+        d.set_result_type(majit_ir::Type::Int);
         (d, info)
     });
 }
@@ -64,9 +69,6 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 }
 
 thread_local! {
-    static PYRE_RAW_INT_FINISH_HINTS: UnsafeCell<HashSet<u64>> =
-        UnsafeCell::new(HashSet::new());
-
     static JIT_CALL_DEPTH: Cell<u32> = Cell::new(0);
     /// JIT call depth at which tracing is active. 0 = not tracing.
     static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
@@ -75,25 +77,6 @@ thread_local! {
     static LAST_TRACE_START_KEY: Cell<u64> = Cell::new(0);
     static RECURSIVE_FORCE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
     static BLACKHOLE_ENTRY_DEPTH: Cell<u32> = Cell::new(0);
-}
-
-fn raw_int_finish_hints() -> &'static mut HashSet<u64> {
-    PYRE_RAW_INT_FINISH_HINTS.with(|cell| unsafe { &mut *cell.get() })
-}
-
-#[inline]
-pub(crate) fn note_finish_protocol_hint(green_key: u64, raw_int: bool) {
-    let hints = raw_int_finish_hints();
-    if raw_int {
-        hints.insert(green_key);
-    } else {
-        hints.remove(&green_key);
-    }
-}
-
-#[inline]
-pub(crate) fn has_finish_protocol_hint(green_key: u64) -> bool {
-    raw_int_finish_hints().contains(&green_key)
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -613,8 +596,7 @@ fn handle_jit_outcome(
         } => {
             let (driver, _) = driver_pair();
             let raw_int_result = raw_int_result
-                || driver.has_raw_int_finish(green_key)
-                || has_finish_protocol_hint(green_key);
+                || driver.has_raw_int_finish(green_key);
             if majit_meta::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
@@ -986,7 +968,7 @@ result = fib(12)";
                 "recursive fib should compile a function-entry trace"
             );
             assert!(
-                driver.has_raw_int_finish(fib_key) || has_finish_protocol_hint(fib_key),
+                driver.has_raw_int_finish(fib_key),
                 "recursive fib compiled finish should use the raw-int protocol"
             );
         }
