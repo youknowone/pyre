@@ -144,8 +144,10 @@ pub struct PyreSym {
     pub(crate) concrete_locals: Vec<PyObjectRef>,
     pub(crate) concrete_stack: Vec<PyObjectRef>,
     /// Concrete value to be consumed by the next push_value() call.
-    /// Set by opcode handlers before pushing a result.
     pub(crate) pending_concrete_push: Option<PyObjectRef>,
+    /// Frame metadata extracted at trace start — avoids stale snapshot reads.
+    pub(crate) concrete_code: *const pyre_bytecode::CodeObject,
+    pub(crate) concrete_namespace: *mut pyre_runtime::PyNamespace,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -630,6 +632,16 @@ pub(crate) fn concrete_namespace_value(frame: usize, idx: usize) -> Option<PyObj
     namespace.get_slot(idx)
 }
 
+fn namespace_slot_direct(ns: *mut PyNamespace, name: &str) -> Option<usize> {
+    if ns.is_null() { return None; }
+    unsafe { &*ns }.slot_of(name)
+}
+
+fn namespace_value_direct(ns: *mut PyNamespace, idx: usize) -> Option<PyObjectRef> {
+    if ns.is_null() { return None; }
+    unsafe { &*ns }.get_slot(idx)
+}
+
 pub(crate) fn record_current_state_guard(
     ctx: &mut TraceCtx,
     frame: OpRef,
@@ -933,6 +945,8 @@ impl PyreSym {
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
             pending_concrete_push: None,
+            concrete_code: std::ptr::null(),
+            concrete_namespace: std::ptr::null_mut(),
         }
     }
 
@@ -990,6 +1004,12 @@ impl PyreSym {
         self.concrete_stack = (0..stack_only_depth)
             .map(|i| concrete_stack_value(concrete_frame, nlocals + i).unwrap_or(PY_NULL))
             .collect();
+        // Extract frame metadata pointers for use without concrete_frame
+        if concrete_frame != 0 {
+            let frame = unsafe { &*(concrete_frame as *const pyre_interp::frame::PyFrame) };
+            self.concrete_code = frame.code;
+            self.concrete_namespace = frame.namespace;
+        }
         self.symbolic_initialized = true;
     }
 
@@ -1047,14 +1067,18 @@ impl PyreSym {
 
 impl TraceFrameState {
     /// Get the concrete return value from the frame's stack top.
-    /// Used by RETURN_VALUE to determine finish type.
     fn concrete_stack_value_at_return(&self) -> Option<PyObjectRef> {
+        // MIFrame Box tracking: read from concrete_stack instead of concrete_frame
+        let s = self.sym();
+        if s.valuestackdepth > 0 {
+            let v = s.concrete_value_at(s.valuestackdepth - 1);
+            if !v.is_null() { return Some(v); }
+        }
         concrete_return_value(self.concrete_frame)
     }
 
     fn next_instruction_consumes_comparison_truth(&self) -> bool {
-        let frame = unsafe { &*(self.concrete_frame as *const pyre_interp::frame::PyFrame) };
-        let code = unsafe { &*frame.code };
+        let code = unsafe { &*self.sym().concrete_code };
         // RPython optimize_goto_if_not works on the semantic successor,
         // not on bytecode trivia like EXTENDED_ARG/NOT_TAKEN/CACHE.
         let mut pc = self.fallthrough_pc;
@@ -4758,14 +4782,21 @@ impl LocalOpcodeHandler for TraceFrameState {
 
 impl NamespaceOpcodeHandler for TraceFrameState {
     fn load_name_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
-        let Some(slot) = concrete_namespace_slot(self.concrete_frame, name) else {
+        let ns = self.sym().concrete_namespace;
+        let Some(slot) = namespace_slot_direct(ns, name)
+            .or_else(|| concrete_namespace_slot(self.concrete_frame, name))
+        else {
             return self.trace_load_name(name);
         };
         // MIFrame Box tracking: set concrete value for global load
-        if let Some(cv) = concrete_namespace_value(self.concrete_frame, slot) {
+        if let Some(cv) = namespace_value_direct(ns, slot)
+            .or_else(|| concrete_namespace_value(self.concrete_frame, slot))
+        {
             self.sym_mut().pending_concrete_push = Some(cv);
         }
-        if let Some(concrete_value) = concrete_namespace_value(self.concrete_frame, slot) {
+        if let Some(concrete_value) = namespace_value_direct(ns, slot)
+            .or_else(|| concrete_namespace_value(self.concrete_frame, slot))
+        {
             unsafe {
                 if is_func(concrete_value) || is_builtin_func(concrete_value) {
                     return self.with_ctx(|this, ctx| {
@@ -4784,7 +4815,10 @@ impl NamespaceOpcodeHandler for TraceFrameState {
     }
 
     fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
-        let Some(slot) = concrete_namespace_slot(self.concrete_frame, name) else {
+        let ns = self.sym().concrete_namespace;
+        let Some(slot) = namespace_slot_direct(ns, name)
+            .or_else(|| concrete_namespace_slot(self.concrete_frame, name))
+        else {
             return self.trace_store_name(name, value);
         };
         self.with_ctx(|this, ctx| TraceFrameState::store_namespace_value(this, ctx, slot, value))
