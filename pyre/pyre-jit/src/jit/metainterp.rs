@@ -226,8 +226,10 @@ impl PyreMetaFrame {
     /// computing concrete results simultaneously.
     pub fn run_one_step(
         &mut self,
-        _ctx: &mut TraceCtx,
+        ctx: &mut TraceCtx,
     ) -> Result<StepAction, pyre_runtime::PyError> {
+        use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction};
+
         let code = unsafe { &*self.jitcode };
         if self.pc >= code.instructions.len() {
             return Err(pyre_runtime::PyError::type_error(
@@ -235,18 +237,151 @@ impl PyreMetaFrame {
             ));
         }
 
-        let Some((_instruction, _op_arg)) =
+        let Some((instruction, op_arg)) =
             pyre_runtime::decode_instruction_at(code, self.pc)
         else {
             return Ok(StepAction::Abort);
         };
         self.pc += 1;
 
-        // TODO: dispatch_opcode — implement all opcode handlers
-        // Each handler follows the RPython pattern:
-        //   let args = [self.pop(), self.pop()];     // pop operands
-        //   let result = self.execute_and_record(ctx, opcode, &args, descr);
-        //   self.push(result);                        // push result
-        Ok(StepAction::Continue)
+        match instruction {
+            // ── Trivia (no-ops) ──
+            Instruction::Nop
+            | Instruction::Cache
+            | Instruction::NotTaken
+            | Instruction::Resume { .. } => Ok(StepAction::Continue),
+
+            // ── Constants ──
+            // RPython: opimpl_int_const → self.execute(rop.SAME_AS_I, constbox)
+            Instruction::LoadSmallInt { i } => {
+                let value = i.get(op_arg) as i64;
+                let opref = ctx.const_int(value);
+                self.push(FrontendOp::new(opref, ConcreteValue::Int(value)));
+                Ok(StepAction::Continue)
+            }
+            Instruction::LoadConst { consti } => {
+                let idx = consti.get(op_arg);
+                let concrete = super::state::load_const_concrete(&code.constants[idx]);
+                let opref = ctx.const_int(concrete.to_pyobj() as i64);
+                self.push(FrontendOp::new(opref, concrete));
+                Ok(StepAction::Continue)
+            }
+
+            // ── Locals ──
+            // RPython: registers[idx] already holds the box
+            Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
+                let idx = var_num.get(op_arg).as_usize();
+                let concrete = self.concrete_locals.get(idx).copied()
+                    .unwrap_or(ConcreteValue::Null);
+                // TODO: proper symbolic load from virtualizable
+                let opref = OpRef::NONE; // placeholder
+                self.push(FrontendOp::new(opref, concrete));
+                Ok(StepAction::Continue)
+            }
+            Instruction::StoreFast { var_num } => {
+                let idx = var_num.get(op_arg).as_usize();
+                let val = self.pop();
+                if idx < self.concrete_locals.len() {
+                    self.concrete_locals[idx] = val.concrete;
+                }
+                // TODO: symbolic store
+                Ok(StepAction::Continue)
+            }
+
+            // ── Stack ──
+            Instruction::PopTop => {
+                self.pop();
+                Ok(StepAction::Continue)
+            }
+
+            // ── Binary ops ──
+            // RPython: opimpl_int_add(b1, b2) → self.execute(rop.INT_ADD, b1, b2)
+            Instruction::BinaryOp { op } => {
+                let b = self.pop();
+                let a = self.pop();
+                let opcode = match op.get(op_arg) {
+                    BinaryOperator::Add => majit_ir::OpCode::IntAddOvf,
+                    BinaryOperator::Subtract => majit_ir::OpCode::IntSubOvf,
+                    BinaryOperator::Multiply => majit_ir::OpCode::IntMulOvf,
+                    BinaryOperator::Remainder => majit_ir::OpCode::IntMod,
+                    BinaryOperator::FloorDivide => majit_ir::OpCode::IntFloorDiv,
+                    _ => majit_ir::OpCode::IntAdd, // fallback
+                };
+                let result = self.execute_and_record(ctx, opcode, &[a, b], None);
+                self.push(result);
+                Ok(StepAction::Continue)
+            }
+
+            // ── Comparison ──
+            Instruction::CompareOp { opname } => {
+                let b = self.pop();
+                let a = self.pop();
+                let opcode = match opname.get(op_arg) {
+                    ComparisonOperator::Less => majit_ir::OpCode::IntLt,
+                    ComparisonOperator::LessOrEqual => majit_ir::OpCode::IntLe,
+                    ComparisonOperator::Greater => majit_ir::OpCode::IntGt,
+                    ComparisonOperator::GreaterOrEqual => majit_ir::OpCode::IntGe,
+                    ComparisonOperator::Equal => majit_ir::OpCode::IntEq,
+                    ComparisonOperator::NotEqual => majit_ir::OpCode::IntNe,
+                };
+                let result = self.execute_and_record(ctx, opcode, &[a, b], None);
+                self.push(result);
+                Ok(StepAction::Continue)
+            }
+
+            // ── Branches ──
+            // RPython: opimpl_goto_if_not(box, target) → box.getint() for direction
+            Instruction::PopJumpIfFalse { delta } => {
+                let val = self.pop();
+                let concrete_truth = val.concrete.is_truthy();
+                // TODO: generate guard + record
+                if !concrete_truth {
+                    let target = self.pc + u32::from(delta.get(op_arg)) as usize;
+                    self.pc = target;
+                }
+                Ok(StepAction::Continue)
+            }
+            Instruction::PopJumpIfTrue { delta } => {
+                let val = self.pop();
+                let concrete_truth = val.concrete.is_truthy();
+                if concrete_truth {
+                    let target = self.pc + u32::from(delta.get(op_arg)) as usize;
+                    self.pc = target;
+                }
+                Ok(StepAction::Continue)
+            }
+
+            // ── Control flow ──
+            Instruction::JumpForward { delta } => {
+                let target = self.pc + u32::from(delta.get(op_arg)) as usize;
+                self.pc = target;
+                Ok(StepAction::Continue)
+            }
+            Instruction::JumpBackward { delta } => {
+                let target = self.pc - u32::from(delta.get(op_arg)) as usize;
+                // RPython: reached_loop_header → CloseLoop
+                let jump_args = Vec::new(); // TODO: collect jump args
+                Ok(StepAction::CloseLoop {
+                    jump_args,
+                    loop_header_pc: target,
+                })
+            }
+            Instruction::ReturnValue => {
+                let result = self.pop();
+                Ok(StepAction::DoneWithThisFrame(result))
+            }
+
+            // ── Unsupported (abort trace) ──
+            _ => {
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[metainterp] unsupported instruction at pc={}: {:?}",
+                        self.pc - 1,
+                        instruction
+                    );
+                }
+                Ok(StepAction::Abort)
+            }
+        }
     }
 }

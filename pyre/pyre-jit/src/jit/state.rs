@@ -136,6 +136,29 @@ impl ConcreteValue {
         }
     }
 }
+
+/// Convert a bytecode constant to ConcreteValue.
+pub fn load_const_concrete(constant: &pyre_bytecode::bytecode::ConstantData) -> ConcreteValue {
+    use pyre_bytecode::bytecode::ConstantData;
+    match constant {
+        ConstantData::Integer { value } => {
+            match i64::try_from(value).ok() {
+                Some(v) => ConcreteValue::Int(v),
+                None => ConcreteValue::Ref(pyre_object::w_long_new(value.clone())),
+            }
+        }
+        ConstantData::Float { value } => ConcreteValue::Float(*value),
+        ConstantData::Boolean { value } => ConcreteValue::Int(*value as i64),
+        ConstantData::Str { value } => {
+            ConcreteValue::Ref(pyre_object::w_str_new(
+                value.as_str().expect("non-UTF-8 string constant"),
+            ))
+        }
+        ConstantData::None => ConcreteValue::Ref(pyre_object::w_none()),
+        _ => ConcreteValue::Null,
+    }
+}
+
 use pyre_runtime::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
