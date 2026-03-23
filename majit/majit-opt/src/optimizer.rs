@@ -1608,15 +1608,11 @@ impl Optimizer {
         }
 
         // Resolve forwarding BEFORE remap.
-        // RPython Box identity: import_boxes provides 1-hop forwarding.
+        // RPython get_box_replacement: follow chain, stop at ptr_info terminal.
         {
             let fwd = ctx.forwarding.clone();
-            let boxes = ctx.import_boxes.clone();
+            let ptr_info = ctx.ptr_info.clone();
             let resolve = |opref: OpRef| -> OpRef {
-                // Check import_boxes first (RPython Box identity)
-                if let Some(&target) = boxes.get(&opref) {
-                    return target;
-                }
                 let mut cur = opref;
                 loop {
                     let idx = cur.0 as usize;
@@ -1626,6 +1622,11 @@ impl Optimizer {
                     let next = fwd[idx];
                     if next.is_none() || next == cur {
                         return cur;
+                    }
+                    // ptr_info stop: next has Info → terminal
+                    let next_idx = next.0 as usize;
+                    if next_idx < ptr_info.len() && ptr_info[next_idx].is_some() {
+                        return next;
                     }
                     cur = next;
                 }
@@ -1685,14 +1686,11 @@ impl Optimizer {
         self.drain_extra_operations_from(0, &mut ctx);
         // Extra operations can introduce new forwarding (for example Heap/Pure
         // forwarding a recently-emitted boxed-field read to its raw payload).
-        // Resolve forwarding again. RPython Box identity via import_boxes.
+        // Resolve forwarding again with ptr_info stop.
         {
             let fwd = ctx.forwarding.clone();
-            let boxes = ctx.import_boxes.clone();
+            let ptr_info = ctx.ptr_info.clone();
             let resolve = |opref: OpRef| -> OpRef {
-                if let Some(&target) = boxes.get(&opref) {
-                    return target;
-                }
                 let mut cur = opref;
                 loop {
                     let idx = cur.0 as usize;
@@ -1702,6 +1700,10 @@ impl Optimizer {
                     let next = fwd[idx];
                     if next.is_none() || next == cur {
                         return cur;
+                    }
+                    let next_idx = next.0 as usize;
+                    if next_idx < ptr_info.len() && ptr_info[next_idx].is_some() {
+                        return next;
                     }
                     cur = next;
                 }
