@@ -95,6 +95,12 @@ pub struct TrackedPreambleUse {
     pub produced: crate::shortpreamble::ProducedShortOp,
 }
 
+/// optimizer.py:787-789: constant_fold — allocate an immutable object at
+/// compile time when all fields are constants. The callback receives the
+/// SizeDescr size_bytes, and returns a raw pointer (GcRef) to freshly
+/// allocated memory. The optimizer writes field values directly.
+pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
+
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.
@@ -219,6 +225,10 @@ pub struct OptContext {
     /// before a guard, consumed by emit_with_guard_check() to encode into
     /// the guard's rd_pendingfields.
     pub pending_for_guard: Vec<Op>,
+    /// optimizer.py:787: constant_fold allocator callback.
+    /// When set, the optimizer can fold immutable virtuals filled with
+    /// constants into compile-time constant pointers (info.py:140-145).
+    pub constant_fold_alloc: Option<ConstantFoldAllocFn>,
     /// True while optimizer.py:_emit_operation equivalent is forcing args
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
@@ -264,6 +274,7 @@ impl OptContext {
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
+            constant_fold_alloc: None,
             import_boxes: HashMap::new(),
         }
     }
@@ -306,6 +317,7 @@ impl OptContext {
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
+            constant_fold_alloc: None,
             import_boxes: HashMap::new(),
         }
     }

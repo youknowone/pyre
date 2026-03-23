@@ -418,10 +418,52 @@ impl PtrInfo {
         // RPython info.py:140-145: immutable virtual filled with constants
         // → constant fold to a compile-time constant pointer.
         if self.is_immutable_and_filled_with_constants(ctx) {
-            // All fields are constants and descr is immutable → can fold
-            // to a constant. For now, we don't have constant_fold infrastructure,
-            // so fall through to the normal force path. This matches RPython's
-            // behavior when constant_fold is not available.
+            if let Some(ref alloc_fn) = ctx.constant_fold_alloc {
+                let (descr, fields, field_descrs) = match self {
+                    PtrInfo::Virtual(v) => (&v.descr, &v.fields, &v.field_descrs),
+                    PtrInfo::VirtualStruct(v) => (&v.descr, &v.fields, &v.field_descrs),
+                    _ => unreachable!(),
+                };
+                let obj_size = descr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
+                if obj_size > 0 {
+                    let ptr = alloc_fn(obj_size);
+                    if !ptr.is_null() {
+                        // info.py:144: _force_elements_immutable
+                        // Write constant field values directly to the allocated memory.
+                        for &(field_idx, val_ref) in fields.iter() {
+                            let resolved = ctx.get_replacement(val_ref);
+                            if let Some(value) = ctx.get_constant(resolved) {
+                                if let Some((_, fd)) =
+                                    field_descrs.iter().find(|(idx, _)| *idx == field_idx)
+                                {
+                                    if let Some(field_d) = fd.as_field_descr() {
+                                        let offset = field_d.offset();
+                                        match value {
+                                            Value::Int(v) => unsafe {
+                                                let dest =
+                                                    (ptr.0 as *mut u8).add(offset) as *mut i64;
+                                                *dest = *v;
+                                            },
+                                            Value::Ref(r) => unsafe {
+                                                let dest =
+                                                    (ptr.0 as *mut u8).add(offset) as *mut usize;
+                                                *dest = r.0;
+                                            },
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // info.py:142: op.set_forwarded(constptr)
+                        let const_ref = GcRef(ptr.0);
+                        ctx.make_constant(opref, Value::Ref(const_ref));
+                        ctx.set_ptr_info(opref, PtrInfo::Constant(const_ref));
+                        return opref;
+                    }
+                }
+            }
+            // No allocator or size unknown: fall through to normal force.
         }
 
         match self {
