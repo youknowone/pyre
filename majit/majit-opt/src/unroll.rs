@@ -1459,13 +1459,24 @@ impl OptUnroll {
         // DIRECT forwarding target (1-hop) without further chain following.
         // This emulates RPython's Box identity where each source has
         // independent forwarding.
+        // RPython import_state (unroll.py:483-490):
+        // 1) source.set_forwarded(target)
+        // 2) setinfo_from_preamble(source, info) → target.set_forwarded(info)
+        // After step 2, get_box_replacement(source) stops at target (because
+        // target._forwarded = info, which is terminal).
+        //
+        // In majit: apply info to target FIRST, then set forwarding.
+        // This ensures get_replacement stops at target (ptr_info is set).
+        for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
+            if let Some(info) = exported_state.exported_infos.get(target) {
+                self.apply_exported_info(
+                    *target, info, &exported_state.exported_infos, ctx,
+                );
+            }
+        }
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
             ctx.replace_op(source, *target);
-            ctx.freeze_import(source);
-            if let Some(info) = exported_state.exported_infos.get(target) {
-                self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
-            }
         }
 
         // Remap pre_force_field_refs keys from Phase 1 OpRefs to Phase 2

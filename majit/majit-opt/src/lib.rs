@@ -105,11 +105,7 @@ pub struct OptContext {
     pub constants: Vec<Option<Value>>,
     /// Forwarding chain: maps old OpRef to replacement OpRef.
     pub forwarding: Vec<OpRef>,
-    /// RPython Box identity parity: positions marked as import-frozen
-    /// return their DIRECT forwarding target (1-hop) in get_replacement,
-    /// without following further chains. This prevents import_state's
-    /// forwarding from accidentally chaining through shared OpRef slots.
-    import_frozen: std::collections::HashSet<u32>,
+    // (import_frozen removed: get_replacement now stops at ptr_info terminals)
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -262,7 +258,7 @@ impl OptContext {
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
-            import_frozen: std::collections::HashSet::new(),
+            // (import_frozen removed)
         }
     }
 
@@ -304,7 +300,7 @@ impl OptContext {
             pre_force_field_refs: HashMap::new(),
             in_final_emission: false,
             pending_for_guard: Vec::new(),
-            import_frozen: std::collections::HashSet::new(),
+            // (import_frozen removed)
         }
     }
 
@@ -677,16 +673,11 @@ impl OptContext {
         self.forwarding[idx] = new;
     }
 
-    /// Mark a position as import-frozen: get_replacement returns its
-    /// direct forwarding target (1-hop) without following further chains.
-    pub fn freeze_import(&mut self, opref: OpRef) {
-        self.import_frozen.insert(opref.0);
-    }
-
     /// Follow the forwarding chain to get the current replacement for `opref`.
-    /// Import-frozen positions stop after 1 hop (RPython Box identity parity).
+    /// RPython: get_box_replacement(op) — follows _forwarded chain, stops
+    /// when _forwarded is Info (not another Box). In our model, we stop
+    /// when the NEXT position has ptr_info set (it's a terminal like Info).
     pub fn get_replacement(&self, mut opref: OpRef) -> OpRef {
-        let mut first = true;
         loop {
             let idx = opref.0 as usize;
             if idx >= self.forwarding.len() {
@@ -696,11 +687,12 @@ impl OptContext {
             if next.is_none() {
                 return opref;
             }
-            // Import-frozen: return the direct target without chaining.
-            if first && self.import_frozen.contains(&(idx as u32)) {
+            // RPython: stop if NEXT has Info attached (terminal).
+            // get_box_replacement returns the Box whose _forwarded is Info.
+            let next_idx = next.0 as usize;
+            if next_idx < self.ptr_info.len() && self.ptr_info[next_idx].is_some() {
                 return next;
             }
-            first = false;
             opref = next;
         }
     }
