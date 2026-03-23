@@ -34,44 +34,57 @@ type FieldKey = (OpRef, u32);
 /// Per-descr (field descriptor index) cache entry. Tracks cached struct→value
 /// pairs and at most one pending lazy SetfieldGc.
 ///
-/// RPython maintains cached_infos/cached_structs lists; we use a HashMap for
-/// O(1) lookup while preserving the same semantics.
+/// RPython uses parallel lists (cached_structs, cached_infos). We use Vec
+/// of tuples for cache-friendly linear scan — the entry count per descr is
+/// typically 1–5, where Vec beats HashMap.
 struct CachedField {
-    /// struct_opref → cached_value_opref.
-    /// RPython: info._fields[descr] accessed via cached_infos/cached_structs.
-    entries: HashMap<OpRef, OpRef>,
-    /// struct_opref → DescrRef for each entry.
-    descrs: HashMap<OpRef, DescrRef>,
+    /// (struct_opref, cached_value_opref) pairs.
+    /// RPython: cached_structs[i] + cached_infos[i]._fields[descr].
+    cached_structs: Vec<OpRef>,
+    cached_values: Vec<OpRef>,
+    /// struct_opref → DescrRef (only stored when available).
+    cached_descrs: Vec<(OpRef, DescrRef)>,
     /// heap.py:40: _lazy_set — at most one pending SetfieldGc per descr.
-    /// RPython enforces this via possible_aliasing: a new set to a different
-    /// struct forces the existing lazy_set first.
     lazy_set: Option<(OpRef, Op)>,
 }
 
 impl CachedField {
     fn new() -> Self {
         CachedField {
-            entries: HashMap::new(),
-            descrs: HashMap::new(),
+            cached_structs: Vec::new(),
+            cached_values: Vec::new(),
+            cached_descrs: Vec::new(),
             lazy_set: None,
         }
     }
 
     /// heap.py:42-49: register_info — register a cached value for a struct.
     fn register(&mut self, struct_opref: OpRef, value: OpRef, descr: Option<&DescrRef>) {
-        self.entries.insert(struct_opref, value);
+        // Update existing entry or append new one.
+        for i in 0..self.cached_structs.len() {
+            if self.cached_structs[i] == struct_opref {
+                self.cached_values[i] = value;
+                if let Some(d) = descr {
+                    // Update descr if exists, else add.
+                    if let Some(entry) = self.cached_descrs.iter_mut().find(|(k, _)| *k == struct_opref) {
+                        entry.1 = d.clone();
+                    } else {
+                        self.cached_descrs.push((struct_opref, d.clone()));
+                    }
+                }
+                return;
+            }
+        }
+        self.cached_structs.push(struct_opref);
+        self.cached_values.push(value);
         if let Some(d) = descr {
-            self.descrs.insert(struct_opref, d.clone());
+            self.cached_descrs.push((struct_opref, d.clone()));
         }
     }
 
-    /// heap.py:59-65: possible_aliasing — check if the lazy_set targets a
-    /// different struct than `struct_opref`. If so, the lazy_set must be
-    /// forced before this struct can be accessed.
-    ///
+    /// heap.py:59-65: possible_aliasing.
     /// Both `lazy_obj` and `struct_opref` must be pre-resolved through
-    /// `ctx.get_replacement` so that two different OpRefs forwarding to the
-    /// same object are treated as identical (PtrInfo identity semantics).
+    /// `ctx.get_replacement` (PtrInfo identity semantics).
     fn possible_aliasing(&self, struct_opref: OpRef) -> bool {
         if let Some((lazy_obj, _)) = &self.lazy_set {
             *lazy_obj != struct_opref
@@ -82,36 +95,55 @@ impl CachedField {
 
     /// heap.py:103-120: getfield_from_cache — return cached value or None.
     fn get(&self, struct_opref: OpRef) -> Option<OpRef> {
-        // Check lazy_set first (most up-to-date value for that struct)
         if let Some((lazy_obj, lazy_op)) = &self.lazy_set {
             if *lazy_obj == struct_opref {
                 return Some(lazy_op.arg(1));
             }
         }
-        self.entries.get(&struct_opref).copied()
+        for i in 0..self.cached_structs.len() {
+            if self.cached_structs[i] == struct_opref {
+                return Some(self.cached_values[i]);
+            }
+        }
+        None
+    }
+
+    /// Look up cached value from entries only (skip lazy_set).
+    fn get_entry(&self, struct_opref: OpRef) -> Option<OpRef> {
+        for i in 0..self.cached_structs.len() {
+            if self.cached_structs[i] == struct_opref {
+                return Some(self.cached_values[i]);
+            }
+        }
+        None
+    }
+
+    /// Get the DescrRef for a struct, if stored.
+    fn get_descr(&self, struct_opref: OpRef) -> Option<&DescrRef> {
+        self.cached_descrs.iter().find(|(k, _)| *k == struct_opref).map(|(_, d)| d)
     }
 
     /// heap.py:162-196: invalidate — clear all cached entries for this descr.
     fn invalidate(&mut self) {
-        self.entries.clear();
-        self.descrs.clear();
+        self.cached_structs.clear();
+        self.cached_values.clear();
+        self.cached_descrs.clear();
     }
 
     /// heap.py:189-196: invalidate with PtrInfo cleanup.
-    /// RPython clears info._fields[descr.get_index()] for every registered info.
     fn invalidate_with_ctx(&mut self, field_idx: u32, ctx: &mut crate::OptContext) {
-        for (&obj, _) in &self.entries {
+        for &obj in &self.cached_structs {
             let obj_resolved = ctx.get_replacement(obj);
             if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
                 info.clear_field(field_idx);
             }
         }
-        self.entries.clear();
-        self.descrs.clear();
+        self.cached_structs.clear();
+        self.cached_values.clear();
+        self.cached_descrs.clear();
     }
 
     /// Invalidate entries that may alias with a write to `obj`.
-    /// Uses aliasing analysis sets to keep entries that cannot alias.
     fn invalidate_for_write(
         &mut self,
         obj: OpRef,
@@ -120,33 +152,43 @@ impl CachedField {
     ) {
         let obj_is_distinct =
             seen_allocation.contains(&obj) || known_distinct.contains(&obj);
-
-        self.entries.retain(|&cached_obj, _| {
-            if cached_obj == obj {
-                return false;
+        let mut i = 0;
+        while i < self.cached_structs.len() {
+            let cached_obj = self.cached_structs[i];
+            let keep = if cached_obj == obj {
+                false
+            } else {
+                let cached_is_distinct =
+                    seen_allocation.contains(&cached_obj) || known_distinct.contains(&cached_obj);
+                obj_is_distinct || cached_is_distinct
+            };
+            if keep {
+                i += 1;
+            } else {
+                self.cached_structs.swap_remove(i);
+                self.cached_values.swap_remove(i);
+                self.cached_descrs.retain(|(k, _)| *k != cached_obj);
             }
-            let cached_is_distinct =
-                seen_allocation.contains(&cached_obj) || known_distinct.contains(&cached_obj);
-            obj_is_distinct || cached_is_distinct
-        });
-        self.descrs.retain(|k, _| self.entries.contains_key(k));
-    }
-
-    /// Remove a specific struct's cache entry.
-    fn remove(&mut self, struct_opref: OpRef) {
-        self.entries.remove(&struct_opref);
-        self.descrs.remove(&struct_opref);
+        }
     }
 
     /// Check if this CachedField has any entries or a lazy_set.
     fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.lazy_set.is_none()
+        self.cached_structs.is_empty() && self.lazy_set.is_none()
     }
 
     /// Retain only entries matching a predicate on the struct opref.
     fn retain_entries(&mut self, f: impl Fn(&OpRef) -> bool) {
-        self.entries.retain(|k, _| f(k));
-        self.descrs.retain(|k, _| self.entries.contains_key(k));
+        let mut i = 0;
+        while i < self.cached_structs.len() {
+            if f(&self.cached_structs[i]) {
+                i += 1;
+            } else {
+                let removed = self.cached_structs.swap_remove(i);
+                self.cached_values.swap_remove(i);
+                self.cached_descrs.retain(|(k, _)| *k != removed);
+            }
+        }
     }
 }
 
@@ -160,36 +202,45 @@ type ArrayItemKey = (OpRef, u32, i64);
 ///
 /// Mirrors CachedField but keyed by (descr_idx, const_index) instead of field_idx.
 struct CachedArrayItem {
-    /// array_opref -> cached_value_opref.
-    entries: HashMap<OpRef, OpRef>,
-    /// array_opref -> DescrRef for each entry.
-    descrs: HashMap<OpRef, DescrRef>,
-    /// heap.py:40: _lazy_set -- at most one pending SetarrayitemGc per (descr, index).
+    /// RPython: cached_structs + cached_infos parallel lists.
+    cached_arrays: Vec<OpRef>,
+    cached_values: Vec<OpRef>,
+    cached_descrs: Vec<(OpRef, DescrRef)>,
+    /// heap.py:40: _lazy_set -- at most one pending SetarrayitemGc.
     lazy_set: Option<(OpRef, Op)>,
 }
 
 impl CachedArrayItem {
     fn new() -> Self {
         CachedArrayItem {
-            entries: HashMap::new(),
-            descrs: HashMap::new(),
+            cached_arrays: Vec::new(),
+            cached_values: Vec::new(),
+            cached_descrs: Vec::new(),
             lazy_set: None,
         }
     }
 
-    /// Register a cached value for an array access.
     fn register(&mut self, array_opref: OpRef, value: OpRef, descr: Option<&DescrRef>) {
-        self.entries.insert(array_opref, value);
+        for i in 0..self.cached_arrays.len() {
+            if self.cached_arrays[i] == array_opref {
+                self.cached_values[i] = value;
+                if let Some(d) = descr {
+                    if let Some(entry) = self.cached_descrs.iter_mut().find(|(k, _)| *k == array_opref) {
+                        entry.1 = d.clone();
+                    } else {
+                        self.cached_descrs.push((array_opref, d.clone()));
+                    }
+                }
+                return;
+            }
+        }
+        self.cached_arrays.push(array_opref);
+        self.cached_values.push(value);
         if let Some(d) = descr {
-            self.descrs.insert(array_opref, d.clone());
+            self.cached_descrs.push((array_opref, d.clone()));
         }
     }
 
-    /// heap.py:59-65: possible_aliasing -- check if the lazy_set targets a
-    /// different array than `array_opref`.
-    ///
-    /// Both `lazy_obj` and `array_opref` must be pre-resolved through
-    /// `ctx.get_replacement` (PtrInfo identity semantics).
     fn possible_aliasing(&self, array_opref: OpRef) -> bool {
         if let Some((lazy_obj, _)) = &self.lazy_set {
             *lazy_obj != array_opref
@@ -198,32 +249,56 @@ impl CachedArrayItem {
         }
     }
 
-    /// Return cached value or None, checking lazy_set first.
     fn get(&self, array_opref: OpRef) -> Option<OpRef> {
         if let Some((lazy_obj, lazy_op)) = &self.lazy_set {
             if *lazy_obj == array_opref {
                 return Some(lazy_op.arg(2));
             }
         }
-        self.entries.get(&array_opref).copied()
+        for i in 0..self.cached_arrays.len() {
+            if self.cached_arrays[i] == array_opref {
+                return Some(self.cached_values[i]);
+            }
+        }
+        None
     }
 
-    /// Clear all cached entries.
+    fn get_entry(&self, array_opref: OpRef) -> Option<OpRef> {
+        for i in 0..self.cached_arrays.len() {
+            if self.cached_arrays[i] == array_opref {
+                return Some(self.cached_values[i]);
+            }
+        }
+        None
+    }
+
+    fn get_descr(&self, array_opref: OpRef) -> Option<&DescrRef> {
+        self.cached_descrs.iter().find(|(k, _)| *k == array_opref).map(|(_, d)| d)
+    }
+
     fn invalidate(&mut self) {
-        self.entries.clear();
-        self.descrs.clear();
+        self.cached_arrays.clear();
+        self.cached_values.clear();
+        self.cached_descrs.clear();
     }
 
-    /// Retain only entries matching a predicate on the array opref.
     fn retain_entries(&mut self, f: impl Fn(&OpRef) -> bool) {
-        self.entries.retain(|k, _| f(k));
-        self.descrs.retain(|k, _| self.entries.contains_key(k));
+        let mut i = 0;
+        while i < self.cached_arrays.len() {
+            if f(&self.cached_arrays[i]) {
+                i += 1;
+            } else {
+                let removed = self.cached_arrays.swap_remove(i);
+                self.cached_values.swap_remove(i);
+                self.cached_descrs.retain(|(k, _)| *k != removed);
+            }
+        }
     }
 
     /// Check if this CachedArrayItem has any entries or a lazy_set.
     #[allow(dead_code)]
     fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.lazy_set.is_none()
+        self.cached_arrays.is_empty() && self.lazy_set.is_none()
     }
 }
 
@@ -676,19 +751,17 @@ impl OptHeap {
         length: Option<i64>,
     ) {
         for (&(_descr_idx, index), cai) in self.array_cache.iter_mut() {
-            cai.entries.retain(|&obj, _| {
-                if obj != dest_ref {
-                    return true; // different array, keep
+            cai.retain_entries(|obj| {
+                if *obj != dest_ref {
+                    return true;
                 }
-                // If we know both start and length, only invalidate entries within range
                 if let (Some(start), Some(len)) = (dest_start, length) {
                     if index < start || index >= start + len {
-                        return true; // outside copy range, keep
+                        return true;
                     }
                 }
-                false // within range or unknown range, invalidate
+                false
             });
-            cai.descrs.retain(|k, _| cai.entries.contains_key(k));
         }
         self.cached_arrayitems_var
             .retain(|&(obj, _descr_idx, _index_ref), _| obj != dest_ref);
@@ -913,7 +986,7 @@ impl OptHeap {
                     force_lazy = true;
                 }
                 // CANNOT_ALIAS: skip lazy_set, check entries below
-            } else if let Some(cached) = cf.entries.get(&obj).copied() {
+            } else if let Some(cached) = cf.get_entry(obj) {
                 let cached = ctx.get_replacement(cached);
                 ctx.replace_op(op.pos, cached);
                 return OptimizationResult::Remove;
@@ -953,11 +1026,9 @@ impl OptHeap {
         if let Some(cached) = ctx.imported_short_fields.remove(&key) {
             ctx.force_op_from_preamble(cached);
             let cf = self.get_or_create_cached_field(field_idx);
-            cf.entries.entry(obj).or_insert(cached);
-            if let Some(descr) = ctx.imported_short_field_descrs.remove(&key) {
-                cf.descrs.insert(obj, descr);
-            } else if let Some(d) = &op.descr {
-                cf.descrs.insert(obj, d.clone());
+            if cf.get_entry(obj).is_none() {
+                let d = ctx.imported_short_field_descrs.remove(&key).or_else(|| op.descr.clone());
+                cf.register(obj, cached, d.as_ref());
             }
         }
 
@@ -970,7 +1041,7 @@ impl OptHeap {
 
         // Check read cache (after import).
         if let Some(cf) = self.field_cache.get(&field_idx) {
-            if let Some(cached) = cf.entries.get(&obj).copied() {
+            if let Some(cached) = cf.get_entry(obj) {
                 let cached = ctx.get_replacement(cached);
                 ctx.replace_op(op.pos, cached);
                 return OptimizationResult::Remove;
@@ -1040,7 +1111,7 @@ impl OptHeap {
                 if *lazy_obj == obj && lazy_op.arg(1) == new_value {
                     return OptimizationResult::Remove;
                 }
-            } else if let Some(&cached) = cf.entries.get(&obj) {
+            } else if let Some(&cached) = cf.get_entry(obj).as_ref() {
                 let cached_resolved = ctx.get_replacement(cached);
                 if cached_resolved == new_value {
                     return OptimizationResult::Remove;
@@ -1090,7 +1161,7 @@ impl OptHeap {
         // heap.py:84-101: after force, recheck cached value
         {
             let cf = self.get_or_create_cached_field(field_idx);
-            if let Some(&cached) = cf.entries.get(&obj) {
+            if let Some(&cached) = cf.get_entry(obj).as_ref() {
                 let cached_resolved = ctx.get_replacement(cached);
                 if cached_resolved == new_value {
                     cf.lazy_set = None;
@@ -1133,15 +1204,13 @@ impl OptHeap {
             if let Some(cached) = ctx.imported_short_arrayitems.remove(&key) {
                 let cached = ctx.force_op_from_preamble(cached);
                 let cai = self.get_or_create_cached_arrayitem(descr_idx, const_index);
-                cai.entries.entry(array).or_insert(cached);
-                if let Some(descr) = ctx.imported_short_arrayitem_descrs.remove(&key) {
-                    cai.descrs.insert(array, descr);
-                } else if let Some(d) = &op.descr {
-                    cai.descrs.insert(array, d.clone());
+                if cai.get_entry(array).is_none() {
+                    let d = ctx.imported_short_arrayitem_descrs.remove(&key).or_else(|| op.descr.clone());
+                    cai.register(array, cached, d.as_ref());
                 }
             }
             if let Some(cai) = self.array_cache.get(&(descr_idx, const_index)) {
-                if let Some(&cached) = cai.entries.get(&array) {
+                if let Some(cached) = cai.get_entry(array) {
                     let cached = ctx.get_replacement(cached);
                     ctx.replace_op(op.pos, cached);
                     return OptimizationResult::Remove;
@@ -1214,7 +1283,7 @@ impl OptHeap {
                 if *lazy_obj == array && lazy_op.arg(2) == new_value {
                     return OptimizationResult::Remove;
                 }
-            } else if let Some(&cached) = cai.entries.get(&array) {
+            } else if let Some(cached) = cai.get_entry(array) {
                 let cached = ctx.get_replacement(cached);
                 if cached == new_value {
                     return OptimizationResult::Remove;
@@ -1225,7 +1294,13 @@ impl OptHeap {
         // Store as lazy set.
         let cai = self.get_or_create_cached_arrayitem(descr_idx, const_index);
         cai.lazy_set = Some((array, op.clone()));
-        cai.entries.remove(&array);
+        // Remove stale entry for this array (will be re-cached on next get).
+        let idx = cai.cached_arrays.iter().position(|a| *a == array);
+        if let Some(idx) = idx {
+            cai.cached_arrays.swap_remove(idx);
+            cai.cached_values.swap_remove(idx);
+            cai.cached_descrs.retain(|(k, _)| *k != array);
+        }
         if let Some(info) = ctx.get_ptr_info_mut(ctx.get_replacement(op.arg(0))) {
             info.set_item(const_index as usize, new_value);
         }
@@ -1679,7 +1754,7 @@ impl Optimization for OptHeap {
             // ── heap.py: RAW_LOAD — cache raw memory reads ──
             OpCode::RawLoadI | OpCode::RawLoadF => {
                 if let Some((obj, field_idx)) = Self::field_key(op) {
-                    if let Some(cached) = self.get_cached_field(field_idx).and_then(|cf| cf.entries.get(&obj).copied()) {
+                    if let Some(cached) = self.get_cached_field(field_idx).and_then(|cf| cf.get_entry(obj)) {
                         let cached = ctx.get_replacement(cached);
                         ctx.replace_op(op.pos, cached);
                         return OptimizationResult::Remove;
@@ -1805,14 +1880,16 @@ impl Optimization for OptHeap {
     /// heap.py:360-377: export ALL cached fields to short preamble.
     fn produce_potential_short_preamble_ops(&self, sb: &mut crate::shortpreamble::ShortBoxes) {
         for cf in self.field_cache.values() {
-            for (&obj, &cached_val) in &cf.entries {
+            for i in 0..cf.cached_structs.len() {
+                let obj = cf.cached_structs[i];
+                let cached_val = cf.cached_values[i];
                 if cached_val.is_none() || obj.is_none() {
                     continue;
                 }
                 if !sb.is_reachable(obj) {
                     continue;
                 }
-                let Some(descr) = cf.descrs.get(&obj) else {
+                let Some(descr) = cf.get_descr(obj) else {
                     continue;
                 };
                 let opcode = descr
@@ -1826,14 +1903,16 @@ impl Optimization for OptHeap {
         }
 
         for (&(_descr_idx, index), cai) in &self.array_cache {
-            for (&obj, &cached_val) in &cai.entries {
+            for i in 0..cai.cached_arrays.len() {
+                let obj = cai.cached_arrays[i];
+                let cached_val = cai.cached_values[i];
                 if cached_val.is_none() || obj.is_none() {
                     continue;
                 }
                 if !sb.is_reachable(obj) {
                     continue;
                 }
-                let Some(descr) = cai.descrs.get(&obj) else {
+                let Some(descr) = cai.get_descr(obj) else {
                     continue;
                 };
                 let idx_ref = OpRef(index as u32);
@@ -1895,7 +1974,9 @@ impl Optimization for OptHeap {
     fn export_cached_fields(&self) -> Vec<(OpRef, u32, OpRef)> {
         let mut result = Vec::new();
         for (&field_idx, cf) in &self.field_cache {
-            for (&obj, &val) in &cf.entries {
+            for i in 0..cf.cached_structs.len() {
+                let obj = cf.cached_structs[i];
+                let val = cf.cached_values[i];
                 if !val.is_none() && !obj.is_none() {
                     result.push((obj, field_idx, val));
                 }
