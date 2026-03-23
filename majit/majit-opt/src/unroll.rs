@@ -1226,10 +1226,12 @@ impl OptUnroll {
             let extra_guards = target_vs.generate_guards(&virtual_state, &args, runtime_boxes);
             for guard_req in &extra_guards {
                 if let Some(mut guard_op) = guard_req.to_op(&args) {
-                    // unroll.py:336-337: copy resume position from patchguardop
+                    // unroll.py:336-337: copy rd_resume_position from patchguardop
+                    // and set descr to ResumeAtPositionDescr()
                     if let Some(ref patch) = ctx.patchguardop {
-                        guard_op.descr = patch.descr.clone();
+                        guard_op.rd_resume_position = patch.rd_resume_position;
                     }
+                    guard_op.descr = Some(crate::make_resume_at_position_descr());
                     optimizer.send_extra_operation(&guard_op, ctx);
                 }
             }
@@ -1380,11 +1382,13 @@ impl OptUnroll {
                     }
                 }
                 // unroll.py:405-409: guards in short preamble inherit
-                // resume position from patchguardop
+                // rd_resume_position from patchguardop and get
+                // ResumeAtPositionDescr as their descr.
                 if new_op.opcode.is_guard() {
                     if let Some(ref patch) = ctx.patchguardop {
-                        new_op.descr = patch.descr.clone();
+                        new_op.rd_resume_position = patch.rd_resume_position;
                     }
+                    new_op.descr = Some(crate::make_resume_at_position_descr());
                 }
                 let new_ref = ctx.alloc_op_position();
                 new_op.pos = new_ref;

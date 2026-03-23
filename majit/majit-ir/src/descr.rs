@@ -71,6 +71,14 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// compile.py: isinstance(resumekey, ResumeAtPositionDescr).
+    /// Guards created during loop unrolling / short preamble inlining
+    /// return true. When bridge compilation starts from such a guard,
+    /// inline_short_preamble is set to false.
+    fn is_resume_at_position(&self) -> bool {
+        false
+    }
+
     /// intbounds.py: descr.is_integer_bounded() / get_integer_min/max.
     /// Returns (field_size_bytes, is_signed) if this is a field descriptor.
     /// Used by intbounds to narrow GETFIELD result bounds.

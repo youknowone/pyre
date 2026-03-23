@@ -297,10 +297,11 @@ pub struct MetaInterp<M: Clone> {
     /// partial optimized ops are saved here so compile_retrace can append
     /// the new body and compile the complete loop.
     pub(crate) partial_trace: Option<PartialTrace>,
-    /// pyjitpl.py:2390: green key where the retrace should resume.
-    /// On the next close_and_compile for this key, compile_retrace is used
-    /// instead of compile_loop.
-    pub(crate) retracing_from: Option<u64>,
+    /// pyjitpl.py:2390: trace position where the retrace should resume.
+    /// Set to potential_retrace_position by retrace_needed(). On the next
+    /// close_and_compile, the merge point's start position is compared
+    /// against this to verify we're retracing from the correct location.
+    pub(crate) retracing_from: Option<majit_trace::recorder::TracePosition>,
     /// pyjitpl.py:2374: optimizer state snapshot from the failed bridge attempt.
     /// compile_retrace imports this to resume optimization from where the
     /// first attempt left off.
@@ -1398,9 +1399,18 @@ impl<M: Clone> MetaInterp<M> {
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
         if self.partial_trace.is_some() {
-            let current_key = self.tracing.as_ref().map(|ctx| ctx.green_key);
-            if let Some(retrace_key) = self.retracing_from {
-                if current_key == Some(retrace_key) {
+            if let Some(retrace_pos) = self.retracing_from {
+                // pyjitpl.py:2994: if start != self.retracing_from
+                // Find the merge point whose position matches retracing_from.
+                let position_matches = self
+                    .tracing
+                    .as_ref()
+                    .and_then(|ctx| {
+                        ctx.get_merge_point(ctx.green_key)
+                            .map(|mp| mp.position == retrace_pos)
+                    })
+                    .unwrap_or(false);
+                if position_matches {
                     let ok = self.compile_retrace(jump_args, meta.clone());
                     if ok {
                         self.cancel_count = 0;
@@ -1427,7 +1437,7 @@ impl<M: Clone> MetaInterp<M> {
                         eprintln!("[jit] retrace cancelled, trying normal compilation");
                     }
                 } else {
-                    // pyjitpl.py:2994-2995: green key mismatch — abort.
+                    // pyjitpl.py:2994-2995: position mismatch — abort.
                     self.clear_retrace_state();
                     if let Some(ctx) = self.tracing.take() {
                         self.warm_state.abort_tracing(ctx.green_key, false);
@@ -1938,7 +1948,8 @@ impl<M: Clone> MetaInterp<M> {
             inputargs,
             constants,
         });
-        self.retracing_from = Some(green_key);
+        // pyjitpl.py:2410: self.retracing_from = self.potential_retrace_position
+        self.retracing_from = self.potential_retrace_position;
         self.exported_state = Some(exported_state);
     }
 
@@ -1959,8 +1970,10 @@ impl<M: Clone> MetaInterp<M> {
             Some(s) => s,
             None => return false,
         };
-        let green_key = match self.retracing_from.take() {
-            Some(k) => k,
+        // Consume retracing_from (position); green_key comes from tracing ctx.
+        self.retracing_from = None;
+        let green_key = match self.tracing.as_ref() {
+            Some(ctx) => ctx.green_key,
             None => return false,
         };
 
@@ -3671,7 +3684,8 @@ impl<M: Clone> MetaInterp<M> {
         // RPython unroll.py:183-236: Optimizer.optimize_bridge()
         let mut optimizer = self.make_optimizer();
         let mut constants = constants;
-        let inline_short_preamble = true;
+        // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
+        let inline_short_preamble = !fail_descr.is_resume_at_position();
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
         let retraced_count = compiled.retraced_count;
         let retrace_limit = 0u32;

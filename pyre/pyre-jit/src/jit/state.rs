@@ -5109,7 +5109,9 @@ impl ControlFlowOpcodeHandler for TraceFrameState {
             let back_edge_key = crate::eval::make_green_key(code_ptr, target);
             if !ctx.has_merge_point(back_edge_key) {
                 // First visit: record merge point and continue tracing.
-                ctx.add_merge_point(back_edge_key);
+                // pyjitpl.py:3030: save live args as original_boxes.
+                let live_args = TraceFrameState::close_loop_args(this, ctx);
+                ctx.add_merge_point(back_edge_key, live_args);
                 TraceFrameState::set_next_instr(this, ctx, target);
                 if majit_meta::majit_log_enabled() {
                     eprintln!(

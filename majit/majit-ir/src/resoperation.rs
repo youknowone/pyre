@@ -87,6 +87,11 @@ pub struct Op {
     /// to replay on guard failure after virtual materialization.
     /// resume.py: rd_pendingfields
     pub rd_pendingfields: Option<Vec<GuardPendingFieldEntry>>,
+    /// resoperation.py: GuardResOp.rd_resume_position — index of the
+    /// guard in the trace for resume data lookup. Set by unroll when
+    /// creating extra guards from short preamble / virtual state.
+    /// -1 means unset.
+    pub rd_resume_position: i32,
 }
 
 impl Op {
@@ -100,6 +105,7 @@ impl Op {
             fail_arg_types: None,
             rd_virtuals: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         }
     }
 
@@ -113,6 +119,7 @@ impl Op {
             fail_arg_types: None,
             rd_virtuals: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         }
     }
 
@@ -2982,6 +2989,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -2992,6 +3000,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -3003,6 +3012,7 @@ mod tests {
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3024,6 +3034,7 @@ mod tests {
             rd_virtuals: None,
             fail_arg_types: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         };
         let s = format!("{op}");
         assert_eq!(s, "v6 = IntAdd(v1, v2)");
@@ -3040,6 +3051,7 @@ mod tests {
             rd_virtuals: None,
             fail_arg_types: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         };
         let s = format!("{op}");
         assert_eq!(s, "SetfieldGc(v0, v1)");
@@ -3057,6 +3069,7 @@ mod tests {
 
             fail_arg_types: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0) [v0, v1]");
@@ -3073,6 +3086,7 @@ mod tests {
             rd_virtuals: None,
             fail_arg_types: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0)");
@@ -3089,6 +3103,7 @@ mod tests {
             rd_virtuals: None,
             fail_arg_types: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 42);
@@ -3109,6 +3124,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3119,6 +3135,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::Finish,
@@ -3130,6 +3147,7 @@ mod tests {
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3150,6 +3168,7 @@ mod tests {
 
             fail_arg_types: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 99);
@@ -3181,6 +3200,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3191,6 +3211,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3201,6 +3222,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -3212,6 +3234,7 @@ mod tests {
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3244,6 +3267,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::IntGt,
@@ -3254,6 +3278,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3264,6 +3289,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::Finish,
@@ -3275,6 +3301,7 @@ mod tests {
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3304,6 +3331,7 @@ mod tests {
             rd_virtuals: None,
             fail_arg_types: None,
             rd_pendingfields: None,
+            rd_resume_position: -1,
         }];
         let constants = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
@@ -3335,6 +3363,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3345,6 +3374,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::IntLt,
@@ -3355,6 +3385,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3365,6 +3396,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::IntSub,
@@ -3375,6 +3407,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -3386,6 +3419,7 @@ mod tests {
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3418,6 +3452,7 @@ mod tests {
                 rd_virtuals: None,
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
             Op {
                 opcode: OpCode::GuardFalse,
@@ -3429,6 +3464,7 @@ mod tests {
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
+                rd_resume_position: -1,
             },
         ];
         let constants = std::collections::HashMap::new();
