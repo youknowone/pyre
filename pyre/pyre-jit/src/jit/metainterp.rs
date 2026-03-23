@@ -100,7 +100,7 @@ impl PyreMetaInterp {
                 pyre_runtime::PyError::type_error("empty framestack during interpret")
             })?;
 
-            match top.run_one_step(ctx)? {
+            match top.run_one_step(ctx, self.namespace)? {
                 StepAction::Continue => {}
                 StepAction::ChangeFrame => {
                     // Framestack was modified — continue with new top
@@ -259,6 +259,7 @@ impl PyreMetaFrame {
     pub fn run_one_step(
         &mut self,
         ctx: &mut TraceCtx,
+        namespace: *mut pyre_runtime::PyNamespace,
     ) -> Result<StepAction, pyre_runtime::PyError> {
         use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction};
 
@@ -305,8 +306,9 @@ impl PyreMetaFrame {
                 let idx = var_num.get(op_arg).as_usize();
                 let concrete = self.concrete_locals.get(idx).copied()
                     .unwrap_or(ConcreteValue::Null);
-                // TODO: proper symbolic load from virtualizable
-                let opref = OpRef::NONE; // placeholder
+                // RPython: box is already in registers[idx]
+                let opref = self.sym.symbolic_locals.get(idx).copied()
+                    .unwrap_or(OpRef::NONE);
                 self.push(FrontendOp::new(opref, concrete));
                 Ok(StepAction::Continue)
             }
@@ -316,7 +318,9 @@ impl PyreMetaFrame {
                 if idx < self.concrete_locals.len() {
                     self.concrete_locals[idx] = val.concrete;
                 }
-                // TODO: symbolic store
+                if idx < self.sym.symbolic_locals.len() {
+                    self.sym.symbolic_locals[idx] = val.opref;
+                }
                 Ok(StepAction::Continue)
             }
 
@@ -414,9 +418,13 @@ impl PyreMetaFrame {
                     self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Null));
                 }
                 // Concrete: read from namespace
-                let concrete = unsafe {
-                    let ns = (*self.jitcode).varnames.as_ptr(); // placeholder
-                    ConcreteValue::Null // TODO: actual namespace lookup
+                let concrete = if !namespace.is_null() {
+                    let ns = unsafe { &*namespace };
+                    ns.get(name)
+                        .map(|&v| ConcreteValue::from_pyobj(v))
+                        .unwrap_or(ConcreteValue::Null)
+                } else {
+                    ConcreteValue::Null
                 };
                 self.push(FrontendOp::new(OpRef::NONE, concrete));
                 Ok(StepAction::Continue)
