@@ -136,7 +136,10 @@ impl PyFrame {
         PyFrame {
             execution_context,
             code,
-            locals_cells_stack_w: pyre_runtime::PyObjectArray::from_vec(vec![pyre_object::PY_NULL; size]),
+            locals_cells_stack_w: pyre_runtime::PyObjectArray::from_vec(vec![
+                pyre_object::PY_NULL;
+                size
+            ]),
             valuestackdepth: nlocals + ncells,
             next_instr: 0,
             namespace,

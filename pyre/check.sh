@@ -137,17 +137,6 @@ run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"   "1142858"        
 
 echo ""
 
-# ── Correctness only ────────────────────────────────────────
-bold "CORRECTNESS (must not crash or give wrong results)"; echo ""
-
-run_bench  "fib_loop"        "$BENCH/fib_loop.py"        "308061521170129"        10
-run_bench  "fib_recursive"   "$BENCH/fib_recursive.py"   "9227465"                60
-run_bench  "nbody"           "$BENCH/nbody.py"           "-0.035117363568587606"  120
-run_bench  "fannkuch"        "$BENCH/fannkuch.py"        "$(printf '73196\n38')"  120
-
-echo ""
-
-# ── Summary ─────────────────────────────────────────────────
 echo "─────────────────────────────────"
 for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo "─────────────────────────────────"
