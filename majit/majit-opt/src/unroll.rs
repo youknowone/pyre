@@ -204,7 +204,7 @@ impl UnrollOptimizer {
                 .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
                 .collect();
         }
-        // Export Phase 1's heap cache for Phase 2 import_state.
+        // Export Phase 1's heap cache for Phase 2.
         exported_state.preamble_heap_cache = opt_p1.export_all_cached_fields();
         self.ensure_preamble_target_token();
         // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──

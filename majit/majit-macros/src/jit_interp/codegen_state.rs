@@ -1262,11 +1262,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         return Some(head);
                     }
                     let stack_ref = self.ensure_linked_list_stack_ref(ctx, selected)?;
-
-                    // Guard that the stack is non-empty before reading head.
-                    // Without this, the body loop can dereference a null head
-                    // pointer when the stack becomes empty after JUMP back to
-                    // the Label.
+                    // RPython LinkedList.pop() has no size check — it relies on
+                    // SIGSEGV → guard failure for null head. We don't have a signal
+                    // handler, so emit an explicit guard on first access per stack.
                     let size_descr = self.linked_list_stack_size_descr()?;
                     let size = ctx.record_op_with_descr(
                         majit_ir::OpCode::GetfieldGcI,
@@ -1281,8 +1279,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         .unwrap_or_else(|| ctx.const_int(self.current_selected as i64));
                     let selected_ref = self.current_selected_ref
                         .unwrap_or(stack_ref);
-                    // Include resume_pc (loop_header_pc) so restore_jit_guard_state
-                    // can return Some(resume_pc) → enables bridge compilation.
                     let resume_pc = ctx.const_int(self.loop_header_pc as i64);
                     let fail_args = vec![stacksize, self.pool_ref, selected_val, selected_ref, resume_pc];
                     let fail_types = vec![

@@ -150,34 +150,6 @@ impl CachedField {
         self.cached_descrs.clear();
     }
 
-    /// Invalidate entries that may alias with a write to `obj`.
-    fn invalidate_for_write(
-        &mut self,
-        obj: OpRef,
-        seen_allocation: &HashSet<OpRef>,
-        known_distinct: &HashSet<OpRef>,
-    ) {
-        let obj_is_distinct = seen_allocation.contains(&obj) || known_distinct.contains(&obj);
-        let mut i = 0;
-        while i < self.cached_structs.len() {
-            let cached_obj = self.cached_structs[i];
-            let keep = if cached_obj == obj {
-                false
-            } else {
-                let cached_is_distinct =
-                    seen_allocation.contains(&cached_obj) || known_distinct.contains(&cached_obj);
-                obj_is_distinct || cached_is_distinct
-            };
-            if keep {
-                i += 1;
-            } else {
-                self.cached_structs.swap_remove(i);
-                self.cached_values.swap_remove(i);
-                self.cached_descrs.retain(|(k, _)| *k != cached_obj);
-            }
-        }
-    }
-
     /// Check if this CachedField has any entries or a lazy_set.
     fn is_empty(&self) -> bool {
         self.cached_structs.is_empty() && self.lazy_set.is_none()
@@ -358,10 +330,6 @@ pub struct OptHeap {
     /// object's field via SETFIELD_GC / SETARRAYITEM_GC.
     /// Caches for unescaped objects survive calls (calls can't access them).
     unescaped: HashSet<OpRef>,
-    /// Objects loaded from distinct immutable fields. Like seen_allocation,
-    /// these cannot alias each other. RPython: _cannot_alias_via_content.
-    known_distinct: HashSet<OpRef>,
-
     // ── Nullity tracking ──
     /// Values known to be non-null: proven by guards (GuardNonnull, GuardClass,
     /// GuardNonnullClass, GuardValue) or by allocation (New, NewWithVtable, etc.).
@@ -401,7 +369,6 @@ impl OptHeap {
             postponed_op: None,
             immutable_field_descrs: HashSet::new(),
             seen_allocation: HashSet::new(),
-            known_distinct: HashSet::new(),
             unescaped: HashSet::new(),
             known_nonnull: HashSet::new(),
             loopinvariant_cache: HashMap::new(),
@@ -754,12 +721,6 @@ impl OptHeap {
     /// invalidates caches for unknown-origin objects with the same field.
     /// A write to an unknown-origin object invalidates all non-seen-allocation
     /// caches for that field.
-    fn invalidate_field_caches_for_write(&mut self, obj: OpRef, field_idx: u32) {
-        if let Some(cf) = self.field_cache.get_mut(&field_idx) {
-            cf.invalidate_for_write(obj, &self.seen_allocation, &self.known_distinct);
-        }
-    }
-
     /// heap.py:206-226: _cannot_alias_via_content
     ///
     /// If both PtrInfos have fields and any shared field index has different
@@ -1040,15 +1001,12 @@ impl OptHeap {
                 let cannot_alias_via_class = matches!(
                     (class1, class2), (Some(c1), Some(c2)) if c1 != c2
                 );
-                let mut cannot_alias = cannot_alias_via_class
-                    || self.seen_allocation.contains(lazy_obj)
-                    || self.seen_allocation.contains(&obj)
-                    || self.known_distinct.contains(lazy_obj)
-                    || self.known_distinct.contains(&obj);
-                if !cannot_alias {
+                // heap.py:198-226: possible_aliasing_two_infos
+                // RPython checks: class/length, then content. No seen_allocation.
+                let cannot_alias = cannot_alias_via_class || {
                     let lazy_obj_resolved = ctx.get_replacement(*lazy_obj);
-                    cannot_alias = Self::cannot_alias_via_content(lazy_obj_resolved, obj, ctx);
-                }
+                    Self::cannot_alias_via_content(lazy_obj_resolved, obj, ctx)
+                };
                 if !cannot_alias {
                     // UNKNOWN_ALIAS → force_lazy_set, return None (cache miss)
                     force_lazy = true;
@@ -1107,12 +1065,18 @@ impl OptHeap {
         if !is_vable_field {
             if let Some(cached) = ctx.imported_short_fields.remove(&key) {
                 ctx.force_op_from_preamble(cached);
+                let d = ctx
+                    .imported_short_field_descrs
+                    .remove(&key)
+                    .or_else(|| op.descr.clone());
+                if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) {
+                    if d.as_ref().map_or(false, |dd| dd.is_always_pure()) {
+                        self.immutable_field_descrs.insert(key.1);
+                        self.immutable_cached_fields.insert(key, cached);
+                    }
+                }
                 let cf = self.get_or_create_cached_field(field_idx);
                 if cf.get_entry(obj).is_none() {
-                    let d = ctx
-                        .imported_short_field_descrs
-                        .remove(&key)
-                        .or_else(|| op.descr.clone());
                     cf.register(obj, cached, d.as_ref());
                 }
             }
@@ -1162,12 +1126,6 @@ impl OptHeap {
         // invalidation because the value never changes.
         if self.immutable_field_descrs.contains(&key.1) {
             self.immutable_cached_fields.insert(key, op.pos);
-            // Ref values loaded from immutable fields cannot alias each other
-            // or seen_allocation objects. This lets the aliasing analysis
-            // preserve their caches across writes to other objects.
-            if op.opcode == OpCode::GetfieldGcR {
-                self.known_distinct.insert(op.pos);
-            }
         }
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         // Record the field value in ptr_info so other passes can see it.
@@ -1294,9 +1252,10 @@ impl OptHeap {
             }
         }
 
-        // Aliasing-aware invalidation: only invalidate caches that might
-        // be affected by this write.
-        self.invalidate_field_caches_for_write(obj, field_idx);
+        // RPython do_setfield: no separate invalidation here.
+        // Aliasing is handled by force_lazy_set → invalidate inside the
+        // possible_aliasing path above. Getfield handles read-after-write
+        // aliasing via its own force path.
 
         // Virtualizable fields (linked list head/size) must be emitted
         // immediately so compiled code always writes to memory. Lazy
@@ -1998,7 +1957,6 @@ impl Optimization for OptHeap {
         self.immutable_field_descrs.clear();
         self.seen_allocation.clear();
         self.unescaped.clear();
-        self.known_distinct.clear();
         self.known_nonnull.clear();
         self.loopinvariant_cache.clear();
         self.last_call_did_not_raise = false;
