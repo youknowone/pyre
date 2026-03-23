@@ -288,24 +288,16 @@ pub fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             StepResult::Continue => {}
             StepResult::CloseLoop { loop_header_pc, .. } if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
-                // Fast path: check for compiled code first, then counter.
+                // Thin inline: counter tick only. Heavy logic in cold helper.
                 let green_key = make_green_key(frame.code, loop_header_pc);
-                if driver.has_compiled_loop(green_key) {
+                if driver.meta_interp_mut().warm_state_mut().counter.tick(green_key) && !driver.is_tracing() {
                     if let Some(result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
                         return result;
                     }
-                } else if !driver.is_tracing()
-                    && driver.meta_interp_mut().warm_state_mut().counter.tick(green_key)
-                    && driver.meta_interp().warm_state_ref().counter_would_fire(green_key) {
-                    if let Some(result) = can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env) {
-                        return result;
-                    }
-                    // Hook returned None: if tracing just started, don't touch
-                    // anything. Otherwise mark as DontTraceHere so the
-                    // counter_would_fire early exit prevents repeated hook entry.
-                    if !driver.is_tracing() {
-                        driver.meta_interp_mut().warm_state_mut().mark_dont_trace(green_key);
-                    }
+                    // Hook returned None without starting a trace: reset counter
+                    // to prevent repeated tick fires. If tracing just started,
+                    // is_tracing() is true so we don't reach here.
+                    driver.meta_interp_mut().warm_state_mut().counter.reset(green_key);
                 }
             }
             StepResult::CloseLoop { .. } => {}
