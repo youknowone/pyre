@@ -171,12 +171,7 @@ impl PyreMetaInterp {
     ///
     /// Record a guard operation and capture resume data from the framestack.
     /// TODO: proper fail_descr integration when TraceCtx API is extended.
-    pub fn generate_guard(
-        &self,
-        _ctx: &mut TraceCtx,
-        _opcode: majit_ir::OpCode,
-        _args: &[OpRef],
-    ) {
+    pub fn generate_guard(&self, _ctx: &mut TraceCtx, _opcode: majit_ir::OpCode, _args: &[OpRef]) {
         // Placeholder — guard recording requires fail_descr creation
         // which depends on TraceCtx internal API. Will be wired up when
         // PyreMetaInterp replaces TraceFrameState as the active tracer.
@@ -213,8 +208,18 @@ impl PyreMetaFrame {
 
     /// Peek at the top of the operand stack without popping.
     fn peek(&self) -> FrontendOp {
-        let opref = self.sym.symbolic_stack.last().copied().unwrap_or(OpRef::NONE);
-        let concrete = self.sym.concrete_stack.last().copied().unwrap_or(ConcreteValue::Null);
+        let opref = self
+            .sym
+            .symbolic_stack
+            .last()
+            .copied()
+            .unwrap_or(OpRef::NONE);
+        let concrete = self
+            .sym
+            .concrete_stack
+            .last()
+            .copied()
+            .unwrap_or(ConcreteValue::Null);
         FrontendOp::new(opref, concrete)
     }
 
@@ -270,9 +275,7 @@ impl PyreMetaFrame {
             ));
         }
 
-        let Some((instruction, op_arg)) =
-            pyre_runtime::decode_instruction_at(code, self.pc)
-        else {
+        let Some((instruction, op_arg)) = pyre_runtime::decode_instruction_at(code, self.pc) else {
             return Ok(StepAction::Abort);
         };
         self.pc += 1;
@@ -304,10 +307,18 @@ impl PyreMetaFrame {
             // RPython: registers[idx] already holds the box
             Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                 let idx = var_num.get(op_arg).as_usize();
-                let concrete = self.sym.concrete_locals.get(idx).copied()
+                let concrete = self
+                    .sym
+                    .concrete_locals
+                    .get(idx)
+                    .copied()
                     .unwrap_or(ConcreteValue::Null);
                 // RPython: box is already in registers[idx]
-                let opref = self.sym.symbolic_locals.get(idx).copied()
+                let opref = self
+                    .sym
+                    .symbolic_locals
+                    .get(idx)
+                    .copied()
                     .unwrap_or(OpRef::NONE);
                 self.push(FrontendOp::new(opref, concrete));
                 Ok(StepAction::Continue)
@@ -443,18 +454,16 @@ impl PyreMetaFrame {
 
                 // RPython: execute_varargs for residual call concrete result
                 let concrete_result = match callable.concrete {
-                    ConcreteValue::Ref(obj) if !obj.is_null() => {
-                        unsafe {
-                            if pyre_runtime::is_builtin_func(obj) {
-                                let func = pyre_runtime::w_builtin_func_get(obj);
-                                let concrete_args: Vec<PyObjectRef> =
-                                    args.iter().map(|a| a.concrete.to_pyobj()).collect();
-                                ConcreteValue::from_pyobj(func(&concrete_args))
-                            } else {
-                                ConcreteValue::Null
-                            }
+                    ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
+                        if pyre_runtime::is_builtin_func(obj) {
+                            let func = pyre_runtime::w_builtin_func_get(obj);
+                            let concrete_args: Vec<PyObjectRef> =
+                                args.iter().map(|a| a.concrete.to_pyobj()).collect();
+                            ConcreteValue::from_pyobj(func(&concrete_args))
+                        } else {
+                            ConcreteValue::Null
                         }
-                    }
+                    },
                     _ => ConcreteValue::Null,
                 };
                 // TODO: proper IR recording for call
@@ -473,7 +482,10 @@ impl PyreMetaFrame {
                 let concrete_items: Vec<PyObjectRef> =
                     items.iter().map(|i| i.concrete.to_pyobj()).collect();
                 let list = pyre_runtime::build_list_from_refs(&concrete_items);
-                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::from_pyobj(list)));
+                self.push(FrontendOp::new(
+                    OpRef::NONE,
+                    ConcreteValue::from_pyobj(list),
+                ));
                 Ok(StepAction::Continue)
             }
             Instruction::BuildTuple { count } => {
@@ -486,7 +498,10 @@ impl PyreMetaFrame {
                 let concrete_items: Vec<PyObjectRef> =
                     items.iter().map(|i| i.concrete.to_pyobj()).collect();
                 let tuple = pyre_runtime::build_tuple_from_refs(&concrete_items);
-                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::from_pyobj(tuple)));
+                self.push(FrontendOp::new(
+                    OpRef::NONE,
+                    ConcreteValue::from_pyobj(tuple),
+                ));
                 Ok(StepAction::Continue)
             }
 
@@ -506,12 +521,14 @@ impl PyreMetaFrame {
             // ── Attribute ──
             Instruction::LoadAttr { namei } => {
                 let name_idx = u32::from(namei.get(op_arg)) as usize;
-                let name = code.names.get(name_idx >> 1).map(|s| s.as_ref()).unwrap_or("");
+                let name = code
+                    .names
+                    .get(name_idx >> 1)
+                    .map(|s| s.as_ref())
+                    .unwrap_or("");
                 let obj = self.pop();
-                let concrete = match pyre_objspace::space::py_getattr(
-                    obj.concrete.to_pyobj(),
-                    name,
-                ) {
+                let concrete = match pyre_objspace::space::py_getattr(obj.concrete.to_pyobj(), name)
+                {
                     Ok(v) => ConcreteValue::from_pyobj(v),
                     Err(_) => ConcreteValue::Null,
                 };
@@ -523,8 +540,18 @@ impl PyreMetaFrame {
             Instruction::Copy { i } => {
                 let depth = i.get(op_arg) as usize;
                 let idx = self.sym.concrete_stack.len().saturating_sub(depth);
-                let concrete = self.sym.concrete_stack.get(idx).copied().unwrap_or(ConcreteValue::Null);
-                let opref = self.sym.symbolic_stack.get(idx).copied().unwrap_or(OpRef::NONE);
+                let concrete = self
+                    .sym
+                    .concrete_stack
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(ConcreteValue::Null);
+                let opref = self
+                    .sym
+                    .symbolic_stack
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(OpRef::NONE);
                 self.push(FrontendOp::new(opref, concrete));
                 Ok(StepAction::Continue)
             }
@@ -591,8 +618,13 @@ impl PyreMetaFrame {
                 if continues {
                     let next_val = match iter.concrete {
                         ConcreteValue::Ref(obj) => {
-                            let v = pyre_runtime::range_iter_next_or_null(obj).unwrap_or(pyre_object::PY_NULL);
-                            if v.is_null() { ConcreteValue::Null } else { ConcreteValue::from_pyobj(v) }
+                            let v = pyre_runtime::range_iter_next_or_null(obj)
+                                .unwrap_or(pyre_object::PY_NULL);
+                            if v.is_null() {
+                                ConcreteValue::Null
+                            } else {
+                                ConcreteValue::from_pyobj(v)
+                            }
                         }
                         _ => ConcreteValue::Null,
                     };
@@ -616,7 +648,10 @@ impl PyreMetaFrame {
                 match items {
                     Ok(items) => {
                         for item in items.into_iter().rev() {
-                            self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::from_pyobj(item)));
+                            self.push(FrontendOp::new(
+                                OpRef::NONE,
+                                ConcreteValue::from_pyobj(item),
+                            ));
                         }
                     }
                     Err(_) => {
@@ -698,12 +733,16 @@ impl PyreMetaFrame {
                 let result = pyre_objspace::space::py_contains(
                     haystack.concrete.to_pyobj(),
                     needle.concrete.to_pyobj(),
-                ).unwrap_or(false);
+                )
+                .unwrap_or(false);
                 let inverted = match invert.get(op_arg) {
                     pyre_bytecode::bytecode::Invert::No => result,
                     pyre_bytecode::bytecode::Invert::Yes => !result,
                 };
-                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Int(inverted as i64)));
+                self.push(FrontendOp::new(
+                    OpRef::NONE,
+                    ConcreteValue::Int(inverted as i64),
+                ));
                 Ok(StepAction::Continue)
             }
             Instruction::IsOp { invert } => {
@@ -714,7 +753,10 @@ impl PyreMetaFrame {
                     pyre_bytecode::bytecode::Invert::No => same,
                     pyre_bytecode::bytecode::Invert::Yes => !same,
                 };
-                self.push(FrontendOp::new(OpRef::NONE, ConcreteValue::Int(result as i64)));
+                self.push(FrontendOp::new(
+                    OpRef::NONE,
+                    ConcreteValue::Int(result as i64),
+                ));
                 Ok(StepAction::Continue)
             }
 
@@ -723,8 +765,18 @@ impl PyreMetaFrame {
                 let pair = var_nums.get(op_arg);
                 let idx1 = u32::from(pair.idx_1()) as usize;
                 let idx2 = u32::from(pair.idx_2()) as usize;
-                let c1 = self.sym.concrete_locals.get(idx1).copied().unwrap_or(ConcreteValue::Null);
-                let c2 = self.sym.concrete_locals.get(idx2).copied().unwrap_or(ConcreteValue::Null);
+                let c1 = self
+                    .sym
+                    .concrete_locals
+                    .get(idx1)
+                    .copied()
+                    .unwrap_or(ConcreteValue::Null);
+                let c2 = self
+                    .sym
+                    .concrete_locals
+                    .get(idx2)
+                    .copied()
+                    .unwrap_or(ConcreteValue::Null);
                 self.push(FrontendOp::new(OpRef::NONE, c1));
                 self.push(FrontendOp::new(OpRef::NONE, c2));
                 Ok(StepAction::Continue)
@@ -737,7 +789,12 @@ impl PyreMetaFrame {
                 if store_idx < self.sym.concrete_locals.len() {
                     self.sym.concrete_locals[store_idx] = val.concrete;
                 }
-                let c = self.sym.concrete_locals.get(load_idx).copied().unwrap_or(ConcreteValue::Null);
+                let c = self
+                    .sym
+                    .concrete_locals
+                    .get(load_idx)
+                    .copied()
+                    .unwrap_or(ConcreteValue::Null);
                 self.push(FrontendOp::new(OpRef::NONE, c));
                 Ok(StepAction::Continue)
             }

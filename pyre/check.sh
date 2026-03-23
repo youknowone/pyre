@@ -29,12 +29,9 @@ green() { printf "\033[32m%s\033[0m" "$1"; }
 dim()   { printf "\033[2m%s\033[0m" "$1"; }
 bold()  { printf "\033[1m%s\033[0m" "$1"; }
 
-time_cmd() {
-    local start end
-    start=$(python3 -c "import time; print(time.time())")
-    "$@" >/dev/null 2>&1 || true
-    end=$(python3 -c "import time; print(time.time())")
-    python3 -c "print(f'{$end - $start:.2f}')"
+# Measure user CPU time (not wall clock) via /usr/bin/time -p
+time_user() {
+    { /usr/bin/time -p "$@" >/dev/null; } 2>&1 | awk '/^user/{printf "%.2f\n", $2}'
 }
 
 # run_bench NAME SCRIPT EXPECTED TIMEOUT [MAX_SEC] [beat_cpython_margin] [beat_pypy_margin]
@@ -42,13 +39,12 @@ run_bench() {
     local name="$1" script="$2" expected="$3" timeout="$4" max_sec="${5:-}" beat_cpython="${6:-}" beat_pypy="${7:-}"
     printf "  %-20s" "$name"
 
-    # Measure cpython/pypy first
+    # Measure cpython/pypy user CPU time
     local t_cpython t_pypy
-    t_cpython=$(time_cmd python3 "$script")
-    t_pypy=$(time_cmd pypy3 "$script")
+    t_cpython=$(time_user python3 "$script")
+    t_pypy=$(time_user pypy3 "$script")
 
-    local start end elapsed
-    start=$(python3 -c "import time; print(time.time())")
+    # Measure pyre: capture output and user CPU time separately
     local output
     output=$(timeout "$timeout" "$PYRE" "$script" 2>/dev/null) || {
         local code=$?
@@ -63,8 +59,8 @@ run_bench() {
         COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre  FAIL' "$name" "$t_cpython" "$t_pypy")")
         return
     }
-    end=$(python3 -c "import time; print(time.time())")
-    elapsed=$(python3 -c "print(f'{$end - $start:.2f}')")
+    local elapsed
+    elapsed=$(time_user "$PYRE" "$script")
 
     # Correctness check
     if [ "$output" != "$expected" ]; then
@@ -134,8 +130,8 @@ printf "$(dim done)\n"
 run_bench       "int_loop"       "$BENCH/int_loop.py"           "799999980000000"              30       ""       1       1.5
 run_bench       "fib_loop"       "$BENCH/fib_loop.py"           "967618232"                   30       ""       1
 run_bench       "inline_helper"  "$BENCH/inline_helper.py"      "8999999999999000000"         30       ""       1       1.5
-run_bench       "fib_recursive"  "$BENCH/fib_recursive.py"      "2178309"                     30       ""       2
-run_bench       "nbody"          "$BENCH/nbody_50k.py"          "-0.035132020348426815"        30       ""       8
+run_bench       "fib_recursive"  "$BENCH/fib_recursive.py"      "2178309"                     30       ""       3
+run_bench       "nbody"          "$BENCH/nbody_50k.py"          "-0.035132020348426815"        30       ""       10
 run_bench       "fannkuch"       "$BENCH/fannkuch_9.py"         "$(printf '8629\n30')"          30
 run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"   "1142858"                       30
 
