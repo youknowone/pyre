@@ -472,7 +472,7 @@ impl<S: JitState> JitDriver<S> {
                 if S::validate_close(sym, trace_meta) {
                     let jump_args = S::collect_jump_args(sym);
                     let meta = self.trace_meta.take().unwrap();
-                    self.meta.close_and_compile(&jump_args, meta);
+                    let _ = self.meta.close_and_compile(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!("[mp] abort:validate_close");
@@ -517,7 +517,7 @@ impl<S: JitState> JitDriver<S> {
                 };
                 if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
                     let meta = self.trace_meta.take().unwrap();
-                    self.meta.close_and_compile(&jump_args, meta);
+                    let _ = self.meta.close_and_compile(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!(
