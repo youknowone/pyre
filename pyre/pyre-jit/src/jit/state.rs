@@ -1335,6 +1335,10 @@ impl TraceFrameState {
         if top_idx < s.symbolic_stack_types.len() && other_idx < s.symbolic_stack_types.len() {
             s.symbolic_stack_types.swap(top_idx, other_idx);
         }
+        // MIFrame Box tracking: swap concrete values too
+        if top_idx < s.concrete_stack.len() && other_idx < s.concrete_stack.len() {
+            s.concrete_stack.swap(top_idx, other_idx);
+        }
         Ok(())
     }
 
@@ -4594,6 +4598,10 @@ impl NamespaceOpcodeHandler for TraceFrameState {
         let Some(slot) = concrete_namespace_slot(self.concrete_frame, name) else {
             return self.trace_load_name(name);
         };
+        // MIFrame Box tracking: set concrete value for global load
+        if let Some(cv) = concrete_namespace_value(self.concrete_frame, slot) {
+            self.sym_mut().pending_concrete_push = Some(cv);
+        }
         if let Some(concrete_value) = concrete_namespace_value(self.concrete_frame, slot) {
             unsafe {
                 if is_func(concrete_value) || is_builtin_func(concrete_value) {
@@ -4620,6 +4628,7 @@ impl NamespaceOpcodeHandler for TraceFrameState {
     }
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
+        self.sym_mut().pending_concrete_push = Some(PY_NULL);
         self.trace_null_value()
     }
 }
