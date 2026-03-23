@@ -43,7 +43,10 @@ impl TracedBox {
     }
 
     pub fn opref_only(opref: OpRef) -> Self {
-        Self { opref, concrete: ConcreteValue::Null }
+        Self {
+            opref,
+            concrete: ConcreteValue::Null,
+        }
     }
 }
 
@@ -133,6 +136,7 @@ impl ConcreteValue {
         }
     }
 }
+use pyre_interp::frame::PendingInlineResult;
 use pyre_runtime::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
@@ -741,12 +745,16 @@ pub(crate) fn concrete_namespace_value(frame: usize, idx: usize) -> Option<PyObj
 }
 
 fn namespace_slot_direct(ns: *mut PyNamespace, name: &str) -> Option<usize> {
-    if ns.is_null() { return None; }
+    if ns.is_null() {
+        return None;
+    }
     unsafe { &*ns }.slot_of(name)
 }
 
 fn namespace_value_direct(ns: *mut PyNamespace, idx: usize) -> Option<PyObjectRef> {
-    if ns.is_null() { return None; }
+    if ns.is_null() {
+        return None;
+    }
     unsafe { &*ns }.get_slot(idx)
 }
 
@@ -1108,10 +1116,18 @@ impl PyreSym {
         // MIFrame concrete Box tracking: populate concrete value arrays
         // from the concrete frame snapshot (RPython MIFrame.setup_call parity).
         self.concrete_locals = (0..nlocals)
-            .map(|i| ConcreteValue::from_pyobj(concrete_stack_value(concrete_frame, i).unwrap_or(PY_NULL)))
+            .map(|i| {
+                ConcreteValue::from_pyobj(
+                    concrete_stack_value(concrete_frame, i).unwrap_or(PY_NULL),
+                )
+            })
             .collect();
         self.concrete_stack = (0..stack_only_depth)
-            .map(|i| ConcreteValue::from_pyobj(concrete_stack_value(concrete_frame, nlocals + i).unwrap_or(PY_NULL)))
+            .map(|i| {
+                ConcreteValue::from_pyobj(
+                    concrete_stack_value(concrete_frame, nlocals + i).unwrap_or(PY_NULL),
+                )
+            })
             .collect();
         // Extract frame metadata pointers for use without concrete_frame
         if concrete_frame != 0 {
@@ -1160,10 +1176,16 @@ impl PyreSym {
     /// unified-array index (0..nlocals = locals, nlocals.. = stack).
     pub(crate) fn concrete_value_at(&self, abs_idx: usize) -> ConcreteValue {
         if abs_idx < self.nlocals {
-            self.concrete_locals.get(abs_idx).copied().unwrap_or(ConcreteValue::Null)
+            self.concrete_locals
+                .get(abs_idx)
+                .copied()
+                .unwrap_or(ConcreteValue::Null)
         } else {
             let stack_idx = abs_idx - self.nlocals;
-            self.concrete_stack.get(stack_idx).copied().unwrap_or(ConcreteValue::Null)
+            self.concrete_stack
+                .get(stack_idx)
+                .copied()
+                .unwrap_or(ConcreteValue::Null)
         }
     }
 
@@ -1180,7 +1202,9 @@ impl TraceFrameState {
         let s = self.sym();
         if s.valuestackdepth > 0 {
             let v = s.concrete_value_at(s.valuestackdepth - 1);
-            if !v.is_null() { return Some(v.to_pyobj()); }
+            if !v.is_null() {
+                return Some(v.to_pyobj());
+            }
         }
         concrete_return_value(self.concrete_frame)
     }
@@ -1359,7 +1383,10 @@ impl TraceFrameState {
         s.symbolic_stack[stack_idx] = value;
         s.symbolic_stack_types[stack_idx] = value_type;
         // MIFrame Box tracking: store concrete value alongside symbolic
-        let concrete = s.pending_concrete_push.take().unwrap_or(ConcreteValue::Null);
+        let concrete = s
+            .pending_concrete_push
+            .take()
+            .unwrap_or(ConcreteValue::Null);
         if stack_idx >= s.concrete_stack.len() {
             s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
         }
@@ -1414,7 +1441,11 @@ impl TraceFrameState {
             .copied()
             .unwrap_or(Type::Ref);
         // MIFrame Box tracking: pop concrete value from concrete_stack
-        let concrete_popped = s.concrete_stack.get(stack_idx).copied().unwrap_or(ConcreteValue::Null);
+        let concrete_popped = s
+            .concrete_stack
+            .get(stack_idx)
+            .copied()
+            .unwrap_or(ConcreteValue::Null);
         // Fall back to concrete_frame only if within snapshot's depth
         let concrete_popped_pyobj = if concrete_popped.is_null() {
             let snapshot_depth = concrete_stack_depth(concrete_frame).unwrap_or(0);
@@ -1665,11 +1696,9 @@ impl TraceFrameState {
     /// Update virtualizable next_instr and valuestackdepth before guards / loop close.
     /// Locals and stack are carried through JUMP args (virtualizable), not flushed to heap.
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
-        let concrete_frame_ptr = self.concrete_frame;
-        let concrete_next_instr =
-            unsafe { (*(concrete_frame_ptr as *const pyre_interp::frame::PyFrame)).next_instr };
+        let fallthrough = self.fallthrough_pc;
         let s = self.sym_mut();
-        let pending_pc = s.pending_next_instr.take().or(Some(concrete_next_instr));
+        let pending_pc = s.pending_next_instr.take().or(Some(fallthrough));
         if let Some(pc) = pending_pc {
             s.vable_next_instr = ctx.const_int(pc as i64);
         }
@@ -4711,7 +4740,11 @@ impl SharedOpcodeHandler for TraceFrameState {
         let s = self.sym();
         let stack_idx = s.valuestackdepth.checked_sub(s.nlocals + depth + 1);
         if let Some(idx) = stack_idx {
-            let concrete = s.concrete_stack.get(idx).copied().unwrap_or(ConcreteValue::Null);
+            let concrete = s
+                .concrete_stack
+                .get(idx)
+                .copied()
+                .unwrap_or(ConcreteValue::Null);
             self.sym_mut().pending_concrete_push = Some(concrete);
         }
         self.with_ctx(|this, ctx| TraceFrameState::peek_value(this, ctx, depth))
@@ -4745,7 +4778,8 @@ impl SharedOpcodeHandler for TraceFrameState {
                     if pyre_runtime::is_builtin_func(concrete_callable) {
                         let func = pyre_runtime::w_builtin_func_get(concrete_callable);
                         let result = func(&concrete_args);
-                        self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(result));
+                        self.sym_mut().pending_concrete_push =
+                            Some(ConcreteValue::from_pyobj(result));
                     } else if pyre_runtime::is_func(concrete_callable) {
                         // User-defined function: call via plain interpreter
                         // to get concrete result without JIT re-entry.
@@ -4767,7 +4801,8 @@ impl SharedOpcodeHandler for TraceFrameState {
                             );
                             CONCRETE_CALL_DEPTH.with(|d| d.set(depth));
                             if let Ok(result) = result {
-                                self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(result));
+                                self.sym_mut().pending_concrete_push =
+                                    Some(ConcreteValue::from_pyobj(result));
                             }
                         }
                     }
@@ -4870,7 +4905,12 @@ impl SharedOpcodeHandler for TraceFrameState {
 impl LocalOpcodeHandler for TraceFrameState {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
         // MIFrame Box tracking: set pending concrete from concrete_locals
-        let concrete = self.sym().concrete_locals.get(idx).copied().unwrap_or(ConcreteValue::Null);
+        let concrete = self
+            .sym()
+            .concrete_locals
+            .get(idx)
+            .copied()
+            .unwrap_or(ConcreteValue::Null);
         self.sym_mut().pending_concrete_push = Some(concrete);
         self.with_ctx(|this, ctx| TraceFrameState::load_local_value(this, ctx, idx))
     }
@@ -4878,7 +4918,12 @@ impl LocalOpcodeHandler for TraceFrameState {
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
         let _ = name;
         // MIFrame Box tracking: set pending concrete from concrete_locals
-        let concrete = self.sym().concrete_locals.get(idx).copied().unwrap_or(ConcreteValue::Null);
+        let concrete = self
+            .sym()
+            .concrete_locals
+            .get(idx)
+            .copied()
+            .unwrap_or(ConcreteValue::Null);
         self.sym_mut().pending_concrete_push = Some(concrete);
         let value = self.with_ctx(|this, ctx| TraceFrameState::load_local_value(this, ctx, idx))?;
         if self.value_type(value) == Type::Ref {
@@ -4891,7 +4936,9 @@ impl LocalOpcodeHandler for TraceFrameState {
 
     fn store_local_value(&mut self, idx: usize, value: Self::Value) -> Result<(), PyError> {
         // MIFrame Box tracking: update concrete_locals from last popped value
-        let concrete = self.sym().last_popped_concrete_value
+        let concrete = self
+            .sym()
+            .last_popped_concrete_value
             .map(ConcreteValue::from_pyobj)
             .unwrap_or(ConcreteValue::Null);
         if idx < self.sym().concrete_locals.len() {
@@ -5002,7 +5049,11 @@ impl TruthOpcodeHandler for TraceFrameState {
     ) -> Result<Self::Value, PyError> {
         // MIFrame Box tracking: compute concrete bool from truth
         if let Some(concrete_truth) = self.sym().last_comparison_concrete_truth {
-            let result = if negate { !concrete_truth } else { concrete_truth };
+            let result = if negate {
+                !concrete_truth
+            } else {
+                concrete_truth
+            };
             self.sym_mut().pending_concrete_push = Some(ConcreteValue::Int(result as i64));
         }
         self.trace_bool_value_from_truth(truth, negate)
@@ -5127,7 +5178,12 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
                         }
                         _ => f64::NAN,
                     };
-                    if !result.is_nan() || matches!(op, BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide) {
+                    if !result.is_nan()
+                        || matches!(
+                            op,
+                            BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide
+                        )
+                    {
                         self.sym_mut().pending_concrete_push = Some(ConcreteValue::Float(result));
                     }
                 }
@@ -5249,7 +5305,8 @@ impl ConstantOpcodeHandler for TraceFrameState {
     }
 
     fn bigint_constant(&mut self, value: &PyBigInt) -> Result<Self::Value, PyError> {
-        self.sym_mut().pending_concrete_push = Some(ConcreteValue::Ref(pyre_object::w_long_new(value.clone())));
+        self.sym_mut().pending_concrete_push =
+            Some(ConcreteValue::Ref(pyre_object::w_long_new(value.clone())));
         self.trace_bigint_constant(value)
     }
 
@@ -5264,7 +5321,8 @@ impl ConstantOpcodeHandler for TraceFrameState {
     }
 
     fn str_constant(&mut self, value: &str) -> Result<Self::Value, PyError> {
-        self.sym_mut().pending_concrete_push = Some(ConcreteValue::Ref(pyre_object::w_str_new(value)));
+        self.sym_mut().pending_concrete_push =
+            Some(ConcreteValue::Ref(pyre_object::w_str_new(value)));
         self.trace_str_constant(value)
     }
 
