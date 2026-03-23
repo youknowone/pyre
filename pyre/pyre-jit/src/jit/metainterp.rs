@@ -167,6 +167,38 @@ impl PyreMetaInterp {
             StepAction::ChangeFrame
         }
     }
+
+    /// RPython MetaInterp.generate_guard() parity (pyjitpl.py:2552).
+    ///
+    /// Record a guard operation and capture resume data from the framestack.
+    /// RPython MetaInterp.generate_guard() parity (pyjitpl.py:2552).
+    ///
+    /// Record a guard operation and capture resume data from the framestack.
+    /// TODO: proper fail_descr integration when TraceCtx API is extended.
+    pub fn generate_guard(
+        &self,
+        _ctx: &mut TraceCtx,
+        _opcode: majit_ir::OpCode,
+        _args: &[OpRef],
+    ) {
+        // Placeholder — guard recording requires fail_descr creation
+        // which depends on TraceCtx internal API. Will be wired up when
+        // PyreMetaInterp replaces TraceFrameState as the active tracer.
+        let _fail_args = self.capture_resumedata();
+    }
+
+    /// RPython MetaInterp.capture_resumedata() parity (pyjitpl.py:2580).
+    ///
+    /// Collect live boxes from all frames in the framestack for guard recovery.
+    fn capture_resumedata(&self) -> Vec<OpRef> {
+        let mut fail_args = Vec::new();
+        for frame in &self.framestack {
+            // RPython get_list_of_active_boxes: all live registers
+            fail_args.extend(frame.sym.symbolic_locals.iter().copied());
+            fail_args.extend(frame.sym.symbolic_stack.iter().copied());
+        }
+        fail_args
+    }
 }
 
 impl PyreMetaFrame {
