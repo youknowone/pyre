@@ -366,16 +366,7 @@ fn can_enter_jit_hook(
     info: &majit_meta::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    // Early exit for blacklisted keys: avoid build_jit_state + build_meta overhead.
     let has_compiled = driver.has_compiled_loop(green_key);
-    if !has_compiled
-        && !driver
-            .meta_interp()
-            .warm_state_ref()
-            .counter_would_fire(green_key)
-    {
-        return None;
-    }
     let mut jit_state = build_jit_state(frame, info);
     if majit_meta::majit_log_enabled() {
         eprintln!(
@@ -401,13 +392,18 @@ fn can_enter_jit_hook(
         if stack_almost_full() {
             return None;
         }
-        driver.back_edge_or_run_compiled_keyed(
+        let was_tracing = driver.is_tracing();
+        let result = driver.back_edge_or_run_compiled_keyed(
             green_key,
             loop_header_pc,
             &mut jit_state,
             env,
             || {},
-        )
+        );
+        if !was_tracing && driver.is_tracing() {
+            JIT_TRACING_DEPTH.with(|d| d.set(JIT_CALL_DEPTH.with(|c| c.get())));
+        }
+        result
     } else {
         None
     };
@@ -591,6 +587,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         );
     }
     driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
+    if driver.is_tracing() {
+        // RPython warmstate.py:429 decay_all_counters:
+        // called once after tracing starts to prevent burst compilation.
+        driver.meta_interp_mut().warm_state_mut().decay_counters();
+    }
     None
 }
 
