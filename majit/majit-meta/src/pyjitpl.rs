@@ -1501,6 +1501,12 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let num_ops_before = trace.ops.len();
+        let num_trace_inputargs = trace.inputargs.len();
+
+        // Save trace_ops + constants snapshot for potential unroll-free retry
+        // (pyjitpl.py:3016-3021).
+        let trace_ops_snapshot = trace_ops.clone();
+        let constants_snapshot = constants.clone();
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
@@ -1519,7 +1525,7 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0);
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
-        unroll_opt.constant_types = constant_types;
+        unroll_opt.constant_types = constant_types.clone();
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
@@ -1528,8 +1534,8 @@ impl<M: Clone> MetaInterp<M> {
             unroll_opt.optimize_trace_with_constants_and_inputs_vable(
                 &trace_ops,
                 &mut constants,
-                trace.inputargs.len(),
-                vable_config,
+                num_trace_inputargs,
+                vable_config.clone(),
             )
         }));
         let (optimized_ops, final_num_inputs) = match optimize_result {
@@ -1545,11 +1551,47 @@ impl<M: Clone> MetaInterp<M> {
                             green_key
                         );
                     }
-                    self.warm_state.abort_tracing(green_key, false);
-                    self.warm_state.reset_function_counts();
-                    return CompileOutcome::Cancelled;
+                    self.cancel_count += 1;
+                    // pyjitpl.py:3015-3021: if cancelled too many times,
+                    // try one last time without unrolling.
+                    if self.cancelled_too_many_times() {
+                        let mut retry_constants = constants_snapshot;
+                        let mut simple_opt = Optimizer::default_pipeline();
+                        simple_opt.constant_types = constant_types;
+                        let retry_result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                simple_opt.optimize_with_constants_and_inputs(
+                                    &trace_ops_snapshot,
+                                    &mut retry_constants,
+                                    num_trace_inputargs,
+                                )
+                            }));
+                        match retry_result {
+                            Ok(retry_ops) => {
+                                if crate::majit_log_enabled() {
+                                    eprintln!(
+                                        "[jit] retry without unroll succeeded at key={}",
+                                        green_key
+                                    );
+                                }
+                                constants = retry_constants;
+                                let ni = simple_opt.final_num_inputs();
+                                (retry_ops, ni)
+                            }
+                            Err(_) => {
+                                self.warm_state.abort_tracing(green_key, false);
+                                self.warm_state.reset_function_counts();
+                                return CompileOutcome::Aborted;
+                            }
+                        }
+                    } else {
+                        self.warm_state.abort_tracing(green_key, false);
+                        self.warm_state.reset_function_counts();
+                        return CompileOutcome::Cancelled;
+                    }
+                } else {
+                    std::panic::resume_unwind(payload);
                 }
-                std::panic::resume_unwind(payload);
             }
         };
         let num_ops_after = optimized_ops.len();
@@ -1570,6 +1612,7 @@ impl<M: Clone> MetaInterp<M> {
                         expected, actual,
                     );
                 }
+                self.cancel_count += 1;
                 self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
             }
@@ -1613,6 +1656,7 @@ impl<M: Clone> MetaInterp<M> {
                 eprintln!("[jit] abort: guardless loop (no interrupt support)");
             }
             self.warm_state.abort_tracing(green_key, true);
+            self.cancel_count += 1;
             self.warm_state.reset_function_counts();
             return CompileOutcome::Cancelled;
         }
@@ -1651,6 +1695,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // RPython: backend failure is non-permanent — allow retry.
                 self.warm_state.abort_tracing(green_key, false);
+                self.cancel_count += 1;
                 self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
             }
@@ -1763,6 +1808,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // RPython: backend compilation failure is non-permanent.
                 self.warm_state.abort_tracing(green_key, false);
+                self.cancel_count += 1;
                 self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
             }
