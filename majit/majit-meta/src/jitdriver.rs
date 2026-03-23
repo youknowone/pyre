@@ -62,6 +62,9 @@ pub struct JitDriverStaticData {
     pub vars: Vec<JitDriverVar>,
     /// Optional name of the virtualizable red variable.
     pub virtualizable: Option<String>,
+    /// warmspot.py:449 jd.result_type — portal function return type.
+    /// Determined once at driver setup from the portal's return signature.
+    pub result_type: Type,
 }
 
 impl JitDriverStaticData {
@@ -86,6 +89,7 @@ impl JitDriverStaticData {
         JitDriverStaticData {
             vars,
             virtualizable: virtualizable.map(str::to_string),
+            result_type: Type::Ref,
         }
     }
 
@@ -1562,7 +1566,12 @@ impl<S: JitState> JitDriver<S> {
         self.meta.clear_compiled_loops();
     }
 
-    /// Whether the compiled finish for this loop exits with a raw int.
+    /// warmspot.py:449 — set the per-driver result_type.
+    pub fn set_result_type(&mut self, tp: Type) {
+        self.meta.set_result_type(tp);
+    }
+
+    /// warmstate.py:385 — whether this driver's portal returns a raw int.
     pub fn has_raw_int_finish(&self, green_key: u64) -> bool {
         self.meta.has_raw_int_finish(green_key)
     }

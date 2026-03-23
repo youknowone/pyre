@@ -3563,8 +3563,7 @@ impl TraceFrameState {
                                     &[callee_frame],
                                 );
                                 let result = if inline_framestack_active
-                                    && (driver.has_raw_int_finish(callee_key)
-                                        || crate::eval::has_finish_protocol_hint(callee_key))
+                                    && driver.has_raw_int_finish(callee_key)
                                 {
                                     box_traced_raw_int(ctx, result)
                                 } else {
@@ -4402,10 +4401,6 @@ pub(crate) fn trace_step_result_to_action(
                     }
                 }
             };
-            crate::eval::note_finish_protocol_hint(
-                state.ctx().green_key(),
-                matches!(finish_type, Type::Int),
-            );
             TraceAction::Finish {
                 finish_args: vec![finish_value],
                 finish_arg_types: vec![finish_type],
@@ -4417,10 +4412,6 @@ pub(crate) fn trace_step_result_to_action(
                 Type::Float => Type::Float,
                 Type::Ref | Type::Void => Type::Ref,
             };
-            crate::eval::note_finish_protocol_hint(
-                state.ctx().green_key(),
-                matches!(finish_type, Type::Int),
-            );
             TraceAction::Finish {
                 finish_args: vec![value],
                 finish_arg_types: vec![finish_type],

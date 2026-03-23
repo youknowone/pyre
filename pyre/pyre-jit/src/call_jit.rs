@@ -40,7 +40,7 @@ enum FinishProtocol {
 #[inline]
 fn finish_protocol(green_key: u64) -> FinishProtocol {
     let (driver, _) = crate::eval::driver_pair();
-    if driver.has_raw_int_finish(green_key) || crate::eval::has_finish_protocol_hint(green_key) {
+    if driver.has_raw_int_finish(green_key) {
         FinishProtocol::RawInt
     } else {
         FinishProtocol::Boxed

@@ -243,8 +243,8 @@ pub struct MetaInterp<M: Clone> {
     /// RPython parity: standard virtualizable that was just forced via
     /// `hint_force_virtualizable` / `gen_store_back_in_vable`.
     pub(crate) forced_virtualizable: Option<OpRef>,
-    /// Green keys whose compiled Finish returns a raw int (not a boxed pointer).
-    pub(crate) raw_int_finish_keys: HashSet<u64>,
+    /// warmspot.py:449 jd.result_type — per-driver static result type.
+    pub(crate) result_type: Type,
     /// Helper function pointers that box raw ints into interpreter objects.
     pub(crate) raw_int_box_helpers: HashSet<i64>,
     /// Helper function pointers that take a raw int argument and return a
@@ -542,13 +542,19 @@ impl<M: Clone> MetaInterp<M> {
             vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
             forced_virtualizable: None,
-            raw_int_finish_keys: HashSet::new(),
+            result_type: Type::Ref,
             raw_int_box_helpers: HashSet::new(),
             raw_int_force_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
         }
+    }
+
+    /// warmspot.py:449 — set the per-driver result_type from the portal
+    /// function's return signature. Called once during driver setup.
+    pub fn set_result_type(&mut self, tp: Type) {
+        self.result_type = tp;
     }
 
     /// Cache the current virtualizable object pointer for trace-entry setup.
@@ -1717,11 +1723,6 @@ impl<M: Clone> MetaInterp<M> {
         // while recursive call boundaries can consume the raw int directly.
         let (optimized_ops, finish_unboxed) =
             compile::unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers);
-        if finish_unboxed {
-            self.raw_int_finish_keys.insert(green_key);
-        } else {
-            self.raw_int_finish_keys.remove(&green_key);
-        }
         let optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
         let optimized_ops = if finish_unboxed {
             compile::unbox_raw_force_results(optimized_ops, &constants, &self.raw_int_force_helpers)
@@ -2727,7 +2728,6 @@ impl<M: Clone> MetaInterp<M> {
     pub fn invalidate_loop(&mut self, green_key: u64) {
         if let Some(compiled) = self.compiled_loops.get(&green_key) {
             compiled.token.invalidate();
-            self.raw_int_finish_keys.remove(&green_key);
             if crate::majit_log_enabled() {
                 eprintln!("[jit] invalidated loop at key={}", green_key);
             }
@@ -2797,9 +2797,9 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.keys().copied().collect()
     }
 
-    /// Whether the compiled Finish for this green_key returns a raw int.
-    pub fn has_raw_int_finish(&self, green_key: u64) -> bool {
-        self.raw_int_finish_keys.contains(&green_key)
+    /// warmstate.py:385 — whether this driver's portal returns a raw int.
+    pub fn has_raw_int_finish(&self, _green_key: u64) -> bool {
+        self.result_type == Type::Int
     }
 
     /// Check whether a guard in a specific compiled trace should get a bridge.
@@ -3137,9 +3137,6 @@ impl<M: Clone> MetaInterp<M> {
         // (call_assembler_fast_path) expects raw ints for [Type::Int] Finish.
         let (optimized_ops, bridge_finish_unboxed) =
             compile::unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers);
-        if bridge_finish_unboxed {
-            self.raw_int_finish_keys.insert(green_key);
-        }
         let optimized_ops = if bridge_finish_unboxed {
             compile::unbox_raw_force_results(optimized_ops, &constants, &self.raw_int_force_helpers)
         } else {
