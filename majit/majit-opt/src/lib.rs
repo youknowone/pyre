@@ -751,23 +751,17 @@ impl OptContext {
     /// RPython Box identity: set per-value forwarding for import_state.
     /// This does NOT use the flat forwarding table, preventing chains.
     pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
-        self.import_boxes.insert(source, target);
-        // Sync: import_boxes → forwarded Op.
-        let idx = source.0 as usize;
-        if idx >= self.forwarded.len() {
-            self.forwarded.resize(idx + 1, Forwarded::None);
-        }
-        self.forwarded[idx] = Forwarded::Op(target);
+        // Use replace_op: forwarding[source] = target.
+        // With ptr_info stop in get_replacement, import_boxes is no longer
+        // needed — target has ptr_info set by apply_exported_info, so
+        // get_replacement(source) → target (stops at ptr_info).
+        self.replace_op(source, target);
     }
 
     /// RPython get_box_replacement: follow forwarding chain, stop when the
     /// NEXT position has ptr_info set (it's a terminal, like RPython's
     /// get_box_replacement stopping at _forwarded=Info).
     pub fn get_replacement(&self, mut opref: OpRef) -> OpRef {
-        // RPython Box identity: import_boxes checked first.
-        if let Some(&target) = self.import_boxes.get(&opref) {
-            return target;
-        }
         loop {
             let idx = opref.0 as usize;
             if idx >= self.forwarding.len() {
