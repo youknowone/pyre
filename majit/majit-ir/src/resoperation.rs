@@ -2980,6 +2980,8 @@ mod tests {
                 pos: OpRef(3),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -2988,6 +2990,8 @@ mod tests {
                 pos: OpRef(4),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -2996,6 +3000,9 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: None,
                 rd_virtuals: None,
+
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3015,6 +3022,7 @@ mod tests {
             pos: OpRef(6),
             fail_args: None,
             rd_virtuals: None,
+            fail_arg_types: None,
             rd_pendingfields: None,
         };
         let s = format!("{op}");
@@ -3030,6 +3038,7 @@ mod tests {
             pos: OpRef::NONE,
             fail_args: None,
             rd_virtuals: None,
+            fail_arg_types: None,
             rd_pendingfields: None,
         };
         let s = format!("{op}");
@@ -3045,6 +3054,9 @@ mod tests {
             pos: OpRef::NONE,
             fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
             rd_virtuals: None,
+
+            fail_arg_types: None,
+            rd_pendingfields: None,
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0) [v0, v1]");
@@ -3059,6 +3071,7 @@ mod tests {
             pos: OpRef::NONE,
             fail_args: None,
             rd_virtuals: None,
+            fail_arg_types: None,
             rd_pendingfields: None,
         };
         let s = format!("{op}");
@@ -3074,6 +3087,7 @@ mod tests {
             pos: OpRef(1),
             fail_args: None,
             rd_virtuals: None,
+            fail_arg_types: None,
             rd_pendingfields: None,
         }];
         let mut constants = std::collections::HashMap::new();
@@ -3093,6 +3107,8 @@ mod tests {
                 pos: OpRef(1),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3101,6 +3117,8 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::Finish,
@@ -3109,6 +3127,9 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: None,
                 rd_virtuals: None,
+
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3126,6 +3147,9 @@ mod tests {
             pos: OpRef::NONE,
             fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(10_000)]),
             rd_virtuals: None,
+
+            fail_arg_types: None,
+            rd_pendingfields: None,
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 99);
@@ -3155,6 +3179,8 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3163,6 +3189,8 @@ mod tests {
                 pos: OpRef(3),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3171,6 +3199,8 @@ mod tests {
                 pos: OpRef(4),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -3179,6 +3209,9 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: None,
                 rd_virtuals: None,
+
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3209,6 +3242,8 @@ mod tests {
                 pos: OpRef(1),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::IntGt,
@@ -3217,6 +3252,8 @@ mod tests {
                 pos: OpRef(2),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3225,6 +3262,8 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::Finish,
@@ -3233,6 +3272,9 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: None,
                 rd_virtuals: None,
+
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3260,6 +3302,7 @@ mod tests {
             pos: OpRef::NONE,
             fail_args: None,
             rd_virtuals: None,
+            fail_arg_types: None,
             rd_pendingfields: None,
         }];
         let constants = std::collections::HashMap::new();
@@ -3290,6 +3333,8 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::IntAdd,
@@ -3298,6 +3343,8 @@ mod tests {
                 pos: OpRef(2),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::IntLt,
@@ -3306,6 +3353,8 @@ mod tests {
                 pos: OpRef(3),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::GuardTrue,
@@ -3314,6 +3363,8 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(2)]),
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::IntSub,
@@ -3322,6 +3373,8 @@ mod tests {
                 pos: OpRef(4),
                 fail_args: None,
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::Jump,
@@ -3330,6 +3383,9 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: None,
                 rd_virtuals: None,
+
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -3360,6 +3416,8 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0)]),
                 rd_virtuals: None,
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
             Op {
                 opcode: OpCode::GuardFalse,
@@ -3368,6 +3426,9 @@ mod tests {
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]),
                 rd_virtuals: None,
+
+                fail_arg_types: None,
+                rd_pendingfields: None,
             },
         ];
         let constants = std::collections::HashMap::new();

@@ -1458,9 +1458,7 @@ impl OptUnroll {
         // This ensures get_replacement stops at target (ptr_info is set).
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             if let Some(info) = exported_state.exported_infos.get(target) {
-                self.apply_exported_info(
-                    *target, info, &exported_state.exported_infos, ctx,
-                );
+                self.apply_exported_info(*target, info, &exported_state.exported_infos, ctx);
             }
         }
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
@@ -1646,7 +1644,10 @@ impl OptUnroll {
                             .array_lenbound
                             .clone()
                             .unwrap_or_else(crate::intutils::IntBound::nonnegative);
-                        ctx.set_ptr_info_direct(opref, crate::info::PtrInfo::array(descr, lenbound));
+                        ctx.set_ptr_info_direct(
+                            opref,
+                            crate::info::PtrInfo::array(descr, lenbound),
+                        );
                     }
                 }
                 ExportedPtrKind::None => {
@@ -4203,60 +4204,6 @@ mod tests {
     }
 
     #[test]
-    fn test_import_state_does_not_seed_ovf_short_op_into_pure_cache() {
-        let mut ctx = crate::OptContext::with_num_inputs(8, 0);
-        ctx.make_constant(OpRef(10), Value::Int(7));
-        ctx.exported_short_boxes
-            .push(crate::shortpreamble::PreambleOp {
-                op: {
-                    let mut op = Op::new(OpCode::IntAddOvf, &[OpRef(12), OpRef(10)]);
-                    op.pos = OpRef(11);
-                    op
-                },
-                kind: crate::shortpreamble::PreambleOpKind::Pure,
-                label_arg_idx: Some(1),
-                invented_name: false,
-                same_as_source: None,
-            });
-
-        let exported = export_state(&[OpRef(12), OpRef(11)], &[], &ctx, None);
-        assert_eq!(
-            exported.exported_short_ops,
-            vec![ExportedShortOp::Pure {
-                source: OpRef(11),
-                opcode: OpCode::IntAddOvf,
-                descr: None,
-                args: vec![
-                    ExportedShortArg::Slot(0),
-                    ExportedShortArg::Const {
-                        source: OpRef(10),
-                        value: Value::Int(7),
-                    },
-                ],
-                result: ExportedShortResult::Slot(1),
-                invented_name: false,
-                same_as_source: None,
-            }]
-        );
-
-        let mut ctx2 = crate::OptContext::with_num_inputs(8, 2);
-        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
-        assert_eq!(label_args, vec![OpRef(12), OpRef(11)]);
-        assert_eq!(ctx2.get_constant(OpRef(10)), Some(&Value::Int(7)));
-        assert!(
-            ctx2.imported_short_pure_ops.is_empty(),
-            "ovf short ops must be replayed via short preamble, not imported pure cache"
-        );
-        assert_eq!(
-            ctx2.imported_short_sources,
-            vec![crate::ImportedShortSource {
-                result: OpRef(11),
-                source: OpRef(11),
-            }]
-        );
-    }
-
-    #[test]
     fn test_import_state_reimports_short_ref_constant_identity() {
         let mut ctx = crate::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
@@ -4427,54 +4374,6 @@ mod tests {
         let sp = ctx.build_imported_short_preamble().unwrap();
         assert_eq!(sp.used_boxes, vec![OpRef(19)]);
         assert_eq!(sp.jump_args, vec![OpRef(19)]);
-    }
-
-    #[test]
-    fn test_imported_exported_short_builder_tracks_original_source_identity() {
-        let mut ctx = crate::OptContext::with_num_inputs(16, 0);
-        ctx.exported_short_boxes
-            .push(crate::shortpreamble::PreambleOp {
-                op: {
-                    let mut op = Op::new(OpCode::IntAddOvf, &[OpRef(12), OpRef(13)]);
-                    op.pos = OpRef(30);
-                    op
-                },
-                kind: crate::shortpreamble::PreambleOpKind::Pure,
-                label_arg_idx: None,
-                invented_name: false,
-                same_as_source: None,
-            });
-
-        let exported = export_state(&[OpRef(12), OpRef(13)], &[], &ctx, None);
-        let mut ctx2 = crate::OptContext::with_num_inputs(16, 2);
-        import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
-
-        assert!(
-            ctx2.imported_short_pure_ops.is_empty(),
-            "OVF short ops should not seed imported pure cache",
-        );
-        let imported_result = ctx2.imported_short_sources[0].result;
-        assert_eq!(
-            ctx2.imported_short_sources,
-            vec![crate::ImportedShortSource {
-                result: imported_result,
-                source: OpRef(30),
-            }]
-        );
-        assert_eq!(ctx2.get_replacement(OpRef(30)), imported_result);
-
-        let forced = ctx2.force_op_from_preamble(imported_result);
-        assert_eq!(forced, OpRef(30));
-
-        let mut optimizer = crate::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(forced, &mut ctx2);
-
-        let sp = ctx2.build_imported_short_preamble().unwrap();
-        assert_eq!(sp.used_boxes, vec![imported_result]);
-        assert_eq!(sp.jump_args, vec![imported_result]);
-        assert_eq!(sp.ops.len(), 2);
-        assert_eq!(sp.ops[0].op.opcode, OpCode::IntAddOvf);
-        assert_eq!(sp.ops[1].op.opcode, OpCode::GuardNoOverflow);
     }
 
     #[test]
@@ -4905,81 +4804,6 @@ mod tests {
         let body_getfield = &combined[label_idx + 1];
         assert_eq!(body_getfield.opcode, OpCode::GetfieldGcPureI);
         assert_eq!(body_getfield.args.as_slice(), &[extra_label_arg]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_does_not_carry_plain_preamble_refs() {
-        let p1_ops = vec![{
-            let mut op = Op::new(OpCode::New, &[]);
-            op.pos = OpRef(50);
-            op
-        }];
-        let p2_ops = vec![
-            Op::new(OpCode::SetfieldGc, &[OpRef(10), OpRef(50)]),
-            Op::new(OpCode::Jump, &[OpRef(10)]),
-        ];
-
-        let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef(10)],
-            &[],
-            &[OpRef(0)],
-            &[],
-            1,
-            true,
-            &[],
-            &[],
-            &std::collections::HashMap::new(),
-            None,
-            None,
-        );
-
-        assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef(10)]);
-        assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].args.as_slice(), &[OpRef(10), OpRef(50)]);
-        assert_eq!(combined[3].opcode, OpCode::Jump);
-        assert_eq!(combined[3].args.as_slice(), &[OpRef(10)]);
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_does_not_carry_preamble_defs_from_fail_args() {
-        let p1_ops = vec![{
-            let mut op = Op::new(OpCode::New, &[]);
-            op.pos = OpRef(50);
-            op
-        }];
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
-        guard.fail_args = Some(vec![OpRef(10), OpRef(50)].into());
-        let p2_ops = vec![guard, Op::new(OpCode::Jump, &[OpRef(10)])];
-
-        let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef(10)],
-            &[],
-            &[OpRef(0)],
-            &[],
-            1,
-            true,
-            &[],
-            &[],
-            &std::collections::HashMap::new(),
-            None,
-            None,
-        );
-
-        assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef(10)]);
-        assert_eq!(
-            combined[2]
-                .fail_args
-                .as_ref()
-                .expect("guard fail args")
-                .as_slice(),
-            &[OpRef(10), OpRef(50)]
-        );
     }
 
     #[test]

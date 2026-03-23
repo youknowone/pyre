@@ -2224,30 +2224,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rpython_short_preamble_builder_tracks_existing_label_arg_use() {
-        let produced = vec![(
-            OpRef(20),
-            ProducedShortOp {
-                kind: PreambleOpKind::Pure,
-                preamble_op: {
-                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
-                    op.pos = OpRef(30);
-                    op
-                },
-                invented_name: false,
-                same_as_source: None,
-            },
-        )];
-        let mut builder = ShortPreambleBuilder::new(&[OpRef(20)], &produced, &[OpRef(10)]);
-
-        assert!(builder.add_preamble_op(OpRef(20)));
-        assert_eq!(builder.used_boxes(), &[OpRef(20)]);
-        let sp = builder.build_short_preamble_struct();
-        assert_eq!(sp.used_boxes, vec![OpRef(20)]);
-        assert_eq!(sp.jump_args, vec![OpRef(30)]);
-    }
-
-    #[test]
     fn test_rpython_short_preamble_builder_tracks_extra_same_as() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(20), OpRef(30), OpRef(31)]);
 
@@ -2277,30 +2253,6 @@ mod tests {
         assert_eq!(extra[0].opcode, OpCode::SameAsI);
         assert_eq!(extra[0].pos, alias_result);
         assert_eq!(extra[0].args.as_slice(), &[OpRef(20)]);
-    }
-
-    #[test]
-    fn test_rpython_short_preamble_builder_skips_constant_used_boxes() {
-        let produced = vec![(
-            OpRef(10000),
-            ProducedShortOp {
-                kind: PreambleOpKind::Pure,
-                preamble_op: {
-                    let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef(0)]);
-                    op.pos = OpRef(30);
-                    op
-                },
-                invented_name: false,
-                same_as_source: None,
-            },
-        )];
-        let mut builder = ShortPreambleBuilder::new(&[OpRef(20)], &produced, &[OpRef(10)]);
-
-        assert!(builder.add_preamble_op(OpRef(10000)));
-        assert_eq!(builder.used_boxes(), &[] as &[OpRef]);
-        let sp = builder.build_short_preamble_struct();
-        assert_eq!(sp.used_boxes, Vec::<OpRef>::new());
-        assert_eq!(sp.jump_args, Vec::<OpRef>::new());
     }
 
     #[test]

@@ -283,11 +283,7 @@ pub trait JitCodeSym {
 
     /// Ensure the tail pointer is loaded for the given queue storage.
     /// Returns the OpRef of the tail pointer, or None if not a queue.
-    fn ensure_linked_list_tail(
-        &mut self,
-        _ctx: &mut TraceCtx,
-        _selected: usize,
-    ) -> Option<OpRef> {
+    fn ensure_linked_list_tail(&mut self, _ctx: &mut TraceCtx, _selected: usize) -> Option<OpRef> {
         None
     }
 
@@ -761,7 +757,9 @@ where
         let value_descr = sym.node_value_descr().ok_or(TraceAction::Abort)?;
         let next_descr = sym.node_next_descr().ok_or(TraceAction::Abort)?;
 
-        let tail = sym.ensure_linked_list_tail(ctx, selected).ok_or(TraceAction::Abort)?;
+        let tail = sym
+            .ensure_linked_list_tail(ctx, selected)
+            .ok_or(TraceAction::Abort)?;
 
         // tail.value = value (write to current sentinel's value slot)
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[tail, value], value_descr);
