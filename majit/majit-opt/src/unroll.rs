@@ -2347,18 +2347,16 @@ fn assemble_peeled_trace_with_jump_args(
         .iter()
         .map(|s| (s.result, s.source))
         .collect();
-    // Use a separate position counter for extra SameAs ops, starting after
-    // label_pos to avoid colliding with it or with imported_short_aliases.
-    // Do NOT modify max_pos — it's used by body-use-before-def below and
-    // changing it breaks int loops where no extra SameAs is generated.
-    let mut extra_pos = next_free_pos(label_pos.saturating_add(1));
+    // RPython compile.py:327: extra_same_as ops are placed sequentially
+    // in the flat operations array between preamble and label. Position =
+    // array index, so a single sequential counter prevents collision.
     for &arg in &filtered_extra_label_args {
         let mapped = alias_remap.get(&arg).copied().unwrap_or(arg);
         if !preamble_defs.contains(&mapped) {
             if let Some(&source) = short_source_map.get(&arg) {
                 if preamble_defs.contains(&source) {
-                    let pos = OpRef(extra_pos);
-                    extra_pos = next_free_pos(extra_pos.saturating_add(1));
+                    let pos = OpRef(max_pos);
+                    max_pos = next_free_pos(max_pos.saturating_add(1));
                     let mut op = Op::new(OpCode::SameAsI, &[source]);
                     op.pos = pos;
                     alias_remap.insert(arg, pos);
