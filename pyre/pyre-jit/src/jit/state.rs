@@ -2172,6 +2172,10 @@ impl TraceFrameState {
         let Some((concrete_obj, concrete_key)) = self.concrete_binary_operands() else {
             return self.trace_binary_value(a, b, BinaryOperator::Subscr);
         };
+        // MIFrame Box tracking: compute concrete subscr result
+        if let Ok(result) = pyre_objspace::space::py_getitem(concrete_obj, concrete_key) {
+            self.sym_mut().pending_concrete_push = Some(result);
+        }
 
         unsafe {
             if is_int(concrete_key) {
@@ -4594,10 +4598,30 @@ impl SharedOpcodeHandler for TraceFrameState {
     }
 
     fn build_list(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: build concrete list from concrete stack values
+        let s = self.sym();
+        let vsd = s.valuestackdepth;
+        let concrete_items: Vec<PyObjectRef> = (0..items.len())
+            .map(|i| s.concrete_value_at(vsd + i))
+            .collect();
+        if concrete_items.iter().all(|v| !v.is_null()) {
+            let list = pyre_runtime::build_list_from_refs(&concrete_items);
+            self.sym_mut().pending_concrete_push = Some(list);
+        }
         self.trace_build_list(items)
     }
 
     fn build_tuple(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        // MIFrame Box tracking: build concrete tuple
+        let s = self.sym();
+        let vsd = s.valuestackdepth;
+        let concrete_items: Vec<PyObjectRef> = (0..items.len())
+            .map(|i| s.concrete_value_at(vsd + i))
+            .collect();
+        if concrete_items.iter().all(|v| !v.is_null()) {
+            let tuple = pyre_runtime::build_tuple_from_refs(&concrete_items);
+            self.sym_mut().pending_concrete_push = Some(tuple);
+        }
         self.trace_build_tuple(items)
     }
 
