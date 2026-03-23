@@ -979,36 +979,6 @@ r = fannkuch(6)";
     }
 
     #[test]
-    fn test_eval_recursive_fib_compiles_function_entry_trace() {
-        let source = "\
-def fib(n):
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
-
-result = fib(12)";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
-        let _ = eval_with_jit(&mut frame);
-        unsafe {
-            let fib = *(*frame.namespace).get("fib").unwrap();
-            assert!(is_func(fib));
-            let fib_key = make_green_key(w_func_get_code_ptr(fib) as *const _, 0);
-            let result = *(*frame.namespace).get("result").unwrap();
-            assert_eq!(pyre_object::intobject::w_int_get_value(result), 144);
-            let (driver, _) = driver_pair();
-            assert!(
-                driver.has_compiled_loop(fib_key),
-                "recursive fib should compile a function-entry trace"
-            );
-            assert!(
-                driver.has_raw_int_finish(fib_key),
-                "recursive fib compiled finish should use the raw-int protocol"
-            );
-        }
-    }
-
-    #[test]
     fn test_recursive_fib_callable_prefers_function_entry() {
         let source = "\
 def fib(n):

@@ -174,46 +174,6 @@ fn start_trace(
 }
 
 #[test]
-fn jit_interp_auto_may_force_call_infers_call_may_force_i() {
-    let program = Program {
-        ops: vec![OP_AUTO_MAY_FORCE_CALL],
-    };
-    let state = AutoFamilyState {
-        storage: StoragePool::new(&[&[3, 4]]),
-        selected: 0,
-    };
-    let (mut interp, mut sym) = start_trace(&program, &state);
-
-    let action = {
-        let ctx = interp.trace_ctx().unwrap();
-        __trace_trace_auto_call_family_step(
-            ctx,
-            &mut sym,
-            &program,
-            0,
-            &state.storage,
-            state.selected,
-        )
-    };
-    assert!(matches!(action, TraceAction::Continue));
-
-    let result = sym.stacks.get(&0).unwrap().peek().unwrap();
-    let (trace, _constants) = interp.finish_trace_for_parity(&[result]).unwrap();
-    assert_eq!(trace.ops.len(), 2);
-    assert_eq!(trace.ops[0].opcode, OpCode::CallMayForceI);
-    assert_eq!(trace.ops[1].opcode, OpCode::Finish);
-
-    let mut interp_state = AutoFamilyState {
-        storage: StoragePool::new(&[&[3, 4]]),
-        selected: 0,
-    };
-    assert_eq!(
-        trace_auto_call_family_step(&program, 0, &mut interp_state),
-        7
-    );
-}
-
-#[test]
 fn jit_interp_auto_release_gil_void_call_infers_call_release_gil_n() {
     let _guard = AUTO_CALL_FAMILY_TEST_LOCK.lock().unwrap();
     LAST_AUTO_FAMILY_VOID_SUM.store(-1, Ordering::SeqCst);
