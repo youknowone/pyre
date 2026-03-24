@@ -6448,12 +6448,40 @@ impl JitState for PyreJitState {
         Some(self.export_virtualizable_state())
     }
 
-    fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
-        unreachable!("pyre closes loops with explicit frame-backed jump args")
+    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
+        let stack_only = sym.stack_only_depth();
+        let mut args = vec![sym.frame, sym.vable_next_instr, sym.vable_valuestackdepth];
+        args.extend_from_slice(&sym.symbolic_locals);
+        let stack_len = stack_only.min(sym.symbolic_stack.len());
+        args.extend_from_slice(&sym.symbolic_stack[..stack_len]);
+        args
     }
 
-    fn collect_typed_jump_args(_sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        unreachable!("pyre closes loops with explicit frame-backed jump args")
+    fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
+        let stack_only = sym.stack_only_depth();
+        let mut args = vec![
+            (sym.frame, Type::Ref),
+            (sym.vable_next_instr, Type::Int),
+            (sym.vable_valuestackdepth, Type::Int),
+        ];
+        for (i, &opref) in sym.symbolic_locals.iter().enumerate() {
+            let tp = sym
+                .symbolic_local_types
+                .get(i)
+                .copied()
+                .unwrap_or(Type::Ref);
+            args.push((opref, tp));
+        }
+        let stack_len = stack_only.min(sym.symbolic_stack.len());
+        for (i, &opref) in sym.symbolic_stack[..stack_len].iter().enumerate() {
+            let tp = sym
+                .symbolic_stack_types
+                .get(i)
+                .copied()
+                .unwrap_or(Type::Ref);
+            args.push((opref, tp));
+        }
+        args
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
