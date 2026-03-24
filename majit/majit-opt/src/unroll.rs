@@ -569,10 +569,10 @@ impl UnrollOptimizer {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("--- peeled trace (assembled) ---");
             eprint!("{}", majit_ir::format_trace(&combined, &consts_p2));
-            eprintln!(
-                "[jit] consts_p2 keys: {:?}",
-                consts_p2.keys().collect::<Vec<_>>()
-            );
+            let mut sorted_consts: Vec<_> =
+                consts_p2.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
+            sorted_consts.sort_by_key(|(k, _)| *k);
+            eprintln!("[jit] consts_p2: {:?}", sorted_consts);
         }
         *constants = consts_p2;
         (combined, p2_ni)
@@ -670,14 +670,6 @@ pub struct ExportedState {
     pub preamble_heap_cache: Vec<(OpRef, u32, OpRef)>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::virtualstate::VirtualState,
-    /// Pre-force JUMP args from Phase 1. These are the JUMP args BEFORE
-    /// force_box_for_end_of_preamble destroyed virtuals. Used by import_state
-    /// to match pre_force_field_refs keys to Phase 2 inputarg positions.
-    pub pre_force_args: Vec<OpRef>,
-    /// Pre-force virtual field refs from Phase 1.
-    /// Needed by import_state to reconstruct PtrInfo::Virtual for
-    /// make_inputargs before virtual args are force-materialized.
-    pub pre_force_field_refs: HashMap<OpRef, Vec<(u32, OpRef)>>,
     /// unroll.py: exported_infos — optimizer knowledge from preamble.
     /// Maps OpRef → info for all args including virtual field contents.
     pub exported_infos: HashMap<OpRef, ExportedValueInfo>,
@@ -805,8 +797,6 @@ impl ExportedState {
             short_preamble: None,
             renamed_inputargs,
             short_inputargs,
-            pre_force_args: Vec::new(),
-            pre_force_field_refs: HashMap::new(),
         }
     }
 
@@ -1084,7 +1074,7 @@ impl OptUnroll {
         // RPython unroll.py:467: next_iteration_args = end_args (post-force).
         // Aliased boxes (same resolved OpRef) are handled by export_state's
         // create_state cache + make_inputargs' position_in_notvirtuals dedup.
-        let mut es = ExportedState::new(
+        ExportedState::new(
             label_args.clone(),
             end_args,
             virtual_state,
@@ -1093,14 +1083,7 @@ impl OptUnroll {
             exported_short_boxes,
             renamed_inputargs.to_vec(),
             short_args,
-        );
-        // Carry pre-force field refs so Phase 2 can reconstruct
-        // PtrInfo::Virtual for make_inputargs.
-        es.pre_force_field_refs = ctx.pre_force_field_refs.clone();
-        // Store pre-force JUMP args so import_state can match
-        // pre_force_field_refs keys to Phase 2 inputarg positions.
-        es.pre_force_args = ctx.pre_force_jump_args.clone().unwrap_or_default();
-        es
+        )
     }
 
     /// unroll.py:432-443: _expand_info
@@ -1123,13 +1106,13 @@ impl OptUnroll {
             return;
         }
         let info = self.collect_exported_info(resolved, ctx, exported_int_bounds);
-        let is_virtual = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual());
+        let has_fields = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual() || !pi.all_items().is_empty());
         infos.insert(resolved, info.clone());
         // Also store under the original (unresolved) key.
         if arg != resolved {
             infos.insert(arg, info);
         }
-        if is_virtual {
+        if has_fields {
             self.expand_infos_from_virtual(resolved, ctx, exported_int_bounds, infos);
         }
     }
@@ -1148,6 +1131,12 @@ impl OptUnroll {
                 v.fields.iter().map(|(_, r)| *r).collect()
             }
             Some(crate::info::PtrInfo::VirtualArray(v)) => v.items.clone(),
+            Some(crate::info::PtrInfo::Instance(v)) if !v.fields.is_empty() => {
+                v.fields.iter().map(|(_, r)| *r).collect()
+            }
+            Some(crate::info::PtrInfo::Struct(v)) if !v.fields.is_empty() => {
+                v.fields.iter().map(|(_, r)| *r).collect()
+            }
             _ => return,
         };
         for field in fields {
@@ -1488,36 +1477,6 @@ impl OptUnroll {
             }
         }
 
-        // Remap pre_force_field_refs keys from Phase 1 OpRefs to Phase 2
-        // targetarg OpRefs. Phase 1 pre_force_args[i] is the pre-force
-        // JUMP arg for position i, targetargs[i] is the Phase 2 inputarg
-        // for the same position.
-        if !exported_state.pre_force_field_refs.is_empty() {
-            for (phase1_idx, phase1_opref) in exported_state.pre_force_args.iter().enumerate() {
-                if let Some(fields) = exported_state.pre_force_field_refs.get(phase1_opref) {
-                    if let Some(&phase2_opref) = targetargs.get(phase1_idx) {
-                        // Also remap field value OpRefs using next_iteration_args mapping:
-                        // Phase 1 field value → Phase 2 equivalent via pre_force_args index.
-                        let remapped_fields: Vec<(u32, OpRef)> = fields
-                            .iter()
-                            .map(|&(idx, val)| {
-                                // Find val in pre_force_args or next_iteration_args
-                                let remapped_val = exported_state
-                                    .pre_force_args
-                                    .iter()
-                                    .position(|&a| a == val)
-                                    .and_then(|pos| targetargs.get(pos).copied())
-                                    .unwrap_or(val);
-                                (idx, remapped_val)
-                            })
-                            .collect();
-                        ctx.pre_force_field_refs
-                            .insert(phase2_opref, remapped_fields);
-                    }
-                }
-            }
-        }
-
         // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs)
         let (label_args, virtuals) = exported_state
             .virtual_state
@@ -1640,9 +1599,19 @@ impl OptUnroll {
             return;
         }
         if let Some(value) = &info.constant {
-            ctx.make_constant(opref, value.clone());
+            let const_opref = if opref.0 < 10_000 {
+                static NEXT_IMPORT_CONST: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(10_100);
+                let new_idx = NEXT_IMPORT_CONST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let new_ref = OpRef(new_idx);
+                ctx.replace_op(opref, new_ref);
+                new_ref
+            } else {
+                opref
+            };
+            ctx.make_constant(const_opref, value.clone());
             if let Value::Ref(ptr) = value {
-                ctx.set_ptr_info(opref, crate::info::PtrInfo::Constant(*ptr));
+                ctx.set_ptr_info(const_opref, crate::info::PtrInfo::Constant(*ptr));
             }
         }
         if let Some(ptr_info) = info.ptr_info.clone() {

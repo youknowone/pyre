@@ -502,35 +502,28 @@ impl OptVirtualize {
         vinfo: VirtualInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        // Mark as no longer virtual FIRST (avoids infinite recursion on nested virtuals).
-        // RPython info.py: after force_box, the ptr_info becomes an Instance
-        // (non-virtual) that RETAINS the field values. This allows subsequent
-        // GetfieldGcPureI on the forced ref to still read the cached field
-        // values without emitting a load from memory.
-        let placeholder = PtrInfo::Instance(crate::info::InstancePtrInfo {
+        // RPython info.py:137-156: _is_virtual = False, _fields retained.
+        // newop.set_forwarded(self) — the same PtrInfo stays on newop (alloc_ref).
+        let preserved = PtrInfo::Instance(crate::info::InstancePtrInfo {
             descr: Some(vinfo.descr.clone()),
             known_class: vinfo.known_class,
             fields: vinfo.fields.clone(),
             field_descrs: vinfo.field_descrs.clone(),
         });
-        ctx.set_ptr_info(opref, placeholder);
+        // Mark as no longer virtual FIRST (avoids infinite recursion)
+        ctx.set_ptr_info(opref, PtrInfo::NonNull);
 
         // Emit the NEW_WITH_VTABLE
         let mut alloc_op = Op::new(OpCode::NewWithVtable, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
         let alloc_ref = ctx.emit_through_passes(alloc_op);
 
+        // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
+        ctx.set_ptr_info(alloc_ref, preserved);
+
         // Set forwarding only when the refs differ (avoids self-loop)
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
-        }
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[virt] force_virtual_instance: opref={:?} alloc_ref={:?} replaced={}",
-                opref,
-                alloc_ref,
-                opref != alloc_ref
-            );
         }
 
         // Emit SETFIELD_GC for each tracked field
@@ -588,6 +581,14 @@ impl OptVirtualize {
         vinfo: VirtualStructInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
+        // RPython info.py:147-156: _is_virtual = False, _fields retained.
+        // newop.set_forwarded(self) — the same PtrInfo (now non-virtual)
+        // stays accessible via get_ptr_info(alloc_ref).
+        let preserved = PtrInfo::Struct(crate::info::StructPtrInfo {
+            descr: vinfo.descr.clone(),
+            fields: vinfo.fields.clone(),
+            field_descrs: vinfo.field_descrs.clone(),
+        });
         // Mark as no longer virtual FIRST (avoids infinite recursion)
         ctx.set_ptr_info(opref, PtrInfo::NonNull);
 
@@ -595,6 +596,9 @@ impl OptVirtualize {
         let mut alloc_op = Op::new(OpCode::New, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
         let alloc_ref = ctx.emit_through_passes(alloc_op);
+
+        // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
+        ctx.set_ptr_info(alloc_ref, preserved);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
@@ -1942,30 +1946,6 @@ impl Optimization for OptVirtualize {
                     crate::virtualstate::export_state(&pre_force_args, ctx, &ctx.ptr_info);
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
                 ctx.pre_force_jump_args = Some(pre_force_args.clone());
-                // Save virtual field OpRefs before force destroys them.
-                for &arg in &pre_force_args {
-                    if let Some(info) = ctx.get_ptr_info(arg).cloned() {
-                        match info {
-                            PtrInfo::Virtual(ref v) => {
-                                for &(field_idx, ref val) in &v.fields {
-                                    ctx.pre_force_field_refs
-                                        .entry(arg)
-                                        .or_insert_with(Vec::new)
-                                        .push((field_idx, *val));
-                                }
-                            }
-                            PtrInfo::VirtualStruct(ref vs) => {
-                                for &(field_idx, ref val) in &vs.fields {
-                                    ctx.pre_force_field_refs
-                                        .entry(arg)
-                                        .or_insert_with(Vec::new)
-                                        .push((field_idx, *val));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
                     let resolved = ctx.get_replacement(*arg);
                     if resolved == frame_ref {
@@ -2009,32 +1989,6 @@ impl Optimization for OptVirtualize {
                     crate::virtualstate::export_state(&pre_force_args, ctx, &ctx.ptr_info);
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
                 ctx.pre_force_jump_args = Some(pre_force_args.clone());
-
-                // Save virtual field OpRefs before force destroys them.
-                // make_inputargs needs this to flatten virtual into field values.
-                for &arg in &pre_force_args {
-                    if let Some(info) = ctx.get_ptr_info(arg).cloned() {
-                        match info {
-                            PtrInfo::VirtualStruct(ref vs) => {
-                                for &(field_idx, ref val) in &vs.fields {
-                                    ctx.pre_force_field_refs
-                                        .entry(arg)
-                                        .or_insert_with(Vec::new)
-                                        .push((field_idx, *val));
-                                }
-                            }
-                            PtrInfo::Virtual(ref v) => {
-                                for &(field_idx, ref val) in &v.fields {
-                                    ctx.pre_force_field_refs
-                                        .entry(arg)
-                                        .or_insert_with(Vec::new)
-                                        .push((field_idx, *val));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
 
                 self.optimize_escaping_op(&jump_op, ctx)
             }

@@ -406,11 +406,12 @@ impl<S: JitState> JitDriver<S> {
         }
         if self.sym.is_none() || self.trace_meta.is_none() {
             if crate::majit_log_enabled() {
-                eprintln!("[mp] abort:sym_none");
+                eprintln!("[mp] abort:sym_none bridge={}", self.bridge_info.is_some());
             }
             self.meta.abort_trace(false);
             self.sym = None;
             self.trace_meta = None;
+            self.bridge_info = None;
             return;
         }
 
@@ -443,6 +444,12 @@ impl<S: JitState> JitDriver<S> {
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
                 {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[bridge] CloseLoop -> close_bridge key={} trace={} fail={}",
+                            bridge_key, bridge_trace_id, bridge_fail_index
+                        );
+                    }
                     let sym = self.sym.take();
                     self.trace_meta = None;
                     if let Some(sym) = sym {
@@ -553,12 +560,18 @@ impl<S: JitState> JitDriver<S> {
                 self.sym = None;
             }
             TraceAction::Abort => {
+                if crate::majit_log_enabled() && self.bridge_info.is_some() {
+                    eprintln!("[bridge] Abort during bridge tracing");
+                }
                 self.meta.abort_trace(false);
                 self.sym = None;
                 self.trace_meta = None;
                 self.bridge_info = None;
             }
             TraceAction::AbortPermanent => {
+                if crate::majit_log_enabled() && self.bridge_info.is_some() {
+                    eprintln!("[bridge] AbortPermanent during bridge tracing");
+                }
                 self.meta.abort_trace(true);
                 self.sym = None;
                 self.trace_meta = None;
@@ -2020,9 +2033,15 @@ impl<S: JitState> JitDriver<S> {
                 {
                     materialize_pending_fields(&exit_layout, &raw_values);
                     self.sync_after(state, &result_meta, descriptor.as_ref());
-                    self.start_bridge_tracing(
+                    let bridge_ok = self.start_bridge_tracing(
                         key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
                     );
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[bridge] start_bridge_tracing key={} trace_id={} fail={} resume_pc={} target_pc={} ok={}",
+                            key_hash, trace_id, fail_index, resume_pc, target_pc, bridge_ok
+                        );
+                    }
                     return Some(resume_pc);
                 }
                 return None;

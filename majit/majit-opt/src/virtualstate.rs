@@ -586,29 +586,10 @@ impl VirtualState {
                 let resolved = ctx.get_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (field_idx, field_state) in fields {
-                    let from_info = ptr_info.and_then(|info| info.get_field(*field_idx));
-                    let field_ref = from_info
-                        .or_else(|| {
-                            ctx.pre_force_field_refs
-                                .get(&resolved)
-                                .or_else(|| ctx.pre_force_field_refs.get(&opref))
-                                .and_then(|flds| {
-                                    flds.iter()
-                                        .find(|(idx, _)| *idx == *field_idx)
-                                        .map(|(_, r)| *r)
-                                })
-                        })
+                    let field_ref = ptr_info
+                        .and_then(|info| info.get_field(*field_idx))
+                        .map(|f| ctx.get_replacement(f))
                         .unwrap_or(OpRef::NONE);
-                    if std::env::var_os("MAJIT_LOG").is_some() && field_ref.is_none() {
-                        eprintln!(
-                            "[jit] enum_forced: opref={:?} resolved={:?} field_idx={} from_info={} pre_force_keys={:?}",
-                            opref,
-                            resolved,
-                            field_idx,
-                            from_info.is_some(),
-                            ctx.pre_force_field_refs.keys().collect::<Vec<_>>()
-                        );
-                    }
                     Self::enum_forced_boxes_for_entry(
                         field_state,
                         field_ref,
@@ -774,24 +755,19 @@ impl VirtualState {
                 if !is_virtual && !force_boxes {
                     return Err(());
                 }
-                for (field_idx, field_state) in fields {
-                    let field_ref = ctx
-                        .get_ptr_info(resolved)
-                        .and_then(|info| info.get_field(*field_idx))
-                        .or_else(|| {
-                            ctx.pre_force_field_refs
-                                .get(&resolved)
-                                .or_else(|| ctx.pre_force_field_refs.get(&opref))
-                                .and_then(|flds| {
-                                    flds.iter()
-                                        .find(|(idx, _)| *idx == *field_idx)
-                                        .map(|(_, r)| *r)
-                                })
-                        })
-                        .unwrap_or(OpRef::NONE);
+                let field_refs: Vec<_> = fields
+                    .iter()
+                    .map(|(field_idx, _)| {
+                        ctx.get_ptr_info(resolved)
+                            .and_then(|info| info.get_field(*field_idx))
+                            .map(|f| ctx.get_replacement(f))
+                            .unwrap_or(OpRef::NONE)
+                    })
+                    .collect();
+                for ((_, field_state), field_ref) in fields.iter().zip(field_refs.iter()) {
                     Self::enum_forced_boxes_for_entry_with_optimizer(
                         field_state,
-                        field_ref,
+                        *field_ref,
                         optimizer,
                         ctx,
                         boxes,

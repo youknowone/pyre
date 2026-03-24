@@ -818,9 +818,11 @@ where
             .ok_or(TraceAction::Abort)?;
 
         let head = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], head_descr.clone());
-        // Guard against null head (empty stack). RPython relies on SIGSEGV;
-        // we use explicit GuardNonnull since we don't have a signal handler.
-        ctx.record_op(OpCode::GuardNonnull, &[head]);
+        // Explicit null guard — provides PtrInfo::NonNull to optimizer which
+        // enables heap cache optimizations. BC_REQUIRE_STACK's size≥1 guard
+        // ensures head is non-null at runtime.
+        let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
+        Self::record_state_guard(ctx, sym, OpCode::GuardNonnull, &[head], &[resume_pc]);
         let value = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr);
         let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, next], head_descr);
@@ -1108,7 +1110,6 @@ where
                         &[stack_ref],
                         head_descr.clone(),
                     );
-                    ctx.record_op(OpCode::GuardNonnull, &[head]);
                     let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
                     ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, next], head_descr);
                     let size = ctx.record_op_with_descr(

@@ -1871,27 +1871,11 @@ impl Optimizer {
                 for arg in &mut state.short_inputargs {
                     remap_opref(arg);
                 }
-                for arg in &mut state.pre_force_args {
-                    remap_opref(arg);
-                }
                 // Remap exported_infos keys
                 let old_infos = std::mem::take(&mut state.exported_infos);
                 for (key, value) in old_infos {
                     let new_key = remap.get(&key.0).map(|&p| OpRef(p)).unwrap_or(key);
                     state.exported_infos.insert(new_key, value);
-                }
-                // Remap pre_force_field_refs keys and values
-                let old_refs = std::mem::take(&mut state.pre_force_field_refs);
-                for (key, fields) in old_refs {
-                    let new_key = remap.get(&key.0).map(|&p| OpRef(p)).unwrap_or(key);
-                    let new_fields: Vec<(u32, OpRef)> = fields
-                        .into_iter()
-                        .map(|(idx, val)| {
-                            let new_val = remap.get(&val.0).map(|&p| OpRef(p)).unwrap_or(val);
-                            (idx, new_val)
-                        })
-                        .collect();
-                    state.pre_force_field_refs.insert(new_key, new_fields);
                 }
                 // Remap exported short boxes
                 for entry in &mut state.exported_short_boxes {
@@ -3572,10 +3556,7 @@ mod tests {
         let mut opt = Optimizer::new();
         let forced = opt.force_box(OpRef(10), &mut ctx);
         assert_ne!(forced, OpRef(10));
-        assert!(ctx.has_extra_operations());
-
-        opt.drain_extra_operations_from(0, &mut ctx);
-
+        // force_box uses force_to_ops_direct → emits to new_operations
         assert!(
             ctx.new_operations
                 .iter()

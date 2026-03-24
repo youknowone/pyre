@@ -1264,7 +1264,7 @@ impl OptHeap {
         let is_vable = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
         if is_vable {
             let cf = self.get_or_create_cached_field(field_idx);
-            cf.lazy_set = None; // drop any previous lazy set
+            cf.lazy_set = None;
             return OptimizationResult::Emit(op.clone());
         }
 
