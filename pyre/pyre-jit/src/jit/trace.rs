@@ -1,15 +1,12 @@
 //! Public trace entrypoint for `pyre`'s JIT portal.
 //!
-//! RPython MetaInterp._interpret() parity: trace_bytecode loops over
-//! all bytecodes in the loop body, recording IR while tracking concrete
-//! values internally via PyreSym's concrete Box arrays. No external
-//! frame execution is needed — each opcode handler computes concrete
-//! results alongside symbolic IR recording.
+//! RPython MetaInterp._interpret() parity: trace_bytecode creates a
+//! PyreMetaInterp and delegates to interpret(). The interpret loop
+//! calls MIFrame::trace_code_step() for each bytecode, combining
+//! concrete execution and symbolic IR recording.
 
 use majit_meta::{TraceAction, TraceCtx};
 use pyre_bytecode::CodeObject;
-use pyre_bytecode::bytecode::Instruction;
-use pyre_runtime::decode_instruction_at;
 
 use crate::jit::metainterp::{MetaInterpFrame, PyreMetaInterp};
 use crate::jit::state::PyreSym;
@@ -44,50 +41,9 @@ pub fn trace_bytecode(
     metainterp.interpret(ctx)
 }
 
-fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
-    let mut next_pc = pc.saturating_add(1);
-    loop {
-        match decode_instruction_at(code, next_pc) {
-            Some((
-                Instruction::ExtendedArg
-                | Instruction::Resume { .. }
-                | Instruction::Nop
-                | Instruction::Cache
-                | Instruction::NotTaken,
-                _,
-            )) => {
-                next_pc += 1;
-            }
-            _ => return next_pc,
-        }
-    }
-}
-
-/// Test PyreMetaInterp on a code object — for validation only.
-/// Returns concrete result if the interpret loop completes.
-#[allow(dead_code)]
-pub fn test_metainterp_trace(
-    code: &CodeObject,
-    namespace: *mut pyre_runtime::PyNamespace,
-    args: &[super::state::ConcreteValue],
-) -> Option<super::state::ConcreteValue> {
-    use super::metainterp::{PyreMetaInterp, StepAction};
-
-    let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, namespace);
-    let frontend_args: Vec<super::state::FrontendOp> = args
-        .iter()
-        .map(|c| super::state::FrontendOp::new(majit_ir::OpRef::NONE, *c))
-        .collect();
-    metainterp.perform_call(code as *const CodeObject, frontend_args, None);
-
-    // Dummy TraceCtx — we only test concrete execution here
-    // TODO: proper TraceCtx integration
-    None // Cannot create TraceCtx without recorder
-}
-
 #[cfg(test)]
 mod tests {
-    use super::semantic_fallthrough_pc;
+    use crate::jit::metainterp::semantic_fallthrough_pc;
     use pyre_bytecode::bytecode::Instruction;
     use pyre_bytecode::compile_exec;
     use pyre_runtime::decode_instruction_at;
