@@ -2145,25 +2145,24 @@ fn call_assembler_fast_path(
     let mut outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
     let mut roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
 
-    // RPython parity: register GC roots + force frame before compiled code.
-    // Skip GC root registration when num_ref_roots == 0 (no Ref-typed
-    // values in the compiled code's output). This avoids mutex overhead
-    // in tight recursive loops like fib.
-    // RPython parity: call_assembler is a direct code-to-code call.
-    // GC roots use the callee's jitframe (not a per-call registry).
-    // Force frame is the callee's jitframe pointer (not a HashMap entry).
+    // RPython _call_header_shadowstack / _call_footer_shadowstack parity:
+    // Push GC roots onto the TLS shadow stack before compiled call, pop
+    // after. The GC collector walks shadow_stack::walk_roots() to find
+    // live refs (collector.rs:337). This replaces the global mutex
+    // registry (register_gc_roots/unregister_gc_roots) with O(1) TLS.
     //
-    // Skip force_frame registration entirely — call_assembler_fast_path
-    // handles guard failures directly using target.fail_descrs, without
-    // needing the force_frame registry. This eliminates Arc::new +
-    // fail_descrs.to_vec() + mutex per call (~750M overhead for fib(32)).
-    // RPython parity: GC roots in CALL_ASSEMBLER live in the callee's
-    // jitframe, not in a per-call registry. The callee's compiled code
-    // manages its own roots via the roots buffer pointer (3rd arg).
-    // Skipping the global registry mutex is safe because:
-    // 1. The roots buffer is stack-allocated and outlives the call
-    // 2. The callee writes GC refs to roots[] which the caller reads after
-    // 3. No GC can trigger between register/unregister (single-threaded JIT)
+    // Skip force_frame registration — call_assembler_fast_path handles
+    // guard failures directly via target.fail_descrs.
+    let shadow_depth = if target.num_ref_roots > 0 {
+        let mut depth = 0usize;
+        for root in roots[..target.num_ref_roots].iter() {
+            depth = majit_gc::shadow_stack::push(*root);
+        }
+        Some(depth + 1 - target.num_ref_roots)
+    } else {
+        None
+    };
+
     let fail_index = unsafe {
         func(
             inputs.as_ptr(),
@@ -2171,6 +2170,10 @@ fn call_assembler_fast_path(
             roots.as_mut_ptr() as *mut i64,
         )
     } as u32;
+
+    if let Some(depth) = shadow_depth {
+        majit_gc::shadow_stack::pop_to(depth);
+    }
     drop(_jitted_guard);
 
     // Handle nested call_assembler DEADFRAME propagation
