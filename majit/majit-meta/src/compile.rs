@@ -1198,6 +1198,128 @@ pub(crate) fn fold_box_into_create_frame(
     ops
 }
 
+/// RPython parity: elide create_frame + drop_frame around CallAssemblerI
+/// for self-recursive raw-int calls. The callee frame is created lazily
+/// on guard failure (in force_fn), not before every recursive call.
+///
+/// Pattern:
+///   v_frame = CallI(create_frame_raw_fn, caller_frame, raw_arg)
+///   v_result = CallAssemblerI(v_frame, 0, 1, raw_arg)
+///   CallN(drop_frame_fn, v_frame)
+///
+/// Result:
+///   v_result = CallAssemblerI(caller_frame, 0, 1, raw_arg)
+///   (CallI and CallN removed)
+///
+/// Guard failure path: force_fn receives caller_frame from inputs[0]
+/// and raw_arg from inputs[3], creates callee frame lazily.
+pub(crate) fn elide_create_frame_for_call_assembler(
+    mut ops: Vec<Op>,
+    constants: &HashMap<u32, i64>,
+    create_frame_raw_map: &HashMap<i64, i64>,
+) -> Vec<Op> {
+    use majit_ir::OpCode;
+
+    if create_frame_raw_map.is_empty() {
+        return ops;
+    }
+
+    // Collect all create_frame function pointers (keys AND values of the map)
+    // Keys = original create_frame, Values = create_frame_raw variant
+    let raw_frame_fns: HashSet<i64> = create_frame_raw_map
+        .keys()
+        .copied()
+        .chain(create_frame_raw_map.values().copied())
+        .collect();
+
+    // Find CallI(create_frame_raw) → CallAssemblerI → CallN(drop) triples
+    let mut removals: Vec<(usize, usize, OpRef, OpRef)> = Vec::new(); // (create_idx, drop_idx, frame_ref, caller_frame)
+
+    for (ci, op) in ops.iter().enumerate() {
+        if !matches!(op.opcode, OpCode::CallI | OpCode::CallR) {
+            continue;
+        }
+        let fn_ptr = op.args.first().and_then(|f| constants.get(&f.0)).copied();
+        let Some(fn_ptr) = fn_ptr else { continue };
+        if !raw_frame_fns.contains(&fn_ptr) {
+            continue;
+        }
+        // This is a create_frame_raw call
+        let frame_ref = op.pos; // v_frame
+        let caller_frame = if op.args.len() >= 2 {
+            op.args[1]
+        } else {
+            continue;
+        };
+
+        // Find the CallAssemblerI that uses frame_ref as first arg
+        let ca_idx = ops[ci + 1..].iter().position(|o| {
+            matches!(
+                o.opcode,
+                OpCode::CallAssemblerI
+                    | OpCode::CallAssemblerR
+                    | OpCode::CallAssemblerF
+                    | OpCode::CallAssemblerN
+            ) && o.args.first() == Some(&frame_ref)
+        });
+        let Some(ca_offset) = ca_idx else { continue };
+        let ca_idx = ci + 1 + ca_offset;
+
+        // Find the CallN(drop_frame) that uses frame_ref
+        let drop_idx = ops[ca_idx + 1..]
+            .iter()
+            .position(|o| o.opcode == OpCode::CallN && o.args.len() >= 2 && o.args[1] == frame_ref);
+        let Some(drop_offset) = drop_idx else {
+            continue;
+        };
+        let drop_idx = ca_idx + 1 + drop_offset;
+
+        // Check frame_ref is not used elsewhere (only in create, CA, drop)
+        let other_use = ops.iter().enumerate().any(|(i, o)| {
+            if i == ci || i == ca_idx || i == drop_idx {
+                return false;
+            }
+            o.args.contains(&frame_ref)
+                || o.fail_args
+                    .as_ref()
+                    .is_some_and(|fa| fa.contains(&frame_ref))
+        });
+        if other_use {
+            continue;
+        }
+
+        removals.push((ci, drop_idx, frame_ref, caller_frame));
+    }
+
+    // Apply in reverse order
+    for (create_idx, drop_idx, frame_ref, caller_frame) in removals.iter().rev() {
+        // Replace CallAssemblerI's first arg: frame_ref → caller_frame
+        for op in ops.iter_mut() {
+            if matches!(
+                op.opcode,
+                OpCode::CallAssemblerI
+                    | OpCode::CallAssemblerR
+                    | OpCode::CallAssemblerF
+                    | OpCode::CallAssemblerN
+            ) && op.args.first() == Some(frame_ref)
+            {
+                op.args[0] = *caller_frame;
+            }
+        }
+        // Remove drop first (higher index), then create
+        ops.remove(*drop_idx);
+        // Adjust create_idx if drop was before it (shouldn't happen)
+        let ci = if *drop_idx < *create_idx {
+            create_idx - 1
+        } else {
+            *create_idx
+        };
+        ops.remove(ci);
+    }
+
+    ops
+}
+
 pub(crate) fn enrich_guard_resume_layouts_for_trace(
     resume_data: &mut HashMap<u32, StoredResumeData>,
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,

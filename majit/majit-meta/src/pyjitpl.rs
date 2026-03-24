@@ -1504,6 +1504,11 @@ impl<M: Clone> MetaInterp<M> {
             &self.raw_int_box_helpers,
             &self.create_frame_raw_map,
         );
+        let trace_ops = compile::elide_create_frame_for_call_assembler(
+            trace_ops,
+            &constants,
+            &self.create_frame_raw_map,
+        );
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) ---");
@@ -2043,6 +2048,11 @@ impl<M: Clone> MetaInterp<M> {
             &self.raw_int_box_helpers,
             &self.create_frame_raw_map,
         );
+        let trace_ops = compile::elide_create_frame_for_call_assembler(
+            trace_ops,
+            &constants,
+            &self.create_frame_raw_map,
+        );
 
         if crate::majit_log_enabled() {
             eprintln!("--- retrace body (before opt) ---");
@@ -2312,6 +2322,11 @@ impl<M: Clone> MetaInterp<M> {
             trace.ops.clone(),
             &mut constants,
             &self.raw_int_box_helpers,
+            &self.create_frame_raw_map,
+        );
+        let trace_ops = compile::elide_create_frame_for_call_assembler(
+            trace_ops,
+            &constants,
             &self.create_frame_raw_map,
         );
 
