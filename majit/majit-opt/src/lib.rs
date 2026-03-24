@@ -872,6 +872,18 @@ impl OptContext {
         self.get_replacement(opref)
     }
 
+    /// Look up the operation that produces a given OpRef.
+    /// Searches emitted operations and input ops.
+    /// Used for pattern matching nested operations (e.g., int_add(int_add(x, C1), C2)).
+    /// Returns a clone to avoid borrow conflicts with mutable ctx methods.
+    pub fn get_producing_op(&self, opref: OpRef) -> Option<Op> {
+        let opref = self.get_replacement(opref);
+        self.new_operations
+            .iter()
+            .find(|op| op.pos == opref)
+            .cloned()
+    }
+
     /// Number of emitted operations so far.
     pub fn num_emitted(&self) -> usize {
         self.new_operations.len()
