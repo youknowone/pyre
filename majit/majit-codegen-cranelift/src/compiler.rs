@@ -1881,19 +1881,12 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         // MetaInterp layer can pick up after execute_token returns.
         // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
         if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-            // green_key from target's header_pc (may be 0 for function-entry traces)
+            // header_pc stores the green_key hash (set by MetaInterp before compile_loop)
             let gk = target.header_pc;
-            // RPython resumedescr parity: extract resume_pc from
-            // recovery_layout (compile-time resume data), not outputs.
-            let resume_pc = fail_descr
-                .recovery_layout
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|r| r.frames.first())
-                .map(|f| f.pc as usize)
-                .unwrap_or(0);
-            notify_bridge_threshold(gk, target.trace_id, fail_index, resume_pc);
+            // resume_pc = 0: the caller (restore_guard_failure_for_loop) uses
+            // jit_state.next_instr which is the correct bytecode PC after
+            // guard failure restoration.
+            notify_bridge_threshold(gk, target.trace_id, fail_index, 0);
         }
 
         let saved_data = if let Some(ref ff) = force_frame {
@@ -4023,15 +4016,8 @@ impl CraneliftBackend {
             let fail_count = fail_descr.get_fail_count();
             if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
                 let gk = compiled.header_pc;
-                let resume_pc = fail_descr
-                    .recovery_layout
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|r| r.frames.first())
-                    .map(|f| f.pc as usize)
-                    .unwrap_or(0);
-                notify_bridge_threshold(gk, compiled.trace_id, fail_index, resume_pc);
+                // resume_pc = 0: caller uses jit_state.next_instr after restoration
+                notify_bridge_threshold(gk, compiled.trace_id, fail_index, 0);
             }
 
             let saved_data = if let Some(ref ff) = force_frame {
