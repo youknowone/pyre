@@ -998,6 +998,10 @@ use std::sync::atomic::AtomicPtr;
 struct CaDispatchEntry {
     code_ptr: AtomicPtr<u8>,
     finish_index: AtomicU64,
+    /// RPython redirect_call_assembler parity: compiled bridge code pointer
+    /// for the guard at finish_index. When set, Cranelift codegen can
+    /// dispatch guard failures directly without extern "C" call overhead.
+    guard_bridge_ptr: AtomicPtr<u8>,
 }
 
 /// Sentinel: finish_index not yet known (self-recursion before compile).
@@ -1016,6 +1020,7 @@ fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatch
         Box::new(CaDispatchEntry {
             code_ptr: AtomicPtr::new(code_ptr as *mut u8),
             finish_index: AtomicU64::new(CA_FINISH_INDEX_UNKNOWN),
+            guard_bridge_ptr: AtomicPtr::new(std::ptr::null_mut()),
         })
     });
     // Update code_ptr if changed (e.g., recompilation)
@@ -2070,6 +2075,8 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
         }
     };
 
+    let bridge_code_ptr = compiled.code_ptr;
+
     // Attach bridge to the guard's fail descriptor
     fail_descr.attach_bridge(crate::guard::BridgeData {
         trace_id: compiled.trace_id,
@@ -2077,7 +2084,7 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
         header_pc: compiled.header_pc,
         source_guard: (target.trace_id, fail_index),
         caller_prefix_layout: compiled.caller_prefix_layout,
-        code_ptr: compiled.code_ptr,
+        code_ptr: bridge_code_ptr,
         fail_descrs: compiled.fail_descrs,
         terminal_exit_layouts: compiled.terminal_exit_layouts,
         gc_runtime_id: compiled.gc_runtime_id,
@@ -2087,6 +2094,17 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
         max_output_slots: compiled.max_output_slots,
         needs_force_frame: compiled.needs_force_frame,
     });
+
+    // RPython redirect_call_assembler parity: store bridge code pointer
+    // in dispatch entry so Cranelift codegen can dispatch guard failures
+    // directly without extern "C" call overhead.
+    let table = ca_dispatch_table().lock().unwrap();
+    if let Some(entry) = table.get(&(target.trace_id)) {
+        entry
+            .guard_bridge_ptr
+            .store(bridge_code_ptr as *mut u8, Ordering::Release);
+    }
+    drop(table);
 
     true
 }
@@ -5510,7 +5528,65 @@ impl CraneliftBackend {
 
                             builder.switch_to_block(direct_force_block);
                             builder.seal_block(direct_force_block);
-                            // RPython assembler_call_helper: bridge check + force_fn.
+
+                            // RPython redirect_call_assembler parity:
+                            // Load guard_bridge_ptr from dispatch entry.
+                            // If set, call bridge directly (no extern "C" overhead).
+                            // If null, fall back to call_assembler_guard_failure.
+                            let bridge_ptr_val = builder.ins().load(
+                                ptr_type,
+                                MemFlags::trusted(),
+                                entry_ptr,
+                                16, // offset of guard_bridge_ptr in CaDispatchEntry
+                            );
+                            let bridge_null = builder.ins().iconst(ptr_type, 0);
+                            let has_bridge =
+                                builder
+                                    .ins()
+                                    .icmp(IntCC::NotEqual, bridge_ptr_val, bridge_null);
+                            let inline_bridge_block = builder.create_block();
+                            let extern_force_block = builder.create_block();
+                            builder.ins().brif(
+                                has_bridge,
+                                inline_bridge_block,
+                                &[],
+                                extern_force_block,
+                                &[],
+                            );
+
+                            // ── Inline bridge dispatch (hot path for base case) ──
+                            builder.switch_to_block(inline_bridge_block);
+                            builder.seal_block(inline_bridge_block);
+                            // Call bridge directly: bridge(outputs, bridge_out, bridge_roots)
+                            // Base case bridge returns result in bridge_out[0].
+                            let bridge_out_slot = builder.create_sized_stack_slot(
+                                StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 3),
+                            );
+                            let bridge_out_ptr =
+                                builder.ins().stack_addr(ptr_type, bridge_out_slot, 0);
+                            let bridge_roots_slot = builder.create_sized_stack_slot(
+                                StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 3),
+                            );
+                            let bridge_roots_ptr =
+                                builder.ins().stack_addr(ptr_type, bridge_roots_slot, 0);
+                            let mut bridge_sig = Signature::new(call_conv);
+                            bridge_sig.params.push(AbiParam::new(ptr_type));
+                            bridge_sig.params.push(AbiParam::new(ptr_type));
+                            bridge_sig.params.push(AbiParam::new(ptr_type));
+                            bridge_sig.returns.push(AbiParam::new(cl_types::I64));
+                            let bridge_sig_ref = builder.import_signature(bridge_sig);
+                            let _bridge_fail = builder.ins().call_indirect(
+                                bridge_sig_ref,
+                                bridge_ptr_val,
+                                &[out_ptr, bridge_out_ptr, bridge_roots_ptr],
+                            );
+                            let bridge_result =
+                                builder.ins().stack_load(cl_types::I64, bridge_out_slot, 0);
+                            builder.ins().jump(ca_merge_block, &[bridge_result]);
+
+                            // ── Extern force fallback (cold: before bridge compiled) ──
+                            builder.switch_to_block(extern_force_block);
+                            builder.seal_block(extern_force_block);
                             let frame_ptr =
                                 builder
                                     .ins()
