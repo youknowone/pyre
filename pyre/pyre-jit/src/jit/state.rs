@@ -5334,6 +5334,22 @@ impl ArithmeticOpcodeHandler for MIFrame {
             };
             self.sym_mut().pending_concrete_push = Some(ConcreteValue::Int(result as i64));
         }
+        // Fallback: compute via objspace for BigInt/mixed types
+        if self.sym().pending_concrete_push.is_none() {
+            if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
+                let cmp_op = match op {
+                    ComparisonOperator::Less => pyre_objspace::space::CompareOp::Lt,
+                    ComparisonOperator::LessOrEqual => pyre_objspace::space::CompareOp::Le,
+                    ComparisonOperator::Greater => pyre_objspace::space::CompareOp::Gt,
+                    ComparisonOperator::GreaterOrEqual => pyre_objspace::space::CompareOp::Ge,
+                    ComparisonOperator::Equal => pyre_objspace::space::CompareOp::Eq,
+                    ComparisonOperator::NotEqual => pyre_objspace::space::CompareOp::Ne,
+                };
+                if let Ok(r) = pyre_objspace::space::py_compare(lhs_obj, rhs_obj, cmp_op) {
+                    self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(r));
+                }
+            }
+        }
         self.compare_value_direct(a, b, op)
     }
 
