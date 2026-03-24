@@ -29,34 +29,23 @@ pub fn trace_bytecode(
     // PyreMetaInterp.interpret() drives the dispatch loop.
     let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,
+        owned_sym: None,
         jitcode: code as *const CodeObject,
         pc: start_pc,
         greenkey: None,
         concrete_frame,
+        owned_concrete_frame: None,
+        parent_fail_args: Vec::new(),
+        parent_fail_arg_types: Vec::new(),
+        drop_frame_opref: None,
+        caller_result_stack_idx: None,
+        arg_state: pyre_bytecode::bytecode::OpArgState::default(),
     };
 
     let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, std::ptr::null_mut());
     metainterp.framestack.push(frame);
 
-    let action = metainterp.interpret(ctx);
-
-    // Retarget green key based on back-edge target.
-    match &action {
-        TraceAction::CloseLoopWithArgs {
-            loop_header_pc: Some(target_pc),
-            ..
-        } => {
-            let key = crate::eval::make_green_key(code as *const CodeObject, *target_pc);
-            ctx.set_green_key(key);
-        }
-        TraceAction::CloseLoop => {
-            let key = crate::eval::make_green_key(code as *const CodeObject, start_pc);
-            ctx.set_green_key(key);
-        }
-        _ => {}
-    }
-
-    action
+    metainterp.interpret(ctx)
 }
 
 #[cfg(test)]

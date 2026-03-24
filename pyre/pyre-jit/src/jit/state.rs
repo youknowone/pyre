@@ -3586,52 +3586,31 @@ impl MIFrame {
                 }
 
                 if can_trace_through {
-                    if inline_framestack_active {
-                        match self.build_pending_inline_frame(
-                            callable,
-                            args,
-                            concrete_callable,
-                            callee_key,
-                        ) {
-                            Ok(pending) => {
-                                self.pending_inline_frame = Some(pending);
-                                return self.with_ctx(|_, ctx| {
-                                    Ok(ctx.const_int(pyre_object::PY_NULL as i64))
-                                });
-                            }
-                            Err(err) => {
-                                if majit_meta::majit_log_enabled() {
-                                    eprintln!(
-                                        "[jit][trace-through] pending inline frame build failed key={} nargs={} err={}",
-                                        callee_key, nargs, err
-                                    );
-                                }
-                            }
+                    // RPython perform_call: produce PendingInlineFrame for
+                    // the MetaInterp interpret loop to push onto framestack.
+                    match self.build_pending_inline_frame(
+                        callable,
+                        args,
+                        concrete_callable,
+                        callee_key,
+                    ) {
+                        Ok(pending) => {
+                            self.pending_inline_frame = Some(pending);
+                            self.sym_mut().pending_concrete_push =
+                                Some(ConcreteValue::Ref(pyre_object::PY_NULL));
+                            return self
+                                .with_ctx(|_, ctx| Ok(ctx.const_int(pyre_object::PY_NULL as i64)));
                         }
-                    }
-                    match self.trace_through_callee(callable, args, concrete_callable, callee_key) {
-                        Ok(result) => return Ok(result),
                         Err(err) => {
-                            let inline_too_long = err.message == "inline trace aborted";
-                            note_inline_trace_too_long(
-                                callee_key,
-                                current_function_key,
-                                root_trace_green_key,
-                                &err,
-                            );
                             if majit_meta::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit][trace-through] inline trace-through failed key={} nargs={} err={}",
-                                    callee_key, nargs, err
+                                    "[jit][perform-call] build_pending failed key={} err={}, residual path",
+                                    callee_key, err
                                 );
                             }
-                            if inline_too_long {
-                                return Err(err);
-                            }
+                            // Fall through to residual helper path
                         }
                     }
-                    // trace-through failed: fall through to the older helper
-                    // path so correctness wins over optimization.
                 }
 
                 // PyPy converges self-recursion to separate functrace +
@@ -3780,29 +3759,26 @@ impl MIFrame {
                             && nargs <= 4
                             && !callee_has_loop
                         {
-                            match self.trace_through_callee(
+                            match self.build_pending_inline_frame(
                                 callable,
                                 args,
                                 concrete_callable,
                                 callee_key,
                             ) {
-                                Ok(result) => return Ok(result),
+                                Ok(pending) => {
+                                    self.pending_inline_frame = Some(pending);
+                                    self.sym_mut().pending_concrete_push =
+                                        Some(ConcreteValue::Ref(pyre_object::PY_NULL));
+                                    return self.with_ctx(|_, ctx| {
+                                        Ok(ctx.const_int(pyre_object::PY_NULL as i64))
+                                    });
+                                }
                                 Err(err) => {
-                                    let inline_too_long = err.message == "inline trace aborted";
-                                    note_inline_trace_too_long(
-                                        callee_key,
-                                        current_function_key,
-                                        root_trace_green_key,
-                                        &err,
-                                    );
                                     if majit_meta::majit_log_enabled() {
                                         eprintln!(
-                                            "[jit][trace-through] call-assembler fallback trace-through failed key={} nargs={} err={}",
-                                            callee_key, nargs, err
+                                            "[jit][perform-call] call-assembler inline failed key={} err={}",
+                                            callee_key, err
                                         );
-                                    }
-                                    if inline_too_long {
-                                        return Err(err);
                                     }
                                 }
                             }
@@ -3984,15 +3960,25 @@ impl MIFrame {
             this.guard_value_ref(ctx, callable, concrete_callable as i64);
         });
 
-        let concrete_args: Vec<PyObjectRef> = (0..args.len())
+        let mut concrete_args: Vec<PyObjectRef> = (0..args.len())
             .map(|i| {
                 self.concrete_call_arg_after_pops(i)
                     .unwrap_or(pyre_object::PY_NULL)
             })
             .collect();
-        for (idx, arg) in concrete_args.iter().copied().enumerate() {
+        // Fill missing concrete args from concrete_frame fallback.
+        for idx in 0..concrete_args.len() {
+            if concrete_args[idx].is_null() {
+                if let Some(val) = self.concrete_at_or_frame(self.sym().valuestackdepth + 2 + idx) {
+                    concrete_args[idx] = val;
+                }
+            }
+        }
+        for (_idx, arg) in concrete_args.iter().copied().enumerate() {
             if arg.is_null() {
-                panic!("pending inline frame lost concrete arg at index {idx}");
+                return Err(PyError::type_error(
+                    "pending inline frame lost concrete arg",
+                ));
             }
         }
 
@@ -4128,6 +4114,7 @@ impl MIFrame {
     /// Instead of emitting an opaque CallMayForce, traces each callee
     /// bytecode instruction into the current trace. Simple functions
     /// like `add(a,b): return a+b` become `IntAdd(a,b)` in the trace.
+    #[allow(dead_code)]
     fn trace_through_callee(
         &mut self,
         callable: OpRef,
@@ -5539,6 +5526,45 @@ impl ConstantOpcodeHandler for MIFrame {
 
 impl OpcodeStepExecutor for MIFrame {
     type Error = PyError;
+
+    /// Fix fusion opcode: load two locals with correct concrete tracking.
+    /// Default impl calls load_local_checked_value twice, causing
+    /// pending_concrete_push to be overwritten on the second call.
+    fn load_fast_pair_checked(
+        &mut self,
+        idx1: usize,
+        _name1: &str,
+        idx2: usize,
+        _name2: &str,
+    ) -> Result<(), Self::Error> {
+        let c1 = self
+            .sym()
+            .concrete_locals
+            .get(idx1)
+            .copied()
+            .unwrap_or(ConcreteValue::Null);
+        let c2 = self
+            .sym()
+            .concrete_locals
+            .get(idx2)
+            .copied()
+            .unwrap_or(ConcreteValue::Null);
+        self.sym_mut().pending_concrete_push = Some(c1);
+        let v1 = self.with_ctx(|this, ctx| MIFrame::load_local_value(this, ctx, idx1))?;
+        self.sym_mut().pending_concrete_push = Some(c1);
+        self.with_ctx(|this, ctx| {
+            MIFrame::push_value(this, ctx, v1);
+            Ok::<(), PyError>(())
+        })?;
+        self.sym_mut().pending_concrete_push = Some(c2);
+        let v2 = self.with_ctx(|this, ctx| MIFrame::load_local_value(this, ctx, idx2))?;
+        self.sym_mut().pending_concrete_push = Some(c2);
+        self.with_ctx(|this, ctx| {
+            MIFrame::push_value(this, ctx, v2);
+            Ok::<(), PyError>(())
+        })?;
+        Ok(())
+    }
 
     fn unsupported(
         &mut self,
@@ -8294,6 +8320,7 @@ mod tests {
 ///
 /// PyPy pyjitpl.py: MIFrame holds jitcode + registers + pc + greenkey.
 /// Ours holds PyreSym (symbolic state) + concrete PyFrame + OpArgState.
+#[allow(dead_code)]
 struct InlineMIFrame {
     sym: PyreSym,
     concrete_frame: pyre_interp::frame::PyFrame,
@@ -8321,7 +8348,7 @@ pub(crate) enum InlineTraceStepAction {
     PushFrame(PendingInlineFrame),
 }
 
-fn execute_inline_residual_call(
+pub(crate) fn execute_inline_residual_call(
     frame: &mut pyre_interp::frame::PyFrame,
     nargs: usize,
 ) -> Result<(), pyre_runtime::PyError> {
@@ -8354,6 +8381,7 @@ fn execute_inline_residual_call(
 /// This matches PyPy's ChangeFrame exception pattern:
 /// - perform_call → newframe + push + ChangeFrame
 /// - finishframe → popframe + make_result_of_lastop + ChangeFrame
+#[allow(dead_code)]
 fn inline_trace_and_execute(
     ctx: &mut majit_meta::TraceCtx,
     pending: PendingInlineFrame,
