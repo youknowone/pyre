@@ -2003,6 +2003,8 @@ impl MIFrame {
             OpCode::GuardIsnull
         };
         self.record_guard(ctx, opcode, &[next]);
+        // heapcache: track nullity after for-iter guard
+        ctx.heap_cache_mut().nullity_now_known(next, continues);
     }
 
     pub(crate) fn record_branch_guard(
