@@ -1392,14 +1392,58 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1(caller_frame: i64, ar
     create_self_recursive_callee_frame_impl_1_boxed(caller_frame, arg0 as PyObjectRef)
 }
 
-/// Self-recursive raw-int variant: accepts a raw int and boxes it when
-/// materializing the interpreter frame local.
+/// Self-recursive raw-int variant: creates the frame WITHOUT boxing
+/// the argument. The raw int is passed directly to compiled code via
+/// CallAssemblerI inputargs. Boxing only happens on guard failure
+/// (in force_fn / jit_force_self_recursive_call_raw_1).
+///
+/// RPython parity: compiled code uses jitframe slots, not PyFrame
+/// locals. Frame locals are only needed for interpreter fallback.
 pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     caller_frame: i64,
     raw_int_arg: i64,
 ) -> i64 {
+    let caller = unsafe { &*(caller_frame as *const PyFrame) };
+    let func_code = caller.code;
+    let globals = caller.namespace;
+    let execution_context = caller.execution_context;
+
+    let arena = arena_ref();
+    if let Some((ptr, was_init)) = arena.take() {
+        let f = unsafe { &mut *ptr };
+        if was_init && f.code == func_code {
+            // Fast path: reuse frame, only reset next_instr.
+            // Skip boxing + locals fill — compiled code uses raw inputargs.
+            // Guard failure path (force_fn) will box raw_int_arg into
+            // frame.locals when interpreter resume is needed.
+            f.next_instr = 0;
+            f.vable_token = 0;
+        } else {
+            // Cold: different code or first use — full init needed.
+            let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
+            unsafe {
+                std::ptr::write(
+                    ptr,
+                    PyFrame::new_for_call(func_code, &[boxed], globals, execution_context),
+                );
+                (&mut *ptr).fix_array_ptrs();
+            }
+            if !was_init {
+                arena.mark_initialized();
+            }
+        }
+        return ptr as i64;
+    }
+
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
-    create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed)
+    let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
+        func_code,
+        &[boxed],
+        globals,
+        execution_context,
+    )));
+    unsafe { &mut *frame_ptr }.fix_array_ptrs();
+    frame_ptr as i64
 }
 
 /// Raw-int variant: accepts a raw int and boxes it internally.
