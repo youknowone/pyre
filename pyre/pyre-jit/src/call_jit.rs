@@ -884,6 +884,10 @@ pub fn install_jit_call_bridge() {
         // callback invoked synchronously when guard fail count reaches
         // threshold. Replaces the deferred pending queue.
         majit_codegen_cranelift::register_bridge_threshold_callback(on_bridge_threshold_reached);
+        // TODO: register MetaInterp-level bridge threshold hook for guards
+        // hit via run_compiled_detailed_with_values (try_function_entry_jit).
+        // Currently disabled — bridge compilation from this path needs
+        // proper resume_pc propagation and frame state management.
     });
 }
 

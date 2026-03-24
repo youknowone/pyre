@@ -1549,7 +1549,10 @@ impl<S: JitState> JitDriver<S> {
         let restored = resume_pc.is_some();
         if restored {
             self.sync_after(state, &exit_meta, descriptor.as_ref());
-            if should_bridge {
+            // TODO: start_bridge_tracing causes stack underflow — PyreSym
+            // initialization doesn't reflect guard failure frame state.
+            // Disabled until rebuild_state_after_failure is implemented.
+            if false && should_bridge {
                 self.start_bridge_tracing(
                     green_key,
                     trace_id,
