@@ -94,16 +94,18 @@ impl TraceCtx {
 
     /// pyjitpl.py:3029-3030 — record a loop header visit with position
     /// and live variable snapshot.
+    ///
+    /// RPython allows multiple merge points with the same green key
+    /// (representing different loop iterations or inlining depths).
+    /// Always appends; has_merge_point checks if any match exists.
     pub fn add_merge_point(&mut self, key: u64, live_args: Vec<OpRef>, live_arg_types: Vec<Type>) {
-        if !self.has_merge_point(key) {
-            let position = self.recorder.get_position();
-            self.current_merge_points.push(MergePoint {
-                green_key: key,
-                position,
-                original_boxes: live_args,
-                original_box_types: live_arg_types,
-            });
-        }
+        let position = self.recorder.get_position();
+        self.current_merge_points.push(MergePoint {
+            green_key: key,
+            position,
+            original_boxes: live_args,
+            original_box_types: live_arg_types,
+        });
     }
 
     /// pyjitpl.py:2908 — bridge traces start with empty merge points.
@@ -111,10 +113,12 @@ impl TraceCtx {
         self.current_merge_points.clear();
     }
 
-    /// Get the merge point for a given green key, if it exists.
+    /// pyjitpl.py:2988: find merge point by key, searching in reverse
+    /// order (most recent first, matching RPython's range(len-1, -1, -1)).
     pub fn get_merge_point(&self, key: u64) -> Option<&MergePoint> {
         self.current_merge_points
             .iter()
+            .rev()
             .find(|mp| mp.green_key == key)
     }
 
@@ -1173,8 +1177,16 @@ impl TraceCtx {
         let descr = make_call_descr(arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(opcode, &call_args, descr)
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr);
+        // heapcache.py: pure/elidable calls (CallPure*) don't invalidate.
+        // Non-pure calls escape their arguments and invalidate caches.
+        if !opcode.is_call_pure() {
+            self.heap_cache.mark_escaped_args(args);
+            self.heap_cache.invalidate_caches_for_escaped();
+        }
+        result
     }
 
     pub fn call_void_typed(&mut self, func_ptr: *const (), args: &[OpRef], arg_types: &[Type]) {
@@ -1273,8 +1285,15 @@ impl TraceCtx {
         let descr = make_call_may_force_descr(arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        self.recorder
-            .record_op_with_descr(opcode, &call_args, descr)
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr);
+        // heapcache.py: may-force calls escape args and invalidate caches.
+        // (GuardNotForced after the call also invalidates, but we need
+        // the escape marking here for correctness.)
+        self.heap_cache.mark_escaped_args(args);
+        self.heap_cache.invalidate_caches_for_escaped();
+        result
     }
 
     pub fn call_may_force_void_typed(

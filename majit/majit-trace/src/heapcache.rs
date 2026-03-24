@@ -61,13 +61,21 @@ pub struct HeapCache {
     likely_virtual: HashSet<OpRef>,
 
     /// heapcache.py: loop-invariant call result cache.
-    /// (func_ptr, args_hash) → result OpRef.
-    loopinvariant_call_cache: HashMap<(OpRef, u64), OpRef>,
+    /// RPython stores exactly ONE result: (descr, arg0_int) → result.
+    /// Subsequent calls overwrite the single entry.
+    loopinvariant_descr: Option<u32>,
+    loopinvariant_arg0: Option<i64>,
+    loopinvariant_result: Option<OpRef>,
 
     /// heapcache.py: escape dependencies.
     /// When value V is stored into container C via SETFIELD_GC(C, V),
     /// record V → C. If V later escapes, C must also be marked escaped.
     escape_deps: HashMap<OpRef, Vec<OpRef>>,
+
+    /// heapcache.py:176: need_guard_not_invalidated — set True on reset,
+    /// consumed by quasi-immut field recording to decide whether to emit
+    /// GUARD_NOT_INVALIDATED.
+    need_guard_not_invalidated: bool,
 }
 
 impl HeapCache {
@@ -83,8 +91,11 @@ impl HeapCache {
             known_nullity: HashMap::new(),
             cached_arraylen: HashMap::new(),
             likely_virtual: HashSet::new(),
-            loopinvariant_call_cache: HashMap::new(),
+            loopinvariant_descr: None,
+            loopinvariant_arg0: None,
+            loopinvariant_result: None,
             escape_deps: HashMap::new(),
+            need_guard_not_invalidated: true,
         }
     }
 
@@ -131,11 +142,22 @@ impl HeapCache {
         self.field_cache.clear();
     }
 
-    /// Invalidate caches for escaped objects only.
-    /// Unescaped objects cannot be affected by external calls.
+    /// heapcache.py: invalidate_unescaped — clear cached values for
+    /// escaped objects only. Unescaped (newly allocated) objects cannot
+    /// be affected by external calls, so their caches are preserved.
     pub fn invalidate_caches_for_escaped(&mut self) {
         self.field_cache
             .retain(|&(obj, _), _| self.is_unescaped.contains(&obj));
+        self.array_cache
+            .retain(|&(obj, _, _), _| self.is_unescaped.contains(&obj));
+    }
+
+    /// heapcache.py: mark_escaped_varargs — escape call arguments before
+    /// cache invalidation. GETFIELD/PTR_EQ/ASSERT_NOT_NONE args don't escape.
+    pub fn mark_escaped_args(&mut self, args: &[OpRef]) {
+        for &arg in args {
+            self.mark_escaped_recursive(arg);
+        }
     }
 
     /// Record a new object allocation. The object is marked as unescaped
@@ -191,8 +213,10 @@ impl HeapCache {
 
     /// Mark an object as escaped. Its cached fields for aliased accesses
     /// may no longer be trusted after external calls.
+    /// heapcache.py: _escape_box removes HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED.
     pub fn mark_escaped(&mut self, opref: OpRef) {
         self.is_unescaped.remove(&opref);
+        self.likely_virtual.remove(&opref);
     }
 
     /// heapcache.py: _escape_box — recursively escape an object and
@@ -201,6 +225,7 @@ impl HeapCache {
         if !self.is_unescaped.remove(&opref) {
             return; // already escaped or not tracked
         }
+        self.likely_virtual.remove(&opref);
         // Propagate escape to all values stored in this object's fields.
         if let Some(deps) = self.escape_deps.remove(&opref) {
             for dep in deps {
@@ -247,22 +272,28 @@ impl HeapCache {
         // heapcache.py: SETFIELD_GC tracking.
         // The written value becomes reachable from the container.
         // If the container later escapes, the value also escapes.
+        // heapcache.py: _escape_from_write — only record dependency if
+        // BOTH container and value are unescaped. If container is unescaped
+        // but value is not, escape the value immediately.
         if opcode == OpCode::SetfieldGc && args.len() >= 2 {
             let container = args[0];
             let value = args[1];
-            // Record dependency: if container escapes, value escapes too.
-            self.escape_deps.entry(container).or_default().push(value);
-            // If container is already escaped, mark value as escaped now.
-            if !self.is_unescaped.contains(&container) {
+            if self.is_unescaped.contains(&container) && self.is_unescaped.contains(&value) {
+                self.escape_deps.entry(container).or_default().push(value);
+            } else if self.is_unescaped.contains(&container) {
+                // Container unescaped, value already escaped — no-op
+            } else {
                 self.mark_escaped_recursive(value);
             }
         }
-        // heapcache.py: SETARRAYITEM_GC — the written value escapes.
         if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
             let container = args[0];
             let value = args[2];
-            self.escape_deps.entry(container).or_default().push(value);
-            if !self.is_unescaped.contains(&container) {
+            if self.is_unescaped.contains(&container) && self.is_unescaped.contains(&value) {
+                self.escape_deps.entry(container).or_default().push(value);
+            } else if self.is_unescaped.contains(&container) {
+                // Container unescaped, value already escaped — no-op
+            } else {
                 self.mark_escaped_recursive(value);
             }
         }
@@ -283,15 +314,35 @@ impl HeapCache {
         if opcode == OpCode::GuardNonnull && !args.is_empty() {
             self.nullity_now_known(args[0], true);
         }
-        // Calls may force/escape objects.
-        if opcode.is_call() {
+
+        // heapcache.py:242-250: mark_escaped — escape arguments for
+        // operations that are NOT in the whitelist.
+        // GETFIELD_GC_*, PTR_EQ/NE, INSTANCE_PTR_EQ/NE, ASSERT_NOT_NONE
+        // do NOT escape their arguments. SETFIELD_GC/SETARRAYITEM_GC are
+        // handled above via _escape_from_write. Everything else escapes.
+        let dont_escape = matches!(
+            opcode,
+            OpCode::GetfieldGcI
+                | OpCode::GetfieldGcR
+                | OpCode::GetfieldGcF
+                | OpCode::GetfieldGcPureI
+                | OpCode::GetfieldGcPureR
+                | OpCode::GetfieldGcPureF
+                | OpCode::PtrEq
+                | OpCode::PtrNe
+                | OpCode::InstancePtrEq
+                | OpCode::InstancePtrNe
+                | OpCode::AssertNotNone
+                | OpCode::SetfieldGc
+                | OpCode::SetarrayitemGc
+        ) || opcode.is_guard()
+            || opcode.is_malloc()
+            || opcode.has_no_side_effect();
+
+        if !dont_escape {
             for &arg in args {
                 self.mark_escaped(arg);
             }
-            if opcode.has_no_side_effect() {
-                return;
-            }
-            self.invalidate_caches_for_escaped();
         }
     }
 
@@ -380,18 +431,25 @@ impl HeapCache {
 
     // ── Loop-invariant call result caching ──
 
-    /// Record a loop-invariant call result.
-    /// heapcache.py: call_loopinvariant_known_result
-    pub fn call_loopinvariant_cache(&mut self, func: OpRef, args_hash: u64, result: OpRef) {
-        self.loopinvariant_call_cache
-            .insert((func, args_hash), result);
+    /// heapcache.py: call_loopinvariant_now_known — record a single
+    /// loop-invariant call result. Only ONE result is stored at a time;
+    /// subsequent calls overwrite the previous entry.
+    pub fn call_loopinvariant_cache(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
+        self.loopinvariant_descr = Some(descr_index);
+        self.loopinvariant_arg0 = Some(arg0_int);
+        self.loopinvariant_result = Some(result);
     }
 
-    /// Look up a cached loop-invariant call result.
-    pub fn call_loopinvariant_lookup(&self, func: OpRef, args_hash: u64) -> Option<OpRef> {
-        self.loopinvariant_call_cache
-            .get(&(func, args_hash))
-            .copied()
+    /// heapcache.py: call_loopinvariant_known_result — look up cached result.
+    /// Returns Some only if descr identity AND arg0 integer value both match.
+    pub fn call_loopinvariant_lookup(&self, descr_index: u32, arg0_int: i64) -> Option<OpRef> {
+        if self.loopinvariant_descr == Some(descr_index)
+            && self.loopinvariant_arg0 == Some(arg0_int)
+        {
+            self.loopinvariant_result
+        } else {
+            None
+        }
     }
 
     // ── Reset variants ──
@@ -407,12 +465,31 @@ impl HeapCache {
         self.known_nullity.clear();
         self.cached_arraylen.clear();
         self.likely_virtual.clear();
-        self.loopinvariant_call_cache.clear();
+        self.loopinvariant_descr = None;
+        self.loopinvariant_arg0 = None;
+        self.loopinvariant_result = None;
         self.escape_deps.clear();
+        self.need_guard_not_invalidated = true;
+    }
+
+    /// heapcache.py:176: check and consume need_guard_not_invalidated.
+    /// Returns true the first time after reset (or after cache clearing).
+    pub fn check_and_clear_guard_not_invalidated(&mut self) -> bool {
+        let needed = self.need_guard_not_invalidated;
+        self.need_guard_not_invalidated = false;
+        needed
+    }
+
+    /// Whether GUARD_NOT_INVALIDATED is needed.
+    pub fn need_guard_not_invalidated(&self) -> bool {
+        self.need_guard_not_invalidated
     }
 
     /// Reset but keep likely-virtual markers.
     /// heapcache.py: reset_keep_likely_virtuals()
+    /// heapcache.py: reset_keep_likely_virtuals — clear caches but
+    /// preserve likely_virtual flags and loopinvariant results.
+    /// Called after non-elidable calls that release the GIL.
     pub fn reset_keep_likely_virtuals(&mut self) {
         self.field_cache.clear();
         self.array_cache.clear();
@@ -422,8 +499,8 @@ impl HeapCache {
         self.seen_allocation.clear();
         self.known_nullity.clear();
         self.cached_arraylen.clear();
-        self.loopinvariant_call_cache.clear();
-        // likely_virtual is NOT cleared
+        // RPython: likely_virtual, loopinvariant_call_cache, escape_deps,
+        // need_guard_not_invalidated are NOT cleared.
     }
 }
 

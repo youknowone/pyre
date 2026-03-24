@@ -1804,6 +1804,8 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
                 }
+                // pyjitpl.py:3025: self.exported_state = None
+                self.exported_state = None;
                 self.warm_state.reset_function_counts();
                 return CompileOutcome::Compiled;
             }
@@ -1819,6 +1821,8 @@ impl<M: Clone> MetaInterp<M> {
                 // RPython: backend compilation failure is non-permanent.
                 self.warm_state.abort_tracing(green_key, false);
                 self.cancel_count += 1;
+                // pyjitpl.py:3025: self.exported_state = None
+                self.exported_state = None;
                 self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
             }
