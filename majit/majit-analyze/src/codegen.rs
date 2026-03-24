@@ -219,9 +219,14 @@ pub fn trace_box_int(
     // Inline W_Int allocation so OptVirtualize can see the object shape
     // and fold later GetfieldRawI(intval) reads back to `value`.
     let obj = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    ctx.heap_cache_mut().new_object(obj);
     let type_ptr = ctx.const_int(int_type_addr);
+    let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, type_ptr], ob_type_descr);
+    ctx.heap_cache_mut().setfield_cached(obj, ob_type_idx, type_ptr);
+    let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], intval_descr);
+    ctx.heap_cache_mut().setfield_cached(obj, intval_idx, value);
     obj
 }
 
@@ -342,9 +347,14 @@ pub fn trace_box_float(
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     let obj = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    ctx.heap_cache_mut().new_object(obj);
     let type_ptr = ctx.const_int(float_type_addr);
+    let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, type_ptr], ob_type_descr);
+    ctx.heap_cache_mut().setfield_cached(obj, ob_type_idx, type_ptr);
+    let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], floatval_descr);
+    ctx.heap_cache_mut().setfield_cached(obj, floatval_idx, value);
     obj
 }
 
