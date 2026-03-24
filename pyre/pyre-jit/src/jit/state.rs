@@ -63,8 +63,19 @@ pub enum ConcreteValue {
     Null,
 }
 
+/// Convert a frame slot value to ConcreteValue, preserving null pointers
+/// as Ref(PY_NULL) instead of ConcreteValue::Null. Frame slots always
+/// contain known values — null means "uninitialized local", not "untracked".
+fn concrete_value_from_slot(obj: PyObjectRef) -> ConcreteValue {
+    if obj.is_null() {
+        return ConcreteValue::Ref(pyre_object::PY_NULL);
+    }
+    ConcreteValue::from_pyobj(obj)
+}
+
 impl ConcreteValue {
     /// Convert from PyObjectRef (unbox if possible).
+    /// Null pointers become ConcreteValue::Null ("untracked").
     pub fn from_pyobj(obj: PyObjectRef) -> Self {
         if obj.is_null() {
             return ConcreteValue::Null;
@@ -1139,18 +1150,18 @@ impl PyreSym {
         self.valuestackdepth = valuestackdepth;
         // MIFrame concrete Box tracking: populate concrete value arrays
         // from the concrete frame snapshot (RPython MIFrame.setup_call parity).
+        // Use concrete_value_from_slot to distinguish "real null pointer"
+        // (Ref(PY_NULL)) from "untracked" (ConcreteValue::Null).
         self.concrete_locals = (0..nlocals)
             .map(|i| {
-                ConcreteValue::from_pyobj(
-                    concrete_stack_value(concrete_frame, i).unwrap_or(PY_NULL),
-                )
+                let obj = concrete_stack_value(concrete_frame, i).unwrap_or(PY_NULL);
+                concrete_value_from_slot(obj)
             })
             .collect();
         self.concrete_stack = (0..stack_only_depth)
             .map(|i| {
-                ConcreteValue::from_pyobj(
-                    concrete_stack_value(concrete_frame, nlocals + i).unwrap_or(PY_NULL),
-                )
+                let obj = concrete_stack_value(concrete_frame, nlocals + i).unwrap_or(PY_NULL);
+                concrete_value_from_slot(obj)
             })
             .collect();
         // Extract frame metadata pointers for use without concrete_frame
@@ -5016,7 +5027,8 @@ impl NamespaceOpcodeHandler for MIFrame {
     }
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
-        self.sym_mut().pending_concrete_push = Some(ConcreteValue::Null);
+        // PUSH_NULL pushes a real null pointer, not "untracked".
+        self.sym_mut().pending_concrete_push = Some(ConcreteValue::Ref(pyre_object::PY_NULL));
         self.trace_null_value()
     }
 }
@@ -5242,6 +5254,27 @@ impl ArithmeticOpcodeHandler for MIFrame {
             };
             self.sym_mut().pending_concrete_push = Some(ConcreteValue::Int(result));
         }
+        // Fallback: if neither int nor float path set pending_concrete_push,
+        // compute via objspace (handles BigInt, mixed types, etc.)
+        if self.sym().pending_concrete_push.is_none() {
+            if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
+                let result = match op {
+                    BinaryOperator::Add | BinaryOperator::InplaceAdd => {
+                        pyre_objspace::space::py_add(lhs_obj, rhs_obj)
+                    }
+                    BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
+                        pyre_objspace::space::py_sub(lhs_obj, rhs_obj)
+                    }
+                    BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
+                        pyre_objspace::space::py_mul(lhs_obj, rhs_obj)
+                    }
+                    _ => Err(pyre_runtime::PyError::type_error("unsupported")),
+                };
+                if let Ok(r) = result {
+                    self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(r));
+                }
+            }
+        }
         if matches!(op, BinaryOperator::Subscr) {
             self.binary_subscr_value(a, b)
         } else if self.concrete_binary_float_operands()
@@ -5350,7 +5383,8 @@ impl ConstantOpcodeHandler for MIFrame {
     }
 
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError> {
-        // Code objects don't have a simple concrete repr; use PY_NULL
+        self.sym_mut().pending_concrete_push =
+            Some(ConcreteValue::Ref(code as *const CodeObject as PyObjectRef));
         self.trace_code_constant(code)
     }
 
