@@ -486,13 +486,9 @@ impl<S: JitState> JitDriver<S> {
                 jump_args,
                 loop_header_pc,
             } => {
-                // RPython pyjitpl.py reached_loop_header(): merge_pc
-                // retarget. Disabled: alias fix resolved, but Phase 2 body
-                // carries SameAs guard condition (v54) as loop-invariant
-                // from Phase 1 instead of recomputing from field reads.
-                // This causes infinite loop when entering at target_pc.
-                // Needs: Phase 2 short preamble must re-import the guard
-                // condition as a computed value, not a constant SameAs.
+                // Green key is no longer retargeted in trace.rs, so
+                // merge_pc stays consistent with the trace entry PC.
+                // No update needed.
                 let _ = loop_header_pc;
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
@@ -689,7 +685,10 @@ impl<S: JitState> JitDriver<S> {
             if self.meta.has_compiled_targets(green_key) {
                 if let Some(sym) = self.sym.as_ref() {
                     let jump_args = S::collect_jump_args(sym);
-                    if self.meta.compile_trace(green_key, &jump_args) {
+                    if matches!(
+                        self.meta.compile_trace(green_key, &jump_args, None),
+                        crate::pyjitpl::CompileOutcome::Compiled
+                    ) {
                         self.sym = None;
                         self.trace_meta = None;
                         return Some(DetailedDriverRunOutcome::Jump {
