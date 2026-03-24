@@ -149,6 +149,12 @@ impl TraceCtx {
         self.heap_cache.reset();
     }
 
+    /// pyjitpl.py:1776-1780: jit.isvirtual(obj) — check if an object
+    /// is likely virtual (allocated during this trace and not escaped).
+    pub fn is_likely_virtual(&self, obj: OpRef) -> bool {
+        self.heap_cache.is_likely_virtual(obj)
+    }
+
     /// Create a standalone TraceCtx for testing or external use.
     pub fn for_test(num_inputs: usize) -> Self {
         let mut recorder = Trace::new();
