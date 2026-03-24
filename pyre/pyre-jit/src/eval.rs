@@ -776,8 +776,16 @@ fn restore_guard_failure_for_loop(
 /// Pattern: [..., NONE, NONE] [ob_type1, intval1, ob_type2, intval2]
 /// Only apply when trailing fields are available (2 Int per null slot).
 /// Otherwise, replace remaining null Refs with w_none() for safety.
-fn materialize_recovery_virtuals(typed: &mut Vec<Value>, _exit_layout: &CompiledExitLayout) {
-    // Find all null Ref slots (virtual markers) after the header (frame/ni/vsd)
+fn materialize_recovery_virtuals(typed: &mut Vec<Value>, exit_layout: &CompiledExitLayout) {
+    // Try recovery layout first (Cranelift-generated from rd_virtuals).
+    if let Some(ref recovery) = exit_layout.recovery_layout {
+        if !recovery.virtual_layouts.is_empty() {
+            if materialize_from_recovery_layout(typed, recovery) {
+                return;
+            }
+        }
+    }
+    // Fallback: heuristic-based materialization.
     let null_slots: Vec<usize> = (3..typed.len())
         .filter(|&i| matches!(typed.get(i), Some(Value::Ref(majit_ir::GcRef(0)))))
         .collect();
@@ -848,6 +856,76 @@ fn materialize_recovery_virtuals(typed: &mut Vec<Value>, _exit_layout: &Compiled
             typed[slot_idx] = Value::Ref(majit_ir::GcRef(w_none() as usize));
         }
     }
+}
+
+/// Materialize virtuals using Cranelift recovery layout (rd_virtuals parity).
+fn materialize_from_recovery_layout(
+    typed: &mut Vec<Value>,
+    recovery: &majit_codegen::ExitRecoveryLayout,
+) -> bool {
+    let w_int_type = &pyre_object::pyobject::INT_TYPE as *const _ as usize;
+    let w_float_type = &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize;
+
+    let resolve_value = |src: &majit_codegen::ExitValueSourceLayout| -> Option<i64> {
+        match src {
+            majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+                typed.get(*idx).map(|v| match v {
+                    Value::Int(i) => *i,
+                    Value::Float(f) => f.to_bits() as i64,
+                    Value::Ref(r) => r.0 as i64,
+                    _ => 0,
+                })
+            }
+            majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
+            _ => None,
+        }
+    };
+
+    // Materialize each virtual described in the recovery layout.
+    let mut materialized: Vec<usize> = Vec::new();
+    for vl in &recovery.virtual_layouts {
+        match vl {
+            majit_codegen::ExitVirtualLayout::Object { fields, .. }
+            | majit_codegen::ExitVirtualLayout::Struct { fields, .. } => {
+                let field_vals: Vec<i64> = fields
+                    .iter()
+                    .map(|(_, src)| resolve_value(src).unwrap_or(0))
+                    .collect();
+                let ob_type = field_vals.first().copied().unwrap_or(0) as usize;
+                let val_raw = field_vals.get(1).copied().unwrap_or(0);
+                let obj = if ob_type == w_float_type {
+                    pyre_object::floatobject::w_float_new(f64::from_bits(val_raw as u64)) as usize
+                } else if ob_type == w_int_type {
+                    pyre_object::intobject::w_int_new(val_raw) as usize
+                } else {
+                    w_none() as usize
+                };
+                materialized.push(obj);
+            }
+            _ => materialized.push(w_none() as usize),
+        }
+    }
+
+    // Replace Virtual(idx) frame slots with materialized pointers.
+    let mut all_ok = true;
+    if let Some(frame) = recovery.frames.last() {
+        for (slot_idx, src) in frame.slots.iter().enumerate() {
+            if let majit_codegen::ExitValueSourceLayout::Virtual(vidx) = src {
+                if let Some(&ptr) = materialized.get(*vidx) {
+                    if slot_idx < typed.len() {
+                        typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
+                    } else {
+                        all_ok = false;
+                    }
+                } else {
+                    all_ok = false;
+                }
+            }
+        }
+    } else {
+        all_ok = false;
+    }
+    all_ok
 }
 
 pub(crate) fn build_jit_state(
