@@ -1498,13 +1498,6 @@ impl OptUnroll {
         // RPython Box identity: shared seen across all imports so that
         // duplicate virtual field OpRefs are detected and given fresh positions.
         let mut import_seen: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
-        // Detect targets that collide with Phase 2 inputarg positions.
-        // In RPython, Phase 1 targets and Phase 2 sources are distinct Box
-        // objects, so forwarding never collides. In pyre, they share the
-        // OpRef namespace, causing get_replacement to stop at the wrong
-        // PtrInfo. Skip replace_op forwarding for colliding targets —
-        // apply_exported_info copies info directly to source instead.
-        let source_set: std::collections::HashSet<OpRef> = targetargs.iter().copied().collect();
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][import] next_iteration_args={:?}",
@@ -1515,12 +1508,7 @@ impl OptUnroll {
             let source = targetargs[i];
             let is_dup = !seen_targets.insert(*target);
             if !is_dup {
-                // Skip replace_op when target is also a Phase 2 inputarg
-                // (different slot) — forwarding would collide with that
-                // slot's PtrInfo. The import_target_map is still recorded
-                // for the assembler's use.
-                let collides = *target != source && source_set.contains(target);
-                ctx.set_import_box(source, *target, collides);
+                ctx.set_import_box(source, *target);
             }
             if let Some(info) = exported_state.exported_infos.get(target) {
                 self.apply_exported_info_recursive(
@@ -1650,21 +1638,29 @@ impl OptUnroll {
         ctx: &mut OptContext,
         seen: &mut std::collections::HashSet<OpRef>,
     ) {
-        // RPython Box identity: do NOT follow forwarding here.
-        // Each inputarg must have independent PtrInfo.
-        if !seen.insert(opref) {
+        // RPython setinfo_from_preamble parity:
+        //   op = get_box_replacement(source)  → follow forwarding to TARGET
+        //   op.set_forwarded(info)            → set info ON TARGET
+        //
+        // In pyre, set_import_box(source, target) creates forwarding[source] = target.
+        // Info must be set on the TARGET (via get_replacement) so that each
+        // target carries its own info. Without this, forwarding[A] → B where
+        // B later gets a different slot's info causes get_replacement(A) to
+        // stop at B's wrong info.
+        let target = ctx.get_replacement(opref);
+        if !seen.insert(target) {
             return;
         }
         if let Some(value) = &info.constant {
-            let const_opref = if opref.0 < 10_000 {
+            let const_opref = if target.0 < 10_000 {
                 static NEXT_IMPORT_CONST: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(10_100);
                 let new_idx = NEXT_IMPORT_CONST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let new_ref = OpRef(new_idx);
-                ctx.replace_op(opref, new_ref);
+                ctx.replace_op(target, new_ref);
                 new_ref
             } else {
-                opref
+                target
             };
             ctx.make_constant(const_opref, value.clone());
             if let Value::Ref(ptr) = value {
@@ -1672,18 +1668,18 @@ impl OptUnroll {
             }
         }
         if let Some(ptr_info) = info.ptr_info.clone() {
-            self.apply_exported_ptr_info(opref, ptr_info, exported_infos, ctx, seen);
+            self.apply_exported_ptr_info(target, ptr_info, exported_infos, ctx, seen);
         } else {
             match info.ptr_kind {
                 ExportedPtrKind::Instance => {
                     ctx.set_ptr_info(
-                        opref,
+                        target,
                         crate::info::PtrInfo::instance(info.ptr_descr.clone(), info.known_class),
                     );
                 }
                 ExportedPtrKind::Struct => {
                     if let Some(descr) = info.ptr_descr.clone() {
-                        ctx.set_ptr_info(opref, crate::info::PtrInfo::struct_ptr(descr));
+                        ctx.set_ptr_info(target, crate::info::PtrInfo::struct_ptr(descr));
                     }
                 }
                 ExportedPtrKind::Array => {
@@ -1692,20 +1688,20 @@ impl OptUnroll {
                             .array_lenbound
                             .clone()
                             .unwrap_or_else(crate::intutils::IntBound::nonnegative);
-                        ctx.set_ptr_info(opref, crate::info::PtrInfo::array(descr, lenbound));
+                        ctx.set_ptr_info(target, crate::info::PtrInfo::array(descr, lenbound));
                     }
                 }
                 ExportedPtrKind::None => {
                     if let Some(class_ptr) = info.known_class {
                         ctx.set_ptr_info(
-                            opref,
+                            target,
                             crate::info::PtrInfo::KnownClass {
                                 class_ptr,
                                 is_nonnull: true,
                             },
                         );
                     } else if info.nonnull {
-                        ctx.set_ptr_info(opref, crate::info::PtrInfo::NonNull);
+                        ctx.set_ptr_info(target, crate::info::PtrInfo::NonNull);
                     }
                 }
             }
@@ -1713,12 +1709,12 @@ impl OptUnroll {
         if let Some(bound) = info.int_bound.as_ref() {
             let widened = bound.widen();
             if widened.lower > i64::MIN {
-                ctx.int_lower_bounds.insert(opref, widened.lower);
+                ctx.int_lower_bounds.insert(target, widened.lower);
             }
-            ctx.imported_int_bounds.insert(opref, widened);
+            ctx.imported_int_bounds.insert(target, widened);
         }
         if let Some(lower) = info.int_lower_bound {
-            ctx.int_lower_bounds.insert(opref, lower);
+            ctx.int_lower_bounds.insert(target, lower);
         }
     }
 

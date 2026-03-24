@@ -755,7 +755,7 @@ impl OptContext {
     }
 
     /// Record that `old` should be replaced by `new` wherever it appears.
-    /// RPython: make_equal_to — within-phase forwarding only.
+    /// RPython set_forwarded parity: setting forwarding REPLACES any Info.
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new {
             return;
@@ -765,6 +765,10 @@ impl OptContext {
             self.forwarding.resize(idx + 1, OpRef::NONE);
         }
         self.forwarding[idx] = new;
+        // Clear ptr_info: this position is now a transit (forwarding).
+        if idx < self.ptr_info.len() {
+            self.ptr_info[idx] = None;
+        }
         self.short_preamble_mapping.remove(&old);
         // Sync to forwarded table.
         if idx >= self.forwarded.len() {
@@ -773,23 +777,22 @@ impl OptContext {
         self.forwarded[idx] = Forwarded::Op(new);
     }
 
-    /// RPython Box identity: set per-value forwarding for import_state.
-    ///
-    /// When `skip_forwarding` is true, the replace_op forwarding is omitted.
-    /// This is needed when `target` is also a Phase 2 inputarg that will
-    /// receive its own PtrInfo from another slot's import — forwarding
-    /// through it would cause get_replacement to stop at the wrong PtrInfo.
-    /// (In RPython, Phase 1 targets are distinct Box objects from Phase 2
-    /// sources, so this collision cannot occur.)
-    pub fn set_import_box(&mut self, source: OpRef, target: OpRef, skip_forwarding: bool) {
-        if !skip_forwarding {
-            self.replace_op(source, target);
-        }
+    /// RPython unroll.py: source.set_forwarded(target)
+    /// Sets forwarding from Phase 2 source to Phase 1 export target.
+    /// apply_exported_info_recursive then sets PtrInfo on the TARGET
+    /// (via get_replacement), matching RPython's setinfo_from_preamble.
+    pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
+        self.replace_op(source, target);
     }
 
     /// RPython get_box_replacement: follow forwarding chain, stop when the
     /// NEXT position has ptr_info set (it's a terminal, like RPython's
     /// get_box_replacement stopping at _forwarded=Info).
+    /// RPython get_box_replacement: follow the forwarding chain until
+    /// we reach a terminal. With ptr_info/forwarding mutual exclusion,
+    /// a position has EITHER forwarding (transit) OR ptr_info (terminal),
+    /// never both. A terminal position has no forwarding → the loop
+    /// ends naturally when forwarding[idx] is NONE.
     pub fn get_replacement(&self, mut opref: OpRef) -> OpRef {
         // RPython: mapping dict lookup (inline_short_preamble).
         // Cross-phase mapping is separate from _forwarded chain.
@@ -804,13 +807,6 @@ impl OptContext {
             let next = self.forwarding[idx];
             if next.is_none() {
                 return opref;
-            }
-            // RPython: stop if NEXT has Info (ptr_info set → terminal).
-            let next_idx = next.0 as usize;
-            if next_idx < self.ptr_info.len() {
-                if self.ptr_info[next_idx].is_some() {
-                    return next;
-                }
             }
             opref = next;
         }
@@ -977,12 +973,19 @@ impl OptContext {
         }
     }
 
+    /// RPython set_forwarded parity: setting Info on a box REPLACES
+    /// any forwarding. In pyre, ptr_info and forwarding must be
+    /// mutually exclusive — the last writer wins.
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
         let idx = opref.0 as usize;
         if idx >= self.ptr_info.len() {
             self.ptr_info.resize(idx + 1, None);
         }
         self.ptr_info[idx] = Some(info);
+        // Clear forwarding: this position is now a terminal (has Info).
+        if idx < self.forwarding.len() {
+            self.forwarding[idx] = OpRef::NONE;
+        }
     }
 
     /// optimizer.py: replace_op_with(old, new_op, ctx)
