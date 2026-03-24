@@ -2146,26 +2146,36 @@ fn call_assembler_fast_path(
     let mut roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
 
     // RPython parity: register GC roots + force frame before compiled code.
-    if let Some(gc_id) = target.gc_runtime_id {
-        register_gc_roots(gc_id, &mut roots);
+    // Skip GC root registration when num_ref_roots == 0 (no Ref-typed
+    // values in the compiled code's output). This avoids mutex overhead
+    // in tight recursive loops like fib.
+    // RPython parity: call_assembler is a direct code-to-code call.
+    // GC roots use the callee's jitframe (not a per-call registry).
+    // Force frame is the callee's jitframe pointer (not a HashMap entry).
+    //
+    // Skip force_frame registration entirely — call_assembler_fast_path
+    // handles guard failures directly using target.fail_descrs, without
+    // needing the force_frame registry. This eliminates Arc::new +
+    // fail_descrs.to_vec() + mutex per call (~750M overhead for fib(32)).
+    let has_gc_roots = target.num_ref_roots > 0;
+    if has_gc_roots {
+        if let Some(gc_id) = target.gc_runtime_id {
+            register_gc_roots(gc_id, &mut roots[..target.num_ref_roots]);
+        }
     }
-    let (handle, _force_frame) = if target.needs_force_frame {
-        let (h, f) = register_force_frame(&target.fail_descrs, target.gc_runtime_id);
-        (h, Some(f))
-    } else {
-        (0, None)
-    };
 
-    let fail_index = with_active_force_frame(handle, || unsafe {
+    let fail_index = unsafe {
         func(
             inputs.as_ptr(),
             outputs.as_mut_ptr(),
             roots.as_mut_ptr() as *mut i64,
         )
-    }) as u32;
+    } as u32;
 
-    if let Some(gc_id) = target.gc_runtime_id {
-        unregister_gc_roots(gc_id, &mut roots);
+    if has_gc_roots {
+        if let Some(gc_id) = target.gc_runtime_id {
+            unregister_gc_roots(gc_id, &mut roots[..target.num_ref_roots]);
+        }
     }
     drop(_jitted_guard);
 
