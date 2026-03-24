@@ -1697,6 +1697,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut token = JitCellToken::new(token_num);
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
+        self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -2152,6 +2153,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut token = JitCellToken::new(token_num);
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
+        self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -2428,6 +2430,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
+        self.backend.set_next_header_pc(green_key);
 
         match self
             .backend
@@ -3520,6 +3523,18 @@ impl<M: Clone> MetaInterp<M> {
     /// Return all green keys that have compiled loops.
     pub fn all_compiled_keys(&self) -> Vec<u64> {
         self.compiled_loops.keys().copied().collect()
+    }
+
+    /// Check whether `trace_id` belongs to a bridge (not a root trace).
+    pub fn is_bridge_trace_id(&self, trace_id: u64) -> bool {
+        // A trace_id is a bridge if it doesn't match any compiled loop's root_trace_id.
+        if trace_id == 0 {
+            return false;
+        }
+        !self
+            .compiled_loops
+            .values()
+            .any(|entry| entry.root_trace_id == trace_id)
     }
 
     /// warmstate.py:385 — whether this driver's portal returns a raw int.

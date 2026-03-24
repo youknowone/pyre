@@ -679,7 +679,9 @@ impl<S: JitState> JitDriver<S> {
             // pyjitpl.py:2973-2977 compile_trace: if the current green_key
             // has compiled code with target tokens, compile the current
             // trace as a bridge to that existing compiled code.
-            if self.meta.has_compiled_targets(green_key) {
+            // Skip for bridge traces — bridges continue recording until they
+            // reach a loop header (CloseLoop) or function return (Finish).
+            if !self.is_bridge_tracing() && self.meta.has_compiled_targets(green_key) {
                 if let Some(sym) = self.sym.as_ref() {
                     let jump_args = S::collect_jump_args(sym);
                     if matches!(
