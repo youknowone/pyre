@@ -11,7 +11,38 @@ use pyre_bytecode::CodeObject;
 use pyre_bytecode::bytecode::Instruction;
 use pyre_runtime::decode_instruction_at;
 
-use crate::jit::state::{MIFrame, PyreSym};
+use crate::jit::metainterp::{MetaInterpFrame, PyreMetaInterp};
+use crate::jit::state::PyreSym;
+
+/// Trace an entire loop body starting at `start_pc`.
+///
+/// RPython MetaInterp._interpret() parity: creates a PyreMetaInterp
+/// with a single frame and delegates to interpret(). The interpret
+/// loop calls MIFrame::trace_code_step() for each bytecode, combining
+/// concrete execution and symbolic IR recording.
+pub fn trace_bytecode(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    code: &CodeObject,
+    start_pc: usize,
+    concrete_frame: usize,
+) -> TraceAction {
+    // Build a MetaInterp with a single root frame.
+    // The root frame borrows PyreSym from the caller via raw pointer.
+    // PyreMetaInterp.interpret() drives the dispatch loop.
+    let frame = MetaInterpFrame {
+        sym: sym as *mut PyreSym,
+        jitcode: code as *const CodeObject,
+        pc: start_pc,
+        greenkey: None,
+        concrete_frame,
+    };
+
+    let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, std::ptr::null_mut());
+    metainterp.framestack.push(frame);
+
+    metainterp.interpret(ctx)
+}
 
 fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
     let mut next_pc = pc.saturating_add(1);
@@ -28,67 +59,6 @@ fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
                 next_pc += 1;
             }
             _ => return next_pc,
-        }
-    }
-}
-
-/// Trace an entire loop body starting at `start_pc`.
-///
-/// RPython MetaInterp._interpret() parity: loops over bytecodes,
-/// recording IR via MIFrame. Concrete values are tracked
-/// internally in PyreSym's concrete_locals/concrete_stack arrays —
-/// no external frame execution is needed. Stops when a back-edge
-/// (CloseLoop) is reached or on error/abort.
-pub fn trace_bytecode(
-    ctx: &mut TraceCtx,
-    sym: &mut PyreSym,
-    code: &CodeObject,
-    start_pc: usize,
-    concrete_frame: usize,
-) -> TraceAction {
-    // RPython MetaInterp mode: PyreMetaFrame handles concrete dispatch
-    // while MIFrame handles symbolic IR recording.
-    // Both share PyreSym's concrete_locals/concrete_stack.
-    let mut pc = start_pc;
-
-    loop {
-        if pc >= code.instructions.len() {
-            return TraceAction::Abort;
-        }
-
-        // ── Symbolic + concrete trace step ──
-        // Each opcode handler records IR AND updates concrete Box values
-        // in PyreSym (via pending_concrete_push / concrete_locals).
-        let mut frame_state =
-            MIFrame::from_sym(ctx, sym, concrete_frame, semantic_fallthrough_pc(code, pc));
-        frame_state.promote_valuestackdepth(concrete_frame);
-
-        let action = frame_state.trace_code_step(code, pc);
-
-        match action {
-            TraceAction::Continue => {
-                // Get next PC from symbolic state
-                let next_pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
-                pc = next_pc;
-            }
-
-            TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-                // Retarget trace green key to loop header
-                if let TraceAction::CloseLoopWithArgs {
-                    loop_header_pc: Some(target_pc),
-                    ..
-                } = action
-                {
-                    let key = crate::eval::make_green_key(code as *const CodeObject, target_pc);
-                    ctx.set_green_key(key);
-                } else if matches!(action, TraceAction::CloseLoop) {
-                    let key = crate::eval::make_green_key(code as *const CodeObject, pc);
-                    ctx.set_green_key(key);
-                }
-                return action;
-            }
-
-            other => return other,
         }
     }
 }
