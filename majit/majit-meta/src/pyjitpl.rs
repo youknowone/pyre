@@ -3068,6 +3068,49 @@ impl<M: Clone> MetaInterp<M> {
         })
     }
 
+    /// RPython MIFrame: unbox Ref→Int where compiled trace expects Int.
+    pub fn adapt_live_values_to_trace_types(
+        &self,
+        green_key: u64,
+        mut values: Vec<Value>,
+    ) -> Vec<Value> {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return values;
+        };
+        // Read actual label types from first guard's fail_arg_types,
+        // which reflects the tracer's typed locals (not build_meta's all-Ref).
+        let types: Vec<Type> = compiled
+            .traces
+            .get(&compiled.root_trace_id)
+            .and_then(|trace| {
+                trace
+                    .ops
+                    .iter()
+                    .find(|op| op.opcode.is_guard())
+                    .and_then(|op| {
+                        op.descr
+                            .as_ref()
+                            .and_then(|d| d.as_fail_descr())
+                            .map(|fd| fd.fail_arg_types().to_vec())
+                    })
+            })
+            .unwrap_or_default();
+        for (i, tp) in types.iter().enumerate() {
+            if i >= values.len() {
+                break;
+            }
+            if let (Value::Ref(r), Type::Int) = (&values[i], tp) {
+                let ptr = r.as_usize();
+                if ptr >= 0x1_0000 && ptr < (1usize << 56) && (ptr & 7) == 0 {
+                    values[i] = Value::Int(unsafe { *((ptr + 8) as *const i64) });
+                } else {
+                    values[i] = Value::Int(ptr as i64);
+                }
+            }
+        }
+        values
+    }
+
     /// Typed-input counterpart to [`run_compiled_detailed`].
     pub fn run_compiled_detailed_with_values(
         &mut self,

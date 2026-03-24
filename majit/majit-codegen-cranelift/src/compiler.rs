@@ -2398,9 +2398,12 @@ extern "C" fn call_assembler_shim(
         "call_assembler shim outcome buffer must be non-null"
     );
 
-    // Use the full DeadFrame path which goes through run_compiled_code
-    // with proper GC root + force frame registration. This matches
-    // RPython's execute_token → guard-fail → assembler_call_helper flow.
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!(
+            "[ca-shim] entering trace_id={} num_inputs={}",
+            target.trace_id, target.num_inputs
+        );
+    }
     let mut frame = execute_registered_loop_target(target, input_slice);
     let descr =
         get_latest_descr_from_deadframe(&frame).expect("get_latest_descr_from_deadframe failed");
@@ -2420,6 +2423,13 @@ extern "C" fn call_assembler_shim(
     let fail_values: Vec<i64> = (0..fail_types.len())
         .map(|i| get_int_from_deadframe(&frame, i).unwrap_or(0))
         .collect();
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!(
+            "[ca-shim] guard fail_idx={} nvals={}",
+            fail_index,
+            fail_values.len()
+        );
+    }
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         if let Some(result) = bh_fn(
             target.header_pc,
@@ -2709,17 +2719,12 @@ fn resolve_call_assembler_target(
         return Ok(None);
     }
 
-    if target.inputarg_types != call_descr.arg_types() {
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[codegen] call-assembler type mismatch: target={:?} descr={:?}",
-                target.inputarg_types,
-                call_descr.arg_types()
-            );
-        }
+    // RPython: arity check only (Int vs Ref mismatch is valid for
+    // function-entry typed locals).
+    if target.inputarg_types.len() != call_descr.arg_types().len() {
         return Err(unsupported_semantics(
             opcode,
-            "call-assembler target input types do not match the descriptor",
+            "call-assembler target arity does not match the descriptor",
         ));
     }
     let finish_descr = target

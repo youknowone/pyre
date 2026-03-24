@@ -437,11 +437,14 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
 
-    // RPython bhimpl_recursive_call → portal_runner parity.
-    let result = match crate::eval::eval_with_jit(frame) {
+    // RPython blackhole: use plain interpreter in force_fn to prevent
+    // CALL_ASSEMBLER re-entry. Disable JIT eval override temporarily.
+    pyre_interp::call::register_eval_override(pyre_interp::eval::eval_frame_plain);
+    let result = match pyre_interp::eval::eval_frame_plain(frame) {
         Ok(r) => r,
         Err(_) => pyre_object::PY_NULL,
     };
+    pyre_interp::call::register_eval_override(crate::eval::eval_with_jit);
 
     // Process deferred bridge compile requests. force_fn is called
     // outside MetaInterp borrow scope, so compile_bridge is safe here.

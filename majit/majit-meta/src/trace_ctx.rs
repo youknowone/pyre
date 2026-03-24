@@ -51,6 +51,8 @@ pub struct TraceCtx {
     virtualizable_info: Option<VirtualizableInfo>,
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
+    /// Header PC at which this trace started (0 = function entry).
+    pub header_pc: usize,
     /// Pending OpRef replacements from inline callee returns.
     /// Applied when the trace is finalized (close_loop/compile).
     replacements: Vec<(OpRef, OpRef)>,
@@ -179,6 +181,7 @@ impl TraceCtx {
             virtualizable_boxes: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
+            header_pc: 0,
             replacements: Vec::new(),
             current_merge_points: vec![MergePoint {
                 green_key,
@@ -212,6 +215,7 @@ impl TraceCtx {
             virtualizable_boxes: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
+            header_pc: 0,
             replacements: Vec::new(),
             current_merge_points: vec![MergePoint {
                 green_key,

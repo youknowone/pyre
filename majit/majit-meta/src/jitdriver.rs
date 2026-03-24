@@ -830,6 +830,9 @@ impl<S: JitState> JitDriver<S> {
             .force_start_tracing(green_key, descriptor, &live_values)
         {
             BackEdgeAction::StartedTracing => {
+                if let Some(ctx) = self.meta.trace_ctx() {
+                    ctx.header_pc = target_pc;
+                }
                 self.sym = Some(S::create_sym(&meta, target_pc));
                 self.trace_meta = Some(meta);
             }
@@ -863,6 +866,9 @@ impl<S: JitState> JitDriver<S> {
             .bound_reached(green_key, None, descriptor, &live_values)
         {
             BackEdgeAction::StartedTracing => {
+                if let Some(ctx) = self.meta.trace_ctx() {
+                    ctx.header_pc = target_pc;
+                }
                 self.sym = Some(S::create_sym(&meta, target_pc));
                 self.trace_meta = Some(meta);
             }
@@ -896,6 +902,9 @@ impl<S: JitState> JitDriver<S> {
         ) {
             BackEdgeAction::Interpret => {}
             BackEdgeAction::StartedTracing => {
+                if let Some(ctx) = self.meta.trace_ctx() {
+                    ctx.header_pc = target_pc;
+                }
                 self.sym = Some(S::create_sym(&meta, target_pc));
                 self.trace_meta = Some(meta);
             }
@@ -1470,6 +1479,13 @@ impl<S: JitState> JitDriver<S> {
                 restored: false,
                 via_blackhole: false,
             };
+        };
+        // RPython MIFrame: function-entry unbox Ref→Int for typed label.
+        let live_values = if target_pc == 0 {
+            self.meta
+                .adapt_live_values_to_trace_types(green_key, live_values)
+        } else {
+            live_values
         };
         pre_run();
         let Some(result) = self
