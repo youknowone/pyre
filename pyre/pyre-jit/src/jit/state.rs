@@ -314,11 +314,10 @@ pub struct PyreSym {
 /// `PyreSym` via raw pointer. The symbolic tracking (locals, stack,
 /// valuestackdepth, next_instr) lives in PyreSym and survives across
 /// instructions; this struct provides the per-instruction context
-/// (ctx, fallthrough_pc, concrete_frame).
+/// (ctx, fallthrough_pc).
 pub(crate) struct MIFrame {
     ctx: *mut TraceCtx,
     sym: *mut PyreSym,
-    concrete_frame: usize,
     ob_type_fd: DescrRef,
     fallthrough_pc: usize,
     /// RPython pyjitpl.py orgpc parity: the PC at the START of the current
@@ -1346,10 +1345,6 @@ impl MIFrame {
         concrete_frame: usize,
         fallthrough_pc: usize,
     ) -> Self {
-        debug_assert!(
-            concrete_frame != 0,
-            "concrete_frame must be a valid frame pointer"
-        );
         sym.init_symbolic(ctx, concrete_frame);
         // orgpc defaults to fallthrough_pc - 1 (opcode start).
         // Overridden by set_orgpc() in trace_code_step.
@@ -1357,7 +1352,6 @@ impl MIFrame {
         Self {
             ctx,
             sym,
-            concrete_frame,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc,
             orgpc,
@@ -2198,21 +2192,13 @@ impl MIFrame {
             .or_else(|| self.concrete_at_or_frame(self.sym().valuestackdepth))
     }
 
-    /// Read a concrete value from MIFrame Box arrays, with fallback
-    /// to the concrete_frame snapshot for indices within snapshot depth.
+    /// Read a concrete value from MIFrame Box arrays.
     fn concrete_at_or_frame(&self, abs_idx: usize) -> Option<PyObjectRef> {
         let v = self.sym().concrete_value_at(abs_idx);
         if !v.is_null() {
             return Some(v.to_pyobj());
         }
-        // Fallback: read from concrete_frame snapshot when Box tracking
-        // has gaps. Only safe for indices within the snapshot's depth.
-        let snapshot_depth = concrete_stack_depth(self.concrete_frame).unwrap_or(0);
-        if abs_idx < snapshot_depth {
-            concrete_stack_value(self.concrete_frame, abs_idx)
-        } else {
-            None
-        }
+        None
     }
 
     fn concrete_binary_operands(&self) -> Option<(PyObjectRef, PyObjectRef)> {
@@ -6735,7 +6721,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -6766,7 +6751,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7028,7 +7012,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7057,7 +7040,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7100,7 +7082,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7136,7 +7117,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7166,7 +7146,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7203,7 +7182,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7264,7 +7242,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: branch_pc,
             parent_fail_args: None,
@@ -7337,7 +7314,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7418,7 +7394,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: compare_pc + 1,
             parent_fail_args: None,
@@ -7485,7 +7460,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: compare_pc + 2,
             parent_fail_args: None,
@@ -7523,7 +7497,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7562,7 +7535,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7598,7 +7570,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7649,7 +7620,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7686,7 +7656,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7722,7 +7691,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7759,7 +7727,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7814,7 +7781,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 459,
             parent_fail_args: None,
@@ -7879,7 +7845,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 459,
             parent_fail_args: None,
@@ -7938,7 +7903,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -7976,7 +7940,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -8024,7 +7987,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -8083,7 +8045,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -8146,7 +8107,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: 1,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -8210,7 +8170,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -8302,7 +8261,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
@@ -8378,7 +8336,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            concrete_frame: frame_ptr,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_fail_args: None,
