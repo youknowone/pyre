@@ -309,6 +309,31 @@ impl OptRewrite {
             }
         }
 
+        // sub_xor_x_y_y: int_sub(int_xor(x, y), y) => x (if x & y == 0)
+        if let Some(inner) = ctx.get_producing_op(arg0) {
+            if inner.opcode == OpCode::IntXor && inner.arg(1) == arg1 {
+                if let (Some(bx), Some(by)) =
+                    (ctx.get_int_bound(inner.arg(0)), ctx.get_int_bound(arg1))
+                {
+                    if bx.and_bound(&by).known_eq_const(0) {
+                        ctx.replace_op(op.pos, inner.arg(0));
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
+            // sub_or_x_y_y: int_sub(int_or(x, y), y) => x (if x & y == 0)
+            if inner.opcode == OpCode::IntOr && inner.arg(1) == arg1 {
+                if let (Some(bx), Some(by)) =
+                    (ctx.get_int_bound(inner.arg(0)), ctx.get_int_bound(arg1))
+                {
+                    if bx.and_bound(&by).known_eq_const(0) {
+                        ctx.replace_op(op.pos, inner.arg(0));
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
+        }
+
         OptimizationResult::PassOn
     }
 
@@ -578,6 +603,45 @@ impl OptRewrite {
             }
         }
 
+        // and_x_c_in_range: int_and(x, C) => x (if x in range [0, C & ~(C+1)])
+        if let Some(c) = ctx.get_constant_int(arg1) {
+            if let Some(bound) = ctx.get_int_bound(arg0) {
+                if bound.lower >= 0 && bound.upper <= (c & !(c.wrapping_add(1))) {
+                    ctx.replace_op(op.pos, arg0);
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
+
+        // and_known_result: int_and(a, b) => C (if result bound is constant)
+        if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
+            let result_bound = ba.and_bound(&bb);
+            if result_bound.is_constant() {
+                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant()));
+                return OptimizationResult::Remove;
+            }
+            // and_idempotent: int_and(x, y) => x (if y.ones | x.zeros == -1)
+            if (bb.tvalue | (!ba.tvalue & !ba.tmask)) == u64::MAX {
+                ctx.replace_op(op.pos, arg0);
+                return OptimizationResult::Remove;
+            }
+        }
+
+        // and_or: int_and(int_or(x, y), z) => int_and(x, z) (if y & z known 0)
+        if let Some(inner) = ctx.get_producing_op(arg0) {
+            if inner.opcode == OpCode::IntOr {
+                if let (Some(by), Some(bz)) =
+                    (ctx.get_int_bound(inner.arg(1)), ctx.get_int_bound(arg1))
+                {
+                    if by.and_bound(&bz).known_eq_const(0) {
+                        let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg1]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
         OptimizationResult::PassOn
     }
 
@@ -660,6 +724,20 @@ impl OptRewrite {
                     new_op.pos = op.pos;
                     return OptimizationResult::Emit(new_op);
                 }
+            }
+        }
+
+        // or_known_result: int_or(a, b) => C (if result bound is constant)
+        if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
+            let result_bound = ba.or_bound(&bb);
+            if result_bound.is_constant() {
+                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant()));
+                return OptimizationResult::Remove;
+            }
+            // or_idempotent: int_or(x, y) => x (if x.ones | y.zeros == -1)
+            if (ba.tvalue | (!bb.tvalue & !bb.tmask)) == u64::MAX {
+                ctx.replace_op(op.pos, arg0);
+                return OptimizationResult::Remove;
             }
         }
 
@@ -868,6 +946,29 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
 
+        // rshift_known_result: int_rshift(a, b) => C (if result bound is constant)
+        if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
+            let result_bound = ba.rshift_bound(&bb);
+            if result_bound.is_constant() {
+                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant()));
+                return OptimizationResult::Remove;
+            }
+        }
+
+        // rshift_lshift: int_rshift(int_lshift(x, y), y) => x (if no overflow)
+        if let Some(inner) = ctx.get_producing_op(arg0) {
+            if inner.opcode == OpCode::IntLshift && inner.arg(1) == arg1 {
+                if let (Some(bx), Some(by)) =
+                    (ctx.get_int_bound(inner.arg(0)), ctx.get_int_bound(arg1))
+                {
+                    if bx.lshift_bound_cannot_overflow(&by) {
+                        ctx.replace_op(op.pos, inner.arg(0));
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
+        }
+
         // rshift_rshift_c_c: int_rshift(int_rshift(x, C1), C2) => int_rshift(x, min(C1+C2, 63))
         if let Some(c2) = ctx.get_constant_int(arg1) {
             if let Some(inner) = ctx.get_producing_op(arg0) {
@@ -911,6 +1012,15 @@ impl OptRewrite {
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
             return OptimizationResult::Remove;
+        }
+
+        // urshift_known_result: uint_rshift(a, b) => C (if result bound is constant)
+        if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
+            let result_bound = ba.urshift_bound(&bb);
+            if result_bound.is_constant() {
+                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant()));
+                return OptimizationResult::Remove;
+            }
         }
 
         // urshift_lshift_x_c_c: uint_rshift(int_lshift(x, C), C) => int_and(x, mask)
@@ -1094,6 +1204,24 @@ impl OptRewrite {
             }
         }
 
+        // eq_different_knownbits: int_eq(x, y) => 0 (if known_ne)
+        if op.opcode == OpCode::IntEq {
+            if let (Some(bx), Some(by)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
+                if bx.known_ne(&by) {
+                    ctx.make_constant(op.pos, Value::Int(0));
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
+        // ne_different_knownbits: int_ne(x, y) => 1 (if known_ne)
+        if op.opcode == OpCode::IntNe {
+            if let (Some(bx), Some(by)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
+                if bx.known_ne(&by) {
+                    ctx.make_constant(op.pos, Value::Int(1));
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
         // eq_same: int_eq(x, x) => 1
         if op.opcode == OpCode::IntEq && arg0 == arg1 {
             ctx.make_constant(op.pos, Value::Int(1));
@@ -1127,6 +1255,23 @@ impl OptRewrite {
                     if bound.is_bool() {
                         ctx.replace_op(op.pos, arg0);
                         return OptimizationResult::Remove;
+                    }
+                }
+            }
+        }
+
+        // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0
+        if op.opcode == OpCode::IntEq {
+            if let Some(inner_sub) = ctx.get_producing_op(arg0) {
+                if inner_sub.opcode == OpCode::IntSub && inner_sub.arg(0) != OpRef::NONE {
+                    if let Some(inner_eq) = ctx.get_producing_op(inner_sub.arg(1)) {
+                        if inner_eq.opcode == OpCode::IntEq
+                            && inner_eq.arg(0) == inner_sub.arg(0)
+                            && inner_eq.arg(1) == arg1
+                        {
+                            ctx.make_constant(op.pos, Value::Int(0));
+                            return OptimizationResult::Remove;
+                        }
                     }
                 }
             }
