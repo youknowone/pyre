@@ -2161,6 +2161,7 @@ impl<M: Clone> MetaInterp<M> {
         token.green_key = green_key;
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
+        self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
