@@ -667,14 +667,15 @@ fn restore_guard_failure_for_loop(
     exit_layout: &CompiledExitLayout,
 ) -> Option<usize> {
     if majit_meta::majit_log_enabled() {
-        let nraw = raw_values.len().min(8);
+        let nraw = raw_values.len();
         let slots: Vec<String> = (0..nraw)
             .map(|i| format!("{:#x}", raw_values[i] as usize))
             .collect();
         eprintln!(
-            "[jit] guard-fail: fail_idx={} types={:?} raw=[{}]",
+            "[jit] guard-fail: fail_idx={} types={:?} raw_len={} raw=[{}]",
             exit_layout.fail_index,
             exit_layout.exit_types,
+            nraw,
             slots.join(", ")
         );
     }
