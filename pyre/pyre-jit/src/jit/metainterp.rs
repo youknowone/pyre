@@ -122,17 +122,8 @@ impl PyreMetaInterp {
                 }
 
                 TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-                    if let TraceAction::CloseLoopWithArgs {
-                        loop_header_pc: Some(target_pc),
-                        ..
-                    } = action
-                    {
-                        let key = crate::eval::make_green_key(code as *const CodeObject, target_pc);
-                        ctx.set_green_key(key);
-                    } else if matches!(action, TraceAction::CloseLoop) {
-                        let key = crate::eval::make_green_key(code as *const CodeObject, pc);
-                        ctx.set_green_key(key);
-                    }
+                    // Green key retarget is done in trace_bytecode()
+                    // which has access to start_pc for CloseLoop.
                     return action;
                 }
 

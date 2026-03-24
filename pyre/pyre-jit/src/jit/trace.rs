@@ -38,7 +38,27 @@ pub fn trace_bytecode(
     let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, std::ptr::null_mut());
     metainterp.framestack.push(frame);
 
-    metainterp.interpret(ctx)
+    let action = metainterp.interpret(ctx);
+
+    // Retarget green key based on back-edge target.
+    // Done here (not inside interpret) because start_pc is needed
+    // for CloseLoop — metainterp doesn't track the trace entry PC.
+    match &action {
+        TraceAction::CloseLoopWithArgs {
+            loop_header_pc: Some(target_pc),
+            ..
+        } => {
+            let key = crate::eval::make_green_key(code as *const CodeObject, *target_pc);
+            ctx.set_green_key(key);
+        }
+        TraceAction::CloseLoop => {
+            let key = crate::eval::make_green_key(code as *const CodeObject, start_pc);
+            ctx.set_green_key(key);
+        }
+        _ => {}
+    }
+
+    action
 }
 
 #[cfg(test)]
