@@ -729,6 +729,17 @@ impl OptRewrite {
             }
         }
 
+        // xor_is_not: int_xor(x, 1) => int_is_zero(x) (if x is bool)
+        if let Some(1) = ctx.get_constant_int(arg1) {
+            if let Some(bound) = ctx.get_int_bound(arg0) {
+                if bound.is_bool() {
+                    let mut new_op = Op::new(OpCode::IntIsZero, &[arg0]);
+                    new_op.pos = op.pos;
+                    return OptimizationResult::Emit(new_op);
+                }
+            }
+        }
+
         OptimizationResult::PassOn
     }
 
@@ -968,14 +979,21 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// Constant fold INT_IS_ZERO. Also handles INT_IS_ZERO(INT_IS_ZERO(x)) -> INT_IS_TRUE(x)
-    /// and INT_IS_ZERO(INT_IS_TRUE(x)) -> INT_IS_ZERO(x).
+    /// Constant fold INT_IS_ZERO.
     fn optimize_int_is_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(if a == 0 { 1 } else { 0 }));
             return OptimizationResult::Remove;
+        }
+
+        // is_zero_true: int_is_zero(x) => 0 (if x known nonzero)
+        if let Some(bound) = ctx.get_int_bound(arg0) {
+            if bound.lower > 0 || bound.upper < 0 {
+                ctx.make_constant(op.pos, Value::Int(0));
+                return OptimizationResult::Remove;
+            }
         }
 
         OptimizationResult::PassOn
@@ -988,6 +1006,19 @@ impl OptRewrite {
         if let Some(a) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(if a != 0 { 1 } else { 0 }));
             return OptimizationResult::Remove;
+        }
+
+        // is_true_bool: int_is_true(x) => x (if x is bool)
+        if let Some(bound) = ctx.get_int_bound(arg0) {
+            if bound.is_bool() {
+                ctx.replace_op(op.pos, arg0);
+                return OptimizationResult::Remove;
+            }
+            // is_true_true: int_is_true(x) => 1 (if x known nonzero)
+            if bound.lower > 0 || bound.upper < 0 {
+                ctx.make_constant(op.pos, Value::Int(1));
+                return OptimizationResult::Remove;
+            }
         }
 
         // is_true_and_minint: int_is_true(int_and(x, MININT)) => int_lt(x, 0)
@@ -1012,6 +1043,19 @@ impl OptRewrite {
         if let Some(a) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(if a < 0 { 0 } else { a }));
             return OptimizationResult::Remove;
+        }
+
+        // force_ge_zero_pos: int_force_ge_zero(x) => x (if x known nonneg)
+        if let Some(bound) = ctx.get_int_bound(arg0) {
+            if bound.known_nonnegative() {
+                ctx.replace_op(op.pos, arg0);
+                return OptimizationResult::Remove;
+            }
+            // force_ge_zero_neg: int_force_ge_zero(x) => 0 (if x known negative)
+            if bound.upper < 0 {
+                ctx.make_constant(op.pos, Value::Int(0));
+                return OptimizationResult::Remove;
+            }
         }
 
         OptimizationResult::PassOn
@@ -1074,6 +1118,17 @@ impl OptRewrite {
                 let mut new_op = Op::new(OpCode::IntIsTrue, &[arg0]);
                 new_op.pos = op.pos;
                 return OptimizationResult::Emit(new_op);
+            }
+        }
+        // eq_one: int_eq(x, 1) => x (if x is bool)
+        if op.opcode == OpCode::IntEq {
+            if let Some(1) = ctx.get_constant_int(arg1) {
+                if let Some(bound) = ctx.get_int_bound(arg0) {
+                    if bound.is_bool() {
+                        ctx.replace_op(op.pos, arg0);
+                        return OptimizationResult::Remove;
+                    }
+                }
             }
         }
 

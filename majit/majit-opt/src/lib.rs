@@ -836,6 +836,20 @@ impl OptContext {
         })
     }
 
+    /// Get the IntBound for an OpRef, if known from imported bounds or constants.
+    pub fn get_int_bound(&self, opref: OpRef) -> Option<crate::intutils::IntBound> {
+        let opref = self.get_replacement(opref);
+        // Check imported bounds first (from Phase 1 / preamble)
+        if let Some(bound) = self.imported_int_bounds.get(&opref) {
+            return Some(bound.clone());
+        }
+        // Constants have exact bounds
+        if let Some(c) = self.get_constant_int(opref) {
+            return Some(crate::intutils::IntBound::from_constant(c));
+        }
+        None
+    }
+
     /// Create a new constant int OpRef.
     pub fn make_constant_int(&mut self, value: i64) -> OpRef {
         let pos = self.alloc_op_position();
