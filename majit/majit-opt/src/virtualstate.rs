@@ -640,8 +640,13 @@ impl VirtualState {
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
             | VirtualStateInfo::Unknown => {
+                // RPython virtualstate.py: enum_forced_boxes stores the
+                // original box, NOT its forwarded value. Using
+                // get_replacement here would collapse distinct boxes that
+                // happen to forward to the same value, creating false
+                // aliases in the Phase 2 Label/JUMP args.
                 if let Some(slot) = boxes.get_mut(*next_slot) {
-                    *slot = ctx.get_replacement(opref);
+                    *slot = opref;
                 }
                 *next_slot += 1;
             }
@@ -839,8 +844,19 @@ impl VirtualState {
                     }
                     _ => resolved,
                 };
+                // RPython: enum_forced_boxes stores the original box
+                // identity. For forced virtuals, use the forced result;
+                // for non-virtuals, use the original opref to preserve
+                // distinct box identity across label positions.
+                let store_ref = if forced != resolved {
+                    // Virtual was forced — use forced result
+                    ctx.get_replacement(forced)
+                } else {
+                    // Non-virtual — preserve original identity
+                    opref
+                };
                 if let Some(slot) = boxes.get_mut(*next_slot) {
-                    *slot = ctx.get_replacement(forced);
+                    *slot = store_ref;
                 }
                 *next_slot += 1;
                 Ok(())

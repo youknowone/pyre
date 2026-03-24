@@ -488,17 +488,11 @@ impl<S: JitState> JitDriver<S> {
             } => {
                 // RPython pyjitpl.py reached_loop_header(): the compiled
                 // loop should use the back-edge target PC as merge_pc.
-                // Currently disabled: false alias fix (next_iteration_args)
-                // is necessary but not sufficient. The Phase 2 body still
-                // produces collapsed JUMP args through assemble_jump's
-                // start_remap mechanism. Full fix requires ensuring
-                // assemble_jump preserves distinct label args.
-                //
-                // if let Some(target_pc) = loop_header_pc {
-                //     if let Some(ref mut meta) = self.trace_meta {
-                //         S::update_meta_merge_pc(meta, target_pc);
-                //     }
-                // }
+                // Disabled: trace entry PC and compiled code entry PC have
+                // different frame states (stack depth, locals). RPython
+                // avoids this by always tracing from jit_merge_point.
+                // Enabling requires extracting live values at the back-edge
+                // target PC, not the trace entry PC.
                 let _ = loop_header_pc;
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
