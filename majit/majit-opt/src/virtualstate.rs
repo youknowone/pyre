@@ -455,10 +455,28 @@ impl VirtualState {
     /// `concrete_refs` is the full loop-carried value list. Virtual entries
     /// recursively contribute the concrete boxes of their forced fields/items.
     pub fn make_inputargs(&self, concrete_refs: &[OpRef], ctx: &OptContext) -> Vec<OpRef> {
+        // RPython VirtualState.make_inputargs: boxes array sized by
+        // numnotvirtuals. Aliased boxes (same resolved OpRef) share the
+        // same position_in_notvirtuals, so they write to the same slot.
         let mut args = vec![OpRef::NONE; self.num_boxes()];
         let mut next_slot = 0usize;
+        // RPython create_state cache: track which resolved OpRef has
+        // already been assigned a slot. If two concrete_refs resolve to
+        // the same OpRef, they share the same slot (position_in_notvirtuals).
+        let mut assigned_slots: HashMap<OpRef, usize> = HashMap::new();
         for (idx, info) in self.state.iter().enumerate() {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
+            let resolved = ctx.get_replacement(opref);
+            if !info.is_virtual() && !matches!(info, VirtualStateInfo::Constant(_)) {
+                if let Some(&existing_slot) = assigned_slots.get(&resolved) {
+                    // Same resolved box — reuse existing slot (RPython alias dedup)
+                    if let Some(slot) = args.get_mut(existing_slot) {
+                        *slot = resolved;
+                    }
+                    continue;
+                }
+                assigned_slots.insert(resolved, next_slot);
+            }
             Self::enum_forced_boxes_for_entry(info, opref, ctx, &mut args, &mut next_slot);
         }
         args.into_iter().filter(|opref| !opref.is_none()).collect()
@@ -519,8 +537,20 @@ impl VirtualState {
     ) -> Result<(Vec<OpRef>, Vec<OpRef>), ()> {
         let mut args = vec![OpRef::NONE; self.num_boxes()];
         let mut next_slot = 0usize;
+        // RPython position_in_notvirtuals dedup: same resolved OpRef → same slot
+        let mut assigned_slots: HashMap<OpRef, usize> = HashMap::new();
         for (idx, info) in self.state.iter().enumerate() {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
+            let resolved = ctx.get_replacement(opref);
+            if !info.is_virtual() && !matches!(info, VirtualStateInfo::Constant(_)) {
+                if let Some(&existing_slot) = assigned_slots.get(&resolved) {
+                    if let Some(slot) = args.get_mut(existing_slot) {
+                        *slot = resolved;
+                    }
+                    continue;
+                }
+                assigned_slots.insert(resolved, next_slot);
+            }
             Self::enum_forced_boxes_for_entry_with_optimizer(
                 info,
                 opref,
@@ -643,13 +673,12 @@ impl VirtualState {
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
             | VirtualStateInfo::Unknown => {
-                // RPython virtualstate.py: enum_forced_boxes stores the
-                // original box, NOT its forwarded value. Using
-                // get_replacement here would collapse distinct boxes that
-                // happen to forward to the same value, creating false
-                // aliases in the Phase 2 Label/JUMP args.
+                // RPython virtualstate.py:425: boxes[position_in_notvirtuals] = box
+                // where box = get_box_replacement(box). Aliased boxes share
+                // the same position_in_notvirtuals via create_state cache,
+                // so they write to the same slot (dedup handled by caller).
                 if let Some(slot) = boxes.get_mut(*next_slot) {
-                    *slot = opref;
+                    *slot = ctx.get_replacement(opref);
                 }
                 *next_slot += 1;
             }
@@ -847,19 +876,11 @@ impl VirtualState {
                     }
                     _ => resolved,
                 };
-                // RPython: enum_forced_boxes stores the original box
-                // identity. For forced virtuals, use the forced result;
-                // for non-virtuals, use the original opref to preserve
-                // distinct box identity across label positions.
-                let store_ref = if forced != resolved {
-                    // Virtual was forced — use forced result
-                    ctx.get_replacement(forced)
-                } else {
-                    // Non-virtual — preserve original identity
-                    opref
-                };
+                // RPython virtualstate.py:425: store resolved box.
+                // Aliased boxes are deduped by the caller via
+                // assigned_slots / position_in_notvirtuals.
                 if let Some(slot) = boxes.get_mut(*next_slot) {
-                    *slot = store_ref;
+                    *slot = ctx.get_replacement(forced);
                 }
                 *next_slot += 1;
                 Ok(())
@@ -1333,11 +1354,23 @@ pub fn export_state(
     ctx: &OptContext,
     ptr_info: &[Option<PtrInfo>],
 ) -> VirtualState {
+    // RPython VirtualStateConstructor.create_state(): cache by resolved box.
+    // If two different oprefs resolve to the same target via get_replacement,
+    // they share the SAME VirtualStateInfo (same position_in_notvirtuals).
+    // This is how RPython preserves box identity through forwarding —
+    // aliased boxes naturally dedup in make_inputargs because they write
+    // to the same position_in_notvirtuals slot.
+    let mut cache: HashMap<OpRef, VirtualStateInfo> = HashMap::new();
     let state = oprefs
         .iter()
         .map(|opref| {
             let resolved = ctx.get_replacement(*opref);
-            export_single_value(resolved, ctx, ptr_info, &mut HashMap::new())
+            if let Some(cached) = cache.get(&resolved) {
+                return cached.clone();
+            }
+            let info = export_single_value(resolved, ctx, ptr_info, &mut HashMap::new());
+            cache.insert(resolved, info.clone());
+            info
         })
         .collect();
     VirtualState::new(state)
