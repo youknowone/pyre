@@ -1469,11 +1469,32 @@ impl OptUnroll {
         // checks import_boxes first and returns target directly —
         // target's own forwarding is NOT followed, matching RPython
         // where v5_box has no _forwarded set.
+        // RPython Box identity: when multiple sources map to the same target,
+        // skip import_box for duplicates so each source has independent PtrInfo.
+        let mut seen_targets: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+        // RPython Box identity: shared seen across all imports so that
+        // duplicate virtual field OpRefs are detected and given fresh positions.
+        let mut import_seen: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit][import] next_iteration_args={:?}",
+                exported_state.next_iteration_args
+            );
+        }
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
-            ctx.set_import_box(source, *target);
+            let is_dup = !seen_targets.insert(*target);
+            if !is_dup {
+                ctx.set_import_box(source, *target);
+            }
             if let Some(info) = exported_state.exported_infos.get(target) {
-                self.apply_exported_info(source, info, &exported_state.exported_infos, ctx);
+                self.apply_exported_info_recursive(
+                    source,
+                    info,
+                    &exported_state.exported_infos,
+                    ctx,
+                    &mut import_seen,
+                );
             }
         }
 
@@ -1594,7 +1615,8 @@ impl OptUnroll {
         ctx: &mut OptContext,
         seen: &mut std::collections::HashSet<OpRef>,
     ) {
-        let opref = ctx.get_replacement(opref);
+        // RPython Box identity: do NOT follow forwarding here.
+        // Each inputarg must have independent PtrInfo.
         if !seen.insert(opref) {
             return;
         }
