@@ -486,12 +486,13 @@ impl<S: JitState> JitDriver<S> {
                 jump_args,
                 loop_header_pc,
             } => {
-                // RPython pyjitpl.py reached_loop_header(): the compiled
-                // loop should use the back-edge target PC as merge_pc.
-                // Disabled: Phase 2 optimizer creates false aliases via
-                // forwarding table (import_state + short preamble imports
-                // collapse distinct inputargs). Needs optimizer-level fix
-                // to preserve distinct box identity throughout Phase 2.
+                // RPython pyjitpl.py reached_loop_header(): merge_pc
+                // retarget. Disabled: alias fix resolved, but Phase 2 body
+                // carries SameAs guard condition (v54) as loop-invariant
+                // from Phase 1 instead of recomputing from field reads.
+                // This causes infinite loop when entering at target_pc.
+                // Needs: Phase 2 short preamble must re-import the guard
+                // condition as a computed value, not a constant SameAs.
                 let _ = loop_header_pc;
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
