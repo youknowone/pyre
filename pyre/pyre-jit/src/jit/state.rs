@@ -561,12 +561,20 @@ fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) ->
     if let Some(folded) = try_trace_const_pure_int_field(ctx, obj, &descr) {
         return folded;
     }
+    // heapcache.py: check if this field was already read/written in this trace
+    let field_index = descr.index();
+    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+        return cached;
+    }
     let opcode = if descr.is_always_pure() {
         OpCode::GetfieldGcPureI
     } else {
         OpCode::GetfieldGcI
     };
-    ctx.record_op_with_descr(opcode, &[obj], descr)
+    let result = ctx.record_op_with_descr(opcode, &[obj], descr);
+    ctx.heap_cache_mut()
+        .getfield_now_known(obj, field_index, result);
+    result
 }
 
 fn trace_gc_object_type_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
@@ -1633,11 +1641,15 @@ impl MIFrame {
                     let type_const = ctx.const_int(float_type_addr);
                     self.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
                 }
-                value = ctx.record_op_with_descr(
-                    OpCode::GetfieldGcPureF,
-                    &[value],
-                    crate::jit::descr::float_floatval_descr(),
-                );
+                let ff_descr = crate::jit::descr::float_floatval_descr();
+                let ff_idx = ff_descr.index();
+                value = if let Some(cached) = ctx.heap_cache().getfield_cached(value, ff_idx) {
+                    cached
+                } else {
+                    let r = ctx.record_op_with_descr(OpCode::GetfieldGcPureF, &[value], ff_descr);
+                    ctx.heap_cache_mut().getfield_now_known(value, ff_idx, r);
+                    r
+                };
             }
             _ => {}
         }
@@ -2636,20 +2648,23 @@ impl MIFrame {
             // fail_arg types (generated trace_unbox_float hardcodes all types
             // as Int, losing Float type info needed for guard recovery).
             let unbox_float = |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
-                // Skip GuardClass for constant objects (ob_type is known at
-                // trace time). RPython optimizer constant-folds these, but
-                // pyre's optimizer doesn't always catch it.
                 if obj.0 < 10_000 {
                     let ob_type =
                         trace_gc_object_int_field(ctx, obj, crate::jit::descr::ob_type_descr());
                     let type_const = ctx.const_int(float_type_addr);
                     this.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
                 }
-                ctx.record_op_with_descr(
-                    OpCode::GetfieldGcPureF,
-                    &[obj],
-                    crate::jit::descr::float_floatval_descr(),
-                )
+                {
+                    let ff_descr = crate::jit::descr::float_floatval_descr();
+                    let ff_idx = ff_descr.index();
+                    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, ff_idx) {
+                        cached
+                    } else {
+                        let r = ctx.record_op_with_descr(OpCode::GetfieldGcPureF, &[obj], ff_descr);
+                        ctx.heap_cache_mut().getfield_now_known(obj, ff_idx, r);
+                        r
+                    }
+                }
             };
             let lhs_raw = if this.value_type(a) == Type::Float {
                 a
@@ -5104,10 +5119,42 @@ impl ControlFlowOpcodeHandler for MIFrame {
 
     fn close_loop_args(&mut self, target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
         self.with_ctx(|this, ctx| {
-            // RPython reached_loop_header(): the loop-close state must carry
-            // the explicit backward-jump target, i.e. the real loop header
-            // merge-point. Reassert it here instead of trusting whatever
-            // fallthrough pc happened to be materialized earlier in the step.
+            // RPython reached_loop_header (pyjitpl.py:2988-3030):
+            // Check current_merge_points for same_greenkey. If this is
+            // an inner loop's first visit, record and continue (unroll).
+            let code_ptr =
+                unsafe { &*(this.concrete_frame as *const pyre_interp::frame::PyFrame) }.code;
+            let back_edge_key = crate::eval::make_green_key(code_ptr, target);
+            // pyjitpl.py:2951: self.heapcache.reset() — FIRST thing in
+            // reached_loop_header, before any merge point processing.
+            ctx.reset_heap_cache();
+            if !ctx.has_merge_point(back_edge_key) {
+                // First visit: record merge point and continue tracing.
+                // pyjitpl.py:3030: save live args + types as original_boxes.
+                let live_args = MIFrame::close_loop_args(this, ctx);
+                let live_types = {
+                    let s = this.sym();
+                    let mut types = vec![Type::Ref, Type::Int, Type::Int]; // frame, ni, vsd
+                    types.extend(s.symbolic_local_types.iter().copied());
+                    let stack_only = s.stack_only_depth();
+                    types.extend(
+                        s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
+                            .iter()
+                            .copied(),
+                    );
+                    types
+                };
+                ctx.add_merge_point(back_edge_key, live_args, live_types);
+                MIFrame::set_next_instr(this, ctx, target);
+                if majit_meta::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][reached_loop_header] first visit, unroll: key={} pc={}",
+                        back_edge_key, target
+                    );
+                }
+                return Ok(None); // Continue — inner loop unrolled
+            }
+            // Same green key seen → close the loop.
             MIFrame::set_next_instr(this, ctx, target);
             Ok(Some(MIFrame::close_loop_args(this, ctx)))
         })
