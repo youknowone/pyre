@@ -1861,11 +1861,20 @@ impl<M: Clone> MetaInterp<M> {
     /// The snapshot is optimized as a bridge; on success the bridge is
     /// compiled and installed, on failure retrace_needed may be set.
     ///
+    /// `bridge_origin`: if Some((trace_id, fail_index)), the trace started
+    /// from a guard failure (ResumeGuardDescr). If None, the trace started
+    /// from the interpreter (ResumeFromInterpDescr / entry bridge).
+    ///
     /// Returns `CompileOutcome::Compiled` if the bridge was successfully
     /// compiled and installed. The caller should switch to compiled code.
     /// Returns `CompileOutcome::Cancelled` if the bridge couldn't close
     /// (retrace_needed was set, or optimization failed).
-    pub fn compile_trace(&mut self, green_key: u64, jump_args: &[OpRef]) -> CompileOutcome {
+    pub fn compile_trace(
+        &mut self,
+        green_key: u64,
+        jump_args: &[OpRef],
+        bridge_origin: Option<(u64, u32)>,
+    ) -> CompileOutcome {
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
             None => return CompileOutcome::Cancelled,
@@ -1896,33 +1905,61 @@ impl<M: Clone> MetaInterp<M> {
 
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] compile_trace: key={}, bridge_ops={}, inputargs={}",
+                "[jit] compile_trace: key={}, bridge_ops={}, origin={:?}",
                 green_key,
                 bridge_ops.len(),
-                bridge_inputargs.len(),
+                bridge_origin,
             );
         }
 
-        // Try to compile as a bridge to the existing compiled loop.
-        let fail_descr_types: Vec<Type> = bridge_inputargs.iter().map(|a| a.tp).collect();
-        let fail_descr_ref = crate::fail_descr::make_fail_descr_typed(fail_descr_types);
-        let fail_descr: &dyn majit_ir::FailDescr = fail_descr_ref.as_fail_descr().unwrap();
-        let success = self.compile_bridge(
-            green_key,
-            0, // fail_index: 0 for entry bridge
-            fail_descr,
-            &bridge_ops,
-            &bridge_inputargs,
-            constants,
-        );
-
-        if success {
-            CompileOutcome::Compiled
-        } else {
-            // Bridge optimization failed. If the optimizer set
-            // retrace_requested, retrace_needed has been called by
-            // compile_bridge internally (new target token added).
-            CompileOutcome::Cancelled
+        match bridge_origin {
+            Some((trace_id, fail_index)) => {
+                // compile.py:1082 — ResumeGuardDescr path: attach bridge
+                // to the existing guard that failed.
+                let fail_descr = {
+                    let compiled = match self.compiled_loops.get(&green_key) {
+                        Some(c) => c,
+                        None => return CompileOutcome::Cancelled,
+                    };
+                    match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
+                        Some(d) => Box::new(d) as Box<dyn majit_ir::FailDescr>,
+                        None => return CompileOutcome::Cancelled,
+                    }
+                };
+                let success = self.compile_bridge(
+                    green_key,
+                    fail_index,
+                    &*fail_descr,
+                    &bridge_ops,
+                    &bridge_inputargs,
+                    constants,
+                );
+                if success {
+                    CompileOutcome::Compiled
+                } else {
+                    CompileOutcome::Cancelled
+                }
+            }
+            None => {
+                // compile.py:1006-1022 — ResumeFromInterpDescr path: entry
+                // bridge. Compile as a fresh entry and attach to interpreter.
+                let fail_descr_types: Vec<Type> = bridge_inputargs.iter().map(|a| a.tp).collect();
+                let fail_descr_ref = crate::fail_descr::make_fail_descr_typed(fail_descr_types);
+                let fail_descr: &dyn majit_ir::FailDescr = fail_descr_ref.as_fail_descr().unwrap();
+                let success = self.compile_bridge(
+                    green_key,
+                    0,
+                    fail_descr,
+                    &bridge_ops,
+                    &bridge_inputargs,
+                    constants,
+                );
+                if success {
+                    CompileOutcome::Compiled
+                } else {
+                    CompileOutcome::Cancelled
+                }
+            }
         }
     }
 
