@@ -488,11 +488,10 @@ impl<S: JitState> JitDriver<S> {
             } => {
                 // RPython pyjitpl.py reached_loop_header(): the compiled
                 // loop should use the back-edge target PC as merge_pc.
-                // Disabled: trace entry PC and compiled code entry PC have
-                // different frame states (stack depth, locals). RPython
-                // avoids this by always tracing from jit_merge_point.
-                // Enabling requires extracting live values at the back-edge
-                // target PC, not the trace entry PC.
+                // Disabled: Phase 2 optimizer creates false aliases via
+                // forwarding table (import_state + short preamble imports
+                // collapse distinct inputargs). Needs optimizer-level fix
+                // to preserve distinct box identity throughout Phase 2.
                 let _ = loop_header_pc;
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
