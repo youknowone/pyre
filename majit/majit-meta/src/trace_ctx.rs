@@ -74,6 +74,9 @@ pub struct MergePoint {
     /// visit to this loop header. Used by compile_loop/compile_retrace as
     /// the inputargs for trace cutting.
     pub original_boxes: Vec<OpRef>,
+    /// Types of original_boxes. RPython Box carries type implicitly;
+    /// majit stores types alongside OpRefs for compile_retrace parity.
+    pub original_box_types: Vec<Type>,
 }
 
 impl TraceCtx {
@@ -86,13 +89,14 @@ impl TraceCtx {
 
     /// pyjitpl.py:3029-3030 — record a loop header visit with position
     /// and live variable snapshot.
-    pub fn add_merge_point(&mut self, key: u64, live_args: Vec<OpRef>) {
+    pub fn add_merge_point(&mut self, key: u64, live_args: Vec<OpRef>, live_arg_types: Vec<Type>) {
         if !self.has_merge_point(key) {
             let position = self.recorder.get_position();
             self.current_merge_points.push(MergePoint {
                 green_key: key,
                 position,
                 original_boxes: live_args,
+                original_box_types: live_arg_types,
             });
         }
     }
@@ -138,6 +142,7 @@ impl TraceCtx {
         let initial_boxes: Vec<OpRef> = (0..recorder.num_inputargs())
             .map(|i| OpRef(i as u32))
             .collect();
+        let initial_types: Vec<Type> = recorder.inputarg_types().to_vec();
         TraceCtx {
             recorder,
             green_key,
@@ -154,6 +159,7 @@ impl TraceCtx {
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
+                original_box_types: initial_types,
                 original_boxes: initial_boxes.clone(),
             }],
         }
@@ -185,6 +191,7 @@ impl TraceCtx {
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
+                original_box_types: initial_boxes.iter().map(|_| Type::Ref).collect(),
                 original_boxes: initial_boxes.clone(),
             }],
         }
