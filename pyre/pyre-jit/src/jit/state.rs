@@ -350,6 +350,7 @@ fn instruction_is_trivia_between_compare_and_branch(instruction: Instruction) ->
             | Instruction::Nop
             | Instruction::Cache
             | Instruction::NotTaken
+            | Instruction::ToBool
     )
 }
 
@@ -5555,6 +5556,14 @@ impl OpcodeStepExecutor for MIFrame {
             MIFrame::push_value(this, ctx, v2);
             Ok::<(), PyError>(())
         })?;
+        Ok(())
+    }
+
+    fn to_bool(&mut self) -> Result<(), Self::Error> {
+        // TO_BOOL converts TOS to a bool. In current bytecode it only appears
+        // after LoadConst True (while True:) or after Compare (already bool).
+        // Treat as identity — the value is already truthy/falsy and the
+        // following PopJumpIfFalse will guard on its truth value.
         Ok(())
     }
 
