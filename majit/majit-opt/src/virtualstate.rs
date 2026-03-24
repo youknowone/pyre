@@ -923,12 +923,30 @@ impl VirtualState {
     ///
     /// `boxes`: the actual OpRefs at each position (used as the guard's
     /// first argument in GUARD_VALUE etc.).
+    /// virtualstate.py:646 generate_guards parity.
+    ///
+    /// Returns Ok(guards) if the incoming state can be accepted with
+    /// runtime guards, Err(()) if fundamentally incompatible
+    /// (VirtualStatesCantMatch).
+    ///
+    /// `runtime_boxes`: live OpRefs at the jump point. When Some,
+    /// non-permanent guard emission is enabled (matching RPython's
+    /// _jump_to_existing_trace path). When None, only structurally
+    /// compatible pairs are accepted (matching generalization_of).
+    ///
+    /// `force_boxes`: when true, Virtual incoming values can be
+    /// accepted by NonVirtual targets (the virtual will be forced
+    /// later by make_inputargs). Matches RPython's force_boxes.
     pub fn generate_guards(
         &self,
         other: &VirtualState,
         boxes: &[OpRef],
         runtime_boxes: Option<&[OpRef]>,
-    ) -> Vec<GuardRequirement> {
+        force_boxes: bool,
+    ) -> Result<Vec<GuardRequirement>, ()> {
+        if self.state.len() != other.state.len() {
+            return Err(());
+        }
         let mut guards = Vec::new();
 
         for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
@@ -940,76 +958,189 @@ impl VirtualState {
                 incoming,
                 box_opref,
                 runtime_box,
+                force_boxes,
                 &mut guards,
-            );
+            )?;
         }
 
-        guards
+        Ok(guards)
     }
 
+    /// virtualstate.py per-entry generate_guards parity.
+    ///
+    /// Returns Ok(()) if the pair is compatible (possibly with guards),
+    /// Err(()) if fundamentally incompatible (VirtualStatesCantMatch).
+    ///
+    /// `runtime_box`: when Some, non-permanent guard emission is possible.
+    /// When None (generalization_of path), only structurally compatible
+    /// pairs are accepted.  RPython uses the concrete runtime value as an
+    /// "educated guess" (comment at virtualstate.py:551-555); majit does
+    /// not have concrete values so it optimistically emits guards whenever
+    /// runtime_box is Some.
+    ///
+    /// `force_boxes`: when true, Virtual incoming can be accepted by
+    /// non-virtual targets (virtualstate.py:523-524 _generate_virtual_guards).
     fn generate_guards_for_entry(
         arg_idx: usize,
         expected: &VirtualStateInfo,
         incoming: &VirtualStateInfo,
         box_opref: OpRef,
-        _runtime_box: Option<OpRef>,
+        runtime_box: Option<OpRef>,
+        force_boxes: bool,
         guards: &mut Vec<GuardRequirement>,
-    ) {
+    ) -> Result<(), ()> {
+        // virtualstate.py:523-524: force_boxes + Virtual incoming
+        // → _generate_virtual_guards (check class compatibility only).
+        if force_boxes && incoming.is_virtual() && !expected.is_virtual() {
+            return match expected {
+                // virtualstate.py:566-568: constant vs virtual → always Err
+                VirtualStateInfo::Constant(_) => Err(()),
+                // virtualstate.py:570-572: knownclass vs virtual → check class
+                VirtualStateInfo::KnownClass { class_ptr } => {
+                    if let VirtualStateInfo::Virtual { known_class, .. } = incoming {
+                        if known_class.as_ref() == Some(class_ptr) {
+                            Ok(())
+                        } else {
+                            Err(())
+                        }
+                    } else {
+                        // Virtual array/struct — virtual is always nonnull,
+                        // so NonNull/Unknown targets accept it.
+                        Ok(())
+                    }
+                }
+                // NonNull/Unknown: virtual is always nonnull → Ok
+                _ => Ok(()),
+            };
+        }
+
         match (expected, incoming) {
-            // If expected is a known class but incoming is unknown, need a guard_class
-            (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::Unknown) => {
-                guards.push(GuardRequirement::GuardClass {
-                    arg_index: arg_idx,
-                    box_opref,
-                    expected_class: *class_ptr,
-                });
+            // virtualstate.py:387-389: Unknown target accepts anything.
+            (VirtualStateInfo::Unknown, _) => Ok(()),
+
+            // ── Constant target ── (virtualstate.py:396-405)
+            (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) if a == b => Ok(()),
+            (VirtualStateInfo::Constant(val), _) => {
+                // virtualstate.py:400-405: runtime_box check for guard_value.
+                if runtime_box.is_some() {
+                    guards.push(GuardRequirement::GuardValue {
+                        arg_index: arg_idx,
+                        box_opref,
+                        expected_value: val.clone(),
+                    });
+                    Ok(())
+                } else {
+                    Err(())
+                }
             }
 
-            // If expected is nonnull but incoming is unknown, need a guard_nonnull
-            (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown) => {
-                guards.push(GuardRequirement::GuardNonnull {
-                    arg_index: arg_idx,
-                    box_opref,
-                });
-            }
-
-            // If expected has bounds but incoming doesn't
-            (VirtualStateInfo::IntBounded(bounds), VirtualStateInfo::Unknown) => {
-                guards.push(GuardRequirement::GuardBounds {
-                    arg_index: arg_idx,
-                    box_opref,
-                    bounds: bounds.clone(),
-                });
-            }
-
-            // If expected is constant but incoming is unknown, need a guard_value
-            (VirtualStateInfo::Constant(val), VirtualStateInfo::Unknown) => {
-                guards.push(GuardRequirement::GuardValue {
-                    arg_index: arg_idx,
-                    box_opref,
-                    expected_value: val.clone(),
-                });
-            }
-
-            // virtualstate.py: VirtualArray with known length vs unknown.
-            // Need guards to ensure the incoming array has the expected length.
+            // ── KnownClass target ── (virtualstate.py:595-624)
             (
-                VirtualStateInfo::VirtualArray {
-                    items: expected_items,
-                    ..
-                },
-                VirtualStateInfo::Unknown,
-            ) => {
-                // The bridge needs to provide an array with exactly this many items.
-                let expected_len = expected_items.len() as i64;
-                guards.push(GuardRequirement::GuardValue {
-                    arg_index: arg_idx,
-                    box_opref,
-                    expected_value: Value::Int(expected_len),
-                });
+                VirtualStateInfo::KnownClass { class_ptr: c1 },
+                VirtualStateInfo::KnownClass { class_ptr: c2 },
+            ) if c1 == c2 => Ok(()),
+            (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::Unknown) => {
+                // virtualstate.py:600-606: runtime_box gate
+                if runtime_box.is_some() {
+                    guards.push(GuardRequirement::GuardClass {
+                        arg_index: arg_idx,
+                        box_opref,
+                        expected_class: *class_ptr,
+                    });
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::NonNull) => {
+                // virtualstate.py:607-613: runtime_box gate
+                if runtime_box.is_some() {
+                    guards.push(GuardRequirement::GuardClass {
+                        arg_index: arg_idx,
+                        box_opref,
+                        expected_class: *class_ptr,
+                    });
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            (
+                VirtualStateInfo::KnownClass { class_ptr },
+                VirtualStateInfo::Constant(Value::Ref(r)),
+            ) if !r.is_null() => {
+                // virtualstate.py:618-624: runtime_box needed to verify
+                // the constant's class matches. Without it, reject.
+                if runtime_box.is_some() {
+                    guards.push(GuardRequirement::GuardClass {
+                        arg_index: arg_idx,
+                        box_opref,
+                        expected_class: *class_ptr,
+                    });
+                    Ok(())
+                } else {
+                    Err(())
+                }
             }
 
-            _ => {} // Already compatible or will fail at is_compatible check
+            // ── NonNull target ── (virtualstate.py:574-593)
+            (VirtualStateInfo::NonNull, VirtualStateInfo::NonNull)
+            | (VirtualStateInfo::NonNull, VirtualStateInfo::KnownClass { .. }) => Ok(()),
+            (VirtualStateInfo::NonNull, VirtualStateInfo::Constant(Value::Ref(r))) => {
+                if !r.is_null() { Ok(()) } else { Err(()) }
+            }
+            (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown) => {
+                // virtualstate.py:578-584: runtime_box gate
+                if runtime_box.is_some() {
+                    guards.push(GuardRequirement::GuardNonnull {
+                        arg_index: arg_idx,
+                        box_opref,
+                    });
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            // NonNull accepts any virtual (virtual is always nonnull).
+            (VirtualStateInfo::NonNull, incoming) if incoming.is_virtual() => Ok(()),
+
+            // ── IntBounded target ── (virtualstate.py:483-499)
+            (VirtualStateInfo::IntBounded(b1), VirtualStateInfo::IntBounded(b2))
+                if b2.lower >= b1.lower && b2.upper <= b1.upper =>
+            {
+                Ok(())
+            }
+            (VirtualStateInfo::IntBounded(b), VirtualStateInfo::Constant(Value::Int(v)))
+                if b.contains(*v) =>
+            {
+                Ok(())
+            }
+            (VirtualStateInfo::IntBounded(bounds), VirtualStateInfo::Unknown) => {
+                // virtualstate.py:493-498: runtime_box gate
+                if runtime_box.is_some() {
+                    guards.push(GuardRequirement::GuardBounds {
+                        arg_index: arg_idx,
+                        box_opref,
+                        bounds: bounds.clone(),
+                    });
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+
+            // ── Virtual targets ── (virtualstate.py:141-320)
+            // Structural match delegated to is_compatible.
+            (expected_vs, incoming_vs) if expected_vs.is_virtual() => {
+                if expected_vs.is_compatible(incoming_vs) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+
+            // Fundamentally incompatible: VirtualStatesCantMatch.
+            _ => Err(()),
         }
     }
 
@@ -1861,7 +1992,11 @@ mod tests {
         let s2 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::Unknown]);
 
         let boxes = vec![OpRef(100), OpRef(101)];
-        let guards = s1.generate_guards(&s2, &boxes, None);
+        // runtime_boxes=Some enables non-permanent guard emission (RPython
+        // _jump_to_existing_trace path). With None, Unknown incoming → Err.
+        let guards = s1
+            .generate_guards(&s2, &boxes, Some(&boxes), false)
+            .unwrap();
         assert_eq!(guards.len(), 2);
         assert!(matches!(
             &guards[0],

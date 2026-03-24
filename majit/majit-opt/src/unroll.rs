@@ -1233,11 +1233,18 @@ impl OptUnroll {
                 None => continue,
             };
 
-            // unroll.py:330-332: generate_guards — check compatibility
-            if !target_vs.generalization_of(&virtual_state) {
-                continue;
-            }
-            let extra_guards = target_vs.generate_guards(&virtual_state, &args, runtime_boxes);
+            // RPython unroll.py:315 parity: try generate_guards directly
+            // instead of gating on generalization_of. If guards can't be
+            // generated (VirtualStatesCantMatch), skip this target.
+            let extra_guards = match target_vs.generate_guards(
+                &virtual_state,
+                &args,
+                runtime_boxes,
+                force_boxes,
+            ) {
+                Ok(guards) => guards,
+                Err(()) => continue,
+            };
             for guard_req in &extra_guards {
                 if let Some(mut guard_op) = guard_req.to_op(&args) {
                     // unroll.py:336-337: copy rd_resume_position from patchguardop
