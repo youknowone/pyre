@@ -381,6 +381,9 @@ impl OptContext {
         if idx < self.forwarding.len() && !self.forwarding[idx].is_none() {
             self.forwarding[idx] = OpRef::NONE;
         }
+        // Phase 2 body defines its own result at pos — supersede any cross-phase
+        // short_preamble_mapping entry, so get_replacement returns the body's
+        // value rather than the preamble import.
         self.short_preamble_mapping.remove(&pos_ref);
         self.new_operations.push(op);
         pos_ref
@@ -717,6 +720,8 @@ impl OptContext {
         if idx < self.ptr_info.len() {
             self.ptr_info[idx] = None;
         }
+        // Phase 2 body is defining the value for `old` — supersede any
+        // cross-phase mapping so get_replacement follows forwarding instead.
         self.short_preamble_mapping.remove(&old);
     }
 
