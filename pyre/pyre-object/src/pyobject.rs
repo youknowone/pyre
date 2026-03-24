@@ -52,6 +52,7 @@ pub static LONG_TYPE: PyType = PyType { tp_name: "int" };
 pub static NONE_TYPE: PyType = PyType {
     tp_name: "NoneType",
 };
+pub static MODULE_TYPE: PyType = PyType { tp_name: "module" };
 
 /// Field offset of `ob_type` within PyObject, for JIT field access.
 pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
