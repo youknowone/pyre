@@ -194,6 +194,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     let is_portal: bool = &*code.obj_name != "<module>";
+    // RPython parity: tracing starts at jit_merge_point (loop header),
+    // not at can_enter_jit (backedge). The counter fires at the backedge,
+    // but actual trace start is deferred to the next visit to the loop
+    // header. This ensures the trace captures the HOT path entry values,
+    // not the EXIT path values from the last iteration.
+    let mut pending_trace: Option<(u64, usize)> = None; // (green_key, loop_header_pc)
 
     loop {
         if frame.next_instr >= code.instructions.len() {
@@ -206,10 +212,22 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         };
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
-        // RPython MetaInterp._interpret() takes over execution entirely.
-        // RPython portal_call_depth parity: only fire merge_point at the
-        // call depth where tracing started. Nested concrete calls skip it.
+        // RPython: tracing starts at jit_merge_point when the counter
+        // threshold was reached at the preceding backedge. The pending_trace
+        // flag defers trace start from the backedge to the loop header.
         if is_portal {
+            // Check pending_trace: start tracing at the loop header
+            if let Some((key, header_pc)) = pending_trace {
+                if pc == header_pc && !driver.is_tracing() {
+                    pending_trace = None;
+                    if let Some(loop_result) =
+                        can_enter_jit_hook(frame, key, header_pc, driver, info, &env)
+                    {
+                        return loop_result;
+                    }
+                    driver.meta_interp_mut().warm_state_mut().counter.reset(key);
+                }
+            }
             let tracing_depth = driver.meta_interp().tracing_call_depth;
             if let Some(depth) = tracing_depth {
                 if call_depth() == depth {
@@ -260,7 +278,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::Continue) => {}
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
-                // Thin inline: counter tick only. Heavy logic in cold helper.
                 let green_key = make_green_key(frame.code, loop_header_pc);
                 if driver
                     .meta_interp_mut()
@@ -269,16 +286,25 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     .tick(green_key)
                     && !driver.is_tracing()
                 {
-                    if let Some(loop_result) =
-                        can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env)
-                    {
-                        return loop_result;
+                    if driver.has_compiled_loop(green_key) {
+                        // Run compiled code at backedge.
+                        if let Some(loop_result) =
+                            can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env)
+                        {
+                            return loop_result;
+                        }
+                        driver
+                            .meta_interp_mut()
+                            .warm_state_mut()
+                            .counter
+                            .reset(green_key);
+                    } else {
+                        // RPython parity: defer tracing to jit_merge_point
+                        // (loop header). The interpreter continues to the
+                        // next iteration, and tracing starts with the HOT
+                        // path entry values instead of the EXIT path values.
+                        pending_trace = Some((green_key, loop_header_pc));
                     }
-                    driver
-                        .meta_interp_mut()
-                        .warm_state_mut()
-                        .counter
-                        .reset(green_key);
                 }
             }
             Ok(StepResult::CloseLoop { .. }) => {}
