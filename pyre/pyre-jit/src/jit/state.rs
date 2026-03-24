@@ -1973,7 +1973,12 @@ impl MIFrame {
     }
 
     pub(crate) fn guard_nonnull(&mut self, ctx: &mut TraceCtx, value: OpRef) {
+        // heapcache.py: skip if nullity already known
+        if ctx.heap_cache().is_nullity_known(value) == Some(true) {
+            return;
+        }
         self.record_guard(ctx, OpCode::GuardNonnull, &[value]);
+        ctx.heap_cache_mut().nullity_now_known(value, true);
     }
 
     pub(crate) fn guard_range_iter(&mut self, ctx: &mut TraceCtx, obj: OpRef) {
@@ -2138,6 +2143,8 @@ impl MIFrame {
         self.record_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type_const]);
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(expected_type as usize));
+        // GuardNonnullClass implies non-null
+        ctx.heap_cache_mut().nullity_now_known(obj, true);
     }
 
     fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
@@ -3053,11 +3060,11 @@ impl MIFrame {
                     let index = ctx.const_int(concrete_len as i64);
                     trace_raw_array_setitem_value(ctx, items_ptr, index, value);
                     let new_len = ctx.const_int((concrete_len + 1) as i64);
-                    ctx.record_op_with_descr(
-                        OpCode::SetfieldGc,
-                        &[list, new_len],
-                        list_items_len_descr(),
-                    );
+                    let len_descr = list_items_len_descr();
+                    let len_descr_idx = len_descr.index();
+                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
+                    ctx.heap_cache_mut()
+                        .setfield_cached(list, len_descr_idx, new_len);
                     Ok(())
                 });
             } else if is_list(concrete_list)
@@ -3097,11 +3104,11 @@ impl MIFrame {
                     };
                     trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                     let new_len = ctx.const_int((concrete_len + 1) as i64);
-                    ctx.record_op_with_descr(
-                        OpCode::SetfieldGc,
-                        &[list, new_len],
-                        list_int_items_len_descr(),
-                    );
+                    let len_descr = list_int_items_len_descr();
+                    let len_descr_idx = len_descr.index();
+                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
+                    ctx.heap_cache_mut()
+                        .setfield_cached(list, len_descr_idx, new_len);
                     Ok(())
                 });
             } else if is_list(concrete_list)
@@ -3142,11 +3149,11 @@ impl MIFrame {
                     };
                     trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                     let new_len = ctx.const_int((concrete_len + 1) as i64);
-                    ctx.record_op_with_descr(
-                        OpCode::SetfieldGc,
-                        &[list, new_len],
-                        list_float_items_len_descr(),
-                    );
+                    let len_descr = list_float_items_len_descr();
+                    let len_descr_idx = len_descr.index();
+                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
+                    ctx.heap_cache_mut()
+                        .setfield_cached(list, len_descr_idx, new_len);
                     Ok(())
                 });
             }
@@ -4323,11 +4330,11 @@ impl MIFrame {
 
             let next_current = ctx.record_op(OpCode::IntAddOvf, &[current, step]);
             this.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
-            ctx.record_op_with_descr(
-                OpCode::SetfieldGc,
-                &[iter, next_current],
-                range_iter_current_descr(),
-            );
+            let ri_descr = range_iter_current_descr();
+            let ri_descr_idx = ri_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_current], ri_descr);
+            ctx.heap_cache_mut()
+                .setfield_cached(iter, ri_descr_idx, next_current);
             this.remember_value_type(current, Type::Int);
             Ok(current)
         })
