@@ -482,11 +482,19 @@ pub fn emit_box_int_inline(
 ) -> OpRef {
     // Emit: v = New(W_Int)
     let new_op = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    // heapcache: track allocation as unescaped
+    ctx.heap_cache_mut().new_object(new_op);
     // Emit: SetfieldGc(v, ob_type, INT_TYPE)
     let type_const = ctx.const_int(int_type_addr);
+    let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_op, ob_type_idx, type_const);
     // Emit: SetfieldGc(v, intval, raw_int)
+    let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_int], intval_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_op, intval_idx, raw_int);
     new_op
 }
 
@@ -499,9 +507,16 @@ pub fn emit_box_float_inline(
     float_type_addr: i64,
 ) -> OpRef {
     let new_op = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    ctx.heap_cache_mut().new_object(new_op);
     let type_const = ctx.const_int(float_type_addr);
+    let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_op, ob_type_idx, type_const);
+    let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_float], floatval_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_op, floatval_idx, raw_float);
     new_op
 }
 

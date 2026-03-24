@@ -1951,6 +1951,10 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2410: self.retracing_from = self.potential_retrace_position
         self.retracing_from = self.potential_retrace_position;
         self.exported_state = Some(exported_state);
+        // pyjitpl.py:2418: self.heapcache.reset()
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.reset_heap_cache();
+        }
     }
 
     /// pyjitpl.py:3171-3177 / compile.py:341-394: compile_retrace — compile

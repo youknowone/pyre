@@ -2,6 +2,7 @@
 //! (RPython splits this across MetaInterp.history, compile.py, and Trace).
 
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type};
+use majit_trace::heapcache::HeapCache;
 use majit_trace::recorder::{Trace, TracePosition};
 
 use majit_codegen::JitCellToken;
@@ -57,6 +58,10 @@ pub struct TraceCtx {
     /// tracing with their trace positions. First visit records the key +
     /// position; second visit closes the loop.
     current_merge_points: Vec<MergePoint>,
+    /// pyjitpl.py:2398: tracing-time heap cache.
+    /// Tracks field/array values, allocations, escape status, and class/nullity
+    /// knowledge during tracing to avoid recording redundant operations.
+    heap_cache: HeapCache,
 }
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
@@ -123,6 +128,21 @@ impl TraceCtx {
         self.recorder.cut(pos);
     }
 
+    /// pyjitpl.py:2398: access the tracing-time heap cache.
+    pub fn heap_cache(&self) -> &HeapCache {
+        &self.heap_cache
+    }
+
+    /// Mutable access to the tracing-time heap cache.
+    pub fn heap_cache_mut(&mut self) -> &mut HeapCache {
+        &mut self.heap_cache
+    }
+
+    /// pyjitpl.py:2951, 2418: reset heap cache at loop header / retrace.
+    pub fn reset_heap_cache(&mut self) {
+        self.heap_cache.reset();
+    }
+
     /// Create a standalone TraceCtx for testing or external use.
     pub fn for_test(num_inputs: usize) -> Self {
         let mut recorder = Trace::new();
@@ -162,6 +182,7 @@ impl TraceCtx {
                 original_box_types: initial_types,
                 original_boxes: initial_boxes.clone(),
             }],
+            heap_cache: HeapCache::new(),
         }
     }
 
@@ -194,6 +215,7 @@ impl TraceCtx {
                 original_box_types: initial_boxes.iter().map(|_| Type::Ref).collect(),
                 original_boxes: initial_boxes.clone(),
             }],
+            heap_cache: HeapCache::new(),
         }
     }
 
