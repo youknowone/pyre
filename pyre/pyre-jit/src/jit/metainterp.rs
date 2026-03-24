@@ -1,216 +1,425 @@
 //! PyreMetaInterp — RPython MetaInterp (pyjitpl.py:2371) parity.
 //!
-//! The MetaInterp drives the tracing loop via interpret(), which
-//! repeatedly calls MIFrame::trace_code_step() on the top frame.
-//! Each step computes concrete results AND records symbolic IR.
-//!
-//! RPython control flow:
-//!   MetaInterp._interpret():
-//!     while True:
-//!       framestack[-1].run_one_step()
-//!
-//! Currently the root frame delegates to MIFrame (state.rs) for
-//! dispatch. Inline call tracing uses a separate framestack in
-//! inline_trace_and_execute (state.rs). Future: unify via
-//! perform_call() / finishframe().
+//! Single interpret() loop with a single framestack for both root
+//! and inline frames. CALL → push_inline_frame (RPython perform_call),
+//! RETURN → finishframe_inline (RPython finishframe).
 
-use majit_ir::OpRef;
+use majit_ir::{OpRef, Type};
 use majit_meta::{TraceAction, TraceCtx};
 use pyre_bytecode::CodeObject;
 use pyre_bytecode::bytecode::Instruction;
 
-use super::state::{ConcreteValue, FrontendOp, MIFrame, PyreSym};
+use super::state::{
+    ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, materialize_pending_inline_result,
+    pending_inline_result_from_concrete,
+};
 
-/// RPython ChangeFrame / DoneWithThisFrame* parity.
-///
-/// Returned by MetaInterpFrame::run_one_step() to signal frame transitions.
-#[derive(Debug)]
-pub enum StepAction {
-    /// Continue executing in the current frame.
-    Continue,
-    /// Frame stack changed (call or return) — reload framestack top.
-    /// RPython: raise ChangeFrame
-    ChangeFrame,
-    /// Outermost frame returned — trace complete.
-    /// RPython: raise DoneWithThisFrameInt/Ref/Float(result)
-    DoneWithThisFrame(FrontendOp),
-    /// Back-edge detected — close loop and compile.
-    CloseLoop {
-        jump_args: Vec<FrontendOp>,
-        loop_header_pc: usize,
-    },
-    /// Trace aborted (error, too long, unsupported).
-    Abort,
-}
-
-/// RPython MIFrame (pyjitpl.py:65) parity.
-///
-/// Each frame in the MetaInterp's framestack tracks both symbolic
-/// (PyreSym) and concrete (ConcreteValue arrays) state.
+/// RPython MIFrame (pyjitpl.py:65) — per-frame tracing state.
 pub struct MetaInterpFrame {
-    /// Symbolic + concrete state (borrowed from caller via raw pointer).
-    /// RPython MIFrame owns its registers; here we borrow PyreSym.
     pub sym: *mut PyreSym,
-    /// Code object being traced (RPython MIFrame.jitcode).
+    pub owned_sym: Option<Box<PyreSym>>,
     pub jitcode: *const CodeObject,
-    /// Program counter (RPython MIFrame.pc).
     pub pc: usize,
-    /// Green key for recursive portal calls.
     pub greenkey: Option<u64>,
-    /// Concrete frame pointer for MIFrame delegation.
     pub concrete_frame: usize,
+    /// Box for heap stability across Vec reallocs.
+    pub owned_concrete_frame: Option<Box<pyre_interp::frame::PyFrame>>,
+    pub parent_fail_args: Vec<OpRef>,
+    pub parent_fail_arg_types: Vec<Type>,
+    pub drop_frame_opref: Option<OpRef>,
+    pub caller_result_stack_idx: Option<usize>,
+    pub arg_state: pyre_bytecode::bytecode::OpArgState,
 }
 
-/// RPython MetaInterp (pyjitpl.py:2371) parity.
-///
-/// Takes over execution during tracing. Owns the framestack and
-/// drives the interpret loop.
+impl MetaInterpFrame {
+    fn is_inline(&self) -> bool {
+        self.owned_concrete_frame.is_some()
+    }
+
+    fn concrete_frame_addr(&self) -> usize {
+        if let Some(ref cf) = self.owned_concrete_frame {
+            &**cf as *const pyre_interp::frame::PyFrame as usize
+        } else {
+            self.concrete_frame
+        }
+    }
+}
+
+/// RPython MetaInterp (pyjitpl.py:2371).
 pub struct PyreMetaInterp {
-    /// Stack of execution frames (RPython MetaInterp.framestack).
     pub framestack: Vec<MetaInterpFrame>,
-    /// Recursive portal call depth.
     pub portal_call_depth: i32,
-    /// Root code object.
     pub jitcode: *const CodeObject,
-    /// Namespace for global lookups.
     pub namespace: *mut pyre_runtime::PyNamespace,
+    inline_call_guard: Option<pyre_interp::call::InlineCallOverrideGuard>,
+    inline_trace_base: usize,
 }
 
 impl PyreMetaInterp {
-    /// Create a new MetaInterp for tracing.
     pub fn new(jitcode: *const CodeObject, namespace: *mut pyre_runtime::PyNamespace) -> Self {
         Self {
             framestack: Vec::new(),
             portal_call_depth: -1,
             jitcode,
             namespace,
+            inline_call_guard: None,
+            inline_trace_base: 0,
         }
     }
 
-    /// RPython MetaInterp._interpret() parity.
-    ///
-    /// Main tracing loop. Repeatedly calls run_one_step() on the top
-    /// frame until a terminal action is reached (CloseLoop or Abort).
-    ///
-    /// Delegates each step to MIFrame::trace_code_step() which handles
-    /// both concrete execution and symbolic IR recording.
+    /// RPython MetaInterp._interpret() — single loop, single framestack.
     pub fn interpret(&mut self, ctx: &mut TraceCtx) -> TraceAction {
+        self.inline_trace_base = ctx.inline_trace_depth();
+
         loop {
             let Some(top) = self.framestack.last_mut() else {
                 return TraceAction::Abort;
             };
-
             let code = unsafe { &*top.jitcode };
-            let pc = top.pc;
-            let sym = unsafe { &mut *top.sym };
-
+            let is_inline = top.is_inline();
+            // Inline frames use concrete_frame.next_instr as PC source
+            // (synchronized with concrete execution). Root frame uses top.pc.
+            let pc = if is_inline {
+                top.owned_concrete_frame.as_ref().unwrap().next_instr
+            } else {
+                top.pc
+            };
             if pc >= code.instructions.len() {
                 return TraceAction::Abort;
             }
 
-            // RPython: framestack[-1].run_one_step()
-            // Delegates to MIFrame::trace_code_step() which handles both
-            // concrete execution and symbolic IR recording.
-            let fallthrough_pc = semantic_fallthrough_pc(code, pc);
-            let mut frame_state = MIFrame::from_sym(ctx, sym, top.concrete_frame, fallthrough_pc);
-            let action = frame_state.trace_code_step(code, pc);
+            let action = if is_inline {
+                self.step_inline_frame(ctx, pc)
+            } else {
+                self.step_root_frame(ctx, pc)
+            };
 
             match action {
-                TraceAction::Continue => {
-                    let next_pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
-                    top.pc = next_pc;
-                }
-
-                TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-                    // Green key retarget is done in trace_bytecode()
-                    // which has access to start_pc for CloseLoop.
-                    return action;
-                }
-
-                other => return other,
+                LoopAction::Continue => {}
+                LoopAction::Return(ta) => return ta,
             }
         }
     }
 
-    /// RPython MetaInterp.perform_call() parity.
-    ///
-    /// Create a new frame for the callee and push it onto the framestack.
-    /// Currently unused — inline tracing uses inline_trace_and_execute.
-    /// Will be activated when inline tracing migrates to framestack pattern.
-    #[allow(dead_code)]
-    pub fn perform_call(
-        &mut self,
-        callee_code: *const CodeObject,
-        args: Vec<FrontendOp>,
-        greenkey: Option<u64>,
-    ) {
-        let code = unsafe { &*callee_code };
-        let nlocals = code.varnames.len();
+    // ── Root frame step ──────────────────────────────────────────
 
-        // RPython MIFrame.setup_call: distribute args to registers
-        // Note: PyreSym is heap-allocated so the raw pointer stays valid.
-        let mut sym = Box::new(PyreSym::new_uninit(OpRef::NONE));
-        sym.concrete_locals = vec![ConcreteValue::Null; nlocals];
-        sym.concrete_stack = Vec::new();
-        sym.symbolic_locals = vec![OpRef::NONE; nlocals];
-        sym.nlocals = nlocals;
-        for (i, arg) in args.iter().enumerate() {
-            if i < nlocals {
-                sym.concrete_locals[i] = arg.concrete;
-                sym.symbolic_locals[i] = arg.opref;
-            }
+    fn step_root_frame(&mut self, ctx: &mut TraceCtx, pc: usize) -> LoopAction {
+        let top = self.framestack.last_mut().unwrap();
+        let code = unsafe { &*top.jitcode };
+        let sym = unsafe { &mut *top.sym };
+        let fallthrough_pc = semantic_fallthrough_pc(code, pc);
+
+        let mut fs = MIFrame::from_sym(ctx, sym, top.concrete_frame, fallthrough_pc);
+        let action = fs.trace_code_step(code, pc);
+        let pending = fs.pending_inline_frame.take();
+        drop(fs);
+
+        if let Some(pending) = pending {
+            // RPython perform_call: callee deferred via pending_inline_frame.
+            let top = self.framestack.last_mut().unwrap();
+            let sym = unsafe { &mut *top.sym };
+            top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+            let result_idx = sym.stack_only_depth().checked_sub(1);
+            self.push_inline_frame(ctx, pending, result_idx);
+            return LoopAction::Continue;
         }
 
+        match action {
+            TraceAction::Continue => {
+                let top = self.framestack.last_mut().unwrap();
+                let sym = unsafe { &mut *top.sym };
+                top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                LoopAction::Continue
+            }
+            TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
+                self.handle_close_loop(ctx, &action, pc);
+                LoopAction::Return(action)
+            }
+            other => LoopAction::Return(other),
+        }
+    }
+
+    // ── Inline frame step ────────────────────────────────────────
+
+    fn step_inline_frame(&mut self, ctx: &mut TraceCtx, pc: usize) -> LoopAction {
+        let top = self.framestack.last_mut().unwrap();
+        let code = unsafe { &*top.jitcode };
+        let sym = unsafe { &mut *top.sym };
+        let cf_addr = top.concrete_frame_addr();
+        let pfa = top.parent_fail_args.clone();
+        let pfa_types = top.parent_fail_arg_types.clone();
+        let fallthrough_pc = semantic_fallthrough_pc(code, pc);
+
+        let inline_action = {
+            let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc);
+            fs.parent_fail_args = Some(pfa);
+            fs.parent_fail_arg_types = Some(pfa_types);
+            let result = fs.trace_code_step_inline(code, pc);
+            let pending = fs.pending_inline_frame.take();
+            drop(fs);
+
+            if let Some(pending) = pending {
+                let top = self.framestack.last_mut().unwrap();
+                let sym = unsafe { &mut *top.sym };
+                top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                let result_idx = sym.stack_only_depth().checked_sub(1);
+                // Pop concrete call args from parent owned_concrete_frame
+                if let Some(ref mut cf) = top.owned_concrete_frame {
+                    for _ in 0..pending.nargs {
+                        cf.pop();
+                    }
+                    let _ = cf.pop(); // null_or_self
+                    let _ = cf.pop(); // callable
+                    cf.next_instr = pc + 1;
+                }
+                self.push_inline_frame(ctx, pending, result_idx);
+                return LoopAction::Continue;
+            }
+            result
+        };
+
+        match inline_action {
+            super::state::InlineTraceStepAction::Trace(TraceAction::Continue) => {
+                let top = self.framestack.last_mut().unwrap();
+                let sym = unsafe { &mut *top.sym };
+                top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                // Concrete execution step
+                self.concrete_execute_step();
+                LoopAction::Continue
+            }
+            super::state::InlineTraceStepAction::Trace(TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+            }) => {
+                self.finishframe_inline(ctx, &finish_args, &finish_arg_types);
+                LoopAction::Continue
+            }
+            super::state::InlineTraceStepAction::Trace(
+                TraceAction::Abort | TraceAction::AbortPermanent,
+            ) => {
+                ctx.truncate_inline_trace_positions(self.inline_trace_base);
+                LoopAction::Return(TraceAction::Abort)
+            }
+            super::state::InlineTraceStepAction::Trace(action) => LoopAction::Return(action),
+            super::state::InlineTraceStepAction::PushFrame(pending) => {
+                // trace_code_step_inline already took the pending frame
+                let top = self.framestack.last_mut().unwrap();
+                let sym = unsafe { &mut *top.sym };
+                top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                let result_idx = sym.stack_only_depth().checked_sub(1);
+                if let Some(ref mut cf) = top.owned_concrete_frame {
+                    for _ in 0..pending.nargs {
+                        cf.pop();
+                    }
+                    let _ = cf.pop(); // null_or_self
+                    let _ = cf.pop(); // callable
+                    cf.next_instr = pc + 1;
+                }
+                self.push_inline_frame(ctx, pending, result_idx);
+                LoopAction::Continue
+            }
+        }
+    }
+
+    // ── Frame management ─────────────────────────────────────────
+
+    /// RPython perform_call: push PendingInlineFrame onto framestack.
+    fn push_inline_frame(
+        &mut self,
+        ctx: &mut TraceCtx,
+        pending: PendingInlineFrame,
+        caller_result_idx: Option<usize>,
+    ) {
+        if self.inline_call_guard.is_none() {
+            self.inline_call_guard = Some(pyre_interp::call::inline_call_override_guard());
+        }
+
+        let (driver, _) = crate::eval::driver_pair();
+        driver.enter_inline_frame(pending.green_key);
+        ctx.push_inline_trace_position(pending.green_key);
+
+        let callee_code = pending.concrete_frame.code;
+        let mut owned_sym = Box::new(pending.sym);
+        let sym_ptr = owned_sym.as_mut() as *mut PyreSym;
+        let mut owned_cf = Box::new(pending.concrete_frame);
+        let cf_addr = &*owned_cf as *const pyre_interp::frame::PyFrame as usize;
+
         let frame = MetaInterpFrame {
-            sym: Box::into_raw(sym),
+            sym: sym_ptr,
+            owned_sym: Some(owned_sym),
             jitcode: callee_code,
             pc: 0,
-            greenkey,
-            concrete_frame: 0,
+            greenkey: Some(pending.green_key),
+            concrete_frame: cf_addr,
+            owned_concrete_frame: Some(owned_cf),
+            parent_fail_args: pending.parent_fail_args,
+            parent_fail_arg_types: pending.parent_fail_arg_types,
+            drop_frame_opref: pending.drop_frame_opref,
+            caller_result_stack_idx: caller_result_idx,
+            arg_state: pyre_bytecode::bytecode::OpArgState::default(),
         };
 
         self.portal_call_depth += 1;
         self.framestack.push(frame);
     }
 
-    /// RPython MetaInterp.finishframe() parity.
-    ///
-    /// Pop the top frame and store the result in the parent frame.
-    #[allow(dead_code)]
-    pub fn finishframe(&mut self, result: FrontendOp) -> StepAction {
-        if let Some(popped) = self.framestack.pop() {
-            // Drop the heap-allocated PyreSym if it was created by perform_call.
-            // Root frames created by trace_bytecode point into the caller's
-            // stack and must NOT be freed here.
-            // TODO: distinguish owned vs borrowed PyreSym
-            let _ = popped;
-        }
+    /// RPython finishframe: pop inline frame, store result in parent.
+    fn finishframe_inline(
+        &mut self,
+        ctx: &mut TraceCtx,
+        finish_args: &[OpRef],
+        finish_arg_types: &[Type],
+    ) {
+        let result_opref = finish_args.first().copied().unwrap_or(OpRef::NONE);
+        let result_type = finish_arg_types.first().copied().unwrap_or(Type::Ref);
+
+        // Concrete RETURN_VALUE execution on inline frame
+        let concrete_result = self.concrete_execute_return();
+
+        // Pop frame
+        let popped = self.framestack.pop().unwrap();
         self.portal_call_depth -= 1;
+        ctx.pop_inline_trace_position();
+
+        // Drop callee frame in trace
+        if let Some(frame_opref) = popped.drop_frame_opref {
+            ctx.call_void(
+                crate::call_jit::jit_drop_callee_frame as *const (),
+                &[frame_opref],
+            );
+        }
+
+        let (driver, _) = crate::eval::driver_pair();
+        driver.leave_inline_frame();
+
+        // Release inline call guard when all inline frames are gone
+        if !self.framestack.iter().any(|f| f.is_inline()) {
+            self.inline_call_guard = None;
+        }
 
         if self.framestack.is_empty() {
-            StepAction::DoneWithThisFrame(result)
-        } else {
-            let parent = self.framestack.last_mut().unwrap();
-            let parent_sym = unsafe { &mut *parent.sym };
-            parent_sym.concrete_stack.push(result.concrete);
-            parent_sym.symbolic_stack.push(result.opref);
-            StepAction::ChangeFrame
+            return; // shouldn't happen: root never produces Finish
+        }
+
+        // make_result_of_lastop: store in parent
+        let parent = self.framestack.last_mut().unwrap();
+        let parent_sym = unsafe { &mut *parent.sym };
+
+        if let Some(result_idx) = popped.caller_result_stack_idx {
+            // Update symbolic stack
+            if let Some(slot) = parent_sym.symbolic_stack.get_mut(result_idx) {
+                *slot = result_opref;
+            }
+            if result_idx >= parent_sym.symbolic_stack_types.len() {
+                parent_sym
+                    .symbolic_stack_types
+                    .resize(result_idx + 1, Type::Ref);
+            }
+            parent_sym.symbolic_stack_types[result_idx] = result_type;
+            parent_sym
+                .transient_value_types
+                .insert(result_opref, result_type);
+
+            // Update concrete stack (THE CRITICAL FIX)
+            let cv = ConcreteValue::from_pyobj(concrete_result);
+            if result_idx < parent_sym.concrete_stack.len() {
+                parent_sym.concrete_stack[result_idx] = cv;
+            } else {
+                parent_sym
+                    .concrete_stack
+                    .resize(result_idx + 1, ConcreteValue::Null);
+                parent_sym.concrete_stack[result_idx] = cv;
+            }
+        }
+
+        // Push concrete result to parent's owned PyFrame
+        if let Some(ref mut pcf) = parent.owned_concrete_frame {
+            pcf.push(concrete_result);
+        }
+
+        // Also set pending_concrete_push for root frame parent
+        parent_sym.pending_concrete_push = Some(ConcreteValue::from_pyobj(concrete_result));
+    }
+
+    // ── Concrete execution helpers ───────────────────────────────
+
+    fn concrete_execute_step(&mut self) {
+        let top = self.framestack.last_mut().unwrap();
+        let Some(cf) = top.owned_concrete_frame.as_mut() else {
+            return;
+        };
+        let cf = &mut **cf;
+        let code = unsafe { &*cf.code };
+        let ni = cf.next_instr;
+        if ni >= code.instructions.len() {
+            return;
+        }
+
+        let code_unit = code.instructions[ni];
+        let (instruction, op_arg) = top.arg_state.get(code_unit);
+        cf.next_instr = ni + 1;
+        let next = cf.next_instr;
+
+        if let Instruction::Call { argc } = instruction {
+            let nargs = argc.get(op_arg) as usize;
+            if pyre_interp::call::replay_pending_inline_call(cf, nargs) {
+                return;
+            }
+            let _ = super::state::execute_inline_residual_call(cf, nargs);
+            return;
+        }
+
+        let _ = pyre_runtime::execute_opcode_step(cf, code, instruction, op_arg, next);
+    }
+
+    fn concrete_execute_return(&mut self) -> pyre_object::PyObjectRef {
+        let top = self.framestack.last_mut().unwrap();
+        let Some(cf) = top.owned_concrete_frame.as_mut() else {
+            return pyre_object::PY_NULL;
+        };
+        let cf = &mut **cf;
+        let code = unsafe { &*cf.code };
+        let ni = cf.next_instr;
+        if ni >= code.instructions.len() {
+            return pyre_object::PY_NULL;
+        }
+
+        let code_unit = code.instructions[ni];
+        let (instruction, op_arg) = top.arg_state.get(code_unit);
+        cf.next_instr = ni + 1;
+        let next = cf.next_instr;
+
+        match pyre_runtime::execute_opcode_step(cf, code, instruction, op_arg, next) {
+            Ok(pyre_runtime::StepResult::Return(value)) => materialize_pending_inline_result(
+                pending_inline_result_from_concrete(Type::Ref, value),
+            ),
+            _ => pyre_object::PY_NULL,
         }
     }
 
-    /// RPython MetaInterp.capture_resumedata() parity (pyjitpl.py:2580).
-    ///
-    /// Collect live boxes from all frames in the framestack for guard recovery.
-    #[allow(dead_code)]
-    fn capture_resumedata(&self) -> Vec<OpRef> {
-        let mut fail_args = Vec::new();
-        for frame in &self.framestack {
-            let sym = unsafe { &*frame.sym };
-            fail_args.extend(sym.symbolic_locals.iter().copied());
-            fail_args.extend(sym.symbolic_stack.iter().copied());
+    // ── Helpers ──────────────────────────────────────────────────
+
+    fn handle_close_loop(&self, ctx: &mut TraceCtx, action: &TraceAction, pc: usize) {
+        let code = unsafe { &*self.framestack[0].jitcode };
+        if let TraceAction::CloseLoopWithArgs {
+            loop_header_pc: Some(target_pc),
+            ..
+        } = action
+        {
+            ctx.set_green_key(crate::eval::make_green_key(
+                code as *const CodeObject,
+                *target_pc,
+            ));
+        } else if matches!(action, TraceAction::CloseLoop) {
+            ctx.set_green_key(crate::eval::make_green_key(code as *const CodeObject, pc));
         }
-        fail_args
     }
+}
+
+/// Internal loop control — not exposed outside interpret().
+enum LoopAction {
+    Continue,
+    Return(TraceAction),
 }
 
 pub(crate) fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
@@ -224,9 +433,7 @@ pub(crate) fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
                 | Instruction::Cache
                 | Instruction::NotTaken,
                 _,
-            )) => {
-                next_pc += 1;
-            }
+            )) => next_pc += 1,
             _ => return next_pc,
         }
     }
