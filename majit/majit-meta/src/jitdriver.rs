@@ -486,10 +486,21 @@ impl<S: JitState> JitDriver<S> {
                 jump_args,
                 loop_header_pc,
             } => {
-                // RPython parity: the active trace green key is already
-                // retargeted by the tracer when it reaches the loop header.
-                // Pass loop_header_pc to close_and_compile so the compiled
-                // loop's is_compatible check uses the actual loop header PC.
+                // RPython pyjitpl.py reached_loop_header(): the compiled
+                // loop should use the back-edge target PC as merge_pc.
+                // Currently disabled: the optimizer's virtual state matching
+                // can produce false aliases when the trace entry PC differs
+                // from the loop header PC. Until the alias bug is fixed,
+                // keep merge_pc at the trace entry PC. The incompatible-state
+                // abort protects against the faulty compiled code.
+                //
+                // TODO: re-enable when Phase 2 alias propagation is fixed:
+                // if let Some(target_pc) = loop_header_pc {
+                //     if let Some(ref mut meta) = self.trace_meta {
+                //         S::update_meta_merge_pc(meta, target_pc);
+                //     }
+                // }
+                let _ = loop_header_pc;
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()

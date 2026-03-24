@@ -129,6 +129,12 @@ pub trait JitState: Sized {
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool;
 
+    /// Update the merge_pc in meta when the trace's green key is
+    /// retargeted to a different loop header (CloseLoopWithArgs).
+    /// RPython pyjitpl.py reached_loop_header(): the compiled loop
+    /// must use the back-edge target PC, not the tracing entry PC.
+    fn update_meta_merge_pc(_meta: &mut Self::Meta, _new_pc: usize) {}
+
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]);
 
     fn restore_values(&mut self, meta: &Self::Meta, values: &[Value]) {

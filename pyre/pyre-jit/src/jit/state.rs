@@ -5915,6 +5915,10 @@ impl JitState for PyreJitState {
             && self.valuestackdepth == meta.valuestackdepth
     }
 
+    fn update_meta_merge_pc(meta: &mut Self::Meta, new_pc: usize) {
+        meta.merge_pc = new_pc;
+    }
+
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
         if values.is_empty() {
             return;
