@@ -149,6 +149,12 @@ impl TraceCtx {
         self.heap_cache.reset();
     }
 
+    /// heapcache.py: EF_RANDOM_EFFECTS — invalidate ALL caches including
+    /// unescaped objects. Used for operations with completely unknown effects.
+    pub fn invalidate_all_heap_caches(&mut self) {
+        self.heap_cache.invalidate_all_caches();
+    }
+
     /// pyjitpl.py:1776-1780: jit.isvirtual(obj) — check if an object
     /// is likely virtual (allocated during this trace and not escaped).
     pub fn is_likely_virtual(&self, obj: OpRef) -> bool {
@@ -1201,9 +1207,13 @@ impl TraceCtx {
         let result = self
             .recorder
             .record_op_with_descr(opcode, &call_args, descr);
-        // heapcache.py: pure/elidable calls (CallPure*) don't invalidate.
-        // Non-pure calls escape their arguments and invalidate caches.
-        if !opcode.is_call_pure() {
+        // heapcache.py: cache invalidation based on effect level.
+        // EF_ELIDABLE / EF_LOOPINVARIANT (CallPure*, CallLoopinvariant*):
+        //   no invalidation at all.
+        // EF_CAN_RAISE / EF_CANNOT_RAISE (Call*, CallMayForce*):
+        //   escape args + invalidate escaped caches.
+        // EF_RANDOM_EFFECTS: handled separately via invalidate_all_caches.
+        if !opcode.is_call_pure() && !opcode.is_call_loopinvariant() {
             self.heap_cache.mark_escaped_args(args);
             self.heap_cache.invalidate_caches_for_escaped();
         }
