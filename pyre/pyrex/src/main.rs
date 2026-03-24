@@ -69,6 +69,15 @@ fn parse_args() -> Result<(RunMode, bool, bool), lexopt::Error> {
 }
 
 fn main() {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("spawn main thread")
+        .join()
+        .unwrap();
+}
+
+fn real_main() {
     let (mode, inspect, quiet) = match parse_args() {
         Ok(v) => v,
         Err(e) => {

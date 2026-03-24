@@ -297,6 +297,8 @@ pub struct PyreSym {
     /// Virtualizable object pointer (PyFrame).
     /// RPython MetaInterp stores the virtualizable separately from MIFrame.
     pub(crate) concrete_vable_ptr: *mut u8,
+    /// Function-entry traces use typed locals (RPython MIFrame parity).
+    pub(crate) is_function_entry_trace: bool,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1113,6 +1115,7 @@ impl PyreSym {
             // concrete_code and concrete_namespace initialized below
             concrete_code: std::ptr::null(),
             concrete_namespace: std::ptr::null_mut(),
+            is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
         }
@@ -1124,11 +1127,16 @@ impl PyreSym {
         if self.symbolic_initialized {
             return;
         }
+        self.is_function_entry_trace = ctx.header_pc == 0;
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
         if majit_meta::majit_log_enabled() {
             eprintln!(
-                "[jit][init-sym] concrete_frame={:#x} nlocals={} vable_base={:?}",
-                concrete_frame, nlocals, self.vable_array_base
+                "[jit][init-sym] concrete_frame={:#x} nlocals={} vable_base={:?} header_pc={} func_entry={}",
+                concrete_frame,
+                nlocals,
+                self.vable_array_base,
+                ctx.header_pc,
+                self.is_function_entry_trace
             );
         }
         let valuestackdepth = concrete_stack_depth(concrete_frame).unwrap_or(nlocals);
@@ -1144,7 +1152,17 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; nlocals]
         };
-        if self.symbolic_local_types.len() != nlocals {
+        if self.is_function_entry_trace {
+            // RPython MIFrame parity: function-entry traces use concrete
+            // value types (W_IntObject → Int). Always override.
+            self.symbolic_local_types = (0..nlocals)
+                .map(|i| {
+                    concrete_stack_value(concrete_frame, i)
+                        .map(concrete_value_type)
+                        .unwrap_or(Type::Ref)
+                })
+                .collect();
+        } else if self.symbolic_local_types.len() != nlocals {
             self.symbolic_local_types = concrete_slot_types(concrete_frame, nlocals, nlocals);
         }
         self.symbolic_stack = if let Some(base) = self.vable_array_base {
@@ -1387,10 +1405,8 @@ impl MIFrame {
     fn build_single_frame_fail_arg_types(&self) -> Vec<Type> {
         let s = self.sym();
         let stack_only = s.stack_only_depth();
-        if s.vable_array_base.is_some() {
-            // RPython parity: virtualizable array slots are always GCREF.
-            // Both locals and stack slots must be Ref in fail_arg_types
-            // so that guard-failure restoration boxes raw values correctly.
+        if s.vable_array_base.is_some() && !s.is_function_entry_trace {
+            // Back-edge: virtualizable array slots are always GCREF.
             let total_slots = s.symbolic_local_types.len() + stack_only;
             virtualizable_fail_arg_types(std::iter::repeat_n(Type::Ref, total_slots))
         } else {
@@ -4172,18 +4188,15 @@ impl MIFrame {
                                 as *const pyre_bytecode::CodeObject;
                             (&*code_ptr).varnames.len()
                         };
-                        // RPython parity: CallAssemblerI locals must be Ref
-                        // (boxed) to match the callee trace's virtualizable
-                        // array type. Re-box the raw Int arg.
-                        let boxed_arg = box_traced_raw_int(ctx, raw_arg);
+                        // RPython pyjitpl.py:3583: pass raw Int arg, return raw Int.
                         let ca_args = synthesize_fresh_callee_entry_args(
                             ctx,
                             callee_frame,
-                            &[boxed_arg],
+                            &[raw_arg],
                             callee_nlocals,
                         );
                         let callee_slot_types =
-                            pending_entry_slot_types_from_args(&[Type::Ref], callee_nlocals, 0);
+                            pending_entry_slot_types_from_args(&[Type::Int], callee_nlocals, 0);
                         let ca_arg_types =
                             frame_entry_arg_types_from_slot_types(&callee_slot_types);
                         let ca_result = ctx.call_assembler_int_by_number_typed(
@@ -4195,8 +4208,8 @@ impl MIFrame {
                             crate::call_jit::jit_drop_callee_frame as *const (),
                             &[callee_frame],
                         );
-                        // Re-box the raw int result for the caller
-                        box_traced_raw_int(ctx, ca_result)
+                        this.remember_value_type(ca_result, Type::Int);
+                        ca_result
                     } else if force_fn
                         == crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1
                             as *const ()
