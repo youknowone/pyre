@@ -1065,11 +1065,10 @@ impl Optimizer {
         }
         if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
             if info.is_virtual() {
-                let forced = if ctx.in_final_emission {
-                    info.force_to_ops_direct(resolved, ctx)
-                } else {
-                    info.force_to_ops(resolved, ctx)
-                };
+                // Always emit force ops directly to new_operations.
+                // RPython info.py: force_box→emit_extra inserts ops at the
+                // current position so they appear BEFORE the current op.
+                let forced = info.force_to_ops_direct(resolved, ctx);
                 return ctx.get_replacement(forced);
             }
         }
@@ -1453,7 +1452,10 @@ impl Optimizer {
         // passes after flush; flush=False (Phase 2) stores it directly.
         if let Some(mut terminal_op) = last_op {
             if self.skip_flush {
-                // Phase 2: JUMP is NOT sent through passes (RPython parity).
+                // RPython optimizer.py:553: resolve args via get_box_replacement.
+                for arg in &mut terminal_op.args {
+                    *arg = ctx.get_replacement(*arg);
+                }
                 self.terminal_op = Some(terminal_op);
             } else {
                 for arg in &mut terminal_op.args {

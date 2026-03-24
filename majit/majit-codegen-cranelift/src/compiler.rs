@@ -2564,9 +2564,10 @@ extern "C" fn gc_unregister_roots_shim(runtime_id: u64, roots_ptr: u64, num_root
 
 thread_local! {
     static DECLARED_VARS_DEBUG: std::cell::RefCell<Option<std::collections::HashSet<u32>>> = const { std::cell::RefCell::new(None) };
-    /// Positions of ops added by GC rewriter (CallMallocNursery, NurseryPtrIncrement).
-    /// These must take precedence over constants in resolve_opref.
-    static GC_REWRITER_POSITIONS: std::cell::RefCell<std::collections::HashSet<u32>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Op-result variable positions: ops that define a result via def_var.
+    /// When an OpRef collides (in both constants map and op-result set),
+    /// the variable takes precedence over the constant.
+    static OP_RESULT_VARS: std::cell::RefCell<Option<std::collections::HashSet<u32>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn resolve_opref(
@@ -2575,13 +2576,18 @@ fn resolve_opref(
     opref: OpRef,
 ) -> CValue {
     if let Some(&c) = constants.get(&opref.0) {
-        // GC rewriter positions override constants: the variable
-        // (allocation result) must take precedence.
-        let is_gc_pos = GC_REWRITER_POSITIONS.with(|cell| cell.borrow().contains(&opref.0));
-        if !is_gc_pos {
+        // Op results take precedence over constants. GC rewriter and
+        // optimizer may assign op results to positions that collide with
+        // constant keys. The variable (e.g., allocation pointer from New)
+        // must win over the stale constant value.
+        let is_op_result = OP_RESULT_VARS.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .is_some_and(|rv| rv.contains(&opref.0))
+        });
+        if !is_op_result {
             return builder.ins().iconst(cl_types::I64, c);
         }
-        // Fall through to use_var for GC rewriter results.
     }
     if opref.is_none() {
         return builder.ins().iconst(cl_types::I64, 0);
@@ -3912,25 +3918,11 @@ impl CraneliftBackend {
     fn prepare_ops_for_compile(&mut self, inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
-        let pre_gc_positions: std::collections::HashSet<u32> = normalized
-            .iter()
-            .filter(|op| !op.pos.is_none())
-            .map(|op| op.pos.0)
-            .collect();
         let result = if let Some(rewriter) = self.gc_rewriter() {
             rewriter.rewrite_for_gc(&normalized)
         } else {
             normalized
         };
-        // Collect positions added by GC rewriter (CallMallocNursery etc.)
-        let gc_positions: std::collections::HashSet<u32> = result
-            .iter()
-            .filter(|op| !op.pos.is_none() && !pre_gc_positions.contains(&op.pos.0))
-            .map(|op| op.pos.0)
-            .collect();
-        GC_REWRITER_POSITIONS.with(|cell| {
-            *cell.borrow_mut() = gc_positions;
-        });
         result
     }
 
@@ -4325,6 +4317,23 @@ impl CraneliftBackend {
         // Debug: save declared_vars snapshot for resolve_opref checking.
         DECLARED_VARS_DEBUG.with(|cell| {
             *cell.borrow_mut() = Some(declared_vars.clone());
+        });
+
+        // Save op-result positions for resolve_opref collision handling.
+        let mut op_result_positions = std::collections::HashSet::new();
+        if !has_entry_label {
+            for i in 0..num_inputs {
+                op_result_positions.insert(i as u32);
+            }
+        }
+        for (op_idx, op) in ops.iter().enumerate() {
+            if op.result_type() != Type::Void {
+                let vi = op_var_index(op, op_idx, num_inputs) as u32;
+                op_result_positions.insert(vi);
+            }
+        }
+        OP_RESULT_VARS.with(|cell| {
+            *cell.borrow_mut() = Some(op_result_positions);
         });
 
         let entry_input_vals: Vec<CValue> = (0..num_inputs)

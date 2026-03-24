@@ -2020,6 +2020,32 @@ impl Optimization for OptHeap {
             // heap.py:433: self.optimizer.pendingfields = pendingfields
             ctx.pending_for_guard = pending_virtual;
         }
+        // RPython parity: when a call uses an object with pending lazy
+        // SetfieldGc, flush those fields so the callee sees them in memory.
+        if op.opcode.is_call() && op.num_args() > 1 {
+            let call_args: Vec<OpRef> = (1..op.num_args())
+                .map(|i| ctx.get_replacement(op.arg(i)))
+                .collect();
+            let flush_indices: Vec<u32> = self
+                .field_cache
+                .iter()
+                .filter_map(|(&field_idx, cf)| {
+                    let (obj, _) = cf.lazy_set.as_ref()?;
+                    let resolved = ctx.get_replacement(*obj);
+                    call_args.contains(&resolved).then_some(field_idx)
+                })
+                .collect();
+            for field_idx in flush_indices {
+                if let Some(cf) = self.field_cache.get_mut(&field_idx) {
+                    if let Some((obj, mut lazy_op)) = cf.lazy_set.take() {
+                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                        // Restore cache after emit
+                        let value_ref = ctx.get_replacement(lazy_op.arg(1));
+                        self.cache_field(obj, field_idx, value_ref, lazy_op.descr.as_ref());
+                    }
+                }
+            }
+        }
     }
 
     /// heap.py: produce_potential_short_preamble_ops(sb)
