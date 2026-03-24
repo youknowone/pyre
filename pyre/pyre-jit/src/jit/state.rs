@@ -4502,11 +4502,7 @@ impl MIFrame {
             if is_list(concrete_value) && w_list_uses_object_storage(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &LIST_TYPE as *const PyType);
-                    let len = ctx.record_op_with_descr(
-                        OpCode::GetfieldRawI,
-                        &[value],
-                        list_items_len_descr(),
-                    );
+                    let len = trace_arraylen_gc(ctx, value, list_items_len_descr());
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[len, zero]))
                 });
@@ -4514,11 +4510,7 @@ impl MIFrame {
             if is_tuple(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &TUPLE_TYPE as *const PyType);
-                    let len = ctx.record_op_with_descr(
-                        OpCode::GetfieldRawI,
-                        &[value],
-                        tuple_items_len_descr(),
-                    );
+                    let len = trace_arraylen_gc(ctx, value, tuple_items_len_descr());
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[len, zero]))
                 });
