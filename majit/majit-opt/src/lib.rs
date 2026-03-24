@@ -170,8 +170,12 @@ pub struct OptContext {
     /// Constants known at optimization time (op -> value).
     pub constants: Vec<Option<Value>>,
     /// Forwarding chain: maps old OpRef to replacement OpRef.
+    /// RPython: Box._forwarded — used for within-phase forwarding only.
     pub forwarding: Vec<OpRef>,
-    // (import_boxes removed: ptr_info stop in get_replacement replaces it)
+    /// RPython: mapping dict in inline_short_preamble — separate from _forwarded.
+    /// Maps Phase 1 source OpRefs to Phase 2 short arg OpRefs.
+    /// Consulted by get_replacement BEFORE the forwarding chain.
+    pub short_preamble_mapping: HashMap<OpRef, OpRef>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -299,6 +303,7 @@ impl OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
             forwarding: Vec::new(),
+            short_preamble_mapping: HashMap::new(),
             num_inputs: 0,
             next_pos: 0,
             extra_operations: VecDeque::new(),
@@ -344,6 +349,7 @@ impl OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
             forwarding: Vec::new(),
+            short_preamble_mapping: HashMap::new(),
             num_inputs: num_inputs as u32,
             next_pos: num_inputs as u32,
             extra_operations: VecDeque::new(),
@@ -745,6 +751,7 @@ impl OptContext {
     }
 
     /// Record that `old` should be replaced by `new` wherever it appears.
+    /// RPython: make_equal_to — within-phase forwarding only.
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new {
             return;
@@ -775,6 +782,11 @@ impl OptContext {
     /// NEXT position has ptr_info set (it's a terminal, like RPython's
     /// get_box_replacement stopping at _forwarded=Info).
     pub fn get_replacement(&self, mut opref: OpRef) -> OpRef {
+        // RPython: mapping dict lookup (inline_short_preamble).
+        // Cross-phase mapping is separate from _forwarded chain.
+        if let Some(&mapped) = self.short_preamble_mapping.get(&opref) {
+            opref = mapped;
+        }
         loop {
             let idx = opref.0 as usize;
             if idx >= self.forwarding.len() {

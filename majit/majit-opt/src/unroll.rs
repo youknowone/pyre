@@ -273,7 +273,6 @@ impl UnrollOptimizer {
         // Import heap cache from preamble so Phase 2 can reuse cached field values
         // instead of re-reading from memory on every iteration.
         opt_p2.import_all_cached_fields(&exported_state.preamble_heap_cache);
-
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
             eprintln!(
@@ -2020,7 +2019,7 @@ impl OptUnroll {
                     let Some(result_opref) = resolve_result(result) else {
                         continue;
                     };
-                    ctx.replace_op(source, result_opref);
+                    ctx.short_preamble_mapping.insert(source, result_opref);
                     let args = args
                         .iter()
                         .map(|arg| match arg {
@@ -2083,7 +2082,7 @@ impl OptUnroll {
                     let Some(value) = resolve_result(result) else {
                         continue;
                     };
-                    ctx.replace_op(source, value);
+                    ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
                     ctx.imported_short_fields.insert((obj, descr_idx), value);
                     ctx.imported_short_field_descrs
@@ -2124,7 +2123,7 @@ impl OptUnroll {
                     let Some(value) = resolve_result(result) else {
                         continue;
                     };
-                    ctx.replace_op(source, value);
+                    ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
                     ctx.imported_short_arrayitems
                         .insert((obj, descr_idx, index), value);
@@ -2156,7 +2155,7 @@ impl OptUnroll {
                     let Some(value) = resolve_result(result) else {
                         continue;
                     };
-                    ctx.replace_op(source, value);
+                    ctx.short_preamble_mapping.insert(source, value);
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
                     ctx.imported_short_sources.push(crate::ImportedShortSource {
                         result: value,

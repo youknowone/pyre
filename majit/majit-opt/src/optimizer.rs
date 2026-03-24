@@ -154,6 +154,8 @@ pub struct Optimizer {
     pub terminal_op: Option<Op>,
     /// Preserved final context after optimization, for jump_to_existing_trace.
     pub final_ctx: Option<OptContext>,
+    /// RPython Box identity: generation epoch for Phase 2 ops.
+    /// Phase 1 JUMP arg OpRef indices to pre-tag as gen=0.
     /// bridgeopt.py: pending bridge knowledge to apply after setup().
     /// Stored here so it survives the setup() clear in optimize_with_constants_and_inputs.
     pending_bridge_knowledge: Option<OptimizerKnowledge>,
@@ -986,6 +988,10 @@ impl Optimizer {
             pass.import_cached_fields(entries);
         }
     }
+
+    /// Pre-tag Phase 1 JUMP arg OpRefs as generation 0.
+
+    /// Lock JUMP arg OpRefs so replace_op won't forward them.
 
     /// optimizer.py: flush()
     /// Flush all passes' postponed state.
