@@ -1099,7 +1099,7 @@ pub fn jit_bridge_compile_for_guard(
         }
 
         // Advance the trace frame's PC for the next instruction.
-        // execute_opcode_step on TraceFrameState updates symbolic state
+        // execute_opcode_step on MIFrame updates symbolic state
         // but not the concrete frame's next_instr. Advance manually.
         trace_frame.next_instr = pc + 1;
     }

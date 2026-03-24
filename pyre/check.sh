@@ -1,11 +1,6 @@
 #!/bin/bash
 # pyre pre-merge check: correctness + regression guard + comparison
 # Usage: ./pyre/check.sh [path/to/pyre]
-#
-# Runs all benchmark scripts and verifies:
-#   1. Correct output (must match expected values)
-#   2. No crashes (exit code 0)
-#   3. Performance gate: fib_loop must stay fast (JIT-optimized)
 
 set -euo pipefail
 
@@ -62,7 +57,6 @@ run_bench() {
     local elapsed
     elapsed=$(time_user "$PYRE" "$script")
 
-    # Correctness check
     if [ "$output" != "$expected" ]; then
         RESULTS+=("$(red "FAIL") $name  wrong output")
         printf "$(red WRONG)  got: %s\n" "$(echo "$output" | head -c 60)"
@@ -71,7 +65,6 @@ run_bench() {
         return
     fi
 
-    # Performance check
     if [ -n "$max_sec" ]; then
         local over
         over=$(python3 -c "print('yes' if $elapsed > $max_sec else 'no')")
@@ -136,7 +129,6 @@ run_bench       "fannkuch"       "$BENCH/fannkuch_9.py"         "$(printf '8629\
 run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"   "1142858"                       30
 
 echo ""
-
 echo "─────────────────────────────────"
 for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo "─────────────────────────────────"

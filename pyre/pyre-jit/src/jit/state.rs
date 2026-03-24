@@ -32,12 +32,12 @@ use pyre_objspace::truth_value as objspace_truth_value;
 /// execution value (ConcreteValue). Created by opcode handlers that
 /// compute concrete results alongside IR recording.
 #[derive(Clone, Copy, Debug)]
-pub struct TracedBox {
+pub struct FrontendOp {
     pub opref: OpRef,
     pub concrete: ConcreteValue,
 }
 
-impl TracedBox {
+impl FrontendOp {
     pub fn new(opref: OpRef, concrete: ConcreteValue) -> Self {
         Self { opref, concrete }
     }
@@ -226,7 +226,7 @@ pub struct PyreSym {
     /// OpRef for the owning PyFrame pointer.
     pub frame: OpRef,
     // ── Persistent symbolic frame field tracking ──
-    // These fields survive across per-instruction TraceFrameState lifetimes.
+    // These fields survive across per-instruction MIFrame lifetimes.
     pub(crate) symbolic_locals: Vec<OpRef>,
     pub(crate) symbolic_stack: Vec<OpRef>,
     pub(crate) symbolic_local_types: Vec<Type>,
@@ -283,6 +283,9 @@ pub struct PyreSym {
     pub(crate) concrete_namespace: *mut pyre_runtime::PyNamespace,
     /// Execution context pointer (for creating callee frames).
     pub(crate) concrete_execution_context: *const pyre_runtime::PyExecutionContext,
+    /// Virtualizable object pointer (PyFrame).
+    /// RPython MetaInterp stores the virtualizable separately from MIFrame.
+    pub(crate) concrete_vable_ptr: *mut u8,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -292,7 +295,7 @@ pub struct PyreSym {
 /// valuestackdepth, next_instr) lives in PyreSym and survives across
 /// instructions; this struct provides the per-instruction context
 /// (ctx, fallthrough_pc, concrete_frame).
-pub(crate) struct TraceFrameState {
+pub(crate) struct MIFrame {
     ctx: *mut TraceCtx,
     sym: *mut PyreSym,
     concrete_frame: usize,
@@ -415,15 +418,15 @@ fn note_inline_trace_too_long(
     }
 }
 
-fn current_trace_green_key(state: &mut TraceFrameState) -> u64 {
+fn current_trace_green_key(state: &mut MIFrame) -> u64 {
     state.with_ctx(|_, ctx| ctx.green_key())
 }
 
-fn root_trace_green_key(state: &mut TraceFrameState) -> u64 {
+fn root_trace_green_key(state: &mut MIFrame) -> u64 {
     state.with_ctx(|_, ctx| ctx.root_green_key())
 }
 
-fn biggest_inline_trace_key(state: &mut TraceFrameState) -> Option<u64> {
+fn biggest_inline_trace_key(state: &mut MIFrame) -> Option<u64> {
     state.with_ctx(|_, ctx| ctx.find_biggest_inline_function())
 }
 
@@ -451,7 +454,7 @@ fn box_traced_raw_float(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     )
 }
 
-fn ensure_boxed_for_ca(ctx: &mut TraceCtx, state: &TraceFrameState, value: OpRef) -> OpRef {
+fn ensure_boxed_for_ca(ctx: &mut TraceCtx, state: &MIFrame, value: OpRef) -> OpRef {
     match state.value_type(value) {
         Type::Int => box_traced_raw_int(ctx, value),
         Type::Float => box_traced_raw_float(ctx, value),
@@ -459,11 +462,7 @@ fn ensure_boxed_for_ca(ctx: &mut TraceCtx, state: &TraceFrameState, value: OpRef
     }
 }
 
-fn box_value_for_python_helper(
-    state: &mut TraceFrameState,
-    ctx: &mut TraceCtx,
-    value: OpRef,
-) -> OpRef {
+fn box_value_for_python_helper(state: &mut MIFrame, ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     match state.value_type(value) {
         Type::Int => box_traced_raw_int(ctx, value),
         Type::Float => box_traced_raw_float(ctx, value),
@@ -472,7 +471,7 @@ fn box_value_for_python_helper(
 }
 
 fn box_args_for_python_helper(
-    state: &mut TraceFrameState,
+    state: &mut MIFrame,
     ctx: &mut TraceCtx,
     args: &[OpRef],
 ) -> Vec<OpRef> {
@@ -1088,6 +1087,7 @@ impl PyreSym {
             concrete_code: std::ptr::null(),
             concrete_namespace: std::ptr::null_mut(),
             concrete_execution_context: std::ptr::null(),
+            concrete_vable_ptr: std::ptr::null_mut(),
         }
     }
 
@@ -1159,6 +1159,7 @@ impl PyreSym {
             self.concrete_code = frame.code;
             self.concrete_namespace = frame.namespace;
             self.concrete_execution_context = frame.execution_context;
+            self.concrete_vable_ptr = concrete_frame as *mut u8;
         }
         self.symbolic_initialized = true;
     }
@@ -1220,7 +1221,7 @@ impl PyreSym {
     }
 }
 
-impl TraceFrameState {
+impl MIFrame {
     /// Get the concrete return value from the frame's stack top.
     fn concrete_stack_value_at_return(&self) -> Option<PyObjectRef> {
         // MIFrame Box tracking: read from concrete_stack
@@ -1231,8 +1232,7 @@ impl TraceFrameState {
                 return Some(v.to_pyobj());
             }
         }
-        // Fallback: read from concrete frame snapshot
-        concrete_return_value(self.concrete_frame)
+        None
     }
 
     fn next_instruction_consumes_comparison_truth(&self) -> bool {
@@ -1425,9 +1425,9 @@ impl TraceFrameState {
         s.valuestackdepth += 1;
     }
 
-    /// Push a TracedBox (RPython execute_and_record return value parity).
+    /// Push a FrontendOp (RPython execute_and_record return value parity).
     /// Bypasses pending_concrete_push — concrete value is directly provided.
-    fn push_traced_box(&mut self, _ctx: &mut TraceCtx, traced: TracedBox) {
+    fn push_traced_box(&mut self, _ctx: &mut TraceCtx, traced: FrontendOp) {
         let value_type = self.value_type(traced.opref);
         let s = self.sym_mut();
         let stack_idx = s.stack_only_depth();
@@ -1452,7 +1452,6 @@ impl TraceFrameState {
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
-        let concrete_frame = self.concrete_frame;
         let s = self.sym_mut();
         let nlocals = s.nlocals;
         let stack_idx = s
@@ -1477,15 +1476,8 @@ impl TraceFrameState {
             .get(stack_idx)
             .copied()
             .unwrap_or(ConcreteValue::Null);
-        // Fall back to concrete_frame only if within snapshot's depth
         let concrete_popped_pyobj = if concrete_popped.is_null() {
-            let snapshot_depth = concrete_stack_depth(concrete_frame).unwrap_or(0);
-            let abs_idx = s.valuestackdepth.saturating_sub(1);
-            if abs_idx < snapshot_depth {
-                concrete_stack_value(concrete_frame, abs_idx)
-            } else {
-                None
-            }
+            None
         } else {
             Some(concrete_popped.to_pyobj())
         };
@@ -1743,7 +1735,7 @@ impl TraceFrameState {
         };
         ctx.gen_store_back_in_vable(vable_ref);
         let info = build_pyframe_virtualizable_info();
-        let obj_ptr = self.concrete_frame as *mut u8;
+        let obj_ptr = self.sym().concrete_vable_ptr;
         unsafe {
             info.tracing_before_residual_call(obj_ptr);
         }
@@ -1753,7 +1745,7 @@ impl TraceFrameState {
 
     fn sync_standard_virtualizable_after_residual_call(&self) -> bool {
         let info = build_pyframe_virtualizable_info();
-        let obj_ptr = self.concrete_frame as *mut u8;
+        let obj_ptr = self.sym().concrete_vable_ptr;
         unsafe { info.tracing_after_residual_call(obj_ptr) }
     }
 
@@ -1815,7 +1807,6 @@ impl TraceFrameState {
         // accounting drifted during tracing, resync depth/shape from the
         // concrete frame before materializing JUMP args.
         // MIFrame Box tracking: use PyreSym's tracked values, not snapshot.
-        let concrete_frame = self.concrete_frame;
         let concrete_nlocals = self.sym().nlocals;
         let concrete_vsd = self.sym().valuestackdepth.max(concrete_nlocals);
         {
@@ -1823,16 +1814,17 @@ impl TraceFrameState {
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
             let stack_only = s.stack_only_depth();
+            // Derive slot types from concrete Box values (no concrete_frame read).
             if s.symbolic_local_types.len() != concrete_nlocals {
-                s.symbolic_local_types =
-                    concrete_slot_types(concrete_frame, concrete_nlocals, concrete_nlocals);
+                s.symbolic_local_types = s.concrete_locals.iter().map(|cv| cv.ir_type()).collect();
             }
             if s.symbolic_stack_types.len() != stack_only {
-                s.symbolic_stack_types =
-                    concrete_slot_types(concrete_frame, concrete_nlocals, concrete_vsd)
-                        .into_iter()
-                        .skip(concrete_nlocals)
-                        .collect();
+                s.symbolic_stack_types = s
+                    .concrete_stack
+                    .iter()
+                    .take(stack_only)
+                    .map(|cv| cv.ir_type())
+                    .collect();
             }
             if s.symbolic_stack.len() < stack_only {
                 s.symbolic_stack.resize(stack_only, OpRef::NONE);
@@ -1885,38 +1877,7 @@ impl TraceFrameState {
             let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
             args.push(self.materialize_loop_carried_value(ctx, value, slot_type));
         }
-        // pyjitpl.py:2954 remove_consts_and_duplicates: replace constant
-        // and duplicate OpRefs with SameAs ops. This ensures each JUMP arg
-        // is a unique non-constant reference, matching the optimizer's
-        // expectation that JUMP args are live input values.
-        let mut slot_types: Vec<Type> = Vec::with_capacity(args.len() - 3);
-        slot_types.extend(local_types.iter().copied());
-        slot_types.extend(stack_types.iter().copied());
-        Self::remove_consts_and_duplicates(&mut args, 3, &slot_types, ctx);
         args
-    }
-
-    /// pyjitpl.py:2934 remove_consts_and_duplicates
-    fn remove_consts_and_duplicates(
-        args: &mut [OpRef],
-        start: usize,
-        slot_types: &[Type],
-        ctx: &mut TraceCtx,
-    ) {
-        let mut seen = std::collections::HashSet::new();
-        for i in start..args.len() {
-            let opref = args[i];
-            if opref == OpRef::NONE {
-                continue;
-            }
-            let is_const = opref.0 >= 10_000;
-            if is_const || !seen.insert(opref) {
-                let tp = slot_types.get(i - start).copied().unwrap_or(Type::Ref);
-                let same_as_opcode = majit_ir::OpCode::same_as_for_type(tp);
-                let fresh = ctx.record_op(same_as_opcode, &[opref]);
-                args[i] = fresh;
-            }
-        }
     }
 
     /// Build the current fail_args for guards: [frame, ni, vsd, locals..., stack...]
@@ -2076,17 +2037,15 @@ impl TraceFrameState {
             .or_else(|| self.concrete_at_or_frame(self.sym().valuestackdepth))
     }
 
-    /// Read a concrete value from Box arrays, with safe fallback to concrete_frame.
-    /// In full-loop tracing, the concrete_frame snapshot may be stale (its stack
-    /// depth doesn't advance), so we only fall back for indices within the
-    /// snapshot's actual depth.
+    /// Read a concrete value from MIFrame Box arrays, with fallback
+    /// to the concrete_frame snapshot for indices within snapshot depth.
     fn concrete_at_or_frame(&self, abs_idx: usize) -> Option<PyObjectRef> {
         let v = self.sym().concrete_value_at(abs_idx);
         if !v.is_null() {
             return Some(v.to_pyobj());
         }
-        // Safe fallback: only read from concrete_frame if the index is within
-        // the snapshot's actual stack depth (avoids underflow/OOB).
+        // Fallback: read from concrete_frame snapshot when Box tracking
+        // has gaps. Only safe for indices within the snapshot's depth.
         let snapshot_depth = concrete_stack_depth(self.concrete_frame).unwrap_or(0);
         if abs_idx < snapshot_depth {
             concrete_stack_value(self.concrete_frame, abs_idx)
@@ -2670,23 +2629,22 @@ impl TraceFrameState {
             // Inline trace_unbox_float but use this.record_guard for correct
             // fail_arg types (generated trace_unbox_float hardcodes all types
             // as Int, losing Float type info needed for guard recovery).
-            let unbox_float =
-                |this: &mut TraceFrameState, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
-                    // Skip GuardClass for constant objects (ob_type is known at
-                    // trace time). RPython optimizer constant-folds these, but
-                    // pyre's optimizer doesn't always catch it.
-                    if obj.0 < 10_000 {
-                        let ob_type =
-                            trace_gc_object_int_field(ctx, obj, crate::jit::descr::ob_type_descr());
-                        let type_const = ctx.const_int(float_type_addr);
-                        this.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
-                    }
-                    ctx.record_op_with_descr(
-                        OpCode::GetfieldGcPureF,
-                        &[obj],
-                        crate::jit::descr::float_floatval_descr(),
-                    )
-                };
+            let unbox_float = |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
+                // Skip GuardClass for constant objects (ob_type is known at
+                // trace time). RPython optimizer constant-folds these, but
+                // pyre's optimizer doesn't always catch it.
+                if obj.0 < 10_000 {
+                    let ob_type =
+                        trace_gc_object_int_field(ctx, obj, crate::jit::descr::ob_type_descr());
+                    let type_const = ctx.const_int(float_type_addr);
+                    this.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+                }
+                ctx.record_op_with_descr(
+                    OpCode::GetfieldGcPureF,
+                    &[obj],
+                    crate::jit::descr::float_floatval_descr(),
+                )
+            };
             let lhs_raw = if this.value_type(a) == Type::Float {
                 a
             } else {
@@ -3937,9 +3895,8 @@ impl TraceFrameState {
         }
 
         let caller_code = self.sym().concrete_code;
-        // Read execution_context and namespace from concrete_frame (the caller).
-        // PyreSym's values may belong to a nested callee in inline trace-through.
-        let caller = unsafe { &*(self.concrete_frame as *const PyFrame) };
+        let caller_exec_ctx = self.sym().concrete_execution_context;
+        let caller_namespace_ptr = self.sym().concrete_namespace;
         let code_ptr = unsafe { w_func_get_code_ptr(concrete_callable) } as *const CodeObject;
         let globals = unsafe { w_func_get_globals(concrete_callable) };
         let closure = unsafe { pyre_runtime::w_func_get_closure(concrete_callable) };
@@ -3948,14 +3905,14 @@ impl TraceFrameState {
             code_ptr,
             &concrete_args,
             globals,
-            caller.execution_context,
+            caller_exec_ctx,
             closure,
         );
         callee_frame.fix_array_ptrs();
 
         let callee_code = unsafe { &*callee_frame.code };
         let callee_nlocals = callee_code.varnames.len();
-        let caller_namespace = caller.namespace;
+        let caller_namespace = caller_namespace_ptr;
         let callee_globals = unsafe { w_func_get_globals(concrete_callable) };
         let can_skip_traced_callee_frame = !is_self_recursive
             && callee_globals == caller_namespace
@@ -3971,6 +3928,17 @@ impl TraceFrameState {
             sym.symbolic_stack = Vec::new();
             sym.symbolic_stack_types = Vec::new();
             sym.symbolic_initialized = true;
+            // MIFrame Box tracking: set concrete metadata for callee
+            sym.concrete_locals = concrete_args
+                .iter()
+                .map(|&a| ConcreteValue::from_pyobj(a))
+                .collect();
+            sym.concrete_locals
+                .resize(callee_nlocals, ConcreteValue::Null);
+            sym.concrete_stack = Vec::new();
+            sym.concrete_code = code_ptr;
+            sym.concrete_namespace = callee_globals as *mut PyNamespace;
+            sym.concrete_execution_context = self.sym().concrete_execution_context;
             let (vable_next_instr, vable_valuestackdepth) =
                 self.with_ctx(|_, ctx| (ctx.const_int(0), ctx.const_int(callee_nlocals as i64)));
             sym.vable_next_instr = vable_next_instr;
@@ -4019,6 +3987,17 @@ impl TraceFrameState {
             sym.symbolic_stack = Vec::new();
             sym.symbolic_stack_types = Vec::new();
             sym.symbolic_initialized = true;
+            // MIFrame Box tracking: set concrete metadata for callee
+            sym.concrete_locals = concrete_args
+                .iter()
+                .map(|&a| ConcreteValue::from_pyobj(a))
+                .collect();
+            sym.concrete_locals
+                .resize(callee_nlocals, ConcreteValue::Null);
+            sym.concrete_stack = Vec::new();
+            sym.concrete_code = code_ptr;
+            sym.concrete_namespace = callee_globals as *mut PyNamespace;
+            sym.concrete_execution_context = self.sym().concrete_execution_context;
             (sym, Some(callee_frame_opref))
         };
 
@@ -4113,13 +4092,8 @@ impl TraceFrameState {
             if args.len() == 1 {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
                     let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
-                    let is_self_recursive = callee_key
-                        == unsafe {
-                            crate::eval::make_green_key(
-                                (*(this.concrete_frame as *const pyre_interp::frame::PyFrame)).code,
-                                0,
-                            )
-                        };
+                    let is_self_recursive =
+                        callee_key == crate::eval::make_green_key(this.sym().concrete_code, 0);
                     // RPython parity: an opaque helper-boundary Python CALL
                     // still produces a boxed object result.  Even if the
                     // callee itself can finish with a raw int, the helper
@@ -4268,7 +4242,7 @@ impl TraceFrameState {
         }
 
         self.with_ctx(|this, ctx| {
-            TraceFrameState::guard_range_iter(this, ctx, iter);
+            MIFrame::guard_range_iter(this, ctx, iter);
 
             let current = trace_gc_object_int_field(ctx, iter, range_iter_current_descr());
             let stop = trace_gc_object_int_field(ctx, iter, range_iter_stop_descr());
@@ -4617,7 +4591,7 @@ impl TraceFrameState {
 }
 
 pub(crate) fn trace_step_result_to_action(
-    state: &mut TraceFrameState,
+    state: &mut MIFrame,
     result: Result<pyre_runtime::StepResult<OpRef>, PyError>,
 ) -> TraceAction {
     match result {
@@ -4726,7 +4700,7 @@ pub(crate) fn trace_step_result_to_action(
     }
 }
 
-impl TraceHelperAccess for TraceFrameState {
+impl TraceHelperAccess for MIFrame {
     fn with_trace_ctx<R>(&mut self, f: impl FnOnce(&mut TraceCtx) -> R) -> R {
         self.with_ctx(|_, ctx| f(ctx))
     }
@@ -4769,18 +4743,18 @@ impl TraceHelperAccess for TraceFrameState {
     }
 }
 
-impl SharedOpcodeHandler for TraceFrameState {
+impl SharedOpcodeHandler for MIFrame {
     type Value = OpRef;
 
     fn push_value(&mut self, value: Self::Value) -> Result<(), PyError> {
         self.with_ctx(|this, ctx| {
-            TraceFrameState::push_value(this, ctx, value);
+            MIFrame::push_value(this, ctx, value);
             Ok(())
         })
     }
 
     fn pop_value(&mut self) -> Result<Self::Value, PyError> {
-        self.with_ctx(|this, ctx| TraceFrameState::pop_value(this, ctx))
+        self.with_ctx(|this, ctx| MIFrame::pop_value(this, ctx))
     }
 
     fn peek_at(&mut self, depth: usize) -> Result<Self::Value, PyError> {
@@ -4795,12 +4769,12 @@ impl SharedOpcodeHandler for TraceFrameState {
                 .unwrap_or(ConcreteValue::Null);
             self.sym_mut().pending_concrete_push = Some(concrete);
         }
-        self.with_ctx(|this, ctx| TraceFrameState::peek_value(this, ctx, depth))
+        self.with_ctx(|this, ctx| MIFrame::peek_value(this, ctx, depth))
     }
 
     fn guard_nonnull_value(&mut self, value: Self::Value) -> Result<(), PyError> {
         self.with_ctx(|this, ctx| {
-            TraceFrameState::guard_nonnull(this, ctx, value);
+            MIFrame::guard_nonnull(this, ctx, value);
             Ok(())
         })
     }
@@ -4840,10 +4814,9 @@ impl SharedOpcodeHandler for TraceFrameState {
                         let depth = CONCRETE_CALL_DEPTH.with(|d| d.get());
                         if depth < 32 {
                             CONCRETE_CALL_DEPTH.with(|d| d.set(depth + 1));
-                            let frame_ptr =
-                                self.concrete_frame as *const pyre_interp::frame::PyFrame;
-                            let result = pyre_interp::call::call_user_function_plain(
-                                unsafe { &*frame_ptr },
+                            let exec_ctx = self.sym().concrete_execution_context;
+                            let result = pyre_interp::call::call_user_function_plain_with_ctx(
+                                exec_ctx,
                                 concrete_callable,
                                 &concrete_args,
                             );
@@ -4960,7 +4933,7 @@ impl SharedOpcodeHandler for TraceFrameState {
     }
 }
 
-impl LocalOpcodeHandler for TraceFrameState {
+impl LocalOpcodeHandler for MIFrame {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
         // MIFrame Box tracking: set pending concrete from concrete_locals
         let concrete = self
@@ -4970,7 +4943,7 @@ impl LocalOpcodeHandler for TraceFrameState {
             .copied()
             .unwrap_or(ConcreteValue::Null);
         self.sym_mut().pending_concrete_push = Some(concrete);
-        self.with_ctx(|this, ctx| TraceFrameState::load_local_value(this, ctx, idx))
+        self.with_ctx(|this, ctx| MIFrame::load_local_value(this, ctx, idx))
     }
 
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
@@ -4983,10 +4956,10 @@ impl LocalOpcodeHandler for TraceFrameState {
             .copied()
             .unwrap_or(ConcreteValue::Null);
         self.sym_mut().pending_concrete_push = Some(concrete);
-        let value = self.with_ctx(|this, ctx| TraceFrameState::load_local_value(this, ctx, idx))?;
+        let value = self.with_ctx(|this, ctx| MIFrame::load_local_value(this, ctx, idx))?;
         if self.value_type(value) == Type::Ref {
             self.with_ctx(|this, ctx| {
-                TraceFrameState::guard_nonnull(this, ctx, value);
+                MIFrame::guard_nonnull(this, ctx, value);
             });
         }
         Ok(value)
@@ -5002,31 +4975,25 @@ impl LocalOpcodeHandler for TraceFrameState {
         if idx < self.sym().concrete_locals.len() {
             self.sym_mut().concrete_locals[idx] = concrete;
         }
-        self.with_ctx(|this, ctx| TraceFrameState::store_local_value(this, ctx, idx, value))
+        self.with_ctx(|this, ctx| MIFrame::store_local_value(this, ctx, idx, value))
     }
 }
 
-impl NamespaceOpcodeHandler for TraceFrameState {
+impl NamespaceOpcodeHandler for MIFrame {
     fn load_name_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
         let ns = self.sym().concrete_namespace;
-        let Some(slot) = namespace_slot_direct(ns, name)
-            .or_else(|| concrete_namespace_slot(self.concrete_frame, name))
-        else {
+        let Some(slot) = namespace_slot_direct(ns, name) else {
             return self.trace_load_name(name);
         };
         // MIFrame Box tracking: set concrete value for global load
-        if let Some(cv) = namespace_value_direct(ns, slot)
-            .or_else(|| concrete_namespace_value(self.concrete_frame, slot))
-        {
+        if let Some(cv) = namespace_value_direct(ns, slot) {
             self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(cv));
         }
-        if let Some(concrete_value) = namespace_value_direct(ns, slot)
-            .or_else(|| concrete_namespace_value(self.concrete_frame, slot))
-        {
+        if let Some(concrete_value) = namespace_value_direct(ns, slot) {
             unsafe {
                 if is_func(concrete_value) || is_builtin_func(concrete_value) {
                     return self.with_ctx(|this, ctx| {
-                        let loaded = TraceFrameState::load_namespace_value(this, ctx, slot)?;
+                        let loaded = MIFrame::load_namespace_value(this, ctx, slot)?;
                         this.guard_value(ctx, loaded, concrete_value as i64);
                         let const_value = ctx.const_int(concrete_value as i64);
                         this.sym_mut()
@@ -5037,17 +5004,15 @@ impl NamespaceOpcodeHandler for TraceFrameState {
                 }
             }
         }
-        self.with_ctx(|this, ctx| TraceFrameState::load_namespace_value(this, ctx, slot))
+        self.with_ctx(|this, ctx| MIFrame::load_namespace_value(this, ctx, slot))
     }
 
     fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
         let ns = self.sym().concrete_namespace;
-        let Some(slot) = namespace_slot_direct(ns, name)
-            .or_else(|| concrete_namespace_slot(self.concrete_frame, name))
-        else {
+        let Some(slot) = namespace_slot_direct(ns, name) else {
             return self.trace_store_name(name, value);
         };
-        self.with_ctx(|this, ctx| TraceFrameState::store_namespace_value(this, ctx, slot, value))
+        self.with_ctx(|this, ctx| MIFrame::store_namespace_value(this, ctx, slot, value))
     }
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
@@ -5056,44 +5021,44 @@ impl NamespaceOpcodeHandler for TraceFrameState {
     }
 }
 
-impl StackOpcodeHandler for TraceFrameState {
+impl StackOpcodeHandler for MIFrame {
     fn swap_values(&mut self, depth: usize) -> Result<(), PyError> {
-        self.with_ctx(|this, ctx| TraceFrameState::swap_values(this, ctx, depth))
+        self.with_ctx(|this, ctx| MIFrame::swap_values(this, ctx, depth))
     }
 }
 
-impl IterOpcodeHandler for TraceFrameState {
+impl IterOpcodeHandler for MIFrame {
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
         self.with_ctx(|this, ctx| {
-            TraceFrameState::guard_range_iter(this, ctx, iter);
+            MIFrame::guard_range_iter(this, ctx, iter);
             Ok(())
         })
     }
 
     fn concrete_iter_continues(&mut self, _iter: Self::Value) -> Result<bool, PyError> {
-        TraceFrameState::concrete_iter_continues(self)
+        MIFrame::concrete_iter_continues(self)
     }
 
     fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
-        TraceFrameState::iter_next_value(self, iter)
+        MIFrame::iter_next_value(self, iter)
     }
 
     fn guard_optional_value(&mut self, next: Self::Value, continues: bool) -> Result<(), PyError> {
         self.with_ctx(|this, ctx| {
-            TraceFrameState::record_for_iter_guard(this, ctx, next, continues);
+            MIFrame::record_for_iter_guard(this, ctx, next, continues);
             Ok(())
         })
     }
 
     fn on_iter_exhausted(&mut self, target: usize) -> Result<(), PyError> {
         self.with_ctx(|this, ctx| {
-            TraceFrameState::set_next_instr(this, ctx, target);
+            MIFrame::set_next_instr(this, ctx, target);
             Ok(())
         })
     }
 }
 
-impl TruthOpcodeHandler for TraceFrameState {
+impl TruthOpcodeHandler for MIFrame {
     type Truth = OpRef;
 
     fn truth_value(&mut self, value: Self::Value) -> Result<Self::Truth, PyError> {
@@ -5118,60 +5083,31 @@ impl TruthOpcodeHandler for TraceFrameState {
     }
 }
 
-impl ControlFlowOpcodeHandler for TraceFrameState {
+impl ControlFlowOpcodeHandler for MIFrame {
     fn fallthrough_target(&mut self) -> usize {
         self.fallthrough_pc()
     }
 
     fn set_next_instr(&mut self, target: usize) -> Result<(), PyError> {
         self.with_ctx(|this, ctx| {
-            TraceFrameState::set_next_instr(this, ctx, target);
+            MIFrame::set_next_instr(this, ctx, target);
             Ok(())
         })
     }
 
     fn close_loop_args(&mut self, target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
         self.with_ctx(|this, ctx| {
-            // RPython reached_loop_header (pyjitpl.py:2988-3030):
-            // Check current_merge_points for same_greenkey. If this is
-            // an inner loop's first visit, record and continue (unroll).
-            let code_ptr =
-                unsafe { &*(this.concrete_frame as *const pyre_interp::frame::PyFrame) }.code;
-            let back_edge_key = crate::eval::make_green_key(code_ptr, target);
-            if !ctx.has_merge_point(back_edge_key) {
-                // First visit: record merge point and continue tracing.
-                // pyjitpl.py:3030: save live args + types as original_boxes.
-                let live_args = TraceFrameState::close_loop_args(this, ctx);
-                let live_types = {
-                    let s = this.sym();
-                    let mut types = vec![Type::Ref, Type::Int, Type::Int]; // frame, ni, vsd
-                    types.extend(s.symbolic_local_types.iter().copied());
-                    let stack_only = s.stack_only_depth();
-                    types.extend(
-                        s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
-                            .iter()
-                            .copied(),
-                    );
-                    types
-                };
-                ctx.add_merge_point(back_edge_key, live_args, live_types);
-                TraceFrameState::set_next_instr(this, ctx, target);
-                if majit_meta::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][reached_loop_header] first visit, unroll: key={} pc={}",
-                        back_edge_key, target
-                    );
-                }
-                return Ok(None); // Continue — inner loop unrolled
-            }
-            // Same green key seen → close the loop.
-            TraceFrameState::set_next_instr(this, ctx, target);
-            Ok(Some(TraceFrameState::close_loop_args(this, ctx)))
+            // RPython reached_loop_header(): the loop-close state must carry
+            // the explicit backward-jump target, i.e. the real loop header
+            // merge-point. Reassert it here instead of trusting whatever
+            // fallthrough pc happened to be materialized earlier in the step.
+            MIFrame::set_next_instr(this, ctx, target);
+            Ok(Some(MIFrame::close_loop_args(this, ctx)))
         })
     }
 }
 
-impl BranchOpcodeHandler for TraceFrameState {
+impl BranchOpcodeHandler for MIFrame {
     fn enter_branch_truth(&mut self, value: Self::Value) -> Result<(), PyError> {
         self.sym_mut().pending_branch_value = Some(value);
         Ok(())
@@ -5189,7 +5125,7 @@ impl BranchOpcodeHandler for TraceFrameState {
         value: Self::Value,
         _truth: Self::Truth,
     ) -> Result<bool, PyError> {
-        TraceFrameState::concrete_branch_truth_for_value(self, value)
+        MIFrame::concrete_branch_truth_for_value(self, value)
     }
 
     fn guard_truth_value(&mut self, truth: Self::Truth, expect_true: bool) -> Result<(), PyError> {
@@ -5199,7 +5135,7 @@ impl BranchOpcodeHandler for TraceFrameState {
             } else {
                 OpCode::GuardFalse
             };
-            TraceFrameState::record_guard(this, ctx, opcode, &[truth]);
+            MIFrame::record_guard(this, ctx, opcode, &[truth]);
             Ok(())
         })
     }
@@ -5211,13 +5147,13 @@ impl BranchOpcodeHandler for TraceFrameState {
         concrete_truth: bool,
     ) -> Result<(), PyError> {
         self.with_ctx(|this, ctx| {
-            TraceFrameState::record_branch_guard(this, ctx, value, truth, concrete_truth);
+            MIFrame::record_branch_guard(this, ctx, value, truth, concrete_truth);
             Ok(())
         })
     }
 }
 
-impl ArithmeticOpcodeHandler for TraceFrameState {
+impl ArithmeticOpcodeHandler for MIFrame {
     fn binary_value(
         &mut self,
         a: Self::Value,
@@ -5385,7 +5321,7 @@ impl ArithmeticOpcodeHandler for TraceFrameState {
     }
 }
 
-impl ConstantOpcodeHandler for TraceFrameState {
+impl ConstantOpcodeHandler for MIFrame {
     fn int_constant(&mut self, value: i64) -> Result<Self::Value, PyError> {
         self.sym_mut().pending_concrete_push = Some(ConcreteValue::Int(value));
         self.trace_int_constant(value)
@@ -5424,7 +5360,7 @@ impl ConstantOpcodeHandler for TraceFrameState {
     }
 }
 
-impl OpcodeStepExecutor for TraceFrameState {
+impl OpcodeStepExecutor for MIFrame {
     type Error = PyError;
 
     fn unsupported(
@@ -6447,7 +6383,7 @@ mod tests {
         sym.nlocals = 1;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -6478,7 +6414,7 @@ mod tests {
         sym.nlocals = 1;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -6740,7 +6676,7 @@ mod tests {
         sym.nlocals = 1;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -6751,9 +6687,8 @@ mod tests {
             pending_inline_frame: None,
         };
 
-        let loaded =
-            <TraceFrameState as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "j")
-                .expect("typed int local should load without guard");
+        let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "j")
+            .expect("typed int local should load without guard");
         assert_eq!(loaded, local);
 
         let recorder = ctx.into_recorder();
@@ -6770,7 +6705,7 @@ mod tests {
         sym.nlocals = 1;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -6781,9 +6716,8 @@ mod tests {
             pending_inline_frame: None,
         };
 
-        let loaded =
-            <TraceFrameState as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "b")
-                .expect("ref local should load with guard");
+        let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "b")
+            .expect("ref local should load with guard");
         assert_eq!(loaded, local);
 
         let recorder = ctx.into_recorder();
@@ -6814,7 +6748,7 @@ mod tests {
         sym.symbolic_initialized = true;
         sym.transient_value_types.insert(raw, Type::Int);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -6831,9 +6765,8 @@ mod tests {
         assert_eq!(state.sym().symbolic_locals[0], raw);
         assert_eq!(state.sym().symbolic_local_types[0], Type::Int);
 
-        let loaded =
-            <TraceFrameState as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "x")
-                .expect("typed raw int local should reload without object guards");
+        let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "x")
+            .expect("typed raw int local should reload without object guards");
         assert_eq!(loaded, raw);
 
         let recorder = ctx.into_recorder();
@@ -6851,7 +6784,7 @@ mod tests {
         sym.nlocals = 1;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -6881,7 +6814,7 @@ mod tests {
         sym.nlocals = 2;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -6892,7 +6825,7 @@ mod tests {
             pending_inline_frame: None,
         };
 
-        let _ = <TraceFrameState as TraceHelperAccess>::trace_binary_value(
+        let _ = <MIFrame as TraceHelperAccess>::trace_binary_value(
             &mut state,
             lhs,
             rhs,
@@ -6918,7 +6851,7 @@ mod tests {
         sym.nlocals = 2;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -6979,7 +6912,7 @@ mod tests {
         sym.transient_value_types.insert(lhs, Type::Int);
         sym.transient_value_types.insert(rhs, Type::Int);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7052,7 +6985,7 @@ mod tests {
         sym.transient_value_types.insert(lhs, Type::Int);
         sym.transient_value_types.insert(rhs, Type::Int);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7133,7 +7066,7 @@ mod tests {
         sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7200,7 +7133,7 @@ mod tests {
         sym.symbolic_initialized = true;
         sym.last_comparison_truth = Some(OpRef(123));
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7238,7 +7171,7 @@ mod tests {
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth - 1;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7277,7 +7210,7 @@ mod tests {
         sym.symbolic_stack = vec![OpRef(10), OpRef(11)];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7313,7 +7246,7 @@ mod tests {
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth - 2;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7364,7 +7297,7 @@ mod tests {
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth - 3;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7401,7 +7334,7 @@ mod tests {
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth - 1;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7437,7 +7370,7 @@ mod tests {
         sym.last_comparison_truth = Some(OpRef(321));
         sym.last_comparison_concrete_truth = Some(false);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7474,7 +7407,7 @@ mod tests {
         sym.valuestackdepth = frame.valuestackdepth - 1;
         sym.transient_value_types.insert(OpRef(77), Type::Int);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7529,7 +7462,7 @@ mod tests {
         sym.symbolic_stack = vec![lower_stack];
         sym.symbolic_stack_types = vec![Type::Ref];
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7594,7 +7527,7 @@ mod tests {
         sym.symbolic_stack_types = vec![Type::Ref];
         sym.pending_branch_value = Some(OpRef::NONE);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7653,7 +7586,7 @@ mod tests {
         sym.last_popped_concrete_value = Some(w_int_new(1));
         sym.pending_branch_value = Some(truth);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7668,7 +7601,7 @@ mod tests {
             this.record_guard(ctx, OpCode::GuardTrue, &[truth]);
         });
         assert_eq!(state.concrete_branch_truth_for_value(truth).unwrap(), true);
-        <TraceFrameState as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
+        <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
         assert!(state.sym().last_popped_concrete_value.is_none());
     }
 
@@ -7691,7 +7624,7 @@ mod tests {
         sym.symbolic_stack = vec![stack0, stack1];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -7739,7 +7672,7 @@ mod tests {
         sym.symbolic_stack = vec![OpRef::NONE];
         sym.symbolic_stack_types = vec![Type::Int];
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7798,7 +7731,7 @@ mod tests {
         sym.valuestackdepth = frame.stack_base();
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -7861,7 +7794,7 @@ mod tests {
         sym.nlocals = 2;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: 1,
@@ -7925,7 +7858,7 @@ mod tests {
         sym.last_popped_concrete_value = Some(concrete_list);
         sym.transient_value_types.insert(value, Type::Int);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -8017,7 +7950,7 @@ mod tests {
         sym.last_popped_concrete_value = Some(concrete_list);
         sym.transient_value_types.insert(value, Type::Float);
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -8093,7 +8026,7 @@ mod tests {
         sym.valuestackdepth = 1;
         sym.symbolic_initialized = true;
 
-        let mut state = TraceFrameState {
+        let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
             concrete_frame: frame_ptr,
@@ -8104,10 +8037,10 @@ mod tests {
             pending_inline_frame: None,
         };
 
-        let next = TraceFrameState::iter_next_value(&mut state, iter)
+        let next = MIFrame::iter_next_value(&mut state, iter)
             .expect("range iterator fast path should trace");
         assert_eq!(state.value_type(next), Type::Int);
-        <TraceFrameState as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
+        <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
             .expect("typed range next should not need optional guard");
 
         let recorder = ctx.into_recorder();
@@ -8180,7 +8113,7 @@ mod tests {
 ///
 /// PyPy pyjitpl.py: MIFrame holds jitcode + registers + pc + greenkey.
 /// Ours holds PyreSym (symbolic state) + concrete PyFrame + OpArgState.
-struct MIFrame {
+struct InlineMIFrame {
     sym: PyreSym,
     concrete_frame: pyre_interp::frame::PyFrame,
     drop_frame_opref: Option<OpRef>,
@@ -8232,7 +8165,7 @@ fn execute_inline_residual_call(
 
 /// PyPy pyjitpl.py `_interpret()` equivalent for inlined calls.
 ///
-/// Uses a framestack (Vec<MIFrame>) instead of recursive Rust calls.
+/// Uses a framestack (Vec<InlineMIFrame>) instead of recursive Rust calls.
 /// When trace_code_step encounters a call that should be inlined,
 /// it pushes a new MIFrame. When RETURN_VALUE is traced, it pops
 /// and stores the result in the parent via make_result_of_lastop.
@@ -8248,7 +8181,7 @@ fn inline_trace_and_execute(
     let _inline_call_override = pyre_interp::call::inline_call_override_guard();
     let inline_trace_base = ctx.inline_trace_depth();
     ctx.push_inline_trace_position(pending.green_key);
-    let mut framestack: Vec<MIFrame> = vec![MIFrame {
+    let mut framestack: Vec<InlineMIFrame> = vec![InlineMIFrame {
         sym: pending.sym,
         concrete_frame: pending.concrete_frame,
         drop_frame_opref: pending.drop_frame_opref,
@@ -8274,7 +8207,7 @@ fn inline_trace_and_execute(
         let pfa = top.parent_fail_args.clone();
         let pfa_types = top.parent_fail_arg_types.clone();
         let trace_action = {
-            let mut fs = TraceFrameState::from_sym(
+            let mut fs = MIFrame::from_sym(
                 ctx,
                 &mut top.sym,
                 &top.concrete_frame as *const _ as usize,
@@ -8314,7 +8247,7 @@ fn inline_trace_and_execute(
                 let (driver, _) = crate::eval::driver_pair();
                 driver.enter_inline_frame(pending.green_key);
                 ctx.push_inline_trace_position(pending.green_key);
-                framestack.push(MIFrame {
+                framestack.push(InlineMIFrame {
                     sym: pending.sym,
                     concrete_frame: pending.concrete_frame,
                     drop_frame_opref: pending.drop_frame_opref,

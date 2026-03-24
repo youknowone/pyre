@@ -11,7 +11,7 @@ use pyre_bytecode::CodeObject;
 use pyre_bytecode::bytecode::Instruction;
 use pyre_runtime::decode_instruction_at;
 
-use crate::jit::state::{PyreSym, TraceFrameState};
+use crate::jit::state::{MIFrame, PyreSym};
 
 fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
     let mut next_pc = pc.saturating_add(1);
@@ -35,7 +35,7 @@ fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
 /// Trace an entire loop body starting at `start_pc`.
 ///
 /// RPython MetaInterp._interpret() parity: loops over bytecodes,
-/// recording IR via TraceFrameState. Concrete values are tracked
+/// recording IR via MIFrame. Concrete values are tracked
 /// internally in PyreSym's concrete_locals/concrete_stack arrays —
 /// no external frame execution is needed. Stops when a back-edge
 /// (CloseLoop) is reached or on error/abort.
@@ -47,7 +47,7 @@ pub fn trace_bytecode(
     concrete_frame: usize,
 ) -> TraceAction {
     // RPython MetaInterp mode: PyreMetaFrame handles concrete dispatch
-    // while TraceFrameState handles symbolic IR recording.
+    // while MIFrame handles symbolic IR recording.
     // Both share PyreSym's concrete_locals/concrete_stack.
     let mut pc = start_pc;
 
@@ -60,7 +60,7 @@ pub fn trace_bytecode(
         // Each opcode handler records IR AND updates concrete Box values
         // in PyreSym (via pending_concrete_push / concrete_locals).
         let mut frame_state =
-            TraceFrameState::from_sym(ctx, sym, concrete_frame, semantic_fallthrough_pc(code, pc));
+            MIFrame::from_sym(ctx, sym, concrete_frame, semantic_fallthrough_pc(code, pc));
         frame_state.promote_valuestackdepth(concrete_frame);
 
         let action = frame_state.trace_code_step(code, pc);
@@ -104,9 +104,9 @@ pub fn test_metainterp_trace(
     use super::metainterp::{PyreMetaInterp, StepAction};
 
     let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, namespace);
-    let frontend_args: Vec<super::state::TracedBox> = args
+    let frontend_args: Vec<super::state::FrontendOp> = args
         .iter()
-        .map(|c| super::state::TracedBox::new(majit_ir::OpRef::NONE, *c))
+        .map(|c| super::state::FrontendOp::new(majit_ir::OpRef::NONE, *c))
         .collect();
     metainterp.perform_call(code as *const CodeObject, frontend_args, None);
 

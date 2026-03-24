@@ -249,6 +249,23 @@ pub fn call_user_function_plain(
     call_user_function_with_eval(frame, callable, args, eval_frame_plain)
 }
 
+/// Call a user function with an explicit execution context pointer.
+/// Used by MIFrame Box tracking when concrete_frame is unavailable.
+pub fn call_user_function_plain_with_ctx(
+    execution_context: *const pyre_runtime::PyExecutionContext,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> PyResult {
+    let code_ptr = unsafe { w_func_get_code_ptr(callable) };
+    let globals = unsafe { w_func_get_globals(callable) };
+    let closure = unsafe { w_func_get_closure(callable) };
+    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+    let mut func_frame =
+        PyFrame::new_for_call_with_closure(func_code, args, globals, execution_context, closure);
+    func_frame.fix_array_ptrs();
+    eval_frame_plain(&mut func_frame)
+}
+
 /// Explicit residual-call protocol used by JIT inline framestack concrete
 /// execution.
 ///
