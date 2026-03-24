@@ -299,6 +299,13 @@ pub struct PyreSym {
     pub(crate) concrete_vable_ptr: *mut u8,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
+    /// RPython capture_resumedata parity (bridge traces only):
+    /// pre-opcode snapshot of valuestackdepth + symbolic_stack so that
+    /// guards inside an opcode can capture the state at opcode START.
+    /// Set at the beginning of trace_code_step when bridge tracing.
+    pub(crate) pre_opcode_vsd: Option<usize>,
+    pub(crate) pre_opcode_stack: Option<Vec<OpRef>>,
+    pub(crate) pre_opcode_stack_types: Option<Vec<Type>>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -314,6 +321,10 @@ pub(crate) struct MIFrame {
     concrete_frame: usize,
     ob_type_fd: DescrRef,
     fallthrough_pc: usize,
+    /// RPython pyjitpl.py orgpc parity: the PC at the START of the current
+    /// opcode. All guards within one opcode capture this as their resume PC
+    /// so that guard failure re-executes the opcode from the beginning.
+    orgpc: usize,
     /// PyPy capture_resumedata: parent frame fail_args for multi-frame guards.
     pub(crate) parent_fail_args: Option<Vec<OpRef>>,
     pub(crate) parent_fail_arg_types: Option<Vec<Type>>,
@@ -1144,6 +1155,9 @@ impl PyreSym {
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
+            pre_opcode_vsd: None,
+            pre_opcode_stack: None,
+            pre_opcode_stack_types: None,
         }
     }
 
@@ -1337,12 +1351,16 @@ impl MIFrame {
             "concrete_frame must be a valid frame pointer"
         );
         sym.init_symbolic(ctx, concrete_frame);
+        // orgpc defaults to fallthrough_pc - 1 (opcode start).
+        // Overridden by set_orgpc() in trace_code_step.
+        let orgpc = fallthrough_pc.saturating_sub(1);
         Self {
             ctx,
             sym,
             concrete_frame,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc,
+            orgpc,
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
@@ -1392,7 +1410,7 @@ impl MIFrame {
     /// full-frame snapshot, materialize any symbolic holes from the concrete
     /// frame before recording the guard.
     fn build_single_frame_fail_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
-        self.flush_to_frame(ctx);
+        self.flush_to_frame_for_guard(ctx);
         let (
             frame,
             next_instr,
@@ -1404,7 +1422,20 @@ impl MIFrame {
             stack_types,
         ) = {
             let s = self.sym();
-            let stack_only = s.stack_only_depth();
+            // RPython capture_resumedata parity: for bridge traces, use
+            // the pre-opcode stack snapshot (saved before opcode popped
+            // its operands). This ensures guard fail_args include the
+            // operands needed to re-execute the opcode on guard failure.
+            let (stack_values, stack_types) = if let Some(ref pre_stack) = s.pre_opcode_stack {
+                let pre_types = s.pre_opcode_stack_types.as_deref().unwrap_or(&[]);
+                (pre_stack.clone(), pre_types.to_vec())
+            } else {
+                let stack_only = s.stack_only_depth();
+                (
+                    s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
+                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
+                )
+            };
             (
                 s.frame,
                 s.vable_next_instr,
@@ -1412,8 +1443,8 @@ impl MIFrame {
                 s.nlocals,
                 s.symbolic_locals.clone(),
                 s.symbolic_local_types.clone(),
-                s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
-                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
+                stack_values,
+                stack_types,
             )
         };
         let mut fa = vec![frame, next_instr, stack_depth];
@@ -1430,7 +1461,12 @@ impl MIFrame {
 
     fn build_single_frame_fail_arg_types(&self) -> Vec<Type> {
         let s = self.sym();
-        let stack_only = s.stack_only_depth();
+        // Use pre-opcode stack depth if available (bridge traces)
+        let stack_only = if let Some(pre_vsd) = s.pre_opcode_vsd {
+            pre_vsd.saturating_sub(s.nlocals)
+        } else {
+            s.stack_only_depth()
+        };
         if s.vable_array_base.is_some() && !s.is_function_entry_trace {
             // Back-edge: virtualizable array slots are always GCREF.
             let total_slots = s.symbolic_local_types.len() + stack_only;
@@ -1789,12 +1825,20 @@ impl MIFrame {
         self.fallthrough_pc
     }
 
+    /// Set pending_next_instr for trace advancement (step_root_frame).
+    /// This is the NEXT bytecode PC — used by the MetaInterp to advance.
     pub(crate) fn prepare_fallthrough(&mut self) {
         self.sym_mut().pending_next_instr = Some(self.fallthrough_pc);
     }
 
-    /// Update virtualizable next_instr and valuestackdepth before guards / loop close.
-    /// Locals and stack are carried through JUMP args (virtualizable), not flushed to heap.
+    /// Set the original PC for the current opcode (RPython orgpc).
+    /// All guards within this opcode will use orgpc as their resume PC.
+    pub(crate) fn set_orgpc(&mut self, pc: usize) {
+        self.orgpc = pc;
+    }
+
+    /// Update virtualizable next_instr and valuestackdepth for JUMP / loop close.
+    /// Uses pending_next_instr (fallthrough_pc or branch target) for non-guard uses.
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let fallthrough = self.fallthrough_pc;
         let s = self.sym_mut();
@@ -1802,8 +1846,26 @@ impl MIFrame {
         if let Some(pc) = pending_pc {
             s.vable_next_instr = ctx.const_int(pc as i64);
         }
-        // valuestackdepth is unconditionally synced (const_int is cheap — deduped by HashMap).
         s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
+    }
+
+    /// RPython capture_resumedata(resumepc=orgpc) parity: flush for guards.
+    /// For bridge traces with a pre-opcode snapshot, uses orgpc + the saved
+    /// stack state so guard failure re-executes the opcode with correct stack.
+    /// Root loop traces continue using fallthrough_pc (original behavior).
+    fn flush_to_frame_for_guard(&mut self, ctx: &mut TraceCtx) {
+        let has_snapshot = self.sym().pre_opcode_vsd.is_some();
+        if has_snapshot {
+            // Bridge trace: use orgpc and pre-opcode stack state
+            let resume_pc = self.orgpc;
+            let pre_vsd = self.sym().pre_opcode_vsd.unwrap();
+            let s = self.sym_mut();
+            s.vable_next_instr = ctx.const_int(resume_pc as i64);
+            s.vable_valuestackdepth = ctx.const_int(pre_vsd as i64);
+        } else {
+            // Root loop: use fallthrough_pc (original behavior)
+            self.flush_to_frame(ctx);
+        }
     }
 
     fn sync_standard_virtualizable_before_residual_call(&mut self, ctx: &mut TraceCtx) {
@@ -1987,7 +2049,7 @@ impl MIFrame {
             return;
         }
 
-        self.flush_to_frame(ctx);
+        self.flush_to_frame_for_guard(ctx);
         let fail_arg_types = self.build_single_frame_fail_arg_types();
         let fail_args = self.build_single_frame_fail_args(ctx);
         ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
@@ -2066,7 +2128,7 @@ impl MIFrame {
             return;
         }
 
-        self.flush_to_frame(ctx);
+        self.flush_to_frame_for_guard(ctx);
         let concrete_next_instr = self.sym().pending_next_instr.unwrap_or(self.fallthrough_pc);
         let (
             frame,
@@ -4577,8 +4639,32 @@ impl MIFrame {
             self.sym_mut().last_comparison_concrete_truth = None;
         }
 
+        self.set_orgpc(pc);
         self.prepare_fallthrough();
+        // RPython capture_resumedata parity (bridge traces): save the
+        // pre-opcode stack state so guard fail_args include operands
+        // that will be popped by the opcode handler.
+        {
+            let (driver, _) = crate::eval::driver_pair();
+            if driver.is_bridge_tracing() {
+                let s = self.sym_mut();
+                let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
+                s.pre_opcode_vsd = Some(s.valuestackdepth);
+                s.pre_opcode_stack =
+                    Some(s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec());
+                s.pre_opcode_stack_types = Some(
+                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
+                );
+            }
+        }
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+        // Clear pre-opcode snapshot after opcode completes
+        {
+            let s = self.sym_mut();
+            s.pre_opcode_vsd = None;
+            s.pre_opcode_stack = None;
+            s.pre_opcode_stack_types = None;
+        }
         self.into_trace_action(step_result)
     }
 

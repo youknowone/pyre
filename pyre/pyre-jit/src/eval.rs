@@ -718,36 +718,24 @@ fn restore_guard_failure_for_loop(
         driver.invalidate_all_compiled();
         return None;
     }
-    // Safety: bridge guards may have incomplete fail_args (missing stack
-    // items for mid-expression guards). Check BEFORE restore to avoid
-    // modifying the frame state and then returning None.
+    // Safety: bridge guards have fail_arg types assigned by the optimizer
+    // which may not match the pre-opcode state (where all values are boxed
+    // Refs). Until the optimizer preserves pre-opcode types, skip restore
+    // for bridge guard failures. The bridge still runs its fast path — only
+    // the guard failure fallback goes to the interpreter.
     {
         let (driver, _) = driver_pair();
         let is_bridge_guard = driver
             .meta_interp()
             .is_bridge_trace_id(exit_layout.trace_id);
         if is_bridge_guard {
-            // Bridge guard with only locals in fail_args (no stack items).
-            // Restoring would set vsd=nlocals but the resume PC may expect
-            // operand stack items, causing stack underflow.
-            let nlocals = typed.len().saturating_sub(3); // 3 header values
-            let vsd = typed
-                .get(2)
-                .and_then(|v| match v {
-                    majit_ir::Value::Int(i) => Some(*i as usize),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            let stack_depth = vsd.saturating_sub(nlocals);
-            if stack_depth == 0 {
-                if majit_meta::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] guard-fail: bridge guard (trace_id={}, vsd={}, stack=0), skipping restore",
-                        exit_layout.trace_id, vsd
-                    );
-                }
-                return None;
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit] guard-fail: bridge guard (trace_id={}), skipping restore (type mismatch)",
+                    exit_layout.trace_id
+                );
             }
+            return None;
         }
     }
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
