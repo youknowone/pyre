@@ -274,10 +274,6 @@ pub struct OptContext {
     /// matching RPython's emit_extra(op, emit=False) which routes to
     /// self.next_optimization.
     pub current_pass_idx: usize,
-    /// Field OpRefs of virtual args before force. Maps virtual OpRef →
-    /// [(field_idx, field_value_ref)]. Used by make_inputargs to flatten
-    /// virtuals into label args after force has destroyed PtrInfo.
-    pub pre_force_field_refs: HashMap<OpRef, Vec<(u32, OpRef)>>,
     /// optimizer.py: pendingfields — deferred SetfieldGc/SetarrayitemGc ops
     /// where the stored value is virtual. Set by OptHeap.emitting_operation()
     /// before a guard, consumed by emit_with_guard_check() to encode into
@@ -334,7 +330,7 @@ impl OptContext {
             preamble_end_args: None,
             skip_flush_mode: false,
             current_pass_idx: 0,
-            pre_force_field_refs: HashMap::new(),
+
             in_final_emission: false,
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
@@ -380,7 +376,7 @@ impl OptContext {
             preamble_end_args: None,
             skip_flush_mode: false,
             current_pass_idx: 0,
-            pre_force_field_refs: HashMap::new(),
+
             in_final_emission: false,
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
@@ -437,6 +433,7 @@ impl OptContext {
         if idx < self.forwarding.len() && !self.forwarding[idx].is_none() {
             self.forwarding[idx] = OpRef::NONE;
         }
+        self.short_preamble_mapping.remove(&pos_ref);
         self.new_operations.push(op);
         pos_ref
     }
@@ -761,6 +758,7 @@ impl OptContext {
             self.forwarding.resize(idx + 1, OpRef::NONE);
         }
         self.forwarding[idx] = new;
+        self.short_preamble_mapping.remove(&old);
         // Sync to forwarded table.
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
