@@ -155,6 +155,17 @@ impl TraceCtx {
         self.heap_cache.is_likely_virtual(obj)
     }
 
+    /// virtualref.py: virtual_ref_during_tracing — create a virtual
+    /// reference wrapper for an object. Returns the VirtualRef OpRef.
+    /// The optimizer can later eliminate the vref if the object stays virtual.
+    pub fn virtual_ref(&mut self, obj: OpRef) -> OpRef {
+        let token = self.recorder.record_op(OpCode::ForceToken, &[]);
+        let result = self.recorder.record_op(OpCode::VirtualRefR, &[obj, token]);
+        // Track the vref allocation as unescaped
+        self.heap_cache.new_object(result);
+        result
+    }
+
     /// Create a standalone TraceCtx for testing or external use.
     pub fn for_test(num_inputs: usize) -> Self {
         let mut recorder = Trace::new();

@@ -583,6 +583,16 @@ fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) ->
     if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
         return cached;
     }
+    // pyjitpl.py:1074-1089: quasi-immutable field handling.
+    // Record the field as quasi-immut known so subsequent reads skip
+    // the QUASIIMMUT_FIELD op. Emit GUARD_NOT_INVALIDATED if needed.
+    if descr.is_quasi_immutable() && !ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
+        ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
+        ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
+        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+            ctx.record_op(OpCode::GuardNotInvalidated, &[]);
+        }
+    }
     let opcode = if descr.is_always_pure() {
         OpCode::GetfieldGcPureI
     } else {

@@ -54,6 +54,12 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether the field is quasi-immutable (rarely changes but can).
+    /// quasiimmut.py: fields marked _immutable_fields_ = ['x?']
+    fn is_quasi_immutable(&self) -> bool {
+        false
+    }
+
     /// Whether this descriptor marks a loop version guard.
     ///
     /// Loop version guards have their alternative path compiled immediately

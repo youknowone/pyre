@@ -48,6 +48,10 @@ pub struct PyreFieldDescr {
     signed: bool,
     /// RPython: is_immutable_field(). Immutable fields survive cache invalidation.
     immutable: bool,
+    /// RPython: _is_quasi_immutable(). Fields that rarely change but CAN change.
+    /// When read during tracing, emits QUASIIMMUT_FIELD + GUARD_NOT_INVALIDATED.
+    /// If mutated at runtime, invalidates all compiled loops watching this field.
+    quasi_immutable: bool,
 }
 
 /// Concrete array descriptor for pointer-backed runtime arrays.
@@ -71,6 +75,10 @@ impl Descr for PyreFieldDescr {
     /// PyPy FieldDescr.is_always_pure(): immutable fields survive cache invalidation.
     fn is_always_pure(&self) -> bool {
         self.immutable
+    }
+
+    fn is_quasi_immutable(&self) -> bool {
+        self.quasi_immutable
     }
 }
 
@@ -134,6 +142,7 @@ pub fn make_field_descr(
         field_type,
         signed,
         immutable: false,
+        quasi_immutable: false,
     })
 }
 
@@ -150,6 +159,7 @@ pub fn make_field_descr_full(
         field_type,
         signed: false,
         immutable,
+        quasi_immutable: false,
     })
 }
 
@@ -167,6 +177,25 @@ pub fn make_immutable_field_descr(
         field_type,
         signed,
         immutable: true,
+        quasi_immutable: false,
+    })
+}
+
+/// Create a field descriptor for a quasi-immutable field.
+/// When read during tracing, emits QUASIIMMUT_FIELD + GUARD_NOT_INVALIDATED.
+pub fn make_quasi_immutable_field_descr(
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+) -> DescrRef {
+    Arc::new(PyreFieldDescr {
+        offset,
+        field_size,
+        field_type,
+        signed,
+        immutable: false,
+        quasi_immutable: true,
     })
 }
 
