@@ -153,19 +153,26 @@ fn generate_trace_functions(out: &mut String) {
 /// Unbox a Python int object: emit GuardClass + GetfieldGc(I|PureI).
 ///
 /// Auto-generated equivalent of PyPy's int_unbox annotation.
-/// Returns the raw i64 OpRef.
+/// Returns the raw i64 OpRef, with heapcache integration.
 fn trace_getfield_gc_int_pureornot(
     ctx: &mut majit_meta::TraceCtx,
     obj: majit_ir::OpRef,
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
+    // heapcache: check if this field was already read/written in this trace
+    let field_index = descr.index();
+    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+        return cached;
+    }
     let opcode = if descr.is_always_pure() {
         OpCode::GetfieldGcPureI
     } else {
         OpCode::GetfieldGcI
     };
-    ctx.record_op_with_descr(opcode, &[obj], descr)
+    let result = ctx.record_op_with_descr(opcode, &[obj], descr);
+    ctx.heap_cache_mut().getfield_now_known(obj, field_index, result);
+    result
 }
 
 pub fn trace_unbox_int(
@@ -177,12 +184,19 @@ pub fn trace_unbox_int(
     fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let ob_type = trace_getfield_gc_int_pureornot(ctx, obj, ob_type_descr);
-    let type_const = ctx.const_int(int_type_addr);
-    ctx.record_guard_typed_with_fail_args(
-        OpCode::GuardClass, &[ob_type, type_const],
-        vec![majit_ir::Type::Int; fail_args.len()], fail_args,
-    );
+    // heapcache: skip GuardClass if class already known
+    if !ctx.heap_cache().is_class_known(obj) {
+        let ob_type = trace_getfield_gc_int_pureornot(ctx, obj, ob_type_descr);
+        let type_const = ctx.const_int(int_type_addr);
+        ctx.record_guard_typed_with_fail_args(
+            OpCode::GuardClass,
+            &[ob_type, type_const],
+            vec![majit_ir::Type::Int; fail_args.len()],
+            fail_args,
+        );
+        ctx.heap_cache_mut()
+            .class_now_known(obj, majit_ir::GcRef(int_type_addr as usize));
+    }
     trace_getfield_gc_int_pureornot(ctx, obj, intval_descr)
 }
 
@@ -278,12 +292,18 @@ fn trace_getfield_gc_float_pureornot(
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
+    let field_index = descr.index();
+    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+        return cached;
+    }
     let opcode = if descr.is_always_pure() {
         OpCode::GetfieldGcPureF
     } else {
         OpCode::GetfieldGcF
     };
-    ctx.record_op_with_descr(opcode, &[obj], descr)
+    let result = ctx.record_op_with_descr(opcode, &[obj], descr);
+    ctx.heap_cache_mut().getfield_now_known(obj, field_index, result);
+    result
 }
 
 pub fn trace_unbox_float(
@@ -295,12 +315,18 @@ pub fn trace_unbox_float(
     fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let ob_type = trace_getfield_gc_int_pureornot(ctx, obj, ob_type_descr);
-    let type_const = ctx.const_int(float_type_addr);
-    ctx.record_guard_typed_with_fail_args(
-        OpCode::GuardClass, &[ob_type, type_const],
-        vec![majit_ir::Type::Int; fail_args.len()], fail_args,
-    );
+    if !ctx.heap_cache().is_class_known(obj) {
+        let ob_type = trace_getfield_gc_int_pureornot(ctx, obj, ob_type_descr);
+        let type_const = ctx.const_int(float_type_addr);
+        ctx.record_guard_typed_with_fail_args(
+            OpCode::GuardClass,
+            &[ob_type, type_const],
+            vec![majit_ir::Type::Int; fail_args.len()],
+            fail_args,
+        );
+        ctx.heap_cache_mut()
+            .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
+    }
     trace_getfield_gc_float_pureornot(ctx, obj, floatval_descr)
 }
 
