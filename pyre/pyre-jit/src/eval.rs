@@ -66,6 +66,10 @@ thread_local! {
             crate::call_jit::jit_create_callee_frame_1 as *const (),
             crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),
         );
+        d.register_create_frame_raw(
+            crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
+            crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
+        );
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
         // warmspot.py:449 — portal function returns a Python object (int).
