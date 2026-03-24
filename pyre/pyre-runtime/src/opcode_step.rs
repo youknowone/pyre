@@ -1338,17 +1338,17 @@ where
         // Phase 1 opcodes (closures, exceptions, imports) will be added
         // ── Closures / cells ──
         Instruction::LoadDeref { i } => {
-            let idx = i.get(op_arg) as usize;
+            let idx = i.get(op_arg).as_usize();
             executor.load_deref(idx)?;
             Ok(StepResult::Continue)
         }
         Instruction::StoreDeref { i } => {
-            let idx = i.get(op_arg) as usize;
+            let idx = i.get(op_arg).as_usize();
             executor.store_deref(idx)?;
             Ok(StepResult::Continue)
         }
         Instruction::DeleteDeref { i } => {
-            let idx = i.get(op_arg) as usize;
+            let idx = i.get(op_arg).as_usize();
             executor.delete_deref(idx)?;
             Ok(StepResult::Continue)
         }
@@ -1596,7 +1596,7 @@ where
             Ok(StepResult::Continue)
         }
         Instruction::LoadFromDictOrDeref { i } => {
-            let idx = i.get(op_arg) as usize;
+            let idx = i.get(op_arg).as_usize();
             executor.load_from_dict_or_deref(idx, code.names[idx].as_ref())?;
             Ok(StepResult::Continue)
         }
